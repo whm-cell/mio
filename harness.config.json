@@ -1,0 +1,23 @@
+{
+  "sourceRoots": { "src": "production", "tests": "test", "scripts": "development" },
+  "documentRoots": ["README.md", "AGENTS.md", "docs"],
+  "privateRoots": [".work", ".runtime"],
+  "generatedRoots": ["node_modules", "dist", "coverage", ".git"],
+  "configurationFiles": [
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "eslint.config.mjs",
+    "vitest.config.ts",
+    "harness.config.json",
+    ".gitignore",
+    ".prettierignore",
+    ".prettierrc.json",
+    ".node-version",
+    ".npmrc",
+    "cordis.patch.yml",
+    ".editorconfig"
+  ]
+}

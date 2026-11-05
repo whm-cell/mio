@@ -1,0 +1,68 @@
+{
+  "name": "@mio/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mio TypeScript service foundation for DeepSeek Harness",
+  "type": "module",
+  "packageManager": "pnpm@11.6.0",
+  "engines": {
+    "node": ">=24.9.0 <25",
+    "dsh": "0.2.2-rc.1"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "AGENTS.md",
+    "docs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "guard": "node scripts/check-guardrails.ts",
+    "test": "vitest run",
+    "test:smoke": "node scripts/smoke.ts",
+    "profile:prepare": "node scripts/prepare-profile.ts",
+    "start": "node scripts/start.ts",
+    "check": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm test && pnpm build && pnpm test:smoke"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.1.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.14.0",
+    "prettier": "3.9.10",
+    "remark-parse": "11.0.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "unified": "11.0.5",
+    "vitest": "4.1.11"
+  }
+}

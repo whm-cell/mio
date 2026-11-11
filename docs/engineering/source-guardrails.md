@@ -4,7 +4,7 @@
 
 开发模块的 `developmentDependencies` 按源码根声明：护栏／任务协调只导入 `scripts/harness/` 内部模块；服务工具允许自身模块及认证、对话、供应商、资产和计算迁移需要的精确配置与 schema，以及共享计算合同的构建公开类型入口。动态目录的受控部署导入另精确允许 `src/providers/store.ts`、`contracts.ts`，由存储入口统一完成归属、版本和声明校验，导入程序自持并关闭该域池；不开放整个业务目录、`catalog.ts` 或 `service.ts`。总检查入口可组合各自命令。开发角色不等于职责边界，类型、重导出和别名解析后的越界均受核对；静态规则不是任意子进程或网络副作用沙箱。
 
-认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts` 与 `src/compute/schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/guardrails.test.ts`。
+认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts` 与 `src/compute/schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
 
 根服务 A 中 COS SDK 包仅允许 `src/integrations/cos.ts` 导入，开发工具和其他 A 模块不得直接或经别名导入；B 的精确适配器按下述多项目声明约束。检查按导入名称、解析包身份和真实归属识别。类型、别名及邻近非法文件反例见同一 fixture；运行权限仍由 COS 凭据、桶策略与实际测试保证。
 
@@ -13,6 +13,8 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 共同响应模块 `src/http-response.ts` 的依赖限定为 `node:http`、`node:crypto` 与解析后指向 `src/contracts.ts` 的本地模块；认证、插件入口、其他包和开发脚本均不可作为其依赖。现有 AST 导入/导出采集与模块解析同时检查 type-only、重导出、类型查询与别名路径，报告 `HTTP_RESPONSE_DEPENDENCY`；合法直接导入和契约别名、违规认证类型/重导出/别名等在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；实际实现只导入 HTTP/ApiError 类型与 UUID 函数，公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。
 
 已登记的 TS 文件还必须进入类型检查配置；生产 TS 必须同时进入构建配置。新增根目录仅登记归属不足以通过，检查器会对账编译器实际匹配的文件集合。
+
+源码根中的 Markdown 须显式进入 `documentRoots`，例如 `tests/README.md`；它仍参与文档链接核对与候选摘要。该文档声明不豁免其他扩展名，也不代替 TS 分类与编译覆盖。
 
 私有 `.env` / `.env.*` 不进入源码清单或任务候选。唯一例外是仓库根的公开 `.env.example`：须在 `configurationFiles` 登记，参与候选摘要，且不能是符号链接；模板只放占位值，真实秘密留在忽略的私有文件。
 

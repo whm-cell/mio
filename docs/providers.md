@@ -20,7 +20,7 @@
 
 迁移默认读取同库已有的对话及回执绑定，只为 owner/配置匹配的旧引用补 historical 行，不改原绑定、digest、回执或 JSONL。对话位于另一数据库时，显式提供 `MIO_CONVERSATIONS_DATABASE_URL` 并运行 `pnpm providers:migrate --apply --with-conversations`；该连接只读引用，供应商写入仍在本域事务，无跨库外键。升级前冻结这些源记录并备份；本地测试不构成生产迁移验收。
 
-旧 92 项数据原样保存在[测试参考](../tests/fixtures/onelink-legacy-snapshot.ts)，不为任何用户 seed 成员或适配。生产代码和构建不依赖该文件；构建先清理生成的 dist，防止已移出模块残留在包中。
+旧 92 项数据原样保存在[测试参考](../tests/providers/fixtures/onelink-legacy-snapshot.ts)，不为任何用户 seed 成员或适配。生产代码和构建不依赖该文件；构建先清理生成的 dist，防止已移出模块残留在包中。
 
 ## 凭据与资源
 
@@ -84,6 +84,6 @@ classification 可省略；可选 `metadata.contextWindow` 只能是有来源的
 
 selectChat 一致读取本人配置、目录、适配、偏好，不解密。fresh resolveChat 核对同一逻辑身份并冻结稳定模型键、raw ID、凭据/目录/声明版本及 operation/profile，再解密到请求内存。已有 requestId 先返回原回执，当前资格变化不重发；在途运行不换版本。详情见[对话规范](conversations.md)。
 
-[HTTP/加密测试](../tests/providers.test.ts)、[刷新测试](../tests/providers-refresh.test.ts)、[迁移测试](../tests/providers-migration.test.ts)、[打包 Profile](../tests/providers-profile.test.ts)与[目录参考测试](../tests/providers-catalog.test.ts)各自提供实际观察。普通检查使用隔离 PG 和协议替身，不读取私有 Key 或自动调用供应商；宿主 provider 配置由[测试 setup](../tests/providers-setup.ts)隔离。
+[HTTP/加密测试](../tests/providers/providers.test.ts)、[刷新测试](../tests/providers/providers-refresh.test.ts)、[迁移测试](../tests/providers/providers-migration.test.ts)、[打包 Profile](../tests/providers/providers-profile.test.ts)与[目录参考测试](../tests/providers/providers-catalog.test.ts)各自提供实际观察。普通检查使用隔离 PG 和协议替身，不读取私有 Key 或自动调用供应商；宿主 provider 配置由[测试 setup](../tests/providers-setup.ts)隔离。
 
-显式 live 入口 `node tests/providers-live.ts <authorized-private-key-file>` 经隔离账号、公开 HTTP、正式 Profile 保存本人 Key、发现目录、部署声明测试默认，并重启再发现；只输出受控元数据。真实目录成功不等于聊天、全部模型、媒体或生产验收。源异常、代理配置、原响应和 Key 不打印。
+显式 live 入口 `node tests/providers/providers-live.ts <authorized-private-key-file>` 经隔离账号、公开 HTTP、正式 Profile 保存本人 Key、发现目录、部署声明测试默认，并重启再发现；只输出受控元数据。真实目录成功不等于聊天、全部模型、媒体或生产验收。源异常、代理配置、原响应和 Key 不打印。

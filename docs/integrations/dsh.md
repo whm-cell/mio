@@ -33,6 +33,6 @@ mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 
 
 ## 验证入口与变更影响
 
-`tests/kernel.test.ts` 经测试模型 → 官方 loop → Session → 隔离真实 JSONL，观察实际第二轮入模上下文、flush、恢复、取消、根关闭、SIGKILL、损坏尾部和工具拒绝。`tests/plugin.test.ts` 保留无守卫原生执行正控制及 HTTP/卸载回归。`pnpm test:smoke` 使用打包产物和官方 Profile，内核就绪是基础路由注册的依赖；测试模型和工具不打包。`pnpm check` 同时验证适配目录及临近非法目录、类型/别名导入反例。
+`tests/foundation/kernel.test.ts` 经测试模型 → 官方 loop → Session → 隔离真实 JSONL，观察实际第二轮入模上下文、flush、恢复、取消、根关闭、SIGKILL、损坏尾部和工具拒绝。`tests/foundation/plugin.test.ts` 保留无守卫原生执行正控制及 HTTP/卸载回归。`pnpm test:smoke` 使用打包产物和官方 Profile，内核就绪是基础路由注册的依赖；测试模型和工具不打包。`pnpm check` 同时验证适配目录及临近非法目录、类型/别名导入反例。
 
 调整版本、装配、scope、持久根、flush/关闭顺序或恢复策略时，重验受影响路径和打包。模拟模型、真实存储、正式 Profile、真实供应商、公共 API、生产及远端门禁分别报告；内核验证不等于公共对话服务已接受。

@@ -53,8 +53,8 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 ## 验证及限制
 
-`tests/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations-engine.test.ts` 验证多所有者异常关闭和无文本取消；`tests/conversations-profile.test.ts` 验证打包后的正式 Profile、多轮、正常重启及 SIGKILL。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
+`tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/conversations-engine.test.ts` 验证多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile、多轮、正常重启及 SIGKILL。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
 
-`tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
+`tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
 
 精确历史仍完整读取/校验单会话日志，公开分页不等于低成本存储查询。列表按 owner/id 索引有界返回、回执按复合主键；本地证据不推导生产吞吐、任意崩溃零丢失或全模型可用。完整检查、独立审阅、真实供应商与人类接受分别判定。

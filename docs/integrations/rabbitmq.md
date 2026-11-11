@@ -20,6 +20,6 @@ A 仅写命令、读结果；B 仅读命令、写结果。两者独立密码、�
 
 `broker:init:dev/test` 在当前配置下先核对已有资源，不匹配即停止，再仅创建缺失项；重复执行不覆盖用户、策略、队列，不清消息。密码通过真实 AMQP 登录核对。中途失败或请求结果未知时保留现场，恢复同一配置后核对并重试，不能用重建队列绕过冲突。普通 `infra:up` 只启动容器并检查节点/端口及资源告警，拓扑初始化仍是显式步骤。
 
-部署维护回归见 [local-broker 单测](../../tests/local-broker.test.ts)、[配置测试](../../tests/local-environment.test.ts) 和显式 [MQ 现场探针](../../tests/local-brokers-live.ts)。现场探针核对角色权限、消息隔离、已确认消息重启保留、另一环境可用，以及空闲 Worker journal/进程接线；完整云端转码、负载和服务器验收另按需求取证。普通检查不访问这两套人工队列或历史 broker。
+部署维护回归见 [local-broker 单测](../../tests/environment/local-broker.test.ts)、[配置测试](../../tests/environment/local-environment.test.ts) 和显式 [MQ 现场探针](../../tests/environment/local-brokers-live.ts)。现场探针核对角色权限、消息隔离、已确认消息重启保留、另一环境可用，以及空闲 Worker journal/进程接线；完整云端转码、负载和服务器验收另按需求取证。普通检查不访问这两套人工队列或历史 broker。
 
 上游依据：[HTTP API](https://www.rabbitmq.com/docs/http-api-reference)、[访问控制](https://www.rabbitmq.com/docs/access-control)、[vhost](https://www.rabbitmq.com/docs/vhosts)、[告警](https://www.rabbitmq.com/docs/alarms)。公共参数、权限、持久化或恢复变化须沿实际 A/B 消费者回归；纯部署环境扩展不改变消息业务协议。

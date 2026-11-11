@@ -6,7 +6,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **可扩展模型路由与默认文本闭环**
 
-[docs/tasks/onelink-integration/prd.md](../prd.md) · [docs/tasks/conversation-service/prd.md](../../conversation-service/prd.md) · [src/dsh/onelink.ts](../../../../src/dsh/onelink.ts) · [tests/onelink/profile.test.ts](../../../../tests/onelink/profile.test.ts) · [tests/conversations-live.ts](../../../../tests/conversations-live.ts)
+[docs/tasks/onelink-integration/prd.md](../prd.md) · [docs/tasks/conversation-service/prd.md](../../conversation-service/prd.md) · [src/dsh/onelink.ts](../../../../src/dsh/onelink.ts) · [tests/onelink/profile.test.ts](../../../../tests/onelink/profile.test.ts) · [tests/conversations/conversations-live.ts](../../../../tests/conversations/conversations-live.ts)
 
 ## onelink-user-provider-catalog
 
@@ -20,7 +20,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "prd": "docs/tasks/onelink-integration/prd.md",
   "records": {
     "path": "docs/tasks/onelink-integration/complete/records.json",
-    "sha256": "b6669ce3424874f85df4c576a06233ad4affaa91e218ec9756a92fda237c76e9"
+    "sha256": "b6ff0e73abcc75ecfa3bb186bad40046e73b3c0615fcbbbf49813087cea15ad9"
   }
 }
 ```

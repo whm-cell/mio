@@ -22,6 +22,7 @@ const sections: Record<string, [string, string][]> = {
     ['docs/coordination.md', '验证与接受'],
     ['docs/coordination.md', '交回与下一步'],
     ['docs/work-records.md', '记录证据'],
+    ['docs/engineering/testing.md', '按变更定位测试'],
   ],
   handoff: [
     ['docs/coordination.md', '跨人交接'],

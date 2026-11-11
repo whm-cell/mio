@@ -2,9 +2,9 @@ import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { authDatabase } from '../auth-database.ts';
-import { packedAuthRuntime } from '../auth-runtime.ts';
-import { importDeclaration } from '../fixtures/provider-declaration.ts';
+import { authDatabase } from '../support/auth-database.ts';
+import { packedAuthRuntime } from '../support/auth-runtime.ts';
+import { importDeclaration } from '../providers/fixtures/provider-declaration.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;

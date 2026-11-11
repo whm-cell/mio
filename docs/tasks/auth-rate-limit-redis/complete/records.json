@@ -27,7 +27,7 @@
           "purpose": "认证后端、PG兼容、计数及人工恢复步骤"
         },
         {
-          "path": "tests/auth-redis.test.ts",
+          "path": "tests/auth/auth-redis.test.ts",
           "purpose": "九规则、有效业务副作用、共享PG及真实Profile切换恢复回退验证"
         }
       ],

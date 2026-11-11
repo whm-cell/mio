@@ -2,7 +2,7 @@
 
 ## 适用范围与接入事实
 
-实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)及[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)。图片、视频、语音、音乐及素材执行器仍未装配；范围见[万联 PRD](../tasks/onelink-integration/prd.md)。协议依据为[模型目录文档](https://docs.onelinkai.cloud/8882392m0)与[文本接入说明](https://docs.onelinkai.cloud/8882612m0)，旧源码身份仅在[测试参考](../../tests/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
+实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)及[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)。图片、视频、语音、音乐及素材执行器仍未装配；范围见[万联 PRD](../tasks/onelink-integration/prd.md)。协议依据为[模型目录文档](https://docs.onelinkai.cloud/8882392m0)与[文本接入说明](https://docs.onelinkai.cloud/8882612m0)，旧源码身份仅在[测试参考](../../tests/providers/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
 
 ## 必须遵守的约束
 
@@ -22,4 +22,4 @@ Mio 输出上限1024、30秒HTTP/idle是本地政策，未知 supplier context/�
 
 ## 验证入口与变更影响
 
-[确定性协议/权限测试](../../tests/providers.test.ts)覆盖固定地址、限界、错误与关闭；[独立 live 入口](../../tests/providers-live.ts)经实际用户 HTTP 和正式打包 Profile 执行目录发现。普通检查不读取 Key 文件或自动联网。改变目标、鉴权、响应解析、凭据范围或新增协议/副作用时，同步业务/API 规范、对应负向验证和此契约；真实结果与静态、打包通过分别报告。
+[确定性协议/权限测试](../../tests/providers/providers.test.ts)覆盖固定地址、限界、错误与关闭；[独立 live 入口](../../tests/providers/providers-live.ts)经实际用户 HTTP 和正式打包 Profile 执行目录发现。普通检查不读取 Key 文件或自动联网。改变目标、鉴权、响应解析、凭据范围或新增协议/副作用时，同步业务/API 规范、对应负向验证和此契约；真实结果与静态、打包通过分别报告。

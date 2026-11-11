@@ -49,7 +49,7 @@ pnpm check
 
 万联动态目录、稳定模型身份及文本消费者按[供应商规范](docs/providers.md)配置本域数据库与主密钥并显式迁移。分库历史引用迁移、部署适配声明和使用方式以该页为准；新 ID 由当前 Key 目录发现，不维护生产型号白名单。开发安排与实际接受见[万联 PRD](docs/tasks/onelink-integration/prd.md)及其成果入口。普通检查不自动访问万联；真实目录/文本须另行显式授权。目录成功不等于全部协议、媒体或生产验收。
 
-启用 provider 域后，对话创建使用准确 modelRef 或本人显式 chat 默认，旧无绑定会话由 owner 一次绑定；按[对话 API](docs/apis/conversations.md)操作并显式执行增量 `conversations:migrate --apply`。未启用 provider 域时保留显式 legacy 路由，BYOK 缺配置不回退。独立真实入口为 `node tests/conversations-live.ts <authorized-private-key-file> [exact-model-id]`，默认 deepseek-v4.1-flash，不进入普通 check；执行前核对本人凭据、测试范围和费用授权，文本授权不扩大媒体、工具或部署范围，也不代表人类接受。
+启用 provider 域后，对话创建使用准确 modelRef 或本人显式 chat 默认，旧无绑定会话由 owner 一次绑定；按[对话 API](docs/apis/conversations.md)操作并显式执行增量 `conversations:migrate --apply`。未启用 provider 域时保留显式 legacy 路由，BYOK 缺配置不回退。独立真实入口为 `node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id]`，默认 deepseek-v4.1-flash，不进入普通 check；执行前核对本人凭据、测试范围和费用授权，文本授权不扩大媒体、工具或部署范围，也不代表人类接受。
 
 ## 本地运行
 
@@ -88,7 +88,7 @@ curl http://127.0.0.1:4311/readyz
 
 开发脚本按职责分为 `scripts/harness/`（工程护栏与任务协调）和 `scripts/service/`（Profile、启动、产物 smoke）。目录归属与开发模块依赖均由 `harness.config.json` 声明；`pnpm check` 组合公共检查与服务装载验证，生产代码保持独立。
 
-一般修改执行相关测试与检查，交付前运行 `pnpm check`。业务工具/权限变化必须测试真实执行链；接口变化更新同一份 API 契约。新增源文件自动继承所属模块规则，新模块需要在护栏配置中说明允许依赖。体量报告是审阅信号，不是自动拆分指令。
+一般修改执行相关测试与检查，交付前按[验证协议](docs/coordination.md#验证与接受)取得覆盖 `pnpm check` 的当前有效结论，可直接执行或复用有效基线并补齐受影响回归；全量条件由该协议统一规定。业务工具/权限变化必须测试真实执行链；接口变化更新同一份 API 契约。新增源文件自动继承所属模块规则，新模块需要在护栏配置中说明允许依赖。体量报告是审阅信号，不是自动拆分指令。
 
 新目标从 `pnpm work guide start` 开始，原任务用 `status` 定位后取 `context`，记录阶段不代表现场已核验。编辑前建档并进入 C1，命令型实施经 `work exec`；源码质量审查与交回前三方对账按[验证协议](docs/coordination.md#验证与接受)执行。完整命令与字段查[记录索引](docs/work-records.md)。
 

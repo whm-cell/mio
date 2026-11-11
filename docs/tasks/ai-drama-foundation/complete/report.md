@@ -6,13 +6,13 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **auth 与基础 HTTP 公共能力抽取**
 
-[src/http-response.ts](../../../../src/http-response.ts) · [src/auth/config.ts](../../../../src/auth/config.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/http.ts](../../../../src/http.ts) · [docs/apis/index.md](../../../apis/index.md) · [tests/auth.test.ts](../../../../tests/auth.test.ts)
+[src/http-response.ts](../../../../src/http-response.ts) · [src/auth/config.ts](../../../../src/auth/config.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/http.ts](../../../../src/http.ts) · [docs/apis/index.md](../../../apis/index.md) · [tests/auth/auth.test.ts](../../../../tests/auth/auth.test.ts)
 
 ## auth-registration-foundation
 
 **邮箱密码注册、持久会话与可信身份底座**
 
-[src/auth/service.ts](../../../../src/auth/service.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [scripts/service/migrate-auth.ts](../../../../scripts/service/migrate-auth.ts) · [docs/auth.md](../../../auth.md) · [docs/apis/auth.md](../../../apis/auth.md) · [tests/auth.test.ts](../../../../tests/auth.test.ts)
+[src/auth/service.ts](../../../../src/auth/service.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [scripts/service/migrate-auth.ts](../../../../scripts/service/migrate-auth.ts) · [docs/auth.md](../../../auth.md) · [docs/apis/auth.md](../../../apis/auth.md) · [tests/auth/auth.test.ts](../../../../tests/auth/auth.test.ts)
 
 ```mio-prd-results
 {
@@ -20,7 +20,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "prd": "docs/prd-ai-drama-foundation.md",
   "records": {
     "path": "docs/tasks/ai-drama-foundation/complete/records.json",
-    "sha256": "b39b28856675d49da69ea5467bf1697bdd81a696d5ea69ab1c3742c425ab1ceb"
+    "sha256": "fdd33dfd2be8db761773a310eb9001edab87e99f6e6c4e70323ac9602ffb4d33"
   }
 }
 ```

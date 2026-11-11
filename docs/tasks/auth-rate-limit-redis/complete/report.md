@@ -6,7 +6,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **公共 Redis 接入与兼容认证限流**
 
-[src/integrations/redis.ts](../../../../src/integrations/redis.ts) · [src/auth/rate-limit.ts](../../../../src/auth/rate-limit.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/integrations/redis.md](../../../integrations/redis.md) · [docs/auth.md](../../../auth.md) · [tests/auth-redis.test.ts](../../../../tests/auth-redis.test.ts)
+[src/integrations/redis.ts](../../../../src/integrations/redis.ts) · [src/auth/rate-limit.ts](../../../../src/auth/rate-limit.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/integrations/redis.md](../../../integrations/redis.md) · [docs/auth.md](../../../auth.md) · [tests/auth/auth-redis.test.ts](../../../../tests/auth/auth-redis.test.ts)
 
 ```mio-prd-results
 {
@@ -14,7 +14,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "prd": "docs/tasks/auth-rate-limit-redis/prd.md",
   "records": {
     "path": "docs/tasks/auth-rate-limit-redis/complete/records.json",
-    "sha256": "29aff0a08346754ac35692bb73ffd51148fd240fb8df6ede083a3a220eb80476"
+    "sha256": "9a754688aed6421e2ce6243aae491959cad5651e59fc0cacc47ff54630d3a2cd"
   }
 }
 ```

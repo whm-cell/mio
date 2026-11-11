@@ -23,7 +23,7 @@
           "purpose": "多个新增精确ID的动态发现、声明、两轮出站与持久化版本回归"
         },
         {
-          "path": "tests/conversations-live.ts",
+          "path": "tests/conversations/conversations-live.ts",
           "purpose": "显式授权的正式用户API真实文本验收入口"
         }
       ],

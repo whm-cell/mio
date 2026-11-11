@@ -6,13 +6,13 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **受控 DSH 内核、多轮与原生持久化边界**
 
-[src/dsh/kernel.ts](../../../../src/dsh/kernel.ts) · [src/dsh/policy.ts](../../../../src/dsh/policy.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [tests/kernel.test.ts](../../../../tests/kernel.test.ts)
+[src/dsh/kernel.ts](../../../../src/dsh/kernel.ts) · [src/dsh/policy.ts](../../../../src/dsh/policy.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [tests/foundation/kernel.test.ts](../../../../tests/foundation/kernel.test.ts)
 
 ## conversation-service
 
 **用户归属的本地对话 API 与真实默认文本闭环**
 
-[src/conversations/http.ts](../../../../src/conversations/http.ts) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/conversations/store.ts](../../../../src/conversations/store.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [docs/apis/conversations.md](../../../apis/conversations.md) · [tests/conversations-live.ts](../../../../tests/conversations-live.ts)
+[src/conversations/http.ts](../../../../src/conversations/http.ts) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/conversations/store.ts](../../../../src/conversations/store.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [docs/apis/conversations.md](../../../apis/conversations.md) · [tests/conversations/conversations-live.ts](../../../../tests/conversations/conversations-live.ts)
 
 ```mio-prd-results
 {
@@ -20,7 +20,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "prd": "docs/tasks/conversation-service/prd.md",
   "records": {
     "path": "docs/tasks/conversation-service/complete/records.json",
-    "sha256": "350c68a2eab3b063de0dcdecaf6f799b12ad382973b629b7477ea69f2675b774"
+    "sha256": "7df1b24d78563e9f26b86633634668563920d74d0017e9b8c0f603d742bf8887"
   }
 }
 ```

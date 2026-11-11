@@ -23,7 +23,7 @@
           "purpose": "持久化、恢复和装配边界规范"
         },
         {
-          "path": "tests/kernel.test.ts",
+          "path": "tests/foundation/kernel.test.ts",
           "purpose": "多轮、取消、SIGKILL、损坏和工具执行反例"
         }
       ],
@@ -61,7 +61,7 @@
           "purpose": "公开输入/输出、错误、流和恢复契约"
         },
         {
-          "path": "tests/conversations-live.ts",
+          "path": "tests/conversations/conversations-live.ts",
           "purpose": "目录内精确模型的独立真实多轮/SSE终态/取消/重启验收"
         }
       ],

@@ -30,6 +30,7 @@
     "README.md",
     "AGENTS.md",
     "docs",
+    "tests/README.md",
     "deploy/rabbitmq/README.md",
     "compute/README.md"
   ],

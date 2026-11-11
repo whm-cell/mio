@@ -2,12 +2,12 @@
 
 本目录维护项目已采用的依赖使用约束和有依据的使用经验，供业务需求直接引用。覆盖存储服务、本地执行工具、模型能力与外部供应商，按实际接入逐步建立正文；当前已整理的契约见下表。返回[资料导航](../index.md)。
 
-| 使用场景                                             | 现行契约                                                            | 实际接入入口                                                                                                                         |
-| ---------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| 使用 PostgreSQL，调整驱动、连接资源或隔离测试        | [PostgreSQL](postgres.md)；认证配置与迁移另见[认证底座](../auth.md) | [认证服务](../../src/auth/service.ts)、[认证迁移](../../scripts/service/migrate-auth.ts)、[测试数据库](../../tests/auth-database.ts) |
-| 使用 Redis，调整连接、命令、资源策略或首个限流消费者 | [Redis](redis.md)；业务规则见[认证底座](../auth.md#限流存储与恢复)  | [公共资源](../../src/integrations/redis.ts)、[认证消费者](../../src/auth/rate-limit.ts)、[插件装配](../../src/plugin.ts)             |
-| 用户万联目录发现、固定出站与凭据隔离                 | [OneLinkAI](onelink.md)；业务规则见[供应商配置](../providers.md)    | [目录客户端](../../src/integrations/onelink/models.ts)、[用户服务](../../src/providers/service.ts)                                   |
-| 用户私有资产直传、条件复制与下载                     | [腾讯云 COS](cos.md)；用户入口见[资产 API](../apis/assets.md)       | [COS 适配器](../../src/integrations/cos.ts)、[资产服务](../../src/assets/service.ts)                                                 |
+| 使用场景                                             | 现行契约                                                            | 实际接入入口                                                                                                                                 |
+| ---------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 使用 PostgreSQL，调整驱动、连接资源或隔离测试        | [PostgreSQL](postgres.md)；认证配置与迁移另见[认证底座](../auth.md) | [认证服务](../../src/auth/service.ts)、[认证迁移](../../scripts/service/migrate-auth.ts)、[测试数据库](../../tests/support/auth-database.ts) |
+| 使用 Redis，调整连接、命令、资源策略或首个限流消费者 | [Redis](redis.md)；业务规则见[认证底座](../auth.md#限流存储与恢复)  | [公共资源](../../src/integrations/redis.ts)、[认证消费者](../../src/auth/rate-limit.ts)、[插件装配](../../src/plugin.ts)                     |
+| 用户万联目录发现、固定出站与凭据隔离                 | [OneLinkAI](onelink.md)；业务规则见[供应商配置](../providers.md)    | [目录客户端](../../src/integrations/onelink/models.ts)、[用户服务](../../src/providers/service.ts)                                           |
+| 用户私有资产直传、条件复制与下载                     | [腾讯云 COS](cos.md)；用户入口见[资产 API](../apis/assets.md)       | [COS 适配器](../../src/integrations/cos.ts)、[资产服务](../../src/assets/service.ts)                                                         |
 
 DSH Agent/Session/原生持久化的采用与约束见 [DSH 内核](dsh.md)，实际入口是[受控内核](../../src/dsh/kernel.ts)和[正式 Profile](../../cordis.patch.yml)。
 

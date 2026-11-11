@@ -9,8 +9,8 @@ import * as Mio from '../../src/plugin.ts';
 import * as Engines from '../../src/dsh/conversations.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
 import { ConversationStore } from '../../src/conversations/store.ts';
-import { authDatabase } from '../auth-database.ts';
-import { kernelRuntime, ScriptedModel } from '../kernel-runtime.ts';
+import { authDatabase } from '../support/auth-database.ts';
+import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
 
 it.each([false, true])(
   'closes the provider pool despite conversation teardown/startup failure (startup=%s)',

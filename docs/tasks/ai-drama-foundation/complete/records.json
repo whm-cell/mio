@@ -28,7 +28,7 @@
           "purpose": "公共能力与两域协议入口"
         },
         {
-          "path": "tests/auth.test.ts",
+          "path": "tests/auth/auth.test.ts",
           "purpose": "认证与响应语义回归"
         }
       ],
@@ -70,7 +70,7 @@
           "purpose": "现行认证 HTTP 契约"
         },
         {
-          "path": "tests/auth.test.ts",
+          "path": "tests/auth/auth.test.ts",
           "purpose": "认证真实入口回归"
         }
       ],

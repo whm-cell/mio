@@ -44,8 +44,10 @@ export async function inventory(root: string, config: HarnessConfig) {
     const document = config.documentRoots.some((base) => beneath(file, base));
     const configuration =
       config.configurationFiles.includes(file) || /^\.github\/workflows\/[^/]+\.ya?ml$/.test(file);
-    if (sourceRoot && !file.endsWith('.ts')) {
-      errors.push(`SOURCE_UNSUPPORTED ${file}: source roots currently support TypeScript only`);
+    if (sourceRoot && !file.endsWith('.ts') && !(document && file.endsWith('.md'))) {
+      errors.push(
+        `SOURCE_UNSUPPORTED ${file}: source roots support TypeScript and explicitly declared Markdown only`,
+      );
     } else if (document && !file.endsWith('.md') && !recordsFile(file) && !taskRegistryFile(file)) {
       errors.push(`DOCUMENT_UNCLASSIFIED ${file}: declare the asset's purpose`);
     } else if (!sourceRoot && !document && !configuration) {

@@ -14,7 +14,7 @@ import { OneLinkAdapter } from '../../src/dsh/onelink.ts';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
 import type { ConversationRun, ModelObservation } from '../../src/conversations/contracts.ts';
 import type { ChatProfile } from '../../src/providers/contracts.ts';
-import { kernelRuntime, ScriptedModel } from '../kernel-runtime.ts';
+import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
 import { protocolResponse, protocolToolResponse } from './fixture.ts';
 
 afterEach(() => vi.unstubAllGlobals());

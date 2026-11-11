@@ -137,6 +137,162 @@ function normsFixture(
 const normsMarkdown = (value: unknown) =>
   `\`\`\`mio-norms-review\n${JSON.stringify(value)}\n\`\`\`\n`;
 
+// This end-to-end scenario runs many individually bounded CLI processes under concurrent suites.
+it('prepares a read-only pending draft, records actual observations, and rejects stale drafts on continuation', async () => {
+  const f = await fixture(['docs/api.md']);
+  const declaration = {
+    version: 2,
+    paths: ['docs/api.md'],
+    reason: 'Fixture API review is needed.',
+  };
+  const updated = cli(f.root, ['update', f.id, '--stdin'], {
+    revision: f.context().revision,
+    reason: 'Declare the current fixture norm.',
+    plan: { norms: declaration },
+  });
+  expect(updated.status, updated.output).toBe(0);
+  expect(cli(f.root, ['sync', f.id, 'Inspected the fixture declaration.']).status).toBe(0);
+  expect(cli(f.root, ['run', f.id, 'checks']).status).toBe(0);
+  const before = await readFile(f.path, 'utf8');
+  const beforeContext = cli(f.root, ['context', f.id, 'verify']).output;
+  expect(beforeContext).not.toContain('norms-draft');
+  let argv = ['read', f.id, 'norms-draft', '--limit', '1024'];
+  let draft = '';
+  let firstHash = '';
+  let pageCount = 0;
+  for (;;) {
+    const result = cli(f.root, argv);
+    expect(result.status, result.output).toBe(0);
+    const page = JSON.parse(result.output);
+    firstHash ||= page.page.sha256;
+    pageCount++;
+    draft += page.text;
+    if (!page.page.next) break;
+    argv = page.page.next.argv;
+  }
+  expect(pageCount).toBeGreaterThan(1);
+  expect(await readFile(f.path, 'utf8')).toBe(before);
+  const report = JSON.parse(draft.split('```mio-norms-review\n')[1]!.split('```')[0]!);
+  const task = await f.state();
+  expect(report.reason).toBe(declaration.reason);
+  expect(report.candidate).toBe(task.checkpoint!.candidate);
+  expect(report.documents).toEqual([
+    {
+      path: 'docs/api.md',
+      sha256: task.checkpoint!.files['docs/api.md'],
+      result: 'pending',
+      assessment: '',
+    },
+  ]);
+  expect(report.requirements.documents.map((entry: { path: string }) => entry.path)).toEqual([
+    'docs/api.md',
+    'docs/tasks/quality/prd.md',
+  ]);
+  expect(report.requirements.result).toBe('pending');
+  expect(report.accepted.result).toBe('pending');
+  expect(report.conclusion.result).toBe('pending');
+  const directory = `.work/tasks/${f.id}/evidence`;
+  await mkdir(join(f.root, directory), { recursive: true });
+  const unfinished = `${directory}/unfinished.md`;
+  await writeFile(join(f.root, unfinished), draft);
+  const submit = (path: string) =>
+    cli(f.root, ['evidence', f.id, 'norms-review', path, 'Fixture observations.']);
+  expect(submit(unfinished).status).toBe(1);
+  expect((await f.state()).evidence).toHaveLength(1);
+  const prepare = () =>
+    cli(f.root, ['deliver', f.id, '--stdin'], {
+      action: 'prepare',
+      revision: f.context().revision,
+      title: 'Fixture result',
+      locations: [{ path: 'docs/api.md', purpose: 'Fixture API' }],
+      outcomes: 'Fixture result.',
+      verification: 'Fixture check and review.',
+      limitations: 'Fixture only.',
+    });
+  expect(prepare().output).toContain('WORK_DELIVERY_EVIDENCE');
+
+  report.reviewer = 'Fixture reviewer';
+  report.requirements.assessment = 'Fixture requirement inspected; no separate design.';
+  for (const page of report.requirements.documents) page.assessment = 'Fixture source inspected.';
+  for (const page of report.documents) page.assessment = 'Fixture normative page inspected.';
+  report.accepted.assessment = 'Fixture accepted results still need inspection.';
+  report.remaining = 'Fixture inspection is incomplete.';
+  report.conclusion.evidence = 'Fixture observations remain pending.';
+  report.limitations = 'Fixture only.';
+  const pending = `${directory}/pending.md`;
+  await writeFile(join(f.root, pending), normsMarkdown(report));
+  expect(submit(pending).status).toBe(0);
+  expect(f.context().assessment.normsReview.result).toBe('pending');
+  expect(prepare().output).toContain('WORK_DELIVERY_EVIDENCE');
+  const pendingBytes = await readFile(join(f.root, pending), 'utf8');
+
+  report.accepted.result = 'fail';
+  report.accepted.assessment = 'Fixture comparison found a conflict.';
+  report.conclusion = { result: 'fail', evidence: 'Fixture conflict must be resolved.' };
+  const failed = `${directory}/failed.md`;
+  await writeFile(join(f.root, failed), normsMarkdown(report));
+  expect(submit(failed).status).toBe(0);
+  expect(f.context().assessment.normsReview.result).toBe('fail');
+  expect(prepare().output).toContain('WORK_DELIVERY_EVIDENCE');
+
+  report.requirements.result = 'pass';
+  for (const page of report.documents) page.result = 'pass';
+  report.accepted = {
+    result: 'pass',
+    assessment: 'No related accepted fixture result.',
+    results: [],
+  };
+  report.remaining = 'No further fixture decisions.';
+  report.conclusion = { result: 'pass', evidence: 'Fixture three-way observations complete.' };
+  const passed = `${directory}/passed.md`;
+  const passedBytes = normsMarkdown(report);
+  await writeFile(join(f.root, passed), passedBytes);
+  expect(submit(passed).status).toBe(0);
+  expect(prepare().status).toBe(0);
+  expect((await f.state()).reviewDecision).toBe('PENDING');
+  expect(f.context().assessment.normsReview.result).toBe('pass');
+
+  const updateNorms = (norms: unknown) =>
+    cli(f.root, ['update', f.id, '--stdin'], {
+      revision: f.context().revision,
+      reason: 'Inspect changed fixture declaration.',
+      plan: { norms },
+    });
+  expect(updateNorms({ ...declaration, reason: 'Fixture reason changed.' }).status).toBe(0);
+  expect(cli(f.root, ['read', f.id, 'norms-draft']).output).toContain('WORK_CONTEXT_CHANGED');
+  expect(cli(f.root, ['sync', f.id, 'Inspected reason change.']).status).toBe(0);
+  expect(submit(passed).output).toContain('candidate or declaration mismatch');
+  expect(cli(f.root, ['read', f.id, 'norms-draft', '--hash', firstHash]).output).toContain(
+    'WORK_READ_STALE',
+  );
+  expect(updateNorms({ ...declaration, paths: [] }).status).toBe(0);
+  expect(cli(f.root, ['sync', f.id, 'Inspected paths change.']).status).toBe(0);
+  expect((await f.state()).plan.norms!.reason).toBe(report.reason);
+  expect(submit(passed).output).toContain('candidate or declaration mismatch');
+  expect(updateNorms(declaration).status).toBe(0);
+  expect(cli(f.root, ['sync', f.id, 'Restored the original declaration.']).status).toBe(0);
+  expect((await f.state()).checkpoint!.candidate).toBe(task.checkpoint!.candidate);
+  await writeFile(join(f.root, 'docs/api.md'), '# API\n\nChanged fixture.');
+  expect(cli(f.root, ['read', f.id, 'norms-draft']).output).toContain('WORK_CONTEXT_CHANGED');
+  expect(cli(f.root, ['sync', f.id, 'Inspected changed fixture source.']).status).toBe(0);
+  expect(submit(passed).output).toContain('candidate or declaration mismatch');
+  expect(await readFile(join(f.root, pending), 'utf8')).toBe(pendingBytes);
+  expect(await readFile(join(f.root, passed), 'utf8')).toBe(passedBytes);
+  expect((await f.state()).evidence.slice(-3).map((entry) => entry.result)).toEqual([
+    'pending',
+    'fail',
+    'pass',
+  ]);
+
+  const missing = await fixture(['docs/api.md']);
+  const missingTask = await missing.state();
+  delete missingTask.plan.norms;
+  await writeFile(missing.path, JSON.stringify(missingTask));
+  expect(cli(missing.root, ['read', missing.id, 'norms-draft']).output).toContain(
+    'WORK_NORMS_CONTRACT',
+  );
+}, 45000);
+
 it.each(['src', 'scripts/harness', 'scripts/service', 'tests', '.', 'src/planned.ts'])(
   'registers a review for source scope %s, including planned source and ancestor directories',
   async (scope) => {
@@ -233,7 +389,7 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
   expect(prepare().output).toContain('WORK_DELIVERY_EVIDENCE');
   const candidate = f.context().assessment.candidate as string;
   let index = 0;
-  const submit = async (report: unknown, result = 'pass') => {
+  const submit = async (report: unknown) => {
     const path = `.work/tasks/${f.id}/evidence/review-${index++}.md`;
     await writeFile(
       join(f.root, path),
@@ -241,7 +397,7 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
     );
     return {
       path,
-      ...cli(f.root, ['evidence', f.id, 'quality-review', result, path, 'Fixture observations.']),
+      ...cli(f.root, ['evidence', f.id, 'quality-review', path, 'Fixture observations.']),
     };
   };
   expect((await submit('# Looks fine')).status).toBe(1);
@@ -266,8 +422,8 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
   for (const result of ['fail', 'pending']) {
     const report = reviewFixture(candidate);
     report.dimensions.unused = { result, evidence: 'Fixture issue or missing consumer evidence.' };
-    expect((await submit(report, 'pass')).status).toBe(1);
-    expect((await submit(report, result)).status).toBe(0);
+    expect((await submit(report)).status).toBe(0);
+    expect((await f.state()).evidence.at(-1)!.result).toBe(result);
     expect(prepare().output).toContain('WORK_DELIVERY_EVIDENCE');
   }
   const valid = await submit(reviewFixture(candidate));
@@ -281,8 +437,7 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
   const normsPath = `.work/tasks/${f.id}/evidence/norms.md`;
   await writeFile(join(f.root, normsPath), normsMarkdown(normsFixture(await f.state())));
   expect(
-    cli(f.root, ['evidence', f.id, 'norms-review', 'pass', normsPath, 'Fixture norm review.'])
-      .status,
+    cli(f.root, ['evidence', f.id, 'norms-review', normsPath, 'Fixture norm review.']).status,
   ).toBe(0);
   expect(prepare().status).toBe(0);
   expect((await f.state()).reviewDecision).toBe('PENDING');
@@ -291,7 +446,7 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
   expect(cli(f.root, ['sync', f.id, 'Inspected changed source.']).status).toBe(0);
   expect(f.context().assessment.qualityReview.result).toBe('pending');
   expect(
-    cli(f.root, ['evidence', f.id, 'quality-review', 'pass', valid.path, 'Old review.']).output,
+    cli(f.root, ['evidence', f.id, 'quality-review', valid.path, 'Old review.']).output,
   ).toContain('review candidate mismatch');
   expect((await f.state()).evidence).toHaveLength(5);
 });
@@ -353,14 +508,7 @@ it('requires actual candidate-bound normative page observations and rejects old 
   const path = `.work/tasks/${f.id}/evidence/norms-page.md`;
   const submit = async (value: unknown) => {
     await writeFile(join(f.root, path), normsMarkdown(value));
-    return cli(f.root, [
-      'evidence',
-      f.id,
-      'norms-review',
-      'pass',
-      path,
-      'Fixture page observations.',
-    ]);
+    return cli(f.root, ['evidence', f.id, 'norms-review', path, 'Fixture page observations.']);
   };
   expect((await submit({ ...report, documents: [] })).output).toContain('WORK_NORMS_EVIDENCE');
   expect(
@@ -384,7 +532,7 @@ it('requires actual candidate-bound normative page observations and rejects old 
   ).toBe(0);
   expect(f.context().assessment.normsReview.result).toBe('pending');
   expect(
-    cli(f.root, ['evidence', f.id, 'norms-review', 'pass', path, 'Attempt old original.']).output,
+    cli(f.root, ['evidence', f.id, 'norms-review', path, 'Attempt old original.']).output,
   ).toContain('candidate or declaration mismatch');
   expect(await readFile(join(f.root, path), 'utf8')).toBe(oldOriginal);
 });
@@ -456,7 +604,6 @@ it('enables reconciliation for maintenance without inventing a development resul
     'evidence',
     f.id,
     'norms-review',
-    'pass',
     path,
     'Synthetic maintenance reconciliation.',
   ]);
@@ -529,7 +676,6 @@ it('checks declared requirement and design current pages without duplicating ord
       'evidence',
       f.id,
       'norms-review',
-      'pass',
       path,
       'Fixture declared-source observations.',
     ]);
@@ -576,14 +722,13 @@ it('rejects missing reconciliation dimensions, bad source binding and fail or pe
   const directory = `.work/tasks/${f.id}/evidence`;
   await mkdir(join(f.root, directory), { recursive: true });
   let observation = 0;
-  const submit = async (value: unknown, declared = 'pass') => {
+  const submit = async (value: unknown) => {
     const path = `${directory}/dimensions-${observation++}.md`;
     await writeFile(join(f.root, path), normsMarkdown(value));
     return cli(f.root, [
       'evidence',
       f.id,
       'norms-review',
-      declared,
       path,
       'Synthetic three-way observations.',
     ]);
@@ -630,7 +775,7 @@ it('rejects missing reconciliation dimensions, bad source binding and fail or pe
       evidence: 'Synthetic requirement coverage has not yet been established.',
     },
   };
-  expect((await submit(pending, 'pending')).status).toBe(0);
+  expect((await submit(pending)).status).toBe(0);
   expect(f.context().assessment.normsReview.result).toBe('pending');
   const pendingEntry = (await f.state()).evidence.at(-1)!;
   const pendingOriginal = await readFile(join(f.root, pendingEntry.artifact), 'utf8');
@@ -639,8 +784,7 @@ it('rejects missing reconciliation dimensions, bad source binding and fail or pe
     accepted: { ...report.accepted, result: 'fail' },
     conclusion: { result: 'fail', evidence: 'Synthetic accepted-state conflict needs resolution.' },
   };
-  expect((await submit(failed, 'pass')).status).toBe(1);
-  const acceptedFailure = await submit(failed, 'fail');
+  const acceptedFailure = await submit(failed);
   expect(acceptedFailure.status, acceptedFailure.output).toBe(0);
   expect(f.context().assessment.normsReview.result).toBe('fail');
   expect(await readFile(join(f.root, pendingEntry.artifact), 'utf8')).toBe(pendingOriginal);
@@ -688,14 +832,8 @@ it('reads legacy originals without migration but requires an explicit v2 declara
   expect(cli(f.root, ['ensure', '--stdin'], { requirement: f.request.requirement }).status).toBe(0);
   expect(await readFile(f.path, 'utf8')).toBe(original);
   expect(
-    cli(f.root, [
-      'evidence',
-      f.id,
-      'norms-review',
-      'pass',
-      path,
-      'Attempt a new legacy observation.',
-    ]).output,
+    cli(f.root, ['evidence', f.id, 'norms-review', path, 'Attempt a new legacy observation.'])
+      .output,
   ).toContain('plan.norms.version 2');
   expect(await readFile(f.path, 'utf8')).toBe(original);
   const progress = cli(f.root, ['update', f.id, '--stdin'], {

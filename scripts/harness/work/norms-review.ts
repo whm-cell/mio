@@ -7,7 +7,7 @@ import {
   resultDocument,
   taskNavigation,
 } from '../task-documents.ts';
-import { identifier } from './records.ts';
+import { identifier, json } from './records.ts';
 import type { Checkpoint, TaskPlan } from './records.ts';
 import { hashField, metadata, record, textField } from './reports.ts';
 
@@ -80,6 +80,56 @@ function pages(value: unknown, paths: string[], current: Checkpoint, outcomes?: 
   }
 }
 
+function requirementPages(plan: TaskPlan, catalog: Awaited<ReturnType<typeof documentCatalog>>) {
+  return [
+    ...new Set(
+      [
+        ...(plan.requirement ? [plan.requirement.source] : []),
+        ...(plan.result ? [plan.result.prd] : []),
+        ...plan.sources.filter((path) => {
+          const source = resolveDocument(path, catalog);
+          return (
+            source.kind !== undefined ||
+            (catalog.documents.length === 0 &&
+              !plan.norms!.paths.includes(path) &&
+              path !== 'docs/index.md' &&
+              !taskNavigation(path) &&
+              !resultDocument(path))
+          );
+        }),
+      ].map((path) => resolveDocument(path, catalog).currentPath),
+    ),
+  ];
+}
+
+/** A read-only starting point; empty observations cannot be registered as a completed review. */
+export async function normsDraft(root: string, plan: TaskPlan, current: Checkpoint) {
+  const catalog = await documentCatalog(root);
+  const sourcePages = requirementPages(plan, catalog);
+  const report = {
+    version: 2,
+    candidate: current.candidate,
+    reviewer: '',
+    reason: plan.norms!.reason,
+    requirements: {
+      result: 'pending',
+      assessment: '',
+      documents: sourcePages.map((path) => ({ path, sha256: current.files[path], assessment: '' })),
+    },
+    documents: plan.norms!.paths.map((path) => ({
+      path,
+      sha256: current.files[path],
+      result: 'pending',
+      assessment: '',
+    })),
+    accepted: { result: 'pending', assessment: '', results: [] },
+    remaining: '',
+    conclusion: { result: 'pending', evidence: '' },
+    limitations: '',
+  };
+  return `# Norms review: incomplete draft\n\nFill in actual observations before registration.\n\n\`\`\`mio-norms-review\n${json(report)}\`\`\`\n`;
+}
+
 /** The operator supplies real observations; the CLI checks binding and shape, never accepted-state truth. */
 export async function normsReviewResult(
   root: string,
@@ -106,27 +156,10 @@ export async function normsReviewResult(
     if (report.version !== 2)
       throw new Error('WORK_NORMS_EVIDENCE: version 2 reconciliation original required');
     const catalog = await documentCatalog(root);
-    const sources = new Set(
-      [
-        ...(plan.requirement ? [plan.requirement.source] : []),
-        ...(plan.result ? [plan.result.prd] : []),
-        ...plan.sources.filter((path) => {
-          const source = resolveDocument(path, catalog);
-          return (
-            source.kind !== undefined ||
-            (catalog.documents.length === 0 &&
-              !plan.norms!.paths.includes(path) &&
-              path !== 'docs/index.md' &&
-              !taskNavigation(path) &&
-              !resultDocument(path))
-          );
-        }),
-      ].map((path) => resolveDocument(path, catalog).currentPath),
-    );
     const requirements = record(report.requirements);
     textField(requirements.assessment);
     outcomes.push(result(requirements.result));
-    pages(requirements.documents, [...sources], current);
+    pages(requirements.documents, requirementPages(plan, catalog), current);
     const accepted = record(report.accepted);
     textField(accepted.assessment);
     outcomes.push(result(accepted.result));

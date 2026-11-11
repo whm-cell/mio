@@ -306,7 +306,7 @@ it('allows implementation before choosing a check command but blocks evidence un
       '-e',
       'require("node:fs").writeFileSync(".work/forbidden", "bad")',
     ],
-    ['evidence', id, 'quality-review', 'pass', '.work/missing.md', 'Cannot bypass missing command'],
+    ['evidence', id, 'quality-review', '.work/missing.md', 'Cannot bypass missing command'],
   ])
     expect(invoke(root, argv).output).toContain('WORK_CHECK_COMMAND');
   await expect(readFile(join(root, '.work/forbidden'))).rejects.toThrow();
@@ -479,7 +479,7 @@ it('rejects competing task writes before launching them while reads and another 
     ['run', 'probe', 'checks', '--', ...write],
     ['sync', 'probe', 'Must not sync a running check.'],
     ['archive', 'probe', 'Must not archive.'],
-    ['evidence', 'probe', 'quality-review', 'pass', 'missing.md', 'Must not register.'],
+    ['evidence', 'probe', 'quality-review', 'missing.md', 'Must not register.'],
     ['handoff', 'probe'],
     ['receive', '.work/inbox/probe.md'],
   ])
@@ -818,8 +818,7 @@ async function accept(root: string) {
     reviewMarkdown(reviewFixture(current.checkpoint!.candidate)),
   );
   expect(
-    invoke(root, ['evidence', 'probe', 'quality-review', 'pass', relative, 'Fixture review.'])
-      .status,
+    invoke(root, ['evidence', 'probe', 'quality-review', relative, 'Fixture review.']).status,
   ).toBe(0);
   await edit(root, (task) => {
     task.stage = 'C1_RELEASED';
@@ -1779,8 +1778,7 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
     '\n```\n';
   await writeFile(join(root, relative), original);
   expect(
-    invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Observed the criterion.'])
-      .status,
+    invoke(root, ['evidence', 'probe', 'observe', relative, 'Observed the criterion.']).status,
   ).toBe(0);
   await accept(root);
   expect(invoke(root, ['check', 'probe']).status).toBe(0);
@@ -1789,8 +1787,7 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
   verifying(root);
   const before = await readFile(statePath(root), 'utf8');
   expect(
-    invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Replace the old observation.'])
-      .output,
+    invoke(root, ['evidence', 'probe', 'observe', relative, 'Replace the old observation.']).output,
   ).toContain('WORK_EVIDENCE_IMMUTABLE');
   expect(await readFile(statePath(root), 'utf8')).toBe(before);
   // On case-insensitive filesystems this is the same inode with nlink=1, not a hard link.
@@ -1801,7 +1798,6 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
       'evidence',
       'probe',
       'observe',
-      'pass',
       alias,
       'Alias must not bypass immutability.',
     ]);
@@ -1815,7 +1811,6 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
       'evidence',
       'probe',
       'observe',
-      'pass',
       fresh,
       'Fresh observation of the same candidate.',
     ]).status,
@@ -1832,7 +1827,6 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
       'evidence',
       'probe',
       'observe',
-      'pass',
       replacement,
       'New observation after missing historical originals.',
     ]).status,
@@ -1843,11 +1837,18 @@ it('binds ordinary manual observations to their declared candidate, criterion an
   const root = await fixture();
   await ready(root);
   await edit(root, (task) => {
-    task.plan.acceptance.push({
-      id: 'observe',
-      method: 'behavior',
-      criterion: 'Observe the actual candidate.',
-    });
+    task.plan.acceptance.push(
+      {
+        id: 'observe',
+        method: 'behavior',
+        criterion: 'Observe the actual candidate.',
+      },
+      {
+        id: 'manual-review',
+        method: 'review',
+        criterion: 'Review the actual candidate.',
+      },
+    );
   });
   expect(invoke(root, ['sync', 'probe', 'Added behavior acceptance.']).status).toBe(0);
   verifying(root);
@@ -1869,7 +1870,6 @@ it('binds ordinary manual observations to their declared candidate, criterion an
     original(report),
     'An unbound historical observation.',
     original({ ...report, candidate: candidateB, criterion: 'different' }),
-    original({ ...report, candidate: candidateB, result: 'fail' }),
     original({ ...report, candidate: candidateB, result: 'unknown' }),
   ]) {
     await writeFile(join(root, relative), body);
@@ -1877,25 +1877,48 @@ it('binds ordinary manual observations to their declared candidate, criterion an
       'evidence',
       'probe',
       'observe',
-      'pass',
       relative,
       'Must not bind invalid observation.',
     ]);
     expect(rejected.status, rejected.output).toBe(1);
     expect(await readFile(statePath(root), 'utf8')).toBe(before);
   }
-  await writeFile(join(root, relative), original({ ...report, candidate: candidateB }));
   expect(
-    invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Observed B.']).status,
+    invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Old call.']).output,
+  ).toContain('WORK_EVIDENCE');
+  expect(
+    invoke(root, ['evidence', 'probe', 'checks', relative, 'Pretend automated.']).output,
+  ).toContain('automated checks use work run');
+  expect(await readFile(statePath(root), 'utf8')).toBe(before);
+  for (const result of ['fail', 'pending']) {
+    const path = `.work/tasks/probe/evidence/observation-${result}.md`;
+    await writeFile(join(root, path), original({ ...report, candidate: candidateB, result }));
+    expect(
+      invoke(root, ['evidence', 'probe', 'observe', path, 'Fixture observation.']).status,
+    ).toBe(0);
+    expect((await state(root)).evidence.at(-1)!.result).toBe(result);
+  }
+  const review = '.work/tasks/probe/evidence/ordinary-review.md';
+  await writeFile(
+    join(root, review),
+    original({ ...report, candidate: candidateB, criterion: 'manual-review' }),
+  );
+  expect(
+    invoke(root, ['evidence', 'probe', 'manual-review', review, 'Fixture review.']).status,
   ).toBe(0);
+  expect((await state(root)).evidence.at(-1)!.result).toBe('pass');
+  await writeFile(join(root, relative), original({ ...report, candidate: candidateB }));
+  expect(invoke(root, ['evidence', 'probe', 'observe', relative, 'Observed B.']).status).toBe(0);
   // Simulate a legacy/imported record that claims B while its actual original still declares A.
   await writeFile(join(root, relative), original(report));
   await edit(root, (task) => {
     task.evidence.at(-1)!.sha256 = digest(original(report));
   });
-  expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence.at(-1).result).toBe(
-    'invalid',
-  );
+  expect(
+    JSON.parse(invoke(root, ['check', 'probe']).output).evidence.find(
+      (entry: { criterion: string }) => entry.criterion === 'observe',
+    ).result,
+  ).toBe('invalid');
   expect((await state(root)).evidence.at(-1)!.candidate).toBe(candidateB);
 });
 
@@ -1911,7 +1934,7 @@ it('rejects linked original aliases at registration and when checking previously
   await link(join(root, relative), alias);
   const before = await readFile(statePath(root), 'utf8');
   const register = () =>
-    invoke(root, ['evidence', 'probe', 'quality-review', 'pass', relative, 'Fixture review.']);
+    invoke(root, ['evidence', 'probe', 'quality-review', relative, 'Fixture review.']);
   expect(register().output).toContain('WORK_ARTIFACT');
   expect(await readFile(statePath(root), 'utf8')).toBe(before);
   await rm(alias);
@@ -1951,7 +1974,6 @@ it('rejects a manual original that is itself a candidate input before attempting
     'evidence',
     'probe',
     'inspect',
-    'pass',
     relative,
     'Must not create a self-bound observation.',
   ]);
@@ -1974,7 +1996,6 @@ it('rejects a manual original that is itself a candidate input before attempting
       'evidence',
       'probe',
       'inspect',
-      'pending',
       copy,
       'Independent retrieved observation remains pending.',
     ]).status,

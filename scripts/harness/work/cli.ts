@@ -57,6 +57,7 @@ Agent operates this CLI; the user supplies goals and decisions.
   guide <action> [--section ref]         navigate one action; expand one stable section ref
   context <task> <action>               read current task summary, checks and one action
   read <task> <task|check> [pointer]     page selected record fields or current checks
+  read <task> norms-draft               page an incomplete norms review draft on demand
   read <task> evidence <index>          page one ledger-bound original (UTF-8 text)
   read-result <prd> [key] [read options] page a public result without personal records
   changes <prd> [key] [read options]     page change summaries or one card
@@ -67,7 +68,7 @@ Agent operates this CLI; the user supplies goals and decisions.
     --stdin                            JSON command (optional) and observed conditions
   verify <task> <criterion> --stdin     inspect or record reviewed reuse/incremental verification
   exec <task> -- <argv ...>             check C1 before launching an implementation command
-  evidence <task> <criterion> <pass|fail|pending> <artifact> <summary>
+  evidence <task> <criterion> <artifact> <summary>  record the original's result
   handoff <task>                        prepare a local portable Markdown handoff
   receive <shared.md> [result-key]      verify a result/handoff, create this member's draft
   archive <task> <reason>               mark history; retain all files
@@ -300,39 +301,32 @@ async function main(activity?: CommandActivity) {
   const criterion = task.plan.acceptance.find((entry) => entry.id === args[1]);
   if (!criterion) throw new Error('WORK_CRITERION: use an acceptance id from this task');
   if (command === 'evidence') {
-    if (
-      args.length !== 5 ||
-      criterion.method === 'automated' ||
-      !['pass', 'fail', 'pending'].includes(args[2]!)
-    )
+    if (args.length !== 4 || criterion.method === 'automated')
       throw new Error(
-        'WORK_EVIDENCE: automated checks use work run; other evidence needs result, artifact and summary',
+        'WORK_EVIDENCE: automated checks use work run; manual evidence needs artifact and summary; result comes from the original',
       );
-    const bytes = await artifact(root, task.plan.id, args[3]!);
+    const bytes = await artifact(root, task.plan.id, args[2]!);
     const sha256 = digest(bytes);
-    await checkManualOriginal(root, task, args[3]!, sha256);
+    await checkManualOriginal(root, task, args[2]!, sha256);
     if (criterion.id === normsCriterion.id) {
       const issues = await normsIssues(root, task.plan, true);
       if (issues.length) throw new Error(issues.join('\n'));
     }
-    if (
-      (await manualEvidenceResult(
-        root,
-        bytes.toString('utf8'),
-        task.plan,
-        task.checkpoint!,
-        criterion.id,
-      )) !== args[2]
-    )
-      throw new Error('WORK_EVIDENCE: declared result disagrees with original');
+    const result = await manualEvidenceResult(
+      root,
+      bytes.toString('utf8'),
+      task.plan,
+      task.checkpoint!,
+      criterion.id,
+    );
     addEvidence(task, {
       criterion: criterion.id,
       method: criterion.method,
-      result: args[2]!,
-      artifact: args[3]!,
+      result,
+      artifact: args[2]!,
       sha256,
       candidate: state.candidate,
-      summary: args[4]!,
+      summary: args[3]!,
       environment: environment(),
     });
     await saveTask(root, task, raw);

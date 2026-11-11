@@ -551,7 +551,6 @@ it('bounds rejected request errors without echoing a huge path or mutating the r
     'evidence',
     id,
     'quality-review',
-    'pass',
     `.work/tasks/${id}/evidence/${'x'.repeat(5000)}.md`,
     'Fixture invalid filename.',
   ]);

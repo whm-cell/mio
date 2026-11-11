@@ -113,11 +113,11 @@ update 可改上述 plan 字段和非释放阶段（C1_IMPLEMENTATION／C1_EVIDE
 
 未完成 delivery journal 优先沿原请求恢复，不叠加冲突回执；不得删 journal／回执绕过。回执写入失败保留命令占用，按命令恢复入口核对；更新已保存但清回执失败时保留事实，重读当前 revision 再对账。正常操作不增加审批或每命令 revision 参数；回执不复制计划、候选和证据，也不是“已读 context”的证明。
 
-契约修改保留旧 checkpoint 与历史证据，并撤回旧接受／释放结论；Agent 审阅变化后再 sync，不能用 update 顺带承认未知代码变化。只改下一步且候选不变可沿用原证据。归档记录默认只读，确有当前授权时用 `reopen: true` 和非空 `plan.authorization` 显式重开，再核对及 sync。旧记录同样可用 update，不强制补 requirement。
+update 不将未知代码变化纳入 checkpoint；只改下一步且候选不变可沿用原证据，候选与证据的完整判断见[恢复与同步](coordination.md#恢复与同步)。归档记录默认只读，确有当前授权时用 `reopen: true` 和非空 `plan.authorization` 显式重开，再核对及 sync。旧记录同样可用 update，不强制补 requirement。
 
 check 只读；退出码按完整现场核验决定，缺失契约、依赖未就绪、归档、上下文或非法释放结论返回非零。有省略内容时还须按上述引用补全上下文；evidence 单独报告验收结果，ready 为 true 不表示任务已完成。
 
-sync 更新检查点，保留历史证据；执行后刷新阶段后继，即使本次核对没有内容变化，也不能保留已经完成的同步动作，不代替业务规划。字节、任务契约、分支／HEAD 变化先审阅再同步；新候选撤回旧释放，旧证据不自动重绑。内容相同的提交／分支变化，经核对仍可复用同内容证据。
+sync 更新检查点并保留历史证据；执行后刷新阶段后继，不代替业务规划。先按[恢复与同步](coordination.md#恢复与同步)审阅变化，再写明理由执行。
 
 文件摘要覆盖固定公共策略、真正工程配置、任务实际声明的范围／输入，以及相关 PRD 登记和必要 alias；合法无关 PRD 的新增或正文变化不成为窄范围任务的隐式输入。同 PRD 未读取的设计／提案正文也不自动进入候选，登记变化仍会被检测；显式广 scope 按原范围展开。全量登记有效性校验继续执行。这是本机完整性读取，不是向模型注入正文；sources 不默认塞入全部操作手册。新公共包的精确输入可写为 `docs/tasks/<名称>/complete/records.json#result=<key>`，绑定该成果的简洁记录与所属登记；追加无关 key 不改变此内容候选。selector 严格解析为公共记录包与成果身份，实际文件仍受路径、符号链接和完整性校验；普通缺失输入照常拒绝。inputStamp 保留物理文件及祖先目录的改写检测，同一 checkout 的并发写入可能保守地使运行验收无效；隔离保证以独立 checkout/worktree 为边界。
 
@@ -153,7 +153,7 @@ pnpm work exec api-probe -- sh -c 'printf "%s\n" "document text" > docs/example.
 
 ```sh
 pnpm work run api-probe checks
-pnpm work evidence api-probe review pass .work/tasks/api-probe/evidence/review.md "实际审查范围、观察与限制"
+pnpm work evidence api-probe review .work/tasks/api-probe/evidence/review.md "实际审查范围、观察与限制"
 ```
 
 run／evidence 先经 update 进入 C1_EVIDENCE_PENDING 并给出当前下一步；失败的阶段更新不能由取证补成成功。验收 ID 来自本任务 acceptance。C0／实施可暂缺 automated 的 `command`；取证阶段缺项会明确报错并阻止 run／evidence，包括显式传入 argv。可返回实施补齐检查脚本，阶段转换按目标阶段核验，现场漂移等检查仍有效。缺命令的自动验收保持 pending，不能 prepare／complete；已提供的非法命令始终拒绝。正式取证前确定完整命令及其实际读取的脚本／配置，覆盖原验收判据并纳入候选输入，审阅变化后 sync，不从命令名称推断覆盖。省略 argv 时 run 执行声明命令；旧记录不自动采信历史最后一条命令。
@@ -191,7 +191,7 @@ reuse 与 incremental 均保留任务原候选身份。新 `.verification.json` 
 
 无可靠基线、影响无法界定或原覆盖依据失效时执行全量，选择规则见[验证与接受](coordination.md#验证与接受)。旧记录不批量迁移：缺旧 checkpoint 时可提供 legacyCheckpoint，必须与日志原候选及快照摘要对应；缺环境记录时提供 legacyEnvironment=`{snapshot,reason}`，明确恢复三类条件的原件依据。已有指纹不得替换，无法核实的条件重新执行。日志和历史失败保持原字节，回执仅位于个人 `.work`，公共成果格式不变。
 
-evidence 只用于 review／behavior，登记本任务 evidence 目录的真实原件或已取回的共享 Markdown。原件需写实际操作者、场景、输入／环境、动作、结果和限制。CLI 拒绝符号链接、硬链接别名和非普通文件，并按现存文件身份核对输入重叠及历史原件，不能通过大小写路径别名重登改写后的原件。共享原件同时属于候选输入时，先取回独立私有副本再绑定，避免原件声明进入自身候选。新观察另存，旧原件及失败保留；缺失的旧原件不阻止新路径补证。单任务占用标记只串行化 CLI，不认证宿主编辑者，原件归属沿[验证与接受](coordination.md#验证与接受)执行。
+evidence 只用于 review／behavior，登记本任务 evidence 目录的真实原件或已取回的共享 Markdown；结果从原件解析，旧的附带 result 参数的调用不再支持。原件需写实际操作者、场景、输入／环境、动作、结果和限制。CLI 拒绝符号链接、硬链接别名和非普通文件，并按现存文件身份核对输入重叠及历史原件，不能通过大小写路径别名重登改写后的原件。共享原件同时属于候选输入时，先取回独立私有副本再绑定，避免原件声明进入自身候选。新观察另存，旧原件及失败保留；缺失的旧原件不阻止新路径补证。单任务占用标记只串行化 CLI，不认证宿主编辑者，原件归属沿[验证与接受](coordination.md#验证与接受)执行。
 
 普通 review／behavior 原件附一个 `mio-evidence` 代码块，声明观察时的 candidate、acceptance 中的 criterion 和 result（pass／fail／pending）。例如以下未执行模板：
 
@@ -223,13 +223,13 @@ evidence 只用于 review／behavior，登记本任务 evidence 目录的真实�
 ```
 ````
 
-每维 result 为 pass／fail／pending／not_applicable，evidence 必须说明观察或不适用理由。三维中有 fail 则整体 fail，否则有 pending 则整体 pending，全部为 pass／not_applicable 才整体 pass；须与 evidence 命令参数相同。候选不匹配、缺维度、空依据和仅有“通过”文本拒绝登记。交付时再次核对原件；原件格式完整不证明语义正确，审查者仍须执行验证协议。
+每维 result 为 pass／fail／pending／not_applicable，evidence 必须说明观察或不适用理由。三维中有 fail 则整体 fail，否则有 pending 则整体 pending，全部为 pass／not_applicable 才整体 pass；登记结果由此推导。候选不匹配、缺维度、空依据和仅有“通过”文本拒绝登记。交付时再次核对原件；原件格式完整不证明语义正确，审查者仍须执行验证协议。
 
 ```sh
-pnpm work evidence api-probe quality-review pending .work/tasks/api-probe/evidence/quality-review.md "实际审查进度与限制"
+pnpm work evidence api-probe quality-review .work/tasks/api-probe/evidence/quality-review.md "实际审查进度与限制"
 ```
 
-`norms-review` 复用同一 evidence 命令，判断方法只在[交回前三方对账](coordination.md#交回与下一步)维护。新原件附一个 v2 `mio-norms-review` 块，reason 与 plan.norms 一致；requirements 保存实际需求／方案来源观察，documents 对 norms.paths 逐页绑定当前摘要，accepted 保存人工核对的相关成果与关系，remaining 说明未完成项、剩余决定和下一步。下面是未执行模板，须替换为真实观察，不能原样填 pass：
+`norms-review` 复用同一 evidence 命令，判断方法只在[交回前三方对账](coordination.md#交回与下一步)维护。按需调用 `pnpm work read api-probe norms-draft` 分页读取未完成初稿，按返回的 next 和 hash 续页；它只读当前核验通过的声明与 checkpoint，填入 reason、候选及声明页面摘要，其余观察留空、结果为 pending。按[验证与接受](coordination.md#验证与接受)保存完整初稿并补真实审阅者、三方观察、结论及限制，再登记；读取不会保存或登记原件。声明或候选变化时保留旧稿，重新核对，不能仅改标签。新原件附一个 v2 `mio-norms-review` 块，reason 与 plan.norms 一致；requirements 保存实际需求／方案来源观察，documents 对 norms.paths 逐页绑定当前摘要，accepted 保存人工核对的相关成果与关系，remaining 说明未完成项、剩余决定和下一步。下面是未执行模板，须替换为真实观察，不能原样填 pass：
 
 ```json
 {
@@ -276,7 +276,7 @@ pnpm work evidence api-probe quality-review pending .work/tasks/api-probe/eviden
 
 requirements.documents 必须覆盖 requirement.source、result.prd 及 sources 中已注册的 prd/design/proposal/change 实际页，去重后用 currentPath，而非迁移 alias；不能靠原件添加未声明来源。没有任务资料注册的旧仓库／fixture，sources 中除 norms.paths、已知导航和成果存档外的声明页也按来源核对。维护规范章节可同时作为需求来源，其余普通规范和纯导航不重复填写。requirements.assessment 要说明要求及方案关系；无独立设计不需造文件。无规范影响时 documents 为 []，仍核对 reason；无相关接受时 accepted.results 为 []，assessment 写真实理由，不虚构成果。
 
-需求、各规范页和 accepted 的 result 只能是 pass/fail/pending，总体按 fail 优先、其次 pending、全部通过才 pass 推导，并须与 conclusion 及 evidence 命令参数相同。缺三方项、缺来源／规范页、不匹配候选、声明或页面摘要、空观察均拒绝。accepted 中 PRD/key/候选仅检查结构，不认证成果存在或接受真实；实际依赖另用 inputs 绑定，不能把原件当作实时镜像。旧声明和原件读取兼容；旧 norms 声明用于新登记前，须显式 update 到 v2、核对变化并 sync，旧通过不转移；已为 v2 的声明无需重复升级。
+需求、各规范页和 accepted 的 result 只能是 pass/fail/pending，总体按 fail 优先、其次 pending、全部通过才 pass 推导，并须与 conclusion 相同。缺三方项、缺来源／规范页、不匹配候选、声明或页面摘要、空观察均拒绝。accepted 中 PRD/key/候选仅检查结构，不认证成果存在或接受真实；实际依赖另用 inputs 绑定，不能把原件当作实时镜像。旧声明和原件读取兼容；旧 norms 声明用于新登记前，须显式 update 到 v2、核对变化并 sync，旧通过不转移；已为 v2 的声明无需重复升级。
 
 当前候选每项按上述方法核对有效原件；缺失或损坏会影响完成判定。旧释放缺证时先经 update 回到 C1_EVIDENCE_PENDING 并撤回当前接受，再显式补证，授权、依赖与上下文检查仍有效。明确开发成果收到针对候选的真实人类接受后，通过下述 deliver complete 设置接受与释放；维护任务交回适用验证后按需 archive，不生成公共完成包。自动通过不代替真实接受。
 
@@ -284,7 +284,7 @@ requirements.documents 必须覆盖 requirement.source、result.prd 及 sources 
 
 开发成果先用 ensure/update 明确 `plan.result={prd,key}` 和 `plan.norms={version:2,paths,reason}`；prd 必须是注册 PRD 的稳定身份，key 保持稳定。必要规范与实现一并进入候选，当前 norms-review 及其他必需原件必须通过。维护声明 `result:null` 及适用 norms，不执行公共交付。
 
-v2 私有交付契约与公共 v5 格式含义不同。旧个人状态继续可查看；旧交付草稿和 v1 journal 不再发布或重放。显式新 prepare 校验当前契约后可替换旧 journal，新 journal 未结束时仍阻止其他记录写入。个人文件不批量迁移。
+v2 私有交付契约与公共 v5 格式含义不同；旧格式和日志处理见[工具恢复边界](engineering/work-tooling.md#写入恢复与保留)。
 
 输出排除仅限本 PRD 报告导航和当前成果键。静态总入口及其他成果、代码与规范仍按真实声明范围参与候选，不忽略整个 complete 目录。
 
@@ -323,9 +323,9 @@ prepare 沿[记录证据](#记录证据)核验每个验收 ID 的当前有效原
 
 complete 再核对必需原件、候选、草稿和接受绑定，从注册 PRD 当前路径确定同目录 complete。v5 records.json 保存 key、title、outcomes、locations、verification、limitations、acceptance；report.md 只生成导航。没有文件清单、详细证据或可恢复源码，候选标识仅关联接受事实。
 
-同 key 更新只替换本项，保留兄弟结果，不要求旧结果先提交；公共写入仅限所属 PRD 的 records/report。静态入口与 `work documents` 也可找到尚无成果的注册需求，成果数量不表示整份 PRD 完成。旧公共格式直接拒绝，不提供历史恢复；含旧全局索引目标的 journal 处理沿[工具恢复边界](engineering/work-tooling.md#写入恢复与保留)，不批量改旧个人记录。
+同 key 更新只替换本项，保留兄弟结果，不要求旧结果先提交；公共写入仅限所属 PRD 的 records/report。静态入口与 `work documents` 也可找到尚无成果的注册需求，成果数量不表示整份 PRD 完成。旧格式和日志处理见[工具恢复边界](engineering/work-tooling.md#写入恢复与保留)。
 
-新流程中断可原样重试请求，v2 journal 恢复本次写入；外部改动、陈旧输入和错误归属拒绝覆盖。未结束新操作阻止其他记录写入，已完成请求不重写被人修改的字节。旧 v1 journal 不重放，需显式重新 prepare；重新准备仍要求当前 revision、契约和原件。reopen 只更新个人状态，公共完整性不因输出排除而免检。
+中断后按[工具恢复边界](engineering/work-tooling.md#写入恢复与保留)恢复，重新 prepare 仍要求当前 revision、契约和原件。reopen 只更新个人状态，公共完整性不因输出排除而免检。
 
 ## 发送与接收
 

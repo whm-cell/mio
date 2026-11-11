@@ -3,6 +3,7 @@ import { digest, json, loadTask } from './records.ts';
 import type { Task } from './records.ts';
 import { finiteOutput, hasReadReference, readPage } from './output.ts';
 import type { ReadOptions } from './output.ts';
+import { normsDraft, normsIssues } from './norms-review.ts';
 
 async function currentAssessment(root: string, task: Task) {
   try {
@@ -147,8 +148,18 @@ export async function readTask(
     const assessment = await currentAssessment(root, task);
     return readPage(assessment, options, command);
   }
+  if (kind === 'norms-draft') {
+    const assessment = await assess(root, task);
+    const issues = await normsIssues(root, task.plan, true);
+    if (!assessment.ready || issues.length || !task.checkpoint)
+      throw new Error(
+        [...assessment.errors, ...issues].join('\n') ||
+          'WORK_NORMS_CONTRACT: reconcile the current task',
+      );
+    return readPage(await normsDraft(root, task.plan, task.checkpoint), options, command);
+  }
   if (kind !== 'evidence' || !entry || !/^(?:0|[1-9]\d{0,8})$/.test(entry))
-    throw new Error('WORK_READ: choose task/check, or evidence with its ledger index');
+    throw new Error('WORK_READ: choose task/check/norms-draft, or evidence with its ledger index');
   const evidence = task.evidence[Number(entry)];
   if (!evidence) throw new Error('WORK_READ_EVIDENCE: ledger entry does not exist');
   command.push(entry);

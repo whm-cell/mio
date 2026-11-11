@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/conversation-service/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/conversation-service/prd.md"
+    }
+  ]
+}

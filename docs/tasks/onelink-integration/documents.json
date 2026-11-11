@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/onelink-integration/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/onelink-integration/prd.md"
+    }
+  ]
+}

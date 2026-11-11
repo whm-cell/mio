@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/onelink-audio-generation/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/onelink-audio-generation/prd.md"
+    }
+  ]
+}

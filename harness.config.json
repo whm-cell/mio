@@ -1,0 +1,111 @@
+{
+  "sourceRoots": {
+    "src": "production",
+    "compute/src": "production",
+    "contracts/compute/src": "production",
+    "compute/tests": "test",
+    "tests": "test",
+    "scripts/harness": "development",
+    "scripts/service": "development"
+  },
+  "developmentDependencies": {
+    "scripts/harness": ["scripts/harness"],
+    "scripts/service": [
+      "scripts/service",
+      "src/auth/config.ts",
+      "src/conversations/config.ts",
+      "src/conversations/schema.ts",
+      "src/assets/config.ts",
+      "src/assets/schema.ts",
+      "src/compute/schema.ts",
+      "src/integrations/rabbitmq.ts",
+      "contracts/compute/dist/index.d.ts",
+      "src/providers/config.ts",
+      "src/providers/schema.ts",
+      "src/providers/store.ts",
+      "src/providers/contracts.ts"
+    ]
+  },
+  "documentRoots": [
+    "README.md",
+    "AGENTS.md",
+    "docs",
+    "deploy/rabbitmq/README.md",
+    "compute/README.md"
+  ],
+  "privateRoots": [".work", ".runtime"],
+  "generatedRoots": [
+    "node_modules",
+    "compute/node_modules",
+    "contracts/compute/node_modules",
+    "dist",
+    "coverage",
+    ".git",
+    "compute/dist",
+    "contracts/compute/dist"
+  ],
+  "projects": {
+    "app": {
+      "kind": "service",
+      "packageRoot": ".",
+      "sources": ["src"],
+      "typecheck": "tsconfig.json",
+      "build": "tsconfig.build.json",
+      "packageAdapters": { "amqplib": ["src/integrations/rabbitmq.ts"] }
+    },
+    "worker": {
+      "kind": "service",
+      "packageRoot": "compute",
+      "sources": ["compute/src"],
+      "typecheck": "compute/tsconfig.json",
+      "build": "compute/tsconfig.build.json",
+      "capabilities": {
+        "sqlite": ["compute/src/adapters/journal.ts"],
+        "fs": ["compute/src/adapters/media.ts"],
+        "child_process": ["compute/src/adapters/media.ts"]
+      },
+      "packageAdapters": {
+        "amqplib": ["compute/src/adapters/rabbitmq.ts"],
+        "cos-nodejs-sdk-v5": ["compute/src/adapters/cos.ts"]
+      }
+    },
+    "protocol": {
+      "kind": "contract",
+      "packageRoot": "contracts/compute",
+      "sources": ["contracts/compute/src"],
+      "typecheck": "contracts/compute/tsconfig.json",
+      "build": "contracts/compute/tsconfig.build.json",
+      "publicEntries": [{ "source": "contracts/compute/src/index.ts", "export": "." }]
+    }
+  },
+  "configurationFiles": [
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".env.example",
+    "deploy/local/compose.yaml",
+    "deploy/local/postgres-init.sh",
+    "deploy/local/redis-start.sh",
+    "deploy/rabbitmq/compose.yaml",
+    "deploy/rabbitmq/rabbitmq.conf",
+    "compute/package.json",
+    "compute/tsconfig.json",
+    "compute/tsconfig.build.json",
+    "contracts/compute/package.json",
+    "contracts/compute/tsconfig.json",
+    "contracts/compute/tsconfig.build.json",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "tsconfig.portable-tools.json",
+    "eslint.config.mjs",
+    "vitest.config.ts",
+    "harness.config.json",
+    ".gitignore",
+    ".prettierignore",
+    ".prettierrc.json",
+    ".node-version",
+    ".npmrc",
+    "cordis.patch.yml",
+    ".editorconfig"
+  ]
+}

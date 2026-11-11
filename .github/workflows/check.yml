@@ -1,0 +1,37 @@
+name: Foundation checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+        env:
+          POSTGRES_USER: mio_test
+          POSTGRES_PASSWORD: mio_fixture_only
+          POSTGRES_DB: mio_auth_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIO_TEST_DATABASE_URL: postgresql://mio_test:mio_fixture_only@127.0.0.1:5432/mio_auth_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.6.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build isolated Redis 8.2.11 test binary
+        run: |
+          curl --fail --location https://download.redis.io/releases/redis-8.2.11.tar.gz -o "$RUNNER_TEMP/redis-8.2.11.tar.gz"
+          echo "fba14b77c4bdcb2d5418b6741fc0cdaac4b78bc73eab9b2e5f3c255d597f16fa  $RUNNER_TEMP/redis-8.2.11.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/redis-8.2.11.tar.gz" -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/redis-8.2.11" -j2 MALLOC=libc
+          echo "MIO_TEST_REDIS_SERVER=$RUNNER_TEMP/redis-8.2.11/src/redis-server" >> "$GITHUB_ENV"
+      - run: pnpm check

@@ -1,0 +1,22 @@
+{
+  "name": "@mio/compute-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.9.0 <25"
+  },
+  "scripts": {
+    "build": "node -e \"const fs=require('node:fs');fs.mkdirSync('dist',{recursive:true});if(fs.lstatSync('dist').isSymbolicLink())throw new Error('BUILD_OUTPUT_SYMLINK');for(const name of fs.readdirSync('dist'))fs.rmSync('dist/'+name,{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@mio/compute-contracts": "workspace:*",
+    "amqplib": "2.2.1",
+    "cos-nodejs-sdk-v5": "3.0.0"
+  }
+}

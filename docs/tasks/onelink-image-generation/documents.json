@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/onelink-image-generation/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/onelink-image-generation/prd.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-image-generation/design.md",
+      "kind": "design",
+      "path": "docs/tasks/onelink-image-generation/design.md"
+    }
+  ]
+}

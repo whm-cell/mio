@@ -1,0 +1,86 @@
+{
+  "version": 5,
+  "prd": "docs/prd-ai-drama-foundation.md",
+  "results": [
+    {
+      "key": "auth-http-shared-primitives",
+      "title": "auth 与基础 HTTP 公共能力抽取",
+      "outcomes": "Foundation 与认证处理器共用响应头和包装错误序列化，认证前缀统一为一个常量，正文限制在认证处理器内局部命名。保留两域来源校验顺序、Content-Type、204、CORS、库响应原始状态和字节、多 Set-Cookie、可信身份及生命周期；完整处理器和域策略继续独立。",
+      "locations": [
+        {
+          "path": "src/http-response.ts",
+          "purpose": "startHttpResponse、writeApiError 共同响应原语"
+        },
+        {
+          "path": "src/auth/config.ts",
+          "purpose": "认证前缀与库选项"
+        },
+        {
+          "path": "src/auth/http.ts",
+          "purpose": "认证 HTTP 入口与原始库响应转发"
+        },
+        {
+          "path": "src/http.ts",
+          "purpose": "Foundation HTTP 实际消费者"
+        },
+        {
+          "path": "docs/apis/index.md",
+          "purpose": "公共能力与两域协议入口"
+        },
+        {
+          "path": "tests/auth.test.ts",
+          "purpose": "认证与响应语义回归"
+        }
+      ],
+      "verification": "原候选的本地 pnpm check 通过：171 项测试、构建及正式打包 DSH smoke。抽取前后同一判据的 16 项 HTTP/DB 测试均通过；使用隔离 PostgreSQL、真实 DSH 入口，以及受控上游响应验证多 Cookie 和原始字节转发。另有六类有界护栏试点、独立质量审查和规范对账。本次资料整理不重验这些历史结论。",
+      "limitations": "未补正文 16 KiB 精确边界和 10 秒超时的直接断言；受控响应试验不代表认证库自然场景均产生多个 Cookie。护栏试点不证明总体检测率或未来发现效率，AST 不证明语义复用。原观察包含 macOS /var 路径别名诊断误报，使用 canonical 路径规避，未扩修。没有真实浏览器、代理链/多实例容量、远端 CI、项目/生成或生产验收。",
+      "acceptance": {
+        "candidate": "c94684dbce33a9a00c52fa8c0f141a1ad861c4975d58be674d5a73fa38068c4b",
+        "statement": "接受这次 auth 和基础 HTTP 公共能力抽取的成果及已披露限制，按现有流程进入 complete，保留原 auth 已完成的成果与证据。",
+        "reference": "2026-11-08当前会话用户对上轮已交回auth-http-shared-primitives及其披露限制的明确接受和complete指令"
+      }
+    },
+    {
+      "key": "auth-registration-foundation",
+      "title": "邮箱密码注册、持久会话与可信身份底座",
+      "outcomes": "完成服务端邮箱密码自助注册/登录、持久会话与撤销、密码更新及可信 /me 身份入口。固定 Origin、方法、正文和 Cookie 边界，提供显式迁移与插件连接释放，区分服务 token 和用户身份；首期自助注册即可登录，不验证邮箱。",
+      "locations": [
+        {
+          "path": "src/auth/service.ts",
+          "purpose": "持久认证、可信身份与数据库生命周期"
+        },
+        {
+          "path": "src/auth/http.ts",
+          "purpose": "认证 HTTP 与 Cookie 边界"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "插件装配、路由和释放入口"
+        },
+        {
+          "path": "scripts/service/migrate-auth.ts",
+          "purpose": "显式认证迁移"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "认证配置与模块职责"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "现行认证 HTTP 契约"
+        },
+        {
+          "path": "tests/auth.test.ts",
+          "purpose": "认证真实入口回归"
+        }
+      ],
+      "verification": "原候选记录了 10 项真实 PostgreSQL/DSH 认证测试、121 项完整检查、构建和正式打包 smoke，并执行增量质量审查及旧独立审查适用性核对。覆盖注册、会话持久化和失效、密码更新/撤销、跨账号隔离、方法/Origin/正文边界、迁移、事务和装卸连接释放。本次仅整理既有接受事实，不表示当前代码重新验收。",
+      "limitations": "仅接受本地认证基础切片。没有真实浏览器、邮箱所有权/邮件、团队/多租户、项目 CRUD、生成、代理链/多实例容量、远端 CI 或生产证据，不表示 S0 或整份 PRD 完成。公共记录不保存详细证据或可恢复代码。",
+      "acceptance": {
+        "candidate": "54b01395a4f817c1ca00af268c97f27a297df1abb14ec43d8fe55127e81eb18a",
+        "statement": "接受认证底座并执行 complete",
+        "reference": "2026-11-07 当前会话用户对认证底座候选54b01395a4f8及公共报告/10项DB-DSH测试、121项完整检查和限制的接受答复（request_user_input_async问题call_xl8u7X194vIy2jBtkeal7Vzt第0项）。"
+      }
+    }
+  ]
+}

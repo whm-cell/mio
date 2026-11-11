@@ -1,0 +1,120 @@
+{
+  "name": "@mio/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mio TypeScript service foundation for DeepSeek Harness",
+  "type": "module",
+  "packageManager": "pnpm@11.6.0",
+  "engines": {
+    "node": ">=24.9.0 <25",
+    "dsh": "0.2.2-rc.1"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    },
+    "./package.json": "./package.json",
+    "./kernel": {
+      "types": "./dist/dsh/kernel.d.ts",
+      "default": "./dist/dsh/kernel.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "AGENTS.md",
+    "docs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p contracts/compute/tsconfig.build.json && node scripts/service/build.ts && pnpm --filter @mio/compute-worker build",
+    "typecheck": "tsc -p contracts/compute/tsconfig.build.json && tsc --noEmit && tsc -p compute/tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "guard": "node scripts/harness/check-guardrails.ts",
+    "work": "node scripts/harness/work/cli.ts",
+    "test": "vitest run",
+    "test:smoke": "node scripts/service/smoke.ts",
+    "profile:prepare": "node scripts/service/prepare-profile.ts",
+    "auth:migrate": "node scripts/service/migrate-auth.ts",
+    "conversations:migrate": "node scripts/service/migrate-conversations.ts",
+    "assets:migrate": "node scripts/service/migrate-assets.ts",
+    "compute:migrate": "node scripts/service/migrate-compute.ts",
+    "providers:migrate": "node scripts/service/migrate-providers.ts",
+    "providers:adapt": "node scripts/service/import-provider-adaptation.ts",
+    "env:init": "node scripts/service/local.ts dev init && node scripts/service/local.ts test init",
+    "infra:up:dev": "node scripts/service/local.ts dev infra up",
+    "infra:up:test": "node scripts/service/local.ts test infra up",
+    "infra:status:dev": "node scripts/service/local.ts dev infra status",
+    "infra:status:test": "node scripts/service/local.ts test infra status",
+    "infra:stop:dev": "node scripts/service/local.ts dev infra stop",
+    "infra:stop:test": "node scripts/service/local.ts test infra stop",
+    "broker:init:dev": "node scripts/service/local.ts dev broker-init",
+    "broker:init:test": "node scripts/service/local.ts test broker-init",
+    "compute:init:dev": "node scripts/service/local.ts dev compute init",
+    "compute:init:test": "node scripts/service/local.ts test compute init",
+    "compute:start:dev": "node scripts/service/local.ts dev compute start",
+    "compute:start:test": "node scripts/service/local.ts test compute start",
+    "migrate:dev": "node scripts/service/local.ts dev migrate",
+    "migrate:test": "node scripts/service/local.ts test migrate",
+    "start": "node scripts/service/local.ts dev start",
+    "start:dev": "node scripts/service/local.ts dev start",
+    "start:test": "node scripts/service/local.ts test start",
+    "check:local": "node scripts/service/local.ts test check",
+    "check": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm test && pnpm build && pnpm test:smoke"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.1.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-agent-loop": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-authorization": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-fs": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-launch-environment": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm-deepseek-api-key": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-query": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-timeout": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@mio/compute-contracts": "workspace:*",
+    "@redis/client": "6.2.1",
+    "amqplib": "2.2.1",
+    "better-auth": "1.7.18",
+    "cos-nodejs-sdk-v5": "3.0.0",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh": "0.2.2-rc.1",
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "eslint": "10.14.0",
+    "prettier": "3.9.10",
+    "remark-parse": "11.0.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "unified": "11.0.5",
+    "vitest": "4.1.11"
+  }
+}

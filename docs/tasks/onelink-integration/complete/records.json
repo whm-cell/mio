@@ -1,0 +1,70 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-integration/prd.md",
+  "results": [
+    {
+      "key": "onelink-user-chat",
+      "title": "可扩展模型路由与默认文本闭环",
+      "locations": [
+        {
+          "path": "docs/tasks/onelink-integration/prd.md",
+          "purpose": "W2本期验收与Messages后续启动条件"
+        },
+        {
+          "path": "docs/tasks/conversation-service/prd.md",
+          "purpose": "保留D1/D2接受并说明W2增量验收边界"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "已有协议统一路由/编码/注册与未知profile拒绝，复用可信请求绑定"
+        },
+        {
+          "path": "tests/onelink/profile.test.ts",
+          "purpose": "多个新增精确ID的动态发现、声明、两轮出站与持久化版本回归"
+        },
+        {
+          "path": "tests/conversations-live.ts",
+          "purpose": "显式授权的正式用户API真实文本验收入口"
+        }
+      ],
+      "outcomes": "沿原W2保留本人可信绑定、冻结版本、官方DSH/公开PiAi编码、回执/历史/取消恢复，集中已有两协议的wire选择与注册，消除未知profile隐式走OpenAI的分支。进程启动后新发现的兼容型号可通过受控声明复用现有调用链，稳定身份与精确model/endpoint保持；未声明型号和未实现协议不出站。当前默认deepseek-v4.1-flash已完成正式用户API真实文本闭环。Claude/Messages进一步适配和真实验收已从本期必需判据移为后续条件，既有两协议确定性要求保留。",
+      "verification": "2026-11-10当前W2候选完整pnpm check通过：24文件380项及格式/类型/lint/AST/构建/正式打包smoke。新增3个随机可适配ID复用两协议、1个pending ID不出站，六次精确出站和PG modelKey/版本断言通过。真实DeepSeek当前目录内默认会话完成两轮上下文、16个SSE文本帧、对应completed/completed/cancelled终态、历史及重启no replay；保存脱敏provider request ID、usage/finish及取消unknown。gpt-6.1-sol/max独立代码审阅、规范三方对账、质量和护栏反例观察通过，10项当前判据齐备。",
+      "limitations": "Claude/Messages真实适配与验收仍未完成，后续需当前目录内可靠代表且明确启动；本次两协议fixture回归不替代其真实验收。只验证当前账号DeepSeek代表，不能保证全部85项/未来模型参数兼容。供应商费用未知、取消usage未知，不保证取消零收费；原跨存储unknown/无自动重发及容量限制保持。D1/D2旧接受、旧失败与旧证据原样保留，本地隔离验证不等同生产部署/迁移或远端门禁；未提交、推送、发布。",
+      "acceptance": {
+        "candidate": "181315a9143f591f91fcba94f2625d6e12547c07eee635f9facf519c1dde4bbe",
+        "statement": "用户接受本次W1/W2交付结果及已披露限制，要求沿原任务进入complete并保留旧证据；Claude/Messages继续作为后续条件项单独pending，暂不提交发布。本记录仅完成本期W2默认文本与已实现协议扩展范围。",
+        "reference": "2026-11-10当前对话用户明确指令：“接受本次 W1/W2 的交付结果及已披露限制，沿原任务进入 complete，保留旧证据；Claude/Messages 继续作为后续条件项单独 pending，暂不提交发布。”"
+      }
+    },
+    {
+      "key": "onelink-user-provider-catalog",
+      "title": "动态模型目录与受控适配扩展",
+      "locations": [
+        {
+          "path": "docs/tasks/onelink-integration/prd.md",
+          "purpose": "本期模型扩展、W1/W2验收与Messages后续条件的原PRD"
+        },
+        {
+          "path": "src/providers/catalog.ts",
+          "purpose": "稳定目录投影与严格部署声明准入"
+        },
+        {
+          "path": "src/providers/service.ts",
+          "purpose": "当前成员/偏好资格与冻结版本选择"
+        },
+        {
+          "path": "tests/onelink/profile.test.ts",
+          "purpose": "运行中回扫新增多个精确ID并复用已有协议的完整用户链回归"
+        }
+      ],
+      "outcomes": "沿原W1保留本人凭据、动态成员、稳定身份/偏好和版本隔离，补齐新型号水平扩展的完整链证据。已有协议的新精确ID通过目录发现与有来源受控声明接入，不维护生产型号白名单、不按型号名称猜协议。部署profile严格要求字符串，未知/未实现项拒绝且不出站。原PRD和现行规范同步本期/后续边界，Claude/Messages进一步适配和真实验收后移，现有实现和确定性测试保留。",
+      "verification": "2026-11-10当前W1候选完整pnpm check通过：24文件380项、格式/类型/lint/AST、构建及正式打包smoke。隔离PG和用户/Profile真实目录发现85项，精确deepseek-v4.1-flash当前默认可见，持久化/重启解密通过。新增随机ID、大小写身份、声明前拒绝和已实现两协议各型号两轮调用回归通过。gpt-6.1-sol/max独立代码审阅及规范三方对账、主控算法/未使用接口/复用和护栏反例观察均通过，8项当前判据齐备。",
+      "limitations": "目录85项只代表当前账号发现，不能等同所有模型适配或实测。新参数语义/新协议仍需有依据的局部实现及验证；Claude/Messages真实项后续单列，历史pending/失败与旧候选证据原样保留。W1目录命令不验证生成；真实DeepSeek对话另属W2。D1/D2及其他旧接受不重开。验证在本地隔离环境，未验证生产容量/迁移或远端门禁，未提交、推送、发布。",
+      "acceptance": {
+        "candidate": "ee8846619b38a0991fcc6014cf053ac46df882e82d1b6e6ae6647d2ffd1462ea",
+        "statement": "用户接受本次W1/W2交付结果及已披露限制，要求沿原任务complete并保留旧证据；Claude/Messages继续作为后续条件项单独pending，暂不提交发布。本次W1收尾候选仅新增已接受W2公共记录作为输入，结果全部字段与用户已接受原草稿一致，已补当前候选完整检查、目录验证及增量独立审阅。",
+        "reference": "2026-11-10当前对话用户明确指令：“接受本次 W1/W2 的交付结果及已披露限制，沿原任务进入 complete，保留旧证据；Claude/Messages 继续作为后续条件项单独 pending，暂不提交发布。”；同次收尾仅对新增兄弟接受记录续验，未改变所接受能力及限制。"
+      }
+    }
+  ]
+}

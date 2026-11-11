@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/prd-ai-drama-foundation.md",
+      "kind": "prd",
+      "path": "docs/tasks/ai-drama-foundation/prd.md"
+    },
+    {
+      "identity": "docs/architecture-ai-drama-foundation.md",
+      "kind": "design",
+      "path": "docs/tasks/ai-drama-foundation/design.md"
+    }
+  ]
+}

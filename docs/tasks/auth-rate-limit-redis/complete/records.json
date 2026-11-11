@@ -1,0 +1,44 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/auth-rate-limit-redis/prd.md",
+  "results": [
+    {
+      "key": "auth-rate-limit-redis",
+      "title": "公共 Redis 接入与兼容认证限流",
+      "locations": [
+        {
+          "path": "src/integrations/redis.ts",
+          "purpose": "固定客户端、配置、总期限、失败分型与有界资源释放"
+        },
+        {
+          "path": "src/auth/rate-limit.ts",
+          "purpose": "公开consume的单键原子计数和真实启动探测"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "数据库默认/显式Redis装配与生命周期注入"
+        },
+        {
+          "path": "docs/integrations/redis.md",
+          "purpose": "资源、版本、权限、未知结果与验证约束的现行契约"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "认证后端、PG兼容、计数及人工恢复步骤"
+        },
+        {
+          "path": "tests/auth-redis.test.ts",
+          "purpose": "九规则、有效业务副作用、共享PG及真实Profile切换恢复回退验证"
+        }
+      ],
+      "outcomes": "提供项目级最小Redis资源与首个认证限流完整切片，固定@redis/client6.2.1/Redis8.2.11；默认database，显式redis经公开consume原子消费，保留九条规则、原429/重试头和PG账号会话/迁移模型。未知/断连503并停止消费，无自动降级或重放；连接探测、消费和关闭有界。必要公共规范及AST边界齐备，真实存量计数、旧cookie与撤销状态完成受控正切、状态丢失恢复和回退。",
+      "verification": "当前候选在HEAD5603f28对应工作区执行pnpm work documents及完整pnpm check：11文件251/251、格式/类型/lint/guard/build及正式打包DSH Profile smoke通过。实际Node24.22.2、PG14.18 Homebrew独占共享*_test库、Redis8.2.11及客户端6.2.1；SQL正控制DB限流2/Redis0，账号会话5/5。三次分别真实等待至少65秒，每次中断约65.5秒；未知保持停止、原账号及撤销状态保留。后续护栏/PRD事实变化已对账，R1行为/范围/限制与用户接受结果等价；quality/norms及有界独立复核通过，历史失败与旧精确期限样本按适用边界保留。",
+      "limitations": "仅限定本地R1；没有真实环境部署、远端CI/分支保护、浏览器、任意代理链、多实例或生产容量/性能SLA证据。独占noeviction资源、禁止带流量篡改以及操作者排清/65秒等待是成立前提，无自动恢复控制面或任意宿主写入沙箱。按用户指令暂不部署，不启动R2；complete不表示生产发布或整份PRD及后续业务完成。",
+      "acceptance": {
+        "candidate": "ac1a53cba2296ea08b8755c137906ef872b254ac05311e8492107cbf4b249f39",
+        "statement": "接受这次 Redis R1 的交付结果，进入 complete，暂不部署。",
+        "reference": "2026-11-08 当前对话用户在知悉后续公共护栏HEAD漂移、需Agent对账后，明确说：接受这次 Redis R1 的交付结果，进入 complete，暂不部署。当前候选经差异核对、完整检查和有界独立复核，与其接受的R1行为、范围和限制等价；依据这次真实接受完成登记，不声称用户人工逐行审阅新候选，不包含部署、提交、推送或R2授权。"
+      }
+    }
+  ]
+}

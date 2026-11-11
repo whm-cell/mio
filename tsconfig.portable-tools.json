@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "rootDir": ".", "outDir": "dist/tools", "declaration": false },
+  "include": [
+    "scripts/service/migrate-auth.ts",
+    "scripts/service/migrate-assets.ts",
+    "scripts/service/migrate-compute.ts",
+    "scripts/service/prepare-profile.ts"
+  ]
+}

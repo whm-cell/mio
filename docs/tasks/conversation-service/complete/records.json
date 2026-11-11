@@ -1,0 +1,78 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/conversation-service/prd.md",
+  "results": [
+    {
+      "key": "conversation-kernel",
+      "title": "受控 DSH 内核、多轮与原生持久化边界",
+      "locations": [
+        {
+          "path": "src/dsh/kernel.ts",
+          "purpose": "固定公开Agent/Session、恢复屏障与所有者生命周期"
+        },
+        {
+          "path": "src/dsh/policy.ts",
+          "purpose": "根与Agent作用域的单调工具拒绝"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "独立正式Profile中的服务装配与关闭"
+        },
+        {
+          "path": "docs/integrations/dsh.md",
+          "purpose": "持久化、恢复和装配边界规范"
+        },
+        {
+          "path": "tests/kernel.test.ts",
+          "purpose": "多轮、取消、SIGKILL、损坏和工具执行反例"
+        }
+      ],
+      "outcomes": "完成原D1受控内核交付与集中核验：官方loop多轮及上下文、真实JSONL持久前缀、取消/关闭、恢复清除旧输入和工具全拒绝；不维护第二loop或消息真相。沿用户对原D1/D2结果及已披露限制的真实接受收口，保留现有两测试补证、旧原件和原草稿；本次仅同步五处接受状态及D2兄弟成果输入。",
+      "verification": "当前候选8/8必需项通过；因D2成果输入及状态文档变化重跑内核10项、内核/工具14项、正式打包Profile和pnpm check（24文件376测试，格式/类型/lint/AST护栏/构建/smoke）。Node24.22.2、PG14.18临时集群、Redis8.2.11独占实例。gpt-6.1-sol/max增量独立审阅无支持充分阻断问题；质量及两PRD/8页规范/相关接受事实对账原件已登记。本次没有新增真实模型调用。",
+      "limitations": "仅本地内核切片；确定性模型不代替真实供应商或D2公共API。SIGKILL/损坏/屏障反例不保证任意崩溃零丢失；精确历史仍全日志读取。D2保留其独立接受和原失败/未知；W1/W2仍分别待接受，Messages真实验收继续单独pending。未提交、推送、部署，未取得远端CI或生产验收。",
+      "acceptance": {
+        "candidate": "0fa0419758aefda36c2c18ff4abc4f8225efb8311bb97e8c9ae159fabe41d0dc",
+        "statement": "接受这次 D1/D2 的交付结果及已披露限制，沿原任务进入 complete，保留旧证据；W2 Messages 继续单独 pending，暂不提交发布。",
+        "reference": "2026-11-09当前对话用户明确接受本次D1/D2交付结果和已披露限制、要求沿原任务complete并保留旧证据、W2 Messages单独pending、暂不提交发布。其已审原D1候选c9e9794211c0fb1c8a8b9a7cf90f8f6e76f8d7d651eddb07246e4b053779e8af和草稿7fa892d72d63c2497fa5e4df2600903b32dbe35fd505bdec5750f251d686c0d3原样备份保留。执行该接受时D2完成新增兄弟成果输入，并仅同步五处公共接受状态，形成当前候选0fa0419758aefda36c2c18ff4abc4f8225efb8311bb97e8c9ae159fabe41d0dc；运行时代码和原两测试字节未变，原8项判据已同候选重验，gpt-6.1-sol/max独立增量复核通过。当前草稿cec1474bc239079af46b1eb3db52677fb27495e047c40a1a3815375f542d4f98仅合入上述完成登记所需状态及验证事实，接受来源仍是本次用户原话，不另造接受。"
+      }
+    },
+    {
+      "key": "conversation-service",
+      "title": "用户归属的本地对话 API 与真实默认文本闭环",
+      "locations": [
+        {
+          "path": "src/conversations/http.ts",
+          "purpose": "登录用户的创建/列表/历史/发送/回执/SSE/取消入口"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "归属、接收去重、取消与关闭的业务协调"
+        },
+        {
+          "path": "src/conversations/store.ts",
+          "purpose": "PG映射、原请求回执、unknown对账与本地实例租约"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "官方Agent/Session/原生持久化适配"
+        },
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "公开输入/输出、错误、流和恢复契约"
+        },
+        {
+          "path": "tests/conversations-live.ts",
+          "purpose": "目录内精确模型的独立真实多轮/SSE终态/取消/重启验收"
+        }
+      ],
+      "outcomes": "完成原D2 A1–A6集中核验：用户归属的对话API、官方多轮与原生历史、幂等回执、流式/取消/失效和正常及强制重启；消费W1/W2动态成员、一次绑定和fresh版本快照，旧回执优先、新资格失效不收费受理。补齐创建三个局部失败、损坏公开历史以及真实SSE终态证据。",
+      "verification": "当前候选9/9必需项通过，D1实际可取得并独立核验8/8。四自动判据26/28/39/9项通过；完整pnpm check为24文件376测试及格式/类型/lint/AST护栏/构建/正式smoke通过。独立gpt-6.1-sol/max审阅无支持充分缺陷；质量及两PRD/17规范/3旧接受论证登记。正式Profile真实目录内deepseek-v4.1-flash完成两轮、13个SSE文本帧和completed/completed/cancelled一致终态；三请求各一次观察，历史、取消与重启去重通过。",
+      "limitations": "本地测试范围，非生产接受；PG14.18临时集群、Redis8.2.11独占进程。首批取消环节失败保留、根因未知，补安全诊断后一次新批次通过，不代表可靠性统计或运行时缺陷已修复；费用和取消usage未知。W2 Messages仍待独立真实代表补验。全日志读取、跨存储unknown与租约非分布式fencing限制保留；无任意崩溃零丢失、共享/生产迁移、浏览器、远端CI证据。未提交、推送、发布或取得人类接受。",
+      "acceptance": {
+        "candidate": "e38253457a7ff04bfcfff81f514771270946b3d4c0f42341055beda230534f8c",
+        "statement": "接受这次 D1/D2 的交付结果及已披露限制，沿原任务进入 complete，保留旧证据；W2 Messages 继续单独 pending，暂不提交发布。",
+        "reference": "2026-11-09当前对话用户在收到原D1 8/8、原D2 9/9待接受草稿及真实补跑/首批失败未知、W2 Messages pending等限制后明确接受D1/D2并要求complete；本项为conversation-service，候选e38253457a7ff04bfcfff81f514771270946b3d4c0f42341055beda230534f8c，原草稿74a29251530acc24835511d7933e0051969f730f00f9e2826452f1b6bb5f2de7。"
+      }
+    }
+  ]
+}

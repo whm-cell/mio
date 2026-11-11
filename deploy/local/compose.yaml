@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mio_admin
+      POSTGRES_PASSWORD: ${MIO_LOCAL_POSTGRES_PASSWORD:?Run pnpm env:init}
+      POSTGRES_DB: mio_${MIO_ENVIRONMENT:?Select dev or test}
+      MIO_ENVIRONMENT: ${MIO_ENVIRONMENT}
+      MIO_LOCAL_DATABASE_PASSWORD: ${MIO_LOCAL_DATABASE_PASSWORD:?Set application password}
+      MIO_LOCAL_REGRESSION_PASSWORD: ${MIO_LOCAL_REGRESSION_PASSWORD:-}
+    ports:
+      - '127.0.0.1:${MIO_LOCAL_POSTGRES_PORT:?Set PostgreSQL port}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/001-mio.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U mio_admin -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 512m
+  redis:
+    image: redis:8.2.11@sha256:b0b01167ff47bc3868e56a967895a26be4230891a1f42a78ab61cdd227accc8d
+    restart: unless-stopped
+    user: redis
+    command: ['sh', '/usr/local/etc/redis/mio-start.sh']
+    environment:
+      MIO_REDIS_NAMESPACE: ${MIO_REDIS_NAMESPACE:?Set Redis namespace}
+      MIO_LOCAL_REDIS_PASSWORD: ${MIO_LOCAL_REDIS_PASSWORD:?Set Redis password}
+    ports:
+      - '127.0.0.1:${MIO_LOCAL_REDIS_PORT:?Set Redis port}:6379'
+    volumes:
+      - redis-data:/data
+      - ./redis-start.sh:/usr/local/etc/redis/mio-start.sh:ro
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'REDISCLI_AUTH="$$MIO_LOCAL_REDIS_PASSWORD" redis-cli --user mio ping | grep -qx PONG',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+  rabbitmq:
+    image: rabbitmq:4.4.0-management@sha256:af6f50d38098d8bd52fef7f3fa85015dd8b2bf6def58e995bf584ae9ba0f6407
+    hostname: mio-${MIO_ENVIRONMENT}-rabbitmq
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 1g
+    environment:
+      RABBITMQ_DEFAULT_USER: mio-${MIO_ENVIRONMENT}-admin
+      RABBITMQ_DEFAULT_PASS: ${MIO_LOCAL_RABBITMQ_PASSWORD:?Run pnpm env:init}
+      RABBITMQ_DEFAULT_VHOST: mio-${MIO_ENVIRONMENT}
+    ports:
+      - '127.0.0.1:${MIO_LOCAL_RABBITMQ_PORT:?Set AMQP port}:5672'
+      - '127.0.0.1:${MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT:?Set management port}:15672'
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ../rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_local_alarms && rabbitmq-diagnostics -q check_port_connectivity',
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:

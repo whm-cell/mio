@@ -1,0 +1,31 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.4.0-management@sha256:af6f50d38098d8bd52fef7f3fa85015dd8b2bf6def58e995bf584ae9ba0f6407
+    hostname: mio-compute-rabbitmq
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 1g
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set a private RabbitMQ user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set a private RabbitMQ password}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:?Set a private RabbitMQ vhost}
+    ports:
+      - '127.0.0.1:${RABBITMQ_AMQP_PORT:?Set an available local AMQP port}:5672'
+      - '127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:?Set an available local management port}:15672'
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  rabbitmq-data:

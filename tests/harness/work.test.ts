@@ -141,8 +141,14 @@ it.each(['checks', 'verification'])(
     );
     verifying(root);
     expect(invoke(root, ['run', 'probe', criterion, '--', ...command]).status).toBe(1);
+    expect((await state(root)).plan.nextAction).toBe(
+      `Review ${criterion} (fail), current originals and remaining gaps; The task declares no development result; return verified maintenance and archive when appropriate.`,
+    );
     expect(invoke(root, ['run', 'probe', criterion, '--', process.execPath, '-e', '']).status).toBe(
       0,
+    );
+    expect((await state(root)).plan.nextAction).toBe(
+      'Review the supplemental observation and the declared complete check; a passing probe cannot replace complete verification or clear failures.',
     );
     const result = JSON.parse(invoke(root, ['check', 'probe']).output);
     expect(
@@ -561,12 +567,14 @@ it('never turns cancellation into a pass even when the child handles SIGTERM by 
   }
 });
 
-it.skipIf(process.platform === 'win32')(
-  'retains occupancy when a same-group descendant outlives its cancelled leader',
-  async () => {
+it.skipIf(process.platform === 'win32').each([false, true])(
+  'retains occupancy when a same-group descendant outlives its cancelled leader (input changed: %s)',
+  async (inputChanged) => {
     const root = await fixture();
     await ready(root);
     expect(run(root).status).toBe(0);
+    const baseline = await state(root);
+    expect(baseline.evidence.at(-1)!.result).toBe('pass');
     const descendant =
       'const fs=require("node:fs");process.on("SIGTERM",()=>fs.writeFileSync(".work/signalled","yes"));setInterval(()=>console.log("late output"),20);fs.writeFileSync(".work/descendant","ready")';
     const script = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'inherit'});process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},100)`;
@@ -575,22 +583,31 @@ it.skipIf(process.platform === 'win32')(
     await expect
       .poll(() => readFile(join(root, '.work/descendant'), 'utf8').catch(() => ''))
       .toBe('ready');
+    if (inputChanged) await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
     running.child.kill('SIGTERM');
     const result = await running.finished;
     expect(result.status, result.output).toBe(1);
     expect(result.output).toContain('WORK_CHILD_ACTIVE');
     expect(await readFile(join(root, '.work/signalled'), 'utf8')).toBe('yes');
-    const evidence = (await state(root)).evidence.at(-1)!;
+    const task = await state(root);
+    const evidence = task.evidence.at(-1)!;
     expect(evidence.result).toBe('pending');
+    expect(evidence.summary).toContain(
+      `unsettled=true; contextChanged=${inputChanged}; coverage=supplement`,
+    );
+    expect(task.plan.nextAction).toBe(
+      'Confirm the execution group has stopped, inspect the provisional log, then recover the retained command marker before continuing.',
+    );
     const observation = JSON.parse(await readFile(join(root, evidence.artifact), 'utf8'));
     const length = (await readFile(join(root, observation.rawLog))).length;
     await expect
       .poll(async () => (await readFile(join(root, observation.rawLog))).length)
       .toBeGreaterThan(length);
+    if (inputChanged) await writeFile(join(root, 'src/value.ts'), 'export const value = 1;\n');
+    const check = JSON.parse(invoke(root, ['check', 'probe']).output);
+    expect(check.candidate).toBe(baseline.checkpoint!.candidate);
     expect(
-      JSON.parse(invoke(root, ['check', 'probe']).output).evidence.find(
-        (entry: { criterion: string }) => entry.criterion === 'checks',
-      ).result,
+      check.evidence.find((entry: { criterion: string }) => entry.criterion === 'checks').result,
     ).toBe('pending');
     expect(invoke(root, ['sync', 'probe', 'Do not clear an active group.']).output).toContain(
       'WORK_BUSY',
@@ -974,8 +991,15 @@ it('does not use verification to complete a failed phase transition and replaces
   expect(run(root).status).toBe(0);
   const after = await state(root);
   expect(after.plan.nextAction).not.toBe(before.plan.nextAction);
-  expect(after.plan.nextAction).toContain('Review checks (pass)');
+  expect(after.plan.nextAction).toBe(
+    'Review checks (pass), current originals and remaining gaps; The task declares no development result; return verified maintenance and archive when appropriate.',
+  );
   expect(after.checkpoint).toEqual(before.checkpoint);
+  expect(after).toMatchObject({
+    stage: 'C1_EVIDENCE_PENDING',
+    reviewDecision: 'PENDING',
+    releaseDisposition: 'HOLD_FOR_EVIDENCE',
+  });
   expect(invoke(root, ['archive', 'probe', 'Fixture maintenance completed.']).status).toBe(0);
   expect((await state(root)).plan.nextAction).toContain('Archived history');
 });
@@ -1100,7 +1124,7 @@ it('automatically creates a PRD subtask and resumes it after interruption withou
   expect(resumed.status, resumed.output).toBe(0);
   const continuation = JSON.parse(resumed.output);
   expect(continuation.task.id).toBe(id);
-  expect(continuation.task.nextAction).toContain('Change value to 2');
+  expect(continuation.task.nextAction).toBe('Change value to 2, then rerun the same criterion.');
   expect(continuation.revision).not.toBe(beforePause.revision);
   expect(await readFile(statePath(root, id), 'utf8')).toBe(saved);
   expect(invoke(root, ['ensure', '--stdin'], proposal()).output).toContain('WORK_CONFLICT');
@@ -1587,7 +1611,11 @@ it('captures new untracked scoped files and fails an otherwise successful check 
   );
   expect(outcome.status).toBe(1);
   expect(outcome.output).toContain('WORK_CONTEXT_CHANGED');
-  expect((await state(root)).evidence[0]!.result).toBe('pending');
+  const task = await state(root);
+  expect(task.evidence[0]!.result).toBe('pending');
+  expect(task.plan.nextAction).toBe(
+    'Inspect the observed input changes and current authorization before sync and verification of the resulting candidate.',
+  );
 });
 
 it('binds evidence to acceptance changes while allowing next-action updates without a new candidate', async () => {

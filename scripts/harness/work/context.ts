@@ -315,7 +315,7 @@ export async function assess(
   };
 }
 
-export function addEvidence(task: Task, entry: Evidence) {
+export function addEvidence(task: Task, entry: Evidence, nextAction?: string) {
   if (!task.checkpoint || entry.candidate !== task.checkpoint.candidate)
     throw new Error('WORK_EVIDENCE: checkpoint mismatch');
   task.evidence.push(entry);
@@ -323,8 +323,9 @@ export function addEvidence(task: Task, entry: Evidence) {
   task.releaseDisposition = 'HOLD_FOR_EVIDENCE';
   task.stage = 'C1_EVIDENCE_PENDING';
   task.plan.nextAction =
+    nextAction ??
     `Review ${entry.criterion} (${entry.result}), current originals and remaining gaps; ` +
-    (task.plan.result
-      ? 'when sufficient, prepare the candidate for actual acceptance.'
-      : 'The task declares no development result; return verified maintenance and archive when appropriate.');
+      (task.plan.result
+        ? 'when sufficient, prepare the candidate for actual acceptance.'
+        : 'The task declares no development result; return verified maintenance and archive when appropriate.');
 }

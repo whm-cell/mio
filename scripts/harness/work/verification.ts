@@ -112,18 +112,20 @@ export async function verify(root: string, id: string, criterionId: string, requ
     await mkdir(dirname(path), { recursive: true });
     const bytes = json(doc);
     await writeFile(path, bytes, { flag: 'wx' });
-    addEvidence(task, {
-      criterion: criterionId,
-      method: 'automated',
-      result: 'pass',
-      candidate: current.candidate,
-      artifact: relative,
-      sha256: digest(bytes),
-      environment: runtimeEnvironment(),
-      summary: `${doc.mode}; reviewed baseline and ${doc.runs.length} supplemental observations; no command executed by verify`,
-    });
-    task.plan.nextAction =
-      'Review remaining criteria and current originals; verification reuse does not grant human acceptance.';
+    addEvidence(
+      task,
+      {
+        criterion: criterionId,
+        method: 'automated',
+        result: 'pass',
+        candidate: current.candidate,
+        artifact: relative,
+        sha256: digest(bytes),
+        environment: runtimeEnvironment(),
+        summary: `${doc.mode}; reviewed baseline and ${doc.runs.length} supplemental observations; no command executed by verify`,
+      },
+      'Review remaining criteria and current originals; verification reuse does not grant human acceptance.',
+    );
     await saveTask(root, task, raw);
     return {
       result: 'pass',

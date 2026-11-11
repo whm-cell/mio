@@ -38,6 +38,9 @@ it('runs once for four different tasks and uses the same resolver for assessment
     expect(reused.status, reused.output).toBe(0);
     expect(check(root, id)).toMatchObject({ result: 'pass', basis: 'reuse' });
     const task = await state(root, id);
+    expect(task.plan.nextAction).toBe(
+      'Review remaining criteria and current originals; verification reuse does not grant human acceptance.',
+    );
     await observe(root, ref(id, task.evidence.at(-1)!));
     expect(await matchingEvidence(root, task, task.checkpoint!.candidate)).toHaveLength(1);
   }

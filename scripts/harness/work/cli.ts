@@ -462,25 +462,27 @@ async function main(activity?: CommandActivity) {
   if (task.evidence.at(-1) !== startEntry)
     throw new Error('WORK_RUN_SETTLEMENT: execution start is no longer the last observation');
   task.evidence.pop();
-  addEvidence(task, {
-    criterion: criterion.id,
-    method: 'automated',
-    result: changed || outcome.unsettled ? 'pending' : passed ? 'pass' : 'fail',
-    artifact: evidencePath,
-    sha256: digest(await readFile(await checkedPath(root, evidencePath))),
-    candidate: state.candidate,
-    summary: `exit ${outcome.status}; cancelled=${outcome.cancelled}; unsettled=${outcome.unsettled}; contextChanged=${changed}; coverage=${completeCheck ? 'complete' : 'supplement'}${contextError ? `; ${contextError}` : ''}`,
-    environment: environment(),
-  });
-  if (outcome.unsettled)
-    task.plan.nextAction =
-      'Confirm the execution group has stopped, inspect the provisional log, then recover the retained command marker before continuing.';
-  else if (changed)
-    task.plan.nextAction =
-      'Inspect the observed input changes and current authorization before sync and verification of the resulting candidate.';
-  else if (!completeCheck)
-    task.plan.nextAction =
-      'Review the supplemental observation and the declared complete check; a passing probe cannot replace complete verification or clear failures.';
+  const nextAction = outcome.unsettled
+    ? 'Confirm the execution group has stopped, inspect the provisional log, then recover the retained command marker before continuing.'
+    : changed
+      ? 'Inspect the observed input changes and current authorization before sync and verification of the resulting candidate.'
+      : !completeCheck
+        ? 'Review the supplemental observation and the declared complete check; a passing probe cannot replace complete verification or clear failures.'
+        : undefined;
+  addEvidence(
+    task,
+    {
+      criterion: criterion.id,
+      method: 'automated',
+      result: changed || outcome.unsettled ? 'pending' : passed ? 'pass' : 'fail',
+      artifact: evidencePath,
+      sha256: digest(await readFile(await checkedPath(root, evidencePath))),
+      candidate: state.candidate,
+      summary: `exit ${outcome.status}; cancelled=${outcome.cancelled}; unsettled=${outcome.unsettled}; contextChanged=${changed}; coverage=${completeCheck ? 'complete' : 'supplement'}${contextError ? `; ${contextError}` : ''}`,
+      environment: environment(),
+    },
+    nextAction,
+  );
   await saveTask(root, task, inFlight);
   console.log(
     `${completeCheck ? '' : 'SUPPLEMENTAL '}${passed ? 'PASS' : 'NOT PASSED'}: ${evidencePath}${changed ? '; WORK_CONTEXT_CHANGED during command' : ''}`,

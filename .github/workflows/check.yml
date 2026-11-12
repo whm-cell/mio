@@ -39,8 +39,6 @@ jobs:
           make -C "$RUNNER_TEMP/redis-8.2.11" -j2 MALLOC=libc
           echo "MIO_TEST_REDIS_SERVER=$RUNNER_TEMP/redis-8.2.11/src/redis-server" >> "$GITHUB_ENV"
       - name: Run checks
-        env:
-          VITEST_MAX_WORKERS: '2'
         run: |
           node -e 'console.log({node: process.version, availableParallelism: require("node:os").availableParallelism(), vitestMaxWorkers: process.env.VITEST_MAX_WORKERS})'
           pnpm check

@@ -42,7 +42,7 @@ Agent 依 [拆解与生命周期](coordination.md#开始任务) 从公共 PRD／
     "acceptance": [
       {
         "id": "checks",
-        "criterion": "完整检查通过",
+        "criterion": "取得覆盖 pnpm check 的当前有效结论",
         "method": "automated",
         "command": ["pnpm", "check"]
       }
@@ -57,7 +57,7 @@ Agent 依 [拆解与生命周期](coordination.md#开始任务) 从公共 PRD／
 
 requirement 由公共文档 source、实际章节 section 和 Agent 首次拆解选定的稳定 key 组成；key 用小写字母、数字、连字符或下划线，最多 80 字符。工具用 source＋key 生成 task ID，section 参与契约核对；新建须对应当前公共 Markdown 中唯一的真实标题文字，内联格式按 AST 读取，围栏里的假标题不算；标题可定位不证明需求语义正确，任务是否重复仍由实际审阅判断。不要因为换会话、改下一步或重试而更换 key；先 status 查询已有任务。续接可只传同一 requirement，返回原进度与证据，不创建替代目录或自动同步；不存在时须提供 plan.goal 才允许创建。已有任务中显式提交的 plan 字段不相同时报 WORK_CONFLICT，应查看原 context 后 update。
 
-plan 的目标、范围、授权和验收来自真实任务。scope 是允许写入的文件／目录；inputs 默认 package.json 与 harness.config.json，再补实际依赖；sources 只登记实际遵循的需求子文档，requirement.source 自动参与摘要。实施前明确验收目标及 automated／review／behavior 方法；automated 完整检查的 `command` argv 按[记录证据](#记录证据)在正式取证前确定。其余字段按需填，不复制空模板。示例不授予权限，工具不认证授权文本的来源。
+plan 的目标、范围、授权和验收来自真实任务。scope 是允许写入的文件／目录；inputs 默认 package.json 与 harness.config.json，再补实际依赖；sources 只登记实际遵循的需求子文档，requirement.source 自动参与摘要。实施前明确验收目标及 automated／review／behavior 方法；针对覆盖结论的验收，`criterion` 表达已确认的覆盖目标，automated 完整检查的 `command` argv 按[记录证据](#记录证据)在正式取证前确定，执行方式按[验证与接受](coordination.md#验证与接受)选择。其余字段按需填，不复制空模板。示例不授予权限，工具不认证授权文本的来源。
 
 首次 ensure 保存初始检查点，完整且无阻塞的契约进入 C0_READY；不完整的记录保持草稿。ensure 退出成功表示已创建或读取记录，能否执行仍需核对 assessment 并展开必要引用。Agent 确认授权和依赖后用 update 标记实施，不会为每轮会话另建记录。原有 v1 任务和 `.work/evidence` 不迁移、不删除；新 clone 从仓库内生成器落地本人目录。
 

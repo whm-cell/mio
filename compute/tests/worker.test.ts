@@ -81,6 +81,95 @@ afterEach(() => {
 });
 
 describe('worker journal and real ffmpeg', () => {
+  it.each([
+    ['expired', 2 * 60 * 60 * 1000, false],
+    ['remaining', 30 * 60 * 1000, true],
+  ] as const)(
+    'uses the persisted wall-clock budget for a %s received attempt after reopen',
+    async (_name, age, shouldDownload) => {
+      const root = directory();
+      const source = join(root, 'source');
+      writeFileSync(source, 'x');
+      const input = command(source);
+      let journal = new Journal(root, 'instance', true);
+      const now = Date.now();
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now - age);
+      try {
+        journal.accept(input);
+      } finally {
+        clock.mockRestore();
+      }
+      journal.close();
+      journal = new Journal(root, 'instance');
+      const download = vi.fn(async () => {
+        throw new Error('storage unavailable');
+      });
+      const events: ComputeResultV1[] = [];
+      const worker = new Worker(
+        journal,
+        { download, head: async () => null, verify: async () => false, upload: async () => {} },
+        {
+          publish: async (event) => {
+            events.push(event);
+          },
+        },
+        root,
+      );
+      const ack = vi.fn();
+      try {
+        await worker.handle(input, ack);
+        expect(download).toHaveBeenCalledTimes(shouldDownload ? 1 : 0);
+        expect(events.at(-1)).toMatchObject({
+          state: 'failed',
+          errorCode: shouldDownload ? 'STORAGE_FAILURE' : 'EXECUTION_TIMEOUT',
+        });
+        expect(ack).toHaveBeenCalledOnce();
+      } finally {
+        journal.close();
+      }
+    },
+  );
+
+  it('gives an old unknown upload a separate reconciliation window after reopen', async () => {
+    const root = directory();
+    const source = join(root, 'source');
+    writeFileSync(source, 'x');
+    const input = command(source);
+    let journal = new Journal(root, 'instance', true);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - 2 * 60 * 60 * 1000);
+    try {
+      journal.accept(input);
+    } finally {
+      clock.mockRestore();
+    }
+    journal.transition(input.attemptId, 'running');
+    journal.recordOutput(input.attemptId, 1, 'a'.repeat(64));
+    journal.transition(input.attemptId, 'unknown_upload');
+    journal.close();
+    journal = new Journal(root, 'instance');
+    const head = vi.fn(async (_key: string, signal: AbortSignal) => {
+      expect(signal.aborted).toBe(false);
+      return null;
+    });
+    const upload = vi.fn(async () => {
+      throw new Error('still unknown');
+    });
+    const worker = new Worker(
+      journal,
+      { download: async () => {}, head, verify: async () => false, upload },
+      { publish: async () => {} },
+      root,
+    );
+    try {
+      await worker.reconcileOne();
+      expect(head).toHaveBeenCalledOnce();
+      expect(upload).toHaveBeenCalledOnce();
+      expect(journal.get(input.attemptId)?.phase).toBe('unknown_upload');
+    } finally {
+      journal.close();
+    }
+  });
+
   it('commits WAL across a killed process and holds an exclusive lock while open', () => {
     const root = directory();
     const moduleUrl = new URL('../src/adapters/journal.ts', import.meta.url).href;

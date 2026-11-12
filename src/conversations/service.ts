@@ -1,4 +1,7 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
+import { createId } from '@mio/foundation/identifiers';
+import { sha256Utf8 } from '@mio/foundation/hash';
 import { ConversationError } from './contracts.ts';
 import type {
   Conversation,
@@ -10,6 +13,8 @@ import type {
 import type { ConversationStore } from './store.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
+
+const log = createLogger('app', 'conversations');
 
 /** Authorization and request ownership remain above the DSH adapter and below HTTP. */
 export function createConversationService(
@@ -33,7 +38,8 @@ export function createConversationService(
     }
   };
   const check = () => {
-    if (closing) throw new ConversationError(503, 'CONVERSATION_UNAVAILABLE');
+    if (closing)
+      throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNAVAILABLE');
   };
   const admit = <T>(work: () => Promise<T>): Promise<T> => {
     check();
@@ -50,23 +56,24 @@ export function createConversationService(
       return await work();
     } catch (error) {
       if (error instanceof ProviderError) throw new ConversationError(error.status, error.code);
-      throw new ConversationError(503, 'MODEL_UNAVAILABLE');
+      throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
     }
   };
   return {
     create(actor: Principal, modelRef?: string): Promise<Conversation> {
       return admit(async () => {
-        if (!providers && modelRef) throw new ConversationError(503, 'MODEL_UNAVAILABLE');
+        if (!providers && modelRef)
+          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
         const selection = providers
           ? await providerAction(() => providers.selectChat(actor, modelRef))
           : undefined;
-        const row = await store.create(actor, randomUUID(), selection);
+        const row = await store.create(actor, createId(), selection);
         try {
           await engine.create(row.dsh_session_id, selection);
           await store.setReady(row.id, true);
         } catch {
           await store.setReady(row.id, false).catch(() => {});
-          throw new ConversationError(503, 'CONVERSATION_UNKNOWN');
+          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNKNOWN');
         }
         return {
           id: row.id,
@@ -80,7 +87,7 @@ export function createConversationService(
       return admit(async () => {
         if (!providers) {
           await store.owned(actor, id);
-          throw new ConversationError(503, 'MODEL_UNAVAILABLE');
+          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
         }
         return store.bind(actor, id, modelRef, () =>
           providerAction(() => providers.selectChat(actor, modelRef)),
@@ -104,10 +111,11 @@ export function createConversationService(
       check();
       const key = `${id}:${requestId}`;
       const ownerKey = `${actor.userId}:${key}`;
-      const digest = createHash('sha256').update(text).digest('hex');
+      const digest = sha256Utf8(text);
       const existing = receiving.get(ownerKey);
       if (existing) {
-        if (existing.digest !== digest) throw new ConversationError(409, 'REQUEST_ID_CONFLICT');
+        if (existing.digest !== digest)
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
         return existing.job;
       }
       const job = admit(async () => {
@@ -116,11 +124,11 @@ export function createConversationService(
           received = await store.receive(actor, id, requestId, digest, async (row) => {
             if (providers) {
               if (!row.model_binding)
-                throw new ConversationError(409, 'CONVERSATION_MODEL_REQUIRED');
+                throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
               return providerAction(() => providers.resolveChat(actor, row.model_binding!));
             }
             if (row.model_binding || !engine.available)
-              throw new ConversationError(503, 'MODEL_UNAVAILABLE');
+              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
             return undefined;
           });
         } catch (error) {
@@ -168,7 +176,7 @@ export function createConversationService(
                             // The durable request observation remains authoritative if the separate provider DB is unavailable.
                             await providers!
                               .recordVerification(actor, received.snapshot!, `${id}:${requestId}`)
-                              .catch(() => console.error('PROVIDER_VERIFICATION_UNAVAILABLE'));
+                              .catch(() => log.error('PROVIDER_VERIFICATION_UNAVAILABLE'));
                           }
                         },
                       }

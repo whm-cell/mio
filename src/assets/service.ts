@@ -1,7 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
+import { createId } from '@mio/foundation/identifiers';
 import { AssetError, MAX_ASSET_BYTES } from './contracts.ts';
 import type { AssetObjectStore, AssetPrincipal } from './contracts.ts';
 import type { AssetRow, AssetStore } from './store.ts';
+
+const log = createLogger('app', 'assets');
 
 function view(row: AssetRow, objects: AssetObjectStore) {
   return {
@@ -30,7 +34,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
   let closing: Promise<void> | undefined;
   let stopping = false;
   const admit = <T>(work: () => Promise<T>): Promise<T> => {
-    if (stopping) throw new AssetError(503, 'ASSET_UNAVAILABLE');
+    if (stopping) throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
     const action = work();
     active.add(action);
     void action.then(
@@ -42,7 +46,8 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
   // The SDK does not expose cancellation for these calls. Stop waiting after the drain
   // deadline; a late copy has a unique key and cannot register through this operation.
   const waitObject = <T>(start: () => Promise<T>): Promise<T> => {
-    if (stop.signal.aborted) return Promise.reject(new AssetError(503, 'ASSET_UNAVAILABLE'));
+    if (stop.signal.aborted)
+      return Promise.reject(new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE'));
     return new Promise<T>((resolve, reject) => {
       const finish = () => {
         clearTimeout(deadline);
@@ -50,7 +55,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       };
       const abort = () => {
         finish();
-        reject(new AssetError(503, 'ASSET_UNAVAILABLE'));
+        reject(new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE'));
       };
       const deadline = setTimeout(() => {
         finish();
@@ -79,13 +84,13 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         if (stopping) break;
         try {
           if (row.staging_key !== `mio/staging/${row.id}`) {
-            console.error('ASSET_STAGING_KEY_INVALID');
+            log.error('ASSET_STAGING_KEY_INVALID');
             continue;
           }
           await waitObject(() => objects.delete(row.staging_key));
           await store.stagingDeleted(row.id, row.staging_key);
         } catch {
-          console.error('ASSET_STAGING_CLEANUP_FAILED');
+          log.error('ASSET_STAGING_CLEANUP_FAILED');
         }
       }
     })().finally(() => {
@@ -94,11 +99,11 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
     return cleanup;
   };
   const timer = setInterval(
-    () => void clean().catch(() => console.error('ASSET_CLEANUP_FAILED')),
+    () => void clean().catch(() => log.error('ASSET_CLEANUP_FAILED')),
     60_000,
   );
   timer.unref();
-  void clean().catch(() => console.error('ASSET_CLEANUP_FAILED'));
+  void clean().catch(() => log.error('ASSET_CLEANUP_FAILED'));
 
   return {
     create(actor: AssetPrincipal, filename: string, contentType: string, size: number) {
@@ -113,11 +118,13 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
           size < 1 ||
           size > MAX_ASSET_BYTES
         )
-          throw new AssetError(400, 'ASSET_INPUT_INVALID');
-        const id = randomUUID();
+          throw new AssetError(HTTP_STATUS.BAD_REQUEST, 'ASSET_INPUT_INVALID');
+        const id = createId();
         const row = await store.create(id, actor.userId, filename, contentType, size);
-        if (row.staging_key !== `mio/staging/${id}`) throw new AssetError(503, 'ASSET_UNAVAILABLE');
-        if (stop.signal.aborted) throw new AssetError(503, 'ASSET_UNAVAILABLE');
+        if (row.staging_key !== `mio/staging/${id}`)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+        if (stop.signal.aborted)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         return {
           assetId: id,
           uploadUrl: objects.uploadUrl(`mio/staging/${id}`, size),
@@ -128,58 +135,63 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
     get(actor: AssetPrincipal, id: string) {
       return admit(async () => {
         const row = await store.owned(id, actor.userId);
-        if (stop.signal.aborted) throw new AssetError(503, 'ASSET_UNAVAILABLE');
+        if (stop.signal.aborted)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         return view(row, objects);
       });
     },
     complete(actor: AssetPrincipal, id: string) {
       return admit(async () => {
         let row = await store.owned(id, actor.userId);
-        if (stop.signal.aborted) throw new AssetError(503, 'ASSET_UNAVAILABLE');
+        if (stop.signal.aborted)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         if (row.state === 'ready') return view(row, objects);
         if (row.state === 'expired' || row.upload_expired)
-          throw new AssetError(409, 'ASSET_EXPIRED');
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_EXPIRED');
         const stagingKey = `mio/staging/${id}`;
-        if (row.staging_key !== stagingKey) throw new AssetError(503, 'ASSET_UNAVAILABLE');
+        if (row.staging_key !== stagingKey)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         let head: { size: number; etag: string };
         try {
           head = await waitObject(() => objects.head(stagingKey));
         } catch (error) {
-          if (statusCode(error) === 404) throw new AssetError(409, 'ASSET_UPLOAD_NOT_FOUND');
-          throw new AssetError(503, 'ASSET_STORAGE_UNAVAILABLE');
+          if (statusCode(error) === 404)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_UPLOAD_NOT_FOUND');
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
         }
         if (head.size !== Number(row.size_bytes) || head.size > MAX_ASSET_BYTES)
-          throw new AssetError(409, 'ASSET_SIZE_MISMATCH');
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
         if (row.source_etag && row.source_etag !== head.etag)
-          throw new AssetError(409, 'ASSET_SOURCE_CHANGED');
-        const lease = randomUUID();
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+        const lease = createId();
         const claimed = await store.claim(id, actor.userId, head.etag, lease);
         if (!claimed) {
           row = await store.owned(id, actor.userId);
           if (row.state === 'ready') return view(row, objects);
           if (row.upload_expired || row.state === 'expired')
-            throw new AssetError(409, 'ASSET_EXPIRED');
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_EXPIRED');
           if (row.source_etag && row.source_etag !== head.etag)
-            throw new AssetError(409, 'ASSET_SOURCE_CHANGED');
-          throw new AssetError(409, 'ASSET_BUSY');
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_BUSY');
         }
         if (claimed.staging_key !== stagingKey) {
           await store.release(id, lease).catch(() => {});
-          throw new AssetError(503, 'ASSET_UNAVAILABLE');
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         }
-        const rawKey = `mio/raw/${id}/${randomUUID()}`;
+        const rawKey = `mio/raw/${id}/${createId()}`;
         try {
           await waitObject(() => objects.copy(stagingKey, rawKey, head.etag));
         } catch (error) {
           await store.release(id, lease).catch(() => {});
-          if (statusCode(error) === 412) throw new AssetError(409, 'ASSET_SOURCE_CHANGED');
-          throw new AssetError(503, 'ASSET_STORAGE_UNAVAILABLE');
+          if (statusCode(error) === 412)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
         }
         const saved = await store.commit(id, actor.userId, lease, rawKey);
         if (saved) return view(saved, objects);
         row = await store.owned(id, actor.userId);
         if (row.state === 'ready') return view(row, objects);
-        throw new AssetError(409, 'ASSET_FINALIZE_SUPERSEDED');
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_FINALIZE_SUPERSEDED');
       });
     },
     clean,

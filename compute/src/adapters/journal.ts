@@ -1,5 +1,6 @@
+import { epochMs } from '@mio/foundation/time';
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createId } from '@mio/foundation/identifiers';
 import {
   COMPUTE_MAX_MEDIA_BYTES,
   parseComputeCommandV1,
@@ -183,7 +184,7 @@ export class Journal {
       .prepare(
         'INSERT INTO attempts (attempt_id, command_id, command_json, phase, started_at) VALUES (?, ?, ?, ?, ?)',
       )
-      .run(command.attemptId, command.messageId, JSON.stringify(command), 'received', Date.now());
+      .run(command.attemptId, command.messageId, JSON.stringify(command), 'received', epochMs());
     const attempt = this.get(command.attemptId);
     if (!attempt) throw new Error('JOURNAL_WRITE_FAILED');
     return attempt;
@@ -299,7 +300,7 @@ export class Journal {
     const event: ComputeResultV1 = {
       version: 1,
       type: 'transcode.result',
-      messageId: randomUUID(),
+      messageId: createId(),
       commandId: command.messageId,
       jobId: command.jobId,
       attemptId,
@@ -312,7 +313,7 @@ export class Journal {
       this.#db.prepare("UPDATE attempts SET phase = 'failed' WHERE attempt_id = ?").run(attemptId);
       this.#db
         .prepare('INSERT INTO manual_resolutions VALUES (?, ?, ?)')
-        .run(attemptId, evidence, Date.now());
+        .run(attemptId, evidence, epochMs());
       this.#db
         .prepare('INSERT INTO events (message_id, attempt_id, body) VALUES (?, ?, ?)')
         .run(event.messageId, attemptId, JSON.stringify(event));

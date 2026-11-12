@@ -1,3 +1,4 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { ProviderError } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
@@ -59,6 +60,6 @@ export function decryptCredential(
     cipher.setAuthTag(envelope.auth_tag);
     return Buffer.concat([cipher.update(envelope.ciphertext), cipher.final()]).toString('utf8');
   } catch {
-    throw new ProviderError(503, 'PROVIDER_CREDENTIAL_UNAVAILABLE');
+    throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_CREDENTIAL_UNAVAILABLE');
   }
 }

@@ -171,6 +171,256 @@ async function fixture() {
   return root;
 }
 
+async function libraryFixture() {
+  const root = await fixture();
+  await json(root, 'harness.config.json', (config) => {
+    config.sourceRoots['packages/foundation/src'] = 'production';
+    config.generatedRoots.push('packages/foundation/dist', 'packages/foundation/node_modules');
+    config.configurationFiles.push(
+      'packages/foundation/package.json',
+      'packages/foundation/tsconfig.json',
+      'packages/foundation/tsconfig.build.json',
+    );
+    config.projects.foundation = {
+      kind: 'library',
+      packageRoot: 'packages/foundation',
+      sources: ['packages/foundation/src'],
+      typecheck: 'packages/foundation/tsconfig.json',
+      build: 'packages/foundation/tsconfig.build.json',
+      publicEntries: [{ source: 'packages/foundation/src/hash.ts', export: './hash' }],
+    };
+  });
+  await put(
+    root,
+    'packages/foundation/package.json',
+    JSON.stringify({
+      name: '@fixture/foundation',
+      type: 'module',
+      exports: { './hash': { types: './dist/hash.d.ts', default: './dist/hash.js' } },
+    }),
+  );
+  await put(
+    root,
+    'packages/foundation/tsconfig.json',
+    JSON.stringify({
+      extends: '../../tsconfig.json',
+      compilerOptions: { rootDir: 'src', outDir: 'dist' },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await put(
+    root,
+    'packages/foundation/tsconfig.build.json',
+    JSON.stringify({
+      extends: './tsconfig.json',
+      compilerOptions: { rootDir: 'src', outDir: 'dist', declaration: true },
+    }),
+  );
+  await put(root, 'packages/foundation/src/hash.ts', 'export const hash = 1;\n');
+  await put(root, 'packages/foundation/src/private.ts', 'export const hidden = 2;\n');
+  await symlink(
+    join(root, 'packages/foundation'),
+    join(root, 'node_modules/@fixture/foundation'),
+    'dir',
+  );
+  build(root, 'packages/foundation/tsconfig.build.json');
+  return root;
+}
+
+it('limits library consumers to public entries and prevents contract and library reverse dependencies', async () => {
+  const root = await libraryFixture();
+  await put(root, 'src/index.ts', "export { hash } from '@fixture/foundation/hash';\n");
+  expect(check(root).status).toBe(0);
+  await put(
+    root,
+    'src/index.ts',
+    "export type { hash } from '../packages/foundation/src/hash.ts';\n",
+  );
+  expect(check(root).status).toBe(0);
+  await json(root, 'tsconfig.json', (config) => {
+    config.compilerOptions.paths = { '@private': ['./packages/foundation/src/private.ts'] };
+  });
+  await put(root, 'src/index.ts', "export type { hidden } from '@private';\n");
+  expect(check(root).output).toContain('PROJECT_DEPENDENCY src/index.ts');
+  await put(
+    root,
+    'src/index.ts',
+    "export const load = () => import('../packages/foundation/src/private.ts');\n",
+  );
+  expect(check(root).output).toContain('PROJECT_DEPENDENCY src/index.ts');
+  await put(root, 'src/index.ts', 'export const app = 1;\n');
+  await put(
+    root,
+    'contracts/compute/src/index.ts',
+    "export type { hash } from '../../../packages/foundation/src/hash.ts';\n",
+  );
+  expect(check(root).output).toContain('PROJECT_DEPENDENCY contracts/compute/src/index.ts');
+  await put(root, 'contracts/compute/src/index.ts', 'export const contract = 1;\n');
+  await put(
+    root,
+    'packages/foundation/src/private.ts',
+    "export const fs = process.getBuiltinModule('node:fs');\n",
+  );
+  expect(check(root).output).toContain('LIBRARY_DEPENDENCY packages/foundation/src/private.ts');
+  await put(
+    root,
+    'packages/foundation/src/private.ts',
+    "export * from '../../../src/private.ts';\n",
+  );
+  expect(check(root).output).toContain('LIBRARY_DEPENDENCY packages/foundation/src/private.ts');
+  await put(root, 'packages/foundation/src/private.ts', "export * from 'node:crypto';\n");
+  expect(check(root).output).not.toContain('LIBRARY_DEPENDENCY packages/foundation/src/private.ts');
+  await put(root, 'packages/foundation/src/private.ts', "export * from 'crypto';\n");
+  expect(check(root).output).toContain('LIBRARY_DEPENDENCY packages/foundation/src/private.ts');
+  await put(
+    root,
+    'packages/foundation/src/private.ts',
+    "const { getBuiltinModule: load } = globalThis.process; export const fs = load('node:fs');\n",
+  );
+  expect(check(root).output).toContain('DYNAMIC_BUILTIN packages/foundation/src/private.ts');
+});
+
+it('rejects a library dependency on its own stale build output while allowing source and package entries', async () => {
+  const root = await libraryFixture();
+  await put(root, 'src/index.ts', "export { hash } from '@fixture/foundation/hash';\n");
+  await put(root, 'packages/foundation/src/private.ts', "export { hash } from './hash.ts';\n");
+  expect(check(root).status).toBe(0);
+  await put(
+    root,
+    'packages/foundation/src/private.ts',
+    "export { hash } from '@fixture/foundation/hash';\n",
+  );
+  expect(check(root).status).toBe(0);
+  for (const source of [
+    "export { hash } from '../dist/hash.js';\n",
+    "export type { hash } from '../dist/hash.js';\n",
+    "export const load = () => import('../dist/hash.js');\n",
+  ]) {
+    await put(root, 'packages/foundation/src/private.ts', source);
+    expect(check(root).output, source).toContain(
+      'LIBRARY_BUILD_OUTPUT packages/foundation/src/private.ts',
+    );
+  }
+  await json(root, 'packages/foundation/tsconfig.json', (config) => {
+    config.compilerOptions = { paths: { '@stale': ['./dist/hash.d.ts'] } };
+  });
+  await put(root, 'packages/foundation/src/private.ts', "export type { hash } from '@stale';\n");
+  expect(check(root).output).toContain('LIBRARY_BUILD_OUTPUT packages/foundation/src/private.ts');
+});
+
+it('rejects a service canonical library subpath resolving to a different public entry', async () => {
+  const root = await libraryFixture();
+  await put(root, 'packages/foundation/src/other.ts', 'export const only = 1;\n');
+  await json(root, 'harness.config.json', (config) => {
+    config.projects.foundation!.publicEntries!.push({
+      source: 'packages/foundation/src/other.ts',
+      export: './other',
+    });
+  });
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    pkg.exports['./other'] = { types: './dist/other.d.ts', default: './dist/other.js' };
+  });
+  build(root, 'packages/foundation/tsconfig.build.json');
+  await put(root, 'src/index.ts', "export { hash } from '@fixture/foundation/hash';\n");
+  expect(check(root).status).toBe(0);
+  await put(root, 'src/index.ts', "export { only } from '@fixture/foundation/hash';\n");
+  await json(root, 'tsconfig.json', (config) => {
+    config.compilerOptions.paths = {
+      '@fixture/foundation/hash': ['./packages/foundation/src/other.ts'],
+    };
+  });
+  expect(check(root).output).toContain('LIBRARY_ENTRY_MISMATCH src/index.ts');
+  await json(root, 'tsconfig.json', (config) => {
+    delete config.compilerOptions.paths;
+  });
+  await json(root, 'tsconfig.build.json', (config) => {
+    config.compilerOptions.paths = {
+      '@fixture/foundation/hash': ['./packages/foundation/src/other.ts'],
+    };
+  });
+  expect(check(root).output).toContain('LIBRARY_ENTRY_MISMATCH src/index.ts');
+});
+
+it('rejects extra or wildcard library exports and incorrect runtime or declaration targets', async () => {
+  const root = await libraryFixture();
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    pkg.exports['./*'] = './dist/*.js';
+  });
+  expect(check(root).output).toContain('manifest exports must equal registered publicEntries');
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    delete pkg.exports['./*'];
+    pkg.exports['./extra'] = './dist/private.js';
+  });
+  expect(check(root).output).toContain('manifest exports must equal registered publicEntries');
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    delete pkg.exports['./extra'];
+    pkg.exports['./hash'] = { types: './dist/private.d.ts', default: './dist/hash.d.ts' };
+  });
+  const result = check(root);
+  expect(result.output).toContain('PROJECT_EXPORT_RUNTIME foundation');
+  expect(result.output).toContain('PROJECT_EXPORT_TYPES foundation');
+});
+
+it('accepts a registered root library entry in standard conditional export form', async () => {
+  const root = await libraryFixture();
+  await json(root, 'harness.config.json', (config) => {
+    config.projects.foundation!.publicEntries![0]!.export = '.';
+  });
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    pkg.exports = { types: './dist/hash.d.ts', default: './dist/hash.js' };
+  });
+  await put(root, 'src/index.ts', "export { hash } from '@fixture/foundation';\n");
+  expect(check(root).status).toBe(0);
+});
+
+it('keeps each HTTP primitive limited to its exact foundation subpaths', async () => {
+  const root = await libraryFixture();
+  await json(root, 'harness.config.json', (config) => {
+    for (const entry of ['errors', 'http-status', 'identifiers'])
+      config.projects.foundation!.publicEntries!.push({
+        source: `packages/foundation/src/${entry}.ts`,
+        export: `./${entry}`,
+      });
+  });
+  await json(root, 'packages/foundation/package.json', (pkg) => {
+    Object.assign(pkg, { name: '@mio/foundation' });
+    for (const entry of ['errors', 'http-status', 'identifiers'])
+      pkg.exports[`./${entry}`] = { types: `./dist/${entry}.d.ts`, default: `./dist/${entry}.js` };
+  });
+  for (const entry of ['errors', 'http-status', 'identifiers'])
+    await put(root, `packages/foundation/src/${entry}.ts`, 'export const value = 1;\n');
+  await mkdir(join(root, 'node_modules/@mio'), { recursive: true });
+  await symlink(
+    join(root, 'packages/foundation'),
+    join(root, 'node_modules/@mio/foundation'),
+    'dir',
+  );
+  build(root, 'packages/foundation/tsconfig.build.json');
+  await put(
+    root,
+    'src/http-request.ts',
+    "export { value } from '@mio/foundation/errors';\nexport { value as status } from '@mio/foundation/http-status';\n",
+  );
+  await put(root, 'src/http-response.ts', "export { value } from '@mio/foundation/identifiers';\n");
+  expect(check(root).status).toBe(0);
+  await put(root, 'src/http-request.ts', "export { hash } from '@mio/foundation/hash';\n");
+  expect(check(root).output).toContain('HTTP_REQUEST_DEPENDENCY src/http-request.ts');
+  await put(
+    root,
+    'src/http-response.ts',
+    "export const load = () => import('@mio/foundation/errors');\n",
+  );
+  expect(check(root).output).toContain('HTTP_RESPONSE_DEPENDENCY src/http-response.ts');
+  await put(root, 'src/http-response.ts', "export { value } from '@mio/foundation/identifiers';\n");
+  await json(root, 'tsconfig.json', (config) => {
+    config.compilerOptions.paths = {
+      '@mio/foundation/errors': ['./packages/foundation/src/hash.ts'],
+    };
+  });
+  await put(root, 'src/http-request.ts', "export type { hash } from '@mio/foundation/errors';\n");
+  expect(check(root).output).toContain('HTTP_REQUEST_DEPENDENCY src/http-request.ts');
+});
+
 it('accepts declared independent source roots and ordinary additional business files', async () => {
   const root = await fixture();
   await put(root, 'src/business/new.ts', 'export const ordinary = 1;\n');

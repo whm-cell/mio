@@ -1,9 +1,12 @@
+import { createLogger } from '@mio/foundation/logging';
 import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { authOptions } from './config.ts';
 import type { AuthConfig } from './config.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
+
+const log = createLogger('app', 'auth');
 
 /** Runtime only checks schema; applying migrations is a separate, explicit service operation. */
 export async function createAuthentication(config: AuthConfig, rateLimit?: AuthRateLimitStorage) {
@@ -13,7 +16,7 @@ export async function createAuthentication(config: AuthConfig, rateLimit?: AuthR
     connectionTimeoutMillis: 5000,
     application_name: 'mio-auth',
   });
-  pool.on('error', () => console.error('AUTH_DATABASE_CONNECTION_ERROR'));
+  pool.on('error', () => log.error('AUTH_DATABASE_CONNECTION_ERROR'));
   try {
     const options = authOptions(config, pool);
     if (rateLimit) options.rateLimit = { ...options.rateLimit, customStorage: rateLimit };

@@ -12,6 +12,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import * as Mio from '../../src/plugin.ts';
 import * as Stores from '../../src/conversations/store.ts';
+import { ConversationError } from '../../src/conversations/contracts.ts';
 import type { Receipt } from '../../src/conversations/contracts.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { kernelRuntime, ScriptedModel, textResponse } from '../support/kernel-runtime.ts';
@@ -754,6 +755,31 @@ it('holds an exclusive schema lease and preserves receipts across normal plugin 
   await terminal(id, 'route-b');
   expect(model.requests.at(-1)!.provider).toBe('mio-model-b');
   expect(JSON.stringify(model.requests.at(-1)!.messages)).toContain('before reload');
+});
+
+it('reconciles only ambiguous reception errors and stops when that reconciliation fails', async () => {
+  const id = await create();
+  const count = model.requests.length;
+  const receiving = vi.spyOn(store, 'receive');
+  const reconcile = vi.spyOn(store, 'reconcileReception');
+  try {
+    receiving.mockRejectedValueOnce(new ConversationError(409, 'CONVERSATION_BUSY'));
+    const known = await send(id, 'known-rejection', 'never run');
+    expect(known.status).toBe(409);
+    expect(reconcile).not.toHaveBeenCalled();
+    receiving.mockRejectedValueOnce(new Error('lost commit acknowledgment'));
+    reconcile.mockRejectedValueOnce(new Error('reconciliation unavailable'));
+    expect((await send(id, 'ambiguous-rejection', 'never run')).status).toBe(503);
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect((await call(path(id, 'requests/ambiguous-rejection'))).status).toBe(503);
+    expect(model.requests.length).toBe(count);
+  } finally {
+    receiving.mockRestore();
+    reconcile.mockRestore();
+    await plugin.dispose();
+    plugin = ctx.plugin(Mio, { tokenEnv: 'MIO_API_TOKEN', allowedOrigins: [] });
+    await plugin;
+  }
 });
 
 it('refuses new execution after the exact schema ownership connection is lost', async () => {

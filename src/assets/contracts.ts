@@ -1,3 +1,5 @@
+import { HttpError } from '@mio/foundation/errors';
+
 export const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
 
 export interface AssetPrincipal {
@@ -13,13 +15,16 @@ export interface AssetObjectStore {
   delete(key: string): Promise<void>;
 }
 
-export class AssetError extends Error {
-  readonly status: number;
-  readonly code: string;
+export type AssetErrorCode =
+  | 'ASSET_NOT_FOUND'
+  | 'ASSET_UNAVAILABLE'
+  | 'ASSET_INPUT_INVALID'
+  | 'ASSET_EXPIRED'
+  | 'ASSET_UPLOAD_NOT_FOUND'
+  | 'ASSET_STORAGE_UNAVAILABLE'
+  | 'ASSET_SIZE_MISMATCH'
+  | 'ASSET_SOURCE_CHANGED'
+  | 'ASSET_BUSY'
+  | 'ASSET_FINALIZE_SUPERSEDED';
 
-  constructor(status: number, code: string) {
-    super(code);
-    this.status = status;
-    this.code = code;
-  }
-}
+export class AssetError extends HttpError<AssetErrorCode> {}

@@ -10,7 +10,7 @@
 
 Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工具也不能直接或通过本职责内 helper 导入 Redis 驱动。公共 Redis 不反向依赖消费者、插件、脚本或测试，只允许独立公共契约作为本地依赖；插件和认证可消费公共资源，迁移工具仍由已有 developmentDependencies 禁止导入该运行模块。AST 与包归属解析覆盖类型导入、重导出和别名；真实 Redis 测试夹具允许导入驱动。新增文件继承 `src` / `tests` 既有分类、类型检查与构建范围，不为目录形状新增冗余配置。这是静态导入边界，不能拦截任意宿主子进程或网络副作用。正反例见同一 guardrail fixture。
 
-共同请求模块 `src/http-request.ts` 的依赖限定为 `node:http`；共同响应模块 `src/http-response.ts` 限定为 `node:http`、`node:crypto` 与解析后指向 `src/contracts.ts` 的本地模块。业务模块、认证、插件入口、其他包和开发脚本均不可作为其依赖；正常业务消费者可导入这两个原语，无需登记消费者。现有 AST 导入/导出采集与模块解析统一检查 type-only、重导出、类型查询、别名和字面量动态导入，分别报告 `HTTP_REQUEST_DEPENDENCY` 与 `HTTP_RESPONSE_DEPENDENCY`；合法和违规场景在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。
+共同请求模块 `src/http-request.ts` 限定依赖 `node:http` 和基础库的 `errors`、`http-status`；共同响应模块 `src/http-response.ts` 限定依赖 `node:http`、基础库 `identifiers` 与解析后指向 `src/contracts.ts` 的本地模块。基础库导入名与解析目标须对应同一个已登记入口，不能借别名指向另一公开入口。业务模块、认证、插件入口、其他包和开发脚本均不可作为其依赖；正常业务消费者可导入这两个原语，无需登记消费者。现有 AST 导入/导出采集与模块解析统一检查 type-only、重导出、类型查询、别名和字面量动态导入，分别报告 `HTTP_REQUEST_DEPENDENCY` 与 `HTTP_RESPONSE_DEPENDENCY`；合法和违规场景在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。
 
 已登记的 TS 文件还必须进入类型检查配置；生产 TS 必须同时进入构建配置。新增根目录仅登记归属不足以通过，检查器会对账编译器实际匹配的文件集合。
 
@@ -18,13 +18,15 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 私有 `.env` / `.env.*` 不进入源码清单或任务候选。唯一例外是仓库根的公开 `.env.example`：须在 `configurationFiles` 登记，参与候选摘要，且不能是符号链接；模板只放占位值，真实秘密留在忽略的私有文件。
 
-多项目使用 `harness.config.json` 的 `projects` 具名对象：每项声明 `kind`（`service` 或 `contract`）、`packageRoot`、`sources`、`typecheck` 和 `build`。根服务的 `packageRoot` 为 `.`，且现有 `src` 只能归属根服务；其他生产根须在 `sourceRoots` 中登记并唯一分配给一个项目。项目的配置路径各自独立，源码根不得重叠，也不得与生成或私有排除路径重叠；未知 role、重复 JSON 键、越界路径及未声明的生成目录显式失败。未配置 `projects` 时仅支持现有 `src` 单生产根，不因出现第二个目录自动推断项目。
+多项目使用 `harness.config.json` 的 `projects` 具名对象：每项声明 `kind`（`service`、`contract` 或 `library`）、`packageRoot`、`sources`、`typecheck` 和 `build`。根服务的 `packageRoot` 为 `.`，且现有 `src` 只能归属根服务；其他生产根须在 `sourceRoots` 中登记并唯一分配给一个项目。项目的配置路径各自独立，源码根不得重叠，也不得与生成或私有排除路径重叠；未知 role、重复 JSON 键、越界路径及未声明的生成目录显式失败。未配置 `projects` 时仅支持现有 `src` 单生产根，不因出现第二个目录自动推断项目。
 
 每项 `typecheck` 和 `build` 指向本项目真实 TypeScript 配置；对应生产文件须进入各自配置的文件集合，其他项目生产文件不得作为其显式编译根文件，本项目测试仍可进入类型检查。构建还须能生成运行代码、使用已登记的生成目录。生产导入按类型和构建两套配置解析，避免两者别名指向不同内部模块。此处核对配置与输入，不执行编译或证明产物存在；根入口仍须实际执行每个项目的类型检查和构建，并单独验证产物。
 
-根类型检查先构建共享合同，再检查 A 与 B；根构建依次构建合同、A 与 B。A 的 `dist/tools` 额外编译既有 auth、assets、compute 三个迁移入口及 profile 准备入口，使仓库外产物可初始化和装载；这些工具仍遵守其源码的 developmentDependencies，A 生产模块不反向导入工具。只编译本期实际需要的入口，其他业务域仍使用原有迁移方式；产物和数据库变化需实际验证。
+根类型检查和构建先构建共享基础库与合同，再检查或构建 A 与 B；基础库构建清理旧输出。A 的 `dist/tools` 额外编译既有 auth、assets、compute 三个迁移入口及 profile 准备入口，使仓库外产物可初始化和装载；这些工具仍遵守其源码的 developmentDependencies，A 生产模块不反向导入工具。只编译本期实际需要的入口，其他业务域仍使用原有迁移方式；产物和数据库变化需实际验证。
 
 服务只能依赖自身源码或 contract 的已声明公开入口，contract 只能依赖自身项目，不能导入其他服务或 contract。普通外部校验包仍可使用，但静态包边界不证明依赖纯净或没有副作用。contract 用 `publicEntries: [{"source":"contracts/compute/src/index.ts","export":"."}]` 将受审源码入口关联其 `packageRoot/package.json` 的 `exports`；运行条件须选择该入口编译得到的 `.js`，类型条件须选择对应 `.d.ts`。当前只支持按声明顺序选择 `types`、`node`、`import`、`default` 条件，不支持条件数组或其他条件；构建后应实际加载包验证。解析目标即使被 TypeScript 标记为外部包，也按真实路径及包身份识别本仓库项目；生成的 `.d.ts` 不代替源文件覆盖。
+
+服务也可使用 library 的已登记公开入口；library 只依赖自身源码及精确的 `node:crypto`、`node:perf_hooks`，contract 不依赖 library。库源码不得依赖自身生成目录，即使旧产物仍存在；正常同包源码和公共入口引用仍可用。使用 library 的规范包名与子路径时，类型与构建解析须分别指向该子路径登记的入口，避免别名指向另一公开入口。library 的 manifest exports 必须与 publicEntries 完全一致，不得额外开放根入口、通配或私有入口；运行和类型条件仍须对应同一入口的输出。生产源码的 no-console 范围由同一 `sourceRoots` 生产分类产生，输出仅由基础日志 sink 负责；静态检查不替代脱敏和运行故障验证。
 
 非根服务可通过 `capabilities` 对 `fs`、`child_process`、`sqlite` 分别登记本项目内真实存在的精确 TS adapter 文件；`node:` 前缀及 `fs/promises` 按对应能力核对，根服务仍不开放这些能力。直接的 `process.getBuiltinModule(...)` 和 `globalThis.process` 的静态属性/字符串下标形式也受检查：目标须为字面量，脱离调用的引用拒绝。计算属性、任意别名、第三方内部行为和运行时反射不在承诺内，静态规则不是进程沙箱。
 

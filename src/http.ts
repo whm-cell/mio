@@ -1,4 +1,6 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { timingSafeEqual } from 'node:crypto';
+import { createLogger } from '@mio/foundation/logging';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Capabilities } from './contracts.ts';
 import { startHttpResponse, writeApiError } from './http-response.ts';
@@ -26,6 +28,7 @@ export function validateOptions(options: HttpOptions): void {
 /** Product HTTP boundary. Authentication does not come from model or request-body identity. */
 export function createHandler(options: HttpOptions) {
   validateOptions(options);
+  const log = createLogger('app', 'http');
   const expected = Buffer.from(`Bearer ${options.token}`);
   const allowedOrigins = new Set(options.allowedOrigins);
 
@@ -38,6 +41,7 @@ export function createHandler(options: HttpOptions) {
       response.end(JSON.stringify(value));
     };
     const fail = (status: number, code: string, message: string): void => {
+      log.warn('HTTP_REQUEST_FAILED', { requestId });
       writeApiError(
         response,
         status,
@@ -47,7 +51,7 @@ export function createHandler(options: HttpOptions) {
     };
     const origin = request.headers.origin;
     if (origin !== undefined && !allowedOrigins.has(origin)) {
-      fail(403, 'ORIGIN_DENIED', 'Origin is not allowed');
+      fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED', 'Origin is not allowed');
       return;
     }
     if (origin !== undefined) {
@@ -57,32 +61,32 @@ export function createHandler(options: HttpOptions) {
 
     const path = request.url?.split('?')[0];
     if (!['/healthz', '/readyz', '/api/v1/capabilities'].includes(path ?? '')) {
-      fail(404, 'NOT_FOUND', 'Unknown endpoint');
+      fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND', 'Unknown endpoint');
       return;
     }
     if (request.method === 'OPTIONS') {
       response.setHeader('access-control-allow-methods', 'GET');
       response.setHeader('access-control-allow-headers', 'Authorization');
-      send(204, undefined);
+      send(HTTP_STATUS.NO_CONTENT, undefined);
       return;
     }
     if (request.method !== 'GET') {
       response.setHeader('allow', 'GET, OPTIONS');
-      fail(405, 'METHOD_NOT_ALLOWED', 'Method is not allowed');
+      fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED', 'Method is not allowed');
       return;
     }
     if (path === '/healthz') {
-      send(200, { status: 'ok', service: 'mio-foundation' });
+      send(HTTP_STATUS.OK, { status: 'ok', service: 'mio-foundation' });
       return;
     }
     if (path === '/readyz') {
-      send(200, { status: 'ready', instanceId: options.instanceId });
+      send(HTTP_STATUS.OK, { status: 'ready', instanceId: options.instanceId });
       return;
     }
     const actual = Buffer.from(request.headers.authorization ?? '');
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
       response.setHeader('www-authenticate', 'Bearer');
-      fail(401, 'UNAUTHORIZED', 'A valid service credential is required');
+      fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED', 'A valid service credential is required');
       return;
     }
     const capabilities: Capabilities = {
@@ -91,6 +95,6 @@ export function createHandler(options: HttpOptions) {
       tools: [],
       sessions: options.sessions ?? false,
     };
-    send(200, capabilities);
+    send(HTTP_STATUS.OK, capabilities);
   };
 }

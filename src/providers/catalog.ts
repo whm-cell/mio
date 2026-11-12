@@ -1,3 +1,4 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -40,7 +41,7 @@ export function membershipError(row: ProviderRow, model?: ModelRecord): string |
 /** Deployment input is data selecting implemented profiles, never executable code or membership. */
 export function validateDeclaration(value: unknown): AdaptationDeclaration {
   if (!value || typeof value !== 'object' || Array.isArray(value))
-    throw new ProviderError(400, 'ADAPTATION_INVALID');
+    throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
   const entry = value as Record<string, unknown>;
   if (
     Object.keys(entry).some(
@@ -63,19 +64,19 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
       (item) => typeof item !== 'string' || !item.trim() || item.length > 512,
     )
   )
-    throw new ProviderError(400, 'ADAPTATION_INVALID');
+    throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
   if (entry.classification !== undefined && !categories.includes(entry.classification as Category))
-    throw new ProviderError(400, 'ADAPTATION_INVALID');
+    throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
   if (entry.metadata !== undefined) {
     if (!entry.metadata || typeof entry.metadata !== 'object' || Array.isArray(entry.metadata))
-      throw new ProviderError(400, 'ADAPTATION_INVALID');
+      throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
     const metadata = entry.metadata as Record<string, unknown>;
     if (
       Object.keys(metadata).some((key) => key !== 'contextWindow') ||
       ('contextWindow' in metadata &&
         (!Number.isSafeInteger(metadata.contextWindow) || Number(metadata.contextWindow) < 1))
     )
-      throw new ProviderError(400, 'ADAPTATION_INVALID');
+      throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
   }
   return entry as unknown as AdaptationDeclaration;
 }

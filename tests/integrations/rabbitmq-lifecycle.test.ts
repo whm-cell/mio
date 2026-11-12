@@ -5,6 +5,7 @@ import { connect } from 'amqplib';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { createComputeService } from '../../src/compute/service.ts';
+import { ComputeError } from '../../src/compute/errors.ts';
 import type { ComputeStore } from '../../src/compute/store.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 
@@ -226,3 +227,77 @@ it('treats a synchronous result-handler failure as recoverable and never acknowl
   expect(pair.consumer.channel.ack).not.toHaveBeenCalled();
   await broker.close();
 });
+
+it.each(['conflict', 'transient', 'sink-failure'] as const)(
+  'preserves result acknowledgment semantics through the service for %s',
+  async (scenario) => {
+    const pair = connections();
+    const accept = vi.fn(async () => {
+      if (scenario === 'conflict') throw new ComputeError(409, 'RESULT_CONFLICT');
+      if (scenario === 'transient') throw new Error('database disconnected');
+    });
+    const store = {
+      accept,
+      claim: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ComputeStore;
+    const service = createComputeService(store, {} as AssetObjectStore, {
+      brokerURL: 'amqp://a:secret@127.0.0.1/test',
+      brokerUser: 'a',
+      expectedResultUser: 'b',
+    });
+    const result = {
+      version: 1,
+      type: 'transcode.result',
+      messageId: randomUUID(),
+      commandId: randomUUID(),
+      jobId: randomUUID(),
+      attemptId: randomUUID(),
+      attempt: 1,
+      state: 'running',
+    };
+    const message = {
+      properties: { userId: 'b', messageId: result.messageId, contentType: 'application/json' },
+      content: Buffer.from(JSON.stringify(result)),
+    } as ConsumeMessage;
+    let output = '';
+    try {
+      await vi.waitFor(() => expect(pair.consumer.channel.consume).toHaveBeenCalled(), {
+        timeout: 2000,
+      });
+      const sink =
+        scenario === 'sink-failure'
+          ? vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+              output += String(chunk);
+              throw new Error('failed output');
+            })
+          : undefined;
+      try {
+        pair.consumer.channel.delivery!(message);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } finally {
+        sink?.mockRestore();
+      }
+      expect(accept).toHaveBeenCalledOnce();
+      if (scenario === 'conflict') {
+        expect(pair.consumer.channel.reject).toHaveBeenCalledWith(message, false);
+        expect(pair.consumer.channel.ack).not.toHaveBeenCalled();
+      } else if (scenario === 'transient') {
+        expect(pair.consumer.channel.reject).not.toHaveBeenCalled();
+        expect(pair.consumer.channel.ack).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(pair.consumer.close).toHaveBeenCalled());
+      } else {
+        expect(pair.consumer.channel.ack).toHaveBeenCalledWith(message);
+        expect(JSON.parse(output)).toMatchObject({
+          event: 'RESULT_COMMITTED',
+          jobId: result.jobId,
+          attemptId: result.attemptId,
+          messageId: result.messageId,
+        });
+        expect(output).not.toContain('secret');
+      }
+    } finally {
+      await service.close();
+    }
+  },
+);

@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { monotonicMs } from '@mio/foundation/time';
+import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-tools';
@@ -56,7 +57,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const handler = createHandler({
     token: process.env[config.tokenEnv] ?? '',
     allowedOrigins: config.allowedOrigins,
-    instanceId: randomUUID(),
+    instanceId: createId(),
     sessions: Boolean(conversationConfig),
   });
 
@@ -71,7 +72,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
     const redisConfig = backend === 'redis' ? readRedisConfig() : undefined;
-    const deadline = performance.now() + 5000;
+    const deadline = monotonicMs() + 5000;
     const redis = redisConfig ? await createRedisResource(redisConfig, deadline) : undefined;
     let auth;
     try {

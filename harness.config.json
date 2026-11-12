@@ -3,6 +3,7 @@
     "src": "production",
     "compute/src": "production",
     "contracts/compute/src": "production",
+    "packages/foundation/src": "production",
     "compute/tests": "test",
     "tests": "test",
     "scripts/harness": "development",
@@ -39,11 +40,13 @@
     "node_modules",
     "compute/node_modules",
     "contracts/compute/node_modules",
+    "packages/foundation/node_modules",
     "dist",
     "coverage",
     ".git",
     "compute/dist",
-    "contracts/compute/dist"
+    "contracts/compute/dist",
+    "packages/foundation/dist"
   ],
   "projects": {
     "app": {
@@ -70,6 +73,21 @@
         "cos-nodejs-sdk-v5": ["compute/src/adapters/cos.ts"]
       }
     },
+    "foundation": {
+      "kind": "library",
+      "packageRoot": "packages/foundation",
+      "sources": ["packages/foundation/src"],
+      "typecheck": "packages/foundation/tsconfig.json",
+      "build": "packages/foundation/tsconfig.build.json",
+      "publicEntries": [
+        { "source": "packages/foundation/src/logging.ts", "export": "./logging" },
+        { "source": "packages/foundation/src/errors.ts", "export": "./errors" },
+        { "source": "packages/foundation/src/http-status.ts", "export": "./http-status" },
+        { "source": "packages/foundation/src/time.ts", "export": "./time" },
+        { "source": "packages/foundation/src/identifiers.ts", "export": "./identifiers" },
+        { "source": "packages/foundation/src/hash.ts", "export": "./hash" }
+      ]
+    },
     "protocol": {
       "kind": "contract",
       "packageRoot": "contracts/compute",
@@ -95,6 +113,9 @@
     "contracts/compute/package.json",
     "contracts/compute/tsconfig.json",
     "contracts/compute/tsconfig.build.json",
+    "packages/foundation/package.json",
+    "packages/foundation/tsconfig.json",
+    "packages/foundation/tsconfig.build.json",
     "tsconfig.json",
     "tsconfig.build.json",
     "tsconfig.portable-tools.json",

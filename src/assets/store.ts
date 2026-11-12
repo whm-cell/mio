@@ -1,6 +1,10 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import { checkAssetSchema } from './schema.ts';
 import { AssetError } from './contracts.ts';
+
+const log = createLogger('app', 'asset-store');
 
 export interface AssetRow {
   id: string;
@@ -43,7 +47,7 @@ export class AssetStore {
         [id, owner],
       )
     ).rows[0];
-    if (!row) throw new AssetError(404, 'ASSET_NOT_FOUND');
+    if (!row) throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
     return row;
   }
 
@@ -117,7 +121,7 @@ export async function createAssetStore(databaseURL: string): Promise<AssetStore>
     query_timeout: 5000,
     application_name: 'mio-assets',
   });
-  pool.on('error', () => console.error('ASSET_DATABASE_CONNECTION_ERROR'));
+  pool.on('error', () => log.error('ASSET_DATABASE_CONNECTION_ERROR'));
   try {
     await checkAssetSchema(pool);
     return new AssetStore(pool);

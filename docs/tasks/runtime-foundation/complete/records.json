@@ -1,0 +1,52 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/runtime-foundation/prd.md",
+  "results": [
+    {
+      "key": "runtime-foundation",
+      "title": "A/B 公共运行时组件与持续治理",
+      "locations": [
+        {
+          "path": "docs/foundation.md",
+          "purpose": "六个公共入口、日志/领域错误/时钟责任的权威规范；实际库源码在 packages/foundation/src/"
+        },
+        {
+          "path": "src/http-request.ts",
+          "purpose": "A侧有界正文读取及公共 errors/http-status 的真实消费者"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "标识、字符串摘要及应用日志的真实消费者"
+        },
+        {
+          "path": "src/compute/errors.ts",
+          "purpose": "从数据库实现解耦的计算领域异常"
+        },
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "A侧计算日志关联、时间工具消费、结果拒绝和恢复语义的应用入口"
+        },
+        {
+          "path": "scripts/harness/source-projects.ts",
+          "purpose": "library公开入口、类型/构建与exports核对"
+        },
+        {
+          "path": "docs/engineering/source-guardrails.md",
+          "purpose": "库依赖、源码覆盖、日志规则及静态能力限制"
+        },
+        {
+          "path": "docs/tasks/runtime-foundation/prd.md",
+          "purpose": "A/B六入口、P1–P4范围、设计取舍和验收；B消费者实际源码在 compute/src/"
+        }
+      ],
+      "outcomes": "建立 @mio/foundation 的 logging、errors、http-status、time、identifiers、hash 六个子入口，迁移 A/B 应用日志、异常/HTTP状态、时间、UUID和UTF-8摘要，共用 A 正文读取并分离 ComputeError。扩展既有AST/构建/library边界，复用 quality-review、norms-review 与候选证据。保持身份和恢复责任，明确修复认证上游body失败时污染本地错误响应头的问题，正常原始响应、多Cookie保持。相同维护任务：新增日志字段由9个生产文件降为1个，假设正文修正由4个降为1个，新增领域码增加1处领域类型声明。",
+      "verification": "当前候选完整 pnpm check 退出0：46文件595测试，格式/类型/lint/AST护栏/build/官方DSH打包启动通过。两项独立审查及综合代码质量审阅的三个维度通过。仓库外A/B六入口、链接隔离、正式A启动和迁移保留通过；B打包main start连接独占真实RabbitMQ4.4.0进入消费后正常退出。真实分块请求撤权四入口均401且无业务写入，fd83029与本候选三项维护对照完成。checks/behavior/quality-review/norms-review均有当前有效pass，保留失败及旧原件。",
+      "limitations": "本次接受限定本地交付，暂不提交、推送或生产部署。真实broker为空队列且COS凭据未使用，没有本候选真云媒体链路、远端CI或生产高可用证据。日志尽力输出且背压丢弃；AST非任意反射沙箱。维护对照只证明选定触点集中，领域码登记及构建负担增加，未证明总体人时或长期成本降低；已销毁请求演练补丁未进入交付。既有locations解析器只接受src/scripts/tests/docs，成果经真实规范和A端消费者导航，packages/foundation/src/及compute/src/没有直接纳入结构化locations。隔离工作区基于fd83029，未合入原工作区后续2a6a692等提交。临时broker已移除。",
+      "acceptance": {
+        "candidate": "f3f83f6e9a0c36a567b55ac7e9eab94578c0f836e0225d30fc6559fc25d86c56",
+        "statement": "接受这次公共基础组件与护栏的交付结果及已披露的限制，按现有流程进入 complete，暂不提交、推送或部署。",
+        "reference": "2026-11-12 本会话用户在收到公共基础组件与护栏交付草稿、595项测试及仓库外A/B验证结论和已披露限制后，明确要求接受并进入complete，暂不提交、推送或部署。登记仅清理过时待接受措辞、个人执行信息，并按实际导入校正消费者导航说明；受验候选、能力、验证及实质限制保持不变。"
+      }
+    }
+  ]
+}

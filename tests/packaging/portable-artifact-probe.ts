@@ -34,6 +34,19 @@ for (const name of ['a', 'b', 'host']) {
 const a = join(root, 'a'),
   b = join(root, 'b'),
   host = join(root, 'host');
+for (const artifact of [a, b]) {
+  const script = `for (const entry of ['logging','errors','http-status','time','identifiers','hash']) {
+    const loaded = await import('@mio/foundation/' + entry);
+    if (!Object.keys(loaded).length) throw new Error('EMPTY_FOUNDATION_ENTRY');
+  }`;
+  const loaded = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: artifact,
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  if (loaded.status !== 0) throw new Error('PORTABLE_FOUNDATION_LOAD_FAILED');
+}
+console.log('PORTABLE_FOUNDATION_ENTRIES_OK');
 const hostPackage = JSON.parse(
   await readFile(join(host, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8'),
 ) as { version: string };

@@ -1,9 +1,12 @@
+import { createLogger } from '@mio/foundation/logging';
 import { isJournalFailure, Journal } from './adapters/journal.ts';
 import { ObjectStore } from './adapters/cos.ts';
 import { processIdentity } from './adapters/media.ts';
 import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
+
+const log = createLogger('worker', 'main');
 
 function required(name: string): string {
   const value = process.env[name];
@@ -93,8 +96,8 @@ async function start(): Promise<void> {
       } catch (error) {
         if (isJournalFailure(error)) {
           stopping = true;
-          console.error('compute worker journal failed; consumption stopped');
-        } else if (!stopping) console.error('compute worker connection error');
+          log.error('JOURNAL_CONSUMPTION_STOPPED');
+        } else if (!stopping) log.error('BROKER_CONNECTION_ERROR');
       } finally {
         maintenance?.stop();
         if (interval) clearInterval(interval);
@@ -114,6 +117,6 @@ async function start(): Promise<void> {
 }
 
 void start().catch(() => {
-  console.error('compute worker startup failed');
+  log.error('WORKER_STARTUP_FAILED');
   process.exitCode = 1;
 });

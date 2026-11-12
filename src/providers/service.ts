@@ -1,3 +1,5 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { utcISOString } from '@mio/foundation/time';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -30,29 +32,31 @@ export function createProviderService(
   const active = new Set<Promise<Discovery>>();
   let closing: Promise<void> | undefined;
   const assertOpen = () => {
-    if (cancellation.signal.aborted) throw new ProviderError(503, 'PROVIDER_UNAVAILABLE');
+    if (cancellation.signal.aborted)
+      throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
   };
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
     const row = await store.state(actor.userId);
     assertOpen();
-    if (!row) throw new ProviderError(404, 'PROVIDER_NOT_CONFIGURED');
+    if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const preference = row.preferences.find((pref) => pref.usage === 'chat' && pref.is_default);
     const ref = modelRef ?? (preference && modelReference(preference.model_key));
     const model = ref ? findModel(row.models, ref) : undefined;
     const reason = membershipError(row, model);
     // Auth and snapshot errors remain distinguishable even when selecting a default.
     if (reason && !['MODEL_NOT_FOUND', 'MODEL_REMOVED'].includes(reason))
-      throw new ProviderError(409, reason);
-    if (!ref) throw new ProviderError(409, 'MODEL_DEFAULT_NOT_SET');
-    if (reason) throw new ProviderError(409, modelRef ? reason : 'MODEL_DEFAULT_INVALID');
+      throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+    if (!ref) throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DEFAULT_NOT_SET');
+    if (reason)
+      throw new ProviderError(HTTP_STATUS.CONFLICT, modelRef ? reason : 'MODEL_DEFAULT_INVALID');
     const adaptation = chatAdaptation(row.adaptations, model!.model_key);
     const enabled =
       row.preferences.find((pref) => pref.model_key === model!.model_key && pref.usage === 'chat')
         ?.enabled ?? true;
     if (!adaptation || !enabled)
       throw new ProviderError(
-        409,
+        HTTP_STATUS.CONFLICT,
         !modelRef ? 'MODEL_DEFAULT_INVALID' : !adaptation ? 'ADAPTER_PENDING' : 'MODEL_DISABLED',
       );
     const selection: ChatSelection = Object.freeze({
@@ -69,7 +73,7 @@ export function createProviderService(
     const result: Discovery = {
       credentialVersion: row.credential_version,
       refreshSeq: row.latest_refresh_seq,
-      checkedAt: new Date().toISOString(),
+      checkedAt: utcISOString(),
       scope: 'models-only',
       status: 'failed',
       ids: [],
@@ -94,7 +98,7 @@ export function createProviderService(
           : 'UPSTREAM_UNAVAILABLE';
       if (error instanceof ProviderError) credentialFailure = error;
     }
-    result.checkedAt = new Date().toISOString();
+    result.checkedAt = utcISOString();
     await store.finishRefresh(actor.userId, row, result, models);
     if (credentialFailure) throw credentialFailure;
     return result;
@@ -113,7 +117,7 @@ export function createProviderService(
         selection.modelId !== selected.modelId ||
         (selected.modelKey !== undefined && selected.modelKey !== selection.modelKey)
       )
-        throw new ProviderError(409, 'MODEL_NOT_FOUND');
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
       const apiKey = decryptCredential(
         row,
         { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
@@ -150,7 +154,7 @@ export function createProviderService(
     save(actor: ProviderPrincipal, expected: number, apiKey: string) {
       assertOpen();
       if (!apiKey || Buffer.byteLength(apiKey) > 4096 || /\s|[\u0000-\u001f\u007f*•]/.test(apiKey))
-        throw new ProviderError(400, 'PROVIDER_KEY_INVALID');
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'PROVIDER_KEY_INVALID');
       return store.save(actor.userId, expected, apiKey);
     },
     settings(actor: ProviderPrincipal, expected: number, patch: SettingsPatch) {
@@ -166,13 +170,13 @@ export function createProviderService(
       assertOpen();
       const usage = patch.usage ?? legacyReference(modelRef)?.usage;
       if (!usage || !categories.includes(usage))
-        throw new ProviderError(400, 'MODEL_USAGE_REQUIRED');
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'MODEL_USAGE_REQUIRED');
       return store.preference(actor.userId, expected, modelRef, usage, patch);
     },
     async catalog(actor: ProviderPrincipal, category?: string) {
       assertOpen();
       if (category !== undefined && !categories.includes(category as Category))
-        throw new ProviderError(400, 'QUERY_INVALID');
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       return catalogView(await store.state(actor.userId), category as Category | undefined);
     },
     async discover(actor: ProviderPrincipal) {

@@ -5,7 +5,7 @@
 | 目录                             | 职责                                                                          |
 | -------------------------------- | ----------------------------------------------------------------------------- |
 | [harness/](harness/)             | 工程护栏、任务资料、读取、验证及交付；专用夹具在 `harness/fixtures/`          |
-| [foundation/](foundation/)       | 插件装载、Profile 准备与 DSH 内核                                             |
+| [foundation/](foundation/)       | 共享运行时原语、HTTP 身份复验、插件装载、Profile 准备与 DSH 内核              |
 | [auth/](auth/)                   | 认证与 Redis 限流消费者                                                       |
 | [providers/](providers/)         | 供应商配置、目录、刷新、迁移；领域参考数据在 `providers/fixtures/`            |
 | [onelink/](onelink/)             | OneLink 适配、传输、生命周期及专用模型夹具                                    |

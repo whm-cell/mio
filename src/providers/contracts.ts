@@ -1,3 +1,5 @@
+import { HttpError } from '@mio/foundation/errors';
+
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
   userId: string;
@@ -5,15 +7,7 @@ export interface ProviderPrincipal {
 }
 export const categories = ['chat', 'image', 'video', 'voice', 'music'] as const;
 export type Category = (typeof categories)[number];
-export class ProviderError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string) {
-    super(code);
-    this.status = status;
-    this.code = code;
-  }
-}
+export class ProviderError extends HttpError {}
 export interface Discovery {
   credentialVersion: number;
   checkedAt: string;

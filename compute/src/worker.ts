@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { epochMs } from '@mio/foundation/time';
+import { createLogger } from '@mio/foundation/logging';
+import { createId } from '@mio/foundation/identifiers';
 import type {
   ComputeCommandV1,
   ComputeFailureCodeV1,
@@ -23,6 +25,7 @@ import type { Broker } from './adapters/rabbitmq.ts';
 import type { Attempt, Phase } from './types.ts';
 
 const ATTEMPT_MS = 60 * 60 * 1000;
+const log = createLogger('worker', 'worker');
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type ResultState =
@@ -87,7 +90,7 @@ export class Worker {
     return {
       version: 1,
       type: 'transcode.result',
-      messageId: randomUUID(),
+      messageId: createId(),
       commandId: command.messageId,
       jobId: command.jobId,
       attemptId: command.attemptId,
@@ -251,6 +254,12 @@ export class Worker {
 
   async handle(command: ComputeCommandV1, ack: () => void): Promise<void> {
     if (!this.admissionReady()) throw new Error('WORKER_NOT_READY');
+    const attemptLog = log.child({
+      jobId: command.jobId,
+      attemptId: command.attemptId,
+      messageId: command.messageId,
+    });
+    attemptLog.info('COMMAND_RECEIVED');
     this.#busy = true;
     this.#activeAttemptId = command.attemptId;
     try {
@@ -281,6 +290,7 @@ export class Worker {
       }
       ack();
       this.#journal.markAckDispatched(command.attemptId);
+      attemptLog.info('COMMAND_ACK_DISPATCHED');
     } finally {
       this.#activeAttemptId = null;
       this.#busy = false;
@@ -292,7 +302,7 @@ export class Worker {
     if (!this.#journal.lastEvent(command.attemptId))
       await this.#emit(attempt, 'received', { state: 'running' });
     else await this.#flush(command.attemptId);
-    const remaining = ATTEMPT_MS - (Date.now() - attempt.startedAt);
+    const remaining = ATTEMPT_MS - (epochMs() - attempt.startedAt);
     if (remaining <= 0) {
       await this.#emit(attempt, 'failed', { state: 'failed', errorCode: 'EXECUTION_TIMEOUT' });
       return;

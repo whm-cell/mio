@@ -4,7 +4,8 @@ import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
-import { ComputeError, ComputeStore } from '../../src/compute/store.ts';
+import { ComputeError } from '../../src/compute/errors.ts';
+import { ComputeStore } from '../../src/compute/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;

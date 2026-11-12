@@ -13,6 +13,7 @@ export interface CheckedProject {
   build: ts.ParsedCommandLine;
   output: string;
   publicTargets: Set<string>;
+  publicEntryTargets: Map<string, Set<string>>;
 }
 
 function projectPath(root: string, path: string): string {
@@ -129,11 +130,27 @@ export async function inspectProjects(
     names.add(manifest.name);
     const packagePath = await realpath(join(root, declaration.packageRoot));
     const publicTargets = new Set<string>();
+    const publicEntryTargets = new Map<string, Set<string>>();
+    const buildInputs = new Set(build.fileNames.map((file) => resolve(file)));
+    if (declaration.kind === 'library') {
+      const mappings = manifest.exports;
+      const actual =
+        mappings && typeof mappings === 'object' && !Array.isArray(mappings)
+          ? Object.keys(mappings).some((key) => key.startsWith('.'))
+            ? Object.keys(mappings)
+            : ['.']
+          : typeof mappings === 'string'
+            ? ['.']
+            : [];
+      const expected = (declaration.publicEntries ?? []).map((entry) => entry.export);
+      if (actual.length !== expected.length || actual.some((key) => !expected.includes(key)))
+        errors.push(`PROJECT_EXPORTS ${id}: manifest exports must equal registered publicEntries`);
+    }
     for (const entry of declaration.publicEntries ?? []) {
       const absoluteSource = resolve(root, entry.source);
       if (!files.includes(entry.source))
         errors.push(`PROJECT_EXPORT_SOURCE ${id}: missing ${entry.source}`);
-      if (!build.fileNames.map((file) => resolve(file)).includes(absoluteSource)) {
+      if (!buildInputs.has(absoluteSource)) {
         errors.push(`PROJECT_EXPORT_BUILD ${id}: ${entry.source} is not a build input`);
         continue;
       }
@@ -149,6 +166,8 @@ export async function inspectProjects(
         continue;
       }
       publicTargets.add(entry.source);
+      const entryTargets = new Set([entry.source]);
+      publicEntryTargets.set(entry.export, entryTargets);
       const runtime = selectedExport(mapping, new Set(['node', 'import']));
       const types = selectedExport(mapping, new Set(['types', 'node', 'import']));
       const runtimePath =
@@ -175,7 +194,10 @@ export async function inspectProjects(
         const path = projectPath(root, resolve(root, declaration.packageRoot, target));
         if (!emitted.includes(path))
           errors.push(`PROJECT_EXPORT_BUILD ${id}: ${target} is not emitted from ${entry.source}`);
-        else publicTargets.add(path);
+        else {
+          publicTargets.add(path);
+          entryTargets.add(path);
+        }
       }
     }
     for (const rules of [declaration.capabilities, declaration.packageAdapters])
@@ -191,6 +213,7 @@ export async function inspectProjects(
       build,
       output,
       publicTargets,
+      publicEntryTargets,
     });
   }
   if (

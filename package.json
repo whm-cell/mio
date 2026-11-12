@@ -34,8 +34,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -p contracts/compute/tsconfig.build.json && node scripts/service/build.ts && pnpm --filter @mio/compute-worker build",
-    "typecheck": "tsc -p contracts/compute/tsconfig.build.json && tsc --noEmit && tsc -p compute/tsconfig.json --noEmit",
+    "build": "pnpm --filter @mio/foundation build && tsc -p contracts/compute/tsconfig.build.json && node scripts/service/build.ts && pnpm --filter @mio/compute-worker build",
+    "typecheck": "pnpm --filter @mio/foundation build && tsc -p contracts/compute/tsconfig.build.json && tsc --noEmit && tsc -p compute/tsconfig.json --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -98,6 +98,7 @@
     "@deepseek-ai/schemastery": "3.19.0",
     "@earendil-works/pi-ai": "1.5.0",
     "@mio/compute-contracts": "workspace:*",
+    "@mio/foundation": "workspace:*",
     "@redis/client": "6.2.1",
     "amqplib": "2.2.1",
     "better-auth": "1.7.18",

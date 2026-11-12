@@ -1,3 +1,4 @@
+import { isUuidV4 } from '@mio/foundation/identifiers';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -24,7 +25,6 @@ import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
 
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export class MediaError extends Error {
   readonly code:
@@ -82,7 +82,7 @@ export function paths(
   directory: string,
   attemptId: string,
 ): { input: string; temporary: string; output: string } {
-  if (!UUID.test(attemptId)) throw new Error('ATTEMPT_ID_INVALID');
+  if (!isUuidV4(attemptId)) throw new Error('ATTEMPT_ID_INVALID');
   const root = resolve(directory);
   return {
     input: join(root, `${attemptId}.input`),

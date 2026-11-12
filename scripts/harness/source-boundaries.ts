@@ -12,13 +12,16 @@ function property(node: ts.Node, name: string): ts.Expression | undefined {
   return undefined;
 }
 
-/** Recognize direct global process access; computed names and arbitrary aliases are not data-flow analysis. */
-export function directBuiltinAccess(node: ts.Node): boolean {
-  const receiver = property(node, 'getBuiltinModule');
-  if (!receiver) return false;
+export function directProcessObject(receiver: ts.Node): boolean {
   if (ts.isIdentifier(receiver) && receiver.text === 'process') return true;
   const global = property(receiver, 'process');
   return !!global && ts.isIdentifier(global) && global.text === 'globalThis';
+}
+
+/** Recognize direct global process access; computed names and arbitrary aliases are not data-flow analysis. */
+export function directBuiltinAccess(node: ts.Node): boolean {
+  const receiver = property(node, 'getBuiltinModule');
+  return !!receiver && directProcessObject(receiver);
 }
 
 export function restrictedCapability(specifier: string): string | undefined {

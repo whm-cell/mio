@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@mio/compute-contracts": "workspace:*",
+    "@mio/foundation": "workspace:*",
     "amqplib": "2.2.1",
     "cos-nodejs-sdk-v5": "3.0.0"
   }

@@ -1,5 +1,5 @@
 import { connect } from 'amqplib';
-import { randomUUID } from 'node:crypto';
+import { createId } from '@mio/foundation/identifiers';
 import { EventEmitter } from 'node:events';
 import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, Message } from 'amqplib';
 import {
@@ -300,7 +300,7 @@ export class Broker {
           });
         this.#handling = tracked;
       },
-      { noAck: false, consumerTag: `mio-${randomUUID()}` },
+      { noAck: false, consumerTag: `mio-${createId()}` },
     );
   }
 

@@ -1,0 +1,38 @@
+{
+  "name": "@mio/foundation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node -e \"const fs=require('node:fs');fs.mkdirSync('dist',{recursive:true});if(fs.lstatSync('dist').isSymbolicLink())throw new Error('BUILD_OUTPUT_SYMLINK');for(const name of fs.readdirSync('dist'))fs.rmSync('dist/'+name,{recursive:true,force:true})\" && tsc -p tsconfig.build.json"
+  },
+  "exports": {
+    "./logging": {
+      "types": "./dist/logging.d.ts",
+      "default": "./dist/logging.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./http-status": {
+      "types": "./dist/http-status.d.ts",
+      "default": "./dist/http-status.js"
+    },
+    "./time": {
+      "types": "./dist/time.d.ts",
+      "default": "./dist/time.js"
+    },
+    "./identifiers": {
+      "types": "./dist/identifiers.d.ts",
+      "default": "./dist/identifiers.js"
+    },
+    "./hash": {
+      "types": "./dist/hash.d.ts",
+      "default": "./dist/hash.js"
+    }
+  },
+  "files": [
+    "dist"
+  ]
+}

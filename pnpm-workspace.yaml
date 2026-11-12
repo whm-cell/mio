@@ -1,6 +1,7 @@
 packages:
   - .
   - contracts/compute
+  - packages/foundation
   - compute
 verifyDepsBeforeRun: error
 overrides:

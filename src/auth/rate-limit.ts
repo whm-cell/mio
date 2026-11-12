@@ -1,4 +1,6 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { monotonicMs } from '@mio/foundation/time';
+import { createId } from '@mio/foundation/identifiers';
+import { sha256Utf8 } from '@mio/foundation/hash';
 import type { BetterAuthOptions } from 'better-auth';
 import type { RedisResource } from '../integrations/redis.ts';
 
@@ -39,19 +41,19 @@ return {1, 0}
 export async function createRedisRateLimit(
   redis: RedisResource,
   namespace: string,
-  startupDeadline = performance.now() + 5000,
+  startupDeadline = monotonicMs() + 5000,
 ): Promise<AuthRateLimitStorage> {
   const prefix = `mio:${namespace}:auth:rate-limit:v1:`;
-  const probe = `${prefix}probe:${randomUUID()}`;
+  const probe = `${prefix}probe:${createId()}`;
   try {
     const reply = await redis.evaluate(
       AUTH_RATE_LIMIT_SCRIPT,
       probe,
       ['1000', '1'],
-      startupDeadline - performance.now(),
+      startupDeadline - monotonicMs(),
     );
-    const ttl = await redis.ttl(probe, startupDeadline - performance.now());
-    const deleted = await redis.delete(probe, startupDeadline - performance.now());
+    const ttl = await redis.ttl(probe, startupDeadline - monotonicMs());
+    const deleted = await redis.delete(probe, startupDeadline - monotonicMs());
     if (
       !Array.isArray(reply) ||
       reply[0] !== 1 ||
@@ -67,13 +69,13 @@ export async function createRedisRateLimit(
   }
   return {
     async consume(key, rule) {
-      const deadline = performance.now() + 1000;
-      const storedKey = prefix + createHash('sha256').update(key).digest('hex');
+      const deadline = monotonicMs() + 1000;
+      const storedKey = prefix + sha256Utf8(key);
       const reply = await redis.evaluate(
         AUTH_RATE_LIMIT_SCRIPT,
         storedKey,
         [String(rule.window * 1000), String(rule.max)],
-        deadline - performance.now(),
+        deadline - monotonicMs(),
       );
       if (
         !Array.isArray(reply) ||

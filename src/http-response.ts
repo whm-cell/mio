@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createId } from '@mio/foundation/identifiers';
 import type { ServerResponse } from 'node:http';
 import type { ApiError } from './contracts.ts';
 
@@ -6,7 +6,7 @@ type JsonContentType = 'application/json' | 'application/json; charset=utf-8';
 
 /** Start once per request; each adapter retains its own routing, CORS and response policy. */
 export function startHttpResponse(response: ServerResponse): string {
-  const requestId = randomUUID();
+  const requestId = createId();
   response.setHeader('cache-control', 'no-store');
   response.setHeader('x-content-type-options', 'nosniff');
   response.setHeader('x-request-id', requestId);

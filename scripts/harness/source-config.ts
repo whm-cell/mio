@@ -3,7 +3,7 @@ import ts from 'typescript';
 
 export type SourceRole = 'production' | 'test' | 'development';
 export interface SourceProject {
-  kind: 'service' | 'contract';
+  kind: 'service' | 'contract' | 'library';
   packageRoot: string;
   sources: string[];
   typecheck: string;
@@ -113,8 +113,8 @@ function validateProjects(
     ];
     for (const key of Object.keys(value))
       if (!fields.includes(key)) errors.push(`PROJECT_FIELD ${id}: unknown ${key}`);
-    if (value.kind !== 'service' && value.kind !== 'contract')
-      errors.push(`PROJECT_KIND ${id}: choose service or contract`);
+    if (value.kind !== 'service' && value.kind !== 'contract' && value.kind !== 'library')
+      errors.push(`PROJECT_KIND ${id}: choose service, contract or library`);
     if (!validPath(value.packageRoot, true)) {
       errors.push(`PROJECT_PACKAGE_ROOT ${id}: invalid packageRoot`);
       continue;
@@ -143,9 +143,9 @@ function validateProjects(
         errors.push(`PROJECT_TSCONFIG ${id}: ${target} is already assigned`);
       configurations.set(target, `${id}.${key}`);
     }
-    if (value.kind === 'contract') {
+    if (value.kind === 'contract' || value.kind === 'library') {
       if (!Array.isArray(value.publicEntries) || !value.publicEntries.length)
-        errors.push(`PROJECT_EXPORTS ${id}: contract requires publicEntries`);
+        errors.push(`PROJECT_EXPORTS ${id}: ${value.kind} requires publicEntries`);
       else {
         const exports = new Set<string>();
         for (const entry of value.publicEntries as unknown[]) {

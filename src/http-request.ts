@@ -1,21 +1,16 @@
 import type { IncomingMessage } from 'node:http';
+import { HttpError } from '@mio/foundation/errors';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 
-export class RequestBodyError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string) {
-    super(code);
-    this.status = status;
-    this.code = code;
-  }
-}
+type RequestBodyErrorCode = 'BODY_TOO_LARGE' | 'BODY_TIMEOUT' | 'BODY_INVALID';
+export class RequestBodyError extends HttpError<RequestBodyErrorCode> {}
 
-/** Shared bounded JSON reader for authenticated mutation endpoints. */
-export async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
-  const bytes = await new Promise<Buffer>((resolve, reject) => {
+/** Read raw bytes without interpreting authentication payloads. */
+export function readBody(request: IncomingMessage, limit = 8192): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    const finish = (code?: string) => {
+    const finish = (code?: RequestBodyErrorCode) => {
       clearTimeout(timer);
       request.off('data', data);
       request.off('end', end);
@@ -25,7 +20,11 @@ export async function readJsonBody(request: IncomingMessage): Promise<Record<str
         request.resume();
         reject(
           new RequestBodyError(
-            code === 'BODY_TOO_LARGE' ? 413 : code === 'BODY_TIMEOUT' ? 408 : 400,
+            code === 'BODY_TOO_LARGE'
+              ? HTTP_STATUS.PAYLOAD_TOO_LARGE
+              : code === 'BODY_TIMEOUT'
+                ? HTTP_STATUS.REQUEST_TIMEOUT
+                : HTTP_STATUS.BAD_REQUEST,
             code,
           ),
         );
@@ -33,7 +32,7 @@ export async function readJsonBody(request: IncomingMessage): Promise<Record<str
     };
     const data = (chunk: Buffer) => {
       size += chunk.length;
-      if (size > 8192) finish('BODY_TOO_LARGE');
+      if (size > limit) finish('BODY_TOO_LARGE');
       else chunks.push(chunk);
     };
     const end = () => finish();
@@ -41,11 +40,19 @@ export async function readJsonBody(request: IncomingMessage): Promise<Record<str
     const timer = setTimeout(() => finish('BODY_TIMEOUT'), 10_000);
     request.on('data', data).once('end', end).once('error', fail).once('aborted', fail);
   });
+}
+
+/** Shared bounded JSON reader for authenticated mutation endpoints. */
+export async function readJsonBody(
+  request: IncomingMessage,
+  limit = 8192,
+): Promise<Record<string, unknown>> {
+  const bytes = await readBody(request, limit);
   try {
     const value: unknown = JSON.parse(bytes.toString('utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
     return value as Record<string, unknown>;
   } catch {
-    throw new RequestBodyError(400, 'BODY_INVALID');
+    throw new RequestBodyError(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
   }
 }

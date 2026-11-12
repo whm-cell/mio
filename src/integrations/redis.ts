@@ -1,3 +1,4 @@
+import { monotonicMs } from '@mio/foundation/time';
 import { createClient, ErrorReply } from '@redis/client';
 
 export interface RedisConfig {
@@ -37,7 +38,7 @@ export class RedisFailure extends Error {
 /** One single-node resource, with no reconnect, offline queue, command replay or driver escape. */
 export async function createRedisResource(
   config: RedisConfig,
-  startupDeadline = performance.now() + 5000,
+  startupDeadline = monotonicMs() + 5000,
 ) {
   const lifetime = new AbortController();
   const client = createClient({
@@ -60,7 +61,7 @@ export async function createRedisResource(
   // node-redis's command timeout only covers commands not yet written to the socket.
   // This deadline also covers an accepted write whose response never arrives.
   const bounded = async <T>(operation: () => Promise<T>, milliseconds: number): Promise<T> => {
-    const deadline = performance.now() + milliseconds;
+    const deadline = monotonicMs() + milliseconds;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       if (milliseconds <= 0) {
@@ -77,7 +78,7 @@ export async function createRedisResource(
         }),
       ]);
       // A blocked event loop can process I/O before the overdue timer callback.
-      if (performance.now() >= deadline) {
+      if (monotonicMs() >= deadline) {
         stop();
         throw new RedisFailure('unknown');
       }
@@ -87,7 +88,7 @@ export async function createRedisResource(
     }
   };
   try {
-    await bounded(() => client.connect(), startupDeadline - performance.now());
+    await bounded(() => client.connect(), startupDeadline - monotonicMs());
   } catch {
     stop();
     throw new Error('REDIS_STARTUP: resource unavailable');

@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
+import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { ProviderError } from './contracts.ts';
@@ -10,6 +12,8 @@ import { checkProviderSchema } from './schema.ts';
 import { providerStateSQL, providerView } from './state.ts';
 import type { ProviderRow, ProviderState } from './state.ts';
 import { findModel, membershipError, chatAdaptation, validateDeclaration } from './catalog.ts';
+
+const log = createLogger('app', 'provider-store');
 
 export interface SettingsPatch {
   enabled?: boolean;
@@ -35,7 +39,9 @@ export class ProviderStore {
       return value;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      throw error instanceof ProviderError ? error : new ProviderError(503, 'PROVIDER_UNAVAILABLE');
+      throw error instanceof ProviderError
+        ? error
+        : new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
     } finally {
       client.release();
     }
@@ -47,9 +53,9 @@ export class ProviderStore {
         [owner],
       )
     ).rows[0];
-    if (!row) throw new ProviderError(404, 'PROVIDER_NOT_CONFIGURED');
+    if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     if (expected !== undefined && row.revision !== expected)
-      throw new ProviderError(409, 'PROVIDER_REVISION_CONFLICT');
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_REVISION_CONFLICT');
     return row;
   }
   async current(owner: string): Promise<ProviderRow | null> {
@@ -78,8 +84,8 @@ export class ProviderStore {
         )
       ).rows[0];
       if ((old?.revision ?? 0) !== expected)
-        throw new ProviderError(409, 'PROVIDER_REVISION_CONFLICT');
-      const id = old?.id ?? randomUUID();
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_REVISION_CONFLICT');
+      const id = old?.id ?? createId();
       const version = (old?.credential_version ?? 0) + 1;
       const envelope = encryptCredential(
         apiKey,
@@ -109,7 +115,8 @@ export class ProviderStore {
             VALUES($1,$2,1,$3,1,$4,$5,$6,$7) ON CONFLICT(owner_id) DO NOTHING RETURNING *`,
             args,
           );
-      if (!result.rows[0]) throw new ProviderError(409, 'PROVIDER_REVISION_CONFLICT');
+      if (!result.rows[0])
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_REVISION_CONFLICT');
       if (old) {
         await client.query(
           "UPDATE mio_provider_models SET membership_state='historical' WHERE provider_id=$1",
@@ -154,15 +161,17 @@ export class ProviderStore {
       const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0]!;
       const model = findModel(state.models, modelRef);
       const reason = membershipError(row, model);
-      if (reason) throw new ProviderError(409, reason);
-      if (usage !== 'chat') throw new ProviderError(409, 'MODEL_USAGE_UNSUPPORTED');
+      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+      if (usage !== 'chat')
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_USAGE_UNSUPPORTED');
       if (!chatAdaptation(state.adaptations, model!.model_key))
-        throw new ProviderError(409, 'ADAPTER_PENDING');
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
       const old = state.preferences.find(
         (p) => p.model_key === model!.model_key && p.usage === usage,
       );
       const enabled = patch.enabled ?? old?.enabled ?? true;
-      if (patch.isDefault && !enabled) throw new ProviderError(409, 'MODEL_DISABLED');
+      if (patch.isDefault && !enabled)
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
       // Disable/remove/rotate preserves the default target, exposing its effective validity separately.
       const isDefault = patch.isDefault ?? old?.is_default ?? false;
       if (isDefault)
@@ -193,7 +202,7 @@ export class ProviderStore {
       const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0]!;
       const model = findModel(state.models, entry.modelRef);
       const reason = membershipError(row, model);
-      if (reason) throw new ProviderError(409, reason);
+      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
       await client.query(
         `INSERT INTO mio_provider_model_adaptations(provider_id,model_key,operation,profile,declaration_version,
           source,source_version,capability_metadata) VALUES($1,$2,$3,$4,1,$5,$6,$7::jsonb)
@@ -253,9 +262,9 @@ export class ProviderStore {
     await this.transaction(async (client) => {
       const row = await this.locked(client, owner);
       if (row.id !== start.id || row.credential_version !== start.credential_version)
-        throw new ProviderError(409, 'PROVIDER_CREDENTIAL_CHANGED');
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_CREDENTIAL_CHANGED');
       if (row.latest_refresh_seq !== start.latest_refresh_seq)
-        throw new ProviderError(409, 'PROVIDER_REFRESH_SUPERSEDED');
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_REFRESH_SUPERSEDED');
       if (discovery.status === 'connected') {
         const version = (row.catalog_version ?? 0) + 1;
         await client.query(
@@ -303,7 +312,8 @@ export class ProviderStore {
   ): Promise<void> {
     await this.transaction(async (client) => {
       const row = await this.locked(client, owner);
-      if (row.id !== snapshot.providerConfigId) throw new ProviderError(409, 'MODEL_NOT_FOUND');
+      if (row.id !== snapshot.providerConfigId)
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
       const current =
         row.credential_version === snapshot.credentialVersion &&
         row.catalog_version === snapshot.catalogVersion;
@@ -345,7 +355,7 @@ export async function createProviderStore(config: ProviderConfig): Promise<Provi
     query_timeout: 5000,
     application_name: 'mio-providers',
   });
-  pool.on('error', () => console.error('PROVIDER_DATABASE_CONNECTION_ERROR'));
+  pool.on('error', () => log.error('PROVIDER_DATABASE_CONNECTION_ERROR'));
   try {
     await checkProviderSchema(pool);
     return new ProviderStore(pool, config);

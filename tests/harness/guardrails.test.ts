@@ -640,10 +640,9 @@ it.each([
       'scripts/harness/tool.ts': 'export const tool = 1;',
       'src/http-request.ts':
         "import type { IncomingMessage } from 'node:http'; export type Request = IncomingMessage;",
-      'src/http-response.ts': `import { randomUUID } from 'node:crypto';
-import type { ServerResponse } from 'node:http';
+      'src/http-response.ts': `import type { ServerResponse } from 'node:http';
 import type { ApiError } from './contracts.ts';
-export function start(response: ServerResponse): ApiError { return { error: { code: randomUUID() + response.statusCode } }; }`,
+export function start(response: ServerResponse): ApiError { return { error: { code: String(response.statusCode) } }; }`,
       'src/assets/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
       'src/compute/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
     });
@@ -675,13 +674,9 @@ export function start(response: ServerResponse): ApiError { return { error: { co
       "export { Pool } from 'pg';",
       "import '../scripts/harness/tool.ts';",
       "export { URL } from 'node:url';",
+      "export { randomUUID } from 'node:crypto';",
       "export const asset = () => import('./assets/value.ts');",
-      ...(file === 'src/http-request.ts'
-        ? [
-            "export type { ApiError } from '@contract';",
-            "export { randomUUID } from 'node:crypto';",
-          ]
-        : []),
+      ...(file === 'src/http-request.ts' ? ["export type { ApiError } from '@contract';"] : []),
     ];
     for (const source of rejected) {
       await writeFile(helper, source);

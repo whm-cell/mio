@@ -1,3 +1,4 @@
+import { HttpError } from '@mio/foundation/errors';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
@@ -65,12 +66,4 @@ export interface ConversationEngine {
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;
 }
-export class ConversationError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string) {
-    super(code);
-    this.status = status;
-    this.code = code;
-  }
-}
+export class ConversationError extends HttpError {}

@@ -2,7 +2,7 @@
 
 仓库内开发、人工测试优先使用[常驻环境](../docs/local-environments.md)的 `compute:init:dev/test` 与 `compute:start:dev/test`；初始化只做一次，启动在前台运行，使用该环境独立的 broker 身份和 journal。`start:dev/test` 启动主服务 A，不会同时启动 B。MQ 权限与部署边界见 [RabbitMQ 契约](../docs/integrations/rabbitmq.md)；下列原始入口仍用于独立部署产物。
 
-本进程只接受计算协议 v1，通过受限 B 身份消费命令并发送结果。需要 Node 24、`ffmpeg`（含 libx264、AAC）和 `ffprobe`。先构建共享协议及 Worker，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
+本进程只接受计算协议 v1，通过受限 B 身份消费命令并发送结果。需要 Node 24、`ffmpeg`（含 libx264、AAC）和 `ffprobe`。先用仓库根 `pnpm build` 构建共享基础库、协议和 Worker，独立产物须提供这两个工作区运行时依赖，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
 
 首次新建卷时显式运行 `node compute/dist/main.js init`，其后运行 `node compute/dist/main.js start`。已有卷丢失、损坏或实例身份不一致时，停止消费并调查；不要对已有卷重新初始化。journal、WAL、SHM 和未确认的输入/输出都须保留在一起。目录是单实例独占的；SQLite 的锁在进程退出后释放，各事件和状态独立提交。
 

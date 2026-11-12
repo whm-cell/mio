@@ -1,11 +1,12 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { readBody } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { AUTH_BASE_PATH } from './config.ts';
 import type { AuthConfig } from './config.ts';
 import type { Authentication } from './service.ts';
 
 const AUTH_BODY_LIMIT_BYTES = 16 * 1024;
-const AUTH_BODY_TIMEOUT_MS = 10_000;
 
 const routes = new Map([
   ['/sign-up/email', 'POST'],
@@ -19,34 +20,6 @@ const routes = new Map([
   ['/revoke-other-sessions', 'POST'],
 ]);
 
-function readBody(request: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let length = 0;
-    const finish = (error?: Error) => {
-      clearTimeout(timer);
-      request.off('data', data);
-      request.off('end', end);
-      request.off('error', fail);
-      request.off('aborted', aborted);
-      if (error) {
-        request.resume();
-        reject(error);
-      } else resolve(Buffer.concat(chunks));
-    };
-    const data = (chunk: Buffer) => {
-      length += chunk.length;
-      if (length > AUTH_BODY_LIMIT_BYTES) finish(new Error('BODY_TOO_LARGE'));
-      else chunks.push(chunk);
-    };
-    const end = () => finish();
-    const fail = () => finish(new Error('BODY_INVALID'));
-    const aborted = () => finish(new Error('BODY_INVALID'));
-    const timer = setTimeout(() => finish(new Error('BODY_TIMEOUT')), AUTH_BODY_TIMEOUT_MS);
-    request.on('data', data).once('end', end).once('error', fail).once('aborted', aborted);
-  });
-}
-
 /** Bound browser-facing auth endpoints; future provider/plugin routes are not exposed implicitly. */
 export function createAuthHandler(config: AuthConfig, auth: Authentication) {
   const allowed = new Set(config.origins);
@@ -56,7 +29,8 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     };
     const origin = request.headers.origin;
-    if (origin !== undefined && !allowed.has(origin)) return fail(403, 'ORIGIN_DENIED');
+    if (origin !== undefined && !allowed.has(origin))
+      return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
     if (origin !== undefined) {
       response.setHeader('access-control-allow-origin', origin);
       response.setHeader('access-control-allow-credentials', 'true');
@@ -65,10 +39,10 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
     const pathname = (request.url ?? '').split('?')[0]!;
     const method =
       pathname === '/api/v1/me' ? 'GET' : routes.get(pathname.slice(AUTH_BASE_PATH.length));
-    if (!method) return fail(404, 'NOT_FOUND');
+    if (!method) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
     if (request.method === 'OPTIONS') {
-      if (!origin) return fail(403, 'ORIGIN_REQUIRED');
-      response.writeHead(204, {
+      if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+      response.writeHead(HTTP_STATUS.NO_CONTENT, {
         'access-control-allow-methods': `${method}, OPTIONS`,
         'access-control-allow-headers': 'Content-Type',
       });
@@ -77,14 +51,14 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
     }
     if (request.method !== method) {
       response.setHeader('allow', `${method}, OPTIONS`);
-      return fail(405, 'METHOD_NOT_ALLOWED');
+      return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
     }
-    if (method === 'POST' && !origin) return fail(403, 'ORIGIN_REQUIRED');
+    if (method === 'POST' && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
     if (
       method === 'POST' &&
       request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
     )
-      return fail(415, 'JSON_REQUIRED');
+      return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
     try {
       const headers = new Headers();
       for (const name of ['cookie', 'origin', 'content-type', 'user-agent'] as const) {
@@ -94,12 +68,15 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       headers.set('x-mio-client-ip', request.socket.remoteAddress ?? '127.0.0.1');
       if (pathname === '/api/v1/me') {
         const identity = await auth.identity(headers);
-        if (!identity) return fail(401, 'UNAUTHORIZED');
-        response.writeHead(200, { 'content-type': 'application/json' });
+        if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
         response.end(JSON.stringify(identity));
         return;
       }
-      const body = method === 'POST' ? (await readBody(request)).toString('utf8') : undefined;
+      const body =
+        method === 'POST'
+          ? (await readBody(request, AUTH_BODY_LIMIT_BYTES)).toString('utf8')
+          : undefined;
       const result = await auth.handler(
         new Request(`${config.baseURL}${request.url}`, {
           method,
@@ -107,23 +84,24 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
           ...(body === undefined ? {} : { body }),
         }),
       );
+      const resultBody = Buffer.from(await result.arrayBuffer());
       for (const [name, value] of result.headers)
         if (!['set-cookie', 'cache-control'].includes(name)) response.setHeader(name, value);
       const cookies = result.headers.getSetCookie();
       if (cookies.length) response.setHeader('set-cookie', cookies);
       response.statusCode = result.status;
-      response.end(Buffer.from(await result.arrayBuffer()));
+      response.end(resultBody);
     } catch (error) {
       if (response.writableEnded) return;
       const code = error instanceof Error ? error.message : '';
       fail(
         code === 'BODY_TOO_LARGE'
-          ? 413
+          ? HTTP_STATUS.PAYLOAD_TOO_LARGE
           : code === 'BODY_TIMEOUT'
-            ? 408
+            ? HTTP_STATUS.REQUEST_TIMEOUT
             : code === 'BODY_INVALID'
-              ? 400
-              : 503,
+              ? HTTP_STATUS.BAD_REQUEST
+              : HTTP_STATUS.SERVICE_UNAVAILABLE,
         code.startsWith('BODY_') ? code : 'AUTH_UNAVAILABLE',
       );
     }

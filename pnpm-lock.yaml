@@ -80,6 +80,9 @@ importers:
       '@mio/compute-contracts':
         specifier: workspace:*
         version: link:contracts/compute
+      '@mio/foundation':
+        specifier: workspace:*
+        version: link:packages/foundation
       '@redis/client':
         specifier: 6.2.1
         version: 6.2.1(@opentelemetry/api@1.9.0)
@@ -135,6 +138,9 @@ importers:
       '@mio/compute-contracts':
         specifier: workspace:*
         version: link:../contracts/compute
+      '@mio/foundation':
+        specifier: workspace:*
+        version: link:../packages/foundation
       amqplib:
         specifier: 2.2.1
         version: 2.2.1
@@ -143,6 +149,8 @@ importers:
         version: 3.0.0
 
   contracts/compute: {}
+
+  packages/foundation: {}
 
 packages:
 

@@ -1,19 +1,14 @@
-import { randomUUID } from 'node:crypto';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
+import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { COMPUTE_PROFILE, COMPUTE_VERSION } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
+import { ComputeError } from './errors.ts';
 
-export class ComputeError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string) {
-    super(code);
-    this.status = status;
-    this.code = code;
-  }
-}
+const log = createLogger('app', 'compute-store');
 
 export interface JobRow {
   id: string;
@@ -126,7 +121,8 @@ export class ComputeStore {
         )
       ).rows[0];
       if (existing) {
-        if (existing.input_asset_id !== assetId) throw new ComputeError(409, 'REQUEST_CONFLICT');
+        if (existing.input_asset_id !== assetId)
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return { job: existing, created: false };
       }
       const counts = (
@@ -136,7 +132,7 @@ export class ComputeStore {
         )
       ).rows[0]!;
       if (Number(counts.global_count) >= 500 || Number(counts.owner_count) >= 10)
-        throw new ComputeError(429, 'COMPUTE_QUOTA_EXCEEDED');
+        throw new ComputeError(HTTP_STATUS.TOO_MANY_REQUESTS, 'COMPUTE_QUOTA_EXCEEDED');
       const asset = (
         await client.query<{ raw_key: string; size_bytes: string }>(
           "SELECT raw_key,size_bytes FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' FOR SHARE",
@@ -144,10 +140,10 @@ export class ComputeStore {
         )
       ).rows[0];
       if (!asset || asset.raw_key !== key || Number(asset.size_bytes) !== size)
-        throw new ComputeError(404, 'ASSET_NOT_FOUND');
-      const id = randomUUID(),
-        attemptId = randomUUID(),
-        commandId = randomUUID();
+        throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+      const id = createId(),
+        attemptId = createId(),
+        commandId = createId();
       const job = (
         await client.query<JobRow>(
           `INSERT INTO mio_compute_jobs(id,owner_id,request_id,input_asset_id,input_key,input_size,input_etag,state,attempt,attempt_id,command_id)
@@ -165,7 +161,7 @@ export class ComputeStore {
   }
 
   async claim(): Promise<{ command: ComputeCommandV1; lease: string } | undefined> {
-    const lease = randomUUID();
+    const lease = createId();
     const row = (
       await this.pool.query<{ command: ComputeCommandV1 }>(
         `UPDATE mio_compute_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
@@ -221,7 +217,7 @@ export class ComputeStore {
           'SELECT id FROM mio_compute_inbox WHERE id=$1 AND payload=$2::jsonb',
           [result.messageId, JSON.stringify(result)],
         );
-        if (!same.rowCount) throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (!same.rowCount) throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         return;
       }
       const job = (
@@ -238,7 +234,7 @@ export class ComputeStore {
       )
         return;
       if (result.state === 'succeeded') {
-        const asset = randomUUID();
+        const asset = createId();
         await client.query(
           `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at,staging_deleted_at,asset_kind)
           VALUES($1,$2,'transcoded.mp4','video/mp4',$3,NULL,$4,'ready',now(),now(),'derived')`,
@@ -252,7 +248,7 @@ export class ComputeStore {
         const next = (
           await client.query<JobRow>(
             `UPDATE mio_compute_jobs SET attempt=attempt+1,attempt_id=$2,command_id=$3,error_code=$4,updated_at=now() WHERE id=$1 RETURNING *`,
-            [job.id, randomUUID(), randomUUID(), result.errorCode],
+            [job.id, createId(), createId(), result.errorCode],
           )
         ).rows[0]!;
         await client.query('INSERT INTO mio_compute_outbox(id,job_id,command) VALUES($1,$2,$3)', [
@@ -287,7 +283,7 @@ export async function createComputeStore(databaseURL: string): Promise<ComputeSt
     query_timeout: 5000,
     application_name: 'mio-compute',
   });
-  pool.on('error', () => console.error('COMPUTE_DATABASE_CONNECTION_ERROR'));
+  pool.on('error', () => log.error('COMPUTE_DATABASE_CONNECTION_ERROR'));
   try {
     await checkComputeSchema(pool);
     return new ComputeStore(pool);

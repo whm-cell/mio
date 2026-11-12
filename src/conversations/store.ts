@@ -1,3 +1,5 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { checkConversationSchema } from './schema.ts';
@@ -11,6 +13,8 @@ import type {
 } from './contracts.ts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 import { legacyReference } from '../providers/catalog.ts';
+
+const log = createLogger('app', 'conversation-store');
 
 export interface ConversationRow {
   id: string;
@@ -57,7 +61,8 @@ export class ConversationStore {
     });
   }
   private assertActive(): void {
-    if (!this.active) throw new ConversationError(503, 'CONVERSATION_UNAVAILABLE');
+    if (!this.active)
+      throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNAVAILABLE');
   }
   markUnavailable(): void {
     this.active = false;
@@ -88,14 +93,16 @@ export class ConversationStore {
           [id, actor.userId],
         )
       ).rows[0];
-      if (!row) throw new ConversationError(404, 'CONVERSATION_NOT_FOUND');
+      if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'CONVERSATION_NOT_FOUND');
       if (row.model_binding) {
         const legacy = legacyReference(modelRef);
         if (row.model_binding.modelRef !== modelRef && legacy?.id !== row.model_binding.modelId)
-          throw new ConversationError(409, 'CONVERSATION_MODEL_LOCKED');
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_LOCKED');
       } else {
-        if (row.active_request) throw new ConversationError(409, 'CONVERSATION_BUSY');
-        if (row.state !== 'ready') throw new ConversationError(409, 'CONVERSATION_UNKNOWN');
+        if (row.active_request)
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+        if (row.state !== 'ready')
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
         row.model_binding = await select();
         await client.query('UPDATE mio_conversations SET model_binding=$2::jsonb WHERE id=$1', [
           id,
@@ -126,7 +133,7 @@ export class ConversationStore {
         [id, actor.userId],
       )
     ).rows[0];
-    if (!row) throw new ConversationError(404, 'CONVERSATION_NOT_FOUND');
+    if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'CONVERSATION_NOT_FOUND');
     return row;
   }
   async list(actor: Principal, after: string | undefined, limit: number) {
@@ -150,7 +157,7 @@ export class ConversationStore {
         [id, requestId],
       )
     ).rows[0];
-    if (!row) throw new ConversationError(404, 'REQUEST_NOT_FOUND');
+    if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'REQUEST_NOT_FOUND');
     return receipt(row);
   }
   async latest(actor: Principal, id: string): Promise<Receipt | null> {
@@ -182,22 +189,26 @@ export class ConversationStore {
           [id, actor.userId],
         )
       ).rows[0];
-      if (!row) throw new ConversationError(404, 'CONVERSATION_NOT_FOUND');
+      if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'CONVERSATION_NOT_FOUND');
       const old = (
         await client.query<RequestRow>(
           'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
           [id, requestId],
         )
       ).rows[0];
-      if (old && old.digest !== digest) throw new ConversationError(409, 'REQUEST_ID_CONFLICT');
+      if (old && old.digest !== digest)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
       if (old) {
         await client.query('COMMIT');
         return { row, receipt: receipt(old), fresh: false };
       }
-      if (row.state !== 'ready') throw new ConversationError(409, 'CONVERSATION_UNKNOWN');
-      if (row.active_request) throw new ConversationError(409, 'CONVERSATION_BUSY');
+      if (row.state !== 'ready')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+      if (row.active_request)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
       const snapshot = typeof resolveFresh === 'function' ? await resolveFresh(row) : undefined;
-      if (resolveFresh === false) throw new ConversationError(503, 'MODEL_UNAVAILABLE');
+      if (resolveFresh === false)
+        throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
       // Only explicit non-secret fields may cross the persistence boundary.
       const binding = snapshot
         ? {
@@ -334,7 +345,7 @@ export async function createConversationStore(databaseURL: string): Promise<Conv
     query_timeout: 5000,
     application_name: 'mio-conversations',
   });
-  pool.on('error', () => console.error('CONVERSATION_DATABASE_CONNECTION_ERROR'));
+  pool.on('error', () => log.error('CONVERSATION_DATABASE_CONNECTION_ERROR'));
   let lease: PoolClient | undefined;
   try {
     await checkConversationSchema(pool);

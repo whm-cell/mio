@@ -47,6 +47,8 @@ pnpm check
 
 `check` 执行格式、类型、lint、文档/结构/索引护栏、测试、构建和官方 Profile 产物 smoke。安装不执行依赖构建脚本；当前最小 Profile 不使用需要额外原生构建的运行能力。
 
+`pnpm build` 先构建共享基础库和计算合同，再构建 A 与 B。部署产物必须随各服务提供这些工作区运行时依赖；仓库内 smoke 的依赖链接不单独证明工作区外产物完整。
+
 万联动态目录、稳定模型身份及文本消费者按[供应商规范](docs/providers.md)配置本域数据库与主密钥并显式迁移。分库历史引用迁移、部署适配声明和使用方式以该页为准；新 ID 由当前 Key 目录发现，不维护生产型号白名单。开发安排与实际接受见[万联 PRD](docs/tasks/onelink-integration/prd.md)及其成果入口。普通检查不自动访问万联；真实目录/文本须另行显式授权。目录成功不等于全部协议、媒体或生产验收。
 
 启用 provider 域后，对话创建使用准确 modelRef 或本人显式 chat 默认，旧无绑定会话由 owner 一次绑定；按[对话 API](docs/apis/conversations.md)操作并显式执行增量 `conversations:migrate --apply`。未启用 provider 域时保留显式 legacy 路由，BYOK 缺配置不回退。独立真实入口为 `node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id]`，默认 deepseek-v4.1-flash，不进入普通 check；执行前核对本人凭据、测试范围和费用授权，文本授权不扩大媒体、工具或部署范围，也不代表人类接受。

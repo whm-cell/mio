@@ -1,12 +1,17 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createLogger } from '@mio/foundation/logging';
+import { epochMs } from '@mio/foundation/time';
+import { isUuidV4 } from '@mio/foundation/identifiers';
 import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeBroker } from '../integrations/rabbitmq.ts';
 import type { ComputeConfig } from './config.ts';
-import { ComputeError } from './store.ts';
+import { ComputeError } from './errors.ts';
 import type { ComputeStore, JobRow } from './store.ts';
 
-const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const log = createLogger('app', 'compute');
+
 function view(job: JobRow) {
   return {
     jobId: job.id,
@@ -36,7 +41,7 @@ export function createComputeService(
   const active = new Set<Promise<unknown>>();
   const stop = new AbortController();
   const admit = <T>(run: () => Promise<T>): Promise<T> => {
-    if (stopping) throw new ComputeError(503, 'COMPUTE_UNAVAILABLE');
+    if (stopping) throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_UNAVAILABLE');
     const action = run();
     active.add(action);
     void action.then(
@@ -77,6 +82,11 @@ export function createComputeService(
     });
   const receive = (result: ComputeResultV1) =>
     admit(async () => {
+      const resultLog = log.child({
+        jobId: result.jobId,
+        attemptId: result.attemptId,
+        messageId: result.messageId,
+      });
       if (result.state === 'succeeded' && (await store.current(result))) {
         const object = await head(result.output.key);
         if (
@@ -88,9 +98,12 @@ export function createComputeService(
       }
       try {
         await store.accept(result);
+        resultLog.info('RESULT_COMMITTED');
       } catch (error) {
-        if (error instanceof ComputeError && error.code === 'RESULT_CONFLICT')
+        if (error instanceof ComputeError && error.code === 'RESULT_CONFLICT') {
+          resultLog.warn('RESULT_CONFLICT');
           throw Object.assign(error, { permanent: true });
+        }
         throw error;
       }
     });
@@ -99,7 +112,7 @@ export function createComputeService(
     void instance.close().catch(() => {});
   };
   const poll = () => {
-    if (stopping || polling || Date.now() < retryAt) return;
+    if (stopping || polling || epochMs() < retryAt) return;
     polling = admit(async () => {
       if (!broker) {
         const acquired = await ComputeBroker.connect(
@@ -136,8 +149,8 @@ export function createComputeService(
     })
       .catch(() => {
         if (!stopping) {
-          console.error('COMPUTE_BROKER_RETRY');
-          retryAt = Date.now() + retryDelay;
+          log.error('COMPUTE_BROKER_RETRY');
+          retryAt = epochMs() + retryDelay;
           retryDelay = Math.min(retryDelay * 2, 30_000);
         }
       })
@@ -151,31 +164,32 @@ export function createComputeService(
   return {
     create(actor: AssetPrincipal, requestId: string, assetId: string) {
       return admit(async () => {
-        if (!uuid.test(requestId) || !uuid.test(assetId))
-          throw new ComputeError(400, 'COMPUTE_INPUT_INVALID');
+        if (!isUuidV4(requestId) || !isUuidV4(assetId))
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'COMPUTE_INPUT_INVALID');
         const previous = await store.request(actor.userId, requestId);
         if (previous) {
-          if (previous.input_asset_id !== assetId) throw new ComputeError(409, 'REQUEST_CONFLICT');
+          if (previous.input_asset_id !== assetId)
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
           return { created: false, job: view(previous) };
         }
         const input = await store.input(actor.userId, assetId);
         if (
           !input ||
           !input.raw_key.startsWith(`mio/raw/${assetId}/`) ||
-          !uuid.test(input.raw_key.slice(`mio/raw/${assetId}/`.length))
+          !isUuidV4(input.raw_key.slice(`mio/raw/${assetId}/`.length))
         )
-          throw new ComputeError(404, 'ASSET_NOT_FOUND');
+          throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
         let object: Awaited<ReturnType<AssetObjectStore['head']>>;
         try {
           object = await head(input.raw_key);
         } catch {
-          throw new ComputeError(503, 'COMPUTE_STORAGE_UNAVAILABLE');
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
         }
         const size = Number(input.size_bytes);
         if (object.size !== size || size < 1 || size > COMPUTE_MAX_MEDIA_BYTES)
-          throw new ComputeError(409, 'ASSET_SIZE_MISMATCH');
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
         if (!object.etag || object.etag.length > 256 || /[\x00-\x1f\x7f]/.test(object.etag))
-          throw new ComputeError(503, 'COMPUTE_STORAGE_UNAVAILABLE');
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
         const created = await store.create(
           actor.userId,
           requestId,
@@ -189,9 +203,9 @@ export function createComputeService(
     },
     get(actor: AssetPrincipal, id: string) {
       return admit(async () => {
-        if (!uuid.test(id)) throw new ComputeError(404, 'NOT_FOUND');
+        if (!isUuidV4(id)) throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
         const job = await store.owned(id, actor.userId);
-        if (!job) throw new ComputeError(404, 'JOB_NOT_FOUND');
+        if (!job) throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
         return view(job);
       });
     },

@@ -1,5 +1,5 @@
 import { readFile, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
 import { beneath } from './inventory.ts';
 import type { HarnessConfig } from './inventory.ts';
@@ -7,6 +7,7 @@ import {
   allowsCapability,
   allowsPackageAdapter,
   directBuiltinAccess,
+  directProcessObject,
   restrictedCapability,
 } from './source-boundaries.ts';
 import {
@@ -18,21 +19,35 @@ import {
 
 const httpPrimitiveDependencies: Record<
   string,
-  { builtins: readonly string[]; local: readonly string[]; diagnostic: string; description: string }
+  {
+    builtins: readonly string[];
+    local: readonly string[];
+    foundation: readonly string[];
+    diagnostic: string;
+    description: string;
+  }
 > = {
   'src/http-request.ts': {
     builtins: ['node:http'],
     local: [],
+    foundation: ['@mio/foundation/errors', '@mio/foundation/http-status'],
     diagnostic: 'HTTP_REQUEST_DEPENDENCY',
     description: 'Node HTTP',
   },
   'src/http-response.ts': {
-    builtins: ['node:http', 'node:crypto'],
+    builtins: ['node:http'],
     local: ['src/contracts.ts'],
+    foundation: ['@mio/foundation/identifiers'],
     diagnostic: 'HTTP_RESPONSE_DEPENDENCY',
-    description: 'Node HTTP/UUID and contracts',
+    description: 'Node HTTP, foundation identifiers and contracts',
   },
 };
+
+function builtinLoaderName(node: ts.Node): boolean {
+  return (
+    (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === 'getBuiltinModule'
+  );
+}
 
 // Aliases can lack packageId; file symlinks can retain a different packageId.
 async function owningPackageName(file: string): Promise<string | undefined> {
@@ -61,6 +76,15 @@ export async function checkSource(root: string, files: readonly string[], harnes
   const graph = new Map<string, string[]>();
   const checked = await inspectProjects(root, files, harness);
   errors.push(...checked.errors);
+  const libraryOutputs = new Map<string, string>();
+  for (const project of checked.projects) {
+    if (project.declaration.kind !== 'library' || !project.output) continue;
+    try {
+      libraryOutputs.set(project.id, await realpath(resolve(root, project.output)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
   const membership = new Map<ts.ParsedCommandLine, Set<string>>();
   const targetOwners = new Map<string, ReturnType<typeof projectForTarget>>();
   const includes = (config: ts.ParsedCommandLine, file: string) => {
@@ -203,6 +227,28 @@ export async function checkSource(root: string, files: readonly string[], harnes
             );
         } else errors.push(`DYNAMIC_BUILTIN ${file}: process.getBuiltinModule cannot be detached`);
       }
+      if (
+        project?.declaration.kind === 'library' &&
+        ((ts.isVariableDeclaration(node) &&
+          ts.isObjectBindingPattern(node.name) &&
+          !!node.initializer &&
+          directProcessObject(node.initializer) &&
+          node.name.elements.some(
+            (element) =>
+              !!element.dotDotDotToken || builtinLoaderName(element.propertyName ?? element.name),
+          )) ||
+          (ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isObjectLiteralExpression(node.left) &&
+            directProcessObject(node.right) &&
+            node.left.properties.some(
+              (element) =>
+                ts.isSpreadAssignment(element) ||
+                ((ts.isPropertyAssignment(element) || ts.isShorthandPropertyAssignment(element)) &&
+                  builtinLoaderName(element.name)),
+            )))
+      )
+        errors.push(`DYNAMIC_BUILTIN ${file}: library cannot destructure the builtin loader`);
       ts.forEachChild(node, (child) => visit(child, nextDepth));
     };
     visit(source);
@@ -310,11 +356,46 @@ export async function checkSource(root: string, files: readonly string[], harnes
       )
         errors.push(`PROJECT_IMPORT_UNRESOLVED ${file}: ${specifier}`);
       if (!production) continue;
+      const canonicalLibrary = checked.projects.find(
+        (owner) =>
+          owner.declaration.kind === 'library' &&
+          (specifier === owner.packageName || specifier.startsWith(`${owner.packageName}/`)),
+      );
+      if (canonicalLibrary && resolved) {
+        const entry =
+          specifier === canonicalLibrary.packageName
+            ? '.'
+            : `.${specifier.slice(canonicalLibrary.packageName.length)}`;
+        if (
+          ownedTarget?.project.id !== canonicalLibrary.id ||
+          !canonicalLibrary.publicEntryTargets.get(entry)?.has(ownedTarget.path)
+        )
+          errors.push(
+            `LIBRARY_ENTRY_MISMATCH ${file}: ${specifier} resolves outside its registered entry`,
+          );
+      }
+      const libraryOutput = project && libraryOutputs.get(project.id);
+      if (libraryOutput && resolved) {
+        const actual = await realpath(resolved.resolvedFileName);
+        const fromOutput = relative(libraryOutput, actual);
+        if (
+          fromOutput === '' ||
+          (fromOutput !== '..' && !fromOutput.startsWith(`..${sep}`) && !isAbsolute(fromOutput))
+        )
+          errors.push(
+            `LIBRARY_BUILD_OUTPUT ${file}: ${specifier} depends on its own generated output`,
+          );
+      }
       if (
         httpPrimitive &&
         !(
           (!resolved && httpPrimitive.builtins.includes(specifier)) ||
-          (target && !resolved?.isExternalLibraryImport && httpPrimitive.local.includes(target))
+          (target && !resolved?.isExternalLibraryImport && httpPrimitive.local.includes(target)) ||
+          (httpPrimitive.foundation.includes(specifier) &&
+            ownedTarget?.project.packageName === '@mio/foundation' &&
+            ownedTarget.project.publicEntryTargets
+              .get(`.${specifier.slice(ownedTarget.project.packageName.length)}`)
+              ?.has(ownedTarget.path))
         )
       )
         errors.push(
@@ -371,13 +452,20 @@ export async function checkSource(root: string, files: readonly string[], harnes
         errors.push(`RUNTIME_CAPABILITY ${file}: ${specifier} needs an explicit reviewed boundary`);
       }
       const publicContract =
-        ownedTarget?.project.declaration.kind === 'contract' &&
+        (ownedTarget?.project.declaration.kind === 'contract' ||
+          ownedTarget?.project.declaration.kind === 'library') &&
         ownedTarget.project.publicTargets.has(ownedTarget.path);
       const allowedContract = project?.declaration.kind === 'service' && publicContract;
       if (project && ownedTarget && project.id !== ownedTarget.project.id && !allowedContract)
         errors.push(
           `PROJECT_DEPENDENCY ${file}: ${specifier} crosses into ${ownedTarget.project.id} private code`,
         );
+      if (
+        project?.declaration.kind === 'library' &&
+        ownedTarget?.project.id !== project.id &&
+        !(!resolved && ['node:crypto', 'node:perf_hooks'].includes(specifier))
+      )
+        errors.push(`LIBRARY_DEPENDENCY ${file}: ${specifier} is outside the library boundary`);
       const localTarget = ownedTarget?.path ?? target;
       if (localTarget && (!resolved?.isExternalLibraryImport || ownedTarget)) {
         if (roleOf(localTarget) !== 'production' && !publicContract)

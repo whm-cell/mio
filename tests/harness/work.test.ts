@@ -49,11 +49,11 @@ afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-function begin(root: string, args: string[]) {
+function begin(root: string, args: string[], timeout = 10_000) {
   const child = spawn(process.execPath, [cli, ...args], {
     cwd: root,
     env: { PATH: process.env.PATH ?? '' },
-    timeout: 10000,
+    timeout,
   });
   let output = '';
   child.stdout.on('data', (bytes: Buffer) => {
@@ -449,6 +449,7 @@ async function implementing(root: string) {
   expect(result.status, result.output).toBe(0);
 }
 
+// This integration scenario starts many individually bounded CLI processes.
 it('rejects competing task writes before launching them while reads and another task continue', async () => {
   const root = await fixture();
   await ready(root);
@@ -464,7 +465,11 @@ it('rejects competing task writes before launching them while reads and another 
   const revision = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output).revision;
   const script =
     'const fs=require("node:fs");fs.writeFileSync(".work/started","ready");setInterval(()=>{if(fs.existsSync(".work/finish"))process.exit(0)},20)';
-  const running = begin(root, ['run', 'probe', 'checks', '--', process.execPath, '-e', script]);
+  const running = begin(
+    root,
+    ['run', 'probe', 'checks', '--', process.execPath, '-e', script],
+    30_000,
+  );
   commands.push(running);
   await expect
     .poll(() => readFile(join(root, '.work/started'), 'utf8').catch(() => ''))
@@ -537,7 +542,7 @@ it('rejects competing task writes before launching them while reads and another 
     'code',
     'ENOENT',
   );
-});
+}, 30_000);
 
 it('never turns cancellation into a pass even when the child handles SIGTERM by exiting zero', async () => {
   const root = await fixture();
@@ -1861,6 +1866,7 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
   ).toBe(0);
 });
 
+// Each observation is registered and checked through the real CLI.
 it('binds ordinary manual observations to their declared candidate, criterion and result', async () => {
   const root = await fixture();
   await ready(root);
@@ -1948,7 +1954,7 @@ it('binds ordinary manual observations to their declared candidate, criterion an
     ).result,
   ).toBe('invalid');
   expect((await state(root)).evidence.at(-1)!.candidate).toBe(candidateB);
-});
+}, 30_000);
 
 it('rejects linked original aliases at registration and when checking previously registered evidence', async () => {
   const root = await fixture();

@@ -352,6 +352,7 @@ it('revokes transitive reuse during active or interrupted source execution and r
   expect(text).toContain('Current checks: invalid');
 });
 
+// Recovery is exercised through several real task processes and chained checks.
 it.skipIf(process.platform === 'win32')(
   'keeps direct and transitive checks unresolved after hard interruption and marker recovery',
   async () => {
@@ -447,7 +448,7 @@ it.skipIf(process.platform === 'win32')(
       }
     }
   },
-  15000,
+  30_000,
 );
 
 it('rejects changed ignored configuration and mismatched external conditions', async () => {

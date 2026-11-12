@@ -27,6 +27,10 @@ jobs:
           node-version: 24.22.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install FFmpeg for media tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
       - name: Build isolated Redis 8.2.11 test binary
         run: |
           curl --fail --location https://download.redis.io/releases/redis-8.2.11.tar.gz -o "$RUNNER_TEMP/redis-8.2.11.tar.gz"
@@ -34,4 +38,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/redis-8.2.11.tar.gz" -C "$RUNNER_TEMP"
           make -C "$RUNNER_TEMP/redis-8.2.11" -j2 MALLOC=libc
           echo "MIO_TEST_REDIS_SERVER=$RUNNER_TEMP/redis-8.2.11/src/redis-server" >> "$GITHUB_ENV"
-      - run: pnpm check
+      - name: Run checks
+        run: |
+          node -e 'console.log({node: process.version, availableParallelism: require("node:os").availableParallelism(), vitestMaxWorkers: process.env.VITEST_MAX_WORKERS})'
+          pnpm check

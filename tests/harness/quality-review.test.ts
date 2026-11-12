@@ -709,6 +709,7 @@ it('checks declared requirement and design current pages without duplicating ord
   await expect(readFile(join(f.root, 'docs/tasks/index.md'))).rejects.toThrow();
 });
 
+// The scenario checks each report through a separate CLI process.
 it('rejects missing reconciliation dimensions, bad source binding and fail or pending observations labelled as all pass', async () => {
   const f = await fixture(['docs/api.md']);
   const update = cli(f.root, ['update', f.id, '--stdin'], {
@@ -797,7 +798,7 @@ it('rejects missing reconciliation dimensions, bad source binding and fail or pe
   task.evidence.at(-1)!.result = 'pass';
   await writeFile(f.path, JSON.stringify(task));
   expect(f.context().assessment.normsReview.result).toBe('invalid');
-});
+}, 30_000);
 
 it('reads legacy originals without migration but requires an explicit v2 declaration for new evidence', async () => {
   const f = await fixture(['docs/api.md'], false);

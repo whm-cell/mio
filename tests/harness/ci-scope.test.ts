@@ -164,3 +164,27 @@ it('falls back when the event, checkout or PR merge candidate cannot be establis
     select({}, { GITHUB_EVENT_NAME: 'pull_request', GITHUB_REF: 'refs/pull/1/merge' }).mode,
   ).toBe('full');
 });
+
+it.each([
+  ['scripts/harness/reader.ts', 'harness'],
+  ['src/plugin.ts', 'full'],
+])('compares a real PR merge against its current target for %s', (path, mode) => {
+  write(path);
+  write('tests/harness/reader.test.ts');
+  const head = commit();
+  git('checkout', '-qb', 'main', base);
+  write('src/target-advance.ts');
+  const target = commit();
+  git('merge', '--no-ff', '-qm', 'PR merge', 'topic');
+  const merged = git('rev-parse', 'HEAD');
+  const event = { pull_request: { base: { sha: target }, head: { sha: head } } };
+  const environment = { GITHUB_EVENT_NAME: 'pull_request', GITHUB_REF: 'refs/pull/1/merge' };
+  expect(select(event, environment)).toMatchObject({ mode, base: target, head: merged });
+  // Neither an older target nor a later PR head describes this immutable merge candidate.
+  expect(
+    select({ pull_request: { base: { sha: base }, head: { sha: head } } }, environment).mode,
+  ).toBe('full');
+  expect(
+    select({ pull_request: { base: { sha: target }, head: { sha: merged } } }, environment).mode,
+  ).toBe('full');
+});

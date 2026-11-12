@@ -8,6 +8,8 @@
 
 本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。`pnpm check:local <范围>` 以隔离回归环境运行定向测试；完整 `pnpm check` 由 GitHub Actions 执行。
 
+现有 [CI 工作流](../../.github/workflows/check.yml)仅在全部差异属于 `scripts/harness/**/*.ts`、`tests/harness/**/*.ts` 或 `docs/coordination.md`、`docs/work-records.md`、本页时执行四项静态检查及 `tests/harness/`、`tests/environment/`，不准备 PostgreSQL、Redis、FFmpeg；环境测试覆盖目录外的护栏消费者。测试入口 `validation-entry.ts`、CI 选择脚本自身、业务／共享代码、依赖、配置、混合或未知改动仍执行原 `pnpm check`；main／默认分支和手动运行始终全量。选择器比较本次 push 的 before→SHA，或本次 PR 合并候选的第一父节点→合并结果，保留重命名两端；缺失或不匹配的比较信息退回全量。定向成功只证明所列检查；完整覆盖仍须结合有效全量基线和实际差异沿既有证据协议核对，不自动继承其他提交的通过结论。
+
 - **任务资料、变更卡片与交付**：`tests/harness/changes.test.ts`、`tests/harness/documents.test.ts`、`tests/harness/*read.test.ts`、`tests/harness/work*.test.ts`、`tests/harness/delivery.test.ts`。从[变更 CLI 测试](../../tests/harness/changes.test.ts)追查读取、登记、候选或交付中实际受影响的路径。
 - **源码与工程护栏**：`tests/harness/guardrail*.test.ts`、`tests/harness/quality-review.test.ts`；AST、别名、源码发现和跨包变化保留合法／违规对照，见[源码护栏](source-guardrails.md)。
 - **插件、Profile 与内核**：[插件](../../tests/foundation/plugin.test.ts)、[内核](../../tests/foundation/kernel.test.ts)、[Profile 准备](../../tests/foundation/prepare-profile.test.ts)；装载、关闭与工具拒绝沿 [DSH 集成](../integrations/dsh.md)核对，产物 smoke 另由 `pnpm test:smoke` 执行。

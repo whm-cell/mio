@@ -1,6 +1,7 @@
 import type { TaskDocument } from '../../scripts/harness/inventory.ts';
 import { writeTaskDocuments } from './fixtures/task-documents-fixture.ts';
 import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import {
   cp,
   link,
@@ -413,7 +414,7 @@ it('preserves evidence across phase updates but invalidates it when the declared
 
 async function ready(root: string, id = 'probe') {
   expect(invoke(root, ['start', id, 'Verify the probe', 'docs/api.md']).status).toBe(0);
-  const revision = JSON.parse(invoke(root, ['context', id, 'resume']).output).revision;
+  const revision = digest(await readFile(statePath(root, id)));
   const updated = invoke(root, ['update', id, '--stdin'], {
     revision,
     reason: 'Derived the probe contract from the fixture user request.',
@@ -439,7 +440,7 @@ async function ready(root: string, id = 'probe') {
 }
 
 async function implementing(root: string) {
-  const revision = JSON.parse(invoke(root, ['context', 'probe', 'implement']).output).revision;
+  const revision = digest(await readFile(statePath(root)));
   const result = invoke(root, ['update', 'probe', '--stdin'], {
     revision,
     reason: 'The fixture user authorized the implementation command.',
@@ -743,10 +744,10 @@ it('keeps pre-record occupancy and retained markers outside task listings', asyn
 });
 
 function verifying(root: string, id = 'probe') {
-  const current = JSON.parse(invoke(root, ['context', id, 'verify']).output);
-  if (current.task.stage === 'C1_EVIDENCE_PENDING') return;
+  const raw = readFileSync(statePath(root, id));
+  if ((JSON.parse(raw.toString()) as Task).stage === 'C1_EVIDENCE_PENDING') return;
   const result = invoke(root, ['update', id, '--stdin'], {
-    revision: current.revision,
+    revision: digest(raw),
     reason: 'The fixture explicitly chooses verification of its existing candidate.',
     stage: 'C1_EVIDENCE_PENDING',
     plan: { nextAction: 'Collect the authorized fixture observations.' },
@@ -1453,6 +1454,7 @@ it.each(['verify', 'deliver', 'handoff', 'archive'])(
   async (action) => {
     const root = await fixture();
     await ready(root);
+    const ref = 'docs/coordination.md#交回与下一步';
     for (const args of [
       ['guide', action],
       ['context', 'probe', action],
@@ -1460,53 +1462,51 @@ it.each(['verify', 'deliver', 'handoff', 'archive'])(
       const result = invoke(root, args);
       expect(result.status, result.output).toBe(0);
       const reading = JSON.parse(result.output).reading as { ref: string }[];
-      const ref = 'docs/coordination.md#交回与下一步';
       expect(reading.some((entry) => entry.ref === ref)).toBe(true);
-      const selected = ref;
-      const expanded = invoke(root, [
-        'guide',
-        action,
-        '--section',
-        selected,
-        '--select',
-        '/blocks',
-        '--limit',
-        '20',
-      ]);
-      expect(expanded.status, expanded.output).toBe(0);
-      const page = JSON.parse(expanded.output);
-      let body = '';
-      for (let index = 0; index < page.page.total; index++) {
-        let offset = 0;
-        do {
-          const part = invoke(root, [
-            'guide',
-            action,
-            '--section',
-            selected,
-            '--select',
-            `/blocks/${index}/body`,
-            '--offset',
-            String(offset),
-            '--limit',
-            '2048',
-          ]);
-          expect(part.status, part.output).toBe(0);
-          const text = JSON.parse(part.output);
-          body += `${text.text}\n`;
-          offset += text.page.count;
-          if (!text.page.next) break;
-        } while (true);
-      }
-      expect(body).toContain('需求与方案');
-      expect(body).toContain('现行规范');
-      expect(body).toContain('已接受成果');
-      expect(body).toContain('取消、暂缓或未完成交接保留缺口');
-      expect(body).toContain('不是实时成果镜像');
-      expect(body).toContain('修正对应权威页后重验');
-      expect(body).toContain('不能把待接受标成已接受');
-      if (action !== 'deliver') expect(body).not.toContain('## 交付命令');
     }
+    const expanded = invoke(root, [
+      'guide',
+      action,
+      '--section',
+      ref,
+      '--select',
+      '/blocks',
+      '--limit',
+      '20',
+    ]);
+    expect(expanded.status, expanded.output).toBe(0);
+    const page = JSON.parse(expanded.output);
+    let body = '';
+    for (let index = 0; index < page.page.total; index++) {
+      let offset = 0;
+      do {
+        const part = invoke(root, [
+          'guide',
+          action,
+          '--section',
+          ref,
+          '--select',
+          `/blocks/${index}/body`,
+          '--offset',
+          String(offset),
+          '--limit',
+          '2048',
+        ]);
+        expect(part.status, part.output).toBe(0);
+        const text = JSON.parse(part.output);
+        body += `${text.text}\n`;
+        offset += text.page.count;
+        if (!text.page.next) break;
+      } while (true);
+    }
+    expect(body).toContain('需求与方案');
+    expect(body).toContain('现行规范');
+    expect(body).toContain('已接受成果');
+    expect(body).toContain('取消、暂缓或未完成交接保留缺口');
+    expect(body).toContain('不是实时成果镜像');
+    expect(body).toContain('修正对应权威页后重验');
+    expect(body).toContain('不能把待接受标成已接受');
+    if (action !== 'deliver') expect(body).not.toContain('## 交付命令');
   },
 );
 

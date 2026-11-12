@@ -1,6 +1,7 @@
 import type { TaskDocument } from '../../scripts/harness/inventory.ts';
 import { writeTaskDocuments } from './fixtures/task-documents-fixture.ts';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -95,7 +96,8 @@ async function fixture(scope = ['src'], development = true) {
   const path = join(root, `.work/tasks/${id}/state.json`);
   const state = async (): Promise<Task> => JSON.parse(await readFile(path, 'utf8'));
   const context = () => JSON.parse(cli(root, ['context', id, 'verify']).output);
-  return { root, id, path, state, context, request };
+  const revision = () => digest(readFileSync(path));
+  return { root, id, path, state, context, revision, request };
 }
 
 function normsFixture(
@@ -146,7 +148,7 @@ it('prepares a read-only pending draft, records actual observations, and rejects
     reason: 'Fixture API review is needed.',
   };
   const updated = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Declare the current fixture norm.',
     plan: { norms: declaration },
   });
@@ -202,7 +204,7 @@ it('prepares a read-only pending draft, records actual observations, and rejects
   const prepare = () =>
     cli(f.root, ['deliver', f.id, '--stdin'], {
       action: 'prepare',
-      revision: f.context().revision,
+      revision: f.revision(),
       title: 'Fixture result',
       locations: [{ path: 'docs/api.md', purpose: 'Fixture API' }],
       outcomes: 'Fixture result.',
@@ -254,7 +256,7 @@ it('prepares a read-only pending draft, records actual observations, and rejects
 
   const updateNorms = (norms: unknown) =>
     cli(f.root, ['update', f.id, '--stdin'], {
-      revision: f.context().revision,
+      revision: f.revision(),
       reason: 'Inspect changed fixture declaration.',
       plan: { norms },
     });
@@ -319,7 +321,7 @@ it('leaves a document task alone despite source inputs, and registers review on 
   expect(f.context().assessment.qualityReview.result).toBe('not_required');
   expect((await f.state()).plan.acceptance).toHaveLength(2);
   const result = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Fixture user adds source implementation.',
     plan: { scope: ['src', 'docs/api.md'] },
   });
@@ -346,12 +348,12 @@ it('refuses missing or automated quality criteria and repairs legacy omission on
   expect(
     cli(f.root, ['deliver', f.id, '--stdin'], {
       action: 'prepare',
-      revision: f.context().revision,
+      revision: f.revision(),
     }).output,
   ).toContain('WORK_QUALITY_CONTRACT');
   expect(
     cli(f.root, ['update', f.id, '--stdin'], {
-      revision: f.context().revision,
+      revision: f.revision(),
       reason: 'Use the existing quality gate.',
       plan: {
         acceptance: [{ id: 'quality-review', method: 'automated', criterion: 'Not a review.' }],
@@ -361,7 +363,7 @@ it('refuses missing or automated quality criteria and repairs legacy omission on
   expect(await readFile(f.path, 'utf8')).toBe(before);
   expect(
     cli(f.root, ['update', f.id, '--stdin'], {
-      revision: f.context().revision,
+      revision: f.revision(),
       reason: 'Register the missing required review.',
     }).status,
   ).toBe(0);
@@ -379,7 +381,7 @@ it('runs the real verify/evidence/delivery flow, blocks incomplete reviews and r
   const prepare = () =>
     cli(f.root, ['deliver', f.id, '--stdin'], {
       action: 'prepare',
-      revision: f.context().revision,
+      revision: f.revision(),
       title: 'Fixture result',
       locations: [{ path: 'src/value.ts', purpose: 'Fixture constant' }],
       outcomes: 'Fixture implementation is ready.',
@@ -492,7 +494,7 @@ it('rechecks review contents at delivery instead of trusting a forged pass label
 it('requires actual candidate-bound normative page observations and rejects old originals after a normative edit', async () => {
   const f = await fixture(['docs/api.md']);
   const changed = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Review the affected current API.',
     plan: { norms: { paths: ['docs/api.md'], reason: 'The fixture API covers this result.' } },
   });
@@ -522,7 +524,7 @@ it('requires actual candidate-bound normative page observations and rejects old 
   expect(cli(f.root, ['check', f.id]).status).toBe(1);
   expect(
     cli(f.root, ['update', f.id, '--stdin'], {
-      revision: f.context().revision,
+      revision: f.revision(),
       reason: 'The same API requirement now has its updated real heading.',
       plan: { requirement: { section: 'Updated current API' } },
     }).status,
@@ -610,8 +612,7 @@ it('enables reconciliation for maintenance without inventing a development resul
   expect(observed.status, observed.output).toBe(0);
   expect(f.context().assessment.normsReview.result).toBe('pass');
   expect(
-    cli(f.root, ['deliver', f.id, '--stdin'], { action: 'prepare', revision: f.context().revision })
-      .output,
+    cli(f.root, ['deliver', f.id, '--stdin'], { action: 'prepare', revision: f.revision() }).output,
   ).toContain('WORK_DELIVERY_RESULT');
   const cancelled = await fixture(['docs/api.md'], false);
   expect(
@@ -643,7 +644,7 @@ it('checks declared requirement and design current pages without duplicating ord
   ];
   await writeTaskDocuments(f.root, registeredDocuments);
   const updated = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Declare the fixture requirement and unadopted design sources before reviewing them.',
     plan: {
       sources: [alias, design, proposal, 'docs/api.md', 'docs/norm.md', 'docs/index.md'],
@@ -713,7 +714,7 @@ it('checks declared requirement and design current pages without duplicating ord
 it('rejects missing reconciliation dimensions, bad source binding and fail or pending observations labelled as all pass', async () => {
   const f = await fixture(['docs/api.md']);
   const update = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Review the real affected API page in all three relationships.',
     plan: { norms: { paths: ['docs/api.md'], reason: 'Fixture normative impact.' } },
   });
@@ -838,7 +839,7 @@ it('reads legacy originals without migration but requires an explicit v2 declara
   ).toContain('plan.norms.version 2');
   expect(await readFile(f.path, 'utf8')).toBe(original);
   const progress = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Only the next action changed.',
     plan: { nextAction: 'Explicitly reconcile before new evidence.' },
   });
@@ -846,7 +847,7 @@ it('reads legacy originals without migration but requires an explicit v2 declara
   expect((await f.state()).plan.norms?.version).toBeUndefined();
   expect(f.context().assessment.normsReview.result).toBe('pass');
   const upgrade = cli(f.root, ['update', f.id, '--stdin'], {
-    revision: f.context().revision,
+    revision: f.revision(),
     reason: 'Explicitly adopt the new reconciliation original contract.',
     plan: { norms: task.plan.norms },
   });

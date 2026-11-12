@@ -41,7 +41,7 @@
     "format:check": "prettier --check .",
     "guard": "node scripts/harness/check-guardrails.ts",
     "work": "node scripts/harness/work/cli.ts",
-    "test": "vitest run",
+    "test": "node scripts/harness/validation-entry.ts test",
     "test:smoke": "node scripts/service/smoke.ts",
     "profile:prepare": "node scripts/service/prepare-profile.ts",
     "auth:migrate": "node scripts/service/migrate-auth.ts",
@@ -68,8 +68,8 @@
     "start": "node scripts/service/local.ts dev start",
     "start:dev": "node scripts/service/local.ts dev start",
     "start:test": "node scripts/service/local.ts test start",
-    "check:local": "node scripts/service/local.ts test check",
-    "check": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm test && pnpm build && pnpm test:smoke"
+    "check:local": "node scripts/harness/validation-entry.ts local",
+    "check": "node scripts/harness/validation-entry.ts check && pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm test && pnpm build && pnpm test:smoke"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0"

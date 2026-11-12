@@ -29,8 +29,8 @@
 
 ```sh
 pnpm install --frozen-lockfile --ignore-scripts
-# Redis 8.2.11 已在 PATH 时直接执行；也可先按下方准备并设置 MIO_TEST_REDIS_SERVER。
-pnpm check
+# 使用实际受影响的测试文件或业务目录。
+pnpm test tests/environment/local-environment.test.ts
 ```
 
 本机没有固定 Redis 时，可编译到忽略的任务目录，不启动长期全局服务：
@@ -42,10 +42,11 @@ echo 'fba14b77c4bdcb2d5418b6741fc0cdaac4b78bc73eab9b2e5f3c255d597f16fa  .runtime
 tar -xzf .runtime/redis-build/redis-8.2.11.tar.gz -C .runtime/redis-build
 make -C .runtime/redis-build/redis-8.2.11 -j4 MALLOC=libc
 export MIO_TEST_REDIS_SERVER="$PWD/.runtime/redis-build/redis-8.2.11/src/redis-server"
-pnpm check
+pnpm --filter @mio/foundation build
+pnpm test tests/integrations/redis.test.ts
 ```
 
-`check` 执行格式、类型、lint、文档/结构/索引护栏、测试、构建和官方 Profile 产物 smoke。安装不执行依赖构建脚本；当前最小 Profile 不使用需要额外原生构建的运行能力。
+`pnpm test` 本地须显式指定测试文件或业务子目录，也可指定多个范围及名称、报告等常用选项；不接受仓库根或 `tests` 总目录。`pnpm check` 仅在 GitHub Actions 执行完整格式、类型、lint、文档/结构/索引护栏、全部测试、构建和官方 Profile 产物 smoke。本地分别运行受影响检查；完整结论按[验证协议](docs/coordination.md#验证与接受)取得。安装不执行依赖构建脚本；当前最小 Profile 不使用需要额外原生构建的运行能力。
 
 `pnpm build` 先构建共享基础库和计算合同，再构建 A 与 B。部署产物必须随各服务提供这些工作区运行时依赖；仓库内 smoke 的依赖链接不单独证明工作区外产物完整。
 
@@ -78,7 +79,7 @@ curl http://127.0.0.1:4310/readyz
 curl http://127.0.0.1:4311/readyz
 ```
 
-启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。测试中间件启动后可使用 `pnpm check:local` 对独立回归库执行完整检查，Redis 故障夹具仍需按安装章节准备。
+启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。测试中间件启动后可使用 `pnpm check:local tests/auth` 对独立回归库执行定向测试，Redis 故障夹具仍需按安装章节准备。
 
 配置：`MIO_HOST` 默认 `127.0.0.1`，`MIO_PORT` 默认 `4310`，`MIO_ALLOWED_ORIGINS` 默认 `[]`。DSH 当前不接受 `0.0.0.0` 通配绑定；远程部署使用明确的接口地址和已配置的 TLS 终止/反向代理。当前没有公网部署验收。
 
@@ -90,7 +91,7 @@ curl http://127.0.0.1:4311/readyz
 
 开发脚本按职责分为 `scripts/harness/`（工程护栏与任务协调）和 `scripts/service/`（Profile、启动、产物 smoke）。目录归属与开发模块依赖均由 `harness.config.json` 声明；`pnpm check` 组合公共检查与服务装载验证，生产代码保持独立。
 
-一般修改执行相关测试与检查，交付前按[验证协议](docs/coordination.md#验证与接受)取得覆盖 `pnpm check` 的当前有效结论，可直接执行或复用有效基线并补齐受影响回归；全量条件由该协议统一规定。业务工具/权限变化必须测试真实执行链；接口变化更新同一份 API 契约。新增源文件自动继承所属模块规则，新模块需要在护栏配置中说明允许依赖。体量报告是审阅信号，不是自动拆分指令。
+一般修改执行相关测试与检查，交付前按[验证协议](docs/coordination.md#验证与接受)取得覆盖 `pnpm check` 的当前有效结论，可由 GitHub Actions 完整检查或复用有效基线并补齐受影响回归；缺可靠结论时等待 CI。业务工具/权限变化必须测试真实执行链；接口变化更新同一份 API 契约。新增源文件自动继承所属模块规则，新模块需要在护栏配置中说明允许依赖。体量报告是审阅信号，不是自动拆分指令。
 
 新目标从 `pnpm work guide start` 开始，原任务用 `status` 定位后取 `context`，记录阶段不代表现场已核验。编辑前建档并进入 C1，命令型实施经 `work exec`；源码质量审查与交回前三方对账按[验证协议](docs/coordination.md#验证与接受)执行。完整命令与字段查[记录索引](docs/work-records.md)。
 

@@ -43,8 +43,13 @@ Agent 依 [拆解与生命周期](coordination.md#开始任务) 从公共 PRD／
       {
         "id": "checks",
         "criterion": "取得覆盖 pnpm check 的当前有效结论",
+        "method": "review"
+      },
+      {
+        "id": "targeted-tests",
+        "criterion": "相关定向测试通过",
         "method": "automated",
-        "command": ["pnpm", "check"]
+        "command": ["pnpm", "test", "tests/foundation/plugin.test.ts"]
       }
     ],
     "nextAction": "实施当前已授权的能力查询修改",
@@ -152,9 +157,11 @@ pnpm work exec api-probe -- sh -c 'printf "%s\n" "document text" > docs/example.
 原件准备的阶段与写入方式统一见[验证与接受](coordination.md#验证与接受)；以下命令登记已有原件，不替代其准备步骤。自动证据 summary 只保存退出、取消、未结束和输入变化结论及必要异常诊断；完整 argv 保存在 artifact 指向的原件中，不复制到摘要。旧摘要仍可读取，不改写历史原件或重新绑定候选；实际复核命令与观察范围时读取原件。
 
 ```sh
-pnpm work run api-probe checks
-pnpm work evidence api-probe review .work/tasks/api-probe/evidence/review.md "实际审查范围、观察与限制"
+pnpm work run api-probe targeted-tests
+pnpm work evidence api-probe checks .work/tasks/api-probe/evidence/checks.md "实际候选 SHA、CI 运行链接、结论与限制"
 ```
+
+CI 结论记录实际提交 SHA、运行链接与结果；review 原件不能作为 `work verify` 的自动执行基线。
 
 run／evidence 先经 update 进入 C1_EVIDENCE_PENDING 并给出当前下一步；失败的阶段更新不能由取证补成成功。验收 ID 来自本任务 acceptance。C0／实施可暂缺 automated 的 `command`；取证阶段缺项会明确报错并阻止 run／evidence，包括显式传入 argv。可返回实施补齐检查脚本，阶段转换按目标阶段核验，现场漂移等检查仍有效。缺命令的自动验收保持 pending，不能 prepare／complete；已提供的非法命令始终拒绝。正式取证前确定完整命令及其实际读取的脚本／配置，覆盖原验收判据并纳入候选输入，审阅变化后 sync，不从命令名称推断覆盖。省略 argv 时 run 执行声明命令；旧记录不自动采信历史最后一条命令。
 
@@ -189,7 +196,7 @@ reuse 与 incremental 均保留任务原候选身份。新 `.verification.json` 
 
 用历史完整检查作为成功边界时，登记和重读回执均核对其文件映射与执行环境。不同输入或环境下的成功不能遮住当前输入或所保留基线上的既有失败和未知。恢复到曾失败的输入或环境后，使用适用的完整检查，或引用相关真实回归明确解决该观察。
 
-无可靠基线、影响无法界定或原覆盖依据失效时执行全量，选择规则见[验证与接受](coordination.md#验证与接受)。旧记录不批量迁移：缺旧 checkpoint 时可提供 legacyCheckpoint，必须与日志原候选及快照摘要对应；缺环境记录时提供 legacyEnvironment=`{snapshot,reason}`，明确恢复三类条件的原件依据。已有指纹不得替换，无法核实的条件重新执行。日志和历史失败保持原字节，回执仅位于个人 `.work`，公共成果格式不变。
+无可靠基线、影响无法界定或原覆盖依据失效时由 GitHub Actions 执行全量，未取得可靠结论前保持 pending；选择规则见[验证与接受](coordination.md#验证与接受)。旧记录不批量迁移：缺旧 checkpoint 时可提供 legacyCheckpoint，必须与日志原候选及快照摘要对应；缺环境记录时提供 legacyEnvironment=`{snapshot,reason}`，明确恢复三类条件的原件依据。已有指纹不得替换，无法核实的条件重新执行。日志和历史失败保持原字节，回执仅位于个人 `.work`，公共成果格式不变。
 
 evidence 只用于 review／behavior，登记本任务 evidence 目录的真实原件或已取回的共享 Markdown；结果从原件解析，旧的附带 result 参数的调用不再支持。原件需写实际操作者、场景、输入／环境、动作、结果和限制。CLI 拒绝符号链接、硬链接别名和非普通文件，并按现存文件身份核对输入重叠及历史原件，不能通过大小写路径别名重登改写后的原件。共享原件同时属于候选输入时，先取回独立私有副本再绑定，避免原件声明进入自身候选。新观察另存，旧原件及失败保留；缺失的旧原件不阻止新路径补证。单任务占用标记只串行化 CLI，不认证宿主编辑者，原件归属沿[验证与接受](coordination.md#验证与接受)执行。
 

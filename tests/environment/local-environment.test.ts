@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -209,3 +209,104 @@ registerHooks({ resolve(specifier, context, next) {
     expect((await once(child, 'close'))[0], stderr).toBe(0);
   }
 });
+
+it('requires a scope before reading the test environment and preserves isolated regression settings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'mio-local-check-'));
+  directories.push(root);
+  const entry = resolve('scripts/harness/validation-entry.ts');
+  const local = resolve('scripts/service/local.ts');
+  const env = {
+    ...process.env,
+    GITHUB_ACTIONS: '',
+    PATH: `${root}:${process.env.PATH}`,
+    TARGET: join(root, 'captured.json'),
+    MIO_AUTH_DATABASE_URL: 'postgresql://inherited/development',
+    MIO_TEST_DATABASE_URL: 'postgresql://inherited/development',
+    MIO_TEST_REDIS_SERVER: '/isolated/redis-server',
+    NODE_ENV: 'development',
+  };
+  async function command(script: string, args: string[]) {
+    const child = spawn(process.execPath, [script, ...args], {
+      cwd: root,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+    return { code: (await once(child, 'close'))[0], output };
+  }
+  for (const [script, args] of [
+    [entry, ['local']],
+    [entry, ['local', '--reporter', 'tests/auth']],
+    [local, ['test', 'check']],
+  ] as const) {
+    const result = await command(script, [...args]);
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain('SCOPE');
+    expect(result.output).not.toContain('ENOENT');
+  }
+  await createLocalEnvironment('test', root);
+  await mkdir(join(root, 'scripts/service'), { recursive: true });
+  await symlink(local, join(root, 'scripts/service/local.ts'));
+  const capture = `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.TARGET, JSON.stringify({ args: process.argv.slice(2), db: process.env.MIO_TEST_DATABASE_URL, redis: process.env.MIO_TEST_REDIS_SERVER, auth: process.env.MIO_AUTH_DATABASE_URL, nodeEnv: process.env.NODE_ENV }));\n`;
+  await writeFile(join(root, 'pnpm'), capture, { mode: 0o700 });
+  const result = await command(entry, ['local', 'tests/auth', '--reporter', 'dot']);
+  expect(result.code, result.output).toBe(0);
+  const captured = JSON.parse(await readFile(env.TARGET, 'utf8'));
+  const values = (await readLocalEnvironment('test', root, {})).values;
+  expect(captured).toEqual({
+    args: ['test', 'tests/auth', '--reporter', 'dot'],
+    db: values.MIO_TEST_DATABASE_URL,
+    redis: '/isolated/redis-server',
+  });
+  await rm(env.TARGET);
+  await writeFile(
+    join(root, 'pnpm'),
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => process.exit(0));\nconsole.log('READY');\nsetInterval(() => {}, 1000);\n`,
+  );
+  const child = spawn(process.execPath, [entry, 'local', 'tests/auth'], {
+    cwd: root,
+    env,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const finished = once(child, 'close');
+  try {
+    await once(child.stdout, 'data', { signal: AbortSignal.timeout(10000) });
+    const exited = once(child, 'close', { signal: AbortSignal.timeout(10000) });
+    child.kill('SIGTERM');
+    await exited;
+    expect((await finished)[0]).not.toBe(0);
+  } finally {
+    if (child.pid) {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+      await finished;
+      await expect
+        .poll(() => {
+          try {
+            process.kill(-child.pid!, 0);
+            return false;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+            return true;
+          }
+        })
+        .toBe(true);
+    }
+  }
+  await writeFile(join(root, 'pnpm'), capture);
+  const path = join(root, '.env.test');
+  const contents = await readFile(path, 'utf8');
+  await writeFile(
+    path,
+    contents.replace(/^MIO_TEST_DATABASE_URL=.*$/m, 'MIO_TEST_DATABASE_URL=wrong'),
+  );
+  const rejected = await command(entry, ['local', 'tests/auth']);
+  expect(rejected.code).not.toBe(0);
+  expect(rejected.output).toContain('LOCAL_REGRESSION_TARGET');
+  await expect(readFile(env.TARGET)).rejects.toThrow();
+}, 30000);

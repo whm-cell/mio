@@ -58,9 +58,9 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 ## 自动化回归与人工数据
 
-测试 PostgreSQL 另建 `mio_regression_test` 和独立账号 `mio_regression`。该账号不能连接人工使用的 `mio_test`；集成测试仍仅创建/删除本轮 schema。准备原有隔离 Redis 测试二进制后，`pnpm check:local` 使用该回归库执行完整 `pnpm check`，不会把 `.env.test` 的业务开关或人工数据库注入测试进程。
+测试 PostgreSQL 另建 `mio_regression_test` 和独立账号 `mio_regression`。该账号不能连接人工使用的 `mio_test`；集成测试仍仅创建/删除本轮 schema。准备原有隔离 Redis 测试二进制后，`pnpm check:local <测试范围>` 使用该回归库执行定向测试，不会把 `.env.test` 的业务开关或人工数据库注入测试进程。
 
-Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。普通 `pnpm check` / CI 不自动加载私有环境文件，不依赖作者环境才能运行；CI 使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
+Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。普通 `pnpm test <范围>` / CI 不自动加载私有环境文件，不依赖作者环境才能运行；CI 使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
 
 显式现场探针 `node tests/environment/local-environments-live.ts --restart-local-environments` 要求两套中间件已经 up、认证迁移完成且应用已停止。它真实注册同邮箱的独立账号、检查跨环境凭据拒绝、依次重启各套中间件并实际等待 65 秒，验证账号、旧会话和 Redis AOF 数据保留。探针不属于普通测试，会保留账号和 Redis 标记；私有账号记录及日志在 `.runtime/local-acceptance/<run>/`。退出后关闭它启动的应用，中间件继续运行。
 

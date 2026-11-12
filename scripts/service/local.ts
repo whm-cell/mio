@@ -39,6 +39,8 @@ async function main(name: 'dev' | 'test') {
     console.log(`${name}: private configuration ${await createLocalEnvironment(name)}`);
     return;
   }
+  if (action === 'check' && name === 'test' && args.length === 0)
+    throw new Error('LOCAL_CHECK_SCOPE: provide a test file or directory');
   const environment = await readLocalEnvironment(name);
   const { runtime, values, host, file } = environment;
   if (action === 'broker-init' && args.length === 0) {
@@ -105,11 +107,11 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);
     return;
   }
-  if (action === 'check' && name === 'test' && args.length === 0) {
+  if (action === 'check' && name === 'test') {
     const expected = `postgresql://mio_regression:${values.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:${values.MIO_LOCAL_POSTGRES_PORT}/mio_regression_test`;
     if (values.MIO_TEST_DATABASE_URL !== expected)
       throw new Error('LOCAL_REGRESSION_TARGET: use the dedicated regression database');
-    await run('pnpm', ['check'], {
+    await run('pnpm', ['test', ...args], {
       ...host,
       MIO_TEST_DATABASE_URL: expected,
       ...(process.env.MIO_TEST_REDIS_SERVER

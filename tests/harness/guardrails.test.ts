@@ -626,44 +626,77 @@ it('allows only the explicit service migration config edge and isolates auth pac
   expect(check(root).output).toContain('AUTH_ADAPTER');
 });
 
-it('keeps response primitives independent through resolved type imports, aliases and re-exports', async () => {
-  const root = await fixture({
-    'src/contracts.ts': 'export interface ApiError { error: { code: string } }',
-    'src/auth/value.ts': 'export interface AuthValue { id: string }',
-    'src/plugin.ts': 'export const plugin = 1;',
-    'scripts/harness/tool.ts': 'export const tool = 1;',
-    'src/http-response.ts': `import { randomUUID } from 'node:crypto';
+it.each([
+  ['src/http-request.ts', 'HTTP_REQUEST_DEPENDENCY'],
+  ['src/http-response.ts', 'HTTP_RESPONSE_DEPENDENCY'],
+] as const)(
+  'keeps HTTP primitive dependencies independent through resolved imports: %s',
+  async (file, diagnostic) => {
+    const root = await fixture({
+      'src/contracts.ts': 'export interface ApiError { error: { code: string } }',
+      'src/auth/value.ts': 'export interface AuthValue { id: string }',
+      'src/assets/value.ts': 'export const asset = 1;',
+      'src/plugin.ts': 'export const plugin = 1;',
+      'scripts/harness/tool.ts': 'export const tool = 1;',
+      'src/http-request.ts':
+        "import type { IncomingMessage } from 'node:http'; export type Request = IncomingMessage;",
+      'src/http-response.ts': `import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { ApiError } from './contracts.ts';
 export function start(response: ServerResponse): ApiError { return { error: { code: randomUUID() + response.statusCode } }; }`,
-  });
-  expect(check(root).status).toBe(0);
-  const configPath = join(root, 'tsconfig.json');
-  const config = JSON.parse(await readFile(configPath, 'utf8'));
-  config.compilerOptions.paths = {
-    '@contract': ['./src/contracts.ts'],
-    '@auth-value': ['./src/auth/value.ts'],
-  };
-  await writeFile(configPath, JSON.stringify(config));
-  const helper = join(root, 'src/http-response.ts');
-  await writeFile(helper, "export type { ApiError } from '@contract';");
-  expect(check(root).status).toBe(0);
-  for (const source of [
-    "import type { AuthValue } from './auth/value.ts'; export type Value = AuthValue;",
-    "export type { AuthValue } from './auth/value.ts';",
-    "import type { AuthValue } from '@auth-value'; export type Value = AuthValue;",
-    "export type Value = import('@auth-value').AuthValue;",
-    "export { plugin } from './plugin.ts';",
-    "export { Pool } from 'pg';",
-    "import '../scripts/harness/tool.ts';",
-    "export { URL } from 'node:url';",
-  ]) {
-    await writeFile(helper, source);
-    const result = check(root);
-    expect(result.status, source + result.output).toBe(1);
-    expect(result.output, source).toContain('HTTP_RESPONSE_DEPENDENCY src/http-response.ts');
-  }
-});
+      'src/assets/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
+      'src/compute/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
+    });
+    expect(check(root).status).toBe(0);
+    const configPath = join(root, 'tsconfig.json');
+    const config = JSON.parse(await readFile(configPath, 'utf8'));
+    config.compilerOptions.paths = {
+      '@contract': ['./src/contracts.ts'],
+      '@auth-value': ['./src/auth/value.ts'],
+    };
+    await writeFile(configPath, JSON.stringify(config));
+    const helper = join(root, file);
+    const allowed = [
+      "export type { IncomingMessage } from 'node:http';",
+      "export const http = () => import('node:http');",
+      ...(file === 'src/http-response.ts' ? ["export type { ApiError } from '@contract';"] : []),
+    ];
+    for (const source of allowed) {
+      await writeFile(helper, source);
+      const result = check(root);
+      expect(result.status, source + result.output).toBe(0);
+    }
+    const rejected = [
+      "import type { AuthValue } from './auth/value.ts'; export type Value = AuthValue;",
+      "export type { AuthValue } from './auth/value.ts';",
+      "import type { AuthValue } from '@auth-value'; export type Value = AuthValue;",
+      "export type Value = import('@auth-value').AuthValue;",
+      "export { plugin } from './plugin.ts';",
+      "export { Pool } from 'pg';",
+      "import '../scripts/harness/tool.ts';",
+      "export { URL } from 'node:url';",
+      "export const asset = () => import('./assets/value.ts');",
+      ...(file === 'src/http-request.ts'
+        ? [
+            "export type { ApiError } from '@contract';",
+            "export { randomUUID } from 'node:crypto';",
+          ]
+        : []),
+    ];
+    for (const source of rejected) {
+      await writeFile(helper, source);
+      const result = check(root);
+      expect(result.status, source + result.output).toBe(1);
+      expect(result.output, source).toContain(`${diagnostic} ${file}`);
+    }
+    config.compilerOptions.paths['node:http'] = ['./src/auth/value.ts'];
+    await writeFile(configPath, JSON.stringify(config));
+    await writeFile(helper, "export type { IncomingMessage } from 'node:http';");
+    const disguised = check(root);
+    expect(disguised.status, disguised.output).toBe(1);
+    expect(disguised.output).toContain(`${diagnostic} ${file}`);
+  },
+);
 
 it.each(['src/plugin.ts', 'src/auth/query.ts'])(
   'resolves database and authentication type aliases before checking the boundary in %s',

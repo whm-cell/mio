@@ -10,7 +10,7 @@
 
 Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工具也不能直接或通过本职责内 helper 导入 Redis 驱动。公共 Redis 不反向依赖消费者、插件、脚本或测试，只允许独立公共契约作为本地依赖；插件和认证可消费公共资源，迁移工具仍由已有 developmentDependencies 禁止导入该运行模块。AST 与包归属解析覆盖类型导入、重导出和别名；真实 Redis 测试夹具允许导入驱动。新增文件继承 `src` / `tests` 既有分类、类型检查与构建范围，不为目录形状新增冗余配置。这是静态导入边界，不能拦截任意宿主子进程或网络副作用。正反例见同一 guardrail fixture。
 
-共同响应模块 `src/http-response.ts` 的依赖限定为 `node:http`、`node:crypto` 与解析后指向 `src/contracts.ts` 的本地模块；认证、插件入口、其他包和开发脚本均不可作为其依赖。现有 AST 导入/导出采集与模块解析同时检查 type-only、重导出、类型查询与别名路径，报告 `HTTP_RESPONSE_DEPENDENCY`；合法直接导入和契约别名、违规认证类型/重导出/别名等在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；实际实现只导入 HTTP/ApiError 类型与 UUID 函数，公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。
+共同请求模块 `src/http-request.ts` 的依赖限定为 `node:http`；共同响应模块 `src/http-response.ts` 限定为 `node:http`、`node:crypto` 与解析后指向 `src/contracts.ts` 的本地模块。业务模块、认证、插件入口、其他包和开发脚本均不可作为其依赖；正常业务消费者可导入这两个原语，无需登记消费者。现有 AST 导入/导出采集与模块解析统一检查 type-only、重导出、类型查询、别名和字面量动态导入，分别报告 `HTTP_REQUEST_DEPENDENCY` 与 `HTTP_RESPONSE_DEPENDENCY`；合法和违规场景在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。
 
 已登记的 TS 文件还必须进入类型检查配置；生产 TS 必须同时进入构建配置。新增根目录仅登记归属不足以通过，检查器会对账编译器实际匹配的文件集合。
 

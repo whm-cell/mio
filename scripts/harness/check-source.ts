@@ -16,6 +16,24 @@ import {
   projectForTarget,
 } from './source-projects.ts';
 
+const httpPrimitiveDependencies: Record<
+  string,
+  { builtins: readonly string[]; local: readonly string[]; diagnostic: string; description: string }
+> = {
+  'src/http-request.ts': {
+    builtins: ['node:http'],
+    local: [],
+    diagnostic: 'HTTP_REQUEST_DEPENDENCY',
+    description: 'Node HTTP',
+  },
+  'src/http-response.ts': {
+    builtins: ['node:http', 'node:crypto'],
+    local: ['src/contracts.ts'],
+    diagnostic: 'HTTP_RESPONSE_DEPENDENCY',
+    description: 'Node HTTP/UUID and contracts',
+  },
+};
+
 // Aliases can lack packageId; file symlinks can retain a different packageId.
 async function owningPackageName(file: string): Promise<string | undefined> {
   let directory = dirname(await realpath(file));
@@ -62,6 +80,7 @@ export async function checkSource(root: string, files: readonly string[], harnes
   }
   for (const file of files.filter((path) => roleOf(path) !== undefined && path.endsWith('.ts'))) {
     const production = roleOf(file) === 'production';
+    const httpPrimitive = production ? httpPrimitiveDependencies[file] : undefined;
     const project = production
       ? projectForSource(file, checked.projects)
       : projectForFile(file, checked.projects);
@@ -292,14 +311,14 @@ export async function checkSource(root: string, files: readonly string[], harnes
         errors.push(`PROJECT_IMPORT_UNRESOLVED ${file}: ${specifier}`);
       if (!production) continue;
       if (
-        file === 'src/http-response.ts' &&
+        httpPrimitive &&
         !(
-          (!resolved && ['node:crypto', 'node:http'].includes(specifier)) ||
-          (target === 'src/contracts.ts' && !resolved?.isExternalLibraryImport)
+          (!resolved && httpPrimitive.builtins.includes(specifier)) ||
+          (target && !resolved?.isExternalLibraryImport && httpPrimitive.local.includes(target))
         )
       )
         errors.push(
-          `HTTP_RESPONSE_DEPENDENCY ${file}: ${specifier} is outside Node HTTP/UUID and contracts`,
+          `${httpPrimitive.diagnostic} ${file}: ${specifier} is outside ${httpPrimitive.description}`,
         );
       if (
         file === 'src/integrations/redis.ts' &&

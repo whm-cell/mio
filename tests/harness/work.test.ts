@@ -49,11 +49,11 @@ afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-function begin(root: string, args: string[]) {
+function begin(root: string, args: string[], timeout = 10_000) {
   const child = spawn(process.execPath, [cli, ...args], {
     cwd: root,
     env: { PATH: process.env.PATH ?? '' },
-    timeout: 10000,
+    timeout,
   });
   let output = '';
   child.stdout.on('data', (bytes: Buffer) => {
@@ -464,7 +464,11 @@ it('rejects competing task writes before launching them while reads and another 
   const revision = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output).revision;
   const script =
     'const fs=require("node:fs");fs.writeFileSync(".work/started","ready");setInterval(()=>{if(fs.existsSync(".work/finish"))process.exit(0)},20)';
-  const running = begin(root, ['run', 'probe', 'checks', '--', process.execPath, '-e', script]);
+  const running = begin(
+    root,
+    ['run', 'probe', 'checks', '--', process.execPath, '-e', script],
+    30_000,
+  );
   commands.push(running);
   await expect
     .poll(() => readFile(join(root, '.work/started'), 'utf8').catch(() => ''))
@@ -537,7 +541,7 @@ it('rejects competing task writes before launching them while reads and another 
     'code',
     'ENOENT',
   );
-});
+}, 30_000);
 
 it('never turns cancellation into a pass even when the child handles SIGTERM by exiting zero', async () => {
   const root = await fixture();

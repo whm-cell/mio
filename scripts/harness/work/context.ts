@@ -19,7 +19,7 @@ export { artifact } from './evidence.ts';
 
 export const requiredSources = ['AGENTS.md', 'docs/coordination.md', 'docs/work-records.md'];
 
-export async function capture(root: string, task: Task): Promise<Checkpoint> {
+export async function captureFiles(root: string, task: Task): Promise<Checkpoint['files']> {
   const config = await loadConfig(root);
   const scan = await inventory(root, config);
   if (scan.errors.length) throw new Error(scan.errors.join('\n'));
@@ -86,6 +86,11 @@ export async function capture(root: string, task: Task): Promise<Checkpoint> {
       files[file] = digest(content);
     } else files[file] = digest(await readFile(await checkedPath(root, file)));
   }
+  return files;
+}
+
+export async function capture(root: string, task: Task): Promise<Checkpoint> {
+  const files = await captureFiles(root, task);
   const plan = task.plan;
   const contractPlan = {
     id: plan.id,

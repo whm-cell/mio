@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { checkedPath, digest, json, parseTask, loadTask } from './records.ts';
 import type { Task } from './records.ts';
-import { capture } from './context.ts';
+import { capture, captureFiles } from './context.ts';
 import { bookPaths, optionalText } from './reports.ts';
 import { documentCatalog } from '../task-documents.ts';
 
@@ -100,7 +100,7 @@ async function finishOperation(root: string, id: string, op: Operation, journal:
   if ((await optionalText(root, operationPath(id))) !== journal)
     throw new Error('WORK_DELIVERY_CONFLICT: operation journal changed');
   const task = parseTask(op.changes.at(-1)!.after!);
-  if (json((await capture(root, task)).files) !== json(op.inputs))
+  if (json(await captureFiles(root, task)) !== json(op.inputs))
     throw new Error('WORK_DELIVERY_STALE: inputs changed during operation');
   // Preflight every destination before any further write. Never roll back newer edits.
   for (const change of op.changes) {

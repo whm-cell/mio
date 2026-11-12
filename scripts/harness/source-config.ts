@@ -1,5 +1,5 @@
 import { isAbsolute } from 'node:path';
-import ts from 'typescript';
+import { parseTree, type Node, type ParseError } from 'jsonc-parser';
 
 export type SourceRole = 'production' | 'test' | 'development';
 export interface SourceProject {
@@ -44,18 +44,19 @@ function validPath(path: unknown, root = false): path is string {
 
 function duplicateKeys(text: string): string[] {
   const duplicates: string[] = [];
-  const source = ts.parseJsonText('harness.config.json', text);
-  const visit = (node: ts.Node): void => {
-    if (ts.isObjectLiteralExpression(node)) {
+  const errors: ParseError[] = [];
+  const source = parseTree(text, errors);
+  if (!source || errors.length) throw new Error('HARNESS_CONFIG: invalid JSON tree');
+  const visit = (node: Node): void => {
+    if (node.type === 'object') {
       const seen = new Set<string>();
-      for (const property of node.properties) {
-        if (!ts.isPropertyAssignment(property) || !ts.isStringLiteral(property.name)) continue;
-        const key = property.name.text;
+      for (const property of node.children ?? []) {
+        const key = property.children![0]!.value as string;
         if (seen.has(key)) duplicates.push(`HARNESS_DUPLICATE_KEY ${key}`);
         seen.add(key);
       }
     }
-    ts.forEachChild(node, visit);
+    node.children?.forEach(visit);
   };
   visit(source);
   return duplicates;

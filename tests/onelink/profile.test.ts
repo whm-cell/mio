@@ -42,13 +42,13 @@ async function revision(owner = 0) {
     }
   ).revision;
 }
-async function terminal(id: string, requestId: string, timeout = 8000) {
+async function terminal(id: string, requestId: string, timeout = 8000, owner = 0) {
   let receipt: { status: string } = { status: '' };
   await expect
     .poll(
       async () => {
         receipt = (await (
-          await call(`/api/v1/conversations/${id}/requests/${requestId}`)
+          await call(`/api/v1/conversations/${id}/requests/${requestId}`, 'GET', undefined, owner)
         ).json()) as { status: string };
         return ['completed', 'failed', 'cancelled', 'unknown'].includes(receipt.status);
       },
@@ -103,7 +103,7 @@ beforeAll(async () => {
     owners.push(((await response.json()) as { user: { id: string } }).user.id);
   }
   expect((await call('/api/v1/conversations', 'POST', {}, 2)).status).toBe(404);
-  for (const owner of [0, 1]) {
+  for (const owner of [0, 1, 2]) {
     expect(
       (
         await call(
@@ -168,7 +168,11 @@ it('keeps owner snapshots across interleaved streams, rotation/disable, cancel, 
       .map((value) => value.authorization)
       .sort(),
   ).toEqual(['Bearer synthetic-profile-owner-0', 'Bearer synthetic-profile-owner-1']);
-  expect(JSON.stringify(seen[count + 1]!.body.messages)).toContain('remember context');
+  const held = seen.slice(-2);
+  const heldA = held.find((value) => value.authorization === 'Bearer synthetic-profile-owner-0')!;
+  const heldB = held.find((value) => value.authorization === 'Bearer synthetic-profile-owner-1')!;
+  expect(JSON.stringify(heldA.body.messages)).toContain('remember context');
+  expect(JSON.stringify(heldB.body.messages)).not.toContain('remember context');
   expect(
     (
       await call('/api/v1/providers/onelink/credential', 'PUT', {
@@ -291,22 +295,48 @@ it('settles an observation persistence failure unknown without repeating the mod
 });
 
 it('freezes accepted credentials through a pause after prepare and before actual fetch', async () => {
-  const id = await create();
-  const count = (await runtime.onelinkRequests()).length;
-  expect((await send(id, 'prepared', 'PAUSE_WIRE')).status).toBe(202);
-  await expect.poll(() => runtime.onelinkPaused()).toBe(true);
-  expect((await runtime.onelinkRequests()).length).toBe(count);
-  const current = (await (await call('/api/v1/providers/onelink')).json()) as { revision: number };
+  const owner = 2;
+  const initial = (await (
+    await call('/api/v1/providers/onelink', 'GET', undefined, owner)
+  ).json()) as { revision: number; credentialVersion: number };
+  expect(initial.credentialVersion).toBe(1);
   expect(
     (
-      await call('/api/v1/providers/onelink/credential', 'PUT', {
-        apiKey: 'synthetic-after-prepare',
-        expectedRevision: current.revision,
-      })
+      await call(
+        '/api/v1/providers/onelink/credential',
+        'PUT',
+        { apiKey: 'synthetic-profile-rotated', expectedRevision: initial.revision },
+        owner,
+      )
     ).status,
   ).toBe(200);
+  expect(
+    await (await call('/api/v1/providers/onelink', 'GET', undefined, owner)).json(),
+  ).toMatchObject({ credentialVersion: 2 });
+  await refresh(owner);
+  const id = await create(owner);
+  const count = (await runtime.onelinkRequests()).length;
+  expect((await send(id, 'prepared', 'PAUSE_WIRE', owner)).status).toBe(202);
+  await expect.poll(() => runtime.onelinkPaused()).toBe(true);
+  expect((await runtime.onelinkRequests()).length).toBe(count);
+  const current = (await (
+    await call('/api/v1/providers/onelink', 'GET', undefined, owner)
+  ).json()) as { revision: number };
+  expect(
+    (
+      await call(
+        '/api/v1/providers/onelink/credential',
+        'PUT',
+        { apiKey: 'synthetic-after-prepare', expectedRevision: current.revision },
+        owner,
+      )
+    ).status,
+  ).toBe(200);
+  expect(
+    await (await call('/api/v1/providers/onelink', 'GET', undefined, owner)).json(),
+  ).toMatchObject({ credentialVersion: 3 });
   await runtime.releaseOnelink();
-  expect(await terminal(id, 'prepared')).toBe('completed');
+  expect(await terminal(id, 'prepared', 8000, owner)).toBe('completed');
   expect((await runtime.onelinkRequests()).at(-1)!.authorization).toBe(
     'Bearer synthetic-profile-rotated',
   );
@@ -317,10 +347,10 @@ it('freezes accepted credentials through a pause after prepare and before actual
     )
   ).rows[0]!;
   expect(stored.model_binding.credentialVersion).toBe(2);
-  expect((await send(id, 'after-prepare', 'fresh input')).status).toBe(409);
-  await refresh();
-  expect((await send(id, 'after-prepare', 'fresh input')).status).toBe(202);
-  expect(await terminal(id, 'after-prepare')).toBe('completed');
+  expect((await send(id, 'after-prepare', 'fresh input', owner)).status).toBe(409);
+  await refresh(owner);
+  expect((await send(id, 'after-prepare', 'fresh input', owner)).status).toBe(202);
+  expect(await terminal(id, 'after-prepare', 8000, owner)).toBe('completed');
   expect((await runtime.onelinkRequests()).at(-1)!.authorization).toBe(
     'Bearer synthetic-after-prepare',
   );

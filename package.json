@@ -103,7 +103,8 @@
     "amqplib": "2.2.1",
     "better-auth": "1.7.18",
     "cos-nodejs-sdk-v5": "3.0.0",
-    "pg": "8.23.1"
+    "pg": "8.23.1",
+    "tencentcloud-sdk-nodejs-sms": "4.1.306"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",

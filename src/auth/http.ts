@@ -11,6 +11,13 @@ const AUTH_BODY_LIMIT_BYTES = 16 * 1024;
 const routes = new Map([
   ['/sign-up/email', 'POST'],
   ['/sign-in/email', 'POST'],
+  ['/phone-number/send-otp', 'POST'],
+  ['/phone-number/verify', 'POST'],
+  ['/phone-binding/send-otp', 'POST'],
+  ['/phone-binding/confirm', 'POST'],
+  ['/sign-in/social', 'POST'],
+  ['/link-social', 'POST'],
+  ['/callback/wechat', 'GET'],
   ['/sign-out', 'POST'],
   ['/get-session', 'GET'],
   ['/change-password', 'POST'],
@@ -19,6 +26,37 @@ const routes = new Map([
   ['/revoke-sessions', 'POST'],
   ['/revoke-other-sessions', 'POST'],
 ]);
+
+function wechatStartBody(raw: string, origin: string) {
+  try {
+    const input: unknown = JSON.parse(raw);
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return;
+    const body = input as Record<string, unknown>;
+    if (
+      body.provider !== 'wechat' ||
+      Object.keys(body).some((key) => !['provider', 'callbackURL'].includes(key))
+    )
+      return;
+    const callback = body.callbackURL ?? '/';
+    if (
+      typeof callback !== 'string' ||
+      !callback.startsWith('/') ||
+      callback.startsWith('//') ||
+      /[\u0000-\u001f\u007f\\]/.test(callback)
+    )
+      return;
+    const url = new URL(callback, origin);
+    if (url.origin !== origin) return;
+    return JSON.stringify({
+      provider: 'wechat',
+      callbackURL: url.href,
+      errorCallbackURL: url.href,
+      disableRedirect: true,
+    });
+  } catch {
+    return;
+  }
+}
 
 /** Bound browser-facing auth endpoints; future provider/plugin routes are not exposed implicitly. */
 export function createAuthHandler(config: AuthConfig, auth: Authentication) {
@@ -37,6 +75,11 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       response.setHeader('vary', 'Origin');
     }
     const pathname = (request.url ?? '').split('?')[0]!;
+    const wechatRoute = [
+      `${AUTH_BASE_PATH}/sign-in/social`,
+      `${AUTH_BASE_PATH}/link-social`,
+      `${AUTH_BASE_PATH}/callback/wechat`,
+    ].includes(pathname);
     const method =
       pathname === '/api/v1/me' ? 'GET' : routes.get(pathname.slice(AUTH_BASE_PATH.length));
     if (!method) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
@@ -59,6 +102,8 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
     )
       return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
+    if (wechatRoute && !config.wechat)
+      return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'WECHAT_UNAVAILABLE');
     try {
       const headers = new Headers();
       for (const name of ['cookie', 'origin', 'content-type', 'user-agent'] as const) {
@@ -73,10 +118,14 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
         response.end(JSON.stringify(identity));
         return;
       }
-      const body =
+      let body =
         method === 'POST'
           ? (await readBody(request, AUTH_BODY_LIMIT_BYTES)).toString('utf8')
           : undefined;
+      if (wechatRoute && method === 'POST') {
+        body = wechatStartBody(body!, config.baseURL);
+        if (!body) return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
+      }
       const result = await auth.handler(
         new Request(`${config.baseURL}${request.url}`, {
           method,

@@ -12,13 +12,17 @@
 
 常驻开发与人工测试通过[本地环境入口](local-environments.md)分别读取私有 `.env` / `.env.test`，选择各自数据库、Redis 和稳定 secret。`pnpm migrate:dev --apply` / `pnpm migrate:test --apply` 执行对应认证迁移；`pnpm start:dev` / `pnpm start:test` 启动独立 Profile。原始迁移命令仍读取进程环境，不隐式加载文件。
 
-| 变量                          | 要求                                                                                             |
-| ----------------------------- | ------------------------------------------------------------------------------------------------ |
-| `MIO_AUTH_BASE_URL`           | 固定对外 origin，如 `https://mio.example.com`，不含路径或末尾 `/`；HTTPS，回环主机可用 HTTP 开发 |
-| `MIO_AUTH_SECRET`             | 至少 32 字符的随机秘密，重启时保持；轮换会使旧签名 cookie 失效                                   |
-| `MIO_AUTH_DATABASE_URL`       | 专用 PostgreSQL 数据库连接，凭据只在服务端持有                                                   |
-| `MIO_AUTH_ALLOWED_ORIGINS`    | 额外精确 origin 的 JSON 数组，默认 `[]`；BASE_URL 自身自动包含，禁止通配符                       |
-| `MIO_AUTH_RATE_LIMIT_BACKEND` | `database`（缺省）或显式 `redis`；Redis 资源配置见[公共契约](integrations/redis.md)              |
+| 变量                                                                                                                                                                      | 要求                                                                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `MIO_AUTH_BASE_URL`                                                                                                                                                       | 固定对外 origin，如 `https://mio.example.com`，不含路径或末尾 `/`；HTTPS，回环主机可用 HTTP 开发 |
+| `MIO_AUTH_SECRET`                                                                                                                                                         | 至少 32 字符的随机秘密，重启时保持；轮换会使旧签名 cookie 失效                                   |
+| `MIO_AUTH_DATABASE_URL`                                                                                                                                                   | 专用 PostgreSQL 数据库连接，凭据只在服务端持有                                                   |
+| `MIO_AUTH_ALLOWED_ORIGINS`                                                                                                                                                | 额外精确 origin 的 JSON 数组，默认 `[]`；BASE_URL 自身自动包含，禁止通配符                       |
+| `MIO_AUTH_RATE_LIMIT_BACKEND`                                                                                                                                             | `database`（缺省）或显式 `redis`；Redis 资源配置见[公共契约](integrations/redis.md)              |
+| `MIO_AUTH_SMS_ENABLED`                                                                                                                                                    | 默认 `false`；设为 `true` 时须完整配置腾讯短信，见[短信契约](integrations/tencent-sms.md)        |
+| `MIO_TENCENT_SMS_SECRET_ID`、`MIO_TENCENT_SMS_SECRET_KEY`、`MIO_TENCENT_SMS_APP_ID`、`MIO_TENCENT_SMS_SIGN_NAME`、`MIO_TENCENT_SMS_TEMPLATE_ID`、`MIO_TENCENT_SMS_REGION` | 启用短信时全部必填；模板须接受验证码和有效分钟数两个参数                                         |
+| `MIO_AUTH_SMS_PHONE_HOUR_LIMIT`、`MIO_AUTH_SMS_PHONE_DAY_LIMIT`、`MIO_AUTH_SMS_IP_HOUR_LIMIT`、`MIO_AUTH_SMS_IP_DAY_LIMIT`、`MIO_AUTH_SMS_GLOBAL_DAY_LIMIT`               | 可选正整数，只允许收紧默认额度，依次最多 5、10、20、100、1000                                    |
+| `MIO_AUTH_WECHAT_ENABLED`、`MIO_AUTH_WECHAT_APP_ID`、`MIO_AUTH_WECHAT_APP_SECRET`                                                                                         | 默认关闭；启用时须完整配置网站应用凭据与实际回调域，见[微信契约](integrations/wechat.md)         |
 
 三个必要配置均未提供时保持原无 DB 的 foundation Profile；提供任一却不完整会拒绝装载，不能静默降级。此兼容边界用于既有基础插件和开发环境；启用认证须配置完整并先迁移。
 
@@ -30,6 +34,8 @@ pnpm start:dev
 ```
 
 第一条只输出迁移计划，第二条才执行。发现库无法自动修复的结构问题（例如额外必填列）时，两种模式均报错，须先审阅并修复目标结构。迁移和运行时复用 `src/auth/config.ts`，普通插件启动只检查结构和连接，不自动建表。目标库需单独备份；升级时的删除、改名、回填应单独审阅，不能假定自动回滚。通用 guard 不连接或修改业务库。
+
+本次认证 schema 包括可空且唯一的手机号、验证码挑战、短信预算及账号复合唯一索引；无论是否启用对应供应商，运行与显式迁移检查同一结构。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更。启用供应商但配置不全会拒绝装载；未启用时相应入口返回不可用，不影响邮箱入口。
 
 认证与 `MIO_API_TOKEN` 分离，后者仍只保护 foundation 能力查询，不能作为 userId。认证启用失败时插件不注册 readyz 或业务路由；成功后 readyz 只表明本次装载就绪，不持续查询数据库健康。
 
@@ -51,11 +57,23 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 
 依赖初始化成功即恢复入口，随后核对原账号/cookie、已撤销会话、额度与存储，异常再次暂停。维护期间认证、`/me`、Foundation 均可能不可达，没有独立维护响应或现场验证后才放流的门控。正常计划重载仅在 Redis 未丢失且旧客户端已排清时复用计数；Redis 重启/清空、未知原因重启都按故障恢复等待，禁止外部进程管理器立即重启绕过。详细切片安排与验收见[PRD §6](tasks/auth-rate-limit-redis/prd.md#6-迁移回退与故障恢复)，真实环境部署须另有明确目标与授权。
 
+### 手机验证码与发送预算
+
+大陆手机号统一为 `+86` 和 11 位号码；随机六位验证码有效 5 分钟，最多错误 3 次。登录和绑定挑战按用途及号码区分，绑定还对应发起的 userId 和 sessionId，确认时重新核对不超过 10 分钟且未撤销的原会话。验证码仅保存带挑战和用途上下文的 HMAC，不保存明文；短期挑战与账号用户均由认证 PostgreSQL 管理。已登录用户只可首次绑定空闲号码，不能换绑、合并或转移。
+
+短信预算独立于挑战和现有请求限流：同一手机号 60 秒冷却、滚动 1 小时至多 5 次及 24 小时至多 10 次，IP 分别至多 20/100 次，整个应用 24 小时至多 1000 次；配置只能收紧。使用直接连接地址及与认证相同的 IP 规范化，代理后共享代理地址额度。预算保存在 PostgreSQL，号码和 IP 键采用稳定 SHA-256，仅为固定长度而非匿名化。正常重启、验证码消费、认证 secret 轮换及 Redis 的 65 秒恢复不会清除预算；数据库恢复到旧快照可能丢失近期预算，需按最长窗口排清后恢复发送。
+
+发送前在数据库事务内占用全部预算并建立 pending 挑战；只有供应商明确受理才激活匹配的挑战。失败和未知不返额度，不自动重发。若供应商已受理、数据库激活提交结果未知，客户端会收到失败，但挑战可能已生效，不能据此推断短信未发出。挑战和过期预算在后续发送时分批清理。正确码由数据库锁和条件删除保证单次消费；绑定同时检查原会话并更新用户。登录的用户／会话创建在消费之后，若后续失败，该码不会恢复，用户需重新发码；不能宣称包括认证库调用的全过程原子。手机号自注册用户获得 `phone-…@auth.mio.invalid` 占位邮箱，该域不允许邮箱密码注册认领，不等于已验证联系邮箱。
+
+### 微信登录与绑定
+
+微信可独立登录或注册，手机号绑定可选；已有用户必须从本人会话主动绑定，不能凭相同邮箱自动合并或转移另一个账号的微信。身份键、授权回调、state 防重放、供应商请求和 AppID 变更前置条件见[微信契约](integrations/wechat.md)。仅开放指定微信 provider 和 GET 回调，不支持换绑、解绑、账号合并或旧账号迁移。微信生成的占位邮箱保持 `emailVerified=false`；微信授权本身不验证邮箱。
+
 ## 职责与限制
 
 - [认证配置](../src/auth/config.ts)的 `readAuthConfig` 与 `authOptions` 由装配、运行时和显式迁移按职责复用；`AUTH_BASE_PATH` 是库选项、插件前缀注册和认证 HTTP 路径截取的同一权威值。`service.ts` 持有认证库与 DB 池，`http.ts` 负责白名单、来源和响应适配，并使用 A 内共同有界读取取得原始正文；`plugin.ts` 仅装配与释放。响应头、包装错误与读取入口见 [API 领域导航](apis/index.md#运行时公共能力)，库原始响应仍由认证适配器转发。
 - [认证服务](../src/auth/service.ts)的 `Authentication.identity(headers)` 返回经数据库验证的 `{userId,sessionId}` 或 `null`；`/api/v1/me` 和[对话 HTTP](../src/conversations/http.ts)是实际消费者，调用时禁止刷新会话。装配入口注入身份解析能力，再把可信主体传给[对话应用服务](../src/conversations/service.ts)检查资源归属；应用服务不依赖 Node HTTP、DSH 或认证驱动，也不信任请求体 userId 或服务 token。长流失效与已受理轮次的关系按[对话规范](conversations.md)执行。项目 CRUD 尚未实现。
-- 首期邮箱未验证，不能用于第三方账号联结、团队邀请信任或邮件找回。邮箱验证、邮件找回、MFA、团队与生成分别按后续契约接入；未开放的入口返回 404。
+- 首期邮箱未验证，不能凭同邮箱自动合并第三方账号，也不能用于团队邀请信任或邮件找回；微信显式绑定依靠当前会话与微信授权。邮箱验证、邮件找回、MFA、团队与生成分别按后续契约接入；未开放的入口返回 404。
 - 数据库凭据与错误脱敏按 [PostgreSQL 使用契约](integrations/postgres.md#必须遵守的约束)执行；密码、cookie、会话 token 和部署秘密不写入公共日志或报告。
 
 ## 验证

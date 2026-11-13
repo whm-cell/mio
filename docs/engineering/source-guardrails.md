@@ -32,6 +32,8 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 `packageAdapters` 可按服务的真实 adapter 文件精确登记 `amqplib`，并允许非根服务登记 `cos-nodejs-sdk-v5`；未知包键、跨项目和不存在的文件拒绝。A 的 COS SDK 仍只允许 `src/integrations/cos.ts`，声明不覆盖 DSH、认证、PG 或 Redis 等既有边界。包名、类型包身份及解析目标的包归属共同参与核对。P2 增加这项声明是因为 B 使用独立凭据访问 COS、A/B 都可能需要各自的 MQ adapter；逐服务在检查器源码中硬编码路径会把正常新增服务变成护栏实现修改。代价是维护显式声明与正反例，不能据此推断运行时隔离。
 
+腾讯短信 SDK `tencentcloud-sdk-nodejs-sms` 只能在根服务的 `src/integrations/tencent-sms.ts` 导入；声明位置、包名、子路径和解析后的包归属一并核对，其他生产和开发源码不能通过别名绕过。此约束隔离真实短信副作用，不允许将未知包加入 `packageAdapters`。
+
 常驻环境的 MQ 初始化工具通过 `developmentDependencies` 精确声明复用 `src/integrations/rabbitmq.ts` 的连接/关闭能力，验证 A/B 登录；不发布或消费业务消息。服务工具仍不能直接导入 amqplib，生产代码不依赖部署工具，拓扑声明留在 `scripts/service/`。
 
 精确的 `@earendil-works/pi-ai`（含 `/models`、`/api/*` 公开子路径）属于同一 DSH 适配边界，按导入名、解析 packageId 与真实包归属识别，不放宽其他 npm 包。conversations/providers 不能反向导入本地 src/dsh。合法适配、临近非法目录、普通业务、type-only 别名及本地越界在同一 guardrail fixture 验证。

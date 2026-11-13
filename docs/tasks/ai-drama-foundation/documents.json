@@ -10,6 +10,16 @@
       "identity": "docs/architecture-ai-drama-foundation.md",
       "kind": "design",
       "path": "docs/tasks/ai-drama-foundation/design.md"
+    },
+    {
+      "identity": "docs/tasks/ai-drama-foundation/pending/auth-extension.md",
+      "kind": "proposal",
+      "path": "docs/tasks/ai-drama-foundation/pending/auth-extension.md"
+    },
+    {
+      "identity": "docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md",
+      "kind": "change",
+      "path": "docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md"
     }
   ]
 }

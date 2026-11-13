@@ -346,6 +346,15 @@ export async function checkSource(root: string, files: readonly string[], harnes
         !allowsPackageAdapter(project, file, 'amqplib')
       )
         errors.push(`AMQP_ADAPTER ${file}: AMQP package belongs in a reviewed adapter`);
+      const smsPackage = [specifier.split('/')[0], resolved?.packageId?.name, packageName].some(
+        (name) => name === 'tencentcloud-sdk-nodejs-sms',
+      );
+      if (
+        (production || developmentRoot) &&
+        smsPackage &&
+        !allowsPackageAdapter(project, file, 'tencentcloud-sdk-nodejs-sms')
+      )
+        errors.push(`SMS_ADAPTER ${file}: SMS package belongs in the reviewed adapter`);
       if (
         (production || developmentRoot) &&
         !resolved &&

@@ -36,6 +36,8 @@ pnpm start:test
 
 中间件 up 等待健康检查，Docker Engine 运行期间按 `unless-stopped` 恢复容器；主机重启后还须启动 Docker Engine。应用命令在前台运行，Ctrl+C 正常关闭；本入口不安装应用的系统开机服务。普通应用启动准备对应 Profile 并只读检查数据库结构，不自动迁移。
 
+手机号短信默认关闭。需要使用时，仅在选定环境的私有配置文件中按[模板](../.env.example)填写该环境授权的腾讯短信应用、签名、模板和凭据，再设 `MIO_AUTH_SMS_ENABLED=true`；另一个环境不会继承这些设置。应用启动不发送短信，实际调用会产生外部费用；模板须有验证码与有效分钟数两个参数。认证结构仍需先预览并显式迁移，详见[认证底座](auth.md#配置与迁移)。
+
 `broker:init:dev/test` 是显式拓扑初始化入口：先核对全部已有资源，再补缺失的策略、持久队列、绑定和受限 A/B 用户；已有资源不匹配时停止，不覆盖、不清队列、不轮换密码。最后真实验证两个身份的 AMQP 登录。首次准备后日常 up 不改拓扑；请求结果未知时保留现场，核对后可重复执行初始化。权限与恢复边界见 [RabbitMQ 契约](integrations/rabbitmq.md)。
 
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。

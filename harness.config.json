@@ -55,7 +55,10 @@
       "sources": ["src"],
       "typecheck": "tsconfig.json",
       "build": "tsconfig.build.json",
-      "packageAdapters": { "amqplib": ["src/integrations/rabbitmq.ts"] }
+      "packageAdapters": {
+        "amqplib": ["src/integrations/rabbitmq.ts"],
+        "tencentcloud-sdk-nodejs-sms": ["src/integrations/tencent-sms.ts"]
+      }
     },
     "worker": {
       "kind": "service",

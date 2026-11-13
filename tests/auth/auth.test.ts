@@ -123,6 +123,13 @@ it('preserves auth wrapper responses, preflights and Origin precedence through t
       code: 'JSON_REQUIRED',
     },
     {
+      path: '/api/auth/sign-in/social',
+      method: 'POST',
+      origin: 'http://localhost:5173',
+      status: 415,
+      code: 'JSON_REQUIRED',
+    },
+    {
       path: '/api/auth/missing',
       method: 'OPTIONS',
       origin: 'https://evil.example',

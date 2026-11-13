@@ -5,11 +5,16 @@ import { Pool } from 'pg';
 import { authOptions } from './config.ts';
 import type { AuthConfig } from './config.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
+import type { SmsSender } from '../integrations/tencent-sms.ts';
 
 const log = createLogger('app', 'auth');
 
 /** Runtime only checks schema; applying migrations is a separate, explicit service operation. */
-export async function createAuthentication(config: AuthConfig, rateLimit?: AuthRateLimitStorage) {
+export async function createAuthentication(
+  config: AuthConfig,
+  rateLimit?: AuthRateLimitStorage,
+  sender?: SmsSender,
+) {
   const pool = new Pool({
     connectionString: config.databaseURL,
     max: 5,
@@ -18,7 +23,7 @@ export async function createAuthentication(config: AuthConfig, rateLimit?: AuthR
   });
   pool.on('error', () => log.error('AUTH_DATABASE_CONNECTION_ERROR'));
   try {
-    const options = authOptions(config, pool);
+    const options = authOptions(config, pool, sender);
     if (rateLimit) options.rateLimit = { ...options.rateLimit, customStorage: rateLimit };
     const migration = await getMigrations(options);
     if (
@@ -28,6 +33,15 @@ export async function createAuthentication(config: AuthConfig, rateLimit?: AuthR
       migration.schemaProblems.length
     )
       throw new Error('AUTH_SCHEMA: run auth:migrate before enabling authentication');
+    if (config.wechat) {
+      const namespace = `${JSON.stringify([config.wechat.appId]).slice(0, -1)},`;
+      const mismatched = await pool.query(
+        `SELECT 1 FROM "account" WHERE "providerId" = 'wechat'
+         AND left("accountId", length($1)) <> $1 LIMIT 1`,
+        [namespace],
+      );
+      if (mismatched.rowCount) throw new Error('AUTH_WECHAT_APP_CHANGED: migration required');
+    }
     const auth = betterAuth(options);
     await auth.$context;
     return {
@@ -41,7 +55,9 @@ export async function createAuthentication(config: AuthConfig, rateLimit?: AuthR
     };
   } catch (error) {
     await pool.end();
-    throw error instanceof Error && error.message.startsWith('AUTH_SCHEMA')
+    throw error instanceof Error &&
+      (error.message.startsWith('AUTH_SCHEMA') ||
+        error.message.startsWith('AUTH_WECHAT_APP_CHANGED'))
       ? error
       : new Error('AUTH_STARTUP: authentication database is unavailable or incompatible');
   }

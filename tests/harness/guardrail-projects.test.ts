@@ -918,3 +918,56 @@ it('rejects out-of-project adapters and unknown package allowances', async () =>
   });
   expect(check(unknown).output).toContain('PROJECT_ADAPTERS worker: unsupported pg');
 });
+
+it('confines Tencent SMS SDK imports and resolves aliases and subpaths', async () => {
+  const root = await fixture();
+  await put(
+    root,
+    'node_modules/tencentcloud-sdk-nodejs-sms/package.json',
+    JSON.stringify({
+      name: 'tencentcloud-sdk-nodejs-sms',
+      type: 'module',
+      types: 'index.d.ts',
+    }),
+  );
+  await put(
+    root,
+    'node_modules/tencentcloud-sdk-nodejs-sms/index.d.ts',
+    'export interface Client {}\n',
+  );
+  await put(
+    root,
+    'node_modules/tencentcloud-sdk-nodejs-sms/sub.d.ts',
+    'export interface Client {}\n',
+  );
+  await put(
+    root,
+    'src/integrations/tencent-sms.ts',
+    "export type { Client } from 'tencentcloud-sdk-nodejs-sms';\n",
+  );
+  await json(root, 'harness.config.json', (config) => {
+    config.projects.app!.packageAdapters = {
+      'tencentcloud-sdk-nodejs-sms': ['src/integrations/tencent-sms.ts'],
+    };
+  });
+  expect(check(root).status).toBe(0);
+  await put(
+    root,
+    'src/auth/service.ts',
+    "export type { Client } from 'tencentcloud-sdk-nodejs-sms/sub';\n",
+  );
+  expect(check(root).output).toContain('SMS_ADAPTER src/auth/service.ts');
+  await json(root, 'tsconfig.json', (config) => {
+    config.compilerOptions.paths = {
+      'sms-alias': ['./node_modules/tencentcloud-sdk-nodejs-sms/index.d.ts'],
+    };
+  });
+  await put(root, 'src/auth/service.ts', "export type { Client } from 'sms-alias';\n");
+  expect(check(root).output).toContain('SMS_ADAPTER src/auth/service.ts');
+  await json(root, 'harness.config.json', (config) => {
+    config.projects.app!.packageAdapters = {
+      'tencentcloud-sdk-nodejs-sms': ['src/auth/service.ts'],
+    };
+  });
+  expect(check(root).output).toContain('SMS access belongs to the root SMS adapter');
+});

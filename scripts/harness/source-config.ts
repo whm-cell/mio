@@ -10,7 +10,9 @@ export interface SourceProject {
   build: string;
   publicEntries?: { source: string; export: string }[];
   capabilities?: Partial<Record<'fs' | 'child_process' | 'sqlite', string[]>>;
-  packageAdapters?: Partial<Record<'cos-nodejs-sdk-v5' | 'amqplib', string[]>>;
+  packageAdapters?: Partial<
+    Record<'cos-nodejs-sdk-v5' | 'amqplib' | 'tencentcloud-sdk-nodejs-sms', string[]>
+  >;
 }
 
 export interface HarnessConfig {
@@ -175,7 +177,7 @@ function validateProjects(
       errors.push(`PROJECT_EXPORTS ${id}: service cannot declare publicEntries`);
     for (const [field, supported] of [
       ['capabilities', ['fs', 'child_process', 'sqlite']],
-      ['packageAdapters', ['cos-nodejs-sdk-v5', 'amqplib']],
+      ['packageAdapters', ['cos-nodejs-sdk-v5', 'amqplib', 'tencentcloud-sdk-nodejs-sms']],
     ] as const) {
       const rules = value[field];
       if (rules === undefined) continue;
@@ -196,6 +198,12 @@ function validateProjects(
           );
         const targets = paths(entries, `${id}.${field}.${name}`, errors);
         if (!targets.length) errors.push(`PROJECT_ADAPTERS ${id}: ${name} requires exact files`);
+        if (
+          field === 'packageAdapters' &&
+          name === 'tencentcloud-sdk-nodejs-sms' &&
+          (root !== '.' || targets.length !== 1 || targets[0] !== 'src/integrations/tencent-sms.ts')
+        )
+          errors.push(`PROJECT_ADAPTERS ${id}: SMS access belongs to the root SMS adapter`);
         for (const target of targets)
           if (!target.endsWith('.ts') || !sources.some((base) => beneath(target, base)))
             errors.push(`PROJECT_ADAPTERS ${id}: ${target} must be an exact source file`);

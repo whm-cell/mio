@@ -4,11 +4,11 @@
 
 ## 本域共同约定
 
-只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及 OAuth 入口不隐式开放。所有 POST 必须携带允许的 Origin 和 JSON，正文最多 16 KiB、读取超时 10 秒。浏览器请求使用 `credentials: 'include'`。
+只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST 必须携带允许的 Origin 和 JSON，正文最多 16 KiB、读取超时 10 秒。浏览器请求使用 `credentials: 'include'`。
 
 OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST 与预检才返回 403。
 
-cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。当前没有浏览器页面或浏览器验收。
+cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
 会话默认 7 天、1 天后可刷新；禁用 cookie 会话缓存，身份与撤销查询以 DB 为准。`/api/v1/me` 只校验身份，不刷新会话；客户端经 `/api/auth/get-session` 同时续期 DB 与 cookie。数据库池和路由随插件生命周期初始化/释放；重载且 secret/数据库不变时会话继续有效。
 
@@ -20,12 +20,100 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | -------------------------------------------------------------------------------------------------------------- | ------------------- |
 | `/sign-in/email`                                                                                               | 60 秒 / 10 次       |
 | `/sign-up/email`                                                                                               | 60 秒 / 5 次        |
+| `/phone-number/send-otp`、`/phone-binding/send-otp`                                                            | 各自 60 秒 / 100 次 |
+| `/phone-number/verify`、`/phone-binding/confirm`                                                               | 各自 60 秒 / 10 次  |
+| `/sign-in/social`、`/link-social`                                                                              | 各自 60 秒 / 10 次  |
+| `/callback/wechat`                                                                                             | 60 秒 / 100 次      |
 | `/change-password`                                                                                             | 10 秒 / 3 次        |
 | `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次 |
 
 错误凭据也占一次放行额度；适配器提前拒绝的 Origin、路径、方法、正文错误和 OPTIONS 不消费。窗口从最近放行计算，放行更新该时间，拒绝不更新；额度耗尽保留库 429 原始消息与 `X-Retry-After`（向上取整的剩余秒数）。代理后的客户端共享代理地址限额，正式部署需要在可信边缘配置限流；当前未验证任意代理链或多实例容量。库自身 CSRF 和适配器 Origin 检查均保留。
 
 计数默认在 DB，显式 Redis 选择与恢复按[认证配置](../auth.md#限流存储与恢复)，资源边界见[Redis 契约](../integrations/redis.md)。Redis 失败返回包装 `503 AUTH_UNAVAILABLE`，不是超额 429；没有静默 DB 回退。未知状态后受限入口持续 503，直至操作者排清、等待并重启；已装载且 DB 正常时 `/api/v1/me` 仍查询 DB。PG 账号/会话、cookie 和原迁移模型不因 Redis 计数改变；整进程维护期间入口可能不可达。
+
+## POST /api/auth/sign-in/social
+
+身份：允许匿名发起微信网站登录。
+
+输入：`provider` 必须为 `wechat`；可选 `callbackURL` 只接受以单个 `/` 开始的本站路径，缺省 `/`。不接受 `idToken`、其他 provider、额外授权参数或未声明字段。
+
+成功：返回库的 `{url,redirect:false}` 并设置短期 state Cookie；前端在同一浏览器中打开 `url`，完成授权后返回指定本站路径。返回的授权地址并不代表已经登录。
+
+错误：输入无效为 400，未启用为 503；来源、限流和数据库错误沿共同约定。
+
+副作用：建立短期授权 state；首次通过微信授权可注册用户，不按相同邮箱自动合并已有账号。客户端不传微信主体或持久化 provider token。
+
+## POST /api/auth/link-social
+
+身份：当前有效且创建不足 10 分钟的会话；当前用户尚未绑定微信。
+
+输入：与微信登录发起相同。回调必须仍携带相同会话与 state Cookie；新的微信授权仅绑定发起人。
+
+成功：返回授权地址并设置短期 state Cookie，响应格式与微信登录发起相同。
+
+错误：无近期会话、已绑定微信或输入无效为 400，未启用为 503；微信已属于另一用户时回调返回错误，不转移或合并账号。
+
+副作用：建立绑定用途的授权 state，不在此步骤直接写入微信主体。
+
+## GET /api/auth/callback/wechat
+
+身份：微信授权返回的 code、state 和发起浏览器的 state Cookie；绑定在回调执行权威会话核验时，还要求发起会话有效且当前浏览器使用同一 userId 和 sessionId。核验已通过的在途绑定不会因并发退出或撤销自动取消，可能在撤销成功后完成；后续请求仍受撤销约束。
+
+输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。
+
+成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。
+
+错误：缺少或错误 state Cookie、重复 state 为 400；库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
+
+副作用：进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
+
+## POST /api/auth/phone-number/send-otp
+
+身份：允许匿名请求登录或自助注册验证码。
+
+输入：`phoneNumber`，接受 11 位大陆号码或其 `+86` 格式；未声明字段拒绝。
+
+成功：200 和 `{status:true}` 表示供应商已受理，不证明送达。
+
+错误：输入无效为 400，短信预算耗尽为 429，未启用或供应商拒绝／结果未知为 503；预算 429 不承诺返回重试秒数。
+
+副作用：先占用持久短信预算并建立短期挑战，再调用[腾讯短信](../integrations/tencent-sms.md)；失败和未知不返预算、不自动重发。
+
+## POST /api/auth/phone-number/verify
+
+身份：持有此号码的登录用途验证码。
+
+输入：`phoneNumber,code`；验证码为 6 位字符串，未声明字段拒绝。
+
+成功：返回 `{status:true}` 并设置会话 Cookie，已有号码登录其所属用户，新号码自助注册。
+
+错误：输入、验证码或用途无效为 400，短信未启用为 503。
+
+副作用：原子消费验证码，再创建或查询用户并创建库会话；后续失败不恢复该码，需重新请求。
+
+## POST /api/auth/phone-binding/send-otp
+
+身份：创建时间不超过 10 分钟且未撤销的当前会话。
+
+输入：`phoneNumber`；格式与登录发码相同。
+
+成功：200 和 `{status:true}` 表示供应商已受理，不证明送达。
+
+错误：输入无效为 400，无近期会话为 401，预算耗尽为 429，未启用或供应商拒绝／结果未知为 503。
+
+副作用：占用短信预算并发送绑定用途验证码，绑定原用户、会话和号码；失败和未知不返预算、不自动重发。
+
+## POST /api/auth/phone-binding/confirm
+
+身份：与发码相同且仍有效的近期会话，以及该号码的绑定用途验证码。
+
+输入：`phoneNumber,code`；格式与登录验证相同。
+
+成功：返回 `{status:true}`，在当前用户首次绑定空闲号码，userId 不变。
+
+错误：输入、验证码、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，短信未启用为 503。
+
+副作用：消费验证码并在事务中检查原会话、更新当前用户；不转移或合并账号。持久预算及恢复边界见[认证底座](../auth.md#手机验证码与发送预算)。
 
 ## POST /api/auth/sign-up/email
 

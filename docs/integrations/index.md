@@ -8,6 +8,8 @@
 | 使用 Redis，调整连接、命令、资源策略或首个限流消费者 | [Redis](redis.md)；业务规则见[认证底座](../auth.md#限流存储与恢复)  | [公共资源](../../src/integrations/redis.ts)、[认证消费者](../../src/auth/rate-limit.ts)、[插件装配](../../src/plugin.ts)                     |
 | 用户万联目录发现、固定出站与凭据隔离                 | [OneLinkAI](onelink.md)；业务规则见[供应商配置](../providers.md)    | [目录客户端](../../src/integrations/onelink/models.ts)、[用户服务](../../src/providers/service.ts)                                           |
 | 用户私有资产直传、条件复制与下载                     | [腾讯云 COS](cos.md)；用户入口见[资产 API](../apis/assets.md)       | [COS 适配器](../../src/integrations/cos.ts)、[资产服务](../../src/assets/service.ts)                                                         |
+| 手机验证码真实短信发送                               | [腾讯云短信](tencent-sms.md)；业务规则见[认证底座](../auth.md)      | [短信适配器](../../src/integrations/tencent-sms.ts)、[认证插件](../../src/auth/phone.ts)                                                     |
+| 微信网站应用登录与显式绑定                           | [微信网站应用](wechat.md)；HTTP 行为见[认证契约](../apis/auth.md)   | [微信适配器](../../src/integrations/wechat.ts)、[认证插件](../../src/auth/wechat.ts)                                                         |
 
 DSH Agent/Session/原生持久化的采用与约束见 [DSH 内核](dsh.md)，实际入口是[受控内核](../../src/dsh/kernel.ts)和[正式 Profile](../../cordis.patch.yml)。
 

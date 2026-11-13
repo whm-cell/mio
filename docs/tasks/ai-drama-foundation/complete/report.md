@@ -14,13 +14,19 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/auth/service.ts](../../../../src/auth/service.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [scripts/service/migrate-auth.ts](../../../../scripts/service/migrate-auth.ts) · [docs/auth.md](../../../auth.md) · [docs/apis/auth.md](../../../apis/auth.md) · [tests/auth/auth.test.ts](../../../../tests/auth/auth.test.ts)
 
+## phone-wechat-auth
+
+**手机号验证码、微信登录与本人首次绑定**
+
+[src/auth/phone.ts](../../../../src/auth/phone.ts) · [src/auth/phone-store.ts](../../../../src/auth/phone-store.ts) · [src/auth/wechat.ts](../../../../src/auth/wechat.ts) · [src/integrations/tencent-sms.ts](../../../../src/integrations/tencent-sms.ts) · [src/integrations/wechat.ts](../../../../src/integrations/wechat.ts) · [docs/apis/auth.md](../../../apis/auth.md) · [docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md](../changes/phone-wechat-auth/change.md) · [docs/tasks/ai-drama-foundation/pending/auth-extension.md](../pending/auth-extension.md)
+
 ```mio-prd-results
 {
   "version": 5,
   "prd": "docs/prd-ai-drama-foundation.md",
   "records": {
     "path": "docs/tasks/ai-drama-foundation/complete/records.json",
-    "sha256": "fdd33dfd2be8db761773a310eb9001edab87e99f6e6c4e70323ac9602ffb4d33"
+    "sha256": "b84723e5b510e1b10a79610b44097372ba4c44d44f8f4636913c064ebdd76144"
   }
 }
 ```

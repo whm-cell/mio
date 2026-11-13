@@ -81,6 +81,52 @@
         "statement": "接受认证底座并执行 complete",
         "reference": "2026-11-07 当前会话用户对认证底座候选54b01395a4f8及公共报告/10项DB-DSH测试、121项完整检查和限制的接受答复（request_user_input_async问题call_xl8u7X194vIy2jBtkeal7Vzt第0项）。"
       }
+    },
+    {
+      "key": "phone-wechat-auth",
+      "title": "手机号验证码、微信登录与本人首次绑定",
+      "locations": [
+        {
+          "path": "src/auth/phone.ts",
+          "purpose": "手机号OTP注册/登录和近期会话首次绑定"
+        },
+        {
+          "path": "src/auth/phone-store.ts",
+          "purpose": "用途绑定、原子消费、共享持久发送预算"
+        },
+        {
+          "path": "src/auth/wechat.ts",
+          "purpose": "微信主体、state与显式绑定会话核验"
+        },
+        {
+          "path": "src/integrations/tencent-sms.ts",
+          "purpose": "官方短信SDK、单连接副作用边界与超时脱敏"
+        },
+        {
+          "path": "src/integrations/wechat.ts",
+          "purpose": "固定微信出站、期限、大小与主体校验"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "现行认证HTTP接口与错误/副作用"
+        },
+        {
+          "path": "docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md",
+          "purpose": "本期范围、Review Contract与实现取舍"
+        },
+        {
+          "path": "docs/tasks/ai-drama-foundation/pending/auth-extension.md",
+          "purpose": "旧认证盘点与追加认证方案背景"
+        }
+      ],
+      "outcomes": "在保留Better Auth/PG/邮箱密码和现有userId/Cookie会话的基础上，追加大陆手机号OTP自注册/登录、本人首次绑定空闲号码、微信网站独立登录/注册及显式首次绑定；保护身份唯一、验证码用途和消费、持久短信预算、OAuth state与原会话，未迁移旧用户或资产。配置、显式迁移、集成契约和源码SDK边界均已维护。",
+      "verification": "候选4600644a在PG18.6/Redis8.2.11上按有效557项回归基线加当前50项认证/真实SDK本地TLS增量形成回执；当前完整格式/类型/lint/AST/documents、A/B构建和打包DSH smoke通过。同HEAD3490f017完整CI运行43362788658与当前增量共同覆盖pnpm check。独立审查与三方对账通过。本人一次真实SMS验证、微信绑定及退出后微信登录均回到同一userId；临时资源已清理。",
+      "limitations": "仅本地候选，未提交/推送/部署，新候选未运行远端CI。真实供应商覆盖一个手机号和同一微信绑定/再次登录，不证明新微信匿名注册的真实路径、容量或长期可用性。微信采用回调核验时点，核验通过的在途绑定不因并发撤销自动取消；短信只直连且SDK/Node升级须复验。没有前端改造、找回/换绑/合并或旧数据迁移。护栏对选定边界与候选证据有实际保护，仍依赖人工语义审查，长期治理成本未证；本轮保留漏用入口、保守目录报警和临时UI门控成本。",
+      "acceptance": {
+        "candidate": "4600644a930f2b5fded3dd6a61498fded3f6eab56c3f3005a8c23752fb61a088",
+        "statement": "用户在收到当前候选的实现、真实认证闭环、验证结果与限制后，要求将代码合并到主分支；最新指令明确暂不推送。按该指令接受此候选并仅授权本地提交及合并，不扩大至远端推送或部署。",
+        "reference": "2026-11-13 本任务对话：真实认证结果确认“显示同一用户、微信已绑定”；当前候选交回后的最新用户指令“将代码合并到主分支 ，暂不推送 。”"
+      }
     }
   ]
 }

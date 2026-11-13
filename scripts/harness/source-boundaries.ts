@@ -45,7 +45,7 @@ export function allowsCapability(
 export function allowsPackageAdapter(
   project: CheckedProject | undefined,
   file: string,
-  name: 'cos-nodejs-sdk-v5' | 'amqplib',
+  name: 'cos-nodejs-sdk-v5' | 'amqplib' | 'tencentcloud-sdk-nodejs-sms',
 ): boolean {
   return project?.declaration.packageAdapters?.[name]?.includes(file) ?? false;
 }

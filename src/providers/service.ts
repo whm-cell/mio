@@ -9,7 +9,7 @@ import type {
   ChatRuntimeSnapshot,
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
-import type { ProviderStore, SettingsPatch } from './store.ts';
+import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
 import { decryptCredential } from './credentials.ts';
 import {
   catalogView,
@@ -161,15 +161,10 @@ export function createProviderService(
       assertOpen();
       return store.settings(actor.userId, expected, patch);
     },
-    preference(
-      actor: ProviderPrincipal,
-      expected: number,
-      modelRef: string,
-      patch: { enabled?: boolean; isDefault?: boolean; usage?: Category },
-    ) {
+    preference(actor: ProviderPrincipal, expected: number, modelRef: string, patch: ModelPatch) {
       assertOpen();
       const usage = patch.usage ?? legacyReference(modelRef)?.usage;
-      if (!usage || !categories.includes(usage))
+      if (('enabled' in patch || 'isDefault' in patch) && (!usage || !categories.includes(usage)))
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'MODEL_USAGE_REQUIRED');
       return store.preference(actor.userId, expected, modelRef, usage, patch);
     },

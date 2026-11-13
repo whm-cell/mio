@@ -68,7 +68,15 @@ export function createProviderHandler(
         : test
           ? []
           : models
-            ? ['modelRef', 'usage', 'enabled', 'isDefault', 'expectedRevision']
+            ? [
+                'modelRef',
+                'usage',
+                'enabled',
+                'isDefault',
+                'name',
+                'description',
+                'expectedRevision',
+              ]
             : ['enabled', 'defaultImageWatermark', 'defaultVideoWatermark', 'expectedRevision'];
       if (Object.keys(value).some((k) => !keys.includes(k)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
@@ -111,7 +119,26 @@ export function createProviderHandler(
         if (typeof modelRef !== 'string') return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         if ('usage' in patch && !categories.includes(patch.usage as never))
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        if (!('enabled' in patch) && !('isDefault' in patch))
+        for (const [key, max] of [
+          ['name', 100],
+          ['description', 500],
+        ] as const) {
+          const item = patch[key];
+          if (
+            key in patch &&
+            item !== null &&
+            (typeof item !== 'string' ||
+              !item.isWellFormed() ||
+              item.includes('\0') ||
+              Array.from(item).length > max)
+          )
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        }
+        const preference = 'enabled' in patch || 'isDefault' in patch;
+        if (
+          (!preference && 'usage' in patch) ||
+          (!preference && !('name' in patch) && !('description' in patch))
+        )
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(await service.preference(actor, expected, modelRef, patch));
       }

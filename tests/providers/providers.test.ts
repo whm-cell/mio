@@ -581,3 +581,206 @@ it('rejects same-name malformed default indexes and missing schema without leaki
   }
   expect(await connectionCount()).toBe(before);
 });
+
+it('edits owner metadata independently and atomically, retaining overrides across refresh, rotation and reopening', async () => {
+  const id = 'Metadata:Exact-Q';
+  let description = 'supplier first';
+  upstream = async () => Response.json({ data: [{ id, description }] });
+  expect((await save('metadata-owner-one-key')).status).toBe(200);
+  expect((await call(`${base}/test`, 'POST', {})).status).toBe(200);
+  const catalog = async (index = 0) =>
+    (await (await call(`${base}/models`, 'GET', undefined, index)).json()) as {
+      items: {
+        modelRef: string;
+        modelId: string | null;
+        name: string | null;
+        description: string | null;
+        nameOverride: string | null;
+        descriptionOverride: string | null;
+        category: string | null;
+        adaptation: unknown;
+        membership: string;
+      }[];
+    };
+  const first = (await catalog()).items.find((item) => item.modelId === id)!;
+  const patch = async (values: Record<string, unknown>, index = 0, revision?: number) =>
+    call(
+      `${base}/models`,
+      'PATCH',
+      {
+        modelRef: first.modelRef,
+        expectedRevision: revision ?? (await current(index)).revision,
+        ...values,
+      },
+      index,
+    );
+  expect(first).toMatchObject({
+    name: id,
+    description: 'supplier first',
+    nameOverride: null,
+    descriptionOverride: null,
+    category: null,
+    adaptation: null,
+  });
+  expect((await patch({ name: '我的名称' })).status).toBe(200);
+  expect((await patch({ description: '我的描述' })).status).toBe(200);
+  let item = (await catalog()).items.find((entry) => entry.modelId === id)!;
+  expect(item).toMatchObject({
+    name: '我的名称',
+    description: '我的描述',
+    category: null,
+    adaptation: null,
+  });
+  const revision = (await current()).revision;
+  expect((await patch({ name: 'stale' }, 0, revision - 1)).status).toBe(409);
+  expect((await patch({ name: 'must roll back', usage: 'chat', isDefault: true })).status).toBe(
+    409,
+  );
+  expect((await current()).revision).toBe(revision);
+  expect((await catalog()).items.find((entry) => entry.modelId === id)!.name).toBe('我的名称');
+  if (!(await current(1))) expect((await save('metadata-owner-two-key', 1)).status).toBe(200);
+  expect((await patch({ name: 'cross-owner' }, 1)).status).toBe(409);
+  expect(
+    (
+      await call(
+        `${base}/models`,
+        'PATCH',
+        { modelRef: first.modelRef, name: 'anonymous', expectedRevision: revision },
+        0,
+        { cookie: '' },
+      )
+    ).status,
+  ).toBe(401);
+  for (const value of [
+    { name: 42 },
+    { description: [] },
+    { name: 'x'.repeat(101) },
+    { description: 'x'.repeat(501) },
+    { name: '\0' },
+    { name: '\ud800' },
+    { usage: 'chat', name: 'unused usage' },
+  ])
+    expect((await patch(value)).status).toBe(400);
+  expect((await patch({ name: '🦊'.repeat(100), description: '文'.repeat(500) })).status).toBe(200);
+  expect((await patch({ name: '', description: '' })).status).toBe(200);
+  expect((await catalog()).items.find((entry) => entry.modelId === id)).toMatchObject({
+    name: '',
+    description: '',
+    nameOverride: '',
+    descriptionOverride: '',
+  });
+  expect((await patch({ name: '我的名称', description: '我的描述' })).status).toBe(200);
+  description = 'supplier updated';
+  expect((await call(`${base}/test`, 'POST', {})).status).toBe(200);
+  expect((await save('metadata-owner-one-rotated-key')).status).toBe(200);
+  item = (await catalog()).items.find((entry) => entry.modelId === id)!;
+  expect(item).toMatchObject({
+    membership: 'historical',
+    name: '我的名称',
+    description: '我的描述',
+  });
+  expect((await patch({ name: 'historical edit' })).status).toBe(200);
+  const reopened = await createProviderStore(config);
+  const row = await reopened.state(
+    (
+      await pool.query('SELECT owner_id FROM mio_provider_configs WHERE id=$1', [
+        (await current()).id,
+      ])
+    ).rows[0].owner_id,
+  );
+  try {
+    expect(
+      row!.models.find(
+        (entry) => entry.model_key === first.modelRef.slice('onelink:model:'.length),
+      ),
+    ).toMatchObject({ display_name: 'historical edit', description_override: '我的描述' });
+  } finally {
+    await reopened.close();
+  }
+  expect((await call(`${base}/test`, 'POST', {})).status).toBe(200);
+  expect((await patch({ name: null })).status).toBe(200);
+  expect((await patch({ description: null })).status).toBe(200);
+  item = (await catalog()).items.find((entry) => entry.modelId === id)!;
+  expect(item).toMatchObject({
+    name: id,
+    description: 'supplier updated',
+    nameOverride: null,
+    descriptionOverride: null,
+    category: null,
+    adaptation: null,
+  });
+  await declareModel(id);
+  await pool.query(
+    "ALTER TABLE mio_provider_models ADD CONSTRAINT metadata_test_failure CHECK(display_name IS DISTINCT FROM 'force failure')",
+  );
+  try {
+    const before = (await current()).revision;
+    expect((await patch({ name: 'force failure', usage: 'chat', isDefault: true })).status).toBe(
+      503,
+    );
+    expect((await current()).revision).toBe(before);
+    expect(
+      (
+        await pool.query('SELECT * FROM mio_provider_model_preferences WHERE model_key=$1', [
+          first.modelRef.slice('onelink:model:'.length),
+        ])
+      ).rows,
+    ).toHaveLength(0);
+    expect((await catalog()).items.find((entry) => entry.modelId === id)!.name).toBe(id);
+  } finally {
+    await pool.query('ALTER TABLE mio_provider_models DROP CONSTRAINT metadata_test_failure');
+  }
+  expect((await patch({ name: '组合成功', usage: 'chat', isDefault: true })).status).toBe(200);
+  expect((await catalog()).items.find((entry) => entry.modelId === id)).toMatchObject({
+    name: '组合成功',
+  });
+  expect(
+    (
+      await pool.query(
+        'SELECT is_default FROM mio_provider_model_preferences WHERE model_key=$1 AND usage=$2',
+        [first.modelRef.slice('onelink:model:'.length), 'chat'],
+      )
+    ).rows[0].is_default,
+  ).toBe(true);
+  await call(base, 'PATCH', { enabled: false, expectedRevision: (await current()).revision });
+  expect((await patch({ description: '禁用时仍可编辑' })).status).toBe(200);
+  expect((await catalog()).items.find((entry) => entry.modelId === id)!.description).toBe(
+    '禁用时仍可编辑',
+  );
+});
+
+it('edits Unicode separator IDs through legacy references without changing stable identity or classification', async () => {
+  const ids = ['Exact\u2028Route', 'Exact\u2029Route'];
+  upstream = async () => Response.json({ data: ids.map((id) => ({ id })) });
+  expect((await save('unicode-separator-owner-key')).status).toBe(200);
+  expect((await call(`${base}/test`, 'POST', {})).status).toBe(200);
+  const list = async () =>
+    (await (await call(`${base}/models`)).json()) as {
+      items: {
+        modelId: string;
+        modelRef: string;
+        name: string;
+        category: string | null;
+        adaptation: unknown;
+      }[];
+    };
+  const before = (await list()).items.filter((entry) => ids.includes(entry.modelId));
+  expect(before).toHaveLength(2);
+  for (const [index, id] of ids.entries()) {
+    const updated = await call(`${base}/models`, 'PATCH', {
+      modelRef: `onelink:chat:${id}`,
+      expectedRevision: (await current()).revision,
+      name: `Unicode ${index}`,
+    });
+    expect(updated.status).toBe(200);
+  }
+  expect((await call(`${base}/test`, 'POST', {})).status).toBe(200);
+  const after = (await list()).items.filter((entry) => ids.includes(entry.modelId));
+  for (const [index, id] of ids.entries())
+    expect(after.find((entry) => entry.modelId === id)).toMatchObject({
+      modelRef: before.find((entry) => entry.modelId === id)!.modelRef,
+      name: `Unicode ${index}`,
+      category: null,
+      adaptation: null,
+    });
+});

@@ -44,6 +44,64 @@ pnpm start:test
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 或 `compute`，例如 `pnpm migrate:test conversations --apply`；资产必须先于计算迁移，分库供应商引用迁移沿[供应商规范](providers.md)。未启用域不自动迁移。
 
+## 常驻 dev 的 OneLink 与对话
+
+以下只配置本人授权的开发环境。先停止旧 dev 应用，备份目标库和现有 `.env`，保留原文件的 600 权限；不要覆盖已有主密钥。向 `.env` 显式加入模板中的 `MIO_PROVIDERS_DATABASE_URL`、`MIO_PROVIDERS_MASTER_KEY`、`MIO_PROVIDERS_MASTER_KEY_ID` 和 `MIO_CONVERSATIONS_DATABASE_URL`。两个 URL 可以各自填写 `.env` 中 `MIO_AUTH_DATABASE_URL` 的完整值；这只是共用物理数据库，各域仍持独立池。文件读取不展开 `$MIO_AUTH_DATABASE_URL`，不能只写变量引用。主密钥是独立 32 字节随机数的标准 base64（初次可用 `openssl rand -base64 32` 生成），ID 可用稳定的 `dev-onelink-v1`；与数据库及 DSH 目录一起安全备份，后续启动继续使用相同值。不要放进仓库、命令历史或共享日志。`.env.test` 仅在需要该环境时独立配置，不回退 `.env`。
+
+核对 SQL 和目标库后执行；已有对话在同库时供应商迁移会读取其旧模型引用，若对话位于独立库，按[供应商迁移](providers.md#配置与迁移)冻结源记录并显式使用 `--with-conversations`：
+
+```sh
+pnpm infra:up:dev
+pnpm migrate:dev providers
+pnpm migrate:dev providers --apply
+pnpm migrate:dev conversations
+pnpm migrate:dev conversations --apply
+pnpm build
+pnpm start:dev
+```
+
+启动只检查结构，不自动迁移、发现或调用模型。下面是使用当前账号的手动路径；认证、供应商和对话具体错误分别见[认证 HTTP](apis/auth.md)、[供应商 HTTP](apis/providers.md)及[对话 HTTP](apis/conversations.md)。命令中的 `REV`、`MODEL_REF`、`OWNER_ID` 和 `CONVERSATION_ID` 都应按每一步真实返回值替换，不要粘贴其他用户的值。
+
+1. 创建私有操作目录 `mkdir -p .runtime/dev/onelink-review && chmod 700 .runtime/dev/onelink-review`。将登录正文 `{"email":"本人测试邮箱","password":"本人密码"}` 保存为其中的 `login.json` 并设为 600。执行以下登录及身份查询；Cookie 文件同样只保存在该目录。
+
+   ```sh
+   curl -sS -c .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' --data-binary @.runtime/dev/onelink-review/login.json http://localhost:4310/api/auth/sign-in/email -o /dev/null -w 'HTTP %{http_code}\n'
+   curl -sS -b .runtime/dev/onelink-review/cookies http://localhost:4310/api/v1/me
+   curl -sS -b .runtime/dev/onelink-review/cookies http://localhost:4310/api/v1/providers/onelink
+   ```
+
+2. 若尚未保存 Key，将 `{"apiKey":"本人授权的万联 Key","expectedRevision":0}` 写入 600 权限的 `credential.json`；已有配置则使用上一步返回的最新 revision，注意这会轮换当前 Key。只通过文件提交，不把明文放在命令行或共享日志。接着显式发现目录，读取实际 `modelRef`、`revision` 和待适配状态。
+
+   ```sh
+   curl -sS -X PUT -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' --data-binary @.runtime/dev/onelink-review/credential.json http://localhost:4310/api/v1/providers/onelink/credential
+   curl -sS -X POST -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{}' http://localhost:4310/api/v1/providers/onelink/test
+   curl -sS -b .runtime/dev/onelink-review/cookies http://localhost:4310/api/v1/providers/onelink/models
+   ```
+
+3. 用刚返回的稳定引用和最新 revision 编辑展示信息；不要求该模型已经可运行。每次写入后重新读取 revision，`null` 可清除覆盖。
+
+   ```sh
+   curl -sS -X PATCH -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{"modelRef":"MODEL_REF","expectedRevision":REV,"name":"我的模型","description":"开发用途"}' http://localhost:4310/api/v1/providers/onelink/models
+   ```
+
+4. 只为当前发现且有可靠协议依据的模型建立[部署声明](providers.md#受控适配声明与实际验证)：将该节 JSON 的 modelRef、profile、source 和 sourceVersion 填成实际值，存为私有 `declaration.json`；OWNER_ID 取 `/api/v1/me` 的 `userId`，REV 取最新 ProviderView。如下显式读取 dev 文件，清除 shell 可能继承的其他环境设置；声明不会创建成员或直接标为 verified。
+
+   ```sh
+   env -i PATH="$PATH" node --env-file=.env scripts/service/import-provider-adaptation.ts OWNER_ID REV .runtime/dev/onelink-review/declaration.json
+   ```
+
+5. 重新 GET 模型目录取得 revision，以稳定引用设置 chat 默认。然后创建对话并发送唯一 requestId；`202` 仅是受理，按原 requestId 查询终态并读历史，不用新 ID 重发状态未知的请求。发送会产生真实模型调用和可能费用。
+
+   ```sh
+   curl -sS -X PATCH -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{"modelRef":"MODEL_REF","usage":"chat","isDefault":true,"expectedRevision":REV}' http://localhost:4310/api/v1/providers/onelink/models
+   curl -sS -X POST -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{}' http://localhost:4310/api/v1/conversations
+   curl -sS -X POST -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{"requestId":"dev-review-1","text":"你好"}' http://localhost:4310/api/v1/conversations/CONVERSATION_ID/messages
+   curl -sS -b .runtime/dev/onelink-review/cookies http://localhost:4310/api/v1/conversations/CONVERSATION_ID/requests/dev-review-1
+   curl -sS -b .runtime/dev/onelink-review/cookies http://localhost:4310/api/v1/conversations/CONVERSATION_ID/history
+   ```
+
+凭据正文和登录材料用完后按本机秘密管理方式处理；不要将它们加入仓库。重启后使用原配置和原 DSH home，观察模型覆盖与历史，不自动重放已受理请求。此路径是人工验证说明，不意味着其他模型、媒体或生产已验证。
+
 启动、迁移及 Compose 明确选择一份完整配置，不叠加开发文件作为测试默认值；继承 shell 中的 Mio/DSH/PG/Redis/RabbitMQ/Compose 配置会被清除，避免开发连接覆盖测试文件。应用只取得运行所需的配置，不继承 `MIO_LOCAL_*` 管理密码和 `MIO_TEST_*` 回归配置。`NODE_ENV` 只表达 Node 运行模式：开发为 development，人工测试为 production；环境选择由显式 dev/test 参数决定。
 
 DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根的开发配置。环境配置统一维护在根 `.env` / `.env.test`，不要在 DSH home 另放 `.env`。

@@ -12,7 +12,7 @@ import { providerView } from './state.ts';
 
 export const modelReference = (key: string) => `onelink:model:${key}`;
 export function legacyReference(ref: string): { usage: Category; id: string } | null {
-  const match = /^onelink:(chat|image|video|voice|music):(.+)$/.exec(ref);
+  const match = /^onelink:(chat|image|video|voice|music):(.+)$/s.exec(ref);
   return match ? { usage: match[1] as Category, id: match[2]! } : null;
 }
 export function findModel(models: ModelRecord[], ref: string): ModelRecord | undefined {
@@ -118,7 +118,14 @@ export function catalogView(state: ProviderState | null, category?: Category) {
         modelRef: modelReference(model.model_key),
         modelKey: model.model_key,
         modelId: model.raw_model_id,
-        name: model.raw_model_id,
+        name: model.display_name ?? model.raw_model_id,
+        description:
+          model.description_override ??
+          (typeof model.supplier_metadata.description === 'string'
+            ? model.supplier_metadata.description
+            : null),
+        nameOverride: model.display_name,
+        descriptionOverride: model.description_override,
         category: model.classification,
         classificationSource: model.classification_source,
         supplierMetadata: model.supplier_metadata,

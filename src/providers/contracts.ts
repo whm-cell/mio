@@ -68,6 +68,8 @@ export interface ModelRecord {
   legacy_ref: string | null;
   unavailable_reason: string | null;
   supplier_metadata: Record<string, unknown>;
+  display_name: string | null;
+  description_override: string | null;
   classification: Category | null;
   classification_source: string | null;
   metadata_source: string | null;

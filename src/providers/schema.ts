@@ -45,6 +45,21 @@ CREATE TABLE IF NOT EXISTS mio_provider_models (
     OR (credential_version>0 AND catalog_version>0 AND first_seen_at IS NOT NULL AND last_seen_at IS NOT NULL)),
   CHECK(membership_state<>'current' OR (credential_version IS NOT NULL AND catalog_version IS NOT NULL))
 );
+ALTER TABLE mio_provider_models
+  ADD COLUMN IF NOT EXISTS display_name text,
+  ADD COLUMN IF NOT EXISTS description_override text;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
+    AND conname='mio_provider_models_display_name_length') THEN
+    ALTER TABLE mio_provider_models ADD CONSTRAINT mio_provider_models_display_name_length
+      CHECK(char_length(display_name)<=100);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
+    AND conname='mio_provider_models_description_override_length') THEN
+    ALTER TABLE mio_provider_models ADD CONSTRAINT mio_provider_models_description_override_length
+      CHECK(char_length(description_override)<=500);
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS mio_provider_model_adaptations (
   provider_id uuid NOT NULL, model_key uuid NOT NULL,
   operation text NOT NULL CHECK(operation='chat'),
@@ -76,8 +91,8 @@ export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<vo
       [2950, 23, 23, 23, 1184, 23, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
-      'SELECT model_key,provider_id,raw_model_id,supplier_metadata,classification,metadata_source,credential_version,catalog_version,first_seen_at,last_seen_at,membership_state FROM mio_provider_models LIMIT 0',
-      [2950, 2950, 25, 3802, 25, 25, 23, 23, 1184, 1184, 25],
+      'SELECT model_key,provider_id,raw_model_id,supplier_metadata,classification,metadata_source,credential_version,catalog_version,first_seen_at,last_seen_at,membership_state,display_name,description_override FROM mio_provider_models LIMIT 0',
+      [2950, 2950, 25, 3802, 25, 25, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
       'SELECT provider_id,model_key,operation,profile,declaration_version,source,source_version,capability_metadata,verification_status,verified_at,verification_evidence,tested_tuple FROM mio_provider_model_adaptations LIMIT 0',
@@ -91,6 +106,21 @@ export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<vo
     const result = await pool.query(sql);
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('PROVIDER_SCHEMA: incompatible columns');
+  }
+  const constraints = await pool.query<{ name: string; definition: string; valid: boolean }>(`
+    SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
+    FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND contype='c'
+      AND conname IN ('mio_provider_models_display_name_length','mio_provider_models_description_override_length')`);
+  for (const [name, definition] of [
+    ['mio_provider_models_display_name_length', 'CHECK ((char_length(display_name) <= 100))'],
+    [
+      'mio_provider_models_description_override_length',
+      'CHECK ((char_length(description_override) <= 500))',
+    ],
+  ]) {
+    const constraint = constraints.rows.find((item) => item.name === name);
+    if (!constraint?.valid || constraint.definition !== definition)
+      throw new Error('PROVIDER_SCHEMA: model metadata length constraints required');
   }
   const index = await pool.query<{
     unique: boolean;

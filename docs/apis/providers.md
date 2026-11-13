@@ -15,7 +15,7 @@ ProviderView 保留 `id/type/enabled/hasKey/masked/credentialVersion/revision/de
 - `lastAttempt=null|{seq,credentialVersion,startedAt,finishedAt,status,error}`，status 为 running/connected/failed，进行中 finishedAt=null。
 - `discovery=null|{credentialVersion,refreshSeq,checkedAt,status,scope:'models-only',ids,error}`：最近完成的本凭据尝试；失败 ids=[]，不能代替 catalog 判断成功快照，升级承接的旧成功通过 catalog 展示。
 
-revision 在配置/偏好/部署声明修改、刷新开始及结束递增；客户端修改先读取最新值。
+revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始及结束递增；客户端修改先读取最新值。
 
 ## GET /api/v1/providers/onelink
 
@@ -71,7 +71,7 @@ revision 在配置/偏好/部署声明修改、刷新开始及结束递增；客
 
 输入：可选单个 category=chat/image/video/voice/music；只筛供应商/部署声明分类，null 分类不自动进入 chat。
 
-成功：200 `{provider,items,defaults}`。items 含稳定 modelRef/modelKey、精确 modelId、可空 category/classificationSource、supplierMetadata、membership、credentialVersion/catalogVersion、firstSeenAt/lastSeenAt、legacyRef、discovered、adaptation、preferences、chat 的 enabled/isDefault/runnable/unavailableReason。modelRef 为 `onelink:model:<UUID>`；历史不可解析项 modelId=null。返回 current/removed/historical 实体，discovered 只表示当前成功成员。
+成功：200 `{provider,items,defaults}`。items 含稳定 modelRef/modelKey、精确 modelId、`name`、`description`、`nameOverride`、`descriptionOverride`、可空 category/classificationSource、supplierMetadata、membership、credentialVersion/catalogVersion、firstSeenAt/lastSeenAt、legacyRef、discovered、adaptation、preferences、chat 的 enabled/isDefault/runnable/unavailableReason。`name` 使用用户覆盖，否则使用精确 modelId；历史不可解析项二者均可为 null。`description` 使用用户覆盖，否则使用供应商字符串描述，均缺失为 null。两个 Override 字段为可空的实际用户覆盖，可区分回退；空字符串是实际覆盖。modelRef 为 `onelink:model:<UUID>`。返回 current/removed/historical 实体，discovered 只表示当前成功成员。
 
 adaptation 为 null 或 `{operation,profile,implementation:'implemented',declarationVersion,source,sourceVersion,metadata,verification}`；verification 含 status/at/evidence/testedTuple。未声明协议时 ADAPTER_PENDING。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用、费用或解密成功。
 
@@ -83,10 +83,10 @@ adaptation 为 null 或 `{operation,profile,implementation:'implemented',declara
 
 身份：当前登录用户。
 
-输入：`{modelRef,usage,expectedRevision,enabled?,isDefault?}`，至少一个布尔偏好。新稳定引用须指定 usage；旧 `onelink:<category>:<rawId>` 可用其 category 表达旧用途，raw ID 无损解析。usage 仅接受五类业务用途，目前可运行适配只有 chat。
+输入：`{modelRef,expectedRevision,name?,description?,usage?,enabled?,isDefault?}`，至少一个展示字段或布尔偏好。展示字段接受字符串或 null，分别最多 100、500 个 Unicode 字符；null 清除覆盖，省略不变，空字符串保留为覆盖。JSON 解码后的字符串拒绝 NUL 和未配对的 UTF-16 代理项；原始正文沿共同 JSON 读取流程解码，不额外严格校验 UTF-8 字节。仅编辑展示字段无需 usage 或运行资格，但模型必须属于当前用户并已存在。修改偏好时新稳定引用须指定 usage；旧 `onelink:<category>:<rawId>` 可用其 category 表达旧用途，raw ID 无损解析。usage 仅接受五类业务用途，目前可运行适配只有 chat；没有偏好字段时不得单独提供 usage。
 
 成功：200 ProviderView；同用途至多一个默认。设默认须当前有效成员、已实现适配和 enabled；原子清除同用途旧默认。禁用保留默认目标但使 effective=false，不选替代。
 
 错误：400 MODEL_USAGE_REQUIRED；409 PROVIDER_DISABLED/PROVIDER_AUTH_REJECTED/MODEL_CATALOG_NOT_DISCOVERED/MODEL_NOT_FOUND/MODEL_REMOVED/LEGACY_MODEL_REF_INVALID/ADAPTER_PENDING/MODEL_USAGE_UNSUPPORTED/MODEL_DISABLED/PROVIDER_REVISION_CONFLICT。
 
-副作用：事务修改本人用途偏好；不能新增目录成员、选择协议、声明能力或伪造实测。部署适配入口见业务规范，无对应普通用户 HTTP 管理入口。
+副作用：配置行锁内核对 owner 和 revision，在同一事务修改本人展示信息及用途偏好，组合请求失败不保存任何部分；不联网。不能新增目录成员、选择协议、声明能力或伪造实测。部署适配入口见业务规范，无对应普通用户 HTTP 管理入口。

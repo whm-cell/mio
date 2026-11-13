@@ -5,6 +5,11 @@
       "identity": "docs/tasks/onelink-integration/prd.md",
       "kind": "prd",
       "path": "docs/tasks/onelink-integration/prd.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-integration/changes/onelink-model-management/change.md",
+      "kind": "change",
+      "path": "docs/tasks/onelink-integration/changes/onelink-model-management/change.md"
     }
   ]
 }

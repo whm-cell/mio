@@ -16,6 +16,8 @@
 
 四表为 configs、models、model_adaptations、model_preferences，均以 `mio_provider_` 为前缀。配置保存 owner、当前密文、凭据版本、最近成功目录和最近尝试；模型保存精确 raw ID、稳定 UUID、来源与成员状态；适配保存已实现 profile、独立声明版本、来源和实际验证；偏好以配置/模型/usage 为键，并用部分唯一索引限制每用途一个默认。models 的配置/raw ID 唯一比较使用 C collation，偏好与适配通过复合外键核对配置归属。
 
+模型表可空保存用户名称和描述覆盖，分别最多 100、500 个 Unicode 字符；显式迁移为已有四表结构增列及长度约束，启动只读核查列与约束。旧行保持空覆盖，原身份、元数据、偏好及未知发现时间不变。刷新、凭据轮换和重启保留覆盖；显示回退及修改规则见[模型 HTTP 契约](apis/providers.md#get-apiv1providersonelinkmodels)。
+
 旧表升级只承接同凭据、connected、models-only 且完整合法的旧 discovery；成功空列表仍有目录版本。旧失败或其他凭据的观察不补成成功。旧偏好生成稳定映射或 historical 行，无发现来源的行不填发现时间/目录版本。原文不可解析的引用保留为 `legacy_ref` 与 `LEGACY_MODEL_REF_INVALID`，不猜模型。映射冲突回滚，要求核对备份中的原偏好。
 
 迁移默认读取同库已有的对话及回执绑定，只为 owner/配置匹配的旧引用补 historical 行，不改原绑定、digest、回执或 JSONL。对话位于另一数据库时，显式提供 `MIO_CONVERSATIONS_DATABASE_URL` 并运行 `pnpm providers:migrate --apply --with-conversations`；该连接只读引用，供应商写入仍在本域事务，无跨库外键。升级前冻结这些源记录并备份；本地测试不构成生产迁移验收。
@@ -46,6 +48,8 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 | 并发晚到                       | 旧序号或旧凭据响应拒绝写回，不能覆盖新成功或新错误                                              |
 
 供应商禁用阻止新选择/调用，保留偏好；仍允许显式只读目录诊断。模型移除、禁用、凭据失效均不自动换默认。usage 是业务用途，与供应商 classification 分离；未知分类不自动产生 chat 默认。用户明确指定 chat 用途，且目标当前有效、有已实现 chat 适配、已启用，才可设置默认。禁用模型保留默认目标并显示无效；修改偏好也执行当前资格检查。
+
+用户可以修改本人已存在实体的展示覆盖，即使其当前不可运行或属于历史；这不创造成员，也不改变分类、声明、验证或偏好。元数据与偏好同次修改共用配置行锁与 revision，在同一事务成功或失败。
 
 ## 受控适配声明与实际验证
 

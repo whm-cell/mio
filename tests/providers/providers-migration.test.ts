@@ -150,6 +150,61 @@ it('rolls back a failed upgrade entirely and rejects cross-configuration referen
     ).rejects.toThrow();
   }));
 
+it('upgrades an existing four-table catalog without changing identity or history and checks metadata constraints', async () =>
+  databaseTest(async (pool) => {
+    await pool.query(providerSchemaSQL);
+    const id = await seed(pool, null);
+    await pool.query(
+      `INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata)
+       VALUES($1,'old-exact-ID','{"description":"supplier"}')`,
+      [id],
+    );
+    await pool.query(
+      'ALTER TABLE mio_provider_models DROP COLUMN display_name, DROP COLUMN description_override',
+    );
+    const before = (await pool.query('SELECT * FROM mio_provider_models')).rows[0];
+    await expect(checkProviderSchema(pool)).rejects.toThrow();
+    await pool.query('BEGIN');
+    await pool.query(providerSchemaSQL);
+    await checkProviderSchema(pool);
+    await pool.query('COMMIT');
+    const migrated = (await pool.query('SELECT * FROM mio_provider_models')).rows[0];
+    expect(migrated).toEqual({ ...before, display_name: null, description_override: null });
+    expect(migrated).toMatchObject({
+      first_seen_at: null,
+      last_seen_at: null,
+      catalog_version: null,
+    });
+    await pool.query(
+      "UPDATE mio_provider_models SET display_name='保存',description_override='保留'",
+    );
+    await pool.query(providerSchemaSQL);
+    expect(
+      (await pool.query('SELECT display_name,description_override FROM mio_provider_models'))
+        .rows[0],
+    ).toEqual({ display_name: '保存', description_override: '保留' });
+    await expect(
+      pool.query("UPDATE mio_provider_models SET display_name=repeat('x',101)"),
+    ).rejects.toThrow();
+    await expect(
+      pool.query("UPDATE mio_provider_models SET description_override=repeat('x',501)"),
+    ).rejects.toThrow();
+    await pool.query(
+      'ALTER TABLE mio_provider_models DROP CONSTRAINT mio_provider_models_display_name_length',
+    );
+    await pool.query(
+      'ALTER TABLE mio_provider_models ADD CONSTRAINT mio_provider_models_display_name_length CHECK(char_length(display_name)<=101)',
+    );
+    await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
+    await expect(
+      pool.query('BEGIN').then(async () => {
+        await pool.query(providerSchemaSQL);
+        await checkProviderSchema(pool);
+      }),
+    ).rejects.toThrow('PROVIDER_SCHEMA');
+    await pool.query('ROLLBACK');
+  }));
+
 it('imports only owner-matching legacy conversation/receipt references from a separately configured database', async () => {
   const database = await authDatabase();
   const conversations = await authDatabase();

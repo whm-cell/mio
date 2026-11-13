@@ -3,6 +3,48 @@
   "prd": "docs/tasks/onelink-integration/prd.md",
   "results": [
     {
+      "key": "onelink-model-management",
+      "title": "OneLink 模型展示管理、常驻 dev 数据与文本闭环",
+      "locations": [
+        {
+          "path": "docs/tasks/onelink-integration/changes/onelink-model-management/change.md",
+          "purpose": "本轮确认的范围、方案与验收边界"
+        },
+        {
+          "path": "src/providers/http.ts",
+          "purpose": "本人模型展示信息与偏好的 HTTP 输入和权限入口"
+        },
+        {
+          "path": "src/providers/store.ts",
+          "purpose": "本人模型展示信息与用途偏好的 revision 与事务写入"
+        },
+        {
+          "path": "src/providers/schema.ts",
+          "purpose": "模型展示字段的增量迁移与结构检查"
+        },
+        {
+          "path": "docs/apis/providers.md",
+          "purpose": "模型展示值、覆盖及管理 API 契约"
+        },
+        {
+          "path": "docs/local-environments.md",
+          "purpose": "常驻 dev 配置、迁移与本人手动使用入口"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "复用现有对话、模型绑定和恢复边界"
+        }
+      ],
+      "outcomes": "本人已有 OneLink 模型可独立修改名称和描述，支持空串覆盖、null 清除及供应商信息回退；保留模型精确 ID、稳定引用、本人归属和既有运行资格，组合偏好修改在同一 revision 事务中提交。显式迁移扩展旧模型表；常驻 dev 已配置 provider 与对话域并保留原数据，当前账号可发现模型、设置默认并通过既有对话链完成真实文本和重启续聊。",
+      "verification": "基线 88fb74d 的 GitHub Actions 完整检查 50 文件 649 项通过；代码候选 c288 静态检查、构建和打包 smoke 通过。隔离 PG14.18 的前候选四域回归 15 文件 92 项与 c288 影响回归 9 文件 56 项通过并完成增量复核；dev PG18.6 实际备份、显式迁移及结构检查，原 3 账号保留，真实目录发现 86 项，名称/描述、资格与失败路径、两轮上下文、取消、重启保留和续聊均有观察。独立代码质量、护栏及七页规范三方对账完成。新候选 4d5ba27 仅变更交付授权/停止条件，文件及环境一致，定向结果按原件复用且未重跑。",
+      "limitations": "GitHub 全量属于改动前基线，本候选推送至 main 后的 CI 尚待实际运行和核查；PG18.6 未重跑全部隔离负向测试，备份仅确认可列目录而未恢复演练。两次 SIGINT 后 local 包装器均退出 1、子进程退出 130；取消轮 usage 未知，不能推断免费；重启去重以原回执、SQL/历史和源码支持，未抓上游 wire。其他模型、媒体、Messages 进一步真实验收和生产环境未在本次范围。",
+      "acceptance": {
+        "candidate": "4d5ba27beae82c9bb220d5f4e1b8619f17b0938707847f2acf8302c80cd4e354",
+        "statement": "你帮我验证一下没问题的话就把代码推送至main分支",
+        "reference": "2026-11-13 当前会话用户在本期结果及限制交回后提出的条件式指令。当前七项证据通过，主控复核相同代码及受影响范围未发现未解决问题，满足继续交付的条件；推送后的 main CI 尚待运行和核查。"
+      }
+    },
+    {
       "key": "onelink-user-chat",
       "title": "可扩展模型路由与默认文本闭环",
       "locations": [

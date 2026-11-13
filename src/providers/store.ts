@@ -20,6 +20,13 @@ export interface SettingsPatch {
   defaultImageWatermark?: boolean;
   defaultVideoWatermark?: boolean;
 }
+export interface ModelPatch {
+  enabled?: boolean;
+  isDefault?: boolean;
+  usage?: Category;
+  name?: string | null;
+  description?: string | null;
+}
 /** All mutations serialize on the configuration row; network calls run outside the transaction. */
 export class ProviderStore {
   private readonly pool: Pool;
@@ -153,38 +160,55 @@ export class ProviderStore {
     owner: string,
     expected: number,
     modelRef: string,
-    usage: Category,
-    patch: { enabled?: boolean; isDefault?: boolean },
+    usage: Category | undefined,
+    patch: ModelPatch,
   ): Promise<ProviderView> {
     return this.transaction(async (client) => {
       const row = await this.locked(client, owner, expected);
       const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0]!;
       const model = findModel(state.models, modelRef);
-      const reason = membershipError(row, model);
-      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
-      if (usage !== 'chat')
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_USAGE_UNSUPPORTED');
-      if (!chatAdaptation(state.adaptations, model!.model_key))
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
-      const old = state.preferences.find(
-        (p) => p.model_key === model!.model_key && p.usage === usage,
-      );
-      const enabled = patch.enabled ?? old?.enabled ?? true;
-      if (patch.isDefault && !enabled)
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
-      // Disable/remove/rotate preserves the default target, exposing its effective validity separately.
-      const isDefault = patch.isDefault ?? old?.is_default ?? false;
-      if (isDefault)
-        await client.query(
-          'UPDATE mio_provider_model_preferences SET is_default=false,updated_at=now() WHERE provider_id=$1 AND usage=$2 AND is_default',
-          [row.id, usage],
+      if ('enabled' in patch || 'isDefault' in patch) {
+        const reason = membershipError(row, model);
+        if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+        if (usage !== 'chat')
+          throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_USAGE_UNSUPPORTED');
+        if (!chatAdaptation(state.adaptations, model!.model_key))
+          throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+        const old = state.preferences.find(
+          (p) => p.model_key === model!.model_key && p.usage === usage,
         );
-      await client.query(
-        `INSERT INTO mio_provider_model_preferences(provider_id,model_key,usage,enabled,is_default)
-          VALUES($1,$2,$3,$4,$5) ON CONFLICT(provider_id,model_key,usage)
-          DO UPDATE SET enabled=$4,is_default=$5,updated_at=now()`,
-        [row.id, model!.model_key, usage, enabled, isDefault],
-      );
+        const enabled = patch.enabled ?? old?.enabled ?? true;
+        if (patch.isDefault && !enabled)
+          throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
+        // Disable/remove/rotate preserves the default target, exposing its effective validity separately.
+        const isDefault = patch.isDefault ?? old?.is_default ?? false;
+        if (isDefault)
+          await client.query(
+            'UPDATE mio_provider_model_preferences SET is_default=false,updated_at=now() WHERE provider_id=$1 AND usage=$2 AND is_default',
+            [row.id, usage],
+          );
+        await client.query(
+          `INSERT INTO mio_provider_model_preferences(provider_id,model_key,usage,enabled,is_default)
+            VALUES($1,$2,$3,$4,$5) ON CONFLICT(provider_id,model_key,usage)
+            DO UPDATE SET enabled=$4,is_default=$5,updated_at=now()`,
+          [row.id, model!.model_key, usage, enabled, isDefault],
+        );
+      }
+      if (!model) throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
+      if ('name' in patch || 'description' in patch)
+        await client.query(
+          `UPDATE mio_provider_models SET display_name=CASE WHEN $3 THEN $4 ELSE display_name END,
+            description_override=CASE WHEN $5 THEN $6 ELSE description_override END
+            WHERE provider_id=$1 AND model_key=$2`,
+          [
+            row.id,
+            model.model_key,
+            'name' in patch,
+            patch.name ?? null,
+            'description' in patch,
+            patch.description ?? null,
+          ],
+        );
       return providerView(
         (
           await client.query<ProviderRow>(

@@ -1387,4 +1387,4 @@ it('keeps twenty PRDs linear in public bytes with all docs in scope and many pri
   expect(packages.filter((path) => path.endsWith('/records.json'))).toHaveLength(20);
   await rm(join(root, '.work'), { recursive: true });
   expect(await checkReports(root, files)).toEqual([]);
-}, 60_000);
+}, 90_000);

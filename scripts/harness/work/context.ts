@@ -89,7 +89,7 @@ export async function captureFiles(root: string, task: Task): Promise<Checkpoint
   return files;
 }
 
-export async function capture(root: string, task: Task): Promise<Checkpoint> {
+export async function captureCandidate(root: string, task: Task) {
   const files = await captureFiles(root, task);
   const plan = task.plan;
   const contractPlan = {
@@ -110,6 +110,11 @@ export async function capture(root: string, task: Task): Promise<Checkpoint> {
     ...(task.delivery ? { deliveryVersion: task.delivery.version } : {}),
   };
   const contract = digest(json(contractPlan));
+  return { files, contract, candidate: digest(json({ files, contract })) };
+}
+
+export async function capture(root: string, task: Task): Promise<Checkpoint> {
+  const { files, contract, candidate } = await captureCandidate(root, task);
   const git = (args: string[]) => {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
     return result.status === 0 ? result.stdout.trim() : null;
@@ -119,7 +124,7 @@ export async function capture(root: string, task: Task): Promise<Checkpoint> {
     branch: git(['symbolic-ref', '--short', '-q', 'HEAD']),
     files,
     contract,
-    candidate: digest(json({ files, contract })),
+    candidate,
   };
 }
 

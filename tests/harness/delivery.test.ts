@@ -125,7 +125,6 @@ async function setup(
     task.plan.acceptance.push({ id: 'norms-review', method: 'review', criterion: 'Review norms.' });
     task.delivery = { version: 2 };
   }
-  task.checkpoint = await capture(root, task);
   task.stage = 'C0_READY';
   await saveTask(root, task);
   await passing(root, id);

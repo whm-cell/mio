@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { checkedPath, digest, json, parseTask, loadTask } from './records.ts';
 import type { Task } from './records.ts';
-import { capture, captureFiles } from './context.ts';
+import { captureCandidate, captureFiles } from './context.ts';
 import { bookPaths, optionalText } from './reports.ts';
 import { documentCatalog } from '../task-documents.ts';
 
@@ -134,7 +134,7 @@ export async function commitDelivery(
   if ((await optionalText(root, statePath)) !== raw)
     throw new Error('WORK_CONFLICT: task changed before delivery');
   changes.push({ path: statePath, before: raw, after: json(task) });
-  const captured = await capture(root, task);
+  const captured = await captureCandidate(root, task);
   if (captured.candidate !== task.checkpoint?.candidate)
     throw new Error('WORK_DELIVERY_STALE: candidate changed before publication');
   const op: Operation = {

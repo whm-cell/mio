@@ -20,7 +20,7 @@ try {
     } finally {
       client.release();
     }
-    await checkComputeSchema(pool);
+    await checkComputeSchema(pool, true);
     console.log('Compute metadata schema is current.');
   } else console.log(computeSchemaSQL);
 } finally {

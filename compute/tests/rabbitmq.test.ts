@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,8 @@ import { Journal } from '../src/adapters/journal.ts';
 import { paths, processIdentity } from '../src/adapters/media.ts';
 import { Maintenance } from '../src/maintenance.ts';
 import { Worker } from '../src/worker.ts';
+import { createImageWorker } from '../src/image-worker.ts';
+import { sealImageKey } from '../../src/compute/image-credentials.ts';
 
 const directories: string[] = [];
 
@@ -57,7 +59,7 @@ async function fixture(closeDuringPrefetch = false, publisherAlreadyClosed = fal
   const nextConsumer = makeConsumer();
   const thirdConsumer = makeConsumer();
   const publisher = Object.assign(new EventEmitter(), {
-    publish: vi.fn(() => false),
+    publish: vi.fn<(...args: unknown[]) => boolean>().mockReturnValue(false),
     prefetch: vi.fn(async () => {
       if (publisherAlreadyClosed) throw new Error('channel already closed');
     }),
@@ -273,6 +275,122 @@ it('closes admission synchronously, drains an accepted handler and requeues a la
   expect(failed).toHaveBeenCalledOnce();
   expect(failed.mock.calls[0]?.[0]).toMatchObject({ message: 'CONSUMER_CANCELLED' });
   await broker.close();
+});
+
+it('waits for an in-flight paid image handler to save its response before broker close returns', async () => {
+  const { Broker, consumer, publisher, consumerConnection, publisherConnection } = await fixture();
+  publisher.publish.mockImplementation((...args: unknown[]) => {
+    (args[4] as (error: null) => void)(null);
+    return true;
+  });
+  const broker = await Broker.connect('amqp://localhost', 'worker-b', 'app-a');
+  const root = mkdtempSync(join(tmpdir(), 'mio-image-close-'));
+  directories.push(root);
+  const instance = randomUUID();
+  let journal = new Journal(root, instance, true);
+  const keys = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const input = { model: 'gpt-image-2', prompt: 'square' };
+  const jobId = randomUUID(),
+    ownerId = randomUUID(),
+    expiresAt = Date.now() + 60000;
+  const binding = JSON.stringify([
+    jobId,
+    ownerId,
+    expiresAt,
+    'gpt-images-v1',
+    Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))),
+  ]);
+  const command = {
+    version: 1 as const,
+    type: 'image.request' as const,
+    profile: 'gpt-images-v1' as const,
+    messageId: randomUUID(),
+    jobId,
+    ownerId,
+    expiresAt,
+    input,
+    credential: sealImageKey('secret', binding, 'b1', keys.publicKey),
+  };
+  let release: (response: Response) => void = () => {};
+  const transport = vi.fn<typeof fetch>().mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        release = resolve;
+      }),
+  );
+  let output:
+    | {
+        key: string;
+        sizeBytes: number;
+        sha256: string;
+        etag: string;
+        contentType: string;
+      }
+    | undefined;
+  const materialize = async (
+    job: string,
+    index: number,
+    _data: string,
+    format: string,
+    fileId: string,
+  ) => {
+    output = {
+      key: `mio/derived/${job}/images/${index}-${fileId}.${format}`,
+      sizeBytes: 3,
+      sha256: 'a'.repeat(64),
+      etag: 'etag',
+      contentType: `image/${format}`,
+    };
+    return output;
+  };
+  const worker = createImageWorker(journal, 'b1', keys.privateKey, materialize, transport);
+  const failed = vi.fn();
+  await broker.consume(
+    async () => {},
+    failed,
+    () => true,
+    async (image, ack) => {
+      if (image.type !== 'image.request') throw new Error('unexpected');
+      const result = await worker(image);
+      await broker.publishImage({
+        version: 1,
+        type: 'image.result',
+        messageId: randomUUID(),
+        commandId: image.messageId,
+        jobId: image.jobId,
+        state: result.state,
+        outputs: 'outputs' in result ? result.outputs : [],
+        ...('errorCode' in result ? { errorCode: result.errorCode } : {}),
+      });
+      ack();
+    },
+  );
+  const message = {
+    content: Buffer.from(JSON.stringify(command)),
+    properties: { userId: 'app-a', contentType: 'application/json', messageId: command.messageId },
+  } as ConsumeMessage;
+  consumer.deliver(message);
+  await vi.waitFor(() => expect(transport).toHaveBeenCalledOnce());
+  const closing = broker.close();
+  expect(consumerConnection.close).not.toHaveBeenCalled();
+  expect(publisherConnection.close).not.toHaveBeenCalled();
+  release(Response.json({ data: [{ b64_json: 'YWJj' }] }));
+  await closing;
+  expect(consumer.ack).toHaveBeenCalledWith(message);
+  expect(failed).not.toHaveBeenCalled();
+  expect(journal.image(jobId)?.phase).toBe('completed');
+  journal.close();
+  journal = new Journal(root, instance);
+  expect(await createImageWorker(journal, '', '', materialize, transport)(command)).toEqual({
+    state: 'completed',
+    outputs: [output],
+  });
+  expect(transport).toHaveBeenCalledOnce();
+  journal.close();
 });
 
 it('requeues a delivery when pause races with consumer registration', async () => {

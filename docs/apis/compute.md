@@ -27,3 +27,41 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
 
 副作用：只读取任务状态；重复或晚到的消息不使任务终态回退。
+
+## POST /api/v1/compute/images
+
+身份：当前登录用户；图片首切片仍待接受。
+
+输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前发现且具有已实现图片 profile 的显式 `image.generate` 声明，parameters 至少有 `prompt`。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、可省略或为 1024x1024 的 size，固定输出带水印 JPEG，其他字段拒绝。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
+
+成功：202 返回图片任务视图；相同 owner/requestId 和输入返回同一任务，不重复生图。
+
+错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、409 REQUEST_CONFLICT 或供应商资格错误、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
+
+副作用：受理会占用与视频共享的执行名额并建立待投递命令，Worker 的供应商调用可能产生费用。
+
+停用 A 的图片密钥配置只阻止新图片准入；已受理命令仍按冻结身份投递并结算，提交有效期过后由 B 拒绝首次提交。已有失败输出仍可使用恢复入口。撤销配置不撤回已交付 B 的凭据信封，也不改变未知结果。
+
+## GET /api/v1/compute/images/{jobId}
+
+身份：任务所有者。
+
+输入：图片任务 UUID，无查询参数。
+
+成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是从 0 开始的原始输出序号，即使前项缺失也不重排。B 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；解码工具非零退出无法区分图片损坏与环境故障时保留原始结果，恢复可能再次失败，需要排查。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。安全 errorCode 不包含供应商原文，也不证明是否收费。
+
+错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
+
+副作用：只读取本人任务和已登记输出。
+
+## POST /api/v1/compute/images/{jobId}/recover
+
+身份：任务所有者。
+
+输入：图片任务 UUID 和空 JSON，仅 `materialization_failed` 可启动恢复；重复请求在恢复进行中复用同一任务。
+
+成功：202 返回当前图片任务视图，表示恢复受理；旧恢复结果不会覆盖新一轮状态。
+
+错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 JOB_NOT_FOUND/NOT_FOUND、409 RESULT_CONFLICT、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE。
+
+副作用：重新核验与视频共享的每用户 10／全局 500 个可执行任务名额，通过现有队列请求 Worker 重试已保存结果，不再次提交生图；未知提交不能通过此入口重发。

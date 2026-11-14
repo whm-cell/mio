@@ -9,14 +9,17 @@ export class Maintenance {
   #active = true;
   #flight: Promise<void> | null = null;
 
+  private readonly imageHandle: Parameters<Broker['consume']>[3];
   constructor(
     broker: Pick<Broker, 'consuming' | 'pause' | 'consume'>,
     worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'>,
     failed: (error: unknown) => void,
+    imageHandle?: Parameters<Broker['consume']>[3],
   ) {
     this.#broker = broker;
     this.#worker = worker;
     this.#failed = failed;
+    this.imageHandle = imageHandle;
   }
 
   tick(): Promise<void> {
@@ -53,6 +56,7 @@ export class Maintenance {
         (command, ack) => this.#worker.handle(command, ack),
         this.#failed,
         () => this.#worker.admissionReady(),
+        this.imageHandle,
       );
     }
   }

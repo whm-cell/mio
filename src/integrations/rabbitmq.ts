@@ -6,8 +6,15 @@ import {
   COMPUTE_MAX_MESSAGE_BYTES,
   RESULT_QUEUE,
   parseComputeResultV1,
+  parseImageResult,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  ComputeResultV1,
+  ImageCommandV1,
+  ImageRecoveryCommandV1,
+  ImageResultV1,
+} from '@mio/compute-contracts';
 
 async function closeConnection(
   connection: ChannelModel,
@@ -141,7 +148,9 @@ export class ComputeBroker {
     }
   }
 
-  async publish(message: ComputeCommandV1): Promise<void> {
+  async publish(
+    message: ComputeCommandV1 | ImageCommandV1 | ImageRecoveryCommandV1,
+  ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
@@ -186,6 +195,7 @@ export class ComputeBroker {
   async consume(
     handle: (result: ComputeResultV1) => Promise<void>,
     failed: () => void,
+    imageHandle?: (result: ImageResultV1) => Promise<void>,
   ): Promise<void> {
     await this.consumer.consume(
       RESULT_QUEUE,
@@ -194,7 +204,7 @@ export class ComputeBroker {
           failed();
           return;
         }
-        let result: ComputeResultV1;
+        let result: ComputeResultV1 | ImageResultV1;
         try {
           if (
             message.properties.userId !== this.expectedUserId ||
@@ -202,11 +212,13 @@ export class ComputeBroker {
             message.content.length > COMPUTE_MAX_MESSAGE_BYTES
           )
             throw new Error('RESULT_INVALID');
-          result = parseComputeResultV1(
-            JSON.parse(
-              new TextDecoder('utf-8', { fatal: true }).decode(message.content),
-            ) as unknown,
+          const value: unknown = JSON.parse(
+            new TextDecoder('utf-8', { fatal: true }).decode(message.content),
           );
+          result =
+            value && typeof value === 'object' && 'type' in value && value.type === 'image.result'
+              ? parseImageResult(value)
+              : parseComputeResultV1(value);
           if (message.properties.messageId !== result.messageId)
             throw new Error('RESULT_ID_MISMATCH');
         } catch {
@@ -214,7 +226,13 @@ export class ComputeBroker {
           return;
         }
         void Promise.resolve()
-          .then(() => handle(result))
+          .then(() => {
+            if (result.type === 'image.result') {
+              if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
+              return imageHandle(result);
+            }
+            return handle(result);
+          })
           .then(
             () => {
               try {

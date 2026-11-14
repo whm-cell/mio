@@ -54,6 +54,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const assetConfig = readAssetConfig();
   const computeConfig = readComputeConfig();
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
+  const imageEnabled = Boolean(process.env.MIO_IMAGE_PUBLIC_KEY && process.env.MIO_IMAGE_KEY_ID);
+  if (Boolean(process.env.MIO_IMAGE_PUBLIC_KEY) !== Boolean(process.env.MIO_IMAGE_KEY_ID))
+    throw new Error('IMAGE_CONFIG: public key and key ID are required together');
+  if (imageEnabled && !/^[A-Za-z0-9_-]{1,64}$/.test(process.env.MIO_IMAGE_KEY_ID!))
+    throw new Error('IMAGE_CONFIG: invalid key ID');
+  if (imageEnabled && (!computeConfig || !providerConfig))
+    throw new Error('IMAGE_CONFIG: compute and providers are required');
   const handler = createHandler({
     token: process.env[config.tokenEnv] ?? '',
     allowedOrigins: config.allowedOrigins,
@@ -114,14 +121,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
+    let providers: ProviderService | undefined;
     if (computeConfig && assetConfig) {
-      const store = await createComputeStore(assetConfig.databaseURL);
+      const store = await createComputeStore(assetConfig.databaseURL, imageEnabled);
       let compute: ReturnType<typeof createComputeService> | undefined;
       try {
         const acquired = (compute = createComputeService(
           store,
           createCosStorage(assetConfig),
           computeConfig,
+          imageEnabled
+            ? {
+                provider: () => providers,
+                publicKey: process.env.MIO_IMAGE_PUBLIC_KEY!,
+                keyId: process.env.MIO_IMAGE_KEY_ID!,
+              }
+            : undefined,
         ));
         ctx.effect(() => async () => acquired.close());
         ctx.effect(() =>
@@ -136,10 +151,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
-    let providers: ProviderService | undefined;
     let conversations: ConversationService | undefined;
     if (providerConfig) {
-      const store = await createProviderStore(providerConfig);
+      const store = await createProviderStore(providerConfig, imageEnabled);
       providers = createProviderService(store, providerConfig);
       const ownedProviders = providers;
       try {

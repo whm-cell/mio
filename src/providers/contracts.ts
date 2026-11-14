@@ -1,4 +1,5 @@
 import { HttpError } from '@mio/foundation/errors';
+import type { ImageProfile } from '@mio/compute-contracts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
@@ -55,8 +56,8 @@ export interface ModelPreference {
 export type ChatProfile = 'openai-chat' | 'anthropic-messages';
 export interface AdaptationDeclaration {
   modelRef: string;
-  operation: 'chat';
-  profile: ChatProfile;
+  operation: 'chat' | 'image.generate';
+  profile: ChatProfile | ImageProfile;
   source: string;
   sourceVersion: string;
   classification?: Category;
@@ -81,8 +82,8 @@ export interface ModelRecord {
 }
 export interface AdaptationRecord {
   model_key: string;
-  operation: 'chat';
-  profile: ChatProfile;
+  operation: 'chat' | 'image.generate';
+  profile: ChatProfile | ImageProfile;
   declaration_version: number;
   source: string;
   source_version: string;

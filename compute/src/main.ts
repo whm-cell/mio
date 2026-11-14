@@ -4,6 +4,8 @@ import { ObjectStore } from './adapters/cos.ts';
 import { processIdentity } from './adapters/media.ts';
 import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
+import { createImageWorker, recoverImageMaterialization } from './image-worker.ts';
+import { createId } from '@mio/foundation/identifiers';
 import { Maintenance } from './maintenance.ts';
 
 const log = createLogger('worker', 'main');
@@ -45,13 +47,35 @@ async function start(): Promise<void> {
     throw new Error('BROKER_USER_MISMATCH');
   const expectedUser = required('MIO_COMPUTE_EXPECTED_COMMAND_USER');
   if (username === expectedUser) throw new Error('BROKER_IDENTITIES_MUST_DIFFER');
+  if (
+    process.env.MIO_COS_SESSION_TOKEN !== undefined &&
+    (!process.env.MIO_COS_SESSION_TOKEN || /\s/.test(process.env.MIO_COS_SESSION_TOKEN))
+  )
+    throw new Error('CONFIG_INVALID:MIO_COS_SESSION_TOKEN');
   const store = new ObjectStore({
     bucket: required('MIO_COS_BUCKET'),
     region: required('MIO_COS_REGION'),
     secretId: required('MIO_COS_SECRET_ID'),
     secretKey: required('MIO_COS_SECRET_KEY'),
+    ...(process.env.MIO_COS_SESSION_TOKEN
+      ? { sessionToken: process.env.MIO_COS_SESSION_TOKEN }
+      : {}),
   });
   const journal = new Journal(directory, instance);
+  const materialize = (
+    jobId: string,
+    index: number,
+    base64: string,
+    format: string,
+    fileId: string,
+    signal?: AbortSignal,
+  ) => store.image(jobId, index, base64, format, fileId, signal);
+  const images = createImageWorker(
+    journal,
+    process.env.MIO_IMAGE_KEY_ID ?? '',
+    process.env.MIO_IMAGE_PRIVATE_KEY ?? '',
+    materialize,
+  );
   let stopping = false;
   let worker: Worker | null = null;
   let notifyStop: () => void = () => {};
@@ -70,6 +94,7 @@ async function start(): Promise<void> {
       let broker: Broker | undefined;
       let interval: ReturnType<typeof setInterval> | undefined;
       let maintenance: Maintenance | undefined;
+      const imageStop = new AbortController();
       try {
         broker = await Broker.connect(url, username, expectedUser);
         worker = new Worker(journal, store, broker, directory);
@@ -80,7 +105,41 @@ async function start(): Promise<void> {
         });
         void failed.catch(() => {});
         const closed = broker.closed();
-        maintenance = new Maintenance(broker, current, fail);
+        const imageBroker = broker;
+        maintenance = new Maintenance(broker, current, fail, async (command, ack) => {
+          let outcome;
+          if (command.type === 'image.recover') {
+            try {
+              outcome = (
+                await recoverImageMaterialization(
+                  journal,
+                  command.jobId,
+                  command.commandId,
+                  command.sequence,
+                  materialize,
+                  imageStop.signal,
+                )
+              ).outcome;
+            } catch (error) {
+              if (!(error instanceof Error) || error.message !== 'IMAGE_RESOLUTION_INVALID')
+                throw error;
+              outcome = { state: 'materialization_failed' as const, outputs: [] };
+            }
+          } else outcome = await images(command, imageStop.signal);
+          await imageBroker.publishImage({
+            version: 1,
+            type: 'image.result',
+            messageId: createId(),
+            commandId: command.type === 'image.recover' ? command.commandId : command.messageId,
+            jobId: command.jobId,
+            state: outcome.state,
+            outputs: 'outputs' in outcome ? outcome.outputs : [],
+            ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
+            ...(command.type === 'image.recover' ? { recoveryId: command.messageId } : {}),
+          });
+          if (outcome.state === 'materializing') throw new Error('IMAGE_MATERIALIZATION_PENDING');
+          ack();
+        });
         const initialized = await Promise.race([
           maintenance.tick().then(() => true),
           closed.then(() => false),
@@ -102,7 +161,12 @@ async function start(): Promise<void> {
         maintenance?.stop();
         if (interval) clearInterval(interval);
         worker?.stop();
-        if (broker) await broker.close();
+        const deadline = setTimeout(() => imageStop.abort(), 5000);
+        try {
+          if (broker) await broker.close();
+        } finally {
+          clearTimeout(deadline);
+        }
         if (maintenance) await maintenance.wait().catch(() => {});
         if (worker) await worker.waitIdle();
         worker = null;

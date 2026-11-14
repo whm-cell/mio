@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_adaptations (
   PRIMARY KEY(provider_id,model_key,operation),
   FOREIGN KEY(provider_id,model_key) REFERENCES mio_provider_models(provider_id,model_key)
 );
+ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_operation_check;
+ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_profile_check;
+ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_operation_check
+  CHECK(operation IN ('chat','image.generate'));
+ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_profile_check
+  CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
+        (operation='image.generate' AND profile IN ('gpt-images-v1','seedream-4-images-v1')));
 ${legacyProviderUpgradeSQL}
 CREATE TABLE IF NOT EXISTS mio_provider_model_preferences (
   provider_id uuid NOT NULL, model_key uuid NOT NULL, model_ref text,
@@ -84,7 +91,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS mio_provider_usage_default
   ON mio_provider_model_preferences(provider_id,usage) WHERE is_default;
 `;
 
-export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<void> {
+export async function checkProviderSchema(
+  pool: Pick<Pool, 'query'>,
+  images = false,
+): Promise<void> {
   for (const [sql, types] of [
     [
       'SELECT id,credential_version,catalog_version,catalog_credential_version,catalog_succeeded_at,latest_refresh_seq,last_attempt_seq,last_attempt_credential_version,last_attempt_started_at,last_attempt_finished_at,last_attempt_status,last_attempt_error_code,credential_auth_state FROM mio_provider_configs LIMIT 0',
@@ -121,6 +131,23 @@ export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<vo
     const constraint = constraints.rows.find((item) => item.name === name);
     if (!constraint?.valid || constraint.definition !== definition)
       throw new Error('PROVIDER_SCHEMA: model metadata length constraints required');
+  }
+  if (images) {
+    const adaptations = await pool.query<{ name: string; definition: string; valid: boolean }>(`
+      SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
+      FROM pg_constraint WHERE conrelid='mio_provider_model_adaptations'::regclass
+        AND conname IN ('mio_provider_model_adaptations_operation_check','mio_provider_model_adaptations_profile_check')`);
+    for (const [name, texts] of [
+      ['mio_provider_model_adaptations_operation_check', ["'image.generate'"]],
+      [
+        'mio_provider_model_adaptations_profile_check',
+        ["'gpt-images-v1'", "'seedream-4-images-v1'"],
+      ],
+    ] as const) {
+      const constraint = adaptations.rows.find((item) => item.name === name);
+      if (!constraint?.valid || !texts.every((text) => constraint.definition.includes(text)))
+        throw new Error('PROVIDER_SCHEMA: image adaptation migration required');
+    }
   }
   const index = await pool.query<{
     unique: boolean;

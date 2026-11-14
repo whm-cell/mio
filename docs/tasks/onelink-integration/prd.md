@@ -12,6 +12,8 @@
 
 原 W3–W7 现为[图片](../onelink-image-generation/prd.md)、[视频](../onelink-video-generation/prd.md)、[音频](../onelink-audio-generation/prd.md)、[素材库](../onelink-material-library/prd.md)和条件性 [Agent 工具](../onelink-agent-tools/prd.md)五份独立需求，各自安排和接受，不形成主从 PRD 或总完成门禁。共享任务/资产候选归[独立设计](../onelink-image-generation/design.md)，由首个真实消费者承担。拆分不启动媒体业务、不预建执行记录、不迁移旧 result，也不扩大非文本费用或工具授权。
 
+W1/W2 只依赖 OneLink 文本配置、动态目录和文本调用授权。Seedream 图片验收复用同一用户的 OneLink 凭据；COS 私有配置和 A/B 真实权限属于 W3/P5 的现场条件，均不成为 W1/W2 的完成前置。缺少这些条件时，只影响对应媒体或计算切片的真实验收。
+
 正式前端、项目/剧本/分镜全业务、组织多租户、平台代付与充值计费、供应商市场、多地域部署及生产容量承诺不在本页范围。必要隔离文本验证沿本人 Key 与既有授权；不提交推送发布、不迁移共享/生产库。BYOK 不代表可不经用户动作自动生成，也不代表 Mio 能准确推算供应商余额。
 
 ## 2. 当前架构与需要改变的接缝

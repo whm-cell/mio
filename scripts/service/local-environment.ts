@@ -157,6 +157,7 @@ export async function readLocalEnvironment(
               'MIO_COMPUTE_DIRECTORY',
               'MIO_COMPUTE_INSTANCE_ID',
               'MIO_COMPUTE_EXPECTED_COMMAND_USER',
+              'MIO_IMAGE_PRIVATE_KEY',
             ].includes(key)) ||
           key === 'NODE_ENV' ||
           key === 'RABBITMQ_URL',

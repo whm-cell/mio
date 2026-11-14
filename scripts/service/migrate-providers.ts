@@ -49,7 +49,7 @@ try {
           JOIN mio_conversations c ON c.id=r.conversation_id WHERE r.model_binding IS NOT NULL`);
         await client.query(providerReferencesSQL, [JSON.stringify(bindings.rows)]);
       }
-      await checkProviderSchema(client);
+      await checkProviderSchema(client, true);
       await client.query('COMMIT');
     } catch {
       await client.query('ROLLBACK');

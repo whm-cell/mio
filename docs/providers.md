@@ -74,6 +74,8 @@ pnpm providers:adapt <owner-id> <expected-revision> <declaration.json>
 }
 ```
 
+图片首切片候选允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1` 或受限单图 `seedream-4-images-v1`；不按名称自动推断。启用图片前执行供应商迁移，启动会检查两个图片声明约束；声明和目录发现均不证明真实生成可用。运行与未接受边界见[计算 HTTP 候选](apis/compute.md#post-apiv1computeimages)。
+
 classification 可省略；可选 `metadata.contextWindow` 只能是有来源的正整数。未知上下文/价格/工具/媒体能力不补值。来源明确是部署声明，不冒充供应商元数据。入口不创造成员、不接收代码/URL/Key/verified，不开放普通用户管理 API。每次声明更新递增独立版本并使验证待核对，分类变化保留身份/偏好。
 
 验证只来自对应成功运行观察，绑定 credential/catalog/adaptation 版本及 operation/profile。刷新、轮换或声明变化使当前验证失效但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。

@@ -37,3 +37,15 @@ it.each([
     }
   },
 );
+
+it('skips nested worktrees under the configured private root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'mio-inventory-worktrees-'));
+  scratch.push(root);
+  await mkdir(join(root, '.claude', 'worktrees', 'agent', 'src'), { recursive: true });
+  await writeFile(join(root, '.claude', 'worktrees', 'agent', 'src', 'private.ts'), 'export {};');
+
+  const result = await inventory(root, legacyHarness());
+
+  expect(result.files).toEqual([]);
+  expect(result.errors).toEqual([]);
+});

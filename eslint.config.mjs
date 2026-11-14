@@ -17,6 +17,7 @@ export default tseslint.config(
       'coverage/**',
       '.runtime/**',
       '.work/**',
+      '.claude/**',
     ],
   },
   ...tseslint.configs.recommended,

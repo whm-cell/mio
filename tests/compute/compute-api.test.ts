@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import { spawnSync } from 'node:child_process';
@@ -100,10 +100,23 @@ beforeAll(async () => {
   vi.stubEnv('RABBITMQ_URL', 'amqp://test-a:test-password@127.0.0.1:1/test');
   vi.stubEnv('MIO_COMPUTE_BROKER_USER', 'test-a');
   vi.stubEnv('MIO_COMPUTE_EXPECTED_RESULT_USER', 'test-b');
+  vi.stubEnv('MIO_PROVIDERS_DATABASE_URL', database.url);
+  vi.stubEnv('MIO_PROVIDERS_MASTER_KEY', randomBytes(32).toString('base64'));
+  vi.stubEnv('MIO_PROVIDERS_MASTER_KEY_ID', 'image-plugin-test');
+  vi.stubEnv('MIO_IMAGE_KEY_ID', 'image-plugin-test');
+  vi.stubEnv(
+    'MIO_IMAGE_PUBLIC_KEY',
+    generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    }).publicKey,
+  );
   for (const file of [
     'scripts/service/migrate-auth.ts',
     'scripts/service/migrate-assets.ts',
     'scripts/service/migrate-compute.ts',
+    'scripts/service/migrate-providers.ts',
   ]) {
     const result = spawnSync(process.execPath, [file, '--apply'], {
       encoding: 'utf8',
@@ -130,6 +143,17 @@ beforeAll(async () => {
 afterAll(async () => {
   try {
     if (ctx) await ctx.fiber.dispose();
+    if (database && observer)
+      await vi.waitFor(
+        async () => {
+          const result = await observer.query<{ count: number }>(
+            'SELECT count(*)::int AS count FROM pg_stat_activity WHERE application_name=$1 AND datname=current_database()',
+            [database.applicationName],
+          );
+          expect(result.rows[0]!.count).toBe(0);
+        },
+        { timeout: 1000, interval: 10 },
+      );
   } finally {
     vi.unstubAllEnvs();
     if (observer) await observer.end();
@@ -137,6 +161,44 @@ afterAll(async () => {
     if (objectServer) await new Promise<void>((resolve) => objectServer.close(() => resolve()));
   }
 }, 30000);
+
+it('wires image admission to the real provider service without creating a job for an unconfigured owner', async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    if (url.hostname !== '127.0.0.1') throw new Error('EXTERNAL_NETWORK_FORBIDDEN');
+    return originalFetch(input, init);
+  });
+  try {
+    const login = await call(
+      '/api/auth/sign-in/email',
+      { email: 'compute-owner@example.test', password },
+      '',
+    );
+    expect(login.status).toBe(200);
+    const loginCookie = cookie(login);
+    expect(loginCookie).not.toBe('');
+    const body = {
+      requestId: randomUUID(),
+      modelRef: 'onelink:image:unconfigured-model',
+      parameters: { prompt: 'test without provider' },
+    };
+    expect((await call('/api/v1/compute/images', body, '')).status).toBe(401);
+    expect(
+      (await call('/api/v1/compute/images', body, loginCookie, 'https://other.invalid')).status,
+    ).toBe(403);
+    const response = await call('/api/v1/compute/images', body, loginCookie);
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { code: 'PROVIDER_NOT_CONFIGURED' } });
+    const counts = await observer.query<{ jobs: number; outbox: number }>(`
+      SELECT (SELECT count(*)::int FROM mio_image_jobs) AS jobs,
+             (SELECT count(*)::int FROM mio_image_outbox) AS outbox`);
+    expect(counts.rows[0]).toEqual({ jobs: 0, outbox: 0 });
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+  } finally {
+    fetchSpy.mockRestore();
+  }
+});
 
 it('accepts authenticated jobs and keeps the outbox while the broker is offline', async () => {
   const bytes = Buffer.from('example video');

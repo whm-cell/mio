@@ -35,7 +35,7 @@ A 从登录会话取得 owner，按 owner 查询已登记资产；HEAD 该 raw �
 
 succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio/derived/<jobId>/<attemptId>/result.mp4`，`sizeBytes` 为 1 至 1073741824，SHA-256 是小写 64 位十六进制。B 对输出及未知上传恢复的 GET 流式执行同一上限，再持久记录最终文件大小与 SHA-256；PUT 传内容校验及 SHA-256 元数据，完成后 HEAD 获取 derived 对象的实际 ETag。A 在登记前 HEAD 该对象，核对 key、实际长度、ETag 与 SHA-256 元数据，并从本地 job 事实取得 owner。HEAD 核对元数据不等同重新读取并计算全部对象字节。A 不以消息内的 owner 或 URL 决定资源归属。结果资产与 job 终态在同一 PG 事务发布；由既有媒体域作增量迁移，保留原数据。
 
-结果直接引用 derived 对象的前提是：新私有桶未开启版本控制；B 的 derived PUT 在权限策略中强制 `x-cos-forbid-overwrite=true`；A/B 运行身份不能删除或绕过限制覆盖 derived。以上均须在新桶执行正反例，不得把 SDK 参数或策略文本当真云证据。前提不成立时停止真实结果接受，重新评估受保护的服务端复制；不静默放开权限。
+图片结果使用 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，其中 `index` 是原始输出序号、`fileId` 是小写 UUID v4。B 在每次实际 PUT 前把该 fileId 追加到 journal；PUT、超时或进程异常后均不得复用同一对象键，下一次物化必须生成新的 fileId。图片 PUT 不先 HEAD 复用对象，也不依赖 `x-cos-forbid-overwrite`；成功后仍 HEAD 并按长度、SHA-256 元数据和实际读取内容核验。结果携带完整唯一键，A 严格解析 jobId、index、fileId、扩展名和 MIME，并在 PG 中把首个有效键绑定为该输出序号的 owner 资产；旧键保留为可对账孤儿，不覆盖已登记 winner。视频结果仍遵守上一段固定 attempt 键及其禁止覆盖前提；这两类约束不得混用。
 
 ## 路由、回执与状态
 
@@ -55,7 +55,7 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 
 每个 attempt 在启动 FFmpeg 前持久写 launch intent，并且同一 attempt 最多 spawn 一次。A 最多创建三个 attempt；保守记账可能在 intent 已写但尚未证明 spawn 时消耗一次，不承诺恰好执行三次。`PROCESS_UNKNOWN` 时停止所有新计算 admission，包括新命令和重投，直到确认旧 FFmpeg 已终止，维持单实例并发 1。若 journal 已持久记录 PID，须核对同一宿主、boot 和进程命名空间，并确认该 PID 不存在；PID 仍存在或身份无法核对则继续 HOLD。若崩溃发生在 PID 落盘前，只能由可证明覆盖该进程的隔离运行时记录或人工核实；worker 或容器重启自身不能当作进程已结束的证明。确认后才能报告 interrupted，由 A 决定是否创建下一个 attempt。
 
-每个 attempt 使用上述固定 derived 键。B 先持久化输出文件、长度和 SHA-256，再发带禁止覆盖头的 PUT；成功或结果未知后均 HEAD 同一键。上传结果未知且对象存在时 GET 同一键、流式重算 SHA-256 和长度再认领；不存在时仅用已持久输出重传同一键。同一进程中若 SDK PUT 因本地等待超时而仍未结束，对账须等待该请求真正结束，不能同时再次查询或写同一键；进程崩溃后只能按同键和摘要重新核验，不能声称旧请求已取消。对象内容不匹配、旧进程仍可能写入或本地输出丢失时保持 unknown，不无条件重新计算或更换键。unknown 事件持久并确认发布后可以 ACK 命令，但 journal 和必要本地文件必须保留；B 启动及有界定时对账可继续同一 attempt，解决后发布新的稳定事件，不能依赖已 ACK 消息再次投递。对账与命令重投共用 journal 排他控制，每次最多处理一个 attempt，定时扫描和失败退避须有界，不能并发对同一键恢复。
+每个视频 attempt 使用上述固定 derived 键。B 先持久化输出文件、长度和 SHA-256，再发带禁止覆盖头的 PUT；成功或结果未知后均 HEAD 同一键。上传结果未知且对象存在时 GET 同一键、流式重算 SHA-256 和长度再认领；不存在时仅用已持久输出重传同一键。同一进程中若 SDK PUT 因本地等待超时而仍未结束，对账须等待该请求真正结束，不能同时再次查询或写同一键；进程崩溃后只能按同键和摘要重新核验，不能声称旧请求已取消。对象内容不匹配、旧进程仍可能写入或本地输出丢失时保持 unknown，不无条件重新计算或更换键。unknown 事件持久并确认发布后可以 ACK 命令，但 journal 和必要本地文件必须保留；B 启动及有界定时对账可继续同一 attempt，解决后发布新的稳定事件，不能依赖已 ACK 消息再次投递。对账与命令重投共用 journal 排他控制，每次最多处理一个 attempt，定时扫描和失败退避须有界，不能并发对同一键恢复。图片物化沿上一段唯一 fileId 规则执行；未确定写入的 attempted fileId 留在 journal 供只读 HEAD/GET 对账，重试仅创建新键。
 
 定期对账可持续较长时间，因此 B 开始对账前同步关闭新命令入场、排空已接纳的 handler，再关闭该次 consumer channel；不能让已投递的新命令在对账锁后等待而消耗其 ACK 期限。关门后迟到的投递不进入 Worker、不创建 attempt 或启动计算，也不 ACK；关闭该旧 channel 后由 broker 重排。旧 channel 的迟到回调不得在新 channel 上应答或误触发重连。publisher 使用独立连接及 channel；对账结束且进场条件满足后新建 consumer channel 并重新订阅。存在 `PROCESS_UNKNOWN` 或磁盘背压时继续暂停订阅，直到相应条件恢复。
 

@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import { once } from 'node:events';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
@@ -540,15 +540,34 @@ it('aborts its in-flight discovery during shutdown, waits for settlement and rel
 });
 
 it('rejects same-name malformed default indexes and missing schema without leaking startup pools', async () => {
-  // The scoped URL supplies application_name; compare the actual isolated consumer group.
+  // Isolate the failed startup pools from the long-lived auth/provider pools in this fixture.
+  const probeName = `${database.applicationName}_startup_probe`;
+  const probeURL = new URL(config.databaseURL);
+  probeURL.searchParams.set('application_name', probeName);
+  const probeConfig = { ...config, databaseURL: probeURL.toString() };
   const connectionCount = async () =>
     (
       await pool.query<{ count: number }>(
         'SELECT count(*)::int AS count FROM pg_stat_activity WHERE application_name=$1 AND datname=current_database()',
-        [database.applicationName],
+        [probeName],
       )
     ).rows[0]!.count;
-  const before = await connectionCount();
+  // pg-pool can resolve end() before the server removes its backend from pg_stat_activity.
+  const expectClosed = () =>
+    vi.waitFor(async () => expect(await connectionCount()).toBe(0), {
+      timeout: 1000,
+      interval: 10,
+    });
+  expect(await connectionCount()).toBe(0);
+  // Prove the probe would see a leaked connection with this identity.
+  const control = new Pool({ connectionString: probeConfig.databaseURL, max: 1 });
+  try {
+    await control.query('SELECT 1');
+    expect(await connectionCount()).toBe(1);
+  } finally {
+    await control.end();
+  }
+  await expectClosed();
   for (const definition of [
     'CREATE UNIQUE INDEX mio_provider_usage_default ON mio_provider_model_preferences(provider_id,model_key) WHERE is_default',
     'CREATE UNIQUE INDEX mio_provider_usage_default ON mio_provider_model_preferences(provider_id,usage) WHERE is_default AND false',
@@ -556,18 +575,19 @@ it('rejects same-name malformed default indexes and missing schema without leaki
     await pool.query('DROP INDEX mio_provider_usage_default');
     await pool.query(definition);
     try {
-      await expect(createProviderStore(config)).rejects.toThrow('PROVIDER_SCHEMA');
+      await expect(createProviderStore(probeConfig)).rejects.toThrow('PROVIDER_SCHEMA');
+      await expectClosed();
     } finally {
       await pool.query('DROP INDEX mio_provider_usage_default');
       await pool.query(providerSchemaSQL);
     }
   }
   await pool.query('CREATE SCHEMA provider_missing');
-  const missing = new URL(config.databaseURL);
+  const missing = new URL(probeConfig.databaseURL);
   missing.searchParams.set('options', '-csearch_path=provider_missing');
   try {
     await expect(
-      createProviderStore({ ...config, databaseURL: missing.toString() }),
+      createProviderStore({ ...probeConfig, databaseURL: missing.toString() }),
     ).rejects.toThrow('PROVIDER_SCHEMA');
     expect(
       (
@@ -579,7 +599,7 @@ it('rejects same-name malformed default indexes and missing schema without leaki
   } finally {
     await pool.query('DROP SCHEMA provider_missing');
   }
-  expect(await connectionCount()).toBe(before);
+  await expectClosed();
 });
 
 it('edits owner metadata independently and atomically, retaining overrides across refresh, rotation and reopening', async () => {

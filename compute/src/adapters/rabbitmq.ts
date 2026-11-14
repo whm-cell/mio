@@ -5,11 +5,20 @@ import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, Message } f
 import {
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
+  IMAGE_MAX_MESSAGE_BYTES,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
   parseComputeCommandV1,
+  parseImageCommand,
+  parseImageRecovery,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  ComputeResultV1,
+  ImageCommandV1,
+  ImageRecoveryCommandV1,
+  ImageResultV1,
+} from '@mio/compute-contracts';
 
 interface BrokerState {
   closed: boolean;
@@ -171,7 +180,13 @@ export class Broker {
     }
   }
 
-  async publish(message: ComputeResultV1): Promise<void> {
+  publish(message: ComputeResultV1): Promise<void> {
+    return this.publishMessage(message);
+  }
+  publishImage(message: ImageResultV1): Promise<void> {
+    return this.publishMessage(message);
+  }
+  private async publishMessage(message: ComputeResultV1 | ImageResultV1): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
     let returned = false;
     const onReturn = (result: Message) => {
@@ -225,6 +240,10 @@ export class Broker {
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
+    imageHandle?: (
+      command: ImageCommandV1 | ImageRecoveryCommandV1,
+      ack: () => void,
+    ) => Promise<void>,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -262,16 +281,30 @@ export class Broker {
           report(error);
           return;
         }
-        let command: ComputeCommandV1;
+        let command: ComputeCommandV1 | ImageCommandV1 | ImageRecoveryCommandV1;
         try {
           if (
             message.properties.userId !== this.#expectedUserId ||
             message.properties.contentType !== 'application/json' ||
-            message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+            message.content.length > IMAGE_MAX_MESSAGE_BYTES
           )
             throw new Error('COMMAND_INVALID');
           const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
-          command = parseComputeCommandV1(JSON.parse(body) as unknown);
+          const value: unknown = JSON.parse(body);
+          command =
+            value && typeof value === 'object' && 'type' in value && value.type === 'image.request'
+              ? parseImageCommand(value)
+              : value &&
+                  typeof value === 'object' &&
+                  'type' in value &&
+                  value.type === 'image.recover'
+                ? parseImageRecovery(value)
+                : parseComputeCommandV1(value);
+          if (
+            command.type === 'transcode.request' &&
+            message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+          )
+            throw new Error('COMMAND_INVALID');
           if (message.properties.messageId !== command.messageId)
             throw new Error('COMMAND_ID_MISMATCH');
         } catch {
@@ -283,7 +316,13 @@ export class Broker {
           return;
         }
         const tracked = Promise.resolve()
-          .then(() => handle(command, () => slot.channel.ack(message)))
+          .then(() => {
+            if (command.type === 'image.request' || command.type === 'image.recover') {
+              if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
+              return imageHandle(command, () => slot.channel.ack(message));
+            }
+            return handle(command, () => slot.channel.ack(message));
+          })
           .catch((error: unknown) => {
             if ((error as Error).message === 'ATTEMPT_CONFLICT') {
               try {
@@ -349,6 +388,9 @@ export class Broker {
 
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
+    // Do not close the journal's owner while an admitted image handler can still write.
+    // The caller aborts its bounded operations if the shutdown grace period expires.
+    if (this.#handling) await this.#handling;
     this.#state.markClosed();
     await Promise.all([
       closeConnection(this.#consumerConnection, this.#closedConnections),

@@ -75,6 +75,8 @@ revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始�
 
 adaptation 为 null 或 `{operation,profile,implementation:'implemented',declarationVersion,source,sourceVersion,metadata,verification}`；verification 含 status/at/evidence/testedTuple。未声明协议时 ADAPTER_PENDING。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用、费用或解密成功。
 
+图片候选另以 `image: {adaptation,enabled,runnable,unavailableReason}` 返回图片声明和本地资格，包含 GPT 与受限 Seedream 4.0 的独立 profile；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。图片声明和本地资格不代表供应商已验证、实时可用或一定有费用额度。
+
 错误：400 QUERY_INVALID；其余见共同约定。
 
 副作用：一条 SQL 一致读取本人目录/配置/声明/偏好，不解密、不联网，不返回用户目录并集或静态名单。
@@ -83,7 +85,7 @@ adaptation 为 null 或 `{operation,profile,implementation:'implemented',declara
 
 身份：当前登录用户。
 
-输入：`{modelRef,expectedRevision,name?,description?,usage?,enabled?,isDefault?}`，至少一个展示字段或布尔偏好。展示字段接受字符串或 null，分别最多 100、500 个 Unicode 字符；null 清除覆盖，省略不变，空字符串保留为覆盖。JSON 解码后的字符串拒绝 NUL 和未配对的 UTF-16 代理项；原始正文沿共同 JSON 读取流程解码，不额外严格校验 UTF-8 字节。仅编辑展示字段无需 usage 或运行资格，但模型必须属于当前用户并已存在。修改偏好时新稳定引用须指定 usage；旧 `onelink:<category>:<rawId>` 可用其 category 表达旧用途，raw ID 无损解析。usage 仅接受五类业务用途，目前可运行适配只有 chat；没有偏好字段时不得单独提供 usage。
+输入：`{modelRef,expectedRevision,name?,description?,usage?,enabled?,isDefault?}`，至少一个展示字段或布尔偏好。展示字段接受字符串或 null，分别最多 100、500 个 Unicode 字符；null 清除覆盖，省略不变，空字符串保留为覆盖。JSON 解码后的字符串拒绝 NUL 和未配对的 UTF-16 代理项；原始正文沿共同 JSON 读取流程解码，不额外严格校验 UTF-8 字节。仅编辑展示字段无需 usage 或运行资格，但模型必须属于当前用户并已存在。修改偏好时新稳定引用须指定 usage；旧 `onelink:<category>:<rawId>` 可用其 category 表达旧用途，raw ID 无损解析。usage 仅接受五类业务用途，此 PATCH 的偏好修改当前仅支持 chat；没有偏好字段时不得单独提供 usage。
 
 成功：200 ProviderView；同用途至多一个默认。设默认须当前有效成员、已实现适配和 enabled；原子清除同用途旧默认。禁用保留默认目标但使 effective=false，不选替代。
 

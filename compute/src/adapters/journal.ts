@@ -114,7 +114,7 @@ export class Journal {
       if (
         meta.length !== 1 ||
         meta[0]?.instance_id !== instanceId ||
-        ![3, 4].includes(Number(meta[0]?.schema_version))
+        ![3, 4, 5].includes(Number(meta[0]?.schema_version))
       ) {
         throw new Error('JOURNAL_IDENTITY_MISMATCH');
       }
@@ -145,11 +145,58 @@ export class Journal {
       if (invalid) throw new Error('JOURNAL_CORRUPT');
       if (db.prepare('SELECT 1 FROM events WHERE confirmed NOT IN (0, 1) LIMIT 1').get())
         throw new Error('JOURNAL_CORRUPT');
+      if (Number(meta[0]?.schema_version) < 5) {
+        db.exec(`BEGIN IMMEDIATE;
+          CREATE TABLE image_attempts (
+            job_id TEXT PRIMARY KEY, identity TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK(phase IN ('submitting','unknown','returned','materializing','completed','rejected')),
+            payload TEXT
+          );
+          UPDATE metadata SET schema_version = 5;
+          COMMIT;`);
+      }
+      db.prepare('SELECT job_id, identity, phase, payload FROM image_attempts LIMIT 0').all();
       this.#db = db;
     } catch (error) {
       db.close();
       throw error;
     }
+  }
+
+  image(jobId: string): { identity: string; phase: string; payload: string | null } | null {
+    const row = this.#db
+      .prepare('SELECT identity, phase, payload FROM image_attempts WHERE job_id = ?')
+      .get(jobId);
+    return row
+      ? {
+          identity: String(row.identity),
+          phase: String(row.phase),
+          payload: row.payload === null ? null : String(row.payload),
+        }
+      : null;
+  }
+
+  beginImage(jobId: string, identity: string): boolean {
+    const existing = this.image(jobId);
+    if (existing) {
+      if (existing.identity !== identity) throw new Error('IMAGE_COMMAND_CONFLICT');
+      return false;
+    }
+    this.#db
+      .prepare("INSERT INTO image_attempts VALUES (?, ?, 'submitting', NULL)")
+      .run(jobId, identity);
+    return true;
+  }
+
+  imagePhase(
+    jobId: string,
+    phase: 'unknown' | 'returned' | 'materializing' | 'completed' | 'rejected',
+    payload: string | null,
+  ): void {
+    const changed = this.#db
+      .prepare('UPDATE image_attempts SET phase = ?, payload = ? WHERE job_id = ?')
+      .run(phase, payload, jobId);
+    if (changed.changes !== 1) throw new Error('IMAGE_ATTEMPT_MISSING');
   }
 
   close(): void {

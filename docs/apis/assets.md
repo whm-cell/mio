@@ -6,7 +6,7 @@
 
 身份只来自登录 Cookie；服务 Bearer 和请求体不能指定 owner、桶、对象键或目标 URL。POST 要求允许的精确 Origin 和 `application/json`；GET 提供 Origin 时也须匹配；OPTIONS 无需登录但须允许 Origin。JSON 上限 8192 字节、10 秒，拒绝额外字段，读取后复核会话。所有响应 no-store，错误为 `{error:{code,message,requestId}}`，不返回 COS 或数据库错误详情。常见错误为 400 BODY_INVALID/QUERY_INVALID/ASSET_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 NOT_FOUND/ASSET_NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED 和 503 ASSET_UNAVAILABLE/ASSET_STORAGE_UNAVAILABLE。
 
-AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?}`；`status` 为 pending、finalizing、ready 或 expired，仅 ready 包含短期下载地址。文件名和 MIME 是用户描述，不证明文件类型或内容安全。地址是临时 bearer 凭证，必须避免日志、公开缓存和转交；COS 浏览器直传需配置指定 Origin 的 CORS。
+AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?}`；`status` 为 pending、finalizing、ready 或 expired，仅 ready 包含短期下载地址。文件名和 MIME 是用户描述，不证明文件类型或内容安全。地址是临时 bearer 凭证，必须避免日志、公开缓存和转交；COS 浏览器直传需配置指定 Origin 的 CORS。若选定的 W3/P5 环境使用临时 COS 凭据，签名 URL 的实际有效期还受该凭据有效期限制；长期受限 Key 不需要额外会话配置。
 
 ## POST /api/v1/assets/uploads
 

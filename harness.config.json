@@ -35,7 +35,7 @@
     "deploy/rabbitmq/README.md",
     "compute/README.md"
   ],
-  "privateRoots": [".work", ".runtime"],
+  "privateRoots": [".work", ".runtime", ".claude"],
   "generatedRoots": [
     "node_modules",
     "compute/node_modules",

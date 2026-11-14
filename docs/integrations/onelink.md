@@ -2,7 +2,7 @@
 
 ## 适用范围与接入事实
 
-实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)及[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)。图片、视频、语音、音乐及素材执行器仍未装配；范围见[万联 PRD](../tasks/onelink-integration/prd.md)。协议依据为[模型目录文档](https://docs.onelinkai.cloud/8882392m0)与[文本接入说明](https://docs.onelinkai.cloud/8882612m0)，旧源码身份仅在[测试参考](../../tests/providers/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
+实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)及[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)。GPT 与受限 Seedream 4.0 图片生成已有待接受候选（见[图片 PRD](../tasks/onelink-image-generation/prd.md)），图片候选复用同一用户的 OneLink 凭据；W1/W2 文本仍独立于图片和 COS 现场条件。真实结果和接受按 profile 分别记录；视频、语音、音乐及素材执行器仍未装配。范围见[万联 PRD](../tasks/onelink-integration/prd.md)。协议依据为[模型目录文档](https://docs.onelinkai.cloud/8882392m0)与[文本接入说明](https://docs.onelinkai.cloud/8882610m0)，旧源码身份仅在[测试参考](../../tests/providers/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
 
 ## 必须遵守的约束
 

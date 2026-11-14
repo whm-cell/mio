@@ -301,3 +301,66 @@ it.each(['conflict', 'transient', 'sink-failure'] as const)(
     }
   },
 );
+
+it.each([true, false])(
+  'does not block later video results when image admission is disabled (image schema: %s)',
+  async (imagesAvailable) => {
+    const pair = connections();
+    const store = {
+      imagesAvailable,
+      imagePending: vi.fn().mockResolvedValue(undefined),
+      imageAccept: vi.fn().mockResolvedValue(undefined),
+      accept: vi.fn().mockResolvedValue(undefined),
+      claim: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ComputeStore;
+    const service = createComputeService(store, {} as AssetObjectStore, {
+      brokerURL: 'amqp://a:secret@127.0.0.1/test',
+      brokerUser: 'a',
+      expectedResultUser: 'b',
+    });
+    const image = {
+      version: 1,
+      type: 'image.result',
+      messageId: randomUUID(),
+      commandId: randomUUID(),
+      jobId: randomUUID(),
+      state: 'unknown',
+      outputs: [],
+    };
+    const video = {
+      version: 1,
+      type: 'transcode.result',
+      messageId: randomUUID(),
+      commandId: randomUUID(),
+      jobId: randomUUID(),
+      attemptId: randomUUID(),
+      attempt: 1,
+      state: 'running',
+    };
+    const delivery = (result: typeof image | typeof video) =>
+      ({
+        properties: { userId: 'b', messageId: result.messageId, contentType: 'application/json' },
+        content: Buffer.from(JSON.stringify(result)),
+      }) as ConsumeMessage;
+    try {
+      await vi.waitFor(() => expect(pair.consumer.channel.consume).toHaveBeenCalled(), {
+        timeout: 2000,
+      });
+      const first = delivery(image),
+        next = delivery(video);
+      pair.consumer.channel.delivery!(first);
+      await vi.waitFor(() =>
+        expect(
+          imagesAvailable ? pair.consumer.channel.ack : pair.consumer.channel.reject,
+        ).toHaveBeenCalledWith(first, ...(imagesAvailable ? [] : [false])),
+      );
+      pair.consumer.channel.delivery!(next);
+      await vi.waitFor(() => expect(pair.consumer.channel.ack).toHaveBeenCalledWith(next));
+      expect(store.imageAccept).toHaveBeenCalledTimes(imagesAvailable ? 1 : 0);
+      expect(store.accept).toHaveBeenCalledOnce();
+    } finally {
+      await service.close();
+    }
+  },
+);

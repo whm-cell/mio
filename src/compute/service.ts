@@ -1,8 +1,14 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { sealImageKey } from './image-credentials.ts';
+import type { ProviderService } from '../providers/service.ts';
+import { parseImageCommand, validImageInput } from '@mio/compute-contracts';
+import type { ImageInput } from '@mio/compute-contracts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
+import { COMPUTE_MAX_MEDIA_BYTES, IMAGE_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
+import type { ImageCommandV1 } from '@mio/compute-contracts';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeBroker } from '../integrations/rabbitmq.ts';
@@ -31,7 +37,10 @@ export function createComputeService(
   store: ComputeStore,
   objects: AssetObjectStore,
   config: ComputeConfig,
+  imageConfig?: { provider: () => ProviderService | undefined; keyId: string; publicKey: string },
 ) {
+  if (imageConfig && !/^[A-Za-z0-9_-]{1,64}$/.test(imageConfig.keyId))
+    throw new Error('IMAGE_CONFIG: invalid key ID');
   let stopping = false;
   let closing: Promise<void> | undefined;
   let broker: ComputeBroker | undefined;
@@ -128,7 +137,33 @@ export function createComputeService(
         retryDelay = 1000;
         acquired.onClose(() => disconnect(acquired));
         try {
-          await acquired.consume(receive, () => disconnect(acquired));
+          await acquired.consume(
+            receive,
+            () => disconnect(acquired),
+            (result) =>
+              admit(async () => {
+                if (!store.imagesAvailable)
+                  throw Object.assign(new Error('IMAGE_SCHEMA_UNAVAILABLE'), { permanent: true });
+                for (const output of result.outputs) {
+                  const found = await head(output.key);
+                  if (
+                    found.size !== output.sizeBytes ||
+                    found.etag !== output.etag ||
+                    found.sha256 !== output.sha256
+                  )
+                    throw Object.assign(new Error('IMAGE_OBJECT_MISMATCH'), {
+                      permanent: true,
+                    });
+                }
+                try {
+                  await store.imageAccept(result);
+                } catch (error) {
+                  if (error instanceof ComputeError && error.code === 'RESULT_CONFLICT')
+                    throw Object.assign(error, { permanent: true });
+                  throw error;
+                }
+              }),
+          );
         } catch (error) {
           disconnect(acquired);
           throw error;
@@ -136,6 +171,13 @@ export function createComputeService(
       }
       const instance = broker;
       if (!instance || stopping) return;
+      if (store.imagesAvailable) {
+        const image = await store.imagePending();
+        if (image) {
+          await instance.publish(image);
+          await store.imageSent(image.jobId, image.messageId);
+        }
+      }
       const item = await store.claim();
       if (!item) return;
       try {
@@ -162,6 +204,111 @@ export function createComputeService(
   timer.unref();
   poll();
   return {
+    createImage(
+      actor: AssetPrincipal,
+      requestId: string,
+      modelRef: string,
+      parameters: Omit<ImageInput, 'model'>,
+    ) {
+      return admit(async () => {
+        if (!store.imagesAvailable) throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        if (
+          !isUuidV4(requestId) ||
+          typeof modelRef !== 'string' ||
+          !parameters ||
+          typeof parameters.prompt !== 'string' ||
+          !parameters.prompt.trim() ||
+          parameters.prompt.length > 32000 ||
+          Object.keys(parameters).some(
+            (k) =>
+              ![
+                'prompt',
+                'n',
+                'background',
+                'moderation',
+                'quality',
+                'size',
+                'output_format',
+                'output_compression',
+                'user',
+              ].includes(k),
+          )
+        )
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        const normalized = Object.fromEntries(
+          Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
+        );
+        const hash = createHash('sha256')
+          .update(JSON.stringify([modelRef, normalized]))
+          .digest('hex');
+        const previous = await store.imageRequest(actor.userId, requestId);
+        if (previous) {
+          if (previous.input_hash !== hash) throw new ComputeError(409, 'REQUEST_CONFLICT');
+          return store.imageGet(actor.userId, previous.id);
+        }
+        if (!imageConfig || !imageConfig.provider())
+          throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        const snapshot = await imageConfig.provider()!.resolveImage(actor, modelRef);
+        const jobId = randomUUID();
+        const expiresAt = Date.now() + 10 * 60_000;
+        const input = { ...parameters, model: snapshot.modelId };
+        if (!validImageInput(input, snapshot.profile))
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        const binding = JSON.stringify([
+          jobId,
+          actor.userId,
+          expiresAt,
+          snapshot.profile,
+          Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))),
+        ]);
+        const credential = sealImageKey(
+          snapshot.apiKey,
+          binding,
+          imageConfig.keyId,
+          imageConfig.publicKey,
+        );
+        const command: ImageCommandV1 = {
+          version: 1,
+          type: 'image.request',
+          messageId: randomUUID(),
+          jobId,
+          ownerId: actor.userId,
+          expiresAt,
+          profile: snapshot.profile,
+          input,
+          credential,
+        };
+        try {
+          parseImageCommand(command);
+        } catch {
+          throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        }
+        if (Buffer.byteLength(JSON.stringify(command), 'utf8') > IMAGE_MAX_MESSAGE_BYTES)
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        const id = await store.imageCreate(actor.userId, requestId, hash, command, {
+          providerConfigId: snapshot.providerConfigId,
+          providerRevision: snapshot.providerRevision,
+          credentialVersion: snapshot.credentialVersion,
+          catalogVersion: snapshot.catalogVersion,
+          adaptationVersion: snapshot.adaptationVersion,
+          modelRef,
+          modelId: snapshot.modelId,
+          operation: 'image.generate',
+          profile: snapshot.profile,
+        });
+        return store.imageGet(actor.userId, id);
+      });
+    },
+    getImage(actor: AssetPrincipal, id: string) {
+      return admit(() => store.imageGet(actor.userId, id));
+    },
+    recoverImage(actor: AssetPrincipal, id: string) {
+      return admit(async () => {
+        if (!store.imagesAvailable) throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        await store.imageRecover(actor.userId, id);
+        return store.imageGet(actor.userId, id);
+      });
+    },
     create(actor: AssetPrincipal, requestId: string, assetId: string) {
       return admit(async () => {
         if (!isUuidV4(requestId) || !isUuidV4(assetId))

@@ -51,14 +51,14 @@ async function main(name: 'dev' | 'test') {
   if (action === 'compute' && args.length === 1 && ['init', 'start'].includes(args[0]!)) {
     const worker = localWorkerEnvironment(name, values, host);
     if (args[0] === 'start') {
-      for (const key of [
-        'MIO_COS_BUCKET',
-        'MIO_COS_REGION',
-        'MIO_COS_SECRET_ID',
-        'MIO_COS_SECRET_KEY',
-      ])
+      for (const key of ['MIO_COS_BUCKET', 'MIO_COS_REGION'])
         if (!worker[key])
           throw new Error(`LOCAL_WORKER_CONFIG: set ${key} in the selected environment file`);
+      for (const key of ['SECRET_ID', 'SECRET_KEY'])
+        if (!worker[`MIO_COS_${key}`])
+          throw new Error(
+            `LOCAL_WORKER_CONFIG: set MIO_LOCAL_COMPUTE_COS_${key} in the selected environment file`,
+          );
     }
     console.log(`${name}: Worker ${args[0]} (${values.MIO_LOCAL_COMPUTE_DIRECTORY})`);
     await run(process.execPath, ['compute/dist/main.js', args[0]!], worker);

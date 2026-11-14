@@ -98,6 +98,11 @@ it('upgrades pre-MQ files without changing old secrets, and rejects partial iden
 
 it('gives B only its own environment identity and rejects a swapped broker or journal', async () => {
   const root = await fixture();
+  const file = join(root, '.env.test');
+  await writeFile(
+    file,
+    `${await readFile(file, 'utf8')}\nMIO_IMAGE_KEY_ID=test-key\nMIO_IMAGE_PUBLIC_KEY=public-test\nMIO_IMAGE_PRIVATE_KEY=private-test\nMIO_COS_SECRET_ID=app-id\nMIO_COS_SECRET_KEY=app-key\nMIO_COS_SESSION_TOKEN=app-token\nMIO_LOCAL_COMPUTE_COS_SECRET_ID=worker-id\nMIO_LOCAL_COMPUTE_COS_SECRET_KEY=worker-key\nMIO_LOCAL_COMPUTE_COS_SESSION_TOKEN=worker-token\n`,
+  );
   const dev = await readLocalEnvironment('dev', root, {});
   const test = await readLocalEnvironment('test', root, {});
   const worker = localWorkerEnvironment('test', test.values, test.host, root);
@@ -105,6 +110,42 @@ it('gives B only its own environment identity and rejects a swapped broker or jo
   expect(worker.MIO_COMPUTE_EXPECTED_COMMAND_USER).toBe('mio-test-a');
   expect(worker.MIO_COMPUTE_DIRECTORY).toBe(join(root, '.runtime/test/compute'));
   expect(worker.RABBITMQ_URL).toContain(`mio-test-b:${test.values.MIO_LOCAL_RABBITMQ_B_PASSWORD}@`);
+  expect(test.runtime.MIO_IMAGE_KEY_ID).toBe('test-key');
+  expect(test.runtime.MIO_IMAGE_PUBLIC_KEY).toBe('public-test');
+  expect(test.runtime.MIO_IMAGE_PRIVATE_KEY).toBeUndefined();
+  expect(worker.MIO_IMAGE_KEY_ID).toBe('test-key');
+  expect(worker.MIO_IMAGE_PRIVATE_KEY).toBe('private-test');
+  expect(worker.MIO_IMAGE_PUBLIC_KEY).toBeUndefined();
+  expect(test.runtime.MIO_COS_SECRET_ID).toBe('app-id');
+  expect(test.runtime.MIO_COS_SECRET_KEY).toBe('app-key');
+  expect(test.runtime.MIO_COS_SESSION_TOKEN).toBe('app-token');
+  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SECRET_ID).toBeUndefined();
+  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SECRET_KEY).toBeUndefined();
+  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN).toBeUndefined();
+  expect(worker.MIO_COS_SECRET_ID).toBe('worker-id');
+  expect(worker.MIO_COS_SECRET_KEY).toBe('worker-key');
+  expect(worker.MIO_COS_SESSION_TOKEN).toBe('worker-token');
+  expect(
+    localWorkerEnvironment(
+      'test',
+      {
+        ...test.values,
+        MIO_LOCAL_COMPUTE_COS_SECRET_ID: undefined,
+        MIO_LOCAL_COMPUTE_COS_SECRET_KEY: undefined,
+        MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN: undefined,
+      },
+      test.host,
+      root,
+    ).MIO_COS_SECRET_ID,
+  ).toBeUndefined();
+  expect(() =>
+    localWorkerEnvironment(
+      'test',
+      { ...test.values, MIO_LOCAL_COMPUTE_COS_SECRET_ID: 'app-id' },
+      test.host,
+      root,
+    ),
+  ).toThrow('LOCAL_WORKER_COS_IDENTITY');
   for (const key of [
     'MIO_AUTH_SECRET',
     'MIO_AUTH_DATABASE_URL',
@@ -114,7 +155,6 @@ it('gives B only its own environment identity and rejects a swapped broker or jo
     'MIO_COMPUTE_EXPECTED_RESULT_USER',
   ])
     expect(worker[key]).toBeUndefined();
-  const file = join(root, '.env.test');
   const original = await readFile(file, 'utf8');
   for (const key of [
     'RABBITMQ_URL',

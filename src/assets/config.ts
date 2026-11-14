@@ -4,6 +4,7 @@ export interface AssetConfig {
   region: string;
   secretId: string;
   secretKey: string;
+  sessionToken?: string;
 }
 
 export function readAssetDatabaseURL(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -24,7 +25,12 @@ export function readAssetConfig(env: NodeJS.ProcessEnv = process.env): AssetConf
   const region = env.MIO_COS_REGION;
   const secretId = env.MIO_COS_SECRET_ID;
   const secretKey = env.MIO_COS_SECRET_KEY;
-  if ([databaseURL, bucket, region, secretId, secretKey].every((value) => value === undefined))
+  const sessionToken = env.MIO_COS_SESSION_TOKEN;
+  if (
+    [databaseURL, bucket, region, secretId, secretKey, sessionToken].every(
+      (value) => value === undefined,
+    )
+  )
     return;
   try {
     if (!databaseURL) throw new Error();
@@ -32,7 +38,15 @@ export function readAssetConfig(env: NodeJS.ProcessEnv = process.env): AssetConf
       throw new Error();
     if (!region || !/^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(region)) throw new Error();
     if (!secretId || !secretKey || /\s/.test(secretId + secretKey)) throw new Error();
-    return { databaseURL, bucket, region, secretId, secretKey };
+    if (sessionToken !== undefined && (!sessionToken || /\s/.test(sessionToken))) throw new Error();
+    return {
+      databaseURL,
+      bucket,
+      region,
+      secretId,
+      secretKey,
+      ...(sessionToken ? { sessionToken } : {}),
+    };
   } catch {
     throw new Error('ASSET_CONFIG: explicit PostgreSQL and private COS settings required');
   }

@@ -25,7 +25,7 @@ export function legacyHarness(): HarnessConfig {
       ],
     },
     documentRoots: ['README.md', 'AGENTS.md', 'docs'],
-    privateRoots: ['.work', '.runtime'],
+    privateRoots: ['.work', '.runtime', '.claude'],
     generatedRoots: ['node_modules', 'dist', 'coverage', '.git'],
     configurationFiles: [
       'package.json',

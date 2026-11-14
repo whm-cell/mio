@@ -42,7 +42,13 @@ pnpm start:test
 
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。
 
-完整转码须在各自环境文件配置独立媒体数据库 `MIO_ASSETS_DATABASE_URL`、本环境授权的 COS 桶与凭据，先迁移 assets 再迁移 compute，并为 A 设置 `MIO_COMPUTE_ENABLED=true`。现有代码没有可配置的 COS 环境前缀，不能仅换一个本地目录就宣称云资源隔离。初始化中间件不自动新建媒体数据库或 COS 桶，也不证明完整云端转码已通过。
+W1/W2 的供应商和文本服务不需要资产/COS 配置。完整转码以及 W3 图片真实闭环才须在各自环境文件配置独立媒体数据库 `MIO_ASSETS_DATABASE_URL`、本环境授权的 COS 桶与可用凭据，先迁移 assets 再迁移 compute，并为 A 设置 `MIO_COMPUTE_ENABLED=true`。现有代码没有可配置的 COS 环境前缀，不能仅换一个本地目录就宣称云资源隔离。初始化中间件不自动新建媒体数据库或 COS 桶，也不证明完整云端转码已通过。
+
+图片候选还需供应商域迁移和显式图片密钥：A 使用 `MIO_IMAGE_PUBLIC_KEY`、`MIO_IMAGE_KEY_ID`，B 使用同 ID 的 `MIO_IMAGE_PRIVATE_KEY`。Key ID 须为 1–64 个字母、数字、下划线或连字符。本地环境文件可按 dotenv 引号格式保存多行 PEM；启动器不会把 B 私钥传给 A，也不会把 A 公钥传给 B。图片消息加入显式 profile 后，升级时须先停图片准入、核对已受理命令，再升级 B 并确认其支持新协议后升级 A；旧 B 不能消费新消息。不同测试批次须使用已授权且隔离的桶、数据库和队列，旧凭据或旧目录不能仅凭存在视为当前授权。运维与恢复边界见 [Worker](../compute/README.md) 和[图片候选](apis/compute.md#post-apiv1computeimages)。
+
+移除 A 图片准入配置不会清理已有任务：图片表已存在时启动检查其当前结构，继续投递、接收和恢复已受理任务；仅旧视频库没有图片表时，误入的图片结果进入 broker 死信，需核对数据库和消息后处理，不冒充完成。已有图片表但结构不兼容须先迁移或恢复正确库，不能静默继续消费。
+
+本地 A 使用原 `MIO_COS_SECRET_ID/KEY`；本地 B 必须在同一私有环境文件另设受限的 `MIO_LOCAL_COMPUTE_COS_SECRET_ID/KEY`，缺失不回退 A，ID 与 A 相同时拒绝启动。升级已有本地 COS 配置时先补 B 独立身份，再启动 Worker；桶与地域继续共用。长期受限 Key 可直接使用；若选定临时凭据，A 使用 `MIO_COS_SESSION_TOKEN`、B 使用 `MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN`，B 字段不会注入 A。两进程由同一本地用户管理，该约定不隔离同用户对环境文件的读取权限。不得使用 Root 凭据；临时凭据失效后操作会失败，签名下载 URL 也不会超出其实际有效期，此时更换同一权限边界的凭据并重新启动对应进程即可。本配置不自动续期。
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 或 `compute`，例如 `pnpm migrate:test conversations --apply`；资产必须先于计算迁移，分库供应商引用迁移沿[供应商规范](providers.md)。未启用域不自动迁移。
 

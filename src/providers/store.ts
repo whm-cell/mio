@@ -370,7 +370,10 @@ export class ProviderStore {
     return (this.closing ??= this.pool.end());
   }
 }
-export async function createProviderStore(config: ProviderConfig): Promise<ProviderStore> {
+export async function createProviderStore(
+  config: ProviderConfig,
+  images = false,
+): Promise<ProviderStore> {
   const pool = new Pool({
     connectionString: config.databaseURL,
     max: 5,
@@ -381,7 +384,7 @@ export async function createProviderStore(config: ProviderConfig): Promise<Provi
   });
   pool.on('error', () => log.error('PROVIDER_DATABASE_CONNECTION_ERROR'));
   try {
-    await checkProviderSchema(pool);
+    await checkProviderSchema(pool, images);
     return new ProviderStore(pool, config);
   } catch {
     await pool.end();

@@ -1,7 +1,28 @@
+export {
+  parseImageCommand,
+  parseImageRecovery,
+  parseImageResult,
+  imageOutputKey,
+  imageOutputIndex,
+  IMAGE_PROFILES,
+  isImageProfile,
+  validImageInput,
+} from './images.ts';
+export type {
+  ImageInput,
+  ImageProfile,
+  ImageEnvelope,
+  ImageCommandV1,
+  ImageRecoveryCommandV1,
+  ImageResultV1,
+  ImageOutput,
+  ImageErrorCode,
+} from './images.ts';
 /** Shared message v1. The transport authenticates publishers separately from these values. */
 export const COMPUTE_VERSION = 1 as const;
 export const COMPUTE_PROFILE = 'mp4-h264-aac-720p24-v1' as const;
 export const COMPUTE_MAX_MESSAGE_BYTES = 8192;
+export const IMAGE_MAX_MESSAGE_BYTES = 160_000;
 export const COMPUTE_MAX_MEDIA_BYTES = 1024 ** 3;
 export const COMMAND_EXCHANGE = 'mio.compute.commands.v1';
 export const COMMAND_QUEUE = 'mio.compute.commands.v1';

@@ -1,5 +1,6 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
+import { isImageProfile } from '@mio/compute-contracts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -104,6 +105,43 @@ export function createProviderService(
     return result;
   };
   return {
+    async resolveImage(actor: ProviderPrincipal, modelRef: string) {
+      assertOpen();
+      const row = await store.state(actor.userId);
+      assertOpen();
+      if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
+      const model = findModel(row.models, modelRef);
+      const reason = membershipError(row, model);
+      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+      const adaptation = row.adaptations.find(
+        (entry) =>
+          entry.model_key === model!.model_key &&
+          entry.operation === 'image.generate' &&
+          isImageProfile(entry.profile),
+      );
+      if (!adaptation || !isImageProfile(adaptation.profile))
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+      if (
+        row.preferences.some(
+          (pref) => pref.model_key === model!.model_key && pref.usage === 'image' && !pref.enabled,
+        )
+      )
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
+      return {
+        modelId: model!.raw_model_id!,
+        profile: adaptation.profile,
+        providerRevision: row.revision,
+        providerConfigId: row.id,
+        credentialVersion: row.credential_version,
+        catalogVersion: row.catalog_version!,
+        adaptationVersion: adaptation.declaration_version,
+        apiKey: decryptCredential(
+          row,
+          { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
+          config,
+        ),
+      };
+    },
     async selectChat(actor: ProviderPrincipal, modelRef?: string): Promise<ChatSelection> {
       return (await chatState(actor, modelRef)).selection;
     },

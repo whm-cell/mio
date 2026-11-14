@@ -59,6 +59,11 @@ export function localWorkerEnvironment(
   host: NodeJS.ProcessEnv,
   root = resolve('.'),
 ): NodeJS.ProcessEnv {
+  if (
+    values.MIO_LOCAL_COMPUTE_COS_SECRET_ID &&
+    values.MIO_LOCAL_COMPUTE_COS_SECRET_ID === values.MIO_COS_SECRET_ID
+  )
+    throw new Error('LOCAL_WORKER_COS_IDENTITY: A and B must use separate identities');
   return {
     ...host,
     NODE_ENV: values.NODE_ENV,
@@ -68,9 +73,14 @@ export function localWorkerEnvironment(
     MIO_COMPUTE_DIRECTORY: resolve(root, values.MIO_LOCAL_COMPUTE_DIRECTORY!),
     MIO_COMPUTE_INSTANCE_ID: values.MIO_LOCAL_COMPUTE_INSTANCE_ID,
     ...Object.fromEntries(
-      ['MIO_COS_BUCKET', 'MIO_COS_REGION', 'MIO_COS_SECRET_ID', 'MIO_COS_SECRET_KEY']
+      ['MIO_COS_BUCKET', 'MIO_COS_REGION', 'MIO_IMAGE_KEY_ID', 'MIO_IMAGE_PRIVATE_KEY']
         .filter((key) => values[key])
         .map((key) => [key, values[key]]),
+    ),
+    ...Object.fromEntries(
+      ['SECRET_ID', 'SECRET_KEY', 'SESSION_TOKEN']
+        .filter((key) => values[`MIO_LOCAL_COMPUTE_COS_${key}`])
+        .map((key) => [`MIO_COS_${key}`, values[`MIO_LOCAL_COMPUTE_COS_${key}`]]),
     ),
   };
 }

@@ -1,4 +1,5 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { isImageProfile } from '@mio/compute-contracts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -57,9 +58,12 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
         ].includes(key),
     ) ||
     typeof entry.modelRef !== 'string' ||
-    entry.operation !== 'chat' ||
     typeof entry.profile !== 'string' ||
-    !['openai-chat', 'anthropic-messages'].includes(entry.profile) ||
+    !(
+      (entry.operation === 'chat' &&
+        ['openai-chat', 'anthropic-messages'].includes(String(entry.profile))) ||
+      (entry.operation === 'image.generate' && isImageProfile(entry.profile))
+    ) ||
     [entry.source, entry.sourceVersion].some(
       (item) => typeof item !== 'string' || !item.trim() || item.length > 512,
     )
@@ -83,12 +87,49 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
 export function chatAdaptation(
   adaptations: AdaptationRecord[],
   key: string,
-): AdaptationRecord | undefined {
-  return adaptations.find((entry) => entry.model_key === key && entry.operation === 'chat');
+):
+  | (AdaptationRecord & { operation: 'chat'; profile: 'openai-chat' | 'anthropic-messages' })
+  | undefined {
+  return adaptations.find(
+    (entry) =>
+      entry.model_key === key &&
+      entry.operation === 'chat' &&
+      ['openai-chat', 'anthropic-messages'].includes(entry.profile),
+  ) as
+    | (AdaptationRecord & { operation: 'chat'; profile: 'openai-chat' | 'anthropic-messages' })
+    | undefined;
+}
+function adaptationView(adaptation?: AdaptationRecord) {
+  return adaptation
+    ? {
+        operation: adaptation.operation,
+        profile: adaptation.profile,
+        implementation: 'implemented',
+        declarationVersion: adaptation.declaration_version,
+        source: adaptation.source,
+        sourceVersion: adaptation.source_version,
+        metadata: adaptation.capability_metadata,
+        verification: {
+          status: adaptation.verification_status,
+          at: adaptation.verified_at,
+          evidence: adaptation.verification_evidence,
+          testedTuple: adaptation.tested_tuple,
+        },
+      }
+    : null;
 }
 /** O(models + adaptations + preferences); no supplier I/O, decryption or product model list. */
 export function catalogView(state: ProviderState | null, category?: Category) {
-  const byModel = new Map((state?.adaptations ?? []).map((item) => [item.model_key, item]));
+  const byModel = new Map(
+    (state?.adaptations ?? [])
+      .filter((item) => item.operation === 'chat')
+      .map((item) => [item.model_key, item]),
+  );
+  const imagesByModel = new Map(
+    (state?.adaptations ?? [])
+      .filter((item) => item.operation === 'image.generate' && isImageProfile(item.profile))
+      .map((item) => [item.model_key, item]),
+  );
   const prefs = new Map<string, ModelPreference[]>();
   for (const item of state?.preferences ?? []) {
     const list = prefs.get(item.model_key) ?? [];
@@ -111,6 +152,11 @@ export function catalogView(state: ProviderState | null, category?: Category) {
           !!adaptation,
       }));
       const chat = preferences.find((pref) => pref.usage === 'chat');
+      const image = preferences.find((pref) => pref.usage === 'image');
+      const imageAdaptation = imagesByModel.get(model.model_key);
+      const imageReason =
+        membershipError(state!, model) ??
+        (!imageAdaptation ? 'ADAPTER_PENDING' : image?.enabled === false ? 'MODEL_DISABLED' : null);
       const reason =
         membershipError(state!, model) ??
         (!adaptation ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);
@@ -140,23 +186,13 @@ export function catalogView(state: ProviderState | null, category?: Category) {
           model.membership_state === 'current' &&
           model.credential_version === state!.credential_version &&
           model.catalog_version === state!.catalog_version,
-        adaptation: adaptation
-          ? {
-              operation: adaptation.operation,
-              profile: adaptation.profile,
-              implementation: 'implemented',
-              declarationVersion: adaptation.declaration_version,
-              source: adaptation.source,
-              sourceVersion: adaptation.source_version,
-              metadata: adaptation.capability_metadata,
-              verification: {
-                status: adaptation.verification_status,
-                at: adaptation.verified_at,
-                evidence: adaptation.verification_evidence,
-                testedTuple: adaptation.tested_tuple,
-              },
-            }
-          : null,
+        adaptation: adaptationView(adaptation),
+        image: {
+          adaptation: adaptationView(imageAdaptation),
+          enabled: image?.enabled ?? true,
+          runnable: imageReason === null,
+          unavailableReason: imageReason,
+        },
         preferences,
         enabled: chat?.enabled ?? true,
         isDefault: chat?.isDefault ?? false,

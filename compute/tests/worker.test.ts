@@ -255,6 +255,7 @@ describe('worker journal and real ffmpeg', () => {
     journal.close();
     const old = new DatabaseSync(join(root, 'journal.sqlite3'));
     old.exec(`BEGIN IMMEDIATE;
+      DROP TABLE image_attempts;
       DROP INDEX attempts_cleanup;
       ALTER TABLE attempts RENAME COLUMN ack_dispatched TO acknowledged;
       CREATE INDEX attempts_cleanup ON attempts(attempt_id) WHERE phase IN ('succeeded','failed') AND acknowledged = 1 AND cleaned = 0;

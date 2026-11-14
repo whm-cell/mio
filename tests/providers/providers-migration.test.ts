@@ -35,6 +35,28 @@ const success = (ids: string[], credentialVersion = 1) => ({
   checkedAt: '2026-11-09T00:00:00Z',
 });
 
+it('checks the image adaptation constraints only when image execution is enabled', async () =>
+  databaseTest(async (pool) => {
+    await pool.query(providerSchemaSQL);
+    await pool.query(`ALTER TABLE mio_provider_model_adaptations
+      DROP CONSTRAINT mio_provider_model_adaptations_operation_check,
+      DROP CONSTRAINT mio_provider_model_adaptations_profile_check,
+      ADD CONSTRAINT mio_provider_model_adaptations_operation_check CHECK(operation='chat'),
+      ADD CONSTRAINT mio_provider_model_adaptations_profile_check CHECK(profile IN ('openai-chat','anthropic-messages'))`);
+    await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
+    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
+    await pool.query(providerSchemaSQL);
+    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+    await pool.query(`ALTER TABLE mio_provider_model_adaptations
+      DROP CONSTRAINT mio_provider_model_adaptations_profile_check,
+      ADD CONSTRAINT mio_provider_model_adaptations_profile_check
+      CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
+            (operation='image.generate' AND profile='gpt-images-v1'))`);
+    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
+    await pool.query(providerSchemaSQL);
+    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+  }));
+
 it('upgrades valid success/empty success, failed and rotated observations without a static seed; reruns preserve identity', async () =>
   databaseTest(async (pool) => {
     await pool.query(legacyProviderSchemaSQL);

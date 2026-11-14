@@ -98,6 +98,69 @@ it('discovers new exact identities without a release, keeps unknown metadata pen
   expect(snapshot.profile).toBe('openai-chat');
 });
 
+it('shows image declaration and eligibility separately while preserving the chat view', async () => {
+  let ids = ['gpt-image-2'];
+  const f = await fixture(async () => metadata(ids));
+  await f.service.discover(f.actor);
+  const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
+  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+    modelRef: ref,
+    operation: 'image.generate',
+    profile: 'gpt-images-v1',
+    source: 'protocol fixture',
+    sourceVersion: 'v1',
+    classification: 'image',
+  });
+  const item = (await f.service.catalog(f.actor)).items[0]!;
+  expect(item).toMatchObject({
+    adaptation: null,
+    runnable: false,
+    unavailableReason: 'ADAPTER_PENDING',
+    image: {
+      adaptation: {
+        operation: 'image.generate',
+        profile: 'gpt-images-v1',
+        verification: { status: 'unverified' },
+      },
+      enabled: true,
+      runnable: true,
+      unavailableReason: null,
+    },
+  });
+  expect((await f.service.resolveImage(f.actor, ref)).modelId).toBe('gpt-image-2');
+  ids = [];
+  await f.service.discover(f.actor);
+  expect((await f.service.catalog(f.actor)).items[0]!.image).toMatchObject({
+    runnable: false,
+    unavailableReason: 'MODEL_REMOVED',
+  });
+});
+
+it('requires an explicit Seedream declaration and freezes the image profile without guessing the model name', async () => {
+  const f = await fixture(async () => metadata(['doubao-seedream-4.0']));
+  await f.service.discover(f.actor);
+  const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
+  await expect(f.service.resolveImage(f.actor, ref)).rejects.toThrow('ADAPTER_PENDING');
+  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+    modelRef: ref,
+    operation: 'image.generate',
+    profile: 'seedream-4-images-v1',
+    source: 'protocol fixture',
+    sourceVersion: 'v1',
+    classification: 'image',
+  });
+  const item = (await f.service.catalog(f.actor)).items[0]!;
+  expect(item.image).toMatchObject({
+    runnable: true,
+    adaptation: { profile: 'seedream-4-images-v1' },
+  });
+  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+    modelId: 'doubao-seedream-4.0',
+    profile: 'seedream-4-images-v1',
+    adaptationVersion: 1,
+  });
+});
+
 it('distinguishes empty success, temporary stale, sticky auth rejection and credential rotation across restart', async () => {
   let response = () => metadata(['New-Z']);
   const f = await fixture(async () => response());

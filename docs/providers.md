@@ -49,6 +49,8 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 供应商禁用阻止新选择/调用，保留偏好；仍允许显式只读目录诊断。模型移除、禁用、凭据失效均不自动换默认。usage 是业务用途，与供应商 classification 分离；未知分类不自动产生 chat 默认。用户明确指定 chat 用途，且目标当前有效、有已实现 chat 适配、已启用，才可设置默认。禁用模型保留默认目标并显示无效；修改偏好也执行当前资格检查。
 
+已受理异步图片的已知上游任务沿任务所属 `user_id` 查询当前保存的 Key，不因禁用新准入、目录刷新或 Key 版本变化而改变归属；Key 无法解密时保留任务，供应商拒绝或不同账户无权查询时不能承诺上游结果可取回。发送时取得的 Key 是一次出站快照，与并发轮换并非原子操作。
+
 用户可以修改本人已存在实体的展示覆盖，即使其当前不可运行或属于历史；这不创造成员，也不改变分类、声明、验证或偏好。元数据与偏好同次修改共用配置行锁与 revision，在同一事务成功或失败。
 
 ## 受控适配声明与实际验证
@@ -68,13 +70,28 @@ pnpm providers:adapt <owner-id> <expected-revision> <declaration.json>
   "modelRef": "onelink:model:<directory-returned-uuid>",
   "operation": "chat",
   "profile": "openai-chat",
+  "sourceKind": "protocol-reference",
   "source": "已核对的协议文档或实际观察依据",
   "sourceVersion": "依据版本",
   "classification": "chat"
 }
 ```
 
-图片首切片候选允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1` 或受限单图 `seedream-4-images-v1`；不按名称自动推断。启用图片前执行供应商迁移，启动会检查两个图片声明约束；声明和目录发现均不证明真实生成可用。运行与未接受边界见[计算 HTTP 候选](apis/compute.md#post-apiv1computeimages)。
+`sourceKind` 必填且只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察）。它只说明适配依据，不建立模型成员；`catalog-membership`、目录快照或旧模型清单不是适配来源，`onelink-v1-models` 等目录事实不能填入 `source`。来源类型按显式字段判断，不从 URL、名称或描述猜测。
+
+已有适配行升级时，迁移为兼容性默认 `protocol-reference` 并保留原 `source/sourceVersion`；新声明必须显式提供 `sourceKind`。刷新继续由 `metadata_source='onelink-v1-models'` 表达目录成员事实，不能写入适配表。
+
+图片首切片候选允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1` 或受限单图 `seedream-4-images-v1`；不按名称自动推断。GPT edit/mask 还须在声明 metadata 中显式列出能力，例如：
+
+```json
+{
+  "operation": "image.generate",
+  "profile": "gpt-images-v1",
+  "metadata": { "image": { "modes": ["generate", "edit"], "mask": { "format": "png" } } }
+}
+```
+
+省略 `metadata.image` 表示只有 generate 能力；显式 `metadata.image` 的 `modes` 必须包含 generate，多参考可另声明供应商 capability 的 `references.maxImages`，outpaint 必须在 `modes` 中列出并同时声明像素 geometry 边界；异步能力必须显式声明 `async:{operations,maxQueries,maxAgeSeconds}`，且 operations 必须是 modes 的子集。不得从模型名称、旧 92 项或目录数量推断 edit、mask、outpaint、async 或其他媒体协议。`references.maxImages` 只约束供应商明确声明的多参考能力，不是固定模型或图片容量策略；async 边界只约束注入 transport 的有界查询，不代表真实供应商字段。当前用户 Key 成功刷新得到的全量模型和数量仍是唯一目录权威。启用图片前执行供应商迁移，启动会检查图片声明约束；声明和目录发现均不证明真实生成可用。运行与未接受边界见[计算 HTTP 候选](apis/compute.md#post-apiv1computeimages)。
 
 classification 可省略；可选 `metadata.contextWindow` 只能是有来源的正整数。未知上下文/价格/工具/媒体能力不补值。来源明确是部署声明，不冒充供应商元数据。入口不创造成员、不接收代码/URL/Key/verified，不开放普通用户管理 API。每次声明更新递增独立版本并使验证待核对，分类变化保留身份/偏好。
 

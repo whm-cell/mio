@@ -1,0 +1,86 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-image-generation/prd.md",
+  "results": [
+    {
+      "key": "async-image-slice",
+      "title": "异步图片提交、查询与重启恢复",
+      "locations": [
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "图片任务入口、owner 权限、异步恢复及 Asset 物化"
+        },
+        {
+          "path": "src/compute/store.ts",
+          "purpose": "持久化任务身份、查询状态、期限与 outbox"
+        },
+        {
+          "path": "src/providers/catalog.ts",
+          "purpose": "当前发现模型与显式 async capability 的资格判断"
+        },
+        {
+          "path": "tests/compute/live-image-loop.ts",
+          "purpose": "隔离真实运行与重启、权限和重放验证入口"
+        },
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "A/B 消息、异步状态、查询与恢复契约"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "图片异步 API、任务状态及资源归属"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "OneLink 图片适配、真实下载与安全边界"
+        }
+      ],
+      "outcomes": "在系统 user_id、PG outbox/journal、私有 COS/Asset 和动态 Provider 目录边界内，支持显式 async capability 的图片任务提交、有界查询、重启恢复和幂等重放；凭据只用于供应商访问，公开接口不泄露上游任务身份、COS 身份或凭据。同步图片能力保留既有契约。",
+      "verification": "最终候选本地完整 pnpm check 通过，61 个测试文件、823 项测试及 format、typecheck、lint、guard、build、smoke 通过；quality-review、需求与规范对账通过。当前用户 Key 刷新目录后选取 image-vidu-q2，真实执行 1 次供应商提交、2 次查询，验证同一任务重启恢复、私有 COS/owner Asset、跨用户拒绝、owner 下载摘要与长度及 requestId/消息重放不重复提交。",
+      "limitations": "真实观察限于本次 Vidu 模型和环境，不推断其他模型行为。远端 GitHub Actions 暂缓；生产性能、容量和压测为本期非目标。历史未知与跨候选观察保留，未覆盖为本轮成功。",
+      "acceptance": {
+        "candidate": "9728b653282bcff1b8298bf578f1bf5db574bdcc1a3253188c865360289da261",
+        "statement": "授权基于最终候选再发起一次真实 Vidu 任务，完成查询、COS、Asset 和重启恢复闭环，通过后推进 E3 complete。",
+        "reference": "本次对话中用户针对最终候选的明确条件接受；同候选真实闭环及必需证据经实施代理和主控核对通过。"
+      }
+    },
+    {
+      "key": "reference-outpaint-slice",
+      "title": "OneLink GPT 多参考输入与 capability-gated outpaint",
+      "locations": [
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "图片 HTTP 输入与 owner/capability 公共约定"
+        },
+        {
+          "path": "docs/apis/providers.md",
+          "purpose": "Provider image modes/references/geometry 声明约定"
+        },
+        {
+          "path": "docs/providers.md",
+          "purpose": "动态目录与 capability 边界说明"
+        },
+        {
+          "path": "docs/tasks/onelink-image-generation/prd.md",
+          "purpose": "E2 独立切片范围与后续 pending 边界"
+        },
+        {
+          "path": "docs/tasks/onelink-image-generation/design.md",
+          "purpose": "E2 多参考与 geometry gate 方案边界"
+        },
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "图片消息与 multipart 协议边界"
+        }
+      ],
+      "outcomes": "完成 GPT 图片能力的 owner-scoped 多参考资产数组、私有 COS 快照与重复 multipart image[]；outpaint 仅在显式 Provider geometry capability 下受理，显式 image modes 必含 generate，保留 E1 生命周期、动态目录与 user_id 归属语义。",
+      "verification": "当前 candidate 通过四项 E2 automated suites（4 pass）、contracts/root typecheck、guard、Prettier、ESLint、diff check；本地 CI-mode GITHUB_ACTIONS=true 使用仓库 Redis 8.2.11 执行 pnpm check，format/typecheck/lint/guard、60 files/760 tests、build、smoke 全通过，仅 allowBuilds 环境 WARN；quality-review、norms-review 已登记通过。",
+      "limitations": "真实 OneLink Key/COS 与供应商多参考/outpaint geometry 未调用或验收；远端 GitHub Actions、生产性能、Seedream edit 与异步协议保持 pending；未提交、推送、部署或 complete。",
+      "acceptance": {
+        "candidate": "95daeceeeb2c0d38311272947dff2e6046e98d633b03d0bf501e4c4029f99f2a",
+        "statement": "接受当前 E2 候选并执行 complete；真实 OneLink/COS、远端 CI、Seedream edit 和异步能力继续保留 pending，不提交、推送或部署。",
+        "reference": "当前对话用户明确接受指令（2026-11-14）"
+      }
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 import { HttpError } from '@mio/foundation/errors';
-import type { ImageProfile } from '@mio/compute-contracts';
+import type { ImageGeometryEdge, ImageOperation, ImageProfile } from '@mio/compute-contracts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
@@ -54,14 +54,32 @@ export interface ModelPreference {
 }
 
 export type ChatProfile = 'openai-chat' | 'anthropic-messages';
+/** Evidence for an implemented protocol adaptation; catalog membership is deliberately absent. */
+export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
+export interface ImageCapabilityMetadata {
+  modes: ImageOperation[];
+  mask?: { format: 'png' };
+  references?: { maxImages: number };
+  geometry?: { unit: 'pixels'; edges: ImageGeometryEdge[] };
+  async?: {
+    operations: ImageOperation[];
+    maxQueries: number;
+    maxAgeSeconds: number;
+  };
+}
+export interface AdaptationCapabilityMetadata {
+  contextWindow?: number;
+  image?: ImageCapabilityMetadata;
+}
 export interface AdaptationDeclaration {
   modelRef: string;
   operation: 'chat' | 'image.generate';
   profile: ChatProfile | ImageProfile;
+  sourceKind: AdaptationSourceKind;
   source: string;
   sourceVersion: string;
   classification?: Category;
-  metadata?: { contextWindow?: number };
+  metadata?: AdaptationCapabilityMetadata;
 }
 export interface ModelRecord {
   model_key: string;
@@ -85,9 +103,10 @@ export interface AdaptationRecord {
   operation: 'chat' | 'image.generate';
   profile: ChatProfile | ImageProfile;
   declaration_version: number;
+  source_kind: AdaptationSourceKind;
   source: string;
   source_version: string;
-  capability_metadata: { contextWindow?: number };
+  capability_metadata: AdaptationCapabilityMetadata;
   verification_status: 'unverified' | 'verified';
   verified_at: string | null;
   verification_evidence: string | null;

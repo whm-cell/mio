@@ -114,7 +114,7 @@ export class Journal {
       if (
         meta.length !== 1 ||
         meta[0]?.instance_id !== instanceId ||
-        ![3, 4, 5].includes(Number(meta[0]?.schema_version))
+        ![3, 4, 5, 6].includes(Number(meta[0]?.schema_version))
       ) {
         throw new Error('JOURNAL_IDENTITY_MISMATCH');
       }
@@ -149,11 +149,30 @@ export class Journal {
         db.exec(`BEGIN IMMEDIATE;
           CREATE TABLE image_attempts (
             job_id TEXT PRIMARY KEY, identity TEXT NOT NULL,
-            phase TEXT NOT NULL CHECK(phase IN ('submitting','unknown','returned','materializing','completed','rejected')),
+            phase TEXT NOT NULL CHECK(phase IN ('submitting','submitted','processing','unknown','returned','materializing','completed','failed','rejected')),
             payload TEXT
           );
           UPDATE metadata SET schema_version = 5;
           COMMIT;`);
+      }
+      if (Number(meta[0]?.schema_version) < 6) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.exec(`ALTER TABLE image_attempts RENAME TO image_attempts_old;
+            CREATE TABLE image_attempts (
+              job_id TEXT PRIMARY KEY, identity TEXT NOT NULL,
+              phase TEXT NOT NULL CHECK(phase IN ('submitting','submitted','processing','unknown','returned','materializing','completed','failed','rejected')),
+              payload TEXT
+            );
+            INSERT INTO image_attempts(job_id,identity,phase,payload)
+              SELECT job_id,identity,phase,payload FROM image_attempts_old;
+            DROP TABLE image_attempts_old;
+            UPDATE metadata SET schema_version = 6;
+            COMMIT;`);
+        } catch (error) {
+          db.exec('ROLLBACK');
+          throw error;
+        }
       }
       db.prepare('SELECT job_id, identity, phase, payload FROM image_attempts LIMIT 0').all();
       this.#db = db;
@@ -190,7 +209,15 @@ export class Journal {
 
   imagePhase(
     jobId: string,
-    phase: 'unknown' | 'returned' | 'materializing' | 'completed' | 'rejected',
+    phase:
+      | 'unknown'
+      | 'submitted'
+      | 'processing'
+      | 'returned'
+      | 'materializing'
+      | 'completed'
+      | 'failed'
+      | 'rejected',
     payload: string | null,
   ): void {
     const changed = this.#db

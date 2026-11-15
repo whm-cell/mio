@@ -153,6 +153,12 @@ importers:
       cos-nodejs-sdk-v5:
         specifier: 3.0.0
         version: 3.0.0
+      ipaddr.js:
+        specifier: 2.5.0
+        version: 2.5.0
+      undici:
+        specifier: 8.11.2
+        version: 8.11.2
 
   contracts/compute: {}
 

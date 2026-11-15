@@ -181,6 +181,28 @@ it('upgrades an existing four-table catalog without changing identity or history
        VALUES($1,'old-exact-ID','{"description":"supplier"}')`,
       [id],
     );
+    const modelKey = (
+      await pool.query<{ model_key: string }>(
+        'SELECT model_key FROM mio_provider_models WHERE provider_id=$1',
+        [id],
+      )
+    ).rows[0]!.model_key;
+    await pool.query(
+      `INSERT INTO mio_provider_model_adaptations(provider_id,model_key,operation,profile,declaration_version,source,source_version)
+       VALUES($1,$2,'chat','openai-chat',1,'legacy protocol note','v1')`,
+      [id, modelKey],
+    );
+    await pool.query(
+      'ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT mio_provider_model_adaptations_source_kind_check, DROP COLUMN source_kind',
+    );
+    await expect(checkProviderSchema(pool)).rejects.toThrow();
+    await pool.query('BEGIN');
+    await pool.query(providerSchemaSQL);
+    await checkProviderSchema(pool);
+    await pool.query('COMMIT');
+    expect(
+      (await pool.query('SELECT source_kind FROM mio_provider_model_adaptations')).rows[0],
+    ).toEqual({ source_kind: 'protocol-reference' });
     await pool.query(
       'ALTER TABLE mio_provider_models DROP COLUMN display_name, DROP COLUMN description_override',
     );

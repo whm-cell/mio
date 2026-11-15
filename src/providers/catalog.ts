@@ -1,5 +1,5 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { isImageProfile } from '@mio/compute-contracts';
+import { IMAGE_GEOMETRY_EDGES, IMAGE_OPERATIONS, isImageProfile } from '@mio/compute-contracts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -12,6 +12,7 @@ import type { ProviderRow, ProviderState } from './state.ts';
 import { providerView } from './state.ts';
 
 export const modelReference = (key: string) => `onelink:model:${key}`;
+const membershipSources = new Set(['onelink-v1-models', 'legacy-complete-discovery']);
 export function legacyReference(ref: string): { usage: Category; id: string } | null {
   const match = /^onelink:(chat|image|video|voice|music):(.+)$/s.exec(ref);
   return match ? { usage: match[1] as Category, id: match[2]! } : null;
@@ -51,6 +52,7 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
           'modelRef',
           'operation',
           'profile',
+          'sourceKind',
           'source',
           'sourceVersion',
           'metadata',
@@ -59,6 +61,7 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
     ) ||
     typeof entry.modelRef !== 'string' ||
     typeof entry.profile !== 'string' ||
+    !['protocol-reference', 'runtime-observation'].includes(String(entry.sourceKind)) ||
     !(
       (entry.operation === 'chat' &&
         ['openai-chat', 'anthropic-messages'].includes(String(entry.profile))) ||
@@ -66,7 +69,8 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
     ) ||
     [entry.source, entry.sourceVersion].some(
       (item) => typeof item !== 'string' || !item.trim() || item.length > 512,
-    )
+    ) ||
+    membershipSources.has(String(entry.source))
   )
     throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
   if (entry.classification !== undefined && !categories.includes(entry.classification as Category))
@@ -76,11 +80,112 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
       throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
     const metadata = entry.metadata as Record<string, unknown>;
     if (
-      Object.keys(metadata).some((key) => key !== 'contextWindow') ||
+      Object.keys(metadata).some((key) => !['contextWindow', 'image'].includes(key)) ||
       ('contextWindow' in metadata &&
         (!Number.isSafeInteger(metadata.contextWindow) || Number(metadata.contextWindow) < 1))
     )
       throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+    if ('image' in metadata) {
+      if (entry.operation !== 'image.generate' || !isImageProfile(entry.profile))
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      const image = metadata.image;
+      if (!image || typeof image !== 'object' || Array.isArray(image))
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      const capability = image as Record<string, unknown>;
+      if (
+        Object.keys(capability).some(
+          (key) => !['modes', 'mask', 'references', 'geometry', 'async'].includes(key),
+        ) ||
+        !Array.isArray(capability.modes) ||
+        capability.modes.length < 1 ||
+        !capability.modes.includes('generate') ||
+        capability.modes.some(
+          (mode) => typeof mode !== 'string' || !IMAGE_OPERATIONS.some((item) => item === mode),
+        ) ||
+        new Set(capability.modes).size !== capability.modes.length
+      )
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      if (capability.modes.includes('edit') && entry.profile !== 'gpt-images-v1')
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      if (capability.modes.includes('outpaint') && entry.profile !== 'gpt-images-v1')
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      if ('mask' in capability) {
+        if (!capability.modes.includes('edit'))
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+        const mask = capability.mask;
+        if (!mask || typeof mask !== 'object' || Array.isArray(mask))
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+        const value = mask as Record<string, unknown>;
+        if (Object.keys(value).length !== 1 || value.format !== 'png')
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      }
+      if ('references' in capability) {
+        const references = capability.references;
+        if (
+          !references ||
+          typeof references !== 'object' ||
+          Array.isArray(references) ||
+          Object.keys(references).length !== 1 ||
+          !Number.isSafeInteger((references as Record<string, unknown>).maxImages) ||
+          Number((references as Record<string, unknown>).maxImages) < 2 ||
+          Number((references as Record<string, unknown>).maxImages) > 16
+        )
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      }
+      if ('geometry' in capability) {
+        if (!capability.modes.includes('outpaint'))
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+        const geometry = capability.geometry;
+        if (!geometry || typeof geometry !== 'object' || Array.isArray(geometry))
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+        const value = geometry as Record<string, unknown>;
+        if (
+          Object.keys(value).length !== 2 ||
+          value.unit !== 'pixels' ||
+          !Array.isArray(value.edges) ||
+          value.edges.length !== IMAGE_GEOMETRY_EDGES.length ||
+          value.edges.some(
+            (edge) =>
+              typeof edge !== 'string' ||
+              !IMAGE_GEOMETRY_EDGES.includes(edge as (typeof IMAGE_GEOMETRY_EDGES)[number]),
+          ) ||
+          new Set(value.edges).size !== value.edges.length
+        )
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      }
+      if (capability.modes.includes('outpaint') && !('geometry' in capability))
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      if ('async' in capability) {
+        const asyncCapability = capability.async;
+        if (
+          !asyncCapability ||
+          typeof asyncCapability !== 'object' ||
+          Array.isArray(asyncCapability)
+        )
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+        const value = asyncCapability as Record<string, unknown>;
+        const modes = capability.modes as string[];
+        if (
+          Object.keys(value).length !== 3 ||
+          !Array.isArray(value.operations) ||
+          value.operations.length < 1 ||
+          value.operations.some(
+            (operation) =>
+              typeof operation !== 'string' ||
+              !IMAGE_OPERATIONS.includes(operation as (typeof IMAGE_OPERATIONS)[number]) ||
+              !modes.includes(operation),
+          ) ||
+          new Set(value.operations).size !== value.operations.length ||
+          !Number.isSafeInteger(value.maxQueries) ||
+          Number(value.maxQueries) < 1 ||
+          Number(value.maxQueries) > 16 ||
+          !Number.isSafeInteger(value.maxAgeSeconds) ||
+          Number(value.maxAgeSeconds) < 1 ||
+          Number(value.maxAgeSeconds) > 86_400
+        )
+          throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
+      }
+    }
   }
   return entry as unknown as AdaptationDeclaration;
 }
@@ -107,6 +212,7 @@ function adaptationView(adaptation?: AdaptationRecord) {
         implementation: 'implemented',
         declarationVersion: adaptation.declaration_version,
         source: adaptation.source,
+        sourceKind: adaptation.source_kind,
         sourceVersion: adaptation.source_version,
         metadata: adaptation.capability_metadata,
         verification: {
@@ -154,9 +260,16 @@ export function catalogView(state: ProviderState | null, category?: Category) {
       const chat = preferences.find((pref) => pref.usage === 'chat');
       const image = preferences.find((pref) => pref.usage === 'image');
       const imageAdaptation = imagesByModel.get(model.model_key);
+      const imageAsyncReady =
+        imageAdaptation?.profile !== 'vidu-image-v1' ||
+        imageAdaptation.capability_metadata.image?.async?.operations.includes('generate');
       const imageReason =
         membershipError(state!, model) ??
-        (!imageAdaptation ? 'ADAPTER_PENDING' : image?.enabled === false ? 'MODEL_DISABLED' : null);
+        (!imageAdaptation || !imageAsyncReady
+          ? 'ADAPTER_PENDING'
+          : image?.enabled === false
+            ? 'MODEL_DISABLED'
+            : null);
       const reason =
         membershipError(state!, model) ??
         (!adaptation ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);

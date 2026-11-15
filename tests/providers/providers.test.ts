@@ -73,6 +73,7 @@ async function declareModel(id: string, index = 0) {
     operation: 'chat',
     profile: 'openai-chat',
     classification: 'chat',
+    sourceKind: 'protocol-reference',
     source: 'deterministic protocol fixture',
     sourceVersion: 'v1',
   });

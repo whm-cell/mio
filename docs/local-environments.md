@@ -92,7 +92,7 @@ pnpm start:dev
    curl -sS -X PATCH -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{"modelRef":"MODEL_REF","expectedRevision":REV,"name":"我的模型","description":"开发用途"}' http://localhost:4310/api/v1/providers/onelink/models
    ```
 
-4. 只为当前发现且有可靠协议依据的模型建立[部署声明](providers.md#受控适配声明与实际验证)：将该节 JSON 的 modelRef、profile、source 和 sourceVersion 填成实际值，存为私有 `declaration.json`；OWNER_ID 取 `/api/v1/me` 的 `userId`，REV 取最新 ProviderView。如下显式读取 dev 文件，清除 shell 可能继承的其他环境设置；声明不会创建成员或直接标为 verified。
+4. 只为当前发现且有可靠协议依据的模型建立[部署声明](providers.md#受控适配声明与实际验证)：先取得当前 Key 的成功模型目录，再将该节 JSON 的 modelRef、profile、sourceKind（`protocol-reference` 或 `runtime-observation`）、source 和 sourceVersion 填成实际值，存为私有 `declaration.json`。官方文档仅提供协议参考，不能补成员；OWNER_ID 取 `/api/v1/me` 的 `userId`，REV 取最新 ProviderView。如下显式读取 dev 文件，清除 shell 可能继承的其他环境设置；声明不会创建成员或直接标为 verified。
 
    ```sh
    env -i PATH="$PATH" node --env-file=.env scripts/service/import-provider-adaptation.ts OWNER_ID REV .runtime/dev/onelink-review/declaration.json

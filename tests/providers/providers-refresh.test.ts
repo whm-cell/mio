@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
-import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
@@ -40,6 +40,7 @@ async function fixture(transport: ModelTransport) {
       modelRef: ref,
       operation: 'chat',
       profile,
+      sourceKind: 'protocol-reference',
       source: 'deterministic protocol fixture',
       sourceVersion: 'v1',
     });
@@ -60,6 +61,9 @@ it('discovers new exact identities without a release, keeps unknown metadata pen
   await f.service.discover(f.actor);
   const first = await f.service.catalog(f.actor);
   expect(first.items).toHaveLength(4);
+  expect(first.items.every((item) => item.supplierMetadataSource === 'onelink-v1-models')).toBe(
+    true,
+  );
   expect(
     first.items.every((item) => item.category === null && item.protocol === null && !item.runnable),
   ).toBe(true);
@@ -98,6 +102,34 @@ it('discovers new exact identities without a release, keeps unknown metadata pen
   expect(snapshot.profile).toBe('openai-chat');
 });
 
+it("resolves an existing task owner's current key independently of admission and discovery", async () => {
+  const transport = vi.fn(async () => metadata(['model']));
+  const f = await fixture(transport);
+  expect(await f.service.resolveImageTaskCredential(f.actor.userId)).toBe(
+    'synthetic-refresh-private-key',
+  );
+  await f.service.settings(f.actor, (await f.service.get(f.actor))!.revision, { enabled: false });
+  await f.service.save(f.actor, (await f.service.get(f.actor))!.revision, 'rotated-task-key');
+  expect(await f.service.get(f.actor)).toMatchObject({
+    enabled: false,
+    credentialAuthState: 'unchecked',
+  });
+  expect(await f.service.resolveImageTaskCredential(f.actor.userId)).toBe('rotated-task-key');
+  await expect(f.service.resolveImageTaskCredential(randomUUID())).rejects.toThrow(
+    'PROVIDER_NOT_CONFIGURED',
+  );
+  await pool.query('UPDATE mio_provider_configs SET auth_tag=$2 WHERE owner_id=$1', [
+    f.actor.userId,
+    Buffer.alloc(16),
+  ]);
+  await expect(f.service.resolveImageTaskCredential(f.actor.userId)).rejects.toThrow(
+    'PROVIDER_CREDENTIAL_UNAVAILABLE',
+  );
+  await f.service.save(f.actor, (await f.service.get(f.actor))!.revision, 'restored-task-key');
+  expect(await f.service.resolveImageTaskCredential(f.actor.userId)).toBe('restored-task-key');
+  expect(transport).not.toHaveBeenCalled();
+});
+
 it('shows image declaration and eligibility separately while preserving the chat view', async () => {
   let ids = ['gpt-image-2'];
   const f = await fixture(async () => metadata(ids));
@@ -107,8 +139,10 @@ it('shows image declaration and eligibility separately while preserving the chat
     modelRef: ref,
     operation: 'image.generate',
     profile: 'gpt-images-v1',
+    sourceKind: 'protocol-reference',
     source: 'protocol fixture',
     sourceVersion: 'v1',
+    metadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
     classification: 'image',
   });
   const item = (await f.service.catalog(f.actor)).items[0]!;
@@ -120,6 +154,8 @@ it('shows image declaration and eligibility separately while preserving the chat
       adaptation: {
         operation: 'image.generate',
         profile: 'gpt-images-v1',
+        sourceKind: 'protocol-reference',
+        metadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
         verification: { status: 'unverified' },
       },
       enabled: true,
@@ -127,12 +163,60 @@ it('shows image declaration and eligibility separately while preserving the chat
       unavailableReason: null,
     },
   });
-  expect((await f.service.resolveImage(f.actor, ref)).modelId).toBe('gpt-image-2');
+  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+    modelId: 'gpt-image-2',
+    capabilityMetadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
+  });
   ids = [];
   await f.service.discover(f.actor);
   expect((await f.service.catalog(f.actor)).items[0]!.image).toMatchObject({
     runnable: false,
     unavailableReason: 'MODEL_REMOVED',
+  });
+});
+
+it('requires explicit async capability for Vidu without inferring it from a discovered model id', async () => {
+  const f = await fixture(async () => metadata(['fixture-vidu-alt', 'fixture-vidu-incomplete']));
+  await f.service.discover(f.actor);
+  const items = (await f.service.catalog(f.actor)).items;
+  const supported = items.find((item) => item.modelId === 'fixture-vidu-alt')!;
+  const incomplete = items.find((item) => item.modelId === 'fixture-vidu-incomplete')!;
+  const declaration = {
+    operation: 'image.generate' as const,
+    profile: 'vidu-image-v1' as const,
+    sourceKind: 'protocol-reference' as const,
+    source: 'synthetic Vidu protocol fixture',
+    sourceVersion: 'v1',
+    classification: 'image' as const,
+  };
+  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+    ...declaration,
+    modelRef: incomplete.modelRef,
+  });
+  expect(
+    (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === incomplete.modelRef)
+      ?.image,
+  ).toMatchObject({
+    runnable: false,
+    unavailableReason: 'ADAPTER_PENDING',
+  });
+  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+    ...declaration,
+    modelRef: supported.modelRef,
+    metadata: {
+      image: {
+        modes: ['generate'],
+        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+    },
+  });
+  expect(
+    (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === supported.modelRef)
+      ?.image.runnable,
+  ).toBe(true);
+  expect(await f.service.resolveImage(f.actor, supported.modelRef)).toMatchObject({
+    modelId: 'fixture-vidu-alt',
+    profile: 'vidu-image-v1',
   });
 });
 
@@ -145,6 +229,7 @@ it('requires an explicit Seedream declaration and freezes the image profile with
     modelRef: ref,
     operation: 'image.generate',
     profile: 'seedream-4-images-v1',
+    sourceKind: 'protocol-reference',
     source: 'protocol fixture',
     sourceVersion: 'v1',
     classification: 'image',
@@ -158,6 +243,72 @@ it('requires an explicit Seedream declaration and freezes the image profile with
     modelId: 'doubao-seedream-4.0',
     profile: 'seedream-4-images-v1',
     adaptationVersion: 1,
+  });
+});
+
+it('rejects adaptations without a current successful directory member', async () => {
+  let ids = ['directory-member'];
+  const f = await fixture(async () => metadata(ids));
+  const missing = 'onelink:model:00000000-0000-4000-8000-000000000000';
+  await expect(
+    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+      modelRef: missing,
+      operation: 'chat',
+      profile: 'openai-chat',
+      sourceKind: 'protocol-reference',
+      source: 'protocol fixture',
+      sourceVersion: 'v1',
+    }),
+  ).rejects.toThrow('MODEL_CATALOG_NOT_DISCOVERED');
+  await f.service.discover(f.actor);
+  await expect(
+    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+      modelRef: 'onelink:chat:docs-only-model',
+      operation: 'chat',
+      profile: 'openai-chat',
+      sourceKind: 'protocol-reference',
+      source: 'https://docs.onelinkai.cloud/8882610m0',
+      sourceVersion: '2026-11-15',
+    }),
+  ).rejects.toThrow('MODEL_NOT_FOUND');
+  const member = (await f.service.catalog(f.actor)).items[0]!;
+  ids = ['different-member'];
+  await f.service.discover(f.actor);
+  await expect(
+    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
+      modelRef: member.modelRef,
+      operation: 'chat',
+      profile: 'openai-chat',
+      sourceKind: 'protocol-reference',
+      source: 'protocol fixture',
+      sourceVersion: 'v1',
+    }),
+  ).rejects.toThrow('MODEL_REMOVED');
+});
+
+it('retains explicit multi-reference and geometry capability metadata without guessing it', async () => {
+  const f = await fixture(async () => metadata(['gpt-image-2']));
+  await f.service.discover(f.actor);
+  const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
+  const declaration = {
+    modelRef: ref,
+    operation: 'image.generate' as const,
+    profile: 'gpt-images-v1' as const,
+    sourceKind: 'protocol-reference' as const,
+    source: 'protocol fixture',
+    sourceVersion: 'v2',
+    metadata: {
+      image: {
+        modes: ['generate', 'edit', 'outpaint'] as const,
+        references: { maxImages: 4 },
+        geometry: { unit: 'pixels' as const, edges: ['left', 'top', 'right', 'bottom'] as const },
+      },
+    },
+    classification: 'image' as const,
+  };
+  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, declaration);
+  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+    capabilityMetadata: declaration.metadata,
   });
 });
 

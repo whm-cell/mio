@@ -70,11 +70,15 @@ async function start(): Promise<void> {
     fileId: string,
     signal?: AbortSignal,
   ) => store.image(jobId, index, base64, format, fileId, signal);
+  const readImage = (ref: { key: string; etag: string; sizeBytes: number }, signal: AbortSignal) =>
+    store.readImage(ref.key, ref.etag, ref.sizeBytes, signal);
   const images = createImageWorker(
     journal,
     process.env.MIO_IMAGE_KEY_ID ?? '',
     process.env.MIO_IMAGE_PRIVATE_KEY ?? '',
     materialize,
+    fetch,
+    readImage,
   );
   let stopping = false;
   let worker: Worker | null = null;
@@ -130,11 +134,16 @@ async function start(): Promise<void> {
             version: 1,
             type: 'image.result',
             messageId: createId(),
-            commandId: command.type === 'image.recover' ? command.commandId : command.messageId,
+            commandId:
+              command.type === 'image.recover' || command.type === 'image.query'
+                ? command.commandId
+                : command.messageId,
             jobId: command.jobId,
             state: outcome.state,
             outputs: 'outputs' in outcome ? outcome.outputs : [],
             ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
+            ...('upstreamTaskId' in outcome ? { upstreamTaskId: outcome.upstreamTaskId } : {}),
+            ...('queryAttempt' in outcome ? { queryAttempt: outcome.queryAttempt } : {}),
             ...(command.type === 'image.recover' ? { recoveryId: command.messageId } : {}),
           });
           if (outcome.state === 'materializing') throw new Error('IMAGE_MATERIALIZATION_PENDING');

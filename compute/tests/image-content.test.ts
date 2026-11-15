@@ -38,11 +38,11 @@ describe('image content validation using real decoders', () => {
       'IMAGE_OUTPUT_INVALID',
     );
   });
-  it('rejects a valid signature with missing image data and oversized decoded dimensions', () => {
+  it('rejects missing image data while accepting dimensions outside a W3 storage policy', () => {
     expect(() => validateImage(Buffer.from('89504e470d0a1a0a', 'hex'), 'png')).toThrow(
       'IMAGE_OUTPUT_INVALID',
     );
-    expect(() => validateImage(image('png', '4096x16'), 'png')).toThrow('IMAGE_OUTPUT_INVALID');
+    expect(() => validateImage(image('png', '4096x16'), 'png')).not.toThrow();
   });
   it('rejects truncated pixel data even when the header retains dimensions', () => {
     const bytes = image('png', '256x256');

@@ -28,7 +28,7 @@ CREATE INDEX IF NOT EXISTS mio_compute_outbox_pending ON mio_compute_outbox(crea
 CREATE TABLE IF NOT EXISTS mio_image_jobs (
   id uuid PRIMARY KEY, owner_id text NOT NULL, request_id uuid NOT NULL,
   input_hash text NOT NULL, command jsonb NOT NULL, admitted jsonb NOT NULL DEFAULT '{}', error_code text,
-  state text NOT NULL CHECK(state IN ('accepted','materializing','completed','partial','materialization_failed','unknown','rejected')),
+  state text NOT NULL CHECK(state IN ('accepted','submitted','processing','materializing','completed','partial','materialization_failed','unknown','failed','rejected')),
   created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(owner_id,request_id)
 );
 CREATE TABLE IF NOT EXISTS mio_image_outbox (
@@ -38,11 +38,17 @@ ALTER TABLE mio_image_jobs DROP CONSTRAINT IF EXISTS mio_image_jobs_state_check;
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS error_code text;
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS active_recovery_id uuid;
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS active_recovery_seq integer NOT NULL DEFAULT 0;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS upstream_task_id text;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS query_attempt integer NOT NULL DEFAULT 0;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS async_max_queries integer;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS async_deadline timestamptz;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS next_query_at timestamptz;
 ALTER TABLE mio_image_outbox ADD COLUMN IF NOT EXISTS recovery_command jsonb;
+ALTER TABLE mio_image_outbox ADD COLUMN IF NOT EXISTS query_command jsonb;
 ALTER TABLE mio_image_jobs ADD CONSTRAINT mio_image_jobs_state_check
-  CHECK(state IN ('accepted','materializing','completed','partial','materialization_failed','unknown','rejected'));
+  CHECK(state IN ('accepted','submitted','processing','materializing','completed','partial','materialization_failed','unknown','failed','rejected'));
 CREATE INDEX IF NOT EXISTS mio_image_jobs_unfinished ON mio_image_jobs(owner_id)
-  WHERE state IN ('accepted','materializing');
+  WHERE state IN ('accepted','submitted','processing','materializing');
 CREATE INDEX IF NOT EXISTS mio_image_outbox_pending ON mio_image_outbox(job_id) WHERE sent_at IS NULL;
 CREATE TABLE IF NOT EXISTS mio_image_outputs (
   job_id uuid NOT NULL REFERENCES mio_image_jobs(id), output_index integer NOT NULL,
@@ -63,15 +69,17 @@ export async function checkComputeSchema(pool: Pool, images = false): Promise<vo
   await pool.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
   if (images) {
     await pool.query(
-      'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,active_recovery_id,active_recovery_seq,state,created_at FROM mio_image_jobs LIMIT 0',
+      'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,active_recovery_id,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,state,created_at FROM mio_image_jobs LIMIT 0',
     );
-    await pool.query('SELECT job_id,sent_at,recovery_command FROM mio_image_outbox LIMIT 0');
+    await pool.query(
+      'SELECT job_id,sent_at,recovery_command,query_command FROM mio_image_outbox LIMIT 0',
+    );
     await pool.query('SELECT job_id,output_index,asset_id FROM mio_image_outputs LIMIT 0');
     const constraint = await pool.query<{ definition: string }>(
       "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='mio_image_jobs'::regclass AND conname='mio_image_jobs_state_check'",
     );
     if (
-      !['partial', 'materialization_failed'].every((value) =>
+      !['partial', 'materialization_failed', 'submitted', 'processing', 'failed'].every((value) =>
         constraint.rows[0]?.definition.includes(`'${value}'`),
       )
     )

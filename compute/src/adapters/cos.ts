@@ -65,6 +65,32 @@ export class ObjectStore {
     await drainInput(stream, directory, command.attemptId, command.input.sizeBytes, signal);
   }
 
+  async readImage(key: string, etag: string, size: number, signal: AbortSignal): Promise<Buffer> {
+    if (signal.aborted) throw new Error('EXECUTION_TIMEOUT');
+    const stream = this.#client.getObjectStream({
+      Bucket: this.#bucket,
+      Region: this.#region,
+      Key: key,
+      IfMatch: etag,
+    }) as Readable;
+    const abort = () => stream.destroy(new Error('EXECUTION_TIMEOUT'));
+    signal.addEventListener('abort', abort, { once: true });
+    try {
+      const chunks: Buffer[] = [];
+      let length = 0;
+      for await (const chunk of stream) {
+        const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        length += part.length;
+        chunks.push(part);
+      }
+      if (length !== size) throw new Error('IMAGE_INPUT_MISMATCH');
+      return Buffer.concat(chunks, length);
+    } finally {
+      signal.removeEventListener('abort', abort);
+      stream.destroy();
+    }
+  }
+
   async head(key: string, signal: AbortSignal): Promise<ObjectInfo | null> {
     try {
       await this.#waitForUpload(key, signal);
@@ -120,7 +146,7 @@ export class ObjectStore {
         : format === 'jpeg'
           ? bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255
           : bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
-    if (!signature || bytes.length > 48 * 1024 * 1024) throw new Error('IMAGE_OUTPUT_INVALID');
+    if (!signature) throw new Error('IMAGE_OUTPUT_INVALID');
     validateImage(bytes, format);
     if (stop?.aborted) throw new Error('EXECUTION_TIMEOUT');
     // Every materialization receives a fresh object identity. A timed-out or

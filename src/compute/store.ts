@@ -5,7 +5,13 @@ import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { COMPUTE_PROFILE, COMPUTE_VERSION, imageOutputIndex } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
-import type { ImageCommandV1, ImageRecoveryCommandV1, ImageResultV1 } from '@mio/compute-contracts';
+import type {
+  ImageCommandV1,
+  ImageEnvelope,
+  ImageQueryCommandV1,
+  ImageRecoveryCommandV1,
+  ImageResultV1,
+} from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
 import { ComputeError } from './errors.ts';
 
@@ -44,6 +50,28 @@ function command(job: JobRow): ComputeCommandV1 {
       sizeBytes: Number(job.input_size),
       etag: job.input_etag,
     },
+  };
+}
+
+function imageQueryCommand(
+  source: ImageCommandV1,
+  upstreamTaskId: string,
+  queryAttempt: number,
+): ImageQueryCommandV1 {
+  return {
+    version: 1,
+    type: 'image.query',
+    messageId: createId(),
+    commandId: source.messageId,
+    jobId: source.jobId,
+    ownerId: source.ownerId,
+    expiresAt: source.expiresAt,
+    profile: source.profile,
+    operation: source.input.operation ?? 'generate',
+    input: source.input,
+    upstreamTaskId,
+    queryAttempt,
+    credential: source.credential,
   };
 }
 
@@ -128,9 +156,37 @@ export class ComputeStore {
         return existing.id;
       }
       await checkCapacity(client, owner, true);
+      const asyncCapability =
+        admitted.async && typeof admitted.async === 'object'
+          ? (admitted.async as { maxQueries?: unknown; maxAgeSeconds?: unknown })
+          : undefined;
+      const asyncMaxQueries =
+        Number.isSafeInteger(asyncCapability?.maxQueries) && Number(asyncCapability?.maxQueries) > 0
+          ? Number(asyncCapability?.maxQueries)
+          : null;
+      const asyncDeadline =
+        asyncMaxQueries !== null &&
+        Number.isSafeInteger(asyncCapability?.maxAgeSeconds) &&
+        Number(asyncCapability?.maxAgeSeconds) > 0
+          ? new Date(
+              Math.min(
+                command.expiresAt,
+                Date.now() + Number(asyncCapability?.maxAgeSeconds) * 1000,
+              ),
+            ).toISOString()
+          : null;
       const saved = await client.query(
-        "INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,state) VALUES($1,$2,$3,$4,$5,$6,'accepted') ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING id",
-        [command.jobId, owner, requestId, hash, JSON.stringify(command), JSON.stringify(admitted)],
+        "INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,async_max_queries,async_deadline,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'accepted') ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING id",
+        [
+          command.jobId,
+          owner,
+          requestId,
+          hash,
+          JSON.stringify(command),
+          JSON.stringify(admitted),
+          asyncMaxQueries,
+          asyncDeadline,
+        ],
       );
       if (saved.rowCount)
         await client.query('INSERT INTO mio_image_outbox(job_id) VALUES($1)', [command.jobId]);
@@ -170,31 +226,229 @@ export class ComputeStore {
       outputs: outputs.rows.map((item) => ({ index: item.output_index, assetId: item.asset_id })),
     };
   }
-  async imagePending(): Promise<ImageCommandV1 | ImageRecoveryCommandV1 | undefined> {
-    return (
-      await this.pool.query<{ command: ImageCommandV1 | ImageRecoveryCommandV1 }>(
-        'SELECT COALESCE(o.recovery_command,j.command) AS command FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE o.sent_at IS NULL ORDER BY j.created_at LIMIT 1',
-      )
-    ).rows[0]?.command;
+  async imagePending(): Promise<
+    ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1 | undefined
+  > {
+    return transaction(this.pool, async (client) => {
+      const due = `o.sent_at IS NULL AND (
+        j.next_query_at IS NULL OR j.next_query_at<=statement_timestamp() OR
+        (o.query_command IS NOT NULL AND (
+          j.async_max_queries IS NULL OR j.query_attempt>j.async_max_queries OR
+          j.async_deadline IS NULL OR j.async_deadline<=statement_timestamp() OR
+          to_timestamp((j.command->>'expiresAt')::double precision/1000)<=statement_timestamp()
+        ))
+      )`;
+      const candidate = (
+        await client.query<{ id: string }>(
+          `SELECT j.id FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id
+           WHERE ${due} ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j`,
+        )
+      ).rows[0];
+      if (!candidate) return undefined;
+      const row = (
+        await client.query<{
+          id: string;
+          owner_id: string;
+          command: ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1;
+          query_expired: boolean;
+          effective_deadline: string | null;
+        }>(
+          `SELECT j.id,j.owner_id,COALESCE(o.query_command,o.recovery_command,j.command) AS command,
+            floor(extract(epoch FROM LEAST(j.async_deadline,to_timestamp((j.command->>'expiresAt')::double precision/1000)))*1000)::bigint AS effective_deadline,
+            o.query_command IS NOT NULL AND (
+              j.async_max_queries IS NULL OR j.query_attempt>j.async_max_queries OR
+              j.async_deadline IS NULL OR j.async_deadline<=statement_timestamp() OR
+              to_timestamp((j.command->>'expiresAt')::double precision/1000)<=statement_timestamp()
+            ) AS query_expired
+          FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id
+          WHERE j.id=$1 AND ${due}`,
+          [candidate.id],
+        )
+      ).rows[0];
+      if (!row) return undefined;
+      if (row.command.type === 'image.query' && row.command.ownerId !== row.owner_id)
+        throw new Error('IMAGE_QUERY_OWNER_MISMATCH');
+      if (row.query_expired) {
+        await client.query(
+          "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_LIMIT',next_query_at=NULL,command=command-'credential' WHERE id=$1",
+          [row.id],
+        );
+        await client.query(
+          'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+          [row.id],
+        );
+        return undefined;
+      }
+      if (row.command.type === 'image.query' && !row.command.queryCredential) {
+        const queryDeadline = Number(row.effective_deadline);
+        if (!Number.isSafeInteger(queryDeadline) || queryDeadline < 1)
+          throw new Error('IMAGE_QUERY_DEADLINE_INVALID');
+        return { ...row.command, queryDeadline };
+      }
+      return row.command;
+    });
   }
   async imageSent(id: string, messageId: string) {
-    await this.pool.query(
-      `UPDATE mio_image_outbox o SET sent_at=now() FROM mio_image_jobs j
-      WHERE o.job_id=$1 AND j.id=o.job_id AND COALESCE(o.recovery_command,j.command)->>'messageId'=$2`,
-      [id, messageId],
-    );
+    await transaction(this.pool, async (client) => {
+      await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 FOR UPDATE', [id]);
+      const sent = await client.query(
+        `UPDATE mio_image_outbox o SET sent_at=now() FROM mio_image_jobs j
+        WHERE o.job_id=$1 AND j.id=o.job_id AND COALESCE(o.query_command,o.recovery_command,j.command)->>'messageId'=$2`,
+        [id, messageId],
+      );
+      if (sent.rowCount)
+        await client.query('UPDATE mio_image_jobs SET next_query_at=NULL WHERE id=$1', [id]);
+    });
+  }
+  async imagePrepareQuery(
+    id: string,
+    messageId: string,
+    queryDeadline: number,
+    credential?: ImageEnvelope,
+  ) {
+    return transaction(this.pool, async (client) => {
+      await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 FOR UPDATE', [id]);
+      const row = (
+        await client.query<{
+          owner_id: string;
+          state: string;
+          query_command: ImageQueryCommandV1 | null;
+          sent_at: Date | null;
+          expired: boolean;
+          effective_deadline: string | null;
+        }>(
+          `SELECT j.owner_id,j.state,o.query_command,o.sent_at,
+            floor(extract(epoch FROM LEAST(j.async_deadline,to_timestamp((j.command->>'expiresAt')::double precision/1000)))*1000)::bigint AS effective_deadline,
+            j.async_max_queries IS NULL OR j.query_attempt>j.async_max_queries OR
+            j.async_deadline IS NULL OR j.async_deadline<=statement_timestamp() OR
+            to_timestamp((j.command->>'expiresAt')::double precision/1000)<=statement_timestamp() AS expired
+          FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1`,
+          [id],
+        )
+      ).rows[0];
+      const query = row?.query_command;
+      if (
+        !row ||
+        !query ||
+        row.sent_at ||
+        !['submitted', 'processing'].includes(row.state) ||
+        query.messageId !== messageId ||
+        query.ownerId !== row.owner_id
+      )
+        return undefined;
+      if (row.expired) {
+        await client.query(
+          "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_LIMIT',next_query_at=NULL,command=command-'credential' WHERE id=$1",
+          [id],
+        );
+        await client.query(
+          'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+          [id],
+        );
+        return undefined;
+      }
+      if (query.queryCredential && query.queryDeadline !== Number(row.effective_deadline)) {
+        await client.query(
+          "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_CREDENTIAL_UNAVAILABLE',next_query_at=NULL WHERE id=$1",
+          [id],
+        );
+        await client.query(
+          'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+          [id],
+        );
+        return undefined;
+      }
+      if (queryDeadline !== Number(row.effective_deadline)) return undefined;
+      if (query.queryCredential) return query;
+      if (!credential) return undefined;
+      const prepared = { ...query, queryDeadline, queryCredential: credential };
+      await client.query('UPDATE mio_image_outbox SET query_command=$2 WHERE job_id=$1', [
+        id,
+        JSON.stringify(prepared),
+      ]);
+      return prepared;
+    });
+  }
+  async imageQueryUnavailable(
+    id: string,
+    messageId: string,
+    code: 'IMAGE_CREDENTIAL_UNAVAILABLE' | 'IMAGE_QUERY_FAILED',
+  ) {
+    await transaction(this.pool, async (client) => {
+      await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 FOR UPDATE', [id]);
+      const pending = await client.query(
+        `UPDATE mio_image_outbox SET query_command=NULL,sent_at=now()
+         WHERE job_id=$1 AND sent_at IS NULL AND query_command->>'messageId'=$2`,
+        [id, messageId],
+      );
+      if (pending.rowCount)
+        await client.query(
+          "UPDATE mio_image_jobs SET state='failed',error_code=$2,next_query_at=NULL WHERE id=$1",
+          [id, code],
+        );
+    });
   }
   async imageRecover(owner: string, id: string) {
     return transaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock($1)', [672049923]);
+      await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 AND owner_id=$2 FOR UPDATE', [
+        id,
+        owner,
+      ]);
       const job = (
-        await client.query<{ state: string; command: ImageCommandV1; active_recovery_seq: number }>(
-          'SELECT state,command,active_recovery_seq FROM mio_image_jobs WHERE id=$1 AND owner_id=$2 FOR UPDATE',
+        await client.query<{
+          state: string;
+          command: ImageCommandV1;
+          active_recovery_seq: number;
+          upstream_task_id: string | null;
+          query_attempt: number;
+          async_max_queries: number | null;
+          async_deadline: Date | null;
+          next_query_at: Date | null;
+          async_expired: boolean;
+        }>(
+          `SELECT state,command,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
+            async_deadline IS NULL OR LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))<=statement_timestamp() AS async_expired
+          FROM mio_image_jobs WHERE id=$1 AND owner_id=$2`,
           [id, owner],
         )
       ).rows[0];
       if (!job) throw new ComputeError(404, 'JOB_NOT_FOUND');
       if (job.state === 'materializing') return;
+      if (
+        job.upstream_task_id &&
+        ['submitted', 'processing', 'failed', 'unknown'].includes(job.state)
+      ) {
+        if (!job.async_max_queries || job.async_expired)
+          throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (job.state === 'submitted' || job.state === 'processing') {
+          const pending = (
+            await client.query<{ query_command: ImageQueryCommandV1 | null }>(
+              'SELECT query_command FROM mio_image_outbox WHERE job_id=$1',
+              [id],
+            )
+          ).rows[0]?.query_command;
+          if (
+            !pending ||
+            pending.upstreamTaskId !== job.upstream_task_id ||
+            pending.queryAttempt !== job.query_attempt
+          )
+            throw new ComputeError(409, 'RESULT_CONFLICT');
+          return;
+        }
+        const nextAttempt = job.query_attempt + 1;
+        if (nextAttempt > job.async_max_queries) throw new ComputeError(409, 'RESULT_CONFLICT');
+        const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt);
+        await client.query(
+          "UPDATE mio_image_jobs SET state='processing',error_code=NULL,query_attempt=$2,next_query_at=now() WHERE id=$1",
+          [id, nextAttempt],
+        );
+        await client.query(
+          'UPDATE mio_image_outbox SET query_command=$2,recovery_command=NULL,sent_at=NULL WHERE job_id=$1',
+          [id, JSON.stringify(query)],
+        );
+        return;
+      }
       if (job.state !== 'materialization_failed') throw new ComputeError(409, 'RESULT_CONFLICT');
       if (job.active_recovery_seq >= 2147483647) throw new ComputeError(409, 'RESULT_CONFLICT');
       await checkCapacity(client, owner, true);
@@ -218,14 +472,22 @@ export class ComputeStore {
   }
   async imageAccept(result: ImageResultV1) {
     await transaction(this.pool, async (client) => {
+      await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 FOR UPDATE', [result.jobId]);
       const job = (
         await client.query<{
           owner_id: string;
           command: ImageCommandV1;
           state: string;
           active_recovery_id: string | null;
+          upstream_task_id: string | null;
+          query_attempt: number;
+          async_max_queries: number | null;
+          async_deadline: Date | null;
+          async_expired: boolean;
         }>(
-          'SELECT owner_id,command,state,active_recovery_id FROM mio_image_jobs WHERE id=$1 FOR UPDATE',
+          `SELECT owner_id,command,state,active_recovery_id,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
+            async_deadline IS NULL OR LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))<=statement_timestamp() AS async_expired
+          FROM mio_image_jobs WHERE id=$1`,
           [result.jobId],
         )
       ).rows[0];
@@ -233,11 +495,127 @@ export class ComputeStore {
         throw new ComputeError(409, 'RESULT_CONFLICT');
       if (job.active_recovery_id !== (result.recoveryId ?? null)) return;
       if (
-        ['completed', 'partial', 'materialization_failed', 'unknown', 'rejected'].includes(
-          job.state,
-        )
+        [
+          'completed',
+          'partial',
+          'materialization_failed',
+          'unknown',
+          'failed',
+          'rejected',
+        ].includes(job.state)
       )
         return;
+      if (
+        result.state === 'submitted' &&
+        job.state === 'submitted' &&
+        result.upstreamTaskId === job.upstream_task_id
+      )
+        return;
+      if (
+        result.state === 'processing' &&
+        job.state === 'processing' &&
+        result.upstreamTaskId === job.upstream_task_id &&
+        Number(result.queryAttempt) < job.query_attempt
+      )
+        return;
+      if (['submitted', 'processing', 'failed'].includes(result.state)) {
+        if (
+          !job.command.input.async ||
+          typeof result.upstreamTaskId !== 'string' ||
+          (result.upstreamTaskId !== job.upstream_task_id && result.state !== 'submitted')
+        )
+          throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (result.state === 'submitted') {
+          if (job.state !== 'accepted' || result.queryAttempt !== 0 || job.upstream_task_id)
+            throw new ComputeError(409, 'RESULT_CONFLICT');
+          const nextAttempt = 1;
+          if (!job.async_max_queries || nextAttempt > job.async_max_queries || job.async_expired) {
+            await client.query(
+              "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_LIMIT',upstream_task_id=$2,next_query_at=NULL WHERE id=$1",
+              [result.jobId, result.upstreamTaskId],
+            );
+            await client.query(
+              'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+              [result.jobId],
+            );
+            await client.query(
+              "UPDATE mio_image_jobs SET command=command-'credential' WHERE id=$1",
+              [result.jobId],
+            );
+            return;
+          }
+          const query = imageQueryCommand(job.command, result.upstreamTaskId, nextAttempt);
+          await client.query(
+            "UPDATE mio_image_jobs SET state='submitted',error_code=NULL,upstream_task_id=$2,query_attempt=$3,next_query_at=now()+interval '250 milliseconds' WHERE id=$1",
+            [result.jobId, result.upstreamTaskId, nextAttempt],
+          );
+          await client.query(
+            'UPDATE mio_image_outbox SET query_command=$2,recovery_command=NULL,sent_at=NULL WHERE job_id=$1',
+            [result.jobId, JSON.stringify(query)],
+          );
+          return;
+        }
+        if (result.state === 'processing') {
+          if (
+            (job.state !== 'processing' && job.state !== 'submitted') ||
+            result.queryAttempt !== job.query_attempt ||
+            !job.upstream_task_id
+          )
+            throw new ComputeError(409, 'RESULT_CONFLICT');
+          const nextAttempt = Number(result.queryAttempt) + 1;
+          if (!job.async_max_queries || nextAttempt > job.async_max_queries || job.async_expired) {
+            await client.query(
+              "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_LIMIT',next_query_at=NULL WHERE id=$1",
+              [result.jobId],
+            );
+            await client.query(
+              'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+              [result.jobId],
+            );
+            await client.query(
+              "UPDATE mio_image_jobs SET command=command-'credential' WHERE id=$1",
+              [result.jobId],
+            );
+            return;
+          }
+          const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt);
+          await client.query(
+            `UPDATE mio_image_jobs SET state='processing',error_code=NULL,query_attempt=$2,
+              next_query_at=statement_timestamp()+(LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))-statement_timestamp())/$3::double precision
+            WHERE id=$1`,
+            [result.jobId, nextAttempt, job.async_max_queries - Number(result.queryAttempt) + 1],
+          );
+          await client.query(
+            'UPDATE mio_image_outbox SET query_command=$2,recovery_command=NULL,sent_at=NULL WHERE job_id=$1',
+            [result.jobId, JSON.stringify(query)],
+          );
+          return;
+        }
+        if (result.queryAttempt === undefined || !job.upstream_task_id)
+          throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (result.queryAttempt < job.query_attempt) return;
+        if (result.queryAttempt !== job.query_attempt)
+          throw new ComputeError(409, 'RESULT_CONFLICT');
+        await client.query(
+          'UPDATE mio_image_jobs SET state=$2,error_code=$3,next_query_at=NULL WHERE id=$1',
+          [result.jobId, 'failed', result.errorCode ?? 'IMAGE_QUERY_FAILED'],
+        );
+        await client.query(
+          'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+          [result.jobId],
+        );
+        const retainAsyncCredential =
+          job.command.input.async === true &&
+          !!job.upstream_task_id &&
+          !!job.async_max_queries &&
+          job.query_attempt < job.async_max_queries &&
+          !job.async_expired;
+        if (!retainAsyncCredential)
+          await client.query("UPDATE mio_image_jobs SET command=command-'credential' WHERE id=$1", [
+            result.jobId,
+          ]);
+        return;
+      }
       const requested = job.command.input.n ?? 1;
       if (
         result.outputs.length > requested ||
@@ -330,6 +708,18 @@ export class ComputeStore {
     return (
       await this.pool.query<{ raw_key: string; size_bytes: string }>(
         "SELECT raw_key,size_bytes FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' AND raw_key IS NOT NULL",
+        [id, owner],
+      )
+    ).rows[0];
+  }
+
+  async imageInput(
+    owner: string,
+    id: string,
+  ): Promise<{ raw_key: string; size_bytes: string; content_type: string } | undefined> {
+    return (
+      await this.pool.query<{ raw_key: string; size_bytes: string; content_type: string }>(
+        "SELECT raw_key,size_bytes,content_type FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' AND raw_key IS NOT NULL",
         [id, owner],
       )
     ).rows[0];

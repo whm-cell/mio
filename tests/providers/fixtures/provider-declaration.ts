@@ -23,6 +23,7 @@ export async function importDeclaration(
         operation: 'chat',
         profile,
         classification: 'chat',
+        sourceKind: 'protocol-reference',
         source,
         sourceVersion: '2026-11-09',
       }),

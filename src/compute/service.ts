@@ -1,8 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { sealImageKey } from './image-credentials.ts';
 import type { ProviderService } from '../providers/service.ts';
-import { parseImageCommand, validImageInput } from '@mio/compute-contracts';
-import type { ImageInput } from '@mio/compute-contracts';
+import {
+  canonicalImageInput,
+  imageQueryCredentialBinding,
+  parseImageCommand,
+  validImageInput,
+} from '@mio/compute-contracts';
+import type { ImageAssetRef, ImageInput, ImageRequestParameters } from '@mio/compute-contracts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
@@ -174,7 +179,51 @@ export function createComputeService(
       if (store.imagesAvailable) {
         const image = await store.imagePending();
         if (image) {
-          await instance.publish(image);
+          let outgoing = image;
+          if (image.type === 'image.query') {
+            if (!image.queryDeadline) {
+              await store.imageQueryUnavailable(
+                image.jobId,
+                image.messageId,
+                'IMAGE_CREDENTIAL_UNAVAILABLE',
+              );
+              return;
+            }
+            let queryCredential = image.queryCredential;
+            if (!queryCredential) {
+              try {
+                const provider = imageConfig?.provider();
+                if (!provider || !imageConfig) throw new Error('IMAGE_CREDENTIAL_UNAVAILABLE');
+                const apiKey = await provider.resolveImageTaskCredential(image.ownerId);
+                queryCredential = sealImageKey(
+                  apiKey,
+                  imageQueryCredentialBinding(image),
+                  imageConfig.keyId,
+                  imageConfig.publicKey,
+                );
+              } catch {
+                await store.imageQueryUnavailable(
+                  image.jobId,
+                  image.messageId,
+                  'IMAGE_CREDENTIAL_UNAVAILABLE',
+                );
+                return;
+              }
+            }
+            const prepared = await store.imagePrepareQuery(
+              image.jobId,
+              image.messageId,
+              image.queryDeadline,
+              queryCredential,
+            );
+            if (!prepared) return;
+            outgoing = prepared;
+            if (Buffer.byteLength(JSON.stringify(outgoing), 'utf8') > IMAGE_MAX_MESSAGE_BYTES) {
+              await store.imageQueryUnavailable(image.jobId, image.messageId, 'IMAGE_QUERY_FAILED');
+              return;
+            }
+          }
+          await instance.publish(outgoing);
           await store.imageSent(image.jobId, image.messageId);
         }
       }
@@ -208,7 +257,7 @@ export function createComputeService(
       actor: AssetPrincipal,
       requestId: string,
       modelRef: string,
-      parameters: Omit<ImageInput, 'model'>,
+      parameters: ImageRequestParameters,
     ) {
       return admit(async () => {
         if (!store.imagesAvailable) throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
@@ -223,6 +272,12 @@ export function createComputeService(
             (k) =>
               ![
                 'prompt',
+                'async',
+                'operation',
+                'imageAssetId',
+                'imageAssetIds',
+                'maskAssetId',
+                'geometry',
                 'n',
                 'background',
                 'moderation',
@@ -234,6 +289,8 @@ export function createComputeService(
               ].includes(k),
           )
         )
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        if (parameters.async !== undefined && typeof parameters.async !== 'boolean')
           throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
         const normalized = Object.fromEntries(
           Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
@@ -248,10 +305,135 @@ export function createComputeService(
         }
         if (!imageConfig || !imageConfig.provider())
           throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        const operation =
+          parameters.operation ??
+          (parameters.geometry !== undefined
+            ? 'outpaint'
+            : parameters.imageAssetId !== undefined ||
+                parameters.imageAssetIds !== undefined ||
+                parameters.maskAssetId !== undefined
+              ? 'edit'
+              : 'generate');
+        if (
+          (operation === 'generate' &&
+            (parameters.maskAssetId !== undefined || parameters.geometry !== undefined)) ||
+          ((operation === 'edit' || operation === 'outpaint') &&
+            parameters.imageAssetId === undefined &&
+            parameters.imageAssetIds === undefined) ||
+          (operation === 'outpaint' && parameters.geometry === undefined) ||
+          (operation !== 'outpaint' && parameters.geometry !== undefined) ||
+          !['generate', 'edit', 'outpaint'].includes(operation)
+        )
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        const imageAsset = async (assetId: string, mask = false): Promise<ImageAssetRef> => {
+          if (!isUuidV4(assetId)) throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          const row = await store.imageInput(actor.userId, assetId);
+          if (
+            !row ||
+            !row.raw_key.startsWith(`mio/raw/${assetId}/`) ||
+            !isUuidV4(row.raw_key.slice(`mio/raw/${assetId}/`.length)) ||
+            !['image/png', 'image/jpeg', 'image/webp'].includes(row.content_type) ||
+            (mask && row.content_type !== 'image/png')
+          )
+            throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+          const size = Number(row.size_bytes);
+          if (!Number.isSafeInteger(size) || size < 1)
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+          let object: Awaited<ReturnType<AssetObjectStore['head']>>;
+          try {
+            object = await head(row.raw_key);
+          } catch {
+            throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
+          }
+          if (
+            !object ||
+            object.size !== size ||
+            !object.etag ||
+            object.etag.length > 256 ||
+            /[\x00-\x1f\x7f]/.test(object.etag)
+          )
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+          return {
+            assetId,
+            key: row.raw_key,
+            sizeBytes: size,
+            etag: object.etag,
+            contentType: row.content_type as ImageAssetRef['contentType'],
+          };
+        };
+        const { imageAssetId, imageAssetIds, maskAssetId, geometry, ...providerParameters } =
+          parameters;
+        if (imageAssetId !== undefined && imageAssetIds !== undefined)
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        if (
+          maskAssetId !== undefined &&
+          (typeof maskAssetId !== 'string' || !isUuidV4(maskAssetId))
+        )
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        const requestedImageIds =
+          imageAssetIds ?? (imageAssetId !== undefined ? [imageAssetId] : []);
+        if (
+          !Array.isArray(requestedImageIds) ||
+          requestedImageIds.some((assetId) => typeof assetId !== 'string') ||
+          new Set(requestedImageIds).size !== requestedImageIds.length
+        )
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        if ((operation === 'edit' || operation === 'outpaint') && requestedImageIds.length < 1)
+          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
         const snapshot = await imageConfig.provider()!.resolveImage(actor, modelRef);
+        const imageCapability = snapshot.capabilityMetadata?.image;
+        if (
+          operation === 'generate' &&
+          requestedImageIds.length > 0 &&
+          (snapshot.profile !== 'vidu-image-v1' || !imageCapability?.references)
+        )
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        if (
+          (operation === 'edit' || operation === 'outpaint') &&
+          !imageCapability?.modes.includes(operation)
+        )
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        if (
+          requestedImageIds.length > 0 &&
+          (!imageCapability?.references ||
+            requestedImageIds.length > imageCapability.references.maxImages)
+        )
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        if (operation === 'outpaint' && !imageCapability?.geometry)
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        if (
+          parameters.async === true &&
+          (!imageCapability?.async || !imageCapability.async.operations.includes(operation))
+        )
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        if (maskAssetId !== undefined && !imageCapability?.mask)
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
+        const images = await Promise.all(requestedImageIds.map((assetId) => imageAsset(assetId)));
+        const mask = maskAssetId !== undefined ? await imageAsset(maskAssetId, true) : undefined;
         const jobId = randomUUID();
-        const expiresAt = Date.now() + 10 * 60_000;
-        const input = { ...parameters, model: snapshot.modelId };
+        const expiresAt =
+          Date.now() +
+          Math.min(
+            10 * 60_000,
+            parameters.async === true ? imageCapability!.async!.maxAgeSeconds * 1000 : 10 * 60_000,
+          );
+        const input: ImageInput = {
+          ...providerParameters,
+          model: snapshot.modelId,
+          ...(parameters.async === true ? { async: true } : {}),
+          ...(operation === 'edit' || operation === 'outpaint'
+            ? {
+                operation,
+                ...(imageAssetId !== undefined && images.length === 1
+                  ? { image: images[0]! }
+                  : { images }),
+                ...(mask ? { mask } : {}),
+                ...(operation === 'outpaint' ? { geometry } : {}),
+              }
+            : images.length > 0
+              ? { images }
+              : {}),
+        };
         if (!validImageInput(input, snapshot.profile))
           throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
         const binding = JSON.stringify([
@@ -259,7 +441,7 @@ export function createComputeService(
           actor.userId,
           expiresAt,
           snapshot.profile,
-          Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))),
+          canonicalImageInput(input),
         ]);
         const credential = sealImageKey(
           snapshot.apiKey,
@@ -291,9 +473,17 @@ export function createComputeService(
           credentialVersion: snapshot.credentialVersion,
           catalogVersion: snapshot.catalogVersion,
           adaptationVersion: snapshot.adaptationVersion,
+          ...(parameters.async === true && imageCapability?.async
+            ? { async: imageCapability.async }
+            : {}),
           modelRef,
           modelId: snapshot.modelId,
-          operation: 'image.generate',
+          operation:
+            input.operation === 'outpaint'
+              ? 'image.outpaint'
+              : input.operation === 'edit'
+                ? 'image.edit'
+                : 'image.generate',
           profile: snapshot.profile,
         });
         return store.imageGet(actor.userId, id);

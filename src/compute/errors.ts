@@ -3,6 +3,7 @@ import { HttpError } from '@mio/foundation/errors';
 export type ComputeErrorCode =
   | 'IMAGE_UNAVAILABLE'
   | 'IMAGE_INPUT_INVALID'
+  | 'IMAGE_OPERATION_UNSUPPORTED'
   | 'REQUEST_CONFLICT'
   | 'COMPUTE_QUOTA_EXCEEDED'
   | 'ASSET_NOT_FOUND'

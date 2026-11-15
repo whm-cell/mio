@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_adaptations (
   operation text NOT NULL CHECK(operation='chat'),
   profile text NOT NULL CHECK(profile IN ('openai-chat','anthropic-messages')),
   declaration_version integer NOT NULL CHECK(declaration_version>0),
+  source_kind text NOT NULL DEFAULT 'protocol-reference',
   source text NOT NULL, source_version text NOT NULL, capability_metadata jsonb NOT NULL DEFAULT '{}',
   verification_status text NOT NULL DEFAULT 'unverified' CHECK(verification_status IN ('unverified','verified')),
   verified_at timestamptz, verification_evidence text, tested_tuple jsonb,
@@ -73,11 +74,16 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_adaptations (
 );
 ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_operation_check;
 ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_profile_check;
+ALTER TABLE mio_provider_model_adaptations
+  ADD COLUMN IF NOT EXISTS source_kind text NOT NULL DEFAULT 'protocol-reference';
+ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_source_kind_check;
+ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_source_kind_check
+  CHECK(source_kind IN ('protocol-reference','runtime-observation'));
 ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_operation_check
   CHECK(operation IN ('chat','image.generate'));
 ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_profile_check
   CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
-        (operation='image.generate' AND profile IN ('gpt-images-v1','seedream-4-images-v1')));
+        (operation='image.generate' AND profile IN ('gpt-images-v1','seedream-4-images-v1','vidu-image-v1')));
 ${legacyProviderUpgradeSQL}
 CREATE TABLE IF NOT EXISTS mio_provider_model_preferences (
   provider_id uuid NOT NULL, model_key uuid NOT NULL, model_ref text,
@@ -105,8 +111,8 @@ export async function checkProviderSchema(
       [2950, 2950, 25, 3802, 25, 25, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
-      'SELECT provider_id,model_key,operation,profile,declaration_version,source,source_version,capability_metadata,verification_status,verified_at,verification_evidence,tested_tuple FROM mio_provider_model_adaptations LIMIT 0',
-      [2950, 2950, 25, 25, 23, 25, 25, 3802, 25, 1184, 25, 3802],
+      'SELECT provider_id,model_key,operation,profile,declaration_version,source_kind,source,source_version,capability_metadata,verification_status,verified_at,verification_evidence,tested_tuple FROM mio_provider_model_adaptations LIMIT 0',
+      [2950, 2950, 25, 25, 23, 25, 25, 25, 3802, 25, 1184, 25, 3802],
     ],
     [
       'SELECT provider_id,model_key,usage,enabled,is_default,updated_at FROM mio_provider_model_preferences LIMIT 0',
@@ -117,6 +123,17 @@ export async function checkProviderSchema(
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('PROVIDER_SCHEMA: incompatible columns');
   }
+  const sourceKinds = await pool.query<{ name: string; definition: string; valid: boolean }>(`
+    SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
+    FROM pg_constraint WHERE conrelid='mio_provider_model_adaptations'::regclass
+      AND conname='mio_provider_model_adaptations_source_kind_check'`);
+  const sourceKind = sourceKinds.rows[0];
+  if (
+    !sourceKind?.valid ||
+    !sourceKind.definition.includes("'protocol-reference'") ||
+    !sourceKind.definition.includes("'runtime-observation'")
+  )
+    throw new Error('PROVIDER_SCHEMA: adaptation source kind constraint required');
   const constraints = await pool.query<{ name: string; definition: string; valid: boolean }>(`
     SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
     FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND contype='c'
@@ -136,12 +153,16 @@ export async function checkProviderSchema(
     const adaptations = await pool.query<{ name: string; definition: string; valid: boolean }>(`
       SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
       FROM pg_constraint WHERE conrelid='mio_provider_model_adaptations'::regclass
-        AND conname IN ('mio_provider_model_adaptations_operation_check','mio_provider_model_adaptations_profile_check')`);
+        AND conname IN ('mio_provider_model_adaptations_source_kind_check','mio_provider_model_adaptations_operation_check','mio_provider_model_adaptations_profile_check')`);
     for (const [name, texts] of [
+      [
+        'mio_provider_model_adaptations_source_kind_check',
+        ["'protocol-reference'", "'runtime-observation'"],
+      ],
       ['mio_provider_model_adaptations_operation_check', ["'image.generate'"]],
       [
         'mio_provider_model_adaptations_profile_check',
-        ["'gpt-images-v1'", "'seedream-4-images-v1'"],
+        ["'gpt-images-v1'", "'seedream-4-images-v1'", "'vidu-image-v1'"],
       ],
     ] as const) {
       const constraint = adaptations.rows.find((item) => item.name === name);

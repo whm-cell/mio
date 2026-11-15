@@ -100,8 +100,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{}`。
 
-成功：202 `{requested,requestId}`；请求绑定当时活动 ID，覆盖受理至 adapter 登记窗口。requested 不表示已经终止或输出已持久，按原请求回执观察实际结算；已结束时 requested=false。
+成功：202 `{requested,requestId}`；请求绑定当时活动 ID，覆盖受理至 adapter 登记窗口。requested 不表示已经终止或输出已持久，按原请求回执观察实际供应商结果与持久化状态；已结束时 requested=false。
 
 错误：见本域共同约定。
 
-副作用：请求官方协作式取消，不能撤销已发生动作或保证退回模型费用；不会取消后续另一请求。
+副作用：请求官方协作式取消，不能撤销已发生动作或保证回收已发生的供应商调用；不会取消后续另一请求。

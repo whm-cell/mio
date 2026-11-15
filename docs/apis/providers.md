@@ -59,11 +59,11 @@ revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始�
 
 输入：`{}`。
 
-成功：200 discovery；connected 表示完整目录成功，空列表也是成功。failed 携稳定脱敏 error：UPSTREAM_AUTH_REJECTED/RATE_LIMITED/UNAVAILABLE/TIMEOUT/CANCELLED/RESPONSE_INVALID/RESPONSE_TOO_LARGE/RESPONSE_OR_TRANSPORT_ERROR（各项均带 UPSTREAM_ 前缀）。失败不覆盖同凭据最近成功快照；认证失败额外阻止新调用。
+成功：200 discovery；connected 表示当前用户 Key 的完整目录成功，空列表也是成功；`ids` 的数量就是本次最新目录数量。failed 携稳定脱敏 error：UPSTREAM_AUTH_REJECTED/RATE_LIMITED/UNAVAILABLE/TIMEOUT/CANCELLED/RESPONSE_INVALID/RESPONSE_TOO_LARGE/RESPONSE_OR_TRANSPORT_ERROR（各项均带 UPSTREAM_ 前缀）。失败不覆盖同凭据最近成功快照；认证失败额外阻止新调用。
 
 错误：409 PROVIDER_CREDENTIAL_CHANGED 或 PROVIDER_REFRESH_SUPERSEDED 表示响应已失效、未发布；503 PROVIDER_CREDENTIAL_UNAVAILABLE 表示不能验证密文，最近尝试仍记录失败。
 
-副作用：先分配持久刷新序号，解密本人当前 Key，固定 GET 目录；完整成功事务发布新目录，其他结果只更新尝试/认证状态。不生成、不自动重试，晚到响应不能覆盖最新发起的尝试。
+副作用：先分配持久刷新序号，解密本人当前 Key，固定 GET `/v1/models`；完整成功事务发布包含模型信息和数量的最新目录，其他结果只更新尝试/认证状态。不生成、不自动重试，晚到响应不能覆盖最新发起的尝试。
 
 ## GET /api/v1/providers/onelink/models
 
@@ -71,11 +71,11 @@ revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始�
 
 输入：可选单个 category=chat/image/video/voice/music；只筛供应商/部署声明分类，null 分类不自动进入 chat。
 
-成功：200 `{provider,items,defaults}`。items 含稳定 modelRef/modelKey、精确 modelId、`name`、`description`、`nameOverride`、`descriptionOverride`、可空 category/classificationSource、supplierMetadata、membership、credentialVersion/catalogVersion、firstSeenAt/lastSeenAt、legacyRef、discovered、adaptation、preferences、chat 的 enabled/isDefault/runnable/unavailableReason。`name` 使用用户覆盖，否则使用精确 modelId；历史不可解析项二者均可为 null。`description` 使用用户覆盖，否则使用供应商字符串描述，均缺失为 null。两个 Override 字段为可空的实际用户覆盖，可区分回退；空字符串是实际覆盖。modelRef 为 `onelink:model:<UUID>`。返回 current/removed/historical 实体，discovered 只表示当前成功成员。
+成功：200 `{provider,items,defaults}`。`items` 是最近一次当前用户 Key 成功刷新得到的全量成员，`items.length` 表示该成功快照的模型数量。items 含稳定 modelRef/modelKey、精确 modelId、`name`、`description`、`nameOverride`、`descriptionOverride`、可空 category/classificationSource、supplierMetadata、membership、credentialVersion/catalogVersion、firstSeenAt/lastSeenAt、legacyRef、discovered、adaptation、preferences、chat 的 enabled/isDefault/runnable/unavailableReason。`name` 使用用户覆盖，否则使用精确 modelId；历史不可解析项二者均可为 null。`description` 使用用户覆盖，否则使用供应商字符串描述，均缺失为 null。两个 Override 字段为可空的实际用户覆盖，可区分回退；空字符串是实际覆盖。modelRef 为 `onelink:model:<UUID>`。返回 current/removed/historical 实体，discovered 只表示当前成功成员。
 
-adaptation 为 null 或 `{operation,profile,implementation:'implemented',declarationVersion,source,sourceVersion,metadata,verification}`；verification 含 status/at/evidence/testedTuple。未声明协议时 ADAPTER_PENDING。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用、费用或解密成功。
+adaptation 为 null 或 `{operation,profile,implementation:'implemented',sourceKind,source,sourceVersion,metadata,verification}`；`sourceKind` 只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察），只影响已发现成员的适配，不建立目录成员；catalog membership、旧快照和静态模型清单不能作为适配来源。verification 含 status/at/evidence/testedTuple。未声明协议时 ADAPTER_PENDING。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用或解密成功。
 
-图片候选另以 `image: {adaptation,enabled,runnable,unavailableReason}` 返回图片声明和本地资格，包含 GPT 与受限 Seedream 4.0 的独立 profile；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。图片声明和本地资格不代表供应商已验证、实时可用或一定有费用额度。
+图片候选另以 `image: {adaptation,enabled,runnable,unavailableReason}` 返回图片声明和本地资格，包含 GPT、受限 Seedream 4.0 与 Vidu `vidu-image-v1` 的独立 profile；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。图片 `adaptation.metadata.image` 的显式 `modes` 必须包含 `generate`，可再声明 `edit`、`mask:{format:"png"}`、供应商多参考 capability `references:{maxImages}`、`geometry:{unit:"pixels",edges:["left","top","right","bottom"]}` 和协议中立 `async:{operations,maxQueries,maxAgeSeconds}`；`outpaint` 必须同时声明 geometry，async operations 必须属于 modes，省略这些字段不推断能力。Vidu profile 仅在已发现成员显式声明 generate async 时具备本地资格，原样发送该成员的精确 modelId；其 transport 只允许 reference2image/task creations 两条 OneLink 路径。`references.maxImages` 不是固定模型或图片容量策略。`parameters.async:true` 只有在当前 profile 的显式 async capability 下受理。图片声明和本地资格不代表供应商已验证或实时可用；真实异步调用与远端 CI 仍分别记录。
 
 错误：400 QUERY_INVALID；其余见共同约定。
 

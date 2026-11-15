@@ -8,7 +8,8 @@ import { Journal } from '../src/adapters/journal.ts';
 import { createImageWorker, recoverImageMaterialization } from '../src/image-worker.ts';
 import { sealImageKey } from '../../src/compute/image-credentials.ts';
 import { validateImage } from '../src/adapters/media.ts';
-import type { ImageProfile } from '@mio/compute-contracts';
+import type { ImageProfile, ImageQueryCommandV1 } from '@mio/compute-contracts';
+import { imageQueryCredentialBinding } from '@mio/compute-contracts';
 
 const keys = generateKeyPairSync('rsa', {
   modulusLength: 2048,
@@ -331,6 +332,61 @@ describe('durable image execution', () => {
       ).toEqual({ state: 'unknown', errorCode: 'IMAGE_SUBMISSION_UNKNOWN' });
       expect(transport).toHaveBeenCalledOnce();
       expect(materialize).not.toHaveBeenCalled();
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
+    }
+  });
+  it('persists sanitized async submission diagnostics without changing the unknown boundary', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const request = command({ async: true });
+    const asyncTransport = {
+      submit: vi.fn(async () => ({
+        state: 'unknown' as const,
+        code: 'IMAGE_SUBMISSION_UNKNOWN' as const,
+        observation: {
+          statusCode: 503,
+          requestIdPresent: true,
+          responsePaths: ['task_id', 'other'] as Array<'task_id' | 'other'>,
+          taskIdPresent: false,
+          errorCategory: 'upstream' as const,
+        },
+      })),
+      query: vi.fn(),
+    };
+    try {
+      const worker = createImageWorker(
+        journal,
+        'b1',
+        keys.privateKey,
+        vi.fn(),
+        fetch,
+        undefined,
+        asyncTransport,
+      );
+      await expect(worker(request)).resolves.toEqual({
+        state: 'unknown',
+        errorCode: 'IMAGE_SUBMISSION_UNKNOWN',
+      });
+      const row = journal.image(request.jobId)!;
+      expect(row.phase).toBe('unknown');
+      expect(JSON.parse(row.payload!)).toEqual({
+        code: 'IMAGE_SUBMISSION_UNKNOWN',
+        observation: {
+          statusCode: 503,
+          requestIdPresent: true,
+          responsePaths: ['task_id', 'other'],
+          taskIdPresent: false,
+          errorCategory: 'upstream',
+        },
+      });
+      await expect(worker(request)).resolves.toEqual({
+        state: 'unknown',
+        errorCode: 'IMAGE_SUBMISSION_UNKNOWN',
+      });
+      expect(asyncTransport.submit).toHaveBeenCalledOnce();
+      expect(asyncTransport.query).not.toHaveBeenCalled();
     } finally {
       journal.close();
       rmSync(directory, { recursive: true });
@@ -772,6 +828,331 @@ describe('durable image execution', () => {
     } finally {
       journal.close();
       rmSync(directory, { recursive: true });
+    }
+  });
+  it('submits async once, queries a persisted upstream task, and materializes only on return', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const request = command({ async: true });
+    const transport = vi.fn<typeof fetch>();
+    const asyncTransport = {
+      submit: vi.fn(async () => ({ state: 'submitted' as const, upstreamTaskId: 'task-async-1' })),
+      query: vi.fn(async (_input, _key, taskId: string, attempt: number) =>
+        attempt === 1
+          ? { state: 'processing' as const, upstreamTaskId: taskId }
+          : {
+              state: 'returned' as const,
+              upstreamTaskId: taskId,
+              images: [{ base64: 'YWJj', format: 'jpeg' as const }],
+            },
+      ),
+    };
+    const materialize = vi.fn(
+      async (job: string, index: number, _data: string, format: string, fileId: string) =>
+        imageOutput(job, index, fileId, format, 3),
+    );
+    const query = (attempt: number): ImageQueryCommandV1 => {
+      const value: ImageQueryCommandV1 = {
+        version: 1,
+        type: 'image.query',
+        messageId: randomUUID(),
+        commandId: request.messageId,
+        jobId: request.jobId,
+        ownerId: request.ownerId,
+        expiresAt: request.expiresAt,
+        profile: request.profile,
+        operation: 'generate',
+        input: request.input as ImageQueryCommandV1['input'],
+        upstreamTaskId: 'task-async-1',
+        queryAttempt: attempt,
+        credential: request.credential,
+        queryDeadline: request.expiresAt,
+      };
+      return {
+        ...value,
+        queryCredential: sealImageKey(
+          'test-secret',
+          imageQueryCredentialBinding(value),
+          'b1',
+          keys.publicKey,
+        ),
+      };
+    };
+    try {
+      const worker = createImageWorker(
+        journal,
+        'b1',
+        keys.privateKey,
+        materialize,
+        transport,
+        undefined,
+        asyncTransport,
+      );
+      await expect(worker(request)).resolves.toEqual({
+        state: 'submitted',
+        upstreamTaskId: 'task-async-1',
+        queryAttempt: 0,
+      });
+      await expect(worker(query(1))).resolves.toEqual({
+        state: 'processing',
+        upstreamTaskId: 'task-async-1',
+        queryAttempt: 1,
+      });
+      await expect(worker(query(2))).resolves.toEqual({
+        state: 'completed',
+        outputs: [expect.objectContaining({ sizeBytes: 3 })],
+      });
+      expect(asyncTransport.submit).toHaveBeenCalledOnce();
+      expect(asyncTransport.query).toHaveBeenCalledTimes(2);
+      expect(transport).not.toHaveBeenCalled();
+      expect(materialize).toHaveBeenCalledOnce();
+      expect(materialize.mock.calls[0]?.[3]).toBe('jpeg');
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
+    }
+  });
+  it('does not resubmit after an async query becomes unknown', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const request = command({ async: true });
+    const asyncTransport = {
+      submit: vi.fn(async () => ({
+        state: 'submitted' as const,
+        upstreamTaskId: 'task-unknown-1',
+      })),
+      query: vi.fn(async () => ({
+        state: 'unknown' as const,
+        code: 'IMAGE_QUERY_UNKNOWN' as const,
+      })),
+    };
+    const query: ImageQueryCommandV1 = {
+      version: 1,
+      type: 'image.query',
+      messageId: randomUUID(),
+      commandId: request.messageId,
+      jobId: request.jobId,
+      ownerId: request.ownerId,
+      expiresAt: request.expiresAt,
+      profile: request.profile,
+      operation: 'generate',
+      input: request.input as ImageQueryCommandV1['input'],
+      upstreamTaskId: 'task-unknown-1',
+      queryAttempt: 1,
+      credential: request.credential,
+      queryDeadline: request.expiresAt,
+    };
+    query.queryCredential = sealImageKey(
+      'test-secret',
+      imageQueryCredentialBinding(query),
+      'b1',
+      keys.publicKey,
+    );
+    try {
+      const worker = createImageWorker(
+        journal,
+        'b1',
+        keys.privateKey,
+        vi.fn(),
+        fetch,
+        undefined,
+        asyncTransport,
+      );
+      await expect(worker(request)).resolves.toMatchObject({ state: 'submitted' });
+      await expect(worker(query)).resolves.toEqual({
+        state: 'failed',
+        errorCode: 'IMAGE_QUERY_UNKNOWN',
+        upstreamTaskId: 'task-unknown-1',
+        queryAttempt: 1,
+      });
+      await expect(worker(request)).resolves.toEqual({
+        state: 'failed',
+        errorCode: 'IMAGE_QUERY_UNKNOWN',
+        upstreamTaskId: 'task-unknown-1',
+        queryAttempt: 1,
+      });
+      expect(asyncTransport.submit).toHaveBeenCalledOnce();
+      expect(asyncTransport.query).toHaveBeenCalledOnce();
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
+    }
+  });
+  it('recovers a known task with the current key without trusting legacy or duplicate queries', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const request = command({ async: true });
+    const asyncTransport = {
+      submit: vi.fn(async () => ({ state: 'submitted' as const, upstreamTaskId: 'task-rotate' })),
+      query: vi.fn(async (_input, _key, taskId: string, attempt: number) =>
+        attempt === 2
+          ? { state: 'processing' as const, upstreamTaskId: taskId }
+          : { state: 'returned' as const, upstreamTaskId: taskId, images: [{ base64: 'YWJj' }] },
+      ),
+    };
+    const query = (attempt: number): ImageQueryCommandV1 => ({
+      version: 1,
+      type: 'image.query',
+      messageId: randomUUID(),
+      commandId: request.messageId,
+      jobId: request.jobId,
+      ownerId: request.ownerId,
+      expiresAt: request.expiresAt,
+      profile: request.profile,
+      operation: 'generate',
+      input: request.input as ImageQueryCommandV1['input'],
+      upstreamTaskId: 'task-rotate',
+      queryAttempt: attempt,
+      credential: request.credential,
+      queryDeadline: request.expiresAt,
+    });
+    const sealed = (value: ImageQueryCommandV1, key: string) => ({
+      ...value,
+      queryCredential: sealImageKey(key, imageQueryCredentialBinding(value), 'b1', keys.publicKey),
+    });
+    const materialize = vi.fn(
+      async (job: string, index: number, _data: string, format: string, fileId: string) =>
+        imageOutput(job, index, fileId, format, 3),
+    );
+    try {
+      const worker = createImageWorker(
+        journal,
+        'b1',
+        keys.privateKey,
+        materialize,
+        fetch,
+        undefined,
+        asyncTransport,
+      );
+      await expect(worker(request)).resolves.toMatchObject({ state: 'submitted' });
+      const legacy = query(1);
+      delete legacy.queryDeadline;
+      await expect(worker(legacy)).resolves.toMatchObject({
+        state: 'failed',
+        errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+        upstreamTaskId: 'task-rotate',
+        queryAttempt: 1,
+      });
+      const rotated = sealed(query(1), 'rotated-secret');
+      await expect(worker(rotated)).resolves.toMatchObject({
+        state: 'failed',
+        queryAttempt: 1,
+      });
+      expect(asyncTransport.query).not.toHaveBeenCalled();
+      const second = sealed(query(2), 'rotated-secret');
+      await expect(worker({ ...second, ownerId: randomUUID() })).rejects.toThrow(
+        'IMAGE_COMMAND_CONFLICT',
+      );
+      await expect(worker({ ...second, upstreamTaskId: 'other-task' })).rejects.toThrow(
+        'IMAGE_QUERY_UNKNOWN',
+      );
+      await expect(worker(second)).resolves.toMatchObject({
+        state: 'processing',
+        queryAttempt: 2,
+      });
+      expect(asyncTransport.query.mock.calls[0]?.[1]).toBe('rotated-secret');
+      await worker(second);
+      await worker(rotated);
+      expect(asyncTransport.query).toHaveBeenCalledOnce();
+      const third = sealed(query(3), 'rotated-secret');
+      await expect(worker({ ...third, queryAttempt: 4 })).resolves.toMatchObject({
+        state: 'failed',
+        errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+        queryAttempt: 4,
+      });
+      const fifth = sealed(query(5), 'rotated-secret');
+      await expect(worker({ ...fifth, messageId: randomUUID() })).resolves.toMatchObject({
+        state: 'failed',
+        errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+        queryAttempt: 5,
+      });
+      const sixth = sealed(query(6), 'rotated-secret');
+      await expect(
+        worker({ ...sixth, queryDeadline: request.expiresAt - 1000 }),
+      ).resolves.toMatchObject({
+        state: 'failed',
+        errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+        queryAttempt: 6,
+      });
+      const late = { ...query(7), queryDeadline: Date.now() - 1 };
+      await expect(worker(sealed(late, 'rotated-secret'))).resolves.toMatchObject({
+        state: 'failed',
+        errorCode: 'IMAGE_QUERY_LIMIT',
+        queryAttempt: 7,
+      });
+      await expect(worker(sealed(query(8), 'restored-secret'))).resolves.toMatchObject({
+        state: 'completed',
+      });
+      expect(asyncTransport.query.mock.calls[1]?.[1]).toBe('restored-secret');
+      expect(asyncTransport.submit).toHaveBeenCalledOnce();
+      expect(asyncTransport.query).toHaveBeenCalledTimes(2);
+      expect(materialize).toHaveBeenCalledOnce();
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
+    }
+  });
+  it('does not query when either the deadline or the query credential is missing', async () => {
+    for (const missing of ['queryDeadline', 'queryCredential'] as const) {
+      const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+      const journal = new Journal(directory, randomUUID(), true);
+      const request = command({ async: true });
+      const asyncTransport = {
+        submit: vi.fn(async () => ({
+          state: 'submitted' as const,
+          upstreamTaskId: 'task-missing',
+        })),
+        query: vi.fn(async () => ({
+          state: 'unknown' as const,
+          code: 'IMAGE_QUERY_UNKNOWN' as const,
+        })),
+      };
+      const query: ImageQueryCommandV1 = {
+        version: 1,
+        type: 'image.query',
+        messageId: randomUUID(),
+        commandId: request.messageId,
+        jobId: request.jobId,
+        ownerId: request.ownerId,
+        expiresAt: request.expiresAt,
+        profile: request.profile,
+        operation: 'generate',
+        input: request.input as ImageQueryCommandV1['input'],
+        upstreamTaskId: 'task-missing',
+        queryAttempt: 1,
+        credential: request.credential,
+        queryDeadline: request.expiresAt,
+      };
+      query.queryCredential = sealImageKey(
+        'current',
+        imageQueryCredentialBinding(query),
+        'b1',
+        keys.publicKey,
+      );
+      delete query[missing];
+      try {
+        const worker = createImageWorker(
+          journal,
+          'b1',
+          keys.privateKey,
+          vi.fn(),
+          fetch,
+          undefined,
+          asyncTransport,
+        );
+        await worker(request);
+        await expect(worker(query)).resolves.toMatchObject({
+          state: 'failed',
+          errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+          upstreamTaskId: 'task-missing',
+          queryAttempt: 1,
+        });
+        expect(asyncTransport.query).not.toHaveBeenCalled();
+        expect(asyncTransport.submit).toHaveBeenCalledOnce();
+      } finally {
+        journal.close();
+        rmSync(directory, { recursive: true });
+      }
     }
   });
 });

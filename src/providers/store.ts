@@ -229,15 +229,16 @@ export class ProviderStore {
       if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
       await client.query(
         `INSERT INTO mio_provider_model_adaptations(provider_id,model_key,operation,profile,declaration_version,
-          source,source_version,capability_metadata) VALUES($1,$2,$3,$4,1,$5,$6,$7::jsonb)
+          source_kind,source,source_version,capability_metadata) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8::jsonb)
           ON CONFLICT(provider_id,model_key,operation) DO UPDATE SET profile=$4,
-          declaration_version=mio_provider_model_adaptations.declaration_version+1,source=$5,source_version=$6,
-          capability_metadata=$7::jsonb,verification_status='unverified'`,
+          declaration_version=mio_provider_model_adaptations.declaration_version+1,source_kind=$5,source=$6,source_version=$7,
+          capability_metadata=$8::jsonb,verification_status='unverified'`,
         [
           row.id,
           model!.model_key,
           entry.operation,
           entry.profile,
+          entry.sourceKind,
           entry.source,
           entry.sourceVersion,
           JSON.stringify(entry.metadata ?? {}),

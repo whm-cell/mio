@@ -52,10 +52,7 @@ export function validateImage(bytes: Buffer, format: string): void {
     !Number.isInteger(stream.width) ||
     !Number.isInteger(stream.height) ||
     stream.width < 1 ||
-    stream.height < 1 ||
-    stream.width > 3840 ||
-    stream.height > 3840 ||
-    stream.width * stream.height > 3840 * 2160
+    stream.height < 1
   )
     throw new Error('IMAGE_OUTPUT_INVALID');
   const decode = spawnSync(
@@ -64,8 +61,6 @@ export function validateImage(bytes: Buffer, format: string): void {
       '-v',
       'error',
       '-xerror',
-      '-max_alloc',
-      '67108864',
       '-threads',
       '1',
       '-protocol_whitelist',

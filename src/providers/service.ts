@@ -105,6 +105,18 @@ export function createProviderService(
     return result;
   };
   return {
+    /** Resolve only the current owner's credential for an already admitted task. */
+    async resolveImageTaskCredential(ownerId: string) {
+      assertOpen();
+      const row = await store.current(ownerId);
+      assertOpen();
+      if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
+      return decryptCredential(
+        row,
+        { ownerId, providerId: row.id, credentialVersion: row.credential_version },
+        config,
+      );
+    },
     async resolveImage(actor: ProviderPrincipal, modelRef: string) {
       assertOpen();
       const row = await store.state(actor.userId);
@@ -130,6 +142,7 @@ export function createProviderService(
       return {
         modelId: model!.raw_model_id!,
         profile: adaptation.profile,
+        capabilityMetadata: adaptation.capability_metadata,
         providerRevision: row.revision,
         providerConfigId: row.id,
         credentialVersion: row.credential_version,

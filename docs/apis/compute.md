@@ -32,15 +32,19 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 身份：当前登录用户；图片首切片仍待接受。
 
-输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前发现且具有已实现图片 profile 的显式 `image.generate` 声明，parameters 至少有 `prompt`。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、可省略或为 1024x1024 的 size，固定输出带水印 JPEG，其他字段拒绝。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
+输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前动态目录且具有已实现图片 profile 的显式声明，parameters 至少有 `prompt`。`parameters.operation` 省略时为 `generate`；`edit` 可使用本人 `imageAssetId` 或有序 `imageAssetIds` 数组，`outpaint` 还必须携带几何边界并仅在当前图片适配的 capability metadata 同时声明 `outpaint` 与 `geometry` 时可用；可选本人 `maskAssetId` 只接受 PNG。`parameters.async:true` 仅在当前 profile 显式声明 `image.async.operations` 时受理；任务先返回脱敏状态，后续由内部 `image.query` 按声明的 maxQueries/maxAgeSeconds 有界推进，HTTP 状态不返回上游任务 ID。A 逐项按系统 `user_id` 查询 ready/original 图片资产并冻结 raw ETag/长度，B 从私有 COS 以 If-Match 读取后向供应商发送白名单 multipart `image` 字段；Asset ID、对象键、ETag 和用户凭据不会透传。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、以及由该 profile/供应商契约决定的 `size`，固定输出带水印 JPEG，其他字段拒绝。这里的 `size` 是供应商生成参数，不是 W3/COS 对象容量策略。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
+
+首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为 capability 时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
+
+已知上游任务的查询使用该任务所属 `user_id` 当前保存且可解密的 OneLink Key；停止新准入、目录变化或 Key 版本变化不改变既有任务和资产的归属。无可用 Key 时保留任务身份并报告 `IMAGE_CREDENTIAL_UNAVAILABLE`，恢复后可在原次数与期限内继续查询；供应商拒绝当前 Key 时如实报告，不能保证不同上游账户有权读取同一任务。
 
 成功：202 返回图片任务视图；相同 owner/requestId 和输入返回同一任务，不重复生图。
 
-错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、409 REQUEST_CONFLICT 或供应商资格错误、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
+错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 ASSET_NOT_FOUND、409 REQUEST_CONFLICT/IMAGE_OPERATION_UNSUPPORTED 或供应商资格错误、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
 
-副作用：受理会占用与视频共享的执行名额并建立待投递命令，Worker 的供应商调用可能产生费用。
+副作用：受理会占用与视频共享的执行名额并建立待投递命令，Worker 随后执行一次供应商调用；edit/generate reference 的输入快照保存在现有图片任务命令中，COS 读取失败发生在提交上游前；Vidu async 结果按公网 HTTPS、限时下载及完整性核对后进入既有 COS/Asset 物化，不依赖固定结果域名清单；Mio 不记录费用、计费、余额或预算。
 
-停用 A 的图片密钥配置只阻止新图片准入；已受理命令仍按冻结身份投递并结算，提交有效期过后由 B 拒绝首次提交。已有失败输出仍可使用恢复入口。撤销配置不撤回已交付 B 的凭据信封，也不改变未知结果。
+停用或轮换 A 的图片 Key 只阻止新图片准入；已受理任务和已登记输出按系统 `user_id` 保留，资源查询和恢复不因 Key 变化失效。任务中的 provider/model/upstream 身份用于恢复，Key 版本只记录提交上下文；撤销配置不删除或重绑既有 COS 资产，也不改变未知结果。
 
 ## GET /api/v1/compute/images/{jobId}
 
@@ -48,7 +52,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 输入：图片任务 UUID，无查询参数。
 
-成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是从 0 开始的原始输出序号，即使前项缺失也不重排。B 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；解码工具非零退出无法区分图片损坏与环境故障时保留原始结果，恢复可能再次失败，需要排查。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。安全 errorCode 不包含供应商原文，也不证明是否收费。
+成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是从 0 开始的原始输出序号，即使前项缺失也不重排。B 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；解码工具非零退出无法区分图片损坏与环境故障时保留原始结果，恢复可能再次失败，需要排查。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。
 
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
 

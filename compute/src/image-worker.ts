@@ -2,18 +2,23 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   imageOutputIndex,
   imageOutputKey,
+  canonicalImageInput,
+  type ImageAssetRef,
   type ImageErrorCode,
   type ImageInput,
   type ImageProfile,
+  type ImageQueryCommandV1,
 } from '@mio/compute-contracts';
 import type { Journal } from './adapters/journal.ts';
-import { createImageProtocol } from './images.ts';
-import type { ImageObservation } from './images.ts';
+import { createImageProtocol, createViduAsyncImageTransport } from './images.ts';
+import { imageQueryCredentialBinding } from '@mio/compute-contracts';
+import type { AsyncImageTransport, ImageObservation, ReadImage } from './images.ts';
 import { openImageCredential } from './image-credentials.ts';
 import type { ImageCredentialEnvelope } from './image-credentials.ts';
 
 export interface ImageCommand {
   messageId: string;
+  type?: 'image.request';
   jobId: string;
   ownerId: string;
   expiresAt: number;
@@ -21,6 +26,7 @@ export interface ImageCommand {
   input: ImageInput;
   credential: ImageCredentialEnvelope;
 }
+export type ImageQueryCommand = ImageQueryCommandV1;
 export interface ImageObject {
   key: string;
   sizeBytes: number;
@@ -31,6 +37,13 @@ export interface ImageObject {
 export type ImageOutcome =
   | { state: 'completed' | 'partial'; outputs: ImageObject[] }
   | { state: 'unknown' | 'rejected'; errorCode: ImageErrorCode }
+  | { state: 'submitted' | 'processing'; upstreamTaskId: string; queryAttempt: number }
+  | {
+      state: 'failed';
+      errorCode: ImageErrorCode;
+      upstreamTaskId?: string;
+      queryAttempt?: number;
+    }
   | { state: 'materializing' | 'materialization_failed'; outputs: ImageObject[] };
 type Materialize = (
   jobId: string,
@@ -44,7 +57,7 @@ interface SavedImages {
   commandId: string;
   format: string;
   expectedCount: number;
-  images: ({ base64: string } | null)[];
+  images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[];
   outputs: ImageObject[];
   resultsByIndex?: Record<string, ImageObject>;
   invalidIndices?: number[];
@@ -93,6 +106,7 @@ async function materializeSaved(
     const image = saved.images[index];
     if (!image) saved.invalidIndices.push(index);
     else {
+      const format = image.format ?? saved.format;
       const fileId = randomUUID();
       saved.pendingFileIds[index] = fileId;
       (saved.attemptedFileIds[index] ??= []).push(fileId);
@@ -102,10 +116,10 @@ async function materializeSaved(
       // that key again.
       journal.imagePhase(jobId, 'materializing', JSON.stringify(saved));
       try {
-        const output = await materialize(jobId, index, image.base64, saved.format, fileId, signal);
+        const output = await materialize(jobId, index, image.base64, format, fileId, signal);
         if (
-          output.key !== imageOutputKey(jobId, index, fileId, saved.format) ||
-          output.contentType !== `image/${saved.format}` ||
+          output.key !== imageOutputKey(jobId, index, fileId, format) ||
+          output.contentType !== `image/${format}` ||
           imageOutputIndex(jobId, output.key, output.contentType) !== index
         )
           throw new Error('IMAGE_OUTPUT_INVALID');
@@ -140,7 +154,7 @@ async function materializeSaved(
   return completed(result);
 }
 
-/** The operator can only resume stored bytes, never invoke the paid transport. */
+/** The operator can only resume stored bytes, never invoke the supplier transport. */
 export async function recoverImageMaterialization(
   journal: Journal,
   jobId: string,
@@ -178,22 +192,27 @@ export async function recoverImageMaterialization(
   };
 }
 
-/** Journal commit precedes the one paid POST; re-entry only resumes durable outputs. */
+/** Journal commit precedes the one supplier POST; re-entry only resumes durable outputs. */
 export function createImageWorker(
   journal: Journal,
   keyId: string,
   privateKey: string,
   materialize: Materialize,
   transport: typeof fetch = fetch,
+  readImage?: ReadImage,
+  asyncTransport?: AsyncImageTransport,
 ) {
   const active = new Set<string>();
-  return async (command: ImageCommand, signal?: AbortSignal): Promise<ImageOutcome> => {
+  return async (
+    command: ImageCommand | ImageQueryCommand,
+    signal?: AbortSignal,
+  ): Promise<ImageOutcome> => {
     const binding = JSON.stringify([
       command.jobId,
       command.ownerId,
       command.expiresAt,
       command.profile,
-      Object.fromEntries(Object.entries(command.input).sort(([a], [b]) => a.localeCompare(b))),
+      canonicalImageInput(command.input),
     ]);
     const identity = createHash('sha256')
       .update(binding)
@@ -208,6 +227,228 @@ export function createImageWorker(
     if (active.has(command.jobId)) throw new Error('IMAGE_BUSY');
     active.add(command.jobId);
     try {
+      const current = journal.image(command.jobId);
+      if (current && current.identity !== identity) throw new Error('IMAGE_COMMAND_CONFLICT');
+      const inputBytes = new Map<string, Uint8Array>();
+      const read = async (ref: ImageAssetRef, inputSignal: AbortSignal) => {
+        const existing = inputBytes.get(ref.assetId);
+        if (existing) return existing;
+        if (!readImage) throw new Error('IMAGE_INPUT_UNAVAILABLE');
+        const bytes = await readImage(ref, inputSignal);
+        inputBytes.set(ref.assetId, bytes);
+        return bytes;
+      };
+      if (command.type === 'image.query') {
+        if (!current) throw new Error('IMAGE_QUERY_UNKNOWN');
+        if (current.phase === 'completed') {
+          const saved = JSON.parse(current.payload ?? '{}') as SavedCompletion;
+          return completed(saved);
+        }
+        if (current.phase === 'failed') {
+          let payload: { code?: ImageErrorCode; upstreamTaskId?: string; queryAttempt?: number };
+          try {
+            payload = JSON.parse(current.payload ?? '{}') as typeof payload;
+          } catch {
+            payload = { code: current.payload as ImageErrorCode };
+          }
+          if (payload.upstreamTaskId !== command.upstreamTaskId || !payload.queryAttempt)
+            throw new Error('IMAGE_QUERY_UNKNOWN');
+          if (command.queryAttempt <= payload.queryAttempt)
+            return {
+              state: 'failed',
+              errorCode: payload.code ?? 'IMAGE_QUERY_FAILED',
+              upstreamTaskId: payload.upstreamTaskId,
+              queryAttempt: payload.queryAttempt,
+            };
+        }
+        if (current.phase === 'materializing' || current.phase === 'returned') {
+          const saved = JSON.parse(current.payload ?? '{}') as SavedImages;
+          return await materializeSaved(journal, command.jobId, saved, materialize, signal);
+        }
+        if (current.phase === 'processing') {
+          const saved = JSON.parse(current.payload ?? '{}') as {
+            upstreamTaskId?: string;
+            queryAttempt?: number;
+          };
+          if (saved.upstreamTaskId !== command.upstreamTaskId || !saved.queryAttempt)
+            throw new Error('IMAGE_QUERY_UNKNOWN');
+          if (command.queryAttempt <= saved.queryAttempt)
+            return {
+              state: 'processing',
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: saved.queryAttempt,
+            };
+        }
+        if (current.phase === 'submitted') {
+          const saved = JSON.parse(current.payload ?? '{}') as {
+            commandId?: string;
+            upstreamTaskId?: string;
+          };
+          if (
+            saved.commandId !== command.commandId ||
+            saved.upstreamTaskId !== command.upstreamTaskId
+          )
+            throw new Error('IMAGE_QUERY_UNKNOWN');
+        } else if (current.phase !== 'processing' && current.phase !== 'failed') {
+          throw new Error('IMAGE_QUERY_UNKNOWN');
+        }
+        const activeAsyncTransport =
+          asyncTransport ??
+          (command.profile === 'vidu-image-v1'
+            ? createViduAsyncImageTransport(transport, read)
+            : undefined);
+        if (!activeAsyncTransport) {
+          journal.imagePhase(
+            command.jobId,
+            'failed',
+            JSON.stringify({
+              code: 'IMAGE_QUERY_FAILED',
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'failed',
+            errorCode: 'IMAGE_QUERY_FAILED',
+            upstreamTaskId: command.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        if (
+          !keyId ||
+          !privateKey ||
+          !command.queryCredential ||
+          !Number.isSafeInteger(command.queryDeadline) ||
+          !command.queryDeadline ||
+          command.queryDeadline > command.expiresAt
+        ) {
+          journal.imagePhase(
+            command.jobId,
+            'failed',
+            JSON.stringify({
+              code: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'failed',
+            errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+            upstreamTaskId: command.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        if (command.queryDeadline <= Date.now() || command.expiresAt <= Date.now()) {
+          journal.imagePhase(
+            command.jobId,
+            'failed',
+            JSON.stringify({
+              code: 'IMAGE_QUERY_LIMIT',
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'failed',
+            errorCode: 'IMAGE_QUERY_LIMIT',
+            upstreamTaskId: command.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        let apiKey: string;
+        try {
+          apiKey = openImageCredential(
+            command.queryCredential,
+            imageQueryCredentialBinding(command),
+            keyId,
+            privateKey,
+          );
+        } catch {
+          journal.imagePhase(
+            command.jobId,
+            'failed',
+            JSON.stringify({
+              code: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'failed',
+            errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
+            upstreamTaskId: command.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        const result = await createImageProtocol(
+          command.profile,
+          command.operation,
+          transport,
+          read,
+          activeAsyncTransport,
+        ).queryAsync(command.input, apiKey, command.upstreamTaskId, command.queryAttempt, signal);
+        if (result.state === 'processing') {
+          journal.imagePhase(
+            command.jobId,
+            'processing',
+            JSON.stringify({
+              commandId: command.commandId,
+              upstreamTaskId: result.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'processing',
+            upstreamTaskId: result.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        if (result.state !== 'returned') {
+          journal.imagePhase(
+            command.jobId,
+            'failed',
+            JSON.stringify({
+              code: result.code,
+              upstreamTaskId: command.upstreamTaskId,
+              queryAttempt: command.queryAttempt,
+            }),
+          );
+          return {
+            state: 'failed',
+            errorCode: result.code,
+            upstreamTaskId: command.upstreamTaskId,
+            queryAttempt: command.queryAttempt,
+          };
+        }
+        const saved: SavedImages = {
+          commandId: command.commandId,
+          format:
+            command.profile === 'seedream-4-images-v1'
+              ? 'jpeg'
+              : (command.input.output_format ?? 'png'),
+          expectedCount: command.input.n ?? 1,
+          images: result.images,
+          outputs: [],
+        };
+        journal.imagePhase(command.jobId, 'returned', JSON.stringify(saved));
+        return await materializeSaved(journal, command.jobId, saved, materialize, signal);
+      }
+      if (
+        !current &&
+        command.input.async !== true &&
+        ['edit', 'outpaint'].includes(command.input.operation ?? 'generate')
+      ) {
+        try {
+          const inputSignal = signal ?? AbortSignal.timeout(180_000);
+          const refs = command.input.images ?? (command.input.image ? [command.input.image] : []);
+          for (const ref of refs) await read(ref, inputSignal);
+          if (command.input.mask) await read(command.input.mask, inputSignal);
+        } catch {
+          // No journal row exists yet, so a COS read failure is safe to retry before
+          // the worker can submit the upstream edit request.
+          throw new Error('IMAGE_INPUT_UNAVAILABLE');
+        }
+      }
       const first = journal.beginImage(command.jobId, identity);
       if (first) {
         if (!keyId || !privateKey || command.expiresAt <= Date.now()) {
@@ -223,11 +464,48 @@ export function createImageWorker(
           journal.imagePhase(command.jobId, 'rejected', 'IMAGE_CREDENTIAL_UNAVAILABLE');
           return { state: 'rejected', errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE' };
         }
-        const result = await createImageProtocol(command.profile, 'generate', transport).submit(
-          command.input,
-          apiKey,
-          signal,
+        const protocol = createImageProtocol(
+          command.profile,
+          command.input.operation ?? 'generate',
+          transport,
+          read,
+          asyncTransport ??
+            (command.profile === 'vidu-image-v1'
+              ? createViduAsyncImageTransport(transport, read)
+              : undefined),
         );
+        if (command.input.async === true) {
+          const result = await protocol.submitAsync(command.input, apiKey, signal);
+          if (result.state === 'submitted') {
+            journal.imagePhase(
+              command.jobId,
+              'submitted',
+              JSON.stringify({
+                commandId: command.messageId,
+                upstreamTaskId: result.upstreamTaskId,
+                queryAttempt: 0,
+              }),
+            );
+            return {
+              state: 'submitted',
+              upstreamTaskId: result.upstreamTaskId,
+              queryAttempt: 0,
+            };
+          }
+          if (result.state === 'unknown') {
+            journal.imagePhase(
+              command.jobId,
+              'unknown',
+              result.observation
+                ? JSON.stringify({ code: result.code, observation: result.observation })
+                : result.code,
+            );
+            return { state: 'unknown', errorCode: result.code };
+          }
+          journal.imagePhase(command.jobId, 'rejected', result.code);
+          return { state: 'rejected', errorCode: result.code };
+        }
+        const result = await protocol.submit(command.input, apiKey, signal, read);
         if (result.state !== 'returned') {
           journal.imagePhase(
             command.jobId,
@@ -258,6 +536,33 @@ export function createImageWorker(
       }
       if (row.phase === 'unknown')
         return { state: 'unknown', errorCode: 'IMAGE_SUBMISSION_UNKNOWN' };
+      if (row.phase === 'submitted' || row.phase === 'processing') {
+        const saved = JSON.parse(row.payload ?? '{}') as {
+          upstreamTaskId?: string;
+          queryAttempt?: number;
+        };
+        if (typeof saved.upstreamTaskId !== 'string' || !Number.isSafeInteger(saved.queryAttempt))
+          throw new Error('IMAGE_RESOLUTION_INVALID');
+        return {
+          state: row.phase,
+          upstreamTaskId: saved.upstreamTaskId,
+          queryAttempt: saved.queryAttempt!,
+        };
+      }
+      if (row.phase === 'failed') {
+        let payload: { code?: ImageErrorCode; upstreamTaskId?: string; queryAttempt?: number };
+        try {
+          payload = JSON.parse(row.payload ?? '{}') as typeof payload;
+        } catch {
+          payload = { code: row.payload as ImageErrorCode };
+        }
+        return {
+          state: 'failed',
+          errorCode: payload.code ?? 'IMAGE_QUERY_FAILED',
+          ...(payload.upstreamTaskId ? { upstreamTaskId: payload.upstreamTaskId } : {}),
+          ...(payload.queryAttempt !== undefined ? { queryAttempt: payload.queryAttempt } : {}),
+        };
+      }
       if (row.phase === 'rejected')
         return {
           state: 'rejected',

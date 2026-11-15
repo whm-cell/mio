@@ -46,6 +46,7 @@ it('limits deployment declarations to sourced, implemented profiles and cannot s
     modelRef: 'onelink:model:some-key',
     operation: 'chat',
     profile: 'openai-chat',
+    sourceKind: 'protocol-reference',
     source: 'fixture',
     sourceVersion: 'v1',
   };
@@ -64,4 +65,110 @@ it('limits deployment declarations to sourced, implemented profiles and cannot s
     { classification: 'unknown' },
   ])
     expect(() => validateDeclaration({ ...entry, ...patch })).toThrow('ADAPTATION_INVALID');
+});
+
+it('accepts only explicit image edit and PNG mask capability metadata', () => {
+  const image = {
+    modelRef: 'onelink:model:some-key',
+    operation: 'image.generate',
+    profile: 'gpt-images-v1',
+    sourceKind: 'protocol-reference',
+    source: 'fixture',
+    sourceVersion: 'v1',
+    metadata: {
+      image: {
+        modes: ['generate', 'edit'],
+        mask: { format: 'png' },
+        async: { operations: ['generate'], maxQueries: 4, maxAgeSeconds: 300 },
+      },
+    },
+  };
+  expect(validateDeclaration(image)).toEqual(image);
+  expect(
+    validateDeclaration({
+      ...image,
+      metadata: {
+        image: {
+          modes: ['generate', 'edit', 'outpaint'],
+          mask: { format: 'png' },
+          references: { maxImages: 4 },
+          geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] },
+        },
+      },
+    }),
+  ).toMatchObject({ metadata: { image: { modes: ['generate', 'edit', 'outpaint'] } } });
+  for (const metadata of [
+    { image: { modes: [] } },
+    { image: { modes: ['edit'] } },
+    { image: { modes: ['edit', 'edit'] } },
+    { image: { modes: ['outpaint'] } },
+    { image: { modes: ['edit'], mask: { format: 'jpeg' } } },
+    { image: { modes: ['edit'], extra: true } },
+    { image: { modes: ['outpaint'], geometry: { unit: 'pixels', edges: ['left'] } } },
+    { image: { modes: ['edit'], references: { maxImages: 1 } } },
+    {
+      image: {
+        modes: ['generate'],
+        async: { operations: ['edit'], maxQueries: 4, maxAgeSeconds: 300 },
+      },
+    },
+    {
+      image: {
+        modes: ['generate'],
+        async: { operations: ['generate'], maxQueries: 0, maxAgeSeconds: 300 },
+      },
+    },
+  ])
+    expect(() => validateDeclaration({ ...image, metadata })).toThrow('ADAPTATION_INVALID');
+  for (const declaration of [
+    { ...image, profile: 'seedream-4-images-v1' },
+    { ...image, operation: 'chat', profile: 'openai-chat' },
+  ])
+    expect(() => validateDeclaration(declaration)).toThrow('ADAPTATION_INVALID');
+});
+
+it('accepts the explicitly sourced Vidu image async capability without inferring it from the model id', () => {
+  const declaration = {
+    modelRef: 'onelink:model:vidu-key',
+    operation: 'image.generate',
+    profile: 'vidu-image-v1',
+    sourceKind: 'protocol-reference',
+    source: 'https://docs.onelinkai.cloud/8653257m0',
+    sourceVersion: '2026-11-14',
+    classification: 'image',
+    metadata: {
+      image: {
+        modes: ['generate'],
+        references: { maxImages: 7 },
+        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+    },
+  };
+  expect(validateDeclaration(declaration)).toEqual(declaration);
+  expect(() => validateDeclaration({ ...declaration, profile: 'gpt-images-v1' })).not.toThrow();
+  expect(() =>
+    validateDeclaration({
+      ...declaration,
+      metadata: { image: { modes: ['generate', 'edit'] } },
+    }),
+  ).toThrow('ADAPTATION_INVALID');
+});
+
+it('requires a non-catalog adaptation source kind and never treats catalog membership as protocol evidence', () => {
+  const entry = {
+    modelRef: 'onelink:model:source-kind',
+    operation: 'chat',
+    profile: 'openai-chat',
+    sourceKind: 'protocol-reference',
+    source: 'onelink-v1-models',
+    sourceVersion: 'v1',
+  };
+  expect(() => validateDeclaration(entry)).toThrow('ADAPTATION_INVALID');
+  for (const sourceKind of [undefined, 'catalog-membership', 'catalog', 'protocol', 'runtime'])
+    expect(() => validateDeclaration({ ...entry, sourceKind, source: 'operator-runbook' })).toThrow(
+      'ADAPTATION_INVALID',
+    );
+  expect(
+    validateDeclaration({ ...entry, sourceKind: 'runtime-observation', source: 'test-run-42' }),
+  ).toMatchObject({ sourceKind: 'runtime-observation' });
 });

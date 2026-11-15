@@ -12,6 +12,7 @@ import type {
   ComputeCommandV1,
   ComputeResultV1,
   ImageCommandV1,
+  ImageQueryCommandV1,
   ImageRecoveryCommandV1,
   ImageResultV1,
 } from '@mio/compute-contracts';
@@ -149,7 +150,7 @@ export class ComputeBroker {
   }
 
   async publish(
-    message: ComputeCommandV1 | ImageCommandV1 | ImageRecoveryCommandV1,
+    message: ComputeCommandV1 | ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1,
   ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {

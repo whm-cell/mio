@@ -10,12 +10,14 @@ import {
   RESULT_ROUTING_KEY,
   parseComputeCommandV1,
   parseImageCommand,
+  parseImageQuery,
   parseImageRecovery,
 } from '@mio/compute-contracts';
 import type {
   ComputeCommandV1,
   ComputeResultV1,
   ImageCommandV1,
+  ImageQueryCommandV1,
   ImageRecoveryCommandV1,
   ImageResultV1,
 } from '@mio/compute-contracts';
@@ -241,7 +243,7 @@ export class Broker {
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
     imageHandle?: (
-      command: ImageCommandV1 | ImageRecoveryCommandV1,
+      command: ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1,
       ack: () => void,
     ) => Promise<void>,
   ): Promise<void> {
@@ -281,7 +283,8 @@ export class Broker {
           report(error);
           return;
         }
-        let command: ComputeCommandV1 | ImageCommandV1 | ImageRecoveryCommandV1;
+        let command:
+          ComputeCommandV1 | ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1;
         try {
           if (
             message.properties.userId !== this.#expectedUserId ||
@@ -297,9 +300,14 @@ export class Broker {
               : value &&
                   typeof value === 'object' &&
                   'type' in value &&
-                  value.type === 'image.recover'
-                ? parseImageRecovery(value)
-                : parseComputeCommandV1(value);
+                  value.type === 'image.query'
+                ? parseImageQuery(value)
+                : value &&
+                    typeof value === 'object' &&
+                    'type' in value &&
+                    value.type === 'image.recover'
+                  ? parseImageRecovery(value)
+                  : parseComputeCommandV1(value);
           if (
             command.type === 'transcode.request' &&
             message.content.length > COMPUTE_MAX_MESSAGE_BYTES
@@ -317,7 +325,11 @@ export class Broker {
         }
         const tracked = Promise.resolve()
           .then(() => {
-            if (command.type === 'image.request' || command.type === 'image.recover') {
+            if (
+              command.type === 'image.request' ||
+              command.type === 'image.query' ||
+              command.type === 'image.recover'
+            ) {
               if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
               return imageHandle(command, () => slot.channel.ack(message));
             }

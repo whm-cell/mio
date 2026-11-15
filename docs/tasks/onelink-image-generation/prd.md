@@ -1,6 +1,6 @@
 # 万联图片生成、编辑与受管资产 PRD
 
-状态：原 W3 的独立需求规划，业务尚未启动或接受。本次拆分只调整资料归属；W1/W2 旧接受不迁移。返回[任务资料与成果](../index.md)。
+状态：各切片按实际范围分步推进与接受，已接受范围以[本能力成果](complete/report.md)为准；未记入该成果入口的切片及目标（含当前目录 0 项的 GPT 真实供应商调用、Seedream edit、真实供应商 outpaint `geometry` 与 Gemini/Kling）保持待接受或 pending。W1/W2 旧接受不迁移。返回[任务资料与成果](../index.md)。
 
 ## 1. 结果与范围
 
@@ -19,9 +19,9 @@
 
 ## 2. 直接依赖与 C0 缺口
 
-复用[供应商规范](../../providers.md)中的本人凭据、稳定模型身份、动态资格和有来源声明，必要已接受基线为 `onelink-user-provider-catalog`（[原成果入口](../onelink-integration/complete/report.md)）；W2 文本完整接受不构成图片前置。适配声明的 `sourceKind=protocol-reference` 只表示协议/文档依据，`runtime-observation` 只表示对应运行观察；二者均不替代当前目录成员。身份、PG、传输与资源约束直接沿[共享候选设计的现行依赖](design.md#1-现行依赖与采用边界)。图片场景相关能力尚未按本 PRD 验证和接受；资产底座仍按本页首段核对实际接受范围，不能从目录成功推导可调用。
+复用[供应商规范](../../providers.md)中的本人凭据、稳定模型身份、动态资格和有来源声明，必要已接受基线为 `onelink-user-provider-catalog`（[原成果入口](../onelink-integration/complete/report.md)）；W2 文本完整接受不构成图片前置。适配声明的 `sourceKind=protocol-reference` 只表示协议/文档依据，`runtime-observation` 只表示对应运行观察；二者均不替代当前目录成员。身份、PG、传输与资源约束直接沿[共享候选设计的现行依赖](design.md#1-现行依赖与采用边界)。图片场景各切片按[本能力成果](complete/report.md)与对应任务证据分别验证和接受；资产底座仍按本页首段核对实际接受范围，不能从目录成功推导可调用。
 
-Seedream 图片调用使用当前用户已经配置的 OneLink 凭据。真实验收仍须确认当前目录包含目标模型、该账户具备图片权限、固定 profile 已实现，并记录实际请求/结果；缺少任一项只使 Seedream 图片验收保持 pending，不回退为另一模型，也不阻塞 W1/W2 文本结果。
+Seedream 图片调用使用当前用户已经配置的 OneLink 凭据。真实验收仍须确认当前目录包含目标模型、该账户具备图片权限、固定 profile 已实现，并记录实际请求/结果；缺少任一项只使 Seedream 图片验收保持 pending，不回退为另一模型，也不阻塞 W1/W2 文本结果。当前用户 Key 刷新的 `/v1/models` 目录包含 Seedream（`doubao-seedream-4.0`）、Kling 与 Vidu（`image-vidu-q2`），但 `gpt-image-*` 与 `gemini-*` 为 0 项；因此 GPT 真实生成/编辑/多参考与上游 outpaint `geometry` 保持 pending，live 核验在目录无匹配模型时以 `LIVE_MODEL_NOT_FOUND` fail-closed 停止（0 次上游生成 POST）。
 
 图片真实闭环使用项目私有 COS 配置和 A/B 的实际权限。现场注入可使用长期受限 `SecretId/SecretKey`，或在实现明确支持时使用带有效期的临时凭据；验收条件是运行时能完成受限读写和 owner 资产登记，不要求额外的 COS 会话配置。签名 URL 和 staging 生命周期仍按 [COS 集成](../../integrations/cos.md)执行。
 
@@ -31,7 +31,7 @@ C0 收口本图片切片的实施范围与调用授权（O1）、以系统 `user
 
 沿[统一生命周期](../../coordination.md#当前任务的生命周期)，本期先落一个可闭环的 GPT `image.edit` 切片：调用方提交本人 `imageAssetId` 和可选 `maskAssetId`，A 按 `user_id` 核对 ready/original 资产并 HEAD 冻结 raw ETag/长度，B 从私有 COS 读取后向 `/v1/images/edits` 发一次 multipart 请求，继续复用现有 journal、unknown、逐输出物化和结果 Asset 绑定。无 mask 的单图 edit 可承接单参考图场景；mask 只接受 PNG。Seedream edit、多参考数组、真正带画布几何的 outpaint、Gemini/Kling/Vidu 异步操作留作后续独立切片。
 
-E2 独立候选已按本节边界建档，增加 owner 资产数组、多参考 multipart 和显式 geometry capability gate；真实供应商字段、权限与 COS 闭环仍待各自验证。E3 增加显式 async capability 下的协议中立 submit/query/recovery、持久 upstream task ID 和有界 query，并实现 Vidu 的受限 OneLink 适配；目录发现、协议适配和真实验证分别记录。每片仍以当前 Key 显式刷新得到的动态目录和显式 capability 声明为准。
+E2（`reference-outpaint-slice`）落地 owner 资产数组、多参考 multipart 和显式 `metadata.image.geometry` capability gate（上游 `geometry` 未验证前保持关闭，`DESIGN-OVER-001`）；E3（`async-image-slice`）落地显式 async capability 下的协议中立 submit/query/recovery、持久 upstream task ID、有界 query 及 `image-vidu-q2` 真实闭环；`seedream-sync-slice` 覆盖 `doubao-seedream-4.0` 真实同步 OneLink + 私有 COS 闭环与场景化 live 核验入口。各切片的已接受状态与范围以[本能力成果](complete/report.md)和对应任务证据为准；目录发现、协议适配和真实验证分别记录。每片仍以当前 Key 显式刷新得到的动态目录和显式 capability 声明为准。
 
 生产性能基准、容量指标和生产压测是本期 non-goal；本地确定性检查与 CI 只证明功能、恢复和护栏，不推导生产性能结论。真实同步与异步 OneLink/COS、远端 CI 及各切片接受状态分别以[本能力成果](complete/report.md)和对应任务证据为准，不由适配代码推定通过。
 
@@ -41,8 +41,8 @@ E2 独立候选已按本节边界建档，增加 owner 资产数组、多参考 
 
 共同证据、安全/恢复和接受规则沿[共同验证约定](design.md#6-共同验证约定)，本能力覆盖原 A1/A2/A5/A6/A7，并额外逐项核验：
 
-- 本期隔离验收覆盖 GPT 单图 edit、可选 PNG mask、跨 user_id/非 ready/非 original/非图片资产拒绝、COS If-Match 读取、multipart 字段白名单和既有结果物化；真实供应商闭环仍待授权批次。
-- 既有生成回归保持；Seedream edit 和 E2 的真实供应商多参考/outpaint 几何接受保留待验证，异步真实证据按具体模型与操作分别记录，不以候选隔离测试代替全 W3。
+- 本期隔离验收覆盖 GPT 单图/多参考 edit、可选 PNG mask、跨 user_id/非 ready/非 original/非图片资产拒绝、COS If-Match 读取、multipart 字段白名单和既有结果物化；因当前 Key `/v1/models` 目录含 0 项 `gpt-image-*`，真实 GPT 供应商闭环保持 pending，live 入口对 `gpt-sync`/`gpt-edit` 验证 `LIVE_MODEL_NOT_FOUND` fail-closed（0 次上游生成 POST）。
+- 既有生成回归保持；`doubao-seedream-4.0` 同步生成与 `image-vidu-q2` 异步生成按真实 OneLink + 私有 COS 闭环分别记录；Seedream edit、真实供应商多参考与上游 outpaint `geometry` 保持 pending，不以候选隔离测试或单型号成功代替全 W3。
 - 生产性能基准、容量和压测不属于本期验收目标；它们不作为 E3 的 pending 或阻塞项。真实同步 OneLink/COS、真实供应商异步端点和远端 CI 沿各自接受边界分别报告。
 - 注入“生成已成功 → 下载/元数据提交失败”，核对只恢复取回/落库、不重复提交上游生成、同 task/output 不重复 Asset；多图部分失败可见，保留可对账身份和有界临时文件清理。
 

@@ -328,3 +328,81 @@ it('allows only the saved task and at most eight query attempts without logging 
     rmSync(directory, { recursive: true });
   }
 });
+
+it.each([
+  ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/img2img'],
+  ['seedream-sync', 'https://api.onelinkai.cloud/volc/api/v3/images/generations'],
+  ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/generations'],
+  ['gpt-edit', 'https://api.onelinkai.cloud/v1/images/edits'],
+] as const)(
+  'enforces the single-POST interlock for explicit scenario %s (%s)',
+  async (scenario, allowedUrl) => {
+    vi.resetModules();
+    const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('ok'));
+    vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
+    vi.stubEnv('MIO_LIVE_IMAGE_SCENARIO', scenario);
+    vi.stubGlobal('fetch', transport);
+    try {
+      await import('../../tests/compute/live-image-audit.ts');
+      const options = { method: 'POST', headers: { authorization: 'synthetic-secret' } };
+      await fetch(allowedUrl, options);
+      expect(() => fetch(allowedUrl, options)).toThrow('LIVE_IMAGE_REPEAT_POST_BLOCKED');
+      expect(transport).toHaveBeenCalledOnce();
+      expect(existsSync(join(directory, 'supplier-post-started.json'))).toBe(true);
+      expect(existsSync(join(directory, 'supplier-post-allowed.json'))).toBe(true);
+      expect(existsSync(join(directory, 'supplier-post-repeat-blocked.json'))).toBe(true);
+      expect(existsSync(join(directory, 'supplier-post-unexpected-blocked.json'))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true });
+    }
+  },
+);
+
+it.each([
+  ['seedream-sync', 'https://api.onelinkai.cloud/v1/images/generations', 'POST'],
+  ['seedream-sync', 'https://api.onelinkai.cloud/vidu/ent/v2/tasks/task/creations', 'GET'],
+  ['seedream-sync', 'https://unexpected.example/volc/api/v3/images/generations', 'POST'],
+  ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/edits', 'POST'],
+  ['gpt-edit', 'https://api.onelinkai.cloud/v1/images/generations', 'POST'],
+  ['vidu-async', 'https://unexpected.example/vidu/ent/v2/reference2image', 'POST'],
+] as const)(
+  'blocks cross-scenario or unexpected host/path requests in %s (%s %s)',
+  async (scenario, rejectedUrl, method) => {
+    vi.resetModules();
+    const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('ok'));
+    vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
+    vi.stubEnv('MIO_LIVE_IMAGE_SCENARIO', scenario);
+    vi.stubGlobal('fetch', transport);
+    try {
+      await import('../../tests/compute/live-image-audit.ts');
+      expect(() => fetch(rejectedUrl, { method })).toThrow('LIVE_IMAGE_UNEXPECTED_PROVIDER_POST');
+      expect(transport).not.toHaveBeenCalled();
+      expect(existsSync(join(directory, 'supplier-post-started.json'))).toBe(true);
+      expect(existsSync(join(directory, 'supplier-post-unexpected-blocked.json'))).toBe(true);
+      expect(existsSync(join(directory, 'supplier-post-allowed.json'))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true });
+    }
+  },
+);
+
+it('rejects an invalid audit scenario before installing fetch hooks', async () => {
+  vi.resetModules();
+  const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
+  vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
+  vi.stubEnv('MIO_LIVE_IMAGE_SCENARIO', 'unknown-scenario');
+  try {
+    await expect(import('../../tests/compute/live-image-audit.ts')).rejects.toThrow(
+      'LIVE_IMAGE_SCENARIO_INVALID',
+    );
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(directory, { recursive: true });
+  }
+});

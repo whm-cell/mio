@@ -10,6 +10,23 @@ import {
 import { join, resolve } from 'node:path';
 
 // Acceptance-only safety interlock: no headers, request body, URL token or credential is logged.
+const maxUpstreamGeneratePosts = 1;
+const SCENARIO_POST_ENDPOINTS = {
+  'vidu-async': [
+    'https://api.onelinkai.cloud/vidu/ent/v2/reference2image',
+    'https://api.onelinkai.cloud/vidu/ent/v2/img2img',
+  ],
+  'seedream-sync': ['https://api.onelinkai.cloud/volc/api/v3/images/generations'],
+  'gpt-sync': ['https://api.onelinkai.cloud/v1/images/generations'],
+  'gpt-edit': ['https://api.onelinkai.cloud/v1/images/edits'],
+} as const;
+type AuditScenario = keyof typeof SCENARIO_POST_ENDPOINTS;
+const rawScenario = process.env.MIO_LIVE_IMAGE_SCENARIO;
+const scenario = (
+  rawScenario && rawScenario.length > 0 ? rawScenario : 'vidu-async'
+) as AuditScenario;
+if (!(scenario in SCENARIO_POST_ENDPOINTS)) throw new Error('LIVE_IMAGE_SCENARIO_INVALID');
+const allowedPostEndpoints: readonly string[] = SCENARIO_POST_ENDPOINTS[scenario];
 const directory = process.env.MIO_LIVE_IMAGE_AUDIT_DIRECTORY;
 if (!directory) throw new Error('LIVE_IMAGE_AUDIT_DIRECTORY_REQUIRED');
 const root = resolve(directory);
@@ -121,11 +138,12 @@ globalThis.fetch = (input, init) => {
   const url = input instanceof Request ? input.url : String(input);
   const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
   const target = new URL(url);
-  const providerPost = method === 'POST' && target.hostname === 'api.onelinkai.cloud';
   const query =
+    scenario === 'vidu-async' &&
     method === 'GET' &&
     target.origin === 'https://api.onelinkai.cloud' &&
     /^\/vidu\/ent\/v2\/tasks\/[^/]+\/creations$/.test(target.pathname);
+  const providerPost = !query;
   let queryAttempt = 0;
   if (query && process.env.MIO_LIVE_IMAGE_HOLD_FIRST_QUERY === 'yes') {
     mark(held);
@@ -162,7 +180,11 @@ globalThis.fetch = (input, init) => {
     }
   }
   if (providerPost) {
-    const expected = url === 'https://api.onelinkai.cloud/vidu/ent/v2/reference2image';
+    const expected =
+      method === 'POST' &&
+      target.origin === 'https://api.onelinkai.cloud' &&
+      allowedPostEndpoints.includes(url) &&
+      maxUpstreamGeneratePosts === 1;
     if (!expected) mark(unexpected);
     let fd: number;
     try {
@@ -184,7 +206,6 @@ globalThis.fetch = (input, init) => {
     mark(allowed);
   }
   const result = originalFetch(input, init);
-  if (!providerPost && !query) return result;
   return result.then(
     (response) => {
       if (query) {

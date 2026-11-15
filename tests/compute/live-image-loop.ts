@@ -36,7 +36,39 @@ import { validateImage } from '../../compute/src/adapters/media.ts';
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
 assert.equal(process.env.MIO_RUN_LIVE_IMAGE, 'yes', 'LIVE_OPT_IN');
-const [phase, runArgument, first, second, candidate, ...extra] = process.argv.slice(2);
+const SCENARIOS = ['vidu-async', 'seedream-sync', 'gpt-sync', 'gpt-edit'] as const;
+type Scenario = (typeof SCENARIOS)[number];
+function parseCliArguments(argv: string[]) {
+  let cliScenario: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--scenario') {
+      assert(cliScenario === undefined && i + 1 < argv.length, 'LIVE_ARGUMENTS');
+      cliScenario = argv[++i];
+    } else if (arg.startsWith('--scenario=')) {
+      assert(cliScenario === undefined, 'LIVE_ARGUMENTS');
+      cliScenario = arg.slice('--scenario='.length);
+    } else {
+      positional.push(arg);
+    }
+  }
+  const envScenario = process.env.MIO_LIVE_IMAGE_SCENARIO;
+  assert(!cliScenario || !envScenario || cliScenario === envScenario, 'LIVE_ARGUMENTS');
+  const raw = cliScenario ?? (envScenario && envScenario.length ? envScenario : undefined);
+  const selected = raw ?? 'vidu-async';
+  assert((SCENARIOS as readonly string[]).includes(selected), 'LIVE_SCENARIO');
+  return {
+    scenario: selected as Scenario,
+    explicitScenario: raw !== undefined,
+    positional,
+  };
+}
+const {
+  scenario,
+  explicitScenario,
+  positional: [phase, runArgument, first, second, candidate, ...extra],
+} = parseCliArguments(process.argv.slice(2));
 assert(
   ['prepare', 'execute'].includes(phase ?? '') &&
     runArgument &&
@@ -62,6 +94,7 @@ type Infrastructure = {
 };
 type State = {
   candidate: string;
+  scenario?: Scenario;
   origin: string;
   a: Environment;
   b: Environment;
@@ -132,11 +165,17 @@ async function settleQueryAudit() {
     await delay(100);
   }
 }
-function child(file: string, args: string[], env: Environment, log: string): ChildProcess {
+function child(
+  file: string,
+  args: string[],
+  env: Environment,
+  log: string,
+  cwd = project,
+): ChildProcess {
   const fd = openSync(join(directory, log), 'a', 0o600);
   try {
     return spawn(process.execPath, [file, ...args], {
-      cwd: project,
+      cwd,
       env,
       stdio: ['ignore', fd, fd],
     });
@@ -164,7 +203,7 @@ async function freePort() {
   return port;
 }
 async function startApp(state: Pick<State, 'a' | 'origin'>) {
-  const process = child(launcher(), ['--profile', 'mio'], state.a, 'app.log');
+  const process = child(launcher(), ['--profile', 'mio'], state.a, 'app.log', directory);
   try {
     for (let i = 0; i < 150; i++) {
       assert(process.exitCode === null && process.signalCode === null, 'LIVE_APP_EXITED');
@@ -363,10 +402,12 @@ async function prepare() {
     MIO_IMAGE_KEY_ID: 'w3-live',
     MIO_IMAGE_PRIVATE_KEY: keys.privateKey,
     MIO_LIVE_IMAGE_AUDIT_DIRECTORY: directory,
+    MIO_LIVE_IMAGE_SCENARIO: scenario,
   };
   save(join(directory, 'private-config.json'), { a, b }, true);
   record('prepare-start', {
     candidate,
+    scenario,
     runnerSha256: fileHash('tests/compute/live-image-loop.ts'),
     auditSha256: fileHash('tests/compute/live-image-audit.ts'),
     appEntrySha256: fileHash('dist/plugin.js'),
@@ -454,15 +495,6 @@ async function prepare() {
         models.provider.catalog.credentialVersion === models.provider.credentialVersion,
       'LIVE_CATALOG_SNAPSHOT',
     );
-    const selected = models.items.find(
-      (item) => item.modelId === 'image-vidu-q2' && item.discovered,
-    );
-    assert(
-      selected &&
-        selected.credentialVersion === models.provider.credentialVersion &&
-        selected.catalogVersion === models.provider.catalog.version,
-      'LIVE_MODEL_NOT_FOUND',
-    );
     save(
       join(directory, 'discovery-snapshot.json'),
       {
@@ -479,27 +511,78 @@ async function prepare() {
       },
       true,
     );
+    const selected = models.items.find(
+      (item) =>
+        item.discovered &&
+        (scenario === 'vidu-async'
+          ? item.modelId === 'image-vidu-q2'
+          : scenario === 'seedream-sync'
+            ? item.modelId === 'doubao-seedream-4.0'
+            : item.modelId === 'gpt-image-1' || item.modelId.startsWith('gpt-image-')),
+    );
+    assert(
+      selected &&
+        selected.credentialVersion === models.provider.credentialVersion &&
+        selected.catalogVersion === models.provider.catalog.version,
+      'LIVE_MODEL_NOT_FOUND',
+    );
     const view = await request(origin, '/api/v1/providers/onelink', 'GET', undefined, cookie);
     const revision = ((await view.json()) as { revision: number }).revision;
     const declaration = join(directory, 'declaration.json');
+    const expectedProfile =
+      scenario === 'vidu-async'
+        ? 'vidu-image-v1'
+        : scenario === 'seedream-sync'
+          ? 'seedream-4-images-v1'
+          : 'gpt-images-v1';
     save(
       declaration,
-      {
-        modelRef: selected.modelRef,
-        operation: 'image.generate',
-        profile: 'vidu-image-v1',
-        sourceKind: 'protocol-reference',
-        source: 'https://docs.onelinkai.cloud/8653257m0',
-        sourceVersion: '2026-11-14',
-        classification: 'image',
-        metadata: {
-          image: {
-            modes: ['generate'],
-            references: { maxImages: 7 },
-            async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-          },
-        },
-      },
+      scenario === 'vidu-async'
+        ? {
+            modelRef: selected.modelRef,
+            operation: 'image.generate',
+            profile: 'vidu-image-v1',
+            sourceKind: 'protocol-reference',
+            source: 'https://docs.onelinkai.cloud/8653257m0',
+            sourceVersion: '2026-11-14',
+            classification: 'image',
+            metadata: {
+              image: {
+                modes: ['generate'],
+                references: { maxImages: 7 },
+                async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+              },
+            },
+          }
+        : scenario === 'seedream-sync'
+          ? {
+              modelRef: selected.modelRef,
+              operation: 'image.generate',
+              profile: 'seedream-4-images-v1',
+              sourceKind: 'protocol-reference',
+              source: 'https://docs.onelinkai.cloud/8655248m0',
+              sourceVersion: '2026-11-14',
+              classification: 'image',
+            }
+          : {
+              modelRef: selected.modelRef,
+              operation: 'image.generate',
+              profile: 'gpt-images-v1',
+              sourceKind: 'protocol-reference',
+              source: 'https://docs.onelinkai.cloud/8882392m0',
+              sourceVersion: '2026-11-14',
+              classification: 'image',
+              metadata: {
+                image:
+                  scenario === 'gpt-edit'
+                    ? {
+                        modes: ['generate', 'edit'],
+                        mask: { format: 'png' },
+                        references: { maxImages: 4 },
+                      }
+                    : { modes: ['generate'] },
+              },
+            },
       true,
     );
     command(
@@ -530,8 +613,9 @@ async function prepare() {
               declarationVersion: number;
               sourceKind: string;
               metadata: {
-                image: {
-                  async: { operations: string[]; maxQueries: number; maxAgeSeconds: number };
+                image?: {
+                  modes?: string[];
+                  async?: { operations: string[]; maxQueries: number; maxAgeSeconds: number };
                 };
               };
             } | null;
@@ -541,26 +625,28 @@ async function prepare() {
     ).items;
     const selectedAdaptation = entries.find((item) => item.modelRef === selected.modelRef);
     const adaptation = selectedAdaptation?.image.adaptation;
+    const asyncMetadata = adaptation?.metadata?.image?.async;
     assert(
       selectedAdaptation?.discovered &&
         selectedAdaptation.credentialVersion === models.provider.credentialVersion &&
         selectedAdaptation.catalogVersion === models.provider.catalog.version &&
         selectedAdaptation?.image.runnable &&
         adaptation?.operation === 'image.generate' &&
-        adaptation.profile === 'vidu-image-v1' &&
+        adaptation.profile === expectedProfile &&
         adaptation.sourceKind === 'protocol-reference' &&
         Number.isSafeInteger(adaptation.declarationVersion) &&
         adaptation.declarationVersion > 0 &&
-        JSON.stringify(adaptation.metadata.image.async.operations) ===
-          JSON.stringify(['generate']) &&
-        adaptation.metadata.image.async.maxQueries === 8 &&
-        adaptation.metadata.image.async.maxAgeSeconds === 600 &&
-        entries.filter((item) => item.image.adaptation?.profile === 'vidu-image-v1').length === 1,
+        (scenario !== 'vidu-async' ||
+          (JSON.stringify(asyncMetadata?.operations) === JSON.stringify(['generate']) &&
+            asyncMetadata?.maxQueries === 8 &&
+            asyncMetadata?.maxAgeSeconds === 600)) &&
+        entries.filter((item) => item.image.adaptation?.profile === expectedProfile).length === 1,
       'LIVE_ADAPTATION',
     );
     save(
       join(directory, 'selected-adaptation.json'),
       {
+        scenario,
         modelId: selected.modelId,
         discovered: selectedAdaptation.discovered,
         credentialVersion: selectedAdaptation.credentialVersion,
@@ -569,7 +655,7 @@ async function prepare() {
         profile: adaptation.profile,
         sourceKind: adaptation.sourceKind,
         adaptationVersion: adaptation.declarationVersion,
-        async: adaptation.metadata.image.async,
+        ...(asyncMetadata ? { async: asyncMetadata } : {}),
       },
       true,
     );
@@ -577,6 +663,7 @@ async function prepare() {
       originPath,
       {
         candidate: candidate!,
+        scenario,
         origin,
         a,
         b,
@@ -588,7 +675,8 @@ async function prepare() {
       true,
     );
     record('prepare-complete', {
-      modelId: 'image-vidu-q2',
+      scenario,
+      modelId: selected.modelId,
       selection: 'exact current successful discovery item; not a static model-count or prefix rule',
       directoryMembers: models.items.length,
       discovered: true,
@@ -597,8 +685,12 @@ async function prepare() {
       adaptationVersion: adaptation.declarationVersion,
       operation: adaptation.operation,
       profile: adaptation.profile,
-      maxQueries: adaptation.metadata.image.async.maxQueries,
-      maxAgeSeconds: adaptation.metadata.image.async.maxAgeSeconds,
+      ...(asyncMetadata
+        ? {
+            maxQueries: asyncMetadata.maxQueries,
+            maxAgeSeconds: asyncMetadata.maxAgeSeconds,
+          }
+        : {}),
       supplierPosts: 0,
     });
   } finally {
@@ -886,6 +978,16 @@ async function replay(state: State, command: ImageCommandV1) {
 async function execute() {
   const state = JSON.parse(readFileSync(originPath, 'utf8')) as State;
   assert.equal(state.candidate, candidate, 'LIVE_CANDIDATE_CHANGED');
+  const activeScenario: Scenario = state.scenario ?? 'vidu-async';
+  assert(!explicitScenario || activeScenario === scenario, 'LIVE_SCENARIO_CHANGED');
+  const isAsync = activeScenario === 'vidu-async';
+  const expectedProfile =
+    activeScenario === 'vidu-async'
+      ? 'vidu-image-v1'
+      : activeScenario === 'seedream-sync'
+        ? 'seedream-4-images-v1'
+        : 'gpt-images-v1';
+  state.b.MIO_LIVE_IMAGE_SCENARIO = activeScenario;
   const aCos = privateEnv(first!);
   const rawBCos = privateEnv(second!);
   const bCos: Environment = { ...rawBCos };
@@ -921,7 +1023,11 @@ async function execute() {
   else delete state.a.MIO_COS_SESSION_TOKEN;
   if (bCos.MIO_COS_SESSION_TOKEN) state.b.MIO_COS_SESSION_TOKEN = bCos.MIO_COS_SESSION_TOKEN;
   else delete state.b.MIO_COS_SESSION_TOKEN;
-  save(join(directory, 'execute-started.json'), { candidate, at: new Date().toISOString() }, true);
+  save(
+    join(directory, 'execute-started.json'),
+    { candidate, scenario: activeScenario, at: new Date().toISOString() },
+    true,
+  );
   save(join(directory, 'runtime-config.json'), { a: state.a, b: state.b }, true);
   const pool = new Pool({ connectionString: state.a.MIO_AUTH_DATABASE_URL });
   let app: ChildProcess | undefined;
@@ -940,16 +1046,26 @@ async function execute() {
     const body = {
       requestId: randomUUID(),
       modelRef: state.modelRef,
-      parameters: {
-        prompt: 'A simple blue square on a white background.',
-        async: true,
-        size: '1080p',
-      },
+      parameters: isAsync
+        ? {
+            prompt: 'A simple blue square on a white background.',
+            async: true,
+            size: '1080p',
+          }
+        : {
+            prompt: 'A simple blue square on a white background.',
+            n: 1,
+            size: '1024x1024',
+          },
     };
     const created = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
     assert.equal(created.status, 202, 'LIVE_IMAGE_ADMISSION');
     const accepted = (await created.json()) as ImageView;
-    record('image-accepted', { jobId: accepted.jobId, requestId: body.requestId });
+    record('image-accepted', {
+      scenario: activeScenario,
+      jobId: accepted.jobId,
+      requestId: body.requestId,
+    });
     let frozen: ImageCommandV1 | undefined;
     for (let i = 0; i < 100; i++) {
       const result = await pool.query<{ command: ImageCommandV1; sent_at: Date | null }>(
@@ -962,213 +1078,284 @@ async function execute() {
       }
       await delay(200);
     }
-    assert(frozen && frozen.profile === 'vidu-image-v1' && frozen.credential, 'LIVE_OUTBOX');
+    assert(frozen && frozen.profile === expectedProfile && frozen.credential, 'LIVE_OUTBOX');
     save(join(directory, 'encrypted-command.json'), frozen, true);
     record('message-published', { jobId: accepted.jobId, messageId: frozen.messageId });
-    worker = child(
-      'compute/dist/main.js',
-      ['start'],
-      {
-        ...state.b,
-        MIO_LIVE_IMAGE_HOLD_FIRST_QUERY: 'yes',
-        NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}`,
-      },
-      'worker.log',
-    );
-    heldWorker = true;
     let image: ImageView | undefined;
-    let persistedTask: string | undefined;
-    let deadline: Date | undefined;
-    for (let i = 0; i < 120; i++) {
-      assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
-      const response = await request(
-        state.origin,
-        `/api/v1/compute/images/${accepted.jobId}`,
-        'GET',
-        undefined,
-        cookie,
+    let queryAttempts = 0;
+    if (isAsync) {
+      worker = child(
+        'compute/dist/main.js',
+        ['start'],
+        {
+          ...state.b,
+          MIO_LIVE_IMAGE_HOLD_FIRST_QUERY: 'yes',
+          NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}`,
+        },
+        'worker.log',
       );
-      assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
-      image = (await response.json()) as ImageView;
-      if (['unknown', 'rejected', 'failed', 'materialization_failed'].includes(image.status)) break;
-      if (existsSync(join(directory, 'supplier-query-held.json'))) {
-        const result = await pool.query<{
+      heldWorker = true;
+      let persistedTask: string | undefined;
+      let deadline: Date | undefined;
+      for (let i = 0; i < 120; i++) {
+        assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
+        const response = await request(
+          state.origin,
+          `/api/v1/compute/images/${accepted.jobId}`,
+          'GET',
+          undefined,
+          cookie,
+        );
+        assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
+        image = (await response.json()) as ImageView;
+        if (['unknown', 'rejected', 'failed', 'materialization_failed'].includes(image.status))
+          break;
+        if (existsSync(join(directory, 'supplier-query-held.json'))) {
+          const result = await pool.query<{
+            upstream_task_id: string | null;
+            query_attempt: number;
+            async_deadline: Date | null;
+            sent_at: Date | null;
+          }>(
+            'SELECT j.upstream_task_id,j.query_attempt,j.async_deadline,o.sent_at FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1',
+            [accepted.jobId],
+          );
+          const saved = result.rows[0];
+          if (
+            saved?.upstream_task_id &&
+            saved.query_attempt === 1 &&
+            saved.async_deadline &&
+            saved.sent_at
+          ) {
+            persistedTask = saved.upstream_task_id;
+            deadline = saved.async_deadline;
+            break;
+          }
+        }
+        await delay(500);
+      }
+      let submissionObservation: SanitizedSubmissionObservation | null = null;
+      if (!persistedTask || !deadline) {
+        if (image?.status === 'unknown') {
+          await stop(worker);
+          worker = undefined;
+          heldWorker = false;
+        }
+        submissionObservation =
+          image?.status === 'unknown'
+            ? journalSubmissionObservation(state.b.MIO_COMPUTE_DIRECTORY!, accepted.jobId)
+            : null;
+        const facts = await pool.query<{
           upstream_task_id: string | null;
           query_attempt: number;
-          async_deadline: Date | null;
-          sent_at: Date | null;
-        }>(
-          'SELECT j.upstream_task_id,j.query_attempt,j.async_deadline,o.sent_at FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1',
-          [accepted.jobId],
+        }>('SELECT upstream_task_id,query_attempt FROM mio_image_jobs WHERE id=$1', [
+          accepted.jobId,
+        ]);
+        if (facts.rows[0]?.upstream_task_id)
+          save(
+            join(directory, 'known-task.json'),
+            { upstreamTaskId: facts.rows[0].upstream_task_id },
+            true,
+          );
+        record('image-outcome', {
+          jobId: accepted.jobId,
+          status: image?.status ?? 'timeout',
+          errorCode: image?.errorCode ?? null,
+          supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
+          taskIdPresent: Boolean(facts.rows[0]?.upstream_task_id),
+          scheduledAttempts: facts.rows[0]?.query_attempt ?? null,
+          observation: submissionObservation,
+        });
+        throw new Error('LIVE_SUBMISSION_NOT_READY');
+      }
+      assert(!existsSync(join(directory, 'supplier-query-1.json')), 'LIVE_QUERY_ALREADY_SENT');
+      await stop(app);
+      app = undefined;
+      await interruptHeldWorker(worker);
+      worker = undefined;
+      heldWorker = false;
+      await waitHeldQueryRedelivery(state.infrastructure);
+      record('restart-before-query', { appStopped: true, workerInterrupted: true, requeued: true });
+      // The worker owns the journal's exclusive SQLite lock until it has exited.
+      const before = new DatabaseSync(join(state.b.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'), {
+        readOnly: true,
+      });
+      try {
+        const saved = before
+          .prepare('SELECT phase,payload FROM image_attempts WHERE job_id=?')
+          .get(accepted.jobId);
+        const payload = JSON.parse(String(saved?.payload)) as { upstreamTaskId?: string };
+        assert(
+          saved?.phase === 'submitted' && payload.upstreamTaskId === persistedTask,
+          'LIVE_SUBMISSION_JOURNAL',
         );
-        const saved = result.rows[0];
+      } finally {
+        before.close();
+      }
+      save(join(directory, 'allowed-task.json'), { upstreamTaskId: persistedTask }, true);
+      record('query-held-before-network', {
+        taskIdPresent: true,
+        journalTaskMatches: true,
+        queryAttempt: 1,
+        deadline: deadline.toISOString(),
+        supplierQueriesForwarded: 0,
+      });
+      app = await startApp(state);
+      cookie = await login(state.origin, {
+        email: state.owner.email,
+        password: state.owner.password,
+      });
+      otherCookie = await login(state.origin, state.other);
+      assert.equal(
+        (
+          await request(
+            state.origin,
+            `/api/v1/compute/images/${accepted.jobId}`,
+            'GET',
+            undefined,
+            otherCookie,
+          )
+        ).status,
+        404,
+        'LIVE_IMAGE_OTHER_OWNER',
+      );
+      assert.equal(
+        (
+          await request(
+            state.origin,
+            `/api/v1/compute/images/${accepted.jobId}/recover`,
+            'POST',
+            {},
+            otherCookie,
+          )
+        ).status,
+        404,
+        'LIVE_IMAGE_OTHER_RECOVERY',
+      );
+      worker = child(
+        'compute/dist/main.js',
+        ['start'],
+        { ...state.b, NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}` },
+        'worker.log',
+      );
+      while (Date.now() <= deadline.getTime() + 10_000) {
+        assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
+        const response = await request(
+          state.origin,
+          `/api/v1/compute/images/${accepted.jobId}`,
+          'GET',
+          undefined,
+          cookie,
+        );
+        assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
+        image = (await response.json()) as ImageView;
         if (
-          saved?.upstream_task_id &&
-          saved.query_attempt === 1 &&
-          saved.async_deadline &&
-          saved.sent_at
-        ) {
-          persistedTask = saved.upstream_task_id;
-          deadline = saved.async_deadline;
+          [
+            'completed',
+            'partial',
+            'unknown',
+            'rejected',
+            'failed',
+            'materialization_failed',
+          ].includes(image.status)
+        )
           break;
-        }
+        await delay(1000);
       }
-      await delay(500);
-    }
-    let submissionObservation: SanitizedSubmissionObservation | null = null;
-    if (!persistedTask || !deadline) {
-      if (image?.status === 'unknown') {
-        await stop(worker);
-        worker = undefined;
-        heldWorker = false;
-      }
-      submissionObservation =
-        image?.status === 'unknown'
-          ? journalSubmissionObservation(state.b.MIO_COMPUTE_DIRECTORY!, accepted.jobId)
-          : null;
-      const facts = await pool.query<{
-        upstream_task_id: string | null;
+      queryAttempts = Array.from({ length: 8 }, (_, index) =>
+        existsSync(join(directory, `supplier-query-${index + 1}.json`)),
+      ).filter(Boolean).length;
+      const currentTask = await pool.query<{
         query_attempt: number;
-      }>('SELECT upstream_task_id,query_attempt FROM mio_image_jobs WHERE id=$1', [accepted.jobId]);
-      if (facts.rows[0]?.upstream_task_id)
-        save(
-          join(directory, 'known-task.json'),
-          { upstreamTaskId: facts.rows[0].upstream_task_id },
-          true,
-        );
+        upstream_task_id: string | null;
+      }>('SELECT query_attempt,upstream_task_id FROM mio_image_jobs WHERE id=$1', [accepted.jobId]);
+      assert(
+        currentTask.rows[0]?.upstream_task_id === persistedTask &&
+          currentTask.rows[0].query_attempt <= 8,
+        'LIVE_QUERY_IDENTITY_OR_LIMIT',
+      );
+      assert(!existsSync(join(directory, 'supplier-query-limit-blocked.json')), 'LIVE_QUERY_LIMIT');
+      assert(
+        !existsSync(join(directory, 'supplier-query-mismatch-blocked.json')),
+        'LIVE_QUERY_TASK_MISMATCH',
+      );
       record('image-outcome', {
         jobId: accepted.jobId,
         status: image?.status ?? 'timeout',
         errorCode: image?.errorCode ?? null,
         supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
-        taskIdPresent: Boolean(facts.rows[0]?.upstream_task_id),
-        scheduledAttempts: facts.rows[0]?.query_attempt ?? null,
+        taskIdPresent: true,
+        queryAttempts,
+        scheduledAttempts: currentTask.rows[0].query_attempt,
+        otherOwnerDenied: true,
         observation: submissionObservation,
       });
-      throw new Error('LIVE_SUBMISSION_NOT_READY');
-    }
-    assert(!existsSync(join(directory, 'supplier-query-1.json')), 'LIVE_QUERY_ALREADY_SENT');
-    await stop(app);
-    app = undefined;
-    await interruptHeldWorker(worker);
-    worker = undefined;
-    heldWorker = false;
-    await waitHeldQueryRedelivery(state.infrastructure);
-    record('restart-before-query', { appStopped: true, workerInterrupted: true, requeued: true });
-    // The worker owns the journal's exclusive SQLite lock until it has exited.
-    const before = new DatabaseSync(join(state.b.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'), {
-      readOnly: true,
-    });
-    try {
-      const saved = before
-        .prepare('SELECT phase,payload FROM image_attempts WHERE job_id=?')
-        .get(accepted.jobId);
-      const payload = JSON.parse(String(saved?.payload)) as { upstreamTaskId?: string };
-      assert(
-        saved?.phase === 'submitted' && payload.upstreamTaskId === persistedTask,
-        'LIVE_SUBMISSION_JOURNAL',
+    } else {
+      assert.equal(
+        (
+          await request(
+            state.origin,
+            `/api/v1/compute/images/${accepted.jobId}`,
+            'GET',
+            undefined,
+            otherCookie,
+          )
+        ).status,
+        404,
+        'LIVE_IMAGE_OTHER_OWNER',
       );
-    } finally {
-      before.close();
-    }
-    save(join(directory, 'allowed-task.json'), { upstreamTaskId: persistedTask }, true);
-    record('query-held-before-network', {
-      taskIdPresent: true,
-      journalTaskMatches: true,
-      queryAttempt: 1,
-      deadline: deadline.toISOString(),
-      supplierQueriesForwarded: 0,
-    });
-    app = await startApp(state);
-    cookie = await login(state.origin, {
-      email: state.owner.email,
-      password: state.owner.password,
-    });
-    otherCookie = await login(state.origin, state.other);
-    assert.equal(
-      (
-        await request(
+      assert.equal(
+        (
+          await request(
+            state.origin,
+            `/api/v1/compute/images/${accepted.jobId}/recover`,
+            'POST',
+            {},
+            otherCookie,
+          )
+        ).status,
+        404,
+        'LIVE_IMAGE_OTHER_RECOVERY',
+      );
+      worker = child(
+        'compute/dist/main.js',
+        ['start'],
+        { ...state.b, NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}` },
+        'worker.log',
+      );
+      for (let i = 0; i < 240; i++) {
+        assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
+        const response = await request(
           state.origin,
           `/api/v1/compute/images/${accepted.jobId}`,
           'GET',
           undefined,
-          otherCookie,
+          cookie,
+        );
+        assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
+        image = (await response.json()) as ImageView;
+        if (
+          [
+            'completed',
+            'partial',
+            'unknown',
+            'rejected',
+            'failed',
+            'materialization_failed',
+          ].includes(image.status)
         )
-      ).status,
-      404,
-      'LIVE_IMAGE_OTHER_OWNER',
-    );
-    assert.equal(
-      (
-        await request(
-          state.origin,
-          `/api/v1/compute/images/${accepted.jobId}/recover`,
-          'POST',
-          {},
-          otherCookie,
-        )
-      ).status,
-      404,
-      'LIVE_IMAGE_OTHER_RECOVERY',
-    );
-    worker = child(
-      'compute/dist/main.js',
-      ['start'],
-      { ...state.b, NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}` },
-      'worker.log',
-    );
-    while (Date.now() <= deadline.getTime() + 10_000) {
-      assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
-      const response = await request(
-        state.origin,
-        `/api/v1/compute/images/${accepted.jobId}`,
-        'GET',
-        undefined,
-        cookie,
-      );
-      assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
-      image = (await response.json()) as ImageView;
-      if (
-        [
-          'completed',
-          'partial',
-          'unknown',
-          'rejected',
-          'failed',
-          'materialization_failed',
-        ].includes(image.status)
-      )
-        break;
-      await delay(1000);
+          break;
+        await delay(1000);
+      }
+      record('image-outcome', {
+        scenario: activeScenario,
+        jobId: accepted.jobId,
+        status: image?.status ?? 'timeout',
+        errorCode: image?.errorCode ?? null,
+        supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
+        otherOwnerDenied: true,
+      });
     }
-    const queryAttempts = Array.from({ length: 8 }, (_, index) =>
-      existsSync(join(directory, `supplier-query-${index + 1}.json`)),
-    ).filter(Boolean).length;
-    const currentTask = await pool.query<{
-      query_attempt: number;
-      upstream_task_id: string | null;
-    }>('SELECT query_attempt,upstream_task_id FROM mio_image_jobs WHERE id=$1', [accepted.jobId]);
-    assert(
-      currentTask.rows[0]?.upstream_task_id === persistedTask &&
-        currentTask.rows[0].query_attempt <= 8,
-      'LIVE_QUERY_IDENTITY_OR_LIMIT',
-    );
-    assert(!existsSync(join(directory, 'supplier-query-limit-blocked.json')), 'LIVE_QUERY_LIMIT');
-    assert(
-      !existsSync(join(directory, 'supplier-query-mismatch-blocked.json')),
-      'LIVE_QUERY_TASK_MISMATCH',
-    );
-    record('image-outcome', {
-      jobId: accepted.jobId,
-      status: image?.status ?? 'timeout',
-      errorCode: image?.errorCode ?? null,
-      supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
-      taskIdPresent: true,
-      queryAttempts,
-      scheduledAttempts: currentTask.rows[0].query_attempt,
-      otherOwnerDenied: true,
-      observation: submissionObservation,
-    });
     assert(image?.status === 'completed' && image.assetIds.length === 1, 'LIVE_IMAGE_INCOMPLETE');
     assert(
       existsSync(join(directory, 'supplier-post-started.json')) &&
@@ -1177,7 +1364,7 @@ async function execute() {
         !existsSync(join(directory, 'supplier-post-unexpected-blocked.json')),
       'LIVE_ATTEMPT_COUNT',
     );
-    await settleQueryAudit();
+    if (isAsync) await settleQueryAudit();
     await stop(worker);
     worker = undefined;
     const db = new DatabaseSync(join(state.b.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'), {
@@ -1198,7 +1385,10 @@ async function execute() {
       assert(
         new RegExp(`^mio/derived/${accepted.jobId}/images/0-[0-9a-f-]{36}\\.(png|jpeg|webp)$`).test(
           output.key,
-        ) && ['image/png', 'image/jpeg', 'image/webp'].includes(output.contentType),
+        ) &&
+          ['image/png', 'image/jpeg', 'image/webp'].includes(output.contentType) &&
+          (activeScenario !== 'seedream-sync' ||
+            (output.key.endsWith('.jpeg') && output.contentType === 'image/jpeg')),
         'LIVE_JOURNAL_OBJECT',
       );
       record('journal-complete', {
@@ -1271,12 +1461,13 @@ async function execute() {
       'LIVE_REPLAY_RESULT',
     );
     record('restart-replay-verified', {
+      scenario: activeScenario,
       jobId: accepted.jobId,
       assetId: image.assetIds[0],
       replayResultId,
       supplierPostAttempts: 1,
       supplierPostsAllowed: 1,
-      supplierQueries: queryAttempts,
+      ...(isAsync ? { supplierQueries: queryAttempts } : {}),
     });
   } catch (error) {
     operationFailure = error;
@@ -1285,36 +1476,38 @@ async function execute() {
     try {
       if (heldWorker) await interruptHeldWorker(worker);
       else {
-        await settleQueryAudit();
+        if (isAsync) await settleQueryAudit();
         await stop(worker);
       }
     } catch {
       cleanupFailures.push('worker');
     }
-    const audit = queryAuditSummary();
-    const supplierEvents = join(directory, 'supplier-http-events.jsonl');
-    const transportErrors: number[] = [];
-    if (existsSync(supplierEvents)) {
-      for (const line of readFileSync(supplierEvents, 'utf8').split('\n')) {
-        try {
-          const event = JSON.parse(line) as { event?: unknown; attempt?: unknown };
-          if (event.event === 'query-transport-error' && typeof event.attempt === 'number')
-            transportErrors.push(event.attempt);
-        } catch {
-          // The detailed trace remains the authoritative private original.
+    if (isAsync) {
+      const audit = queryAuditSummary();
+      const supplierEvents = join(directory, 'supplier-http-events.jsonl');
+      const transportErrors: number[] = [];
+      if (existsSync(supplierEvents)) {
+        for (const line of readFileSync(supplierEvents, 'utf8').split('\n')) {
+          try {
+            const event = JSON.parse(line) as { event?: unknown; attempt?: unknown };
+            if (event.event === 'query-transport-error' && typeof event.attempt === 'number')
+              transportErrors.push(event.attempt);
+          } catch {
+            // The detailed trace remains the authoritative private original.
+          }
         }
       }
+      record('query-audit-summary', { ...audit, transportErrors });
+      if (
+        !operationFailure &&
+        (!audit.issued.length ||
+          audit.missingResponses.length ||
+          audit.missingTraces.length ||
+          audit.responses.length !== audit.issued.length ||
+          audit.traces.length !== audit.responses.length)
+      )
+        operationFailure = new Error('LIVE_QUERY_AUDIT_INCOMPLETE');
     }
-    record('query-audit-summary', { ...audit, transportErrors });
-    if (
-      !operationFailure &&
-      (!audit.issued.length ||
-        audit.missingResponses.length ||
-        audit.missingTraces.length ||
-        audit.responses.length !== audit.issued.length ||
-        audit.traces.length !== audit.responses.length)
-    )
-      operationFailure = new Error('LIVE_QUERY_AUDIT_INCOMPLETE');
     try {
       if (observer) await bounded(observer.connection.close());
     } catch {

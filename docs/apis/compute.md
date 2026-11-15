@@ -30,9 +30,9 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 ## POST /api/v1/compute/images
 
-身份：当前登录用户；图片首切片仍待接受。
+身份：当前登录用户；各图片切片的已接受范围以[图片能力成果](../tasks/onelink-image-generation/complete/report.md)为准，尚未记入该成果入口的切片以及真实 GPT（当前 Key 目录 0 项 `gpt-image-*`）、Seedream edit、Gemini/Kling 与上游 outpaint `geometry` 仍保持待接受或 pending。
 
-输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前动态目录且具有已实现图片 profile 的显式声明，parameters 至少有 `prompt`。`parameters.operation` 省略时为 `generate`；`edit` 可使用本人 `imageAssetId` 或有序 `imageAssetIds` 数组，`outpaint` 还必须携带几何边界并仅在当前图片适配的 capability metadata 同时声明 `outpaint` 与 `geometry` 时可用；可选本人 `maskAssetId` 只接受 PNG。`parameters.async:true` 仅在当前 profile 显式声明 `image.async.operations` 时受理；任务先返回脱敏状态，后续由内部 `image.query` 按声明的 maxQueries/maxAgeSeconds 有界推进，HTTP 状态不返回上游任务 ID。A 逐项按系统 `user_id` 查询 ready/original 图片资产并冻结 raw ETag/长度，B 从私有 COS 以 If-Match 读取后向供应商发送白名单 multipart `image` 字段；Asset ID、对象键、ETag 和用户凭据不会透传。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、以及由该 profile/供应商契约决定的 `size`，固定输出带水印 JPEG，其他字段拒绝。这里的 `size` 是供应商生成参数，不是 W3/COS 对象容量策略。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
+输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前动态目录且具有已实现图片 profile 的显式声明，parameters 至少有 `prompt`。`parameters.operation` 省略时为 `generate`；`edit` 可使用本人 `imageAssetId` 或有序 `imageAssetIds` 数组，`outpaint` 还必须携带几何边界，因上游 `geometry` 协议尚未验证（`DESIGN-OVER-001`），默认关闭，仅在当前图片适配的 capability metadata 同时显式声明 `outpaint` 与 `geometry` 时可用；可选本人 `maskAssetId` 只接受 PNG。`parameters.async:true` 仅在当前 profile 显式声明 `image.async.operations` 时受理；任务先返回脱敏状态，后续由内部 `image.query` 按声明的 maxQueries/maxAgeSeconds 有界推进，HTTP 状态不返回上游任务 ID。A 逐项按系统 `user_id` 查询 ready/original 图片资产并冻结 raw ETag/长度，B 从私有 COS 以 If-Match 读取后向供应商发送白名单 multipart `image` 字段；Asset ID、对象键、ETag 和用户凭据不会透传。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、以及由该 profile/供应商契约决定的 `size`，固定输出带水印 JPEG，其他字段拒绝。这里的 `size` 是供应商生成参数，不是 W3/COS 对象容量策略。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
 
 首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为 capability 时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
 

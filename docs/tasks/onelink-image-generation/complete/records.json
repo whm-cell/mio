@@ -81,6 +81,48 @@
         "statement": "接受当前 E2 候选并执行 complete；真实 OneLink/COS、远端 CI、Seedream edit 和异步能力继续保留 pending，不提交、推送或部署。",
         "reference": "当前对话用户明确接受指令（2026-11-14）"
       }
+    },
+    {
+      "key": "seedream-sync-slice",
+      "title": "Seedream 4.0 真实同步生图闭环与场景化图片 Live 验收入口",
+      "locations": [
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "图片同步/异步任务受理、owner 权限与 Asset 物化绑定"
+        },
+        {
+          "path": "src/providers/catalog.ts",
+          "purpose": "当前发现模型与 seedream-4-images-v1 显式适配资格判断"
+        },
+        {
+          "path": "tests/compute/live-image-audit.ts",
+          "purpose": "场景化图片出网 POST 白名单与单次生成 POST 安全互锁（maxUpstreamGeneratePosts = 1）"
+        },
+        {
+          "path": "tests/compute/live-image-loop.ts",
+          "purpose": "支持 vidu-async、seedream-sync、gpt-sync、gpt-edit 显式场景选择的隔离真实运行与重放验证入口"
+        },
+        {
+          "path": "docs/tasks/onelink-image-generation/prd.md",
+          "purpose": "委托 complete/report.md 记录已接受切片，说明当前目录 0 项 gpt-image-*/gemini-* 的 pending 边界"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "区分图片接口已接受切片与待验证切片，明确 outpaint geometry 默认关闭（DESIGN-OVER-001）"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "补充 Seedream 4.0 同步生成端点、请求字段白名单、b64_json/JPEG 物化约束与场景化 live 验证入口说明"
+        }
+      ],
+      "outcomes": "参数化 live-image-loop.ts 与 live-image-audit.ts 支持 vidu-async、seedream-sync、gpt-sync、gpt-edit 显式场景选择并保持单次生成 POST 安全互锁；在系统 user_id、PG outbox/journal、私有 COS/Asset 与当前动态目录边界内，完成 doubao-seedream-4.0（seedream-4-images-v1）单次真实同步生图、私有 COS 物化、owner Asset 下载校验、跨用户 404 及重启/MQ 重放不重复提交闭环，以及 gpt-sync 在目录缺失时的 LIVE_MODEL_NOT_FOUND fail-closed 验证；同步对齐公共文档状态。",
+      "verification": "当前候选 0724efaced912d86e1426dc54f0b00e277528e4f603c338bbfc4c289e6a0964b 通过 18 项 live-audit 单测、72 项图片与 Worker 回归测试、format:check、typecheck、lint、guard、pnpm work documents 及基于 E3 完整基线的增量 full-check；在本地隔离 PG/RabbitMQ、私有 COS 与当前用户 OneLink Key 上真实执行 1 次 doubao-seedream-4.0 同步闭环（1 次 POST，0 次重放重复 POST）及 1 次 gpt-sync 目录缺失 fail-closed 验证（LIVE_MODEL_NOT_FOUND，0 次 POST）；quality-review 与 norms-review 三方对账通过。",
+      "limitations": "真实供应商观察限于当前用户 Key 目录中的 doubao-seedream-4.0（及既有已接受的 image-vidu-q2）；当前目录含 0 项 gpt-image-* 与 gemini-*，真实 GPT 生成/编辑/多参考、Seedream edit、真实供应商 outpaint geometry 与 Gemini/Kling 保持 pending；远端 GitHub Actions 与生产性能不在本轮范围。",
+      "acceptance": {
+        "candidate": "0724efaced912d86e1426dc54f0b00e277528e4f603c338bbfc4c289e6a0964b",
+        "statement": "用户确认执行计划并授权推进 U0（接受 seedream-sync-slice 并进入 complete 落盘本地提交）与后续优化任务",
+        "reference": "conversation://ea0b4ffc-2195-452c-b802-bccf372807a8 (2026-11-15 user U0-U2 execution authorization)"
+      }
     }
   ]
 }

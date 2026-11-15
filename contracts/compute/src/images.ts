@@ -7,6 +7,34 @@ export function isImageProfile(value: unknown): value is ImageProfile {
 export const IMAGE_OPERATIONS = ['generate', 'edit', 'outpaint'] as const;
 export type ImageOperation = (typeof IMAGE_OPERATIONS)[number];
 
+export interface ImageProfileRule {
+  readonly supportedOperations: readonly ImageOperation[];
+  readonly requiresAsync: boolean;
+  readonly allowGenerateReferences: boolean;
+  readonly fixedOutputFormat: 'jpeg' | null;
+}
+
+export const IMAGE_PROFILE_RULES = {
+  'gpt-images-v1': {
+    supportedOperations: ['generate', 'edit', 'outpaint'],
+    requiresAsync: false,
+    allowGenerateReferences: false,
+    fixedOutputFormat: null,
+  },
+  'seedream-4-images-v1': {
+    supportedOperations: ['generate'],
+    requiresAsync: false,
+    allowGenerateReferences: false,
+    fixedOutputFormat: 'jpeg',
+  },
+  'vidu-image-v1': {
+    supportedOperations: ['generate'],
+    requiresAsync: true,
+    allowGenerateReferences: true,
+    fixedOutputFormat: null,
+  },
+} as const satisfies Record<ImageProfile, ImageProfileRule>;
+
 export const IMAGE_GEOMETRY_EDGES = ['left', 'top', 'right', 'bottom'] as const;
 export type ImageGeometryEdge = (typeof IMAGE_GEOMETRY_EDGES)[number];
 
@@ -486,73 +514,7 @@ const inputFields = new Set([
   'user',
 ]);
 
-export function validImageInput(input: ImageInput, profile: ImageProfile): boolean {
-  if (!isImageProfile(profile)) return false;
-  if (Object.keys(input).some((key) => !inputFields.has(key))) return false;
-  if (
-    typeof input.model !== 'string' ||
-    !input.model.trim() ||
-    input.model.length > 256 ||
-    /[\x00-\x1f\x7f]/.test(input.model)
-  )
-    return false;
-  if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 32_000)
-    return false;
-  if (input.async !== undefined && typeof input.async !== 'boolean') return false;
-  const operation = input.operation ?? 'generate';
-  if (!IMAGE_OPERATIONS.includes(operation)) return false;
-  const images = input.images ?? (input.image ? [input.image] : []);
-  if (input.image !== undefined && input.images !== undefined) return false;
-  if (
-    input.images !== undefined &&
-    (!Array.isArray(input.images) ||
-      input.images.length < 1 ||
-      input.images.some((image) => !validAssetRef(image)) ||
-      new Set(input.images.map((image) => image.assetId)).size !== input.images.length)
-  )
-    return false;
-  if (input.geometry !== undefined && !validImageGeometry(input.geometry)) return false;
-  if (
-    operation === 'generate' &&
-    ((profile !== 'vidu-image-v1' && images.length > 0) ||
-      input.mask !== undefined ||
-      input.geometry !== undefined)
-  )
-    return false;
-  if (
-    (operation === 'edit' || operation === 'outpaint') &&
-    (profile !== 'gpt-images-v1' ||
-      images.length < 1 ||
-      (input.mask !== undefined && !validAssetRef(input.mask, true)))
-  )
-    return false;
-  if (operation === 'edit' && input.mask !== undefined && images.length < 1) return false;
-  if (operation === 'outpaint' && input.geometry === undefined) return false;
-  if (operation !== 'outpaint' && input.geometry !== undefined) return false;
-  if (profile === 'seedream-4-images-v1') {
-    return (
-      operation === 'generate' &&
-      Object.keys(input).every((key) =>
-        ['model', 'prompt', 'operation', 'n', 'size'].includes(key),
-      ) &&
-      (input.n === undefined || input.n === 1) &&
-      (input.size === undefined || input.size === '1024x1024')
-    );
-  }
-  if (profile === 'vidu-image-v1') {
-    return (
-      operation === 'generate' &&
-      input.async === true &&
-      input.image === undefined &&
-      input.mask === undefined &&
-      input.geometry === undefined &&
-      input.n === undefined &&
-      (input.size === undefined || ['1080p', '2K', '4K'].includes(input.size)) &&
-      Object.keys(input).every((key) =>
-        ['model', 'prompt', 'async', 'operation', 'images', 'n', 'size'].includes(key),
-      )
-    );
-  }
+function validGptImageInput(input: ImageInput): boolean {
   if (input.n !== undefined && (!Number.isInteger(input.n) || input.n < 1 || input.n > 10))
     return false;
   const enums = {
@@ -601,6 +563,83 @@ export function validImageInput(input: ImageInput, profile: ImageProfile): boole
       input.user.length <= 256 &&
       !/[\x00-\x1f\x7f]/.test(input.user))
   );
+}
+
+export function validImageInput(input: ImageInput, profile: ImageProfile): boolean {
+  if (!isImageProfile(profile)) return false;
+  if (Object.keys(input).some((key) => !inputFields.has(key))) return false;
+  if (
+    typeof input.model !== 'string' ||
+    !input.model.trim() ||
+    input.model.length > 256 ||
+    /[\x00-\x1f\x7f]/.test(input.model)
+  )
+    return false;
+  if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 32_000)
+    return false;
+  if (input.async !== undefined && typeof input.async !== 'boolean') return false;
+  const operation = input.operation ?? 'generate';
+  if (!IMAGE_OPERATIONS.includes(operation)) return false;
+  const rules = IMAGE_PROFILE_RULES[profile];
+  if (!rules.supportedOperations.some((item) => item === operation)) return false;
+  if (rules.requiresAsync && input.async !== true) return false;
+  const images = input.images ?? (input.image ? [input.image] : []);
+  if (input.image !== undefined && input.images !== undefined) return false;
+  if (
+    input.images !== undefined &&
+    (!Array.isArray(input.images) ||
+      input.images.length < 1 ||
+      input.images.some((image) => !validAssetRef(image)) ||
+      new Set(input.images.map((image) => image.assetId)).size !== input.images.length)
+  )
+    return false;
+  if (input.geometry !== undefined && !validImageGeometry(input.geometry)) return false;
+  if (
+    operation === 'generate' &&
+    ((!rules.allowGenerateReferences && images.length > 0) ||
+      input.mask !== undefined ||
+      input.geometry !== undefined)
+  )
+    return false;
+  if (
+    (operation === 'edit' || operation === 'outpaint') &&
+    (images.length < 1 || (input.mask !== undefined && !validAssetRef(input.mask, true)))
+  )
+    return false;
+  if (operation === 'edit' && input.mask !== undefined && images.length < 1) return false;
+  if (operation === 'outpaint' && input.geometry === undefined) return false;
+  if (operation !== 'outpaint' && input.geometry !== undefined) return false;
+  switch (profile) {
+    case 'seedream-4-images-v1':
+      return (
+        operation === 'generate' &&
+        Object.keys(input).every((key) =>
+          ['model', 'prompt', 'operation', 'n', 'size'].includes(key),
+        ) &&
+        (input.n === undefined || input.n === 1) &&
+        (input.size === undefined || input.size === '1024x1024')
+      );
+    case 'vidu-image-v1':
+      return (
+        operation === 'generate' &&
+        input.async === true &&
+        input.image === undefined &&
+        input.mask === undefined &&
+        input.geometry === undefined &&
+        input.n === undefined &&
+        (input.size === undefined || ['1080p', '2K', '4K'].includes(input.size)) &&
+        Object.keys(input).every((key) =>
+          ['model', 'prompt', 'async', 'operation', 'images', 'n', 'size'].includes(key),
+        )
+      );
+    case 'gpt-images-v1':
+      return validGptImageInput(input);
+    default: {
+      const exhaustive: never = profile;
+      void exhaustive;
+      return false;
+    }
+  }
 }
 
 function validImageGeometry(value: unknown): value is ImageGeometry {

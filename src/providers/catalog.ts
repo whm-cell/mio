@@ -1,5 +1,11 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { IMAGE_GEOMETRY_EDGES, IMAGE_OPERATIONS, isImageProfile } from '@mio/compute-contracts';
+import {
+  IMAGE_GEOMETRY_EDGES,
+  IMAGE_OPERATIONS,
+  IMAGE_PROFILE_RULES,
+  isImageProfile,
+} from '@mio/compute-contracts';
+import type { ImageProfile } from '@mio/compute-contracts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -105,9 +111,9 @@ export function validateDeclaration(value: unknown): AdaptationDeclaration {
         new Set(capability.modes).size !== capability.modes.length
       )
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
-      if (capability.modes.includes('edit') && entry.profile !== 'gpt-images-v1')
-        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
-      if (capability.modes.includes('outpaint') && entry.profile !== 'gpt-images-v1')
+      const supportedModes: readonly string[] =
+        IMAGE_PROFILE_RULES[entry.profile].supportedOperations;
+      if (capability.modes.some((mode) => !supportedModes.includes(String(mode))))
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ADAPTATION_INVALID');
       if ('mask' in capability) {
         if (!capability.modes.includes('edit'))
@@ -233,7 +239,10 @@ export function catalogView(state: ProviderState | null, category?: Category) {
   );
   const imagesByModel = new Map(
     (state?.adaptations ?? [])
-      .filter((item) => item.operation === 'image.generate' && isImageProfile(item.profile))
+      .filter(
+        (item): item is AdaptationRecord & { operation: 'image.generate'; profile: ImageProfile } =>
+          item.operation === 'image.generate' && isImageProfile(item.profile),
+      )
       .map((item) => [item.model_key, item]),
   );
   const prefs = new Map<string, ModelPreference[]>();
@@ -261,8 +270,9 @@ export function catalogView(state: ProviderState | null, category?: Category) {
       const image = preferences.find((pref) => pref.usage === 'image');
       const imageAdaptation = imagesByModel.get(model.model_key);
       const imageAsyncReady =
-        imageAdaptation?.profile !== 'vidu-image-v1' ||
-        imageAdaptation.capability_metadata.image?.async?.operations.includes('generate');
+        !imageAdaptation ||
+        !IMAGE_PROFILE_RULES[imageAdaptation.profile].requiresAsync ||
+        Boolean(imageAdaptation.capability_metadata.image?.async?.operations.includes('generate'));
       const imageReason =
         membershipError(state!, model) ??
         (!imageAdaptation || !imageAsyncReady

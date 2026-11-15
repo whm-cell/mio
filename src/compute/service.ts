@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { sealImageKey } from './image-credentials.ts';
 import type { ProviderService } from '../providers/service.ts';
 import {
+  IMAGE_PROFILE_RULES,
   canonicalImageInput,
   imageQueryCredentialBinding,
   parseImageCommand,
@@ -385,7 +386,8 @@ export function createComputeService(
         if (
           operation === 'generate' &&
           requestedImageIds.length > 0 &&
-          (snapshot.profile !== 'vidu-image-v1' || !imageCapability?.references)
+          (!IMAGE_PROFILE_RULES[snapshot.profile].allowGenerateReferences ||
+            !imageCapability?.references)
         )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
         if (

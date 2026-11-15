@@ -401,6 +401,57 @@ function validBase64(value: unknown): value is string {
   return true;
 }
 
+async function buildGptEditFormData(
+  input: ImageInput,
+  operation: string,
+  bounded: AbortSignal,
+  read?: ReadImage,
+): Promise<FormData | null> {
+  const refs = input.images ?? (input.image ? [input.image] : []);
+  if (!refs.length) return null;
+  const form = new FormData();
+  form.set('model', input.model);
+  form.set('prompt', input.prompt);
+  form.set('response_format', 'b64_json');
+  for (const ref of refs) {
+    const source = await read?.(ref, bounded);
+    if (!source || !matchesImageSignature(source, ref.contentType)) return null;
+    const sourceBytes = Uint8Array.from(source);
+    form.append(
+      'image',
+      new Blob([sourceBytes.buffer as ArrayBuffer], { type: ref.contentType }),
+      `image.${imageExtension(ref.contentType)}`,
+    );
+  }
+  if (operation === 'outpaint' && input.geometry)
+    form.set('geometry', JSON.stringify(input.geometry));
+  if (input.mask) {
+    const mask = await read?.(input.mask, bounded);
+    if (!mask || !matchesImageSignature(mask, input.mask.contentType)) return null;
+    const maskBytes = Uint8Array.from(mask);
+    form.append(
+      'mask',
+      new Blob([maskBytes.buffer as ArrayBuffer], { type: input.mask.contentType }),
+      'mask.png',
+    );
+  }
+  const optional = [
+    'n',
+    'background',
+    'moderation',
+    'quality',
+    'size',
+    'output_format',
+    'output_compression',
+    'user',
+  ] as const;
+  for (const key of optional) {
+    const value = input[key];
+    if (value !== undefined) form.set(key, String(value));
+  }
+  return form;
+}
+
 /** B-only transport. Caller must persist submission intent BEFORE calling this once.
  * No response here establishes durable completion or permits another POST.
  * Base64 remains untrusted until the materializer validates actual image contents.
@@ -517,14 +568,12 @@ export function createImageProtocol(
       read?: ReadImage,
     ): Promise<ImageSubmission> {
       if (
-        profile === 'vidu-image-v1' ||
         !validImageInput(input, profile) ||
         (input.operation ?? 'generate') !== operation ||
         !apiKey ||
         /[\r\n]/.test(apiKey)
       )
         return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
-      const seedream = profile === 'seedream-4-images-v1';
       const deadline = AbortSignal.timeout(180_000);
       const bounded = signal ? AbortSignal.any([signal, deadline]) : deadline;
       if (bounded.aborted) return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
@@ -534,73 +583,46 @@ export function createImageProtocol(
       let body: BodyInit;
       let endpoint: string;
       let headers: Record<string, string>;
+      let primaryUsageField:
+        readonly ['generated_images', 'generatedImages'] | readonly ['input_tokens', 'inputTokens'];
       try {
-        if (operation === 'edit' || operation === 'outpaint') {
-          if (seedream) return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
-          const refs = input.images ?? (input.image ? [input.image] : []);
-          if (!refs.length) return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
-          const form = new FormData();
-          form.set('model', input.model);
-          form.set('prompt', input.prompt);
-          form.set('response_format', 'b64_json');
-          for (const ref of refs) {
-            const source = await (read ?? readImage)?.(ref, bounded);
-            if (!source || !matchesImageSignature(source, ref.contentType))
-              return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
-            const sourceBytes = Uint8Array.from(source);
-            form.append(
-              'image',
-              new Blob([sourceBytes.buffer as ArrayBuffer], { type: ref.contentType }),
-              `image.${imageExtension(ref.contentType)}`,
-            );
+        switch (profile) {
+          case 'vidu-image-v1':
+            return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
+          case 'seedream-4-images-v1':
+            if (operation !== 'generate') return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
+            primaryUsageField = ['generated_images', 'generatedImages'];
+            endpoint = 'https://api.onelinkai.cloud/volc/api/v3/images/generations';
+            headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+            body = JSON.stringify({
+              model: input.model,
+              prompt: input.prompt,
+              size: input.size ?? '1024x1024',
+              response_format: 'b64_json',
+              sequential_image_generation: 'disabled',
+              stream: false,
+              watermark: true,
+            });
+            break;
+          case 'gpt-images-v1':
+            primaryUsageField = ['input_tokens', 'inputTokens'];
+            if (operation === 'edit' || operation === 'outpaint') {
+              const form = await buildGptEditFormData(input, operation, bounded, read ?? readImage);
+              if (!form) return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
+              body = form;
+              endpoint = 'https://api.onelinkai.cloud/v1/images/edits';
+              headers = { Authorization: `Bearer ${apiKey}` };
+            } else {
+              endpoint = 'https://api.onelinkai.cloud/v1/images/generations';
+              headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+              body = JSON.stringify(input);
+            }
+            break;
+          default: {
+            const exhaustive: never = profile;
+            void exhaustive;
+            return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
           }
-          if (operation === 'outpaint' && input.geometry)
-            form.set('geometry', JSON.stringify(input.geometry));
-          if (input.mask) {
-            const mask = await (read ?? readImage)?.(input.mask, bounded);
-            if (!mask || !matchesImageSignature(mask, input.mask.contentType))
-              return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
-            const maskBytes = Uint8Array.from(mask);
-            form.append(
-              'mask',
-              new Blob([maskBytes.buffer as ArrayBuffer], { type: input.mask.contentType }),
-              'mask.png',
-            );
-          }
-          const optional = [
-            'n',
-            'background',
-            'moderation',
-            'quality',
-            'size',
-            'output_format',
-            'output_compression',
-            'user',
-          ] as const;
-          for (const key of optional) {
-            const value = input[key];
-            if (value !== undefined) form.set(key, String(value));
-          }
-          body = form;
-          endpoint = 'https://api.onelinkai.cloud/v1/images/edits';
-          headers = { Authorization: `Bearer ${apiKey}` };
-        } else {
-          const payload = seedream
-            ? {
-                model: input.model,
-                prompt: input.prompt,
-                size: input.size ?? '1024x1024',
-                response_format: 'b64_json',
-                sequential_image_generation: 'disabled',
-                stream: false,
-                watermark: true,
-              }
-            : input;
-          endpoint = seedream
-            ? 'https://api.onelinkai.cloud/volc/api/v3/images/generations'
-            : 'https://api.onelinkai.cloud/v1/images/generations';
-          headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-          body = JSON.stringify(payload);
         }
       } catch {
         return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
@@ -657,9 +679,7 @@ export function createImageProtocol(
         if ('usage' in payload && payload.usage && typeof payload.usage === 'object') {
           const usage = payload.usage as Record<string, unknown>;
           const fields = [
-            ...(seedream
-              ? ([['generated_images', 'generatedImages']] as const)
-              : ([['input_tokens', 'inputTokens']] as const)),
+            primaryUsageField,
             ['output_tokens', 'outputTokens'],
             ['total_tokens', 'totalTokens'],
           ] as const;

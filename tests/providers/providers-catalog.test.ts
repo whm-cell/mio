@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { expect, it } from 'vitest';
+import { IMAGE_PROFILES, IMAGE_PROFILE_RULES } from '@mio/compute-contracts';
 import { catalogView, legacyReference, validateDeclaration } from '../../src/providers/catalog.ts';
+import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import {
   legacyPresets,
   legacySource,
@@ -171,4 +173,37 @@ it('requires a non-catalog adaptation source kind and never treats catalog membe
   expect(
     validateDeclaration({ ...entry, sourceKind: 'runtime-observation', source: 'test-run-42' }),
   ).toMatchObject({ sourceKind: 'runtime-observation' });
+});
+
+it('derives provider adaptation profile constraints and mode gates from IMAGE_PROFILES and IMAGE_PROFILE_RULES', () => {
+  const expectedSqlList = IMAGE_PROFILES.map((profile) => `'${profile}'`).join(',');
+  expect(providerSchemaSQL).toContain(
+    `(operation='image.generate' AND profile IN (${expectedSqlList}))`,
+  );
+  for (const profile of IMAGE_PROFILES) {
+    const supported: readonly string[] = IMAGE_PROFILE_RULES[profile].supportedOperations;
+    for (const mode of ['edit', 'outpaint'] as const) {
+      const declaration = {
+        modelRef: `onelink:model:${profile}`,
+        operation: 'image.generate' as const,
+        profile,
+        sourceKind: 'protocol-reference' as const,
+        source: 'fixture',
+        sourceVersion: 'v1',
+        metadata: {
+          image: {
+            modes: ['generate', mode],
+            ...(mode === 'outpaint'
+              ? { geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] } }
+              : {}),
+          },
+        },
+      };
+      if (supported.includes(mode)) {
+        expect(validateDeclaration(declaration)).toMatchObject({ profile });
+      } else {
+        expect(() => validateDeclaration(declaration)).toThrow('ADAPTATION_INVALID');
+      }
+    }
+  }
 });

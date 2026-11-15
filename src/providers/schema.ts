@@ -1,6 +1,13 @@
 import type { Pool } from 'pg';
+import { IMAGE_PROFILES } from '@mio/compute-contracts';
 import { legacyProviderUpgradeSQL } from './schema-migration.ts';
 export { providerReferencesSQL } from './schema-migration.ts';
+
+const imageProfileSqlLiterals = IMAGE_PROFILES.map((profile) => {
+  if (!/^[a-z0-9-]+$/.test(profile))
+    throw new Error(`PROVIDER_SCHEMA: unsafe image profile identifier ${profile}`);
+  return `'${profile}'`;
+});
 
 /** Explicit migration only. Startup runs the read-only check below. */
 export const providerSchemaSQL = `
@@ -83,7 +90,7 @@ ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_ada
   CHECK(operation IN ('chat','image.generate'));
 ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_profile_check
   CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
-        (operation='image.generate' AND profile IN ('gpt-images-v1','seedream-4-images-v1','vidu-image-v1')));
+        (operation='image.generate' AND profile IN (${imageProfileSqlLiterals.join(',')})));
 ${legacyProviderUpgradeSQL}
 CREATE TABLE IF NOT EXISTS mio_provider_model_preferences (
   provider_id uuid NOT NULL, model_key uuid NOT NULL, model_ref text,
@@ -160,10 +167,7 @@ export async function checkProviderSchema(
         ["'protocol-reference'", "'runtime-observation'"],
       ],
       ['mio_provider_model_adaptations_operation_check', ["'image.generate'"]],
-      [
-        'mio_provider_model_adaptations_profile_check',
-        ["'gpt-images-v1'", "'seedream-4-images-v1'", "'vidu-image-v1'"],
-      ],
+      ['mio_provider_model_adaptations_profile_check', imageProfileSqlLiterals],
     ] as const) {
       const constraint = adaptations.rows.find((item) => item.name === name);
       if (!constraint?.valid || !texts.every((text) => constraint.definition.includes(text)))

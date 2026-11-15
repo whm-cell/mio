@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { parseImageQuery, parseImageResult } from '@mio/compute-contracts';
+import {
+  IMAGE_PROFILES,
+  IMAGE_PROFILE_RULES,
+  parseImageQuery,
+  parseImageResult,
+  validImageInput,
+  type ImageProfile,
+  type ImageProfileRule,
+} from '@mio/compute-contracts';
 import { createImageProtocol, createViduAsyncImageTransport } from '../src/images.ts';
 import type { ReadImage } from '../src/images.ts';
 
@@ -914,5 +922,40 @@ describe('GPT image protocol', () => {
     );
     expect('code' in result && result.code).toBe(code);
     expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('keeps IMAGE_PROFILE_RULES exhaustive across IMAGE_PROFILES and fails closed on unknown profiles', async () => {
+    const ruleKeys = Object.keys(IMAGE_PROFILE_RULES).sort();
+    expect(ruleKeys).toEqual([...IMAGE_PROFILES].sort());
+    const expected: Record<ImageProfile, ImageProfileRule> = {
+      'gpt-images-v1': {
+        supportedOperations: ['generate', 'edit', 'outpaint'],
+        requiresAsync: false,
+        allowGenerateReferences: false,
+        fixedOutputFormat: null,
+      },
+      'seedream-4-images-v1': {
+        supportedOperations: ['generate'],
+        requiresAsync: false,
+        allowGenerateReferences: false,
+        fixedOutputFormat: 'jpeg',
+      },
+      'vidu-image-v1': {
+        supportedOperations: ['generate'],
+        requiresAsync: true,
+        allowGenerateReferences: true,
+        fixedOutputFormat: null,
+      },
+    };
+    expect(IMAGE_PROFILE_RULES).toEqual(expected);
+    expect(validImageInput(input, 'unknown-profile-v1' as ImageProfile)).toBe(false);
+    const transport = vi.fn<typeof fetch>();
+    await expect(
+      createImageProtocol('vidu-image-v1', 'generate', transport).submit(
+        { model: 'image-vidu-q2', prompt: 'async only', async: true },
+        key,
+      ),
+    ).resolves.toEqual({ state: 'rejected', code: 'IMAGE_INPUT_INVALID' });
+    expect(transport).not.toHaveBeenCalled();
   });
 });

@@ -1283,3 +1283,170 @@ it('admits only a discovered and explicitly async Vidu model through HTTP and th
     await database.close();
   }
 }, 15000);
+
+it('admits only an explicitly declared async Kling model and rejects sync, size, multi-output, references, and omni models', async () => {
+  const database = await authDatabase();
+  const pool = new Pool({ connectionString: database.url });
+  await pool.query(assetSchemaSQL);
+  await pool.query(computeSchemaSQL);
+  await pool.query(providerSchemaSQL);
+  const config = { databaseURL: database.url, masterKey: randomBytes(32), masterKeyId: 'fixture' };
+  const providerStore = await createProviderStore(config, true);
+  const provider = createProviderService(providerStore, config, async () =>
+    Response.json({
+      data: ['image-kling-v3', 'image-kling-v3-omni', 'fixture-kling-incomplete'].map((id) => ({
+        id,
+        object: 'model',
+        owned_by: 'fixture',
+      })),
+    }),
+  );
+  const actor = { userId: randomUUID(), sessionId: 'fixture-kling' };
+  await provider.save(actor, 0, 'synthetic-kling-provider-key');
+  await provider.discover(actor);
+  const catalog = (await provider.catalog(actor)).items;
+  const model = (id: string) => catalog.find((item) => item.modelId === id)!.modelRef;
+  const declaration = {
+    operation: 'image.generate' as const,
+    profile: 'kling-image-v1' as const,
+    sourceKind: 'protocol-reference' as const,
+    source: 'https://docs.onelinkai.cloud/8653497m0',
+    sourceVersion: '2026-09-08',
+    classification: 'image' as const,
+  };
+  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
+    ...declaration,
+    modelRef: model('fixture-kling-incomplete'),
+  });
+  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
+    ...declaration,
+    modelRef: model('image-kling-v3'),
+    metadata: {
+      image: {
+        modes: ['generate'],
+        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+    },
+  });
+  const keys = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const directory = mkdtempSync(join(tmpdir(), 'mio-kling-admission-'));
+  const journal = new Journal(directory, randomUUID(), true);
+  const transport = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+    if (String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations') {
+      expect(init?.method).toBe('POST');
+      expect(JSON.parse(String(init?.body))).toEqual({
+        model_name: 'image-kling-v3',
+        prompt: 'fixture',
+        n: 1,
+      });
+      return Response.json({ code: 0, data: { task_id: 'kling-http-task-1' } });
+    }
+    if (
+      String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations/kling-http-task-1'
+    ) {
+      return Response.json({
+        code: 0,
+        data: { task_id: 'kling-http-task-1', task_status: 'processing' },
+      });
+    }
+    throw new Error(`unexpected URL ${String(url)}`);
+  });
+  const worker = createImageWorker(journal, 'b1', keys.privateKey, vi.fn(), transport);
+  bus.execute = async (command) => {
+    if (command.type === 'image.recover') throw new Error('unexpected recovery');
+    const result = await worker(command);
+    await bus.receive!(
+      parseImageResult({
+        version: 1,
+        type: 'image.result',
+        messageId: randomUUID(),
+        commandId: command.type === 'image.query' ? command.commandId : command.messageId,
+        jobId: command.jobId,
+        state: result.state,
+        outputs: 'outputs' in result ? result.outputs : [],
+        ...('errorCode' in result ? { errorCode: result.errorCode } : {}),
+        ...('upstreamTaskId' in result ? { upstreamTaskId: result.upstreamTaskId } : {}),
+        ...('queryAttempt' in result ? { queryAttempt: result.queryAttempt } : {}),
+      }),
+    );
+  };
+  bus.receive = undefined;
+  const service = createComputeService(
+    new ComputeStore(pool, true),
+    {
+      head: vi.fn(),
+      uploadUrl: () => '',
+      downloadUrl: () => '',
+      copy: async () => {},
+      delete: async () => {},
+    },
+    { brokerURL: 'amqp://localhost', brokerUser: 'a', expectedResultUser: 'b' },
+    { keyId: 'b1', publicKey: keys.publicKey, provider: () => provider },
+  );
+  let origin = '';
+  const server = createServer(
+    (req, res) => void createComputeHandler(service, async () => actor, [origin])(req, res),
+  );
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('fixture server');
+  origin = `http://127.0.0.1:${address.port}`;
+  const call = (modelRef: string, parameters: Record<string, unknown>) =>
+    fetch(`${origin}/api/v1/compute/images`, {
+      method: 'POST',
+      headers: { origin, 'content-type': 'application/json' },
+      body: JSON.stringify({ requestId: randomUUID(), modelRef, parameters }),
+    });
+  try {
+    const omni = await call(model('image-kling-v3-omni'), { prompt: 'fixture', async: true });
+    expect(omni.status).toBe(409);
+    expect((await omni.json()).error.code).toBe('ADAPTER_PENDING');
+
+    const incomplete = await call(model('fixture-kling-incomplete'), {
+      prompt: 'fixture',
+      async: true,
+    });
+    expect(incomplete.status).toBe(409);
+    expect((await incomplete.json()).error.code).toBe('IMAGE_OPERATION_UNSUPPORTED');
+
+    for (const invalidParams of [
+      { prompt: 'fixture' },
+      { prompt: 'fixture', async: false },
+      { prompt: 'fixture', async: true, size: '1080p' },
+      { prompt: 'fixture', async: true, n: 2 },
+    ]) {
+      const rejected = await call(model('image-kling-v3'), invalidParams);
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error.code).toBe('IMAGE_INPUT_INVALID');
+    }
+
+    for (const unsupportedParams of [
+      { prompt: 'fixture', async: true, imageAssetId: randomUUID() },
+      { prompt: 'fixture', async: true, operation: 'generate', imageAssetIds: [randomUUID()] },
+    ]) {
+      const unsupported = await call(model('image-kling-v3'), unsupportedParams);
+      expect(unsupported.status).toBe(409);
+      expect((await unsupported.json()).error.code).toBe('IMAGE_OPERATION_UNSUPPORTED');
+    }
+    expect(transport).not.toHaveBeenCalled();
+
+    const admitted = await call(model('image-kling-v3'), { prompt: 'fixture', async: true });
+    expect(admitted.status).toBe(202);
+    await vi.waitFor(() => expect(transport).toHaveBeenCalled(), { timeout: 4000 });
+    expect(String(transport.mock.calls[0]?.[0])).toBe(
+      'https://api.onelinkai.cloud/kling/v1/images/generations',
+    );
+  } finally {
+    await service.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    journal.close();
+    rmSync(directory, { recursive: true });
+    await provider.close();
+    await database.close();
+  }
+}, 15000);

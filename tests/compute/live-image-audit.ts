@@ -16,6 +16,7 @@ const SCENARIO_POST_ENDPOINTS = {
     'https://api.onelinkai.cloud/vidu/ent/v2/reference2image',
     'https://api.onelinkai.cloud/vidu/ent/v2/img2img',
   ],
+  'kling-async': ['https://api.onelinkai.cloud/kling/v1/images/generations'],
   'seedream-sync': ['https://api.onelinkai.cloud/volc/api/v3/images/generations'],
   'gpt-sync': ['https://api.onelinkai.cloud/v1/images/generations'],
   'gpt-edit': ['https://api.onelinkai.cloud/v1/images/edits'],
@@ -90,14 +91,55 @@ async function observeQuery(response: Response, attempt: number) {
       const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         const payload = value as Record<string, unknown>;
-        facts.stateType = payload.state === undefined ? 'absent' : typeof payload.state;
-        facts.state =
-          typeof payload.state !== 'string'
-            ? 'unknown'
-            : ['created', 'queueing', 'processing', 'success', 'failed'].includes(payload.state)
-              ? payload.state
-              : 'other';
-        const creations = payload.creations;
+        let creations: unknown;
+        if (scenario === 'kling-async') {
+          facts.codeZero = payload.code === 0;
+          const data =
+            payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+              ? (payload.data as Record<string, unknown>)
+              : null;
+          const status = data?.task_status;
+          facts.stateType = status === undefined ? 'absent' : typeof status;
+          const normalizedStatus =
+            typeof status === 'string' &&
+            /^[A-Za-z_]+$/.test(status) &&
+            (status === status.toLowerCase() || status === status.toUpperCase())
+              ? status.toLowerCase()
+              : '';
+          facts.state =
+            typeof status !== 'string'
+              ? 'unknown'
+              : [
+                    'not_start',
+                    'submitted',
+                    'queued',
+                    'queueing',
+                    'in_progress',
+                    'processing',
+                    'succeed',
+                    'success',
+                    'failed',
+                    'failure',
+                  ].includes(normalizedStatus)
+                ? normalizedStatus
+                : 'other';
+          const taskResult =
+            data?.task_result &&
+            typeof data.task_result === 'object' &&
+            !Array.isArray(data.task_result)
+              ? (data.task_result as Record<string, unknown>)
+              : null;
+          creations = taskResult?.images;
+        } else {
+          facts.stateType = payload.state === undefined ? 'absent' : typeof payload.state;
+          facts.state =
+            typeof payload.state !== 'string'
+              ? 'unknown'
+              : ['created', 'queueing', 'processing', 'success', 'failed'].includes(payload.state)
+                ? payload.state
+                : 'other';
+          creations = payload.creations;
+        }
         facts.creationsType =
           creations === undefined
             ? 'absent'
@@ -139,10 +181,12 @@ globalThis.fetch = (input, init) => {
   const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
   const target = new URL(url);
   const query =
-    scenario === 'vidu-async' &&
     method === 'GET' &&
     target.origin === 'https://api.onelinkai.cloud' &&
-    /^\/vidu\/ent\/v2\/tasks\/[^/]+\/creations$/.test(target.pathname);
+    ((scenario === 'vidu-async' &&
+      /^\/vidu\/ent\/v2\/tasks\/[^/]+\/creations$/.test(target.pathname)) ||
+      (scenario === 'kling-async' &&
+        /^\/kling\/v1\/images\/generations\/[^/]+$/.test(target.pathname)));
   const providerPost = !query;
   let queryAttempt = 0;
   if (query && process.env.MIO_LIVE_IMAGE_HOLD_FIRST_QUERY === 'yes') {

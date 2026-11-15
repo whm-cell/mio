@@ -331,6 +331,7 @@ it('allows only the saved task and at most eight query attempts without logging 
 
 it.each([
   ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/img2img'],
+  ['kling-async', 'https://api.onelinkai.cloud/kling/v1/images/generations'],
   ['seedream-sync', 'https://api.onelinkai.cloud/volc/api/v3/images/generations'],
   ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/generations'],
   ['gpt-edit', 'https://api.onelinkai.cloud/v1/images/edits'],
@@ -364,10 +365,18 @@ it.each([
 it.each([
   ['seedream-sync', 'https://api.onelinkai.cloud/v1/images/generations', 'POST'],
   ['seedream-sync', 'https://api.onelinkai.cloud/vidu/ent/v2/tasks/task/creations', 'GET'],
+  ['seedream-sync', 'https://api.onelinkai.cloud/kling/v1/images/generations/task', 'GET'],
   ['seedream-sync', 'https://unexpected.example/volc/api/v3/images/generations', 'POST'],
   ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/edits', 'POST'],
   ['gpt-edit', 'https://api.onelinkai.cloud/v1/images/generations', 'POST'],
   ['vidu-async', 'https://unexpected.example/vidu/ent/v2/reference2image', 'POST'],
+  ['vidu-async', 'https://api.onelinkai.cloud/kling/v1/images/generations/task', 'GET'],
+  ['kling-async', 'https://api.onelinkai.cloud/vidu/ent/v2/reference2image', 'POST'],
+  ['kling-async', 'https://api.onelinkai.cloud/v1/images/generations', 'POST'],
+  ['kling-async', 'https://api.onelinkai.cloud/volc/api/v3/images/generations', 'POST'],
+  ['kling-async', 'https://api.onelinkai.cloud/kling/v1/images/omni-image', 'POST'],
+  ['kling-async', 'https://api.onelinkai.cloud/vidu/ent/v2/tasks/task/creations', 'GET'],
+  ['kling-async', 'https://unexpected.example/kling/v1/images/generations', 'POST'],
 ] as const)(
   'blocks cross-scenario or unexpected host/path requests in %s (%s %s)',
   async (scenario, rejectedUrl, method) => {
@@ -391,6 +400,107 @@ it.each([
     }
   },
 );
+
+it('enforces Kling task-ID matching, eight-query cap, and sanitized envelope diagnostics without logging URLs', async () => {
+  vi.resetModules();
+  const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
+  const statuses = [
+    'NOT_START',
+    'queued',
+    'IN_PROGRESS',
+    'SUBMITTED',
+    'SUCCEED',
+    'success',
+    'FAILURE',
+    'UNKNOWN',
+  ];
+  let responseIndex = 0;
+  const transport = vi.fn<typeof fetch>().mockImplementation(async () => {
+    const currentStatus = statuses[responseIndex++];
+    return Response.json({
+      code: responseIndex === 6 ? 1001 : 0,
+      message: 'private-kling-message',
+      data: {
+        task_id: 'private-kling-task',
+        task_status: currentStatus,
+        task_result: {
+          images: [{ index: 0, url: 'https://cdn.kling.example/private-image?sig=private-sig' }],
+        },
+      },
+      secret: 'synthetic-kling-secret',
+    });
+  });
+  vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
+  vi.stubEnv('MIO_LIVE_IMAGE_SCENARIO', 'kling-async');
+  vi.stubGlobal('fetch', transport);
+  writeFileSync(
+    join(directory, 'allowed-task.json'),
+    JSON.stringify({ upstreamTaskId: 'private-kling-task' }),
+    { mode: 0o600 },
+  );
+  try {
+    await import('../../tests/compute/live-image-audit.ts');
+    expect(() =>
+      fetch('https://api.onelinkai.cloud/kling/v1/images/generations/other-kling-task'),
+    ).toThrow('LIVE_QUERY_TASK_MISMATCH');
+    const url = 'https://api.onelinkai.cloud/kling/v1/images/generations/private-kling-task';
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const response = await fetch(url, { headers: { authorization: 'synthetic-kling-secret' } });
+      expect(((await response.json()) as { data: { task_id: string } }).data.task_id).toBe(
+        'private-kling-task',
+      );
+    }
+    expect(() => fetch(url)).toThrow('LIVE_QUERY_LIMIT_BLOCKED');
+    expect(transport).toHaveBeenCalledTimes(8);
+    await vi.waitFor(() => {
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        expect(existsSync(join(directory, `supplier-query-${attempt}-response.json`))).toBe(true);
+        expect(existsSync(join(directory, `supplier-query-${attempt}-trace.json`))).toBe(true);
+      }
+    });
+    const events = readFileSync(join(directory, 'supplier-http-events.jsonl'), 'utf8');
+    expect(events).not.toContain('synthetic-kling-secret');
+    expect(events).not.toContain('private-kling-task');
+    expect(events).not.toContain('private-kling-message');
+    expect(events).not.toContain('private-image');
+    expect(events).not.toContain('private-sig');
+    const facts = events
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .sort((a, b) => a.attempt - b.attempt);
+    expect(facts.map((event) => event.state)).toEqual([
+      'not_start',
+      'queued',
+      'in_progress',
+      'submitted',
+      'succeed',
+      'success',
+      'failure',
+      'other',
+    ]);
+    expect(facts[4]).toMatchObject({
+      status: 200,
+      codeZero: true,
+      state: 'succeed',
+      stateType: 'string',
+      creationsType: 'array',
+      creationsCount: 1,
+      firstUrlPresent: true,
+      firstUrlSyntaxAllowed: true,
+    });
+    expect(facts[5]).toMatchObject({
+      codeZero: false,
+      state: 'success',
+    });
+    expect(existsSync(join(directory, 'supplier-query-mismatch-blocked.json'))).toBe(true);
+    expect(existsSync(join(directory, 'supplier-query-limit-blocked.json'))).toBe(true);
+  } finally {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    rmSync(directory, { recursive: true });
+  }
+});
 
 it('rejects an invalid audit scenario before installing fetch hooks', async () => {
   vi.resetModules();

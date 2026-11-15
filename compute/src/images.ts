@@ -8,7 +8,8 @@ export interface ImageObservation {
   outputTokens?: number;
   totalTokens?: number;
 }
-export type AsyncImageObservationPath = 'task_id' | 'state' | 'creations' | 'error' | 'other';
+export type AsyncImageObservationPath =
+  'task_id' | 'state' | 'creations' | 'data' | 'code' | 'error' | 'other';
 export type AsyncImageErrorCategory =
   | 'none'
   | 'auth'
@@ -76,13 +77,32 @@ export interface AsyncImageTransport {
 export type ReadImage = (ref: ImageAssetRef, signal: AbortSignal) => Promise<Uint8Array>;
 
 const VIDU_ENDPOINT = 'https://api.onelinkai.cloud/vidu/ent/v2/reference2image';
-const VIDU_TASK_ID = /^[A-Za-z0-9._:-]{1,256}$/;
-// Submission responses are observed only for bounded, sanitized diagnostics.
-const VIDU_SUBMISSION_BODY_LIMIT = 1024 * 1024;
+const KLING_ENDPOINT = 'https://api.onelinkai.cloud/kling/v1/images/generations';
+const KLING_IN_FLIGHT_STATUSES = new Set([
+  'not_start',
+  'submitted',
+  'queued',
+  'queueing',
+  'in_progress',
+  'processing',
+]);
+const KLING_FAILED_STATUSES = new Set(['failed', 'failure']);
+const KLING_COMPLETED_STATUSES = new Set(['succeed', 'success']);
+const ASYNC_TASK_ID = /^[A-Za-z0-9._:-]{1,256}$/;
+
+function normalizeKlingTaskStatus(raw: unknown): string {
+  if (typeof raw !== 'string' || !/^[A-Za-z_]+$/.test(raw)) return '';
+  if (raw !== raw.toLowerCase() && raw !== raw.toUpperCase()) return '';
+  return raw.toLowerCase();
+}
+// Async JSON envelopes are read within a fixed bound for sanitized diagnostics and state checks.
+const ASYNC_JSON_BODY_LIMIT = 1024 * 1024;
 const ASYNC_OBSERVATION_PATHS = [
   'task_id',
   'state',
   'creations',
+  'data',
+  'code',
   'error',
   'other',
 ] as const satisfies readonly AsyncImageObservationPath[];
@@ -99,7 +119,7 @@ const ASYNC_ERROR_CATEGORIES = [
   'aborted',
 ] as const satisfies readonly AsyncImageErrorCategory[];
 
-function safeViduResultUrl(value: unknown): URL | null {
+function safeResultUrl(value: unknown): URL | null {
   if (typeof value !== 'string' || value.length > 2048) return null;
   try {
     const url = new URL(value);
@@ -114,7 +134,7 @@ function viduDataUrl(bytes: Uint8Array, contentType: ImageAssetRef['contentType'
   return `data:${contentType};base64,${Buffer.from(bytes).toString('base64')}`;
 }
 
-function viduJson(value: unknown): Record<string, unknown> | null {
+function jsonObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
@@ -150,7 +170,7 @@ function asyncResponseObservation(
 }
 
 function sanitizeAsyncObservation(value: unknown): AsyncImageObservation | undefined {
-  const input = viduJson(value);
+  const input = jsonObject(value);
   if (!input) return undefined;
   const result: AsyncImageObservation = {};
   if (
@@ -184,7 +204,7 @@ function sanitizeAsyncObservation(value: unknown): AsyncImageObservation | undef
   return Object.keys(result).length ? result : undefined;
 }
 
-async function readViduSubmissionJson(
+async function readAsyncJson(
   response: Response,
 ): Promise<{ payload: Record<string, unknown> | null; malformed: boolean; readFailed: boolean }> {
   const reader = response.body?.getReader();
@@ -196,14 +216,14 @@ async function readViduSubmissionJson(
       const part = await reader.read();
       if (part.done) break;
       total += part.value.byteLength;
-      if (total > VIDU_SUBMISSION_BODY_LIMIT)
+      if (total > ASYNC_JSON_BODY_LIMIT)
         return { payload: null, malformed: true, readFailed: false };
       chunks.push(part.value);
     }
     const text = Buffer.concat(chunks).toString('utf8');
     if (!text) return { payload: null, malformed: true, readFailed: false };
     try {
-      const payload = viduJson(JSON.parse(text));
+      const payload = jsonObject(JSON.parse(text));
       return { payload, malformed: payload === null, readFailed: false };
     } catch {
       return { payload: null, malformed: true, readFailed: false };
@@ -215,7 +235,7 @@ async function readViduSubmissionJson(
   }
 }
 
-async function readViduResult(response: Response): Promise<Uint8Array | null> {
+async function readResultBytes(response: Response): Promise<Uint8Array | null> {
   const reader = response.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -230,6 +250,52 @@ async function readViduResult(response: Response): Promise<Uint8Array | null> {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
+}
+
+function rejectAsyncSubmissionHttp(
+  response: Response,
+  payload: Record<string, unknown> | null,
+): AsyncImageSubmission {
+  const errorCategory: AsyncImageErrorCategory =
+    response.status === 401 || response.status === 403
+      ? 'auth'
+      : response.status === 429
+        ? 'rate_limit'
+        : response.status === 400 || response.status === 422
+          ? 'rejected'
+          : 'upstream';
+  const observation = asyncResponseObservation(response, payload, false, errorCategory);
+  if (response.status === 401 || response.status === 403)
+    return { state: 'rejected', code: 'IMAGE_AUTH', observation };
+  if (response.status === 429) return { state: 'rejected', code: 'IMAGE_LIMITED', observation };
+  if (response.status === 400 || response.status === 422)
+    return { state: 'rejected', code: 'IMAGE_REJECTED', observation };
+  return { state: 'unknown', code: 'IMAGE_SUBMISSION_UNKNOWN', observation };
+}
+
+async function downloadAsyncImage(
+  rawUrl: unknown,
+  download: typeof withPublicHttps,
+  signal: AbortSignal,
+): Promise<{ base64: string; format: 'png' | 'jpeg' | 'webp' } | null> {
+  const url = safeResultUrl(rawUrl);
+  if (!url) return null;
+  return download(url, signal, async (result) => {
+    if (!result.ok) {
+      await result.body?.cancel().catch(() => {});
+      return null;
+    }
+    const bytes = await readResultBytes(result);
+    if (!bytes) return null;
+    const contentType = (['image/png', 'image/jpeg', 'image/webp'] as const).find((type) =>
+      matchesImageSignature(bytes, type),
+    );
+    if (!contentType) return null;
+    return {
+      base64: Buffer.from(bytes).toString('base64'),
+      format: contentType.slice('image/'.length) as 'png' | 'jpeg' | 'webp',
+    };
+  });
 }
 
 /** Protocol-neutral Vidu adapter. It only uses the documented OneLink paths and an owner-scoped reader. */
@@ -261,28 +327,11 @@ export function createViduAsyncImageTransport(
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        const parsed = await readViduSubmissionJson(response);
+        const parsed = await readAsyncJson(response);
         const payload = parsed.payload;
-        if (!response.ok) {
-          const errorCategory: AsyncImageErrorCategory =
-            response.status === 401 || response.status === 403
-              ? 'auth'
-              : response.status === 429
-                ? 'rate_limit'
-                : response.status === 400 || response.status === 422
-                  ? 'rejected'
-                  : 'upstream';
-          const observation = asyncResponseObservation(response, payload, false, errorCategory);
-          if (response.status === 401 || response.status === 403)
-            return { state: 'rejected', code: 'IMAGE_AUTH', observation };
-          if (response.status === 429)
-            return { state: 'rejected', code: 'IMAGE_LIMITED', observation };
-          if (response.status === 400 || response.status === 422)
-            return { state: 'rejected', code: 'IMAGE_REJECTED', observation };
-          return { state: 'unknown', code: 'IMAGE_SUBMISSION_UNKNOWN', observation };
-        }
+        if (!response.ok) return rejectAsyncSubmissionHttp(response, payload);
         const taskId = payload?.task_id;
-        const taskIdPresent = typeof taskId === 'string' && VIDU_TASK_ID.test(taskId);
+        const taskIdPresent = typeof taskId === 'string' && ASYNC_TASK_ID.test(taskId);
         const errorCategory: AsyncImageErrorCategory = parsed.malformed
           ? 'malformed_response'
           : taskIdPresent
@@ -308,7 +357,7 @@ export function createViduAsyncImageTransport(
       }
     },
     async query(_input, apiKey, upstreamTaskId, _queryAttempt, signal) {
-      if (!VIDU_TASK_ID.test(upstreamTaskId))
+      if (!ASYNC_TASK_ID.test(upstreamTaskId))
         return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
       try {
         const response = await transport(
@@ -327,34 +376,133 @@ export function createViduAsyncImageTransport(
             ? { state: 'failed', code: 'IMAGE_QUERY_FAILED' }
             : { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
         }
-        const payload = viduJson(await response.json());
+        const parsed = await readAsyncJson(response);
+        const payload = parsed.payload;
         const state = payload?.state;
         if (state === 'created' || state === 'queueing' || state === 'processing')
           return { state: 'processing', upstreamTaskId };
         if (state === 'failed') return { state: 'failed', code: 'IMAGE_QUERY_FAILED' };
-        if (state !== 'success' || !Array.isArray(payload?.creations) || !payload.creations.length)
+        if (
+          parsed.malformed ||
+          state !== 'success' ||
+          !Array.isArray(payload?.creations) ||
+          !payload.creations.length
+        )
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
         const images: { base64: string; format: 'png' | 'jpeg' | 'webp' }[] = [];
         for (const raw of payload.creations) {
-          const creation = viduJson(raw);
-          const url = safeViduResultUrl(creation?.url);
-          if (!url) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
-          const image = await download(url, signal, async (result) => {
-            if (!result.ok) {
-              await result.body?.cancel().catch(() => {});
-              return null;
-            }
-            const bytes = await readViduResult(result);
-            if (!bytes) return null;
-            const contentType = (['image/png', 'image/jpeg', 'image/webp'] as const).find((type) =>
-              matchesImageSignature(bytes, type),
-            );
-            if (!contentType) return null;
-            return {
-              base64: Buffer.from(bytes).toString('base64'),
-              format: contentType.slice('image/'.length) as 'png' | 'jpeg' | 'webp',
-            };
-          });
+          const image = await downloadAsyncImage(jsonObject(raw)?.url, download, signal);
+          if (!image) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+          images.push(image);
+        }
+        return { state: 'returned', upstreamTaskId, images };
+      } catch {
+        return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+      }
+    },
+  };
+}
+
+/** Protocol-neutral Kling adapter for fixed OneLink async submit/query endpoints. */
+export function createKlingAsyncImageTransport(
+  transport: typeof fetch = fetch,
+  download: typeof withPublicHttps = withPublicHttps,
+): AsyncImageTransport {
+  return {
+    async submit(input, apiKey, signal) {
+      if (
+        input.async !== true ||
+        (input.operation ?? 'generate') !== 'generate' ||
+        (input.n !== undefined && input.n !== 1) ||
+        !validImageInput(input, 'kling-image-v1') ||
+        !apiKey ||
+        /[\r\n]/.test(apiKey)
+      )
+        return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
+      try {
+        const response = await transport(KLING_ENDPOINT, {
+          method: 'POST',
+          redirect: 'error',
+          signal,
+          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model_name: input.model,
+            prompt: input.prompt,
+            n: input.n ?? 1,
+          }),
+        });
+        const parsed = await readAsyncJson(response);
+        const payload = parsed.payload;
+        if (!response.ok) return rejectAsyncSubmissionHttp(response, payload);
+        const data = payload ? jsonObject(payload.data) : null;
+        const rawTaskId = data?.task_id;
+        const validTaskId = typeof rawTaskId === 'string' && ASYNC_TASK_ID.test(rawTaskId);
+        const accepted = !parsed.malformed && payload?.code === 0 && validTaskId;
+        const errorCategory: AsyncImageErrorCategory = parsed.malformed
+          ? 'malformed_response'
+          : payload?.code !== 0
+            ? 'upstream'
+            : accepted
+              ? 'none'
+              : rawTaskId !== undefined && rawTaskId !== null
+                ? 'invalid_task_id'
+                : 'missing_task_id';
+        const observation = asyncResponseObservation(response, payload, accepted, errorCategory);
+        return accepted
+          ? { state: 'submitted', upstreamTaskId: rawTaskId, observation }
+          : { state: 'unknown', code: 'IMAGE_SUBMISSION_UNKNOWN', observation };
+      } catch {
+        return {
+          state: 'unknown',
+          code: 'IMAGE_SUBMISSION_UNKNOWN',
+          observation: { errorCategory: signal.aborted ? 'aborted' : 'transport' },
+        };
+      }
+    },
+    async query(input, apiKey, upstreamTaskId, _queryAttempt, signal) {
+      if (!ASYNC_TASK_ID.test(upstreamTaskId) || !apiKey || /[\r\n]/.test(apiKey))
+        return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+      try {
+        const response = await transport(
+          `${KLING_ENDPOINT}/${encodeURIComponent(upstreamTaskId)}`,
+          {
+            method: 'GET',
+            redirect: 'error',
+            signal,
+            headers: { Authorization: `Bearer ${apiKey}` },
+          },
+        );
+        if (response.status === 404) {
+          await response.body?.cancel().catch(() => {});
+          return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        }
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          return response.status === 401 || response.status === 403
+            ? { state: 'failed', code: 'IMAGE_QUERY_FAILED' }
+            : { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        }
+        const parsed = await readAsyncJson(response);
+        if (parsed.malformed || parsed.payload?.code !== 0)
+          return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        const data = jsonObject(parsed.payload.data);
+        if (!data || (data.task_id !== undefined && data.task_id !== upstreamTaskId))
+          return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        const status = normalizeKlingTaskStatus(data.task_status);
+        if (KLING_IN_FLIGHT_STATUSES.has(status)) return { state: 'processing', upstreamTaskId };
+        if (KLING_FAILED_STATUSES.has(status))
+          return { state: 'failed', code: 'IMAGE_QUERY_FAILED' };
+        const rawImages = jsonObject(data.task_result)?.images;
+        if (
+          !KLING_COMPLETED_STATUSES.has(status) ||
+          !Array.isArray(rawImages) ||
+          rawImages.length < 1 ||
+          rawImages.length > (input.n ?? 1)
+        )
+          return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        const images: { base64: string; format: 'png' | 'jpeg' | 'webp' }[] = [];
+        for (const raw of rawImages) {
+          const image = await downloadAsyncImage(jsonObject(raw)?.url, download, signal);
           if (!image) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
           images.push(image);
         }
@@ -588,6 +736,7 @@ export function createImageProtocol(
       try {
         switch (profile) {
           case 'vidu-image-v1':
+          case 'kling-image-v1':
             return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
           case 'seedream-4-images-v1':
             if (operation !== 'generate') return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };

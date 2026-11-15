@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import { Journal } from '../src/adapters/journal.ts';
 import { createImageWorker, recoverImageMaterialization } from '../src/image-worker.ts';
+import { createKlingAsyncImageTransport } from '../src/images.ts';
 import { sealImageKey } from '../../src/compute/image-credentials.ts';
 import { validateImage } from '../src/adapters/media.ts';
 import type { ImageProfile, ImageQueryCommandV1 } from '@mio/compute-contracts';
@@ -1153,6 +1154,187 @@ describe('durable image execution', () => {
         journal.close();
         rmSync(directory, { recursive: true });
       }
+    }
+  });
+
+  it.each(['succeed', 'success'] as const)(
+    'dispatches kling-image-v1 (%s) through default worker async transport and replays completion without repeat POST or GET',
+    async (terminalStatus) => {
+      const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+      const journal = new Journal(directory, randomUUID(), true);
+      const request = command({ model: 'image-kling-v3', async: true }, 'kling-image-v1');
+      let postCalls = 0;
+      let getCalls = 0;
+      let downloadCalls = 0;
+      const transport = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+        if (String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations') {
+          postCalls++;
+          expect(init?.method).toBe('POST');
+          expect(JSON.parse(String(init?.body))).toEqual({
+            model_name: 'image-kling-v3',
+            prompt: 'square',
+            n: 1,
+          });
+          return Response.json({ code: 0, data: { task_id: 'kling-worker-1' } });
+        }
+        if (
+          String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations/kling-worker-1'
+        ) {
+          const inFlight = ['NOT_START', 'queued', 'in_progress', 'SUBMITTED'][getCalls++];
+          return inFlight
+            ? Response.json({
+                code: 0,
+                data: { task_id: 'kling-worker-1', task_status: inFlight },
+              })
+            : Response.json({
+                code: 0,
+                data: {
+                  task_id: 'kling-worker-1',
+                  task_status: terminalStatus,
+                  task_result: { images: [{ index: 0, url: 'https://cdn.kling.example/out.png' }] },
+                },
+              });
+        }
+        downloadCalls++;
+        return new Response(pngBytes, { headers: { 'content-type': 'image/png' } });
+      });
+      const materialize = vi.fn(
+        async (job: string, index: number, _data: string, format: string, fileId: string) =>
+          imageOutput(job, index, fileId, format, pngBytes.length),
+      );
+      const query = (attempt: number): ImageQueryCommandV1 => {
+        const value: ImageQueryCommandV1 = {
+          version: 1,
+          type: 'image.query',
+          messageId: randomUUID(),
+          commandId: request.messageId,
+          jobId: request.jobId,
+          ownerId: request.ownerId,
+          expiresAt: request.expiresAt,
+          profile: 'kling-image-v1',
+          operation: 'generate',
+          input: request.input as ImageQueryCommandV1['input'],
+          upstreamTaskId: 'kling-worker-1',
+          queryAttempt: attempt,
+          credential: request.credential,
+          queryDeadline: request.expiresAt,
+        };
+        return {
+          ...value,
+          queryCredential: sealImageKey(
+            'test-secret',
+            imageQueryCredentialBinding(value),
+            'b1',
+            keys.publicKey,
+          ),
+        };
+      };
+      try {
+        const defaultWorker = createImageWorker(
+          journal,
+          'b1',
+          keys.privateKey,
+          materialize,
+          transport,
+        );
+        await expect(defaultWorker(request)).resolves.toEqual({
+          state: 'submitted',
+          upstreamTaskId: 'kling-worker-1',
+          queryAttempt: 0,
+        });
+        for (const attempt of [1, 2, 3, 4]) {
+          await expect(defaultWorker(query(attempt))).resolves.toEqual({
+            state: 'processing',
+            upstreamTaskId: 'kling-worker-1',
+            queryAttempt: attempt,
+          });
+        }
+        const downloadAwareWorker = createImageWorker(
+          journal,
+          'b1',
+          keys.privateKey,
+          materialize,
+          transport,
+          undefined,
+          createKlingAsyncImageTransport(transport, async (url, signal, consume) =>
+            consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
+          ),
+        );
+        const finalQuery = query(5);
+        const completedOutcome = await downloadAwareWorker(finalQuery);
+        expect(completedOutcome).toEqual({
+          state: 'completed',
+          outputs: [
+            expect.objectContaining({ sizeBytes: pngBytes.length, contentType: 'image/png' }),
+          ],
+        });
+        await expect(defaultWorker(request)).resolves.toEqual(completedOutcome);
+        await expect(downloadAwareWorker(finalQuery)).resolves.toEqual(completedOutcome);
+        expect(postCalls).toBe(1);
+        expect(getCalls).toBe(5);
+        expect(downloadCalls).toBe(1);
+        expect(materialize).toHaveBeenCalledOnce();
+        expect(materialize.mock.calls[0]?.[3]).toBe('png');
+      } finally {
+        journal.close();
+        rmSync(directory, { recursive: true });
+      }
+    },
+  );
+
+  it('maps OneLink gateway Kling failure status to IMAGE_QUERY_FAILED without resubmitting', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const request = command({ model: 'image-kling-v3', async: true }, 'kling-image-v1');
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (url) =>
+        String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations'
+          ? Response.json({ code: 0, data: { task_id: 'kling-fail-1' } })
+          : Response.json({ code: 0, data: { task_id: 'kling-fail-1', task_status: 'failure' } }),
+      );
+    const queryCmd: ImageQueryCommandV1 = {
+      version: 1,
+      type: 'image.query',
+      messageId: randomUUID(),
+      commandId: request.messageId,
+      jobId: request.jobId,
+      ownerId: request.ownerId,
+      expiresAt: request.expiresAt,
+      profile: 'kling-image-v1',
+      operation: 'generate',
+      input: request.input as ImageQueryCommandV1['input'],
+      upstreamTaskId: 'kling-fail-1',
+      queryAttempt: 1,
+      credential: request.credential,
+      queryDeadline: request.expiresAt,
+    };
+    queryCmd.queryCredential = sealImageKey(
+      'test-secret',
+      imageQueryCredentialBinding(queryCmd),
+      'b1',
+      keys.publicKey,
+    );
+    try {
+      const worker = createImageWorker(journal, 'b1', keys.privateKey, vi.fn(), transport);
+      await expect(worker(request)).resolves.toMatchObject({ state: 'submitted' });
+      await expect(worker(queryCmd)).resolves.toEqual({
+        state: 'failed',
+        errorCode: 'IMAGE_QUERY_FAILED',
+        upstreamTaskId: 'kling-fail-1',
+        queryAttempt: 1,
+      });
+      await expect(worker(request)).resolves.toEqual({
+        state: 'failed',
+        errorCode: 'IMAGE_QUERY_FAILED',
+        upstreamTaskId: 'kling-fail-1',
+        queryAttempt: 1,
+      });
+      expect(transport).toHaveBeenCalledTimes(2);
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
     }
   });
 });

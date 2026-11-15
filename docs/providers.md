@@ -81,7 +81,7 @@ pnpm providers:adapt <owner-id> <expected-revision> <declaration.json>
 
 已有适配行升级时，迁移为兼容性默认 `protocol-reference` 并保留原 `source/sourceVersion`；新声明必须显式提供 `sourceKind`。刷新继续由 `metadata_source='onelink-v1-models'` 表达目录成员事实，不能写入适配表。
 
-图片首切片候选允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1` 或受限单图 `seedream-4-images-v1`；不按名称自动推断。GPT edit/mask 还须在声明 metadata 中显式列出能力，例如：
+图片适配允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1`、受限单图 `seedream-4-images-v1`、异步 `vidu-image-v1` 或异步 `kling-image-v1`；不按名称自动推断。GPT edit/mask 还须在声明 metadata 中显式列出能力，例如：
 
 ```json
 {

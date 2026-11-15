@@ -207,3 +207,125 @@ it('derives provider adaptation profile constraints and mode gates from IMAGE_PR
     }
   }
 });
+
+it('accepts explicitly sourced Kling async image capability and keeps incomplete adaptations ADAPTER_PENDING in catalogView', () => {
+  const declaration = {
+    modelRef: 'onelink:model:kling-key',
+    operation: 'image.generate' as const,
+    profile: 'kling-image-v1' as const,
+    sourceKind: 'protocol-reference' as const,
+    source: 'https://docs.onelinkai.cloud/8653497m0',
+    sourceVersion: '2026-09-08',
+    classification: 'image' as const,
+    metadata: {
+      image: {
+        modes: ['generate' as const],
+        async: { operations: ['generate' as const], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+    },
+  };
+  expect(validateDeclaration(declaration)).toEqual(declaration);
+  expect(() =>
+    validateDeclaration({
+      ...declaration,
+      metadata: { image: { modes: ['generate', 'edit'] } },
+    }),
+  ).toThrow('ADAPTATION_INVALID');
+
+  const now = new Date('2026-11-15T00:00:00.000Z');
+  const modelKey = '00000000-0000-4000-8000-000000000099';
+  const baseState = {
+    id: '00000000-0000-4000-8000-000000000001',
+    owner_id: 'owner-1',
+    enabled: true,
+    default_image_watermark: false,
+    default_video_watermark: false,
+    revision: 1,
+    credential_version: 1,
+    cipher_format: 1,
+    master_key_id: 'k1',
+    nonce: Buffer.alloc(12),
+    ciphertext: Buffer.alloc(16),
+    auth_tag: Buffer.alloc(16),
+    discovery: null,
+    catalog_version: 1,
+    catalog_credential_version: 1,
+    catalog_succeeded_at: now,
+    latest_refresh_seq: 1,
+    last_attempt_seq: 1,
+    last_attempt_credential_version: 1,
+    last_attempt_started_at: now,
+    last_attempt_finished_at: now,
+    last_attempt_status: 'connected' as const,
+    last_attempt_error_code: null,
+    credential_auth_state: 'valid' as const,
+    models: [
+      {
+        model_key: modelKey,
+        raw_model_id: 'image-kling-v3',
+        legacy_ref: null,
+        unavailable_reason: null,
+        supplier_metadata: {},
+        classification: 'image' as const,
+        metadata_source: 'onelink-v1-models',
+        classification_source: 'adaptation',
+        credential_version: 1,
+        catalog_version: 1,
+        first_seen_at: now.toISOString(),
+        last_seen_at: now.toISOString(),
+        membership_state: 'current' as const,
+        display_name: null,
+        description_override: null,
+      },
+    ],
+    preferences: [],
+  };
+
+  const incompleteView = catalogView({
+    ...baseState,
+    adaptations: [
+      {
+        model_key: modelKey,
+        operation: 'image.generate',
+        profile: 'kling-image-v1',
+        declaration_version: 1,
+        source_kind: 'protocol-reference',
+        source: declaration.source,
+        source_version: declaration.sourceVersion,
+        capability_metadata: { image: { modes: ['generate'] } },
+        verification_status: 'unverified',
+        verified_at: null,
+        verification_evidence: null,
+        tested_tuple: null,
+      },
+    ],
+  });
+  expect(incompleteView.items[0]?.image).toMatchObject({
+    runnable: false,
+    unavailableReason: 'ADAPTER_PENDING',
+  });
+
+  const completeView = catalogView({
+    ...baseState,
+    adaptations: [
+      {
+        model_key: modelKey,
+        operation: 'image.generate',
+        profile: 'kling-image-v1',
+        declaration_version: 2,
+        source_kind: 'protocol-reference',
+        source: declaration.source,
+        source_version: declaration.sourceVersion,
+        capability_metadata: declaration.metadata,
+        verification_status: 'unverified',
+        verified_at: null,
+        verification_evidence: null,
+        tested_tuple: null,
+      },
+    ],
+  });
+  expect(completeView.items[0]?.image).toMatchObject({
+    runnable: true,
+    unavailableReason: null,
+  });
+});

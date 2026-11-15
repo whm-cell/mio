@@ -1,4 +1,9 @@
-export const IMAGE_PROFILES = ['gpt-images-v1', 'seedream-4-images-v1', 'vidu-image-v1'] as const;
+export const IMAGE_PROFILES = [
+  'gpt-images-v1',
+  'seedream-4-images-v1',
+  'vidu-image-v1',
+  'kling-image-v1',
+] as const;
 export type ImageProfile = (typeof IMAGE_PROFILES)[number];
 export function isImageProfile(value: unknown): value is ImageProfile {
   return typeof value === 'string' && IMAGE_PROFILES.some((profile) => profile === value);
@@ -31,6 +36,12 @@ export const IMAGE_PROFILE_RULES = {
     supportedOperations: ['generate'],
     requiresAsync: true,
     allowGenerateReferences: true,
+    fixedOutputFormat: null,
+  },
+  'kling-image-v1': {
+    supportedOperations: ['generate'],
+    requiresAsync: true,
+    allowGenerateReferences: false,
     fixedOutputFormat: null,
   },
 } as const satisfies Record<ImageProfile, ImageProfileRule>;
@@ -630,6 +641,15 @@ export function validImageInput(input: ImageInput, profile: ImageProfile): boole
         (input.size === undefined || ['1080p', '2K', '4K'].includes(input.size)) &&
         Object.keys(input).every((key) =>
           ['model', 'prompt', 'async', 'operation', 'images', 'n', 'size'].includes(key),
+        )
+      );
+    case 'kling-image-v1':
+      return (
+        operation === 'generate' &&
+        input.async === true &&
+        (input.n === undefined || input.n === 1) &&
+        Object.keys(input).every((key) =>
+          ['model', 'prompt', 'async', 'operation', 'n'].includes(key),
         )
       );
     case 'gpt-images-v1':

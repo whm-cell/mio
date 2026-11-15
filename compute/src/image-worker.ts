@@ -12,7 +12,11 @@ import {
   type ImageQueryCommandV1,
 } from '@mio/compute-contracts';
 import type { Journal } from './adapters/journal.ts';
-import { createImageProtocol, createViduAsyncImageTransport } from './images.ts';
+import {
+  createImageProtocol,
+  createKlingAsyncImageTransport,
+  createViduAsyncImageTransport,
+} from './images.ts';
 import type { AsyncImageTransport, ImageObservation, ReadImage } from './images.ts';
 import { openImageCredential } from './image-credentials.ts';
 import type { ImageCredentialEnvelope } from './image-credentials.ts';
@@ -91,6 +95,8 @@ function defaultAsyncImageTransport(
   switch (profile) {
     case 'vidu-image-v1':
       return createViduAsyncImageTransport(transport, read);
+    case 'kling-image-v1':
+      return createKlingAsyncImageTransport(transport);
     case 'gpt-images-v1':
     case 'seedream-4-images-v1':
       return undefined;

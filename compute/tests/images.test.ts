@@ -9,7 +9,11 @@ import {
   type ImageProfile,
   type ImageProfileRule,
 } from '@mio/compute-contracts';
-import { createImageProtocol, createViduAsyncImageTransport } from '../src/images.ts';
+import {
+  createImageProtocol,
+  createKlingAsyncImageTransport,
+  createViduAsyncImageTransport,
+} from '../src/images.ts';
 import type { ReadImage } from '../src/images.ts';
 
 const input = { model: 'gpt-image-2', prompt: 'a blue square' };
@@ -17,6 +21,12 @@ const key = 'private-test-credential';
 
 function testVidu(transport: typeof fetch, read: ReadImage) {
   return createViduAsyncImageTransport(transport, read, async (url, signal, consume) =>
+    consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
+  );
+}
+
+function testKling(transport: typeof fetch) {
+  return createKlingAsyncImageTransport(transport, async (url, signal, consume) =>
     consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
   );
 }
@@ -946,6 +956,12 @@ describe('GPT image protocol', () => {
         allowGenerateReferences: true,
         fixedOutputFormat: null,
       },
+      'kling-image-v1': {
+        supportedOperations: ['generate'],
+        requiresAsync: true,
+        allowGenerateReferences: false,
+        fixedOutputFormat: null,
+      },
     };
     expect(IMAGE_PROFILE_RULES).toEqual(expected);
     expect(validImageInput(input, 'unknown-profile-v1' as ImageProfile)).toBe(false);
@@ -956,6 +972,316 @@ describe('GPT image protocol', () => {
         key,
       ),
     ).resolves.toEqual({ state: 'rejected', code: 'IMAGE_INPUT_INVALID' });
+    await expect(
+      createImageProtocol('kling-image-v1', 'generate', transport).submit(
+        { model: 'image-kling-v3', prompt: 'async only', async: true },
+        key,
+      ),
+    ).resolves.toEqual({ state: 'rejected', code: 'IMAGE_INPUT_INVALID' });
     expect(transport).not.toHaveBeenCalled();
+  });
+
+  it('validates minimal Kling async generate inputs and rejects unsupported parameters', () => {
+    const validBase = { model: 'image-kling-v3', prompt: 'a blue square', async: true as const };
+    expect(validImageInput(validBase, 'kling-image-v1')).toBe(true);
+    expect(validImageInput({ ...validBase, n: 1 }, 'kling-image-v1')).toBe(true);
+    expect(
+      validImageInput({ ...validBase, operation: 'generate' as const }, 'kling-image-v1'),
+    ).toBe(true);
+    const ref = {
+      assetId: '00000000-0000-4000-8000-000000000001',
+      key: 'mio/raw/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002',
+      sizeBytes: 4,
+      etag: 'etag',
+      contentType: 'image/png' as const,
+    };
+    for (const invalid of [
+      { model: 'image-kling-v3', prompt: 'sync' },
+      { ...validBase, async: false },
+      { ...validBase, n: 2 },
+      { ...validBase, size: '1080p' },
+      { ...validBase, size: '1024x1024' },
+      { ...validBase, quality: 'low' as const },
+      { ...validBase, output_format: 'png' as const },
+      { ...validBase, operation: 'edit' as const, image: ref },
+      {
+        ...validBase,
+        operation: 'outpaint' as const,
+        image: ref,
+        geometry: { left: 16, top: 0, right: 0, bottom: 0 },
+      },
+      { ...validBase, images: [ref] },
+      { ...validBase, image: ref },
+      { ...validBase, mask: ref },
+      { ...validBase, geometry: { left: 16, top: 0, right: 0, bottom: 0 } },
+    ]) {
+      expect(validImageInput(invalid, 'kling-image-v1')).toBe(false);
+    }
+  });
+
+  it('submits and queries documented Kling async image tasks with magic-byte format detection', async () => {
+    const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const jpegBytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
+    const webpBytes = Uint8Array.from([...Buffer.from('RIFF'), 0, 0, 0, 0, ...Buffer.from('WEBP')]);
+    let queryStatus = 'submitted';
+    let formatStage: 'png' | 'jpeg' | 'webp' | null = null;
+    const transport = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
+      if (String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations') {
+        expect(init?.method).toBe('POST');
+        expect(init?.redirect).toBe('error');
+        expect(init?.headers).toEqual({
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        });
+        expect(JSON.parse(String(init?.body))).toEqual({
+          model_name: 'image-kling-v3',
+          prompt: 'a blue square',
+          n: 1,
+        });
+        return Response.json(
+          { code: 0, message: 'SUCCEED', request_id: 'private-req', data: { task_id: 'kling-1' } },
+          { headers: { 'x-request-id': 'private-header-req' } },
+        );
+      }
+      if (String(url) === 'https://api.onelinkai.cloud/kling/v1/images/generations/kling-1') {
+        expect(init?.method).toBe('GET');
+        expect(init?.redirect).toBe('error');
+        expect(init?.headers).toEqual({ Authorization: `Bearer ${key}` });
+        if (!formatStage) {
+          return Response.json({
+            code: 0,
+            data: { task_id: 'kling-1', task_status: queryStatus },
+          });
+        }
+        return Response.json({
+          code: 0,
+          data: {
+            task_id: 'kling-1',
+            task_status: queryStatus,
+            final_unit_deduction: '1',
+            task_result: {
+              images: [{ index: 0, url: `https://cdn.kling.example/${formatStage}.bin` }],
+            },
+          },
+        });
+      }
+      expect(init?.method).toBe('GET');
+      expect(init?.redirect).toBe('error');
+      expect(init?.headers).toBeUndefined();
+      const body =
+        formatStage === 'png' ? pngBytes : formatStage === 'jpeg' ? jpegBytes : webpBytes;
+      return new Response(body, { headers: { 'content-type': 'application/octet-stream' } });
+    });
+    const protocol = testKling(transport);
+    const request = { model: 'image-kling-v3', prompt: 'a blue square', async: true as const };
+    const submitted = await protocol.submit(request, key, AbortSignal.timeout(1000));
+    expect(submitted).toEqual({
+      state: 'submitted',
+      upstreamTaskId: 'kling-1',
+      observation: {
+        statusCode: 200,
+        requestIdPresent: true,
+        responsePaths: ['code', 'other', 'data'],
+        taskIdPresent: true,
+        errorCategory: 'none',
+      },
+    });
+    expect(JSON.stringify(submitted)).not.toContain('private-req');
+    expect(JSON.stringify(submitted)).not.toContain('private-header-req');
+    for (const inFlight of [
+      'not_start',
+      'queued',
+      'queueing',
+      'in_progress',
+      'SUBMITTED',
+      'processing',
+      'NOT_START',
+      'IN_PROGRESS',
+    ]) {
+      queryStatus = inFlight;
+      await expect(
+        protocol.query(request, key, 'kling-1', 1, AbortSignal.timeout(1000)),
+      ).resolves.toEqual({ state: 'processing', upstreamTaskId: 'kling-1' });
+    }
+    for (const statusValue of ['succeed', 'success', 'SUCCEED', 'SUCCESS'] as const) {
+      queryStatus = statusValue;
+      for (const [nextStage, bytes] of [
+        ['png', pngBytes],
+        ['jpeg', jpegBytes],
+        ['webp', webpBytes],
+      ] as const) {
+        formatStage = nextStage;
+        const result = await protocol.query(request, key, 'kling-1', 3, AbortSignal.timeout(1000));
+        expect(result).toEqual({
+          state: 'returned',
+          upstreamTaskId: 'kling-1',
+          images: [{ base64: Buffer.from(bytes).toString('base64'), format: nextStage }],
+        });
+        expect(JSON.stringify(result)).not.toContain('final_unit_deduction');
+      }
+    }
+  });
+
+  it('classifies Kling submit and query errors safely without leaking supplier envelopes or retrying', async () => {
+    const request = { model: 'image-kling-v3', prompt: 'a blue square', async: true as const };
+    for (const [status, expectedState, expectedCode, expectedCategory] of [
+      [401, 'rejected', 'IMAGE_AUTH', 'auth'],
+      [429, 'rejected', 'IMAGE_LIMITED', 'rate_limit'],
+      [400, 'rejected', 'IMAGE_REJECTED', 'rejected'],
+      [500, 'unknown', 'IMAGE_SUBMISSION_UNKNOWN', 'upstream'],
+    ] as const) {
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          Response.json(
+            { code: 999, message: `secret-${key}`, data: { task_id: 'unused' } },
+            { status, headers: { 'x-request-id': 'private-req' } },
+          ),
+        );
+      const outcome = await testKling(transport).submit(request, key, AbortSignal.timeout(1000));
+      expect(outcome).toEqual({
+        state: expectedState,
+        code: expectedCode,
+        observation: {
+          statusCode: status,
+          requestIdPresent: true,
+          responsePaths: ['code', 'other', 'data'],
+          taskIdPresent: false,
+          errorCategory: expectedCategory,
+        },
+      });
+      expect(JSON.stringify(outcome)).not.toContain(key);
+      expect(JSON.stringify(outcome)).not.toContain('private-req');
+      expect(transport).toHaveBeenCalledOnce();
+    }
+
+    for (const [payload, expectedCategory, paths] of [
+      [
+        { code: 1201, message: key, data: { task_id: 'unused' } },
+        'upstream',
+        ['code', 'other', 'data'],
+      ],
+      [{ code: 0, data: {} }, 'missing_task_id', ['code', 'data']],
+      [{ code: 0, data: { task_id: 'bad task id' } }, 'invalid_task_id', ['code', 'data']],
+    ] as const) {
+      const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json(payload));
+      const outcome = await testKling(transport).submit(request, key, AbortSignal.timeout(1000));
+      expect(outcome).toEqual({
+        state: 'unknown',
+        code: 'IMAGE_SUBMISSION_UNKNOWN',
+        observation: {
+          statusCode: 200,
+          requestIdPresent: false,
+          responsePaths: [...paths],
+          taskIdPresent: false,
+          errorCategory: expectedCategory,
+        },
+      });
+      expect(JSON.stringify(outcome)).not.toContain(key);
+      expect(transport).toHaveBeenCalledOnce();
+    }
+
+    for (const [responseFactory, expected] of [
+      [
+        () => Response.json({ code: 0, data: { task_id: 'kling-1', task_status: 'failed' } }),
+        { state: 'failed', code: 'IMAGE_QUERY_FAILED' },
+      ],
+      [
+        () => Response.json({ code: 0, data: { task_id: 'kling-1', task_status: 'failure' } }),
+        { state: 'failed', code: 'IMAGE_QUERY_FAILED' },
+      ],
+      [
+        () => Response.json({ code: 0, data: { task_id: 'kling-1', task_status: 'FAILURE' } }),
+        { state: 'failed', code: 'IMAGE_QUERY_FAILED' },
+      ],
+      [() => new Response(key, { status: 401 }), { state: 'failed', code: 'IMAGE_QUERY_FAILED' }],
+      [() => new Response(key, { status: 404 }), { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' }],
+      [() => new Response(key, { status: 502 }), { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' }],
+      [
+        () => Response.json({ code: 1002, data: { task_id: 'kling-1', task_status: 'succeed' } }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({ code: 0, data: { task_id: 'other-task', task_status: 'processing' } }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({
+            code: 0,
+            data: {
+              task_id: 'kling-1',
+              task_status: 'succeed',
+              task_result: {
+                images: [
+                  { url: 'https://cdn.kling.example/1.png' },
+                  { url: 'https://cdn.kling.example/2.png' },
+                ],
+              },
+            },
+          }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({
+            code: 0,
+            data: {
+              task_id: 'kling-1',
+              task_status: 'succeeded',
+              task_result: { images: [{ url: 'https://cdn.kling.example/1.png' }] },
+            },
+          }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({
+            code: 0,
+            data: {
+              task_id: 'kling-1',
+              task_status: 'UNKNOWN',
+              task_result: { images: [{ url: 'https://cdn.kling.example/1.png' }] },
+            },
+          }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({
+            code: 0,
+            data: {
+              task_id: 'kling-1',
+              task_status: 'Submitted',
+              task_result: { images: [{ url: 'https://cdn.kling.example/1.png' }] },
+            },
+          }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+      [
+        () =>
+          Response.json({
+            code: 0,
+            data: {
+              task_id: 'kling-1',
+              task_status: 'succeed',
+              task_result: { images: [{ url: 'http://cdn.kling.example/insecure.png' }] },
+            },
+          }),
+        { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' },
+      ],
+    ] as const) {
+      const transport = vi.fn<typeof fetch>().mockImplementation(async () => responseFactory());
+      const outcome = await testKling(transport).query(
+        request,
+        key,
+        'kling-1',
+        1,
+        AbortSignal.timeout(1000),
+      );
+      expect(outcome).toEqual(expected);
+      expect(transport).toHaveBeenCalledOnce();
+    }
   });
 });

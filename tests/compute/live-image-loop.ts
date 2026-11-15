@@ -36,7 +36,7 @@ import { validateImage } from '../../compute/src/adapters/media.ts';
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
 assert.equal(process.env.MIO_RUN_LIVE_IMAGE, 'yes', 'LIVE_OPT_IN');
-const SCENARIOS = ['vidu-async', 'seedream-sync', 'gpt-sync', 'gpt-edit'] as const;
+const SCENARIOS = ['vidu-async', 'kling-async', 'seedream-sync', 'gpt-sync', 'gpt-edit'] as const;
 type Scenario = (typeof SCENARIOS)[number];
 function parseCliArguments(argv: string[]) {
   let cliScenario: string | undefined;
@@ -516,9 +516,11 @@ async function prepare() {
         item.discovered &&
         (scenario === 'vidu-async'
           ? item.modelId === 'image-vidu-q2'
-          : scenario === 'seedream-sync'
-            ? item.modelId === 'doubao-seedream-4.0'
-            : item.modelId === 'gpt-image-1' || item.modelId.startsWith('gpt-image-')),
+          : scenario === 'kling-async'
+            ? item.modelId === 'image-kling-v3'
+            : scenario === 'seedream-sync'
+              ? item.modelId === 'doubao-seedream-4.0'
+              : item.modelId === 'gpt-image-1' || item.modelId.startsWith('gpt-image-')),
     );
     assert(
       selected &&
@@ -532,9 +534,11 @@ async function prepare() {
     const expectedProfile =
       scenario === 'vidu-async'
         ? 'vidu-image-v1'
-        : scenario === 'seedream-sync'
-          ? 'seedream-4-images-v1'
-          : 'gpt-images-v1';
+        : scenario === 'kling-async'
+          ? 'kling-image-v1'
+          : scenario === 'seedream-sync'
+            ? 'seedream-4-images-v1'
+            : 'gpt-images-v1';
     save(
       declaration,
       scenario === 'vidu-async'
@@ -554,35 +558,51 @@ async function prepare() {
               },
             },
           }
-        : scenario === 'seedream-sync'
+        : scenario === 'kling-async'
           ? {
               modelRef: selected.modelRef,
               operation: 'image.generate',
-              profile: 'seedream-4-images-v1',
+              profile: 'kling-image-v1',
               sourceKind: 'protocol-reference',
-              source: 'https://docs.onelinkai.cloud/8655248m0',
-              sourceVersion: '2026-11-14',
-              classification: 'image',
-            }
-          : {
-              modelRef: selected.modelRef,
-              operation: 'image.generate',
-              profile: 'gpt-images-v1',
-              sourceKind: 'protocol-reference',
-              source: 'https://docs.onelinkai.cloud/8882392m0',
-              sourceVersion: '2026-11-14',
+              source: 'https://docs.onelinkai.cloud/8653497m0',
+              sourceVersion: '2026-09-08',
               classification: 'image',
               metadata: {
-                image:
-                  scenario === 'gpt-edit'
-                    ? {
-                        modes: ['generate', 'edit'],
-                        mask: { format: 'png' },
-                        references: { maxImages: 4 },
-                      }
-                    : { modes: ['generate'] },
+                image: {
+                  modes: ['generate'],
+                  async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+                },
               },
-            },
+            }
+          : scenario === 'seedream-sync'
+            ? {
+                modelRef: selected.modelRef,
+                operation: 'image.generate',
+                profile: 'seedream-4-images-v1',
+                sourceKind: 'protocol-reference',
+                source: 'https://docs.onelinkai.cloud/8655248m0',
+                sourceVersion: '2026-11-14',
+                classification: 'image',
+              }
+            : {
+                modelRef: selected.modelRef,
+                operation: 'image.generate',
+                profile: 'gpt-images-v1',
+                sourceKind: 'protocol-reference',
+                source: 'https://docs.onelinkai.cloud/8882392m0',
+                sourceVersion: '2026-11-14',
+                classification: 'image',
+                metadata: {
+                  image:
+                    scenario === 'gpt-edit'
+                      ? {
+                          modes: ['generate', 'edit'],
+                          mask: { format: 'png' },
+                          references: { maxImages: 4 },
+                        }
+                      : { modes: ['generate'] },
+                },
+              },
       true,
     );
     command(
@@ -636,7 +656,7 @@ async function prepare() {
         adaptation.sourceKind === 'protocol-reference' &&
         Number.isSafeInteger(adaptation.declarationVersion) &&
         adaptation.declarationVersion > 0 &&
-        (scenario !== 'vidu-async' ||
+        (!(scenario === 'vidu-async' || scenario === 'kling-async') ||
           (JSON.stringify(asyncMetadata?.operations) === JSON.stringify(['generate']) &&
             asyncMetadata?.maxQueries === 8 &&
             asyncMetadata?.maxAgeSeconds === 600)) &&
@@ -703,7 +723,7 @@ type SavedOutput = { key: string; sizeBytes: number; sha256: string; contentType
 type SanitizedSubmissionObservation = {
   statusCode?: number;
   requestIdPresent?: boolean;
-  responsePaths?: ('task_id' | 'state' | 'creations' | 'error' | 'other')[];
+  responsePaths?: ('task_id' | 'state' | 'creations' | 'data' | 'code' | 'error' | 'other')[];
   taskIdPresent?: boolean;
   errorCategory?:
     | 'none'
@@ -717,7 +737,15 @@ type SanitizedSubmissionObservation = {
     | 'transport'
     | 'aborted';
 };
-const submissionObservationPaths = new Set(['task_id', 'state', 'creations', 'error', 'other']);
+const submissionObservationPaths = new Set([
+  'task_id',
+  'state',
+  'creations',
+  'data',
+  'code',
+  'error',
+  'other',
+]);
 const submissionErrorCategories = new Set([
   'none',
   'auth',
@@ -743,13 +771,13 @@ function safeSubmissionObservation(value: unknown): SanitizedSubmissionObservati
   if (typeof input.requestIdPresent === 'boolean')
     observation.requestIdPresent = input.requestIdPresent;
   if (Array.isArray(input.responsePaths)) {
-    const paths: ('task_id' | 'state' | 'creations' | 'error' | 'other')[] = [];
+    const paths: ('task_id' | 'state' | 'creations' | 'data' | 'code' | 'error' | 'other')[] = [];
     for (const path of input.responsePaths) {
       if (typeof path === 'string' && submissionObservationPaths.has(path)) {
         const typed = path as (typeof paths)[number];
         if (!paths.includes(typed)) paths.push(typed);
       }
-      if (paths.length === 5) break;
+      if (paths.length === submissionObservationPaths.size) break;
     }
     observation.responsePaths = paths;
   }
@@ -980,13 +1008,15 @@ async function execute() {
   assert.equal(state.candidate, candidate, 'LIVE_CANDIDATE_CHANGED');
   const activeScenario: Scenario = state.scenario ?? 'vidu-async';
   assert(!explicitScenario || activeScenario === scenario, 'LIVE_SCENARIO_CHANGED');
-  const isAsync = activeScenario === 'vidu-async';
+  const isAsync = activeScenario === 'vidu-async' || activeScenario === 'kling-async';
   const expectedProfile =
     activeScenario === 'vidu-async'
       ? 'vidu-image-v1'
-      : activeScenario === 'seedream-sync'
-        ? 'seedream-4-images-v1'
-        : 'gpt-images-v1';
+      : activeScenario === 'kling-async'
+        ? 'kling-image-v1'
+        : activeScenario === 'seedream-sync'
+          ? 'seedream-4-images-v1'
+          : 'gpt-images-v1';
   state.b.MIO_LIVE_IMAGE_SCENARIO = activeScenario;
   const aCos = privateEnv(first!);
   const rawBCos = privateEnv(second!);
@@ -1046,17 +1076,23 @@ async function execute() {
     const body = {
       requestId: randomUUID(),
       modelRef: state.modelRef,
-      parameters: isAsync
-        ? {
-            prompt: 'A simple blue square on a white background.',
-            async: true,
-            size: '1080p',
-          }
-        : {
-            prompt: 'A simple blue square on a white background.',
-            n: 1,
-            size: '1024x1024',
-          },
+      parameters:
+        activeScenario === 'vidu-async'
+          ? {
+              prompt: 'A simple blue square on a white background.',
+              async: true,
+              size: '1080p',
+            }
+          : activeScenario === 'kling-async'
+            ? {
+                prompt: 'A simple blue square on a white background.',
+                async: true,
+              }
+            : {
+                prompt: 'A simple blue square on a white background.',
+                n: 1,
+                size: '1024x1024',
+              },
     };
     const created = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
     assert.equal(created.status, 202, 'LIVE_IMAGE_ADMISSION');

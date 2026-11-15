@@ -45,6 +45,60 @@
       }
     },
     {
+      "key": "kling-async-image-slice",
+      "title": "OneLink Kling 异步文生图（kling-image-v1）提交、有界查询与重启恢复",
+      "locations": [
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "kling-image-v1 异步图片任务受理、owner 权限、重启恢复与 Asset 物化绑定"
+        },
+        {
+          "path": "src/providers/catalog.ts",
+          "purpose": "当前发现模型 image-kling-v3（排除 image-kling-v3-omni）与显式 async 适配资格判定"
+        },
+        {
+          "path": "src/providers/schema.ts",
+          "purpose": "mio_provider_model_adaptations_profile_check 约束升级以纳入 kling-image-v1"
+        },
+        {
+          "path": "tests/compute/images-http.test.ts",
+          "purpose": "kling-image-v1 与 image-kling-v3 / image-kling-v3-omni HTTP 准入及错误映射集成测试"
+        },
+        {
+          "path": "tests/compute/live-image-loop.ts",
+          "purpose": "kling-async 隔离真实闭环、首轮查询前硬重启恢复、Asset 鉴权与重放验收入口"
+        },
+        {
+          "path": "tests/compute/live-image-audit.ts",
+          "purpose": "kling-async 单次生成 POST 互锁（maxUpstreamGeneratePosts = 1）与有界查询脱敏审计"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "Kling 异步端点、请求/响应约束、万联网关任务转发状态机与安全边界说明"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "kling-image-v1 异步图片 HTTP 输入、任务生命周期与资源归属契约"
+        },
+        {
+          "path": "docs/apis/providers.md",
+          "purpose": "Provider 显式适配 kling-image-v1 的 metadata.image 规则"
+        },
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "A/B 异步消息、contracts/compute/src/images.ts 契约输入与 compute/src/images.ts 及 compute/src/image-worker.ts 恢复协议"
+        }
+      ],
+      "outcomes": "在系统 `user_id`、PG outbox/journal、私有 COS/`Asset` 与动态 Provider 目录边界内，落地 `kling-image-v1`（精确对应目录已发现的 `image-kling-v3`，显式排除异构端点 `image-kling-v3-omni`）异步文生图能力：在 `contracts/compute/src/images.ts`、`compute/src/images.ts`（`createKlingAsyncImageTransport`）与 `compute/src/image-worker.ts`（`defaultAsyncImageTransport`）复用协议中立 `AsyncImageTransport` 与穷尽 `ImageProfile` 分发，支持单次异步提交、万联网关与公开文档有限状态有界轮询、重启恢复、公网 HTTPS 受控下载、私有 COS 物化、owner `Asset` 鉴权读取及幂等重放，并扩展 `kling-async` 场景化 live 审计与运行器。",
+      "verification": "当前候选 `949f2128698b4df3a47f01f545f97fedd9b7fdc2b53156dfb05d41adc62f1fb2` 通过 `kling-unit-tests`（101 项单测）、`kling-integration-tests`（25 项集成测试，含 PG `mio_provider_model_adaptations_profile_check` 迁移升级）、`format:check`、`typecheck`、`lint`、`guard`、`test:smoke` 及锚定有效基线的增量 `full-check`；在独立隔离 PG/RabbitMQ、私有 COS 与当前 OneLink Key 上完成 `miow3kling20261115c-run` 端到端真实闭环（1 次生成 POST、首轮查询前硬重启恢复、2 次查询达 `success`、PNG 463918 字节 SHA-256 一致、owner 200 / 跨用户 404 / 未登录 401、二次重启后 `requestId` 与 MQ 消息重放 0 次重复 POST 与 0 次额外查询，历史跨候选 Run A/B 原件完整保留）；`quality-review` 与 v2 `norms-review` 三方对账通过。",
+      "limitations": "真实供应商观察限于当前 OneLink Key 目录中的 `image-kling-v3`（异步 `generate`、`n = 1`）；使用独立端点 `/kling/v1/images/omni-image` 的 `image-kling-v3-omni`、Kling 参考图/多图参数、当前目录缺失的 `gpt-image-*` / `gemini-*` 真实闭环、Seedream `edit` 与真实上游 `outpaint` `geometry` 保持 `pending`；远端 GitHub Actions 全量检查与生产性能压测不在本轮范围。",
+      "acceptance": {
+        "candidate": "949f2128698b4df3a47f01f545f97fedd9b7fdc2b53156dfb05d41adc62f1fb2",
+        "statement": "接受当前 kling-async-image-slice 候选（949f2128698b4df3a47f01f545f97fedd9b7fdc2b53156dfb05d41adc62f1fb2）进入 complete ，并把本地代码进行提交。暂不推送。",
+        "reference": "conversation://ea0b4ffc-2195-452c-b802-bccf372807a8 (2026-11-15T20:10:26+08:00 user acceptance)"
+      }
+    },
+    {
       "key": "reference-outpaint-slice",
       "title": "OneLink GPT 多参考输入与 capability-gated outpaint",
       "locations": [

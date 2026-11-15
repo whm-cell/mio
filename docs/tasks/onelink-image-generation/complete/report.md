@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/compute/service.ts](../../../../src/compute/service.ts) · [src/compute/store.ts](../../../../src/compute/store.ts) · [src/providers/catalog.ts](../../../../src/providers/catalog.ts) · [tests/compute/live-image-loop.ts](../../../../tests/compute/live-image-loop.ts) · [docs/tasks/compute-service/protocol.md](../../compute-service/protocol.md) · [docs/apis/compute.md](../../../apis/compute.md) · [docs/integrations/onelink.md](../../../integrations/onelink.md)
 
+## kling-async-image-slice
+
+**OneLink Kling 异步文生图（kling-image-v1）提交、有界查询与重启恢复**
+
+[src/compute/service.ts](../../../../src/compute/service.ts) · [src/providers/catalog.ts](../../../../src/providers/catalog.ts) · [src/providers/schema.ts](../../../../src/providers/schema.ts) · [tests/compute/images-http.test.ts](../../../../tests/compute/images-http.test.ts) · [tests/compute/live-image-loop.ts](../../../../tests/compute/live-image-loop.ts) · [tests/compute/live-image-audit.ts](../../../../tests/compute/live-image-audit.ts) · [docs/integrations/onelink.md](../../../integrations/onelink.md) · [docs/apis/compute.md](../../../apis/compute.md) · [docs/apis/providers.md](../../../apis/providers.md) · [docs/tasks/compute-service/protocol.md](../../compute-service/protocol.md)
+
 ## reference-outpaint-slice
 
 **OneLink GPT 多参考输入与 capability-gated outpaint**
@@ -26,7 +32,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "prd": "docs/tasks/onelink-image-generation/prd.md",
   "records": {
     "path": "docs/tasks/onelink-image-generation/complete/records.json",
-    "sha256": "8233e1299d0b546573bbebefddceddff2285cbe9c3ef6eeffb00e68ceeec9375"
+    "sha256": "493315efce94f328d2f9bacfb7cd1d4bc15040877035f957748207d75c0c9694"
   }
 }
 ```

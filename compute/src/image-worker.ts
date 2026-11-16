@@ -1,22 +1,22 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  IMAGE_PROFILE_RULES,
+  canonicalImageRouteConfig,
+  imageCommandCredentialBinding,
   imageOutputIndex,
   imageOutputKey,
   imageQueryCredentialBinding,
-  canonicalImageInput,
+  isImageDriver,
+  validateImageRouteConfig,
   type ImageAssetRef,
+  type ImageDriver,
   type ImageErrorCode,
   type ImageInput,
-  type ImageProfile,
   type ImageQueryCommandV1,
+  type ImageRouteConfig,
 } from '@mio/compute-contracts';
 import type { Journal } from './adapters/journal.ts';
-import {
-  createImageProtocol,
-  createKlingAsyncImageTransport,
-  createViduAsyncImageTransport,
-} from './images.ts';
+import { withPublicHttps } from './adapters/public-https.ts';
+import { createRoutedImageProtocol, defaultRouteAsyncTransport } from './images.ts';
 import type { AsyncImageTransport, ImageObservation, ReadImage } from './images.ts';
 import { openImageCredential } from './image-credentials.ts';
 import type { ImageCredentialEnvelope } from './image-credentials.ts';
@@ -27,7 +27,8 @@ export interface ImageCommand {
   jobId: string;
   ownerId: string;
   expiresAt: number;
-  profile: ImageProfile;
+  profile: ImageDriver;
+  route: ImageRouteConfig;
   input: ImageInput;
   credential: ImageCredentialEnvelope;
 }
@@ -87,32 +88,11 @@ function completed(saved: SavedCompletion): ImageOutcome {
   };
 }
 
-function defaultAsyncImageTransport(
-  profile: ImageProfile,
-  transport: typeof fetch,
-  read: ReadImage,
-): AsyncImageTransport | undefined {
-  switch (profile) {
-    case 'vidu-image-v1':
-      return createViduAsyncImageTransport(transport, read);
-    case 'kling-image-v1':
-      return createKlingAsyncImageTransport(transport);
-    case 'gpt-images-v1':
-    case 'seedream-4-images-v1':
-      return undefined;
-    default: {
-      const exhaustive: never = profile;
-      void exhaustive;
-      return undefined;
-    }
-  }
-}
-
 function defaultSavedImageFormat(
-  profile: ImageProfile,
+  route: ImageRouteConfig | null,
   outputFormat: ImageInput['output_format'],
 ): 'png' | 'jpeg' | 'webp' {
-  return IMAGE_PROFILE_RULES[profile]?.fixedOutputFormat ?? outputFormat ?? 'png';
+  return route?.outputSpec.fixedOutputFormat ?? outputFormat ?? 'png';
 }
 
 async function materializeSaved(
@@ -234,19 +214,22 @@ export function createImageWorker(
   transport: typeof fetch = fetch,
   readImage?: ReadImage,
   asyncTransport?: AsyncImageTransport,
+  download: typeof withPublicHttps = withPublicHttps,
 ) {
   const active = new Set<string>();
   return async (
     command: ImageCommand | ImageQueryCommand,
     signal?: AbortSignal,
   ): Promise<ImageOutcome> => {
-    const binding = JSON.stringify([
-      command.jobId,
-      command.ownerId,
-      command.expiresAt,
-      command.profile,
-      canonicalImageInput(command.input),
-    ]);
+    const route =
+      isImageDriver(command.profile) &&
+      validateImageRouteConfig(command.route) &&
+      command.profile === command.route.driver
+        ? canonicalImageRouteConfig(command.route)
+        : null;
+    const binding = route
+      ? imageCommandCredentialBinding({ ...command, route })
+      : JSON.stringify([command.jobId, command.ownerId, command.expiresAt, command.profile, null]);
     const identity = createHash('sha256')
       .update(binding)
       .update(
@@ -326,8 +309,9 @@ export function createImageWorker(
           throw new Error('IMAGE_QUERY_UNKNOWN');
         }
         const activeAsyncTransport =
-          asyncTransport ?? defaultAsyncImageTransport(command.profile, transport, read);
-        if (!activeAsyncTransport) {
+          asyncTransport ??
+          (route ? defaultRouteAsyncTransport(route, transport, read, download) : undefined);
+        if (!route || !activeAsyncTransport) {
           journal.imagePhase(
             command.jobId,
             'failed',
@@ -410,12 +394,13 @@ export function createImageWorker(
             queryAttempt: command.queryAttempt,
           };
         }
-        const result = await createImageProtocol(
-          command.profile,
+        const result = await createRoutedImageProtocol(
+          route,
           command.operation,
           transport,
           read,
           activeAsyncTransport,
+          download,
         ).queryAsync(command.input, apiKey, command.upstreamTaskId, command.queryAttempt, signal);
         if (result.state === 'processing') {
           journal.imagePhase(
@@ -452,7 +437,7 @@ export function createImageWorker(
         }
         const saved: SavedImages = {
           commandId: command.commandId,
-          format: defaultSavedImageFormat(command.profile, command.input.output_format),
+          format: defaultSavedImageFormat(route, command.input.output_format),
           expectedCount: command.input.n ?? 1,
           images: result.images,
           outputs: [],
@@ -460,10 +445,14 @@ export function createImageWorker(
         journal.imagePhase(command.jobId, 'returned', JSON.stringify(saved));
         return await materializeSaved(journal, command.jobId, saved, materialize, signal);
       }
+      const hasInputRefs =
+        command.input.image !== undefined ||
+        (command.input.images?.length ?? 0) > 0 ||
+        command.input.mask !== undefined;
       if (
         !current &&
-        command.input.async !== true &&
-        ['edit', 'outpaint'].includes(command.input.operation ?? 'generate')
+        hasInputRefs &&
+        !(command.input.async === true && asyncTransport !== undefined && !readImage)
       ) {
         try {
           const inputSignal = signal ?? AbortSignal.timeout(180_000);
@@ -472,12 +461,16 @@ export function createImageWorker(
           if (command.input.mask) await read(command.input.mask, inputSignal);
         } catch {
           // No journal row exists yet, so a COS read failure is safe to retry before
-          // the worker can submit the upstream edit request.
+          // the worker can submit the upstream request.
           throw new Error('IMAGE_INPUT_UNAVAILABLE');
         }
       }
       const first = journal.beginImage(command.jobId, identity);
       if (first) {
+        if (!route) {
+          journal.imagePhase(command.jobId, 'rejected', 'IMAGE_HANDLER_UNAVAILABLE');
+          return { state: 'rejected', errorCode: 'IMAGE_HANDLER_UNAVAILABLE' };
+        }
         if (!keyId || !privateKey || command.expiresAt <= Date.now()) {
           const errorCode =
             !keyId || !privateKey ? 'IMAGE_HANDLER_UNAVAILABLE' : 'IMAGE_CREDENTIAL_UNAVAILABLE';
@@ -491,12 +484,13 @@ export function createImageWorker(
           journal.imagePhase(command.jobId, 'rejected', 'IMAGE_CREDENTIAL_UNAVAILABLE');
           return { state: 'rejected', errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE' };
         }
-        const protocol = createImageProtocol(
-          command.profile,
+        const protocol = createRoutedImageProtocol(
+          route,
           command.input.operation ?? 'generate',
           transport,
           read,
-          asyncTransport ?? defaultAsyncImageTransport(command.profile, transport, read),
+          asyncTransport ?? defaultRouteAsyncTransport(route, transport, read, download),
+          download,
         );
         if (command.input.async === true) {
           const result = await protocol.submitAsync(command.input, apiKey, signal);
@@ -542,7 +536,7 @@ export function createImageWorker(
         }
         const saved: SavedImages = {
           commandId: command.messageId,
-          format: defaultSavedImageFormat(command.profile, command.input.output_format),
+          format: defaultSavedImageFormat(route, command.input.output_format),
           expectedCount: command.input.n ?? 1,
           images: result.images,
           outputs: [],
@@ -605,7 +599,7 @@ export function createImageWorker(
       const saved = JSON.parse(row.payload!) as SavedImages;
       // Unreleased older journal rows did not retain the publication identity.
       saved.commandId ??= command.messageId;
-      saved.format ??= defaultSavedImageFormat(command.profile, command.input.output_format);
+      saved.format ??= defaultSavedImageFormat(route, command.input.output_format);
       saved.expectedCount ??= command.input.n ?? 1;
       if (saved.commandId !== command.messageId) throw new Error('IMAGE_COMMAND_CONFLICT');
       return await materializeSaved(journal, command.jobId, saved, materialize, signal);

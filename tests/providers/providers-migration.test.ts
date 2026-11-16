@@ -35,25 +35,26 @@ const success = (ids: string[], credentialVersion = 1) => ({
   checkedAt: '2026-11-09T00:00:00Z',
 });
 
-it('checks the image adaptation constraints only when image execution is enabled', async () =>
+it('enforces route and verification primary keys and active schema columns unconditionally', async () =>
   databaseTest(async (pool) => {
     await pool.query(providerSchemaSQL);
-    await pool.query(`ALTER TABLE mio_provider_model_adaptations
-      DROP CONSTRAINT mio_provider_model_adaptations_operation_check,
-      DROP CONSTRAINT mio_provider_model_adaptations_profile_check,
-      ADD CONSTRAINT mio_provider_model_adaptations_operation_check CHECK(operation='chat'),
-      ADD CONSTRAINT mio_provider_model_adaptations_profile_check CHECK(profile IN ('openai-chat','anthropic-messages'))`);
     await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
+    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+
+    await pool.query(
+      'ALTER TABLE mio_provider_model_routes DROP CONSTRAINT mio_provider_model_routes_pkey',
+    );
+    await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
     await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
     await pool.query(providerSchemaSQL);
     await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
-    await pool.query(`ALTER TABLE mio_provider_model_adaptations
-      DROP CONSTRAINT mio_provider_model_adaptations_profile_check,
-      ADD CONSTRAINT mio_provider_model_adaptations_profile_check
-      CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
-            (operation='image.generate' AND profile='gpt-images-v1'))`);
-    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
+
+    await pool.query(
+      'ALTER TABLE mio_provider_model_verifications DROP CONSTRAINT mio_provider_model_verifications_pkey',
+    );
+    await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
     await pool.query(providerSchemaSQL);
+    await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
     await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
   }));
 
@@ -114,7 +115,10 @@ it('upgrades valid success/empty success, failed and rotated observations withou
       raw_model_id: null,
       unavailable_reason: 'LEGACY_MODEL_REF_INVALID',
     });
-    expect((await pool.query('SELECT * FROM mio_provider_model_adaptations')).rows).toHaveLength(0);
+    expect((await pool.query('SELECT * FROM mio_provider_model_routes')).rows).toHaveLength(0);
+    expect((await pool.query('SELECT * FROM mio_provider_model_verifications')).rows).toHaveLength(
+      0,
+    );
     const prefs = (await pool.query('SELECT * FROM mio_provider_model_preferences')).rows;
     expect(
       new Set(
@@ -172,9 +176,25 @@ it('rolls back a failed upgrade entirely and rejects cross-configuration referen
     ).rejects.toThrow();
   }));
 
-it('upgrades an existing four-table catalog without changing identity or history and checks metadata constraints', async () =>
+it('upgrades an existing catalog non-destructively, drops legacy adaptation_origin, and checks metadata constraints', async () =>
   databaseTest(async (pool) => {
     await pool.query(providerSchemaSQL);
+    // Simulate pre-existing legacy mio_provider_model_adaptations table and legacy adaptation_origin column
+    await pool.query(`
+      CREATE TABLE mio_provider_model_adaptations (
+        provider_id uuid NOT NULL,
+        model_key uuid NOT NULL,
+        operation text NOT NULL,
+        profile text NOT NULL,
+        declaration_version integer NOT NULL DEFAULT 1,
+        verification_status text NOT NULL DEFAULT 'unverified',
+        verified_at timestamptz,
+        verification_evidence text,
+        tested_tuple jsonb,
+        PRIMARY KEY(provider_id, model_key, operation)
+      );
+      ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text DEFAULT 'platform';
+    `);
     const id = await seed(pool, null);
     await pool.query(
       `INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata)
@@ -188,21 +208,17 @@ it('upgrades an existing four-table catalog without changing identity or history
       )
     ).rows[0]!.model_key;
     await pool.query(
-      `INSERT INTO mio_provider_model_adaptations(provider_id,model_key,operation,profile,declaration_version,source,source_version)
-       VALUES($1,$2,'chat','openai-chat',1,'legacy protocol note','v1')`,
-      [id, modelKey],
+      `INSERT INTO mio_provider_model_routes(
+         provider_type,raw_model_id,operation,vendor,driver,classification,submit_path,source_kind,source,source_version,declaration_version,enabled
+       ) VALUES('onelink','old-exact-ID','chat','openai','openai-chat','chat','/v1/chat/completions','protocol-reference','legacy-doc','v1',1,true)`,
     );
     await pool.query(
-      'ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT mio_provider_model_adaptations_source_kind_check, DROP COLUMN source_kind',
+      `INSERT INTO mio_provider_model_adaptations(
+         provider_id,model_key,operation,profile,declaration_version,verification_status,verified_at,verification_evidence,tested_tuple
+       ) VALUES($1,$2,'chat','openai-chat',1,'verified',now(),'legacy-evidence-1','{"adaptationOrigin":"owner","modelId":"old-exact-ID"}'::jsonb)`,
+      [id, modelKey],
     );
-    await expect(checkProviderSchema(pool)).rejects.toThrow();
-    await pool.query('BEGIN');
-    await pool.query(providerSchemaSQL);
-    await checkProviderSchema(pool);
-    await pool.query('COMMIT');
-    expect(
-      (await pool.query('SELECT source_kind FROM mio_provider_model_adaptations')).rows[0],
-    ).toEqual({ source_kind: 'protocol-reference' });
+
     await pool.query(
       'ALTER TABLE mio_provider_models DROP COLUMN display_name, DROP COLUMN description_override',
     );
@@ -212,6 +228,29 @@ it('upgrades an existing four-table catalog without changing identity or history
     await pool.query(providerSchemaSQL);
     await checkProviderSchema(pool);
     await pool.query('COMMIT');
+
+    // Non-destructive: mio_provider_model_adaptations is preserved, adaptation_origin column is dropped,
+    // and matching verified row is migrated idempotently without adaptationOrigin in tested_tuple.
+    expect(
+      (await pool.query("SELECT to_regclass('mio_provider_model_adaptations') AS name")).rows[0]
+        .name,
+    ).toBe('mio_provider_model_adaptations');
+    const verifications = (
+      await pool.query(
+        'SELECT driver, declaration_version, verification_status, verification_evidence, tested_tuple FROM mio_provider_model_verifications WHERE provider_id=$1',
+        [id],
+      )
+    ).rows;
+    expect(verifications).toEqual([
+      {
+        driver: 'openai-chat',
+        declaration_version: 1,
+        verification_status: 'verified',
+        verification_evidence: 'legacy-evidence-1',
+        tested_tuple: { modelId: 'old-exact-ID' },
+      },
+    ]);
+
     const migrated = (await pool.query('SELECT * FROM mio_provider_models')).rows[0];
     expect(migrated).toEqual({ ...before, display_name: null, description_override: null });
     expect(migrated).toMatchObject({

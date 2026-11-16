@@ -2,12 +2,17 @@ import { randomUUID, generateKeyPairSync } from 'node:crypto';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
 import type { ImageCommandV1, ImageResultV1 } from '@mio/compute-contracts';
-import { parseImageCommand, parseImageResult } from '@mio/compute-contracts';
+import {
+  imageCommandCredentialBinding,
+  parseImageCommand,
+  parseImageResult,
+} from '@mio/compute-contracts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeStore } from '../../src/compute/store.ts';
 import { sealImageKey } from '../../src/compute/image-credentials.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { findFixtureImageRouteConfig } from '../providers/fixtures/onelink-routes-fixture.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -17,6 +22,8 @@ const keys = generateKeyPairSync('rsa', {
   publicKeyEncoding: { type: 'spki', format: 'pem' },
   privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
 });
+const GPT_ROUTE = findFixtureImageRouteConfig('gpt-image-2');
+
 function imageKey(jobId: string, index: number, format = 'png') {
   const fileId = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
   return `mio/derived/${jobId}/images/${index}-${fileId}.${format}`;
@@ -62,7 +69,8 @@ it('reserves shared capacity for owner recovery, ignores stale results and remov
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: GPT_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: owner,
@@ -139,7 +147,8 @@ it('counts image and video admission together and rechecks capacity before expli
   const make = (): ImageCommandV1 => ({
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: GPT_ROUTE,
     messageId: randomUUID(),
     jobId: randomUUID(),
     ownerId: owner,
@@ -202,7 +211,8 @@ it.each([
     const image: ImageCommandV1 = {
       version: 1,
       type: 'image.request',
-      profile: 'gpt-images-v1',
+      profile: 'openai-images',
+      route: GPT_ROUTE,
       messageId: randomUUID(),
       jobId: randomUUID(),
       ownerId: owner,
@@ -232,32 +242,43 @@ it.each([
     });
   },
 );
+
 it('atomically deduplicates admission, persists encrypted outbox and registers owned assets once', async () => {
   const jobId = randomUUID();
   const requestId = randomUUID();
   const input = { model: 'gpt-image-2', prompt: 'square' };
   const expiresAt = Date.now() + 60000;
-  const credential = sealImageKey(
-    'private-key',
-    JSON.stringify([jobId, 'owner', expiresAt, 'gpt-images-v1', input]),
-    'b1',
-    keys.publicKey,
-  );
-  const command: ImageCommandV1 = {
-    version: 1,
-    type: 'image.request',
-    profile: 'gpt-images-v1',
+  const commandBase = {
+    version: 1 as const,
+    type: 'image.request' as const,
+    profile: 'openai-images' as const,
+    route: GPT_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
     expiresAt,
     input,
+  };
+  const credential = sealImageKey(
+    'private-key',
+    imageCommandCredentialBinding(commandBase),
+    'b1',
+    keys.publicKey,
+  );
+  const command: ImageCommandV1 = {
+    ...commandBase,
     credential,
   };
   expect(parseImageCommand(command)).toEqual(command);
   expect(() => parseImageCommand({ ...command, profile: 'unimplemented-profile' })).toThrow(
     'IMAGE_MESSAGE_INVALID',
   );
+  expect(() => parseImageCommand({ ...command, profile: 'gpt-images-v1' })).toThrow(
+    'IMAGE_MESSAGE_INVALID',
+  );
+  const { route: _missingRoute, ...missingRoute } = command;
+  void _missingRoute;
+  expect(() => parseImageCommand(missingRoute)).toThrow('IMAGE_MESSAGE_INVALID');
   const { profile: _missingProfile, ...missingProfile } = command;
   void _missingProfile;
   expect(() => parseImageCommand(missingProfile)).toThrow('IMAGE_MESSAGE_INVALID');
@@ -355,7 +376,8 @@ it('registers durable partial outputs and resumes the remainder without duplicat
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: GPT_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
@@ -406,7 +428,8 @@ it('registers a later output by its stable index when the earlier output is miss
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: GPT_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',

@@ -71,11 +71,11 @@ it('rejects the COS package under a business import alias', async () => {
 });
 
 it.each([
-  ['scripts/service/import-provider-adaptation.ts', 'src/providers/store.ts', 0],
-  ['scripts/service/import-provider-adaptation.ts', 'src/providers/catalog.ts', 1],
-  ['scripts/service/import-provider-adaptation.ts', 'src/providers/contracts.ts', 0],
-  ['scripts/service/import-provider-adaptation.ts', 'src/providers/service.ts', 1],
-  ['scripts/service/import-provider-adaptation.ts', 'src/providers-extra/store.ts', 1],
+  ['scripts/service/import-provider-route.ts', 'src/providers/store.ts', 0],
+  ['scripts/service/import-provider-route.ts', 'src/providers/catalog.ts', 1],
+  ['scripts/service/import-provider-route.ts', 'src/providers/contracts.ts', 0],
+  ['scripts/service/import-provider-route.ts', 'src/providers/service.ts', 1],
+  ['scripts/service/import-provider-route.ts', 'src/providers-extra/store.ts', 1],
   ['scripts/harness/deploy.ts', 'src/providers/store.ts', 1],
 ] as const)(
   'keeps deployment imports exact, including type aliases: %s -> %s',

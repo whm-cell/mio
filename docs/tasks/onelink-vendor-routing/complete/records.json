@@ -1,0 +1,60 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-vendor-routing/prd.md",
+  "results": [
+    {
+      "key": "onelink-db-vendor-routing",
+      "title": "万联（OneLink）单轨数据库模型路由目录、单用户验证隔离与四原厂纯协议驱动",
+      "locations": [
+        {
+          "path": "src/providers/onelink/router.ts",
+          "purpose": "单轨模型路由配置解析、1..500 条外部 JSON 导入校验与按 model_key + operation + declarationVersion + tested_tuple 判定的验证视图"
+        },
+        {
+          "path": "src/providers/catalog.ts",
+          "purpose": "预构建 routes / preferences / verifications 三张 Map 索引的 O(M+P+R+V) 目录投影与单轨资格计算"
+        },
+        {
+          "path": "src/providers/schema.ts",
+          "purpose": "mio_provider_model_routes 与 mio_provider_model_verifications（主键 (provider_id, model_key, operation)）建表、无损保留历史 mio_provider_model_adaptations 表、移除 adaptation_origin 列及匹配路由 verified 幂等回填迁移"
+        },
+        {
+          "path": "scripts/service/import-provider-route.ts",
+          "purpose": "pnpm providers:route <--stdin | routes.json>（64 KiB 有界普通文件/stdin 读取）幂等平台路由导入入口"
+        },
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "图片任务必填 ImageRouteConfig 动态校验、defaultImageWatermark 合成、canonicalImageRouteConfig 信封 AAD 绑定与单用户验证落库"
+        },
+        {
+          "path": "src/compute/store.ts",
+          "purpose": "图片任务 route_snapshot 持久化，以及对缺失合法路由的存量未发 image.request（rejected / IMAGE_HANDLER_UNAVAILABLE）与在途 image.query（failed / IMAGE_QUERY_FAILED）双向 fail-closed 拦截"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "文本对话单轨路由 submitPath、maxOutputTokens 与 contextWindow 上限注入 DSH Model"
+        },
+        {
+          "path": "tests/providers/vendor-routing.test.ts",
+          "purpose": "六场景隔离集成验收（外部 JSON 幂等共享、目录成员硬隔离、单用户验证隔离、零 TS 改动新模型对话+图片闭环、存量无损迁移与回填、未发/在途无快照任务双向 fail-closed）"
+        },
+        {
+          "path": "docs/tasks/onelink-vendor-routing/design.md",
+          "purpose": "单轨数据库模型路由、compute/src/providers/onelink/* 四原厂纯驱动拆分、必填跨进程路由快照与 DESIGN-OVER-001 退役对照详细设计"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "src/providers/onelink/router.ts 与 compute/src/providers/onelink/{shared,openai,volcengine,vidu,kling,router} 四原厂纯驱动边界及 Kling referenceFormat 显式编码规范"
+        }
+      ],
+      "outcomes": "按 DESIGN-OVER-001 单轨落地平台级模型路由表 `mio_provider_model_routes` 与单用户验证表 `mio_provider_model_verifications`（主键 `(provider_id, model_key, operation)`；保持用户 Key `/v1/models` 动态发现为唯一目录成员权威，退役运行时 `mio_provider_model_adaptations` 读取、`providers:adapt`、内置种子表及旧 4-profile 硬编码枚举，同时非破坏性保留历史 `mio_provider_model_adaptations` 表并幂等回填命中有效路由的 `verified` 记录，源码、脚本、配置与 `dist` 编译产物零模型/系列名硬编码）；提供 `pnpm providers:route <--stdin | routes.json>`（64 KiB 有界输入读取，内容未变不递增 `declaration_version`）；将 `ImageCommandV1` 与 `ImageQueryCommandV1` 的 `route: ImageRouteConfig` 设为必填并纳入信封加密 AAD 绑定及 `imageOutputIndex` `0..15` 上界；在 Service A 将有效路由注入文本对话与图片动态准入（`catalogView` 预建 `verifications` Map 实现严格 `O(M+P+R+V)`），并在对话回执与图片材料化完成后按 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组幂等登记当前用户 `verified`；将 Worker B 单体图片协议拆分为 `compute/src/providers/onelink/{shared,openai,volcengine,vidu,kling,router}` 四原厂纯协议驱动，对缺失合法路由的存量未发 `image.request` 与在途 `image.query` 分别 fail-closed 结算 `rejected` / `IMAGE_HANDLER_UNAVAILABLE` 与 `failed` / `IMAGE_QUERY_FAILED`。",
+      "verification": "当前候选 `30fb8bb659a72963b184a9a61339071bcfec08652adfbc83373633e72d59757e` 通过 `work-documents`、全仓 `format:check`、`typecheck`、`tsconfig.portable-tools.json` 类型检查、`lint`、`guard`（348 文件 AST 边界检查通过）、正式打包 `test:smoke`、原厂路由单测（`compute/tests/vendor-routing.test.ts`）与六场景隔离集成验收测试（`tests/providers/vendor-routing.test.ts`）及全部受影响子系统测试全集（33 个测试文件、432 项测试通过），完成源码及 `dist` 产物零硬编码扫描、锚定有效基线的增量 `full-check` 复核、`quality-review` 与 v2 `norms-review` 三方对账；已完成 PRD 文档保持 0 行 diff，全程 0 次外部付费 OneLink 请求且未修改共享 `mio_dev` 表或 `mio-dev` 队列。",
+      "limitations": "Unit 1 按授权约束未发起外部付费 OneLink 请求，常驻环境外部路由 JSON 导入及真实目录新模型的单次生成 POST 有界现网验证归属 Unit 2（`onelink-route-live-expansion`）；上游未核实的 `outpaint` `geometry` 仍默认门控关闭（`DESIGN-OVER-001`）；视频、语音、音乐与向量执行 Worker 归属后续独立 PRD；远端 GitHub Actions 全量 CI 尚未在本分支运行。",
+      "acceptance": {
+        "candidate": "30fb8bb659a72963b184a9a61339071bcfec08652adfbc83373633e72d59757e",
+        "statement": "确认无误 ， 当前候选进入 complete。然后将代码进行本地提交，不要推送",
+        "reference": "user-explicit:ea0b4ffc-2195-452c-b802-bccf372807a8@2026-11-16T10:17:32+08:00"
+      }
+    }
+  ]
+}

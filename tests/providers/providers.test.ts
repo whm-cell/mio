@@ -19,6 +19,7 @@ import { encryptCredential, decryptCredential } from '../../src/providers/creden
 import { discoverModels, ONELINK_ORIGIN } from '../../src/integrations/onelink/models.ts';
 import type { ProviderView } from '../../src/providers/contracts.ts';
 import { isolateProviderEnvironment, inheritedProviderVariableCount } from '../providers-setup.ts';
+import { findFixtureRoute, makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -63,20 +64,13 @@ async function save(apiKey: string, index = 0, expectedRevision?: number) {
     index,
   );
 }
-async function declareModel(id: string, index = 0) {
-  const provider = await current(index);
-  const owner = (
-    await pool.query('SELECT owner_id FROM mio_provider_configs WHERE id=$1', [provider.id])
-  ).rows[0].owner_id as string;
-  await store.declare(owner, provider.revision, {
-    modelRef: `onelink:chat:${id}`,
-    operation: 'chat',
-    profile: 'openai-chat',
-    classification: 'chat',
-    sourceKind: 'protocol-reference',
-    source: 'deterministic protocol fixture',
-    sourceVersion: 'v1',
-  });
+async function declareModel(id: string) {
+  await store.importRoutes([
+    makeChatRouteFixture(id, 'openai', {
+      source: 'deterministic protocol fixture',
+      sourceVersion: 'v1',
+    }),
+  ]);
 }
 
 beforeAll(async () => {
@@ -806,20 +800,13 @@ it('edits Unicode separator IDs through legacy references without changing stabl
     });
 });
 
-it('rejects a pre-Kling image profile constraint during startup check until providerSchemaSQL upgrades it cleanly', async () => {
+it('rejects a missing route primary key during startup check until providerSchemaSQL upgrades it cleanly', async () => {
   await pool.query(
-    'ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT mio_provider_model_adaptations_profile_check',
+    'ALTER TABLE mio_provider_model_routes DROP CONSTRAINT mio_provider_model_routes_pkey',
   );
-  await pool.query(`
-    ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_profile_check
-      CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
-            (operation='image.generate' AND profile IN ('gpt-images-v1','seedream-4-images-v1','vidu-image-v1')))
-  `);
   try {
-    await expect(checkProviderSchema(pool, false)).resolves.toBeUndefined();
-    await expect(checkProviderSchema(pool, true)).rejects.toThrow(
-      'PROVIDER_SCHEMA: image adaptation migration required',
-    );
+    await expect(checkProviderSchema(pool, false)).rejects.toThrow('PROVIDER_SCHEMA');
+    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
     await expect(createProviderStore(config, true)).rejects.toThrow(
       'PROVIDER_SCHEMA: run providers:migrate; database unavailable or incompatible',
     );
@@ -842,29 +829,17 @@ it('rejects a pre-Kling image profile constraint during startup check until prov
     const target = view.items.find((entry) => entry.modelId === 'image-kling-v3')!;
     expect(target.image.runnable).toBe(false);
     expect(target.image.unavailableReason).toBe('ADAPTER_PENDING');
-    await upgradedStore.declare(actor.userId, (await isolatedService.get(actor))!.revision, {
-      modelRef: target.modelRef,
-      operation: 'image.generate',
-      profile: 'kling-image-v1',
-      sourceKind: 'protocol-reference',
-      source: 'https://docs.onelinkai.cloud/8653497m0',
-      sourceVersion: '2026-09-08',
-      classification: 'image',
-      metadata: {
-        image: {
-          modes: ['generate'],
-          async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-        },
-      },
-    });
+    await upgradedStore.importRoutes([findFixtureRoute('image-kling-v3', 'image.generate')]);
     const resolved = await isolatedService.resolveImage(actor, target.modelRef);
     expect(resolved).toMatchObject({
       modelId: 'image-kling-v3',
-      profile: 'kling-image-v1',
+      vendor: 'kling',
+      profile: 'kling-images',
       capabilityMetadata: {
         image: {
           modes: ['generate'],
-          async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+          references: { maxImages: 1 },
+          async: { operations: ['generate'], maxQueries: 16, maxAgeSeconds: 3600 },
         },
       },
     });

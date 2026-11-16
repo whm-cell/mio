@@ -1,13 +1,6 @@
 import type { Pool } from 'pg';
-import { IMAGE_PROFILES } from '@mio/compute-contracts';
 import { legacyProviderUpgradeSQL } from './schema-migration.ts';
 export { providerReferencesSQL } from './schema-migration.ts';
-
-const imageProfileSqlLiterals = IMAGE_PROFILES.map((profile) => {
-  if (!/^[a-z0-9-]+$/.test(profile))
-    throw new Error(`PROVIDER_SCHEMA: unsafe image profile identifier ${profile}`);
-  return `'${profile}'`;
-});
 
 /** Explicit migration only. Startup runs the read-only check below. */
 export const providerSchemaSQL = `
@@ -67,30 +60,123 @@ DO $$ BEGIN
       CHECK(char_length(description_override)<=500);
   END IF;
 END $$;
-CREATE TABLE IF NOT EXISTS mio_provider_model_adaptations (
-  provider_id uuid NOT NULL, model_key uuid NOT NULL,
-  operation text NOT NULL CHECK(operation='chat'),
-  profile text NOT NULL CHECK(profile IN ('openai-chat','anthropic-messages')),
-  declaration_version integer NOT NULL CHECK(declaration_version>0),
-  source_kind text NOT NULL DEFAULT 'protocol-reference',
-  source text NOT NULL, source_version text NOT NULL, capability_metadata jsonb NOT NULL DEFAULT '{}',
-  verification_status text NOT NULL DEFAULT 'unverified' CHECK(verification_status IN ('unverified','verified')),
-  verified_at timestamptz, verification_evidence text, tested_tuple jsonb,
-  PRIMARY KEY(provider_id,model_key,operation),
-  FOREIGN KEY(provider_id,model_key) REFERENCES mio_provider_models(provider_id,model_key)
+CREATE TABLE IF NOT EXISTS mio_provider_model_routes (
+  provider_type text NOT NULL DEFAULT 'onelink'
+    CHECK (provider_type = 'onelink'),
+  raw_model_id text COLLATE "C" NOT NULL
+    CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
+  operation text NOT NULL
+    CHECK (operation IN ('chat', 'image.generate')),
+  vendor text NOT NULL
+    CHECK (char_length(vendor) BETWEEN 1 AND 64 AND vendor ~ '^[a-z0-9-]+$'),
+  driver text NOT NULL
+    CHECK (char_length(driver) BETWEEN 1 AND 64 AND driver ~ '^[a-z0-9-]+$'),
+  classification text NOT NULL
+    CHECK (classification IN ('chat', 'image', 'video', 'voice', 'music')),
+  submit_path text NOT NULL
+    CHECK (
+      char_length(submit_path) BETWEEN 2 AND 256
+      AND submit_path ~ '^/[A-Za-z0-9._/{}-]+$'
+      AND position('..' in submit_path) = 0
+      AND position('//' in submit_path) = 0
+    ),
+  edit_path text
+    CHECK (
+      edit_path IS NULL OR (
+        char_length(edit_path) BETWEEN 2 AND 256
+        AND edit_path ~ '^/[A-Za-z0-9._/{}-]+$'
+        AND position('..' in edit_path) = 0
+        AND position('//' in edit_path) = 0
+      )
+    ),
+  query_path_template text
+    CHECK (
+      query_path_template IS NULL OR (
+        char_length(query_path_template) BETWEEN 2 AND 256
+        AND query_path_template ~ '^/[A-Za-z0-9._/{}-]+$'
+        AND position('..' in query_path_template) = 0
+        AND position('//' in query_path_template) = 0
+        AND position('{task_id}' in query_path_template) > 0
+      )
+    ),
+  param_spec jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(param_spec) = 'object'),
+  request_defaults jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(request_defaults) = 'object'),
+  output_spec jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(output_spec) = 'object'),
+  capability_metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(capability_metadata) = 'object'),
+  source_kind text NOT NULL
+    CHECK (source_kind IN ('protocol-reference', 'runtime-observation')),
+  source text NOT NULL
+    CHECK (char_length(btrim(source)) BETWEEN 1 AND 500),
+  source_version text NOT NULL
+    CHECK (char_length(btrim(source_version)) BETWEEN 1 AND 200),
+  declaration_version integer NOT NULL DEFAULT 1
+    CHECK (declaration_version >= 1),
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_type, raw_model_id, operation)
 );
-ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_operation_check;
-ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_profile_check;
-ALTER TABLE mio_provider_model_adaptations
-  ADD COLUMN IF NOT EXISTS source_kind text NOT NULL DEFAULT 'protocol-reference';
-ALTER TABLE mio_provider_model_adaptations DROP CONSTRAINT IF EXISTS mio_provider_model_adaptations_source_kind_check;
-ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_source_kind_check
-  CHECK(source_kind IN ('protocol-reference','runtime-observation'));
-ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_operation_check
-  CHECK(operation IN ('chat','image.generate'));
-ALTER TABLE mio_provider_model_adaptations ADD CONSTRAINT mio_provider_model_adaptations_profile_check
-  CHECK((operation='chat' AND profile IN ('openai-chat','anthropic-messages')) OR
-        (operation='image.generate' AND profile IN (${imageProfileSqlLiterals.join(',')})));
+CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
+  provider_id uuid NOT NULL,
+  model_key uuid NOT NULL,
+  operation text NOT NULL
+    CHECK (operation IN ('chat', 'image.generate')),
+  declaration_version integer NOT NULL
+    CHECK (declaration_version > 0),
+  driver text NOT NULL
+    CHECK (char_length(driver) BETWEEN 1 AND 64 AND driver ~ '^[a-z0-9-]+$'),
+  verification_status text NOT NULL DEFAULT 'unverified'
+    CHECK (verification_status IN ('unverified', 'verified')),
+  verified_at timestamptz,
+  verification_evidence text,
+  tested_tuple jsonb,
+  PRIMARY KEY (provider_id, model_key, operation),
+  FOREIGN KEY (provider_id, model_key) REFERENCES mio_provider_models(provider_id, model_key)
+);
+ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid = 'mio_provider_model_routes'::regclass AND contype = 'p'
+  ) THEN
+    ALTER TABLE mio_provider_model_routes ADD PRIMARY KEY (provider_type, raw_model_id, operation);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid = 'mio_provider_model_verifications'::regclass AND contype = 'p'
+  ) THEN
+    ALTER TABLE mio_provider_model_verifications ADD PRIMARY KEY (provider_id, model_key, operation);
+  END IF;
+  IF to_regclass('mio_provider_model_adaptations') IS NOT NULL THEN
+    INSERT INTO mio_provider_model_verifications (
+      provider_id, model_key, operation, declaration_version, driver,
+      verification_status, verified_at, verification_evidence, tested_tuple
+    )
+    SELECT
+      a.provider_id, a.model_key, a.operation, a.declaration_version, a.profile,
+      'verified', a.verified_at, a.verification_evidence,
+      CASE
+        WHEN jsonb_typeof(a.tested_tuple) = 'object'
+        THEN a.tested_tuple - 'adaptationOrigin'
+        ELSE a.tested_tuple
+      END
+    FROM mio_provider_model_adaptations a
+    JOIN mio_provider_models m
+      ON m.provider_id = a.provider_id AND m.model_key = a.model_key
+    JOIN mio_provider_configs c
+      ON c.id = a.provider_id
+    JOIN mio_provider_model_routes r
+      ON r.provider_type = c.provider_type
+     AND r.raw_model_id = m.raw_model_id COLLATE "C"
+     AND r.operation = a.operation
+     AND r.driver = a.profile
+     AND r.enabled = true
+    WHERE a.verification_status = 'verified'
+    ON CONFLICT (provider_id, model_key, operation) DO NOTHING;
+  END IF;
+END $$;
 ${legacyProviderUpgradeSQL}
 CREATE TABLE IF NOT EXISTS mio_provider_model_preferences (
   provider_id uuid NOT NULL, model_key uuid NOT NULL, model_ref text,
@@ -106,8 +192,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS mio_provider_usage_default
 
 export async function checkProviderSchema(
   pool: Pick<Pool, 'query'>,
-  images = false,
+  _images = false,
 ): Promise<void> {
+  void _images;
   for (const [sql, types] of [
     [
       'SELECT id,credential_version,catalog_version,catalog_credential_version,catalog_succeeded_at,latest_refresh_seq,last_attempt_seq,last_attempt_credential_version,last_attempt_started_at,last_attempt_finished_at,last_attempt_status,last_attempt_error_code,credential_auth_state FROM mio_provider_configs LIMIT 0',
@@ -118,8 +205,12 @@ export async function checkProviderSchema(
       [2950, 2950, 25, 3802, 25, 25, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
-      'SELECT provider_id,model_key,operation,profile,declaration_version,source_kind,source,source_version,capability_metadata,verification_status,verified_at,verification_evidence,tested_tuple FROM mio_provider_model_adaptations LIMIT 0',
-      [2950, 2950, 25, 25, 23, 25, 25, 25, 3802, 25, 1184, 25, 3802],
+      'SELECT provider_type,raw_model_id,operation,vendor,driver,classification,submit_path,edit_path,query_path_template,param_spec,request_defaults,output_spec,capability_metadata,source_kind,source,source_version,declaration_version,enabled,created_at,updated_at FROM mio_provider_model_routes LIMIT 0',
+      [25, 25, 25, 25, 25, 25, 25, 25, 25, 3802, 3802, 3802, 3802, 25, 25, 25, 23, 16, 1184, 1184],
+    ],
+    [
+      'SELECT provider_id,model_key,operation,declaration_version,driver,verification_status,verified_at,verification_evidence,tested_tuple FROM mio_provider_model_verifications LIMIT 0',
+      [2950, 2950, 25, 23, 25, 25, 1184, 25, 3802],
     ],
     [
       'SELECT provider_id,model_key,usage,enabled,is_default,updated_at FROM mio_provider_model_preferences LIMIT 0',
@@ -130,17 +221,6 @@ export async function checkProviderSchema(
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('PROVIDER_SCHEMA: incompatible columns');
   }
-  const sourceKinds = await pool.query<{ name: string; definition: string; valid: boolean }>(`
-    SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
-    FROM pg_constraint WHERE conrelid='mio_provider_model_adaptations'::regclass
-      AND conname='mio_provider_model_adaptations_source_kind_check'`);
-  const sourceKind = sourceKinds.rows[0];
-  if (
-    !sourceKind?.valid ||
-    !sourceKind.definition.includes("'protocol-reference'") ||
-    !sourceKind.definition.includes("'runtime-observation'")
-  )
-    throw new Error('PROVIDER_SCHEMA: adaptation source kind constraint required');
   const constraints = await pool.query<{ name: string; definition: string; valid: boolean }>(`
     SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
     FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND contype='c'
@@ -156,23 +236,30 @@ export async function checkProviderSchema(
     if (!constraint?.valid || constraint.definition !== definition)
       throw new Error('PROVIDER_SCHEMA: model metadata length constraints required');
   }
-  if (images) {
-    const adaptations = await pool.query<{ name: string; definition: string; valid: boolean }>(`
-      SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
-      FROM pg_constraint WHERE conrelid='mio_provider_model_adaptations'::regclass
-        AND conname IN ('mio_provider_model_adaptations_source_kind_check','mio_provider_model_adaptations_operation_check','mio_provider_model_adaptations_profile_check')`);
-    for (const [name, texts] of [
-      [
-        'mio_provider_model_adaptations_source_kind_check',
-        ["'protocol-reference'", "'runtime-observation'"],
-      ],
-      ['mio_provider_model_adaptations_operation_check', ["'image.generate'"]],
-      ['mio_provider_model_adaptations_profile_check', imageProfileSqlLiterals],
-    ] as const) {
-      const constraint = adaptations.rows.find((item) => item.name === name);
-      if (!constraint?.valid || !texts.every((text) => constraint.definition.includes(text)))
-        throw new Error('PROVIDER_SCHEMA: image adaptation migration required');
-    }
+  for (const [table, pkColumns] of [
+    ['mio_provider_model_routes', ['provider_type', 'raw_model_id', 'operation']],
+    ['mio_provider_model_verifications', ['provider_id', 'model_key', 'operation']],
+  ] as const) {
+    const pk = await pool.query<{
+      unique: boolean;
+      valid: boolean;
+      ready: boolean;
+      columns: string[];
+    }>(
+      `SELECT i.indisunique AS unique,i.indisvalid AS valid,i.indisready AS ready,
+         ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(num,position)
+           JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.num ORDER BY k.position) AS columns
+       FROM pg_index i WHERE i.indrelid=$1::regclass AND i.indisprimary`,
+      [table],
+    );
+    const pkRow = pk.rows[0];
+    if (
+      !pkRow?.unique ||
+      !pkRow.valid ||
+      !pkRow.ready ||
+      JSON.stringify(pkRow.columns) !== JSON.stringify(pkColumns)
+    )
+      throw new Error(`PROVIDER_SCHEMA: primary key required on ${table}`);
   }
   const index = await pool.query<{
     unique: boolean;

@@ -1,6 +1,6 @@
 # 用户万联配置与动态模型目录
 
-每个登录用户持有一个逻辑 `onelink` 配置；身份沿[认证底座](auth.md)，接口正文见[供应商 HTTP](apis/providers.md)，出站见[万联集成](integrations/onelink.md)。[万联 PRD](tasks/onelink-integration/prd.md)维护需求与安排，实际接受范围和限制见其[成果入口](tasks/onelink-integration/complete/report.md)。目录、协议实现、真实观察和业务接受分别判定。
+每个登录用户持有一个逻辑 `onelink` 配置；身份沿[认证底座](auth.md)，接口正文见[供应商 HTTP](apis/providers.md)，出站见[万联集成](integrations/onelink.md)。[万联 PRD](tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](tasks/onelink-vendor-routing/prd.md)维护需求与安排，实际接受范围和限制见各自成果入口（如[万联成果](tasks/onelink-integration/complete/report.md)）。目录、协议实现、真实观察和业务接受分别判定。
 
 ## 配置与迁移
 
@@ -14,7 +14,7 @@
 
 `pnpm providers:migrate` 展示 SQL；`pnpm providers:migrate --apply` 在一个事务内升级并检查。停止旧实例并按库责任备份后执行，启动只读检查，不自动迁移或联网。不兼容结构、约束冲突及迁移失败须核对原数据；失败事务不留下半套可运行结构，不承诺自动降级。
 
-四表为 configs、models、model_adaptations、model_preferences，均以 `mio_provider_` 为前缀。配置保存 owner、当前密文、凭据版本、最近成功目录和最近尝试；模型保存精确 raw ID、稳定 UUID、来源与成员状态；适配保存已实现 profile、独立声明版本、来源和实际验证；偏好以配置/模型/usage 为键，并用部分唯一索引限制每用途一个默认。models 的配置/raw ID 唯一比较使用 C collation，偏好与适配通过复合外键核对配置归属。
+五张现行表为 configs、models、model_preferences、model_routes、model_verifications，均以 `mio_provider_` 为前缀。配置保存 owner、当前密文、凭据版本、最近成功目录和最近尝试；模型保存精确 raw ID、稳定 UUID、来源与成员状态；`model_routes` 按 `(provider_type, raw_model_id, operation)` 保存受控平台级原厂协议路由目录（`vendor`、`driver`、相对端点、参数规格、默认项、输出规格与依据来源），不绑定具体用户且绝不创造用户目录成员；`model_verifications` 按 `(provider_id, model_key, operation)` 独立持久化每用户实际运行验证元组；偏好以配置/模型/usage 为键，并用部分唯一索引限制每用途一个默认。models 与 routes 的 raw ID 比较统一使用 C collation，偏好与用户验证均通过复合外键核对配置归属。若本地旧库存在历史 `mio_provider_model_adaptations` 表，迁移保留原表行不做破坏性删除，并在存在匹配已启用平台路由时将已验证记录（剥离旧 `adaptationOrigin`）幂等回填至 `model_verifications`，运行时不再读写旧单用户适配表。
 
 模型表可空保存用户名称和描述覆盖，分别最多 100、500 个 Unicode 字符；显式迁移为已有四表结构增列及长度约束，启动只读核查列与约束。旧行保持空覆盖，原身份、元数据、偏好及未知发现时间不变。刷新、凭据轮换和重启保留覆盖；显示回退及修改规则见[模型 HTTP 契约](apis/providers.md#get-apiv1providersonelinkmodels)。
 
@@ -30,7 +30,7 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 轮换原位替换密文、递增 credentialVersion，保留启停、水印、模型身份、适配和偏好/default 目标；旧成员成为 historical，旧成功目录保留历史版本但不授予新凭据资格。新版本必须显式成功发现。当前只保存当前密文，不提供历史 Key 平台。重启须注入同一主密钥和 ID；缺失在配置阶段拒绝，错误密钥/篡改在解密时拒绝，不回退。
 
-[存储](../src/providers/store.ts)自持最多 5 个连接、连接/查询等待各 5 秒。所有变更在配置行锁下串行；初建 owner 唯一约束及客户端 expectedRevision 防并发覆盖。刷新开始和完成、配置/偏好及适配声明更新递增 revision。关闭取消并等待发现，先收敛对话运行再关闭本域池；即使对话清理失败也释放本域并保留错误。共同资源约束沿[PostgreSQL](integrations/postgres.md)。
+[存储](../src/providers/store.ts)自持最多 5 个连接、连接/查询等待各 5 秒。所有用户配置变更在配置行锁下串行；初建 owner 唯一约束及客户端 expectedRevision 防并发覆盖。刷新开始和完成、配置/展示覆盖及偏好更新递增 revision；平台路由实质更新独立递增 `mio_provider_model_routes.declaration_version`。关闭取消并等待发现，先收敛对话运行再关闭本域池；即使对话清理失败也释放本域并保留错误。共同资源约束沿[PostgreSQL](integrations/postgres.md)。
 
 ## 目录、刷新与资格
 
@@ -57,45 +57,35 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 目录成员、供应商 metadata/classification、服务实现、用户偏好和实际验证分开返回。当前官方 /v1/models 结构只承诺描述性字段，不足以证明逐模型协议；名称前缀、owned_by、description 均不用于推断。当前解析器不会虚构自动关联；未来出现可核实的结构化协议字段时，须先核对供应商契约再增加识别。
 
-元数据不足的模型立即显示 ADAPTER_PENDING。部署可用下列入口为**当前已发现成员**选择已实现的 `chat/openai-chat` 或 `chat/anthropic-messages`：
+元数据不足的模型立即显示 ADAPTER_PENDING。适配解析对同一用户已发现成员采用单轨路由判定：`平台原厂路由（mio_provider_model_routes） -> ADAPTER_PENDING`。部署通过受控路由入口维护平台级路由目录（不创造成员、不写 `verified`、不内置静态模型种子）：
 
 ```sh
-pnpm providers:adapt <owner-id> <expected-revision> <declaration.json>
+pnpm providers:route <--stdin | routes.json>
 ```
 
-文件最多 8192 字节，形如：
+普通文件路径或 `--stdin` 导入单条路由对象、`{ routes: [...] }` 或 `1..500` 条路由数组 JSON（读取前校验普通文件或标准输入上限 `65536` 字节），写入前复用[逻辑路由器](../src/providers/onelink/router.ts)纯结构校验器核对已注册驱动（文本 `openai-chat`/`anthropic-messages`；图片 `openai-images`/`volcengine-ark-images`/`vidu-images`/`kling-images`）、驱动前缀路径不变量与 `paramSpec`；幂等重放相同路由不递增 `declaration_version`。路由条目形如：
 
 ```json
 {
-  "modelRef": "onelink:model:<directory-returned-uuid>",
+  "rawModelId": "<exact-discovered-model-id>",
   "operation": "chat",
-  "profile": "openai-chat",
+  "vendor": "openai",
+  "driver": "openai-chat",
+  "classification": "chat",
+  "submitPath": "/v1/chat/completions",
   "sourceKind": "protocol-reference",
   "source": "已核对的协议文档或实际观察依据",
-  "sourceVersion": "依据版本",
-  "classification": "chat"
+  "sourceVersion": "依据版本"
 }
 ```
 
-`sourceKind` 必填且只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察）。它只说明适配依据，不建立模型成员；`catalog-membership`、目录快照或旧模型清单不是适配来源，`onelink-v1-models` 等目录事实不能填入 `source`。来源类型按显式字段判断，不从 URL、名称或描述猜测。
+`sourceKind` 必填且只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察）。它只说明适配依据，不建立模型成员；`catalog-membership`、目录快照或旧模型清单不是适配来源，`onelink-v1-models` 等目录事实不能填入 `source`。来源类型按显式字段判断，不从 URL、名称或描述猜测。刷新继续由 `metadata_source='onelink-v1-models'` 表达目录成员事实，不能写入路由表。
 
-已有适配行升级时，迁移为兼容性默认 `protocol-reference` 并保留原 `source/sourceVersion`；新声明必须显式提供 `sourceKind`。刷新继续由 `metadata_source='onelink-v1-models'` 表达目录成员事实，不能写入适配表。
+图片路由统一使用纯原厂协议驱动（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`），所有操作、尺寸、输出张数、参考图与异步边界均由路由 `paramSpec`、`requestDefaults` 与 `outputSpec` 显式声明，不按名称或前缀自动推断，也不保留按型号写死的旧图片 profile 表。目录返回的图片 `metadata.image` 由生效路由 `paramSpec` 确定性派生：`modes` 必须包含 `generate`，参考图能力可声明 `references.maxImages`（整数 `1..16`，支持单参考与多参考），`edit` 须声明合法 `editPath`（或驱动同端点承载）与正数参考图上限，PNG 遮罩须显式开启 `allowMaskPng:true`，`outpaint` 必须在 `supportedOperations` 中列出并同时开启 `allowOutpaintGeometry:true`（派生像素 `geometry` 边界）；异步能力必须显式声明 `async:{operations,maxQueries,maxAgeSeconds}` 与包含 `{task_id}` 的 `queryPathTemplate`，且 operations 必须是支持操作的子集。不得从模型名称、旧 92 项或目录数量推断 edit、mask、outpaint、async 或其他媒体协议。`references.maxImages` 只约束供应商明确声明的参考图能力，不是固定模型或图片容量策略；async 边界只约束有界查询（`maxAgeSeconds` 最长 86400 秒）。当前用户 Key 成功刷新得到的全量模型和数量仍是唯一目录权威。启用图片前执行供应商迁移，启动只读检查路由与验证表约束；声明和目录发现均不证明真实生成可用。运行与未接受边界见[计算 HTTP](apis/compute.md#post-apiv1computeimages)。
 
-图片适配允许为有可靠协议依据的当前成员显式声明 `operation: "image.generate"`，profile 为 `gpt-images-v1`、受限单图 `seedream-4-images-v1`、异步 `vidu-image-v1` 或异步 `kling-image-v1`；不按名称自动推断。GPT edit/mask 还须在声明 metadata 中显式列出能力，例如：
+平台路由仅对用户已存在成员补充空缺分类，未知分类仍不自动归入 chat；可选文本 `capabilityMetadata.contextWindow` 为正整数，`capabilityMetadata.maxOutputTokens` 为 `1..65536` 正整数（缺省按 1024 执行）。未知上下文/价格/工具/媒体能力不补值。来源明确是部署路由声明，不冒充供应商元数据。入口不创造成员、不接收任意外部主机 URL/Key/verified，不开放普通用户管理 API。每次实质路由更新递增 `declaration_version` 并使旧版本验证回到 `unverified`，分类变化保留身份/偏好。
 
-```json
-{
-  "operation": "image.generate",
-  "profile": "gpt-images-v1",
-  "metadata": { "image": { "modes": ["generate", "edit"], "mask": { "format": "png" } } }
-}
-```
-
-省略 `metadata.image` 表示只有 generate 能力；显式 `metadata.image` 的 `modes` 必须包含 generate，多参考可另声明供应商 capability 的 `references.maxImages`，outpaint 必须在 `modes` 中列出并同时声明像素 geometry 边界；异步能力必须显式声明 `async:{operations,maxQueries,maxAgeSeconds}`，且 operations 必须是 modes 的子集。不得从模型名称、旧 92 项或目录数量推断 edit、mask、outpaint、async 或其他媒体协议。`references.maxImages` 只约束供应商明确声明的多参考能力，不是固定模型或图片容量策略；async 边界只约束注入 transport 的有界查询，不代表真实供应商字段。当前用户 Key 成功刷新得到的全量模型和数量仍是唯一目录权威。启用图片前执行供应商迁移，启动会检查图片声明约束；声明和目录发现均不证明真实生成可用。运行与未接受边界见[计算 HTTP 候选](apis/compute.md#post-apiv1computeimages)。
-
-classification 可省略；可选 `metadata.contextWindow` 只能是有来源的正整数。未知上下文/价格/工具/媒体能力不补值。来源明确是部署声明，不冒充供应商元数据。入口不创造成员、不接收代码/URL/Key/verified，不开放普通用户管理 API。每次声明更新递增独立版本并使验证待核对，分类变化保留身份/偏好。
-
-验证只来自对应成功运行观察，绑定 credential/catalog/adaptation 版本及 operation/profile。刷新、轮换或声明变化使当前验证失效但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
+验证只来自当前用户本人的成功运行观察（文本对话完成或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
 
 ### 模型扩展边界
 

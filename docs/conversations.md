@@ -16,7 +16,7 @@
 
 未启用 provider 域时保留 legacy：没有 provider/model 仍可创建/查询，发送返回 `503 MODEL_UNAVAILABLE` 且不新增接收记录；未注册 provider 拒绝，不支持的 model 沿原驱动结算失败。启用[用户供应商域](providers.md)后公共对话统一使用 BYOK，当前用户缺配置不回退全局或他人 Key；同时存在的 legacy 环境不参与选模或缺配校验。已绑定 BYOK 的会话不能在 legacy 装配下改跑全局模型。已有请求 ID 始终先查询/去重。
 
-BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已实现适配共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、适配与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；1024 tokens 和 30 秒 idle/HTTP 是 Mio 政策。不支持的内容/选项在出站前拒绝。
+BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策），30 秒 idle/HTTP 是 Mio 政策。不支持的内容/选项在出站前拒绝。
 
 真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察不等于费用结算；全零/缺失 SDK usage 保持 unknown，失败时的非零 usage 只是 partial。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
 
@@ -35,7 +35,7 @@ pnpm start:dev
 
 PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与接收/结算状态，不保存第二份消息正文；正文以 DSH 原生日志为权威。先保存 creating 映射，再创建并 flush 原生 Session，最后标 ready；失败映射保持 unknown，可从所属用户列表定位，不伪报已持久创建。
 
-显式增量迁移保留可空对话模型绑定、可空请求绑定和观察数组；旧行不从环境回填、不删除旧回执。fresh 请求保存配置 ID/revision、modelKey、精确 modelRef/modelId、credentialVersion/catalogVersion/adaptationVersion、operation/profile，兼容保留 protocol/capabilityVersion；owner/内部 Session 沿对话取得。Key 只在运行内存，不能序列化整个快照。观察仅保存受控 HTTP status、provider request ID、token usage/已知程度、finish 和稳定 failureCode；401/403、402、408/504、429 分别区分鉴权、额度、超时、限流，不能分类的失败保持 unknown。请求观察落库失败结算 unknown；独立供应商验证标记失败保留已持久请求观察，不重发模型。成功观察只标记对应当前凭据/目录/适配元组，旧运行晚到不能覆盖新验证。
+显式增量迁移保留可空对话模型绑定、可空请求绑定和观察数组；旧行不从环境回填、不删除旧回执。fresh 请求保存配置 ID/revision、modelKey、精确 modelRef/modelId、credentialVersion/catalogVersion/adaptationVersion（取平台路由 `declaration_version`）、operation/profile，兼容保留 protocol/capabilityVersion；owner/内部 Session 沿对话取得。Key 只在运行内存，不能序列化整个快照。观察仅保存受控 HTTP status、provider request ID、token usage/已知程度、finish 和稳定 failureCode；401/403、402、408/504、429 分别区分鉴权、额度、超时、限流，不能分类的失败保持 unknown。请求观察落库失败结算 unknown；独立供应商验证标记失败保留已持久请求观察，不重发模型。成功观察只把该用户本人 `mio_provider_model_verifications` 在对应当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组下标记为 `verified`，不改动平台路由或他人验证状态，旧运行晚到不能覆盖新验证。
 
 同对话只接受一个活动请求。事务锁住归属行，先查原 request ID：同内容返回原回执，异内容冲突，早于当前目录、默认、认证阻断和解密；不同 ID 遇忙拒绝。输入摘要不含可变版本，不因刷新/轮换重发。目录移除或默认失效后旧回执/历史仍可读，fresh 输入无资格时不新增收费接收。进程内保存同一用户在途接收 Promise，持久去重仍由 PostgreSQL 唯一键负责。
 

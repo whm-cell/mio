@@ -53,6 +53,35 @@ function protocolProfile(profile: ChatProfile) {
 export const onelinkRoute = (selection: ChatSelection) =>
   protocolProfile(selection.protocol).provider;
 
+function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
+  const maxTokens = snapshot.maxOutputTokens ?? 1024;
+  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 65536)
+    throw new LlmError('OneLink maxOutputTokens is invalid', 'BINDING_REQUIRED');
+  return maxTokens;
+}
+
+function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
+  const protocol = protocolProfile(snapshot.protocol);
+  const submitPath = snapshot.submitPath ?? protocol.path;
+  if (
+    !/^\/[A-Za-z0-9._/-]+$/.test(submitPath) ||
+    submitPath.includes('..') ||
+    submitPath.includes('//')
+  )
+    throw new LlmError('OneLink submitPath is invalid', 'BINDING_REQUIRED');
+  if (snapshot.protocol === 'openai-chat') {
+    if (!submitPath.startsWith('/v1/') || !submitPath.endsWith('/chat/completions'))
+      throw new LlmError('OneLink submitPath is invalid', 'BINDING_REQUIRED');
+    const prefix = submitPath.slice(0, -'/chat/completions'.length);
+    if (!prefix.startsWith('/v1'))
+      throw new LlmError('OneLink submitPath is invalid', 'BINDING_REQUIRED');
+    return { protocol, submitPath, baseUrl: `${ONELINK_ORIGIN}${prefix}` };
+  }
+  if (submitPath !== '/v1/messages')
+    throw new LlmError('OneLink submitPath is invalid', 'BINDING_REQUIRED');
+  return { protocol, submitPath, baseUrl: ONELINK_ORIGIN };
+}
+
 function metadata(
   provider: string,
   model: string,
@@ -63,17 +92,18 @@ function metadata(
     id: model,
     name: model,
     inputModalities: ['text'],
-    defaultMaxTokens: 1024,
+    defaultMaxTokens: snapshotMaxTokens(snapshot),
     ...(snapshot.contextWindow ? { context: { contextWindow: snapshot.contextWindow } } : {}),
   };
 }
 
 /** One immutable request's SDK provider; only the public protocol factories perform encoding. */
 function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAdapter {
-  const protocol = protocolProfile(run.snapshot.protocol);
+  const { protocol, submitPath, baseUrl } = resolveChatEndpoint(run.snapshot);
+  const maxTokens = snapshotMaxTokens(run.snapshot);
   const provider = protocol.provider;
   const api = protocol.api();
-  const transport = chatTransport(run.snapshot.apiKey, protocol.path, facts);
+  const transport = chatTransport(run.snapshot.apiKey, submitPath, facts);
   const requestOptions = (options: SimpleStreamOptions | undefined): SimpleStreamOptions => {
     const rest = { ...options };
     delete rest.apiKey;
@@ -93,12 +123,12 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
     name: run.snapshot.modelId,
     provider,
     api: protocol.apiId,
-    baseUrl: protocol.baseUrl,
+    baseUrl,
     input: ['text'],
     reasoning: false,
     // SDK 1.5.0 treats zero as unknown. Never expose this as supplier metadata.
     contextWindow: run.snapshot.contextWindow ?? 0,
-    maxTokens: 1024,
+    maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: protocol.compat,
   };
@@ -126,7 +156,7 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
     displayName: 'OneLinkAI',
     piProvider,
     modelErrors: new Map(),
-    configuredMaxTokens: new Map([[run.snapshot.modelId, 1024]]),
+    configuredMaxTokens: new Map([[run.snapshot.modelId, maxTokens]]),
     retryPolicy,
     streamIdleTimeoutMs: 30_000,
     timeoutMs: 30_000,
@@ -200,6 +230,7 @@ export class OneLinkAdapter extends LlmAdapter {
     facts: ChatResponseFacts,
     stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
   ): AsyncIterable<StreamChunk> {
+    const maxTokens = snapshotMaxTokens(run.snapshot);
     if (
       this.bindings.get(signal) !== run ||
       options.signal !== signal ||
@@ -209,7 +240,7 @@ export class OneLinkAdapter extends LlmAdapter {
       options.provider !== onelinkRoute(run.snapshot) ||
       options.model !== run.snapshot.modelId ||
       !options.maxTokens ||
-      options.maxTokens > 1024 ||
+      options.maxTokens > maxTokens ||
       options.stop !== undefined ||
       options.messages.some((message) =>
         message.content.some((block) => block.type === 'image' || block.type === 'file'),

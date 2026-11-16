@@ -6,7 +6,7 @@ import type { ConversationConfig } from '../conversations/config.ts';
 import type { ConversationEngine, HistoryItem } from '../conversations/contracts.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
-import type { ChatSelection } from '../providers/contracts.ts';
+import type { ChatRuntimeSnapshot, ChatSelection } from '../providers/contracts.ts';
 
 /** Narrow bridge: DSH values stop here; only public text/status values leave it. */
 export function createDshConversationEngine(
@@ -25,9 +25,16 @@ export function createDshConversationEngine(
     ...(config.model ? { model: config.model } : {}),
     maxTokens: 1024,
   };
-  const selectedOptions = (selection?: ChatSelection) =>
+  const selectedOptions = (selection?: ChatSelection | ChatRuntimeSnapshot) =>
     selection
-      ? { provider: onelinkRoute(selection), model: selection.modelId, maxTokens: 1024 }
+      ? {
+          provider: onelinkRoute(selection),
+          model: selection.modelId,
+          maxTokens:
+            'maxOutputTokens' in selection && selection.maxOutputTokens !== undefined
+              ? selection.maxOutputTokens
+              : 1024,
+        }
       : options;
   return {
     get available() {

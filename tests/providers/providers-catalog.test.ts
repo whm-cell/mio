@@ -1,7 +1,13 @@
 import { createHash } from 'node:crypto';
 import { expect, it } from 'vitest';
-import { IMAGE_PROFILES, IMAGE_PROFILE_RULES } from '@mio/compute-contracts';
-import { catalogView, legacyReference, validateDeclaration } from '../../src/providers/catalog.ts';
+import { IMAGE_DRIVERS } from '@mio/compute-contracts';
+import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
+import {
+  deriveImageCapabilityMetadata,
+  resolveImageRoute,
+  validateModelRouteEntry,
+  validateRouteImportPayload,
+} from '../../src/providers/onelink/router.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import {
   legacyPresets,
@@ -9,6 +15,10 @@ import {
   legacyCapabilityProfileById,
   legacyCapabilityProfiles,
 } from './fixtures/onelink-legacy-snapshot.ts';
+import {
+  findFixtureImageRouteConfig,
+  findFixtureRoute,
+} from './fixtures/onelink-routes-fixture.ts';
 
 it('retains the original 92-entry snapshot only as a migration/test reference', () => {
   expect(legacySource.presetsSha256).toBe(
@@ -43,194 +53,182 @@ it('parses old references without changing case, punctuation or route suffixes',
   expect(legacyReference('onelink:unknown:id')).toBeNull();
   expect(legacyReference('onelink:chat:')).toBeNull();
 });
-it('limits deployment declarations to sourced, implemented profiles and cannot set verified or an endpoint', () => {
+
+it('limits route imports to sourced, implemented vendor drivers and rejects endpoints, pricing or legacy profiles', () => {
   const entry = {
-    modelRef: 'onelink:model:some-key',
+    providerType: 'onelink',
+    rawModelId: 'custom-chat-model',
     operation: 'chat',
-    profile: 'openai-chat',
+    vendor: 'openai',
+    driver: 'openai-chat',
+    classification: 'chat',
+    submitPath: '/v1/chat/completions',
     sourceKind: 'protocol-reference',
     source: 'fixture',
     sourceVersion: 'v1',
   };
-  expect(validateDeclaration(entry)).toEqual(entry);
+  expect(validateModelRouteEntry(entry)).toMatchObject({
+    providerType: 'onelink',
+    rawModelId: 'custom-chat-model',
+    operation: 'chat',
+    vendor: 'openai',
+    driver: 'openai-chat',
+    submitPath: '/v1/chat/completions',
+  });
+  expect(validateRouteImportPayload({ routes: [entry] })).toHaveLength(1);
   for (const patch of [
-    { profile: 'unknown' },
-    { profile: ['openai-chat'] },
-    { profile: null },
-    { profile: { toString: () => 'openai-chat' } },
+    { driver: 'unknown' },
+    { driver: 'gpt-images-v1' },
+    { driver: ['openai-chat'] },
+    { driver: null },
+    { vendor: '' },
+    { vendor: 'Invalid Vendor!' },
     { operation: 'image' },
+    { submitPath: 'https://other.test/v1/chat/completions' },
+    { submitPath: '/v1/../secret' },
     { source: '' },
     { verified: true },
     { endpoint: 'https://other.test' },
-    { metadata: { price: 0 } },
-    { metadata: { contextWindow: 0 } },
+    { capabilityMetadata: { price: 0 } },
+    { capabilityMetadata: { contextWindow: 0 } },
     { classification: 'unknown' },
   ])
-    expect(() => validateDeclaration({ ...entry, ...patch })).toThrow('ADAPTATION_INVALID');
+    expect(() => validateModelRouteEntry({ ...entry, ...patch })).toThrow('ROUTE_INVALID');
 });
 
-it('accepts only explicit image edit and PNG mask capability metadata', () => {
-  const image = {
-    modelRef: 'onelink:model:some-key',
-    operation: 'image.generate',
-    profile: 'gpt-images-v1',
-    sourceKind: 'protocol-reference',
-    source: 'fixture',
-    sourceVersion: 'v1',
-    metadata: {
-      image: {
-        modes: ['generate', 'edit'],
-        mask: { format: 'png' },
-        async: { operations: ['generate'], maxQueries: 4, maxAgeSeconds: 300 },
-      },
+it('validates explicit image route paramSpec, edit/mask/outpaint gates, and derives capability metadata', () => {
+  const gptFixture = findFixtureRoute('gpt-image-2', 'image.generate');
+  const gptRouteConfig = findFixtureImageRouteConfig('gpt-image-2');
+  const validated = validateModelRouteEntry(gptFixture);
+  expect(validated.driver).toBe('openai-images');
+  expect(deriveImageCapabilityMetadata(gptRouteConfig.paramSpec)).toEqual({
+    modes: ['generate', 'edit'],
+    references: { maxImages: 16 },
+    mask: { format: 'png' },
+  });
+  expect(validated.capabilityMetadata).toEqual({
+    image: {
+      modes: ['generate', 'edit'],
+      references: { maxImages: 16 },
+      mask: { format: 'png' },
     },
-  };
-  expect(validateDeclaration(image)).toEqual(image);
-  expect(
-    validateDeclaration({
-      ...image,
-      metadata: {
-        image: {
-          modes: ['generate', 'edit', 'outpaint'],
-          mask: { format: 'png' },
-          references: { maxImages: 4 },
-          geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] },
-        },
-      },
-    }),
-  ).toMatchObject({ metadata: { image: { modes: ['generate', 'edit', 'outpaint'] } } });
-  for (const metadata of [
-    { image: { modes: [] } },
-    { image: { modes: ['edit'] } },
-    { image: { modes: ['edit', 'edit'] } },
-    { image: { modes: ['outpaint'] } },
-    { image: { modes: ['edit'], mask: { format: 'jpeg' } } },
-    { image: { modes: ['edit'], extra: true } },
-    { image: { modes: ['outpaint'], geometry: { unit: 'pixels', edges: ['left'] } } },
-    { image: { modes: ['edit'], references: { maxImages: 1 } } },
-    {
-      image: {
-        modes: ['generate'],
-        async: { operations: ['edit'], maxQueries: 4, maxAgeSeconds: 300 },
-      },
-    },
-    {
-      image: {
-        modes: ['generate'],
-        async: { operations: ['generate'], maxQueries: 0, maxAgeSeconds: 300 },
-      },
-    },
-  ])
-    expect(() => validateDeclaration({ ...image, metadata })).toThrow('ADAPTATION_INVALID');
-  for (const declaration of [
-    { ...image, profile: 'seedream-4-images-v1' },
-    { ...image, operation: 'chat', profile: 'openai-chat' },
-  ])
-    expect(() => validateDeclaration(declaration)).toThrow('ADAPTATION_INVALID');
-});
+  });
 
-it('accepts the explicitly sourced Vidu image async capability without inferring it from the model id', () => {
-  const declaration = {
-    modelRef: 'onelink:model:vidu-key',
-    operation: 'image.generate',
-    profile: 'vidu-image-v1',
-    sourceKind: 'protocol-reference',
-    source: 'https://docs.onelinkai.cloud/8653257m0',
-    sourceVersion: '2026-11-14',
-    classification: 'image',
-    metadata: {
-      image: {
-        modes: ['generate'],
-        references: { maxImages: 7 },
+  const withOutpaint = validateModelRouteEntry({
+    ...gptFixture,
+    paramSpec: {
+      ...gptFixture.paramSpec!,
+      supportedOperations: ['generate', 'edit', 'outpaint'],
+      allowOutpaintGeometry: true,
+    },
+  });
+  expect(withOutpaint.capabilityMetadata).toMatchObject({
+    image: {
+      modes: ['generate', 'edit', 'outpaint'],
+      geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] },
+    },
+  });
+
+  for (const bad of [
+    // edit without editPath
+    { ...gptFixture, editPath: null },
+    // edit with 0 maxReferenceImages
+    {
+      ...gptFixture,
+      paramSpec: { ...gptFixture.paramSpec!, maxReferenceImages: 0 },
+    },
+    // outpaint without allowOutpaintGeometry
+    {
+      ...gptFixture,
+      paramSpec: {
+        ...gptFixture.paramSpec!,
+        supportedOperations: ['generate', 'outpaint'],
+        allowOutpaintGeometry: false,
+      },
+    },
+    // async without queryPathTemplate
+    {
+      ...gptFixture,
+      paramSpec: {
+        ...gptFixture.paramSpec!,
+        requiresAsync: true,
         async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
       },
     },
-  };
-  expect(validateDeclaration(declaration)).toEqual(declaration);
-  expect(() => validateDeclaration({ ...declaration, profile: 'gpt-images-v1' })).not.toThrow();
-  expect(() =>
-    validateDeclaration({
-      ...declaration,
-      metadata: { image: { modes: ['generate', 'edit'] } },
-    }),
-  ).toThrow('ADAPTATION_INVALID');
+    // legacy profile rejected
+    { ...gptFixture, driver: 'gpt-images-v1' },
+    { ...gptFixture, driver: 'seedream-4-images-v1' },
+    { ...gptFixture, driver: 'vidu-image-v1' },
+    { ...gptFixture, driver: 'kling-image-v1' },
+  ])
+    expect(() => validateModelRouteEntry(bad)).toThrow('ROUTE_INVALID');
 });
 
-it('requires a non-catalog adaptation source kind and never treats catalog membership as protocol evidence', () => {
+it('requires a non-catalog route source kind and never treats catalog membership as protocol evidence', () => {
   const entry = {
-    modelRef: 'onelink:model:source-kind',
+    providerType: 'onelink',
+    rawModelId: 'source-kind-model',
     operation: 'chat',
-    profile: 'openai-chat',
+    vendor: 'openai',
+    driver: 'openai-chat',
+    classification: 'chat',
+    submitPath: '/v1/chat/completions',
     sourceKind: 'protocol-reference',
     source: 'onelink-v1-models',
     sourceVersion: 'v1',
   };
-  expect(() => validateDeclaration(entry)).toThrow('ADAPTATION_INVALID');
+  expect(() => validateModelRouteEntry(entry)).toThrow('ROUTE_INVALID');
   for (const sourceKind of [undefined, 'catalog-membership', 'catalog', 'protocol', 'runtime'])
-    expect(() => validateDeclaration({ ...entry, sourceKind, source: 'operator-runbook' })).toThrow(
-      'ADAPTATION_INVALID',
-    );
+    expect(() =>
+      validateModelRouteEntry({ ...entry, sourceKind, source: 'operator-runbook' }),
+    ).toThrow('ROUTE_INVALID');
   expect(
-    validateDeclaration({ ...entry, sourceKind: 'runtime-observation', source: 'test-run-42' }),
+    validateModelRouteEntry({ ...entry, sourceKind: 'runtime-observation', source: 'test-run-42' }),
   ).toMatchObject({ sourceKind: 'runtime-observation' });
 });
 
-it('derives provider adaptation profile constraints and mode gates from IMAGE_PROFILES and IMAGE_PROFILE_RULES', () => {
-  const expectedSqlList = IMAGE_PROFILES.map((profile) => `'${profile}'`).join(',');
+it('validates schema tables, image drivers, and keeps incomplete async routes ADAPTER_PENDING in catalogView', () => {
+  expect(IMAGE_DRIVERS).toEqual([
+    'openai-images',
+    'volcengine-ark-images',
+    'vidu-images',
+    'kling-images',
+  ]);
+  expect(providerSchemaSQL).toContain('CREATE TABLE IF NOT EXISTS mio_provider_model_routes');
   expect(providerSchemaSQL).toContain(
-    `(operation='image.generate' AND profile IN (${expectedSqlList}))`,
+    'CREATE TABLE IF NOT EXISTS mio_provider_model_verifications',
   );
-  for (const profile of IMAGE_PROFILES) {
-    const supported: readonly string[] = IMAGE_PROFILE_RULES[profile].supportedOperations;
-    for (const mode of ['edit', 'outpaint'] as const) {
-      const declaration = {
-        modelRef: `onelink:model:${profile}`,
-        operation: 'image.generate' as const,
-        profile,
-        sourceKind: 'protocol-reference' as const,
-        source: 'fixture',
-        sourceVersion: 'v1',
-        metadata: {
-          image: {
-            modes: ['generate', mode],
-            ...(mode === 'outpaint'
-              ? { geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] } }
-              : {}),
-          },
-        },
-      };
-      if (supported.includes(mode)) {
-        expect(validateDeclaration(declaration)).toMatchObject({ profile });
-      } else {
-        expect(() => validateDeclaration(declaration)).toThrow('ADAPTATION_INVALID');
-      }
-    }
-  }
-});
+  expect(providerSchemaSQL).toContain(
+    'ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin',
+  );
 
-it('accepts explicitly sourced Kling async image capability and keeps incomplete adaptations ADAPTER_PENDING in catalogView', () => {
-  const declaration = {
-    modelRef: 'onelink:model:kling-key',
-    operation: 'image.generate' as const,
-    profile: 'kling-image-v1' as const,
-    sourceKind: 'protocol-reference' as const,
-    source: 'https://docs.onelinkai.cloud/8653497m0',
-    sourceVersion: '2026-09-08',
-    classification: 'image' as const,
-    metadata: {
-      image: {
-        modes: ['generate' as const],
-        async: { operations: ['generate' as const], maxQueries: 8, maxAgeSeconds: 600 },
-      },
-    },
-  };
-  expect(validateDeclaration(declaration)).toEqual(declaration);
-  expect(() =>
-    validateDeclaration({
-      ...declaration,
-      metadata: { image: { modes: ['generate', 'edit'] } },
+  const klingEntry = validateModelRouteEntry(findFixtureRoute('image-kling-v3', 'image.generate'));
+  expect(
+    resolveImageRoute({
+      provider_type: klingEntry.providerType,
+      raw_model_id: klingEntry.rawModelId,
+      operation: klingEntry.operation,
+      vendor: klingEntry.vendor,
+      driver: klingEntry.driver,
+      classification: klingEntry.classification,
+      submit_path: klingEntry.submitPath,
+      edit_path: klingEntry.editPath,
+      query_path_template: klingEntry.queryPathTemplate,
+      param_spec: klingEntry.paramSpec,
+      request_defaults: klingEntry.requestDefaults,
+      output_spec: klingEntry.outputSpec,
+      capability_metadata: klingEntry.capabilityMetadata,
+      source_kind: klingEntry.sourceKind,
+      source: klingEntry.source,
+      source_version: klingEntry.sourceVersion,
+      declaration_version: 1,
+      enabled: true,
     }),
-  ).toThrow('ADAPTATION_INVALID');
+  ).toMatchObject({
+    vendor: 'kling',
+    profile: 'kling-images',
+    asyncReady: true,
+  });
 
   const now = new Date('2026-11-15T00:00:00.000Z');
   const modelKey = '00000000-0000-4000-8000-000000000099';
@@ -268,7 +266,7 @@ it('accepts explicitly sourced Kling async image capability and keeps incomplete
         supplier_metadata: {},
         classification: 'image' as const,
         metadata_source: 'onelink-v1-models',
-        classification_source: 'adaptation',
+        classification_source: 'route:https://docs.onelinkai.cloud/8653497m0@2026-09-08',
         credential_version: 1,
         catalog_version: 1,
         first_seen_at: now.toISOString(),
@@ -281,22 +279,29 @@ it('accepts explicitly sourced Kling async image capability and keeps incomplete
     preferences: [],
   };
 
+  // Disabled or corrupted async route (missing query_path_template) stays ADAPTER_PENDING
   const incompleteView = catalogView({
     ...baseState,
-    adaptations: [
+    routes: [
       {
-        model_key: modelKey,
+        provider_type: 'onelink',
+        raw_model_id: 'image-kling-v3',
         operation: 'image.generate',
-        profile: 'kling-image-v1',
+        vendor: 'kling',
+        driver: 'kling-images',
+        classification: 'image',
+        submit_path: '/kling/v1/images/generations',
+        edit_path: null,
+        query_path_template: null,
+        param_spec: klingEntry.paramSpec as unknown as Record<string, unknown>,
+        request_defaults: klingEntry.requestDefaults,
+        output_spec: klingEntry.outputSpec as unknown as Record<string, unknown>,
+        capability_metadata: {},
+        source_kind: klingEntry.sourceKind,
+        source: klingEntry.source,
+        source_version: klingEntry.sourceVersion,
         declaration_version: 1,
-        source_kind: 'protocol-reference',
-        source: declaration.source,
-        source_version: declaration.sourceVersion,
-        capability_metadata: { image: { modes: ['generate'] } },
-        verification_status: 'unverified',
-        verified_at: null,
-        verification_evidence: null,
-        tested_tuple: null,
+        enabled: true,
       },
     ],
   });
@@ -307,25 +312,59 @@ it('accepts explicitly sourced Kling async image capability and keeps incomplete
 
   const completeView = catalogView({
     ...baseState,
-    adaptations: [
+    routes: [
       {
+        provider_type: 'onelink',
+        raw_model_id: 'image-kling-v3',
+        operation: 'image.generate',
+        vendor: 'kling',
+        driver: 'kling-images',
+        classification: 'image',
+        submit_path: klingEntry.submitPath,
+        edit_path: klingEntry.editPath,
+        query_path_template: klingEntry.queryPathTemplate,
+        param_spec: klingEntry.paramSpec as unknown as Record<string, unknown>,
+        request_defaults: klingEntry.requestDefaults,
+        output_spec: klingEntry.outputSpec as unknown as Record<string, unknown>,
+        capability_metadata: klingEntry.capabilityMetadata,
+        source_kind: klingEntry.sourceKind,
+        source: klingEntry.source,
+        source_version: klingEntry.sourceVersion,
+        declaration_version: 2,
+        enabled: true,
+      },
+    ],
+    verifications: [
+      {
+        provider_id: baseState.id,
         model_key: modelKey,
         operation: 'image.generate',
-        profile: 'kling-image-v1',
+        driver: 'kling-images',
         declaration_version: 2,
-        source_kind: 'protocol-reference',
-        source: declaration.source,
-        source_version: declaration.sourceVersion,
-        capability_metadata: declaration.metadata,
-        verification_status: 'unverified',
-        verified_at: null,
-        verification_evidence: null,
-        tested_tuple: null,
+        verification_status: 'verified',
+        verified_at: now.toISOString(),
+        verification_evidence: JSON.stringify({ runId: 'run-1' }),
+        tested_tuple: {
+          modelId: 'image-kling-v3',
+          modelKey,
+          operation: 'image.generate',
+          profile: 'kling-images',
+          credentialVersion: 1,
+          catalogVersion: 1,
+          adaptationVersion: 2,
+        },
       },
     ],
   });
   expect(completeView.items[0]?.image).toMatchObject({
     runnable: true,
     unavailableReason: null,
+    adaptation: {
+      vendor: 'kling',
+      profile: 'kling-images',
+      declarationVersion: 2,
+      verification: { status: 'verified' },
+    },
   });
+  expect('origin' in (completeView.items[0]?.image?.adaptation ?? {})).toBe(false);
 });

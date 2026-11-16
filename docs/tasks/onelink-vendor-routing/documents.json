@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/onelink-vendor-routing/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/onelink-vendor-routing/prd.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-vendor-routing/design.md",
+      "kind": "design",
+      "path": "docs/tasks/onelink-vendor-routing/design.md"
+    }
+  ]
+}

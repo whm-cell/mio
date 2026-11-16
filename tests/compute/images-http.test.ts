@@ -32,6 +32,23 @@ import { createProviderStore } from '../../src/providers/store.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderError } from '../../src/providers/contracts.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import {
+  findFixtureImageRouteConfig,
+  findFixtureRoute,
+} from '../providers/fixtures/onelink-routes-fixture.ts';
+
+const MOCK_SEED_ROUTE = findFixtureImageRouteConfig('doubao-seedream-4.0');
+const MOCK_GPT_BASE_ROUTE = findFixtureImageRouteConfig('gpt-image-2');
+const MOCK_GPT_ASYNC_ROUTE = {
+  ...MOCK_GPT_BASE_ROUTE,
+  paramSpec: {
+    ...MOCK_GPT_BASE_ROUTE.paramSpec,
+    supportedOperations: ['generate', 'edit', 'outpaint'] as const,
+    maxReferenceImages: 4,
+    allowOutpaintGeometry: true,
+    async: { operations: ['generate'] as const, maxQueries: 8, maxAgeSeconds: 600 },
+  },
+};
 
 const bus = vi.hoisted(() => ({
   receive: undefined as undefined | ((r: ImageResultV1) => Promise<void>),
@@ -227,9 +244,34 @@ it('runs HTTP admission through PG outbox, B journal and result to owned asset; 
           },
           resolveImage: async (_actor: unknown, modelRef: string) => {
             if (modelRef === 'unadapted') throw new ProviderError(409, 'ADAPTER_PENDING');
+            if (modelRef === 'seed') {
+              return {
+                modelId: 'doubao-seedream-4.0',
+                vendor: 'volcengine',
+                profile: 'volcengine-ark-images' as const,
+                route: MOCK_SEED_ROUTE,
+                apiKey: 'secret',
+                providerConfigId: randomUUID(),
+                credentialVersion: 1,
+                catalogVersion: 1,
+                adaptationVersion: 1,
+                capabilityMetadata: { image: { modes: ['generate'] } },
+              };
+            }
             return {
-              modelId: modelRef === 'seed' ? 'doubao-seedream-4.0' : 'gpt-image-2',
-              profile: modelRef === 'seed' ? 'seedream-4-images-v1' : 'gpt-images-v1',
+              modelId: 'gpt-image-2',
+              vendor: 'openai',
+              profile: 'openai-images' as const,
+              route: {
+                ...MOCK_GPT_ASYNC_ROUTE,
+                paramSpec: {
+                  ...MOCK_GPT_ASYNC_ROUTE.paramSpec,
+                  async:
+                    modelRef === 'no-async'
+                      ? null
+                      : { operations: ['generate'], maxQueries: 4, maxAgeSeconds: 300 },
+                },
+              },
               apiKey: 'secret',
               providerConfigId: randomUUID(),
               credentialVersion: 1,
@@ -609,7 +651,7 @@ it('runs HTTP admission through PG outbox, B journal and result to owned asset; 
       [seed.jobId],
     );
     expect(record.rows[0]).toMatchObject({
-      profile: 'seedream-4-images-v1',
+      profile: 'volcengine-ark-images',
       content_type: 'image/jpeg',
     });
     expect(record.rows[0]?.raw_key).toMatch(
@@ -642,7 +684,8 @@ it('distributes pending async queries and retains the new schedule when an older
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: MOCK_GPT_ASYNC_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
@@ -835,7 +878,8 @@ it('does not publish an async query when its saved bounds or credential lifetime
       const command: ImageCommandV1 = {
         version: 1,
         type: 'image.request',
-        profile: 'gpt-images-v1',
+        profile: 'openai-images',
+        route: MOCK_GPT_ASYNC_ROUTE,
         messageId: randomUUID(),
         jobId,
         ownerId: 'owner',
@@ -893,7 +937,8 @@ it('keeps async credentials for manual recovery of a known upstream task', async
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: MOCK_GPT_ASYNC_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
@@ -967,7 +1012,8 @@ it('keeps a pending or in-flight query on repeated recovery and ignores stale fa
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: MOCK_GPT_ASYNC_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
@@ -1060,7 +1106,8 @@ it('continues a previously admitted image and allows output recovery after new i
   const command: ImageCommandV1 = {
     version: 1,
     type: 'image.request',
-    profile: 'gpt-images-v1',
+    profile: 'openai-images',
+    route: MOCK_GPT_ASYNC_ROUTE,
     messageId: randomUUID(),
     jobId,
     ownerId: 'owner',
@@ -1162,28 +1209,22 @@ it('admits only a discovered and explicitly async Vidu model through HTTP and th
   await provider.discover(actor);
   const catalog = (await provider.catalog(actor)).items;
   const model = (id: string) => catalog.find((item) => item.modelId === id)!.modelRef;
-  const declaration = {
-    operation: 'image.generate' as const,
-    profile: 'vidu-image-v1' as const,
-    sourceKind: 'protocol-reference' as const,
-    source: 'synthetic Vidu protocol fixture',
-    sourceVersion: 'v1',
-    classification: 'image' as const,
-  };
-  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
-    ...declaration,
-    modelRef: model('fixture-vidu-incomplete'),
-  });
-  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
-    ...declaration,
-    modelRef: model('fixture-vidu-alt'),
-    metadata: {
-      image: {
-        modes: ['generate'],
+  const viduFixture = findFixtureRoute('image-vidu-q2', 'image.generate');
+  await providerStore.importRoutes([
+    {
+      ...viduFixture,
+      rawModelId: 'fixture-vidu-incomplete',
+      enabled: false,
+    },
+    {
+      ...viduFixture,
+      rawModelId: 'fixture-vidu-alt',
+      paramSpec: {
+        ...viduFixture.paramSpec!,
         async: { operations: ['generate'], maxQueries: 4, maxAgeSeconds: 300 },
       },
     },
-  });
+  ]);
   const keys = generateKeyPairSync('rsa', {
     modulusLength: 2048,
     publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -1306,28 +1347,34 @@ it('admits only an explicitly declared async Kling model and rejects sync, size,
   await provider.discover(actor);
   const catalog = (await provider.catalog(actor)).items;
   const model = (id: string) => catalog.find((item) => item.modelId === id)!.modelRef;
-  const declaration = {
-    operation: 'image.generate' as const,
-    profile: 'kling-image-v1' as const,
-    sourceKind: 'protocol-reference' as const,
-    source: 'https://docs.onelinkai.cloud/8653497m0',
-    sourceVersion: '2026-09-08',
-    classification: 'image' as const,
-  };
-  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
-    ...declaration,
-    modelRef: model('fixture-kling-incomplete'),
-  });
-  await providerStore.declare(actor.userId, (await provider.get(actor))!.revision, {
-    ...declaration,
-    modelRef: model('image-kling-v3'),
-    metadata: {
-      image: {
-        modes: ['generate'],
+  const klingFixture = findFixtureRoute('image-kling-v3', 'image.generate');
+  await pool.query(
+    `INSERT INTO mio_provider_model_routes(
+       provider_type,raw_model_id,operation,vendor,driver,classification,
+       submit_path,edit_path,query_path_template,param_spec,request_defaults,output_spec,
+       capability_metadata,source_kind,source,source_version,declaration_version,enabled
+     ) VALUES(
+       'onelink','fixture-kling-incomplete','image.generate','kling','kling-images','image',
+       '/kling/v1/images/generations',NULL,NULL,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,
+       '{}'::jsonb,'protocol-reference','https://docs.onelinkai.cloud/8653497m0','fixture',1,true
+     )`,
+  );
+  await providerStore.importRoutes([
+    {
+      ...klingFixture,
+      rawModelId: 'image-kling-v3',
+      paramSpec: {
+        ...klingFixture.paramSpec!,
+        maxN: 1,
+        allowedSizes: null,
+        maxReferenceImages: 0,
+        allowGenerateReferences: false,
+        allowedAspectRatios: [],
         async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
       },
+      requestDefaults: {},
     },
-  });
+  ]);
   const keys = generateKeyPairSync('rsa', {
     modulusLength: 2048,
     publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -1411,7 +1458,7 @@ it('admits only an explicitly declared async Kling model and rejects sync, size,
       async: true,
     });
     expect(incomplete.status).toBe(409);
-    expect((await incomplete.json()).error.code).toBe('IMAGE_OPERATION_UNSUPPORTED');
+    expect((await incomplete.json()).error.code).toBe('ADAPTER_PENDING');
 
     for (const invalidParams of [
       { prompt: 'fixture' },

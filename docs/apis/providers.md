@@ -15,7 +15,7 @@ ProviderView 保留 `id/type/enabled/hasKey/masked/credentialVersion/revision/de
 - `lastAttempt=null|{seq,credentialVersion,startedAt,finishedAt,status,error}`，status 为 running/connected/failed，进行中 finishedAt=null。
 - `discovery=null|{credentialVersion,refreshSeq,checkedAt,status,scope:'models-only',ids,error}`：最近完成的本凭据尝试；失败 ids=[]，不能代替 catalog 判断成功快照，升级承接的旧成功通过 catalog 展示。
 
-revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始及结束递增；客户端修改先读取最新值。
+revision 在配置/模型展示信息/偏好修改、刷新开始及结束递增（平台模型路由更新独立递增路由 `declarationVersion`）；客户端修改先读取最新值。
 
 ## GET /api/v1/providers/onelink
 
@@ -73,13 +73,13 @@ revision 在配置/模型展示信息/偏好/部署声明修改、刷新开始�
 
 成功：200 `{provider,items,defaults}`。`items` 是最近一次当前用户 Key 成功刷新得到的全量成员，`items.length` 表示该成功快照的模型数量。items 含稳定 modelRef/modelKey、精确 modelId、`name`、`description`、`nameOverride`、`descriptionOverride`、可空 category/classificationSource、supplierMetadata、membership、credentialVersion/catalogVersion、firstSeenAt/lastSeenAt、legacyRef、discovered、adaptation、preferences、chat 的 enabled/isDefault/runnable/unavailableReason。`name` 使用用户覆盖，否则使用精确 modelId；历史不可解析项二者均可为 null。`description` 使用用户覆盖，否则使用供应商字符串描述，均缺失为 null。两个 Override 字段为可空的实际用户覆盖，可区分回退；空字符串是实际覆盖。modelRef 为 `onelink:model:<UUID>`。返回 current/removed/historical 实体，discovered 只表示当前成功成员。
 
-adaptation 为 null 或 `{operation,profile,implementation:'implemented',sourceKind,source,sourceVersion,metadata,verification}`；`sourceKind` 只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察），只影响已发现成员的适配，不建立目录成员；catalog membership、旧快照和静态模型清单不能作为适配来源。verification 含 status/at/evidence/testedTuple。未声明协议时 ADAPTER_PENDING。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用或解密成功。
+adaptation 为 null 或 `{operation,vendor,profile,implementation:'implemented',declarationVersion,sourceKind,source,sourceVersion,metadata,verification}`（`vendor` 为上游原厂标识，`profile` 为服务端已实现协议驱动名，`declarationVersion` 为当前生效平台路由声明版本），按 `平台原厂路由（mio_provider_model_routes） -> ADAPTER_PENDING` 单轨返回当前已存在成员的生效适配；`sourceKind` 只能是 `protocol-reference`（协议/文档依据）或 `runtime-observation`（对应模型和操作的实际运行观察），只影响已存在成员的适配与分类回退，绝不向用户目录注入未发现成员；catalog membership、旧快照和静态模型清单不能作为适配来源。`verification` 含每用户独立计算的 `status`（仅 `'unverified'` 或 `'verified'`，跨用户完全隔离）及 `at/evidence/testedTuple`。未命中有效路由或驱动未实现时返回 `ADAPTER_PENDING`。每个 preference 含 usage/enabled/isDefault/effectiveDefault。defaults 按用途返回目标、effective 和 unavailableReason；失效不会自动改目标。runnable 表示本地资格，不保证上游实时可用或解密成功。
 
-图片候选另以 `image: {adaptation,enabled,runnable,unavailableReason}` 返回图片声明和本地资格，包含 GPT、受限 Seedream 4.0、Vidu `vidu-image-v1` 与 Kling `kling-image-v1` 的独立 profile；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。图片 `adaptation.metadata.image` 的显式 `modes` 必须包含 `generate`，可再声明 `edit`、`mask:{format:"png"}`、供应商多参考 capability `references:{maxImages}`、`geometry:{unit:"pixels",edges:["left","top","right","bottom"]}` 和协议中立 `async:{operations,maxQueries,maxAgeSeconds}`；`outpaint` 必须同时声明 geometry，async operations 必须属于 modes，省略这些字段不推断能力。Vidu 与 Kling 异步 profile 仅在已发现成员显式声明 generate async 时具备本地资格，原样发送该成员的精确 modelId（`kling-image-v1` 不包含使用独立 `/kling/v1/images/omni-image` 的 `image-kling-v3-omni`）；各自 transport 只允许已核对的固定提交/查询两条 OneLink 路径。`references.maxImages` 不是固定模型或图片容量策略。`parameters.async:true` 只有在当前 profile 的显式 async capability 下受理。图片声明和本地资格不代表供应商已验证或实时可用；真实异步调用与远端 CI 仍分别记录。
+图片候选另以 `image: {adaptation,enabled,runnable,unavailableReason}` 返回图片生效适配和本地资格，`profile` 标识生效原厂驱动（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`）；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。图片 `adaptation.metadata.image` 由生效路由规格派生：`modes` 必须包含 `generate`，可声明 `edit`、`mask:{format:"png"}`、供应商参考图能力 `references:{maxImages}`（`1..16`）、`geometry:{unit:"pixels",edges:["left","top","right","bottom"]}` 和 `async:{operations,maxQueries,maxAgeSeconds}`；`outpaint` 必须同时声明 geometry，async operations 必须属于 modes，省略这些字段不推断能力。异步驱动（`vidu-images`、`kling-images`）仅在具备 generate async 规格与合法相对查询模板时 `runnable=true`，原样发送该成员的精确 modelId（`kling-images` 可按路由区分标准 `/kling/v1/images/generations` 与 Omni `/kling/v1/images/omni-image`）。`references.maxImages` 不是固定模型或图片容量策略。`parameters.async:true` 只有在当前生效路由显式声明 async capability 时受理。图片路由和本地资格不代表供应商已验证或实时可用；真实调用与远端 CI 仍分别记录。
 
 错误：400 QUERY_INVALID；其余见共同约定。
 
-副作用：一条 SQL 一致读取本人目录/配置/声明/偏好，不解密、不联网，不返回用户目录并集或静态名单。
+副作用：一条 SQL 一致读取本人目录/配置/受成员门控的平台路由/本人验证与偏好，不解密、不联网，不返回用户目录并集或静态名单。
 
 ## PATCH /api/v1/providers/onelink/models
 

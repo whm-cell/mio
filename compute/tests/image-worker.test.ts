@@ -6,32 +6,162 @@ import { spawnSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import { Journal } from '../src/adapters/journal.ts';
 import { createImageWorker, recoverImageMaterialization } from '../src/image-worker.ts';
-import { createKlingAsyncImageTransport } from '../src/images.ts';
+import { createRoutedKlingImageProtocol } from '../src/providers/onelink/kling/index.ts';
 import { sealImageKey } from '../../src/compute/image-credentials.ts';
 import { validateImage } from '../src/adapters/media.ts';
-import type { ImageProfile, ImageQueryCommandV1 } from '@mio/compute-contracts';
-import { imageQueryCredentialBinding } from '@mio/compute-contracts';
+import type {
+  ImageCommandV1,
+  ImageDriver,
+  ImageInput,
+  ImageQueryCommandV1,
+  ImageRouteConfig,
+} from '@mio/compute-contracts';
+import { imageCommandCredentialBinding, imageQueryCredentialBinding } from '@mio/compute-contracts';
 
 const keys = generateKeyPairSync('rsa', {
   modulusLength: 2048,
   publicKeyEncoding: { type: 'spki', format: 'pem' },
   privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
 });
-function command(input: Record<string, unknown> = {}, profile: ImageProfile = 'gpt-images-v1') {
+
+const GPT_ROUTE: ImageRouteConfig = {
+  driver: 'openai-images',
+  vendor: 'openai',
+  submitPath: '/v1/images/generations',
+  editPath: '/v1/images/edits',
+  queryPathTemplate: null,
+  requiresAsync: false,
+  effectiveWatermark: null,
+  paramSpec: {
+    supportedOperations: ['generate', 'edit'],
+    requiresAsync: false,
+    maxN: 10,
+    allowExplicitN: true,
+    allowedSizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
+    allowCustomDimensions: true,
+    maxReferenceImages: 16,
+    allowGenerateReferences: false,
+    allowMaskPng: true,
+    allowOutpaintGeometry: false,
+    allowedQualities: ['high', 'medium', 'low', 'auto'],
+    allowedBackgrounds: ['transparent', 'opaque', 'auto'],
+    allowedModerations: ['low', 'auto'],
+    allowedOutputFormats: ['png', 'jpeg', 'webp'],
+    allowOutputCompression: true,
+    allowUserField: true,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+  },
+  requestDefaults: { responseFormat: 'b64_json' },
+  outputSpec: { fixedOutputFormat: null },
+};
+
+const SEEDREAM_ROUTE: ImageRouteConfig = {
+  driver: 'volcengine-ark-images',
+  vendor: 'volcengine',
+  submitPath: '/volc/api/v3/images/generations',
+  editPath: null,
+  queryPathTemplate: null,
+  requiresAsync: false,
+  effectiveWatermark: true,
+  paramSpec: {
+    supportedOperations: ['generate'],
+    requiresAsync: false,
+    maxN: 1,
+    allowExplicitN: true,
+    allowedSizes: ['1024x1024'],
+    allowCustomDimensions: false,
+    maxReferenceImages: 0,
+    allowGenerateReferences: false,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    allowOutputCompression: false,
+    allowUserField: false,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: null,
+  },
+  requestDefaults: {
+    watermark: true,
+    sequentialImageGeneration: 'disabled',
+    responseFormat: 'b64_json',
+    stream: false,
+    defaultSize: '1024x1024',
+  },
+  outputSpec: { fixedOutputFormat: 'jpeg' },
+};
+
+const KLING_ROUTE: ImageRouteConfig = {
+  driver: 'kling-images',
+  vendor: 'kling',
+  submitPath: '/kling/v1/images/generations',
+  editPath: null,
+  queryPathTemplate: '/kling/v1/images/generations/{task_id}',
+  requiresAsync: true,
+  effectiveWatermark: null,
+  paramSpec: {
+    supportedOperations: ['generate'],
+    requiresAsync: true,
+    maxN: 1,
+    allowExplicitN: true,
+    allowedSizes: null,
+    allowCustomDimensions: false,
+    maxReferenceImages: 0,
+    allowGenerateReferences: false,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    allowOutputCompression: false,
+    allowUserField: false,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: { operations: ['generate'], maxQueries: 16, maxAgeSeconds: 3600 },
+  },
+  requestDefaults: {},
+  outputSpec: { fixedOutputFormat: null },
+};
+
+function defaultRouteFor(profile: ImageDriver): ImageRouteConfig {
+  switch (profile) {
+    case 'openai-images':
+      return GPT_ROUTE;
+    case 'volcengine-ark-images':
+      return SEEDREAM_ROUTE;
+    case 'kling-images':
+      return KLING_ROUTE;
+    case 'vidu-images':
+      throw new Error('unexpected vidu-images without explicit route');
+  }
+}
+
+function command(
+  input: Record<string, unknown> = {},
+  profile: ImageDriver = 'openai-images',
+  route: ImageRouteConfig = defaultRouteFor(profile),
+): ImageCommandV1 {
   const base = {
+    version: 1 as const,
+    type: 'image.request' as const,
     messageId: randomUUID(),
     jobId: randomUUID(),
     ownerId: randomUUID(),
     expiresAt: Date.now() + 60_000,
     profile,
-    input: { model: 'gpt-image-2', prompt: 'square', ...input },
+    route,
+    input: { model: 'gpt-image-2', prompt: 'square', ...input } as ImageInput,
   };
-  const sorted = Object.fromEntries(
-    Object.entries(base.input).sort(([a], [b]) => a.localeCompare(b)),
-  );
-  const binding = JSON.stringify([base.jobId, base.ownerId, base.expiresAt, base.profile, sorted]);
+  const binding = imageCommandCredentialBinding(base);
   return { ...base, credential: sealImageKey('test-secret', binding, 'b1', keys.publicKey) };
 }
+
 function imageOutput(
   job: string,
   index: number,
@@ -109,9 +239,9 @@ describe('durable image execution', () => {
         state: 'rejected',
         errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
       });
-      const wrongProfile = command();
-      wrongProfile.profile = 'seedream-4-images-v1';
-      expect(await worker(wrongProfile)).toEqual({
+      const wrongRoute = command();
+      wrongRoute.route = { ...GPT_ROUTE, vendor: 'tampered' };
+      expect(await worker(wrongRoute)).toEqual({
         state: 'rejected',
         errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
       });
@@ -121,7 +251,8 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
-  it('preserves Seedream JPEG and safe provider observation across failure, restart and recovery', async () => {
+
+  it('preserves Volcengine Seedream JPEG and safe provider observation across failure, restart and recovery', async () => {
     const encoded = spawnSync(
       'ffmpeg',
       [
@@ -147,7 +278,7 @@ describe('durable image execution', () => {
     let journal = new Journal(directory, instance, true);
     const request = command(
       { model: 'doubao-seedream-4.0', n: 1, size: '1024x1024' },
-      'seedream-4-images-v1',
+      'volcengine-ark-images',
     );
     const transport = vi.fn<typeof fetch>().mockResolvedValue(
       Response.json(
@@ -204,6 +335,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('retains an upstream request ID on unknown and rejected outcomes without retry', async () => {
     for (const outcome of ['unknown', 'rejected'] as const) {
       const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
@@ -245,6 +377,7 @@ describe('durable image execution', () => {
       }
     }
   });
+
   it('restarts materialization without another paid POST and preserves command identity', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const instance = randomUUID();
@@ -284,6 +417,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('exposes durable outputs when a later output fails and resumes the remainder only', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -315,6 +449,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('retains ambiguous submission across restart without replay', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const instance = randomUUID();
@@ -338,6 +473,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('persists sanitized async submission diagnostics without changing the unknown boundary', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -393,6 +529,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('exposes a supplier short response as partial across restart without another POST', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const instance = randomUUID();
@@ -425,6 +562,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('allows one explicit materialization recovery after three failures and republishes saved completion', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const instance = randomUUID();
@@ -518,6 +656,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('rejects a new command without image keys without sending it upstream', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -539,6 +678,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('retains a valid later PNG when an earlier upstream item has invalid base64', async () => {
     const encoded = spawnSync(
       'ffmpeg',
@@ -606,6 +746,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it.each([
     [{}, [{ b64_json: 'bad!' }]],
     [{ n: 2 }, [{ b64_json: 'bad!' }, { b64_json: 'bad!' }]],
@@ -630,6 +771,7 @@ describe('durable image execution', () => {
       }
     },
   );
+
   it('retains valid returned bytes through missing decoder tools and resumes without another POST', async () => {
     const encoded = spawnSync(
       'ffmpeg',
@@ -696,6 +838,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('retains an indeterminate corrupt PNG and exposes a valid later output without reposting', async () => {
     const encoded = spawnSync(
       'ffmpeg',
@@ -768,6 +911,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('continues later outputs when the first materialization fails and retries only the missing index', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -802,6 +946,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('marks invalid decoded content as missing and still retains a later valid output', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -831,6 +976,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('submits async once, queries a persisted upstream task, and materializes only on return', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -862,6 +1008,7 @@ describe('durable image execution', () => {
         ownerId: request.ownerId,
         expiresAt: request.expiresAt,
         profile: request.profile,
+        route: request.route,
         operation: 'generate',
         input: request.input as ImageQueryCommandV1['input'],
         upstreamTaskId: 'task-async-1',
@@ -913,6 +1060,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('does not resubmit after an async query becomes unknown', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -936,6 +1084,7 @@ describe('durable image execution', () => {
       ownerId: request.ownerId,
       expiresAt: request.expiresAt,
       profile: request.profile,
+      route: request.route,
       operation: 'generate',
       input: request.input as ImageQueryCommandV1['input'],
       upstreamTaskId: 'task-unknown-1',
@@ -979,6 +1128,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('recovers a known task with the current key without trusting legacy or duplicate queries', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
@@ -1000,6 +1150,7 @@ describe('durable image execution', () => {
       ownerId: request.ownerId,
       expiresAt: request.expiresAt,
       profile: request.profile,
+      route: request.route,
       operation: 'generate',
       input: request.input as ImageQueryCommandV1['input'],
       upstreamTaskId: 'task-rotate',
@@ -1093,6 +1244,7 @@ describe('durable image execution', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
   it('does not query when either the deadline or the query credential is missing', async () => {
     for (const missing of ['queryDeadline', 'queryCredential'] as const) {
       const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
@@ -1117,6 +1269,7 @@ describe('durable image execution', () => {
         ownerId: request.ownerId,
         expiresAt: request.expiresAt,
         profile: request.profile,
+        route: request.route,
         operation: 'generate',
         input: request.input as ImageQueryCommandV1['input'],
         upstreamTaskId: 'task-missing',
@@ -1158,12 +1311,12 @@ describe('durable image execution', () => {
   });
 
   it.each(['succeed', 'success'] as const)(
-    'dispatches kling-image-v1 (%s) through default worker async transport and replays completion without repeat POST or GET',
+    'dispatches kling-images (%s) through default worker async transport and replays completion without repeat POST or GET',
     async (terminalStatus) => {
       const pngBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
       const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
       const journal = new Journal(directory, randomUUID(), true);
-      const request = command({ model: 'image-kling-v3', async: true }, 'kling-image-v1');
+      const request = command({ model: 'image-kling-v3', async: true }, 'kling-images');
       let postCalls = 0;
       let getCalls = 0;
       let downloadCalls = 0;
@@ -1212,7 +1365,8 @@ describe('durable image execution', () => {
           jobId: request.jobId,
           ownerId: request.ownerId,
           expiresAt: request.expiresAt,
-          profile: 'kling-image-v1',
+          profile: 'kling-images',
+          route: request.route,
           operation: 'generate',
           input: request.input as ImageQueryCommandV1['input'],
           upstreamTaskId: 'kling-worker-1',
@@ -1257,8 +1411,12 @@ describe('durable image execution', () => {
           materialize,
           transport,
           undefined,
-          createKlingAsyncImageTransport(transport, async (url, signal, consume) =>
-            consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
+          createRoutedKlingImageProtocol(
+            KLING_ROUTE,
+            transport,
+            undefined,
+            async (url, signal, consume) =>
+              consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
           ),
         );
         const finalQuery = query(5);
@@ -1286,7 +1444,7 @@ describe('durable image execution', () => {
   it('maps OneLink gateway Kling failure status to IMAGE_QUERY_FAILED without resubmitting', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'mio-image-'));
     const journal = new Journal(directory, randomUUID(), true);
-    const request = command({ model: 'image-kling-v3', async: true }, 'kling-image-v1');
+    const request = command({ model: 'image-kling-v3', async: true }, 'kling-images');
     const transport = vi
       .fn<typeof fetch>()
       .mockImplementation(async (url) =>
@@ -1302,7 +1460,8 @@ describe('durable image execution', () => {
       jobId: request.jobId,
       ownerId: request.ownerId,
       expiresAt: request.expiresAt,
-      profile: 'kling-image-v1',
+      profile: 'kling-images',
+      route: request.route,
       operation: 'generate',
       input: request.input as ImageQueryCommandV1['input'],
       upstreamTaskId: 'kling-fail-1',

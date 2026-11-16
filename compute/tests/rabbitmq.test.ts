@@ -4,7 +4,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { COMPUTE_PROFILE, parseComputeCommandV1 } from '@mio/compute-contracts';
+import {
+  COMPUTE_PROFILE,
+  imageCommandCredentialBinding,
+  parseComputeCommandV1,
+} from '@mio/compute-contracts';
 import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import type { ConsumeMessage } from 'amqplib';
 import { Journal } from '../src/adapters/journal.ts';
@@ -294,26 +298,60 @@ it('waits for an in-flight paid image handler to save its response before broker
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
   const input = { model: 'gpt-image-2', prompt: 'square' };
+  const route = {
+    driver: 'openai-images' as const,
+    vendor: 'openai',
+    submitPath: '/v1/images/generations',
+    editPath: '/v1/images/edits',
+    queryPathTemplate: null,
+    requiresAsync: false,
+    effectiveWatermark: null,
+    paramSpec: {
+      supportedOperations: ['generate', 'edit'] as const,
+      requiresAsync: false,
+      maxN: 10,
+      allowExplicitN: true,
+      allowedSizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
+      allowCustomDimensions: true,
+      maxReferenceImages: 16,
+      allowGenerateReferences: false,
+      allowMaskPng: true,
+      allowOutpaintGeometry: false,
+      allowedQualities: ['high', 'medium', 'low', 'auto'] as const,
+      allowedBackgrounds: ['transparent', 'opaque', 'auto'] as const,
+      allowedModerations: ['low', 'auto'] as const,
+      allowedOutputFormats: ['png', 'jpeg', 'webp'] as const,
+      allowOutputCompression: true,
+      allowUserField: true,
+      allowedAspectRatios: [],
+      allowWatermarkOverride: false,
+      async: null,
+    },
+    requestDefaults: { responseFormat: 'b64_json' as const },
+    outputSpec: { fixedOutputFormat: null },
+  };
   const jobId = randomUUID(),
     ownerId = randomUUID(),
     expiresAt = Date.now() + 60000;
-  const binding = JSON.stringify([
-    jobId,
-    ownerId,
-    expiresAt,
-    'gpt-images-v1',
-    Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))),
-  ]);
-  const command = {
+  const baseCommand = {
     version: 1 as const,
     type: 'image.request' as const,
-    profile: 'gpt-images-v1' as const,
+    profile: 'openai-images' as const,
+    route,
     messageId: randomUUID(),
     jobId,
     ownerId,
     expiresAt,
     input,
-    credential: sealImageKey('secret', binding, 'b1', keys.publicKey),
+  };
+  const command = {
+    ...baseCommand,
+    credential: sealImageKey(
+      'secret',
+      imageCommandCredentialBinding(baseCommand),
+      'b1',
+      keys.publicKey,
+    ),
   };
   let release: (response: Response) => void = () => {};
   const transport = vi.fn<typeof fetch>().mockImplementation(

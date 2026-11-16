@@ -49,7 +49,7 @@
     "assets:migrate": "node scripts/service/migrate-assets.ts",
     "compute:migrate": "node scripts/service/migrate-compute.ts",
     "providers:migrate": "node scripts/service/migrate-providers.ts",
-    "providers:adapt": "node scripts/service/import-provider-adaptation.ts",
+    "providers:route": "node scripts/service/import-provider-route.ts",
     "env:init": "node scripts/service/local.ts dev init && node scripts/service/local.ts test init",
     "infra:up:dev": "node scripts/service/local.ts dev infra up",
     "infra:up:test": "node scripts/service/local.ts test infra up",

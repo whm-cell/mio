@@ -1,33 +1,180 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  IMAGE_PROFILES,
-  IMAGE_PROFILE_RULES,
+  IMAGE_DRIVERS,
   parseImageQuery,
   parseImageResult,
-  validImageInput,
-  type ImageProfile,
-  type ImageProfileRule,
+  validateImageInputByRoute,
+  validateImageRouteConfig,
+  type ImageDriver,
+  type ImageRouteConfig,
 } from '@mio/compute-contracts';
-import {
-  createImageProtocol,
-  createKlingAsyncImageTransport,
-  createViduAsyncImageTransport,
-} from '../src/images.ts';
-import type { ReadImage } from '../src/images.ts';
+import { createRoutedImageProtocol, type ReadImage } from '../src/images.ts';
+import type { withPublicHttps } from '../src/adapters/public-https.ts';
+import { createRoutedKlingImageProtocol } from '../src/providers/onelink/kling/index.ts';
+import { createRoutedViduImageProtocol } from '../src/providers/onelink/vidu/index.ts';
+
+type ImageDownload = typeof withPublicHttps;
 
 const input = { model: 'gpt-image-2', prompt: 'a blue square' };
 const key = 'private-test-credential';
 
-function testVidu(transport: typeof fetch, read: ReadImage) {
-  return createViduAsyncImageTransport(transport, read, async (url, signal, consume) =>
-    consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
+const GPT_ROUTE: ImageRouteConfig = {
+  driver: 'openai-images',
+  vendor: 'openai',
+  submitPath: '/v1/images/generations',
+  editPath: '/v1/images/edits',
+  queryPathTemplate: null,
+  requiresAsync: false,
+  effectiveWatermark: null,
+  paramSpec: {
+    supportedOperations: ['generate', 'edit', 'outpaint'],
+    requiresAsync: false,
+    maxN: 10,
+    allowExplicitN: true,
+    allowedSizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
+    allowCustomDimensions: true,
+    maxReferenceImages: 16,
+    allowGenerateReferences: false,
+    allowMaskPng: true,
+    allowOutpaintGeometry: true,
+    allowedQualities: ['high', 'medium', 'low', 'auto'],
+    allowedBackgrounds: ['transparent', 'opaque', 'auto'],
+    allowedModerations: ['low', 'auto'],
+    allowedOutputFormats: ['png', 'jpeg', 'webp'],
+    allowOutputCompression: true,
+    allowUserField: true,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+  },
+  requestDefaults: { responseFormat: 'b64_json' },
+  outputSpec: { fixedOutputFormat: null },
+};
+
+const SEEDREAM_ROUTE: ImageRouteConfig = {
+  driver: 'volcengine-ark-images',
+  vendor: 'volcengine',
+  submitPath: '/volc/api/v3/images/generations',
+  editPath: null,
+  queryPathTemplate: null,
+  requiresAsync: false,
+  effectiveWatermark: true,
+  paramSpec: {
+    supportedOperations: ['generate'],
+    requiresAsync: false,
+    maxN: 1,
+    allowExplicitN: true,
+    allowedSizes: ['1024x1024'],
+    allowCustomDimensions: false,
+    maxReferenceImages: 0,
+    allowGenerateReferences: false,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    allowOutputCompression: false,
+    allowUserField: false,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: null,
+  },
+  requestDefaults: {
+    watermark: true,
+    sequentialImageGeneration: 'disabled',
+    responseFormat: 'b64_json',
+    stream: false,
+    defaultSize: '1024x1024',
+  },
+  outputSpec: { fixedOutputFormat: 'jpeg' },
+};
+
+const VIDU_ROUTE: ImageRouteConfig = {
+  driver: 'vidu-images',
+  vendor: 'vidu',
+  submitPath: '/vidu/ent/v2/reference2image',
+  editPath: null,
+  queryPathTemplate: '/vidu/ent/v2/tasks/{task_id}/creations',
+  requiresAsync: true,
+  effectiveWatermark: null,
+  paramSpec: {
+    supportedOperations: ['generate'],
+    requiresAsync: true,
+    maxN: 1,
+    allowExplicitN: false,
+    allowedSizes: ['1080p', '2K', '4K'],
+    allowCustomDimensions: false,
+    maxReferenceImages: 7,
+    allowGenerateReferences: true,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    allowOutputCompression: false,
+    allowUserField: false,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: { operations: ['generate'], maxQueries: 16, maxAgeSeconds: 3600 },
+  },
+  requestDefaults: {},
+  outputSpec: { fixedOutputFormat: null },
+};
+
+const KLING_MINIMAL_ROUTE: ImageRouteConfig = {
+  driver: 'kling-images',
+  vendor: 'kling',
+  submitPath: '/kling/v1/images/generations',
+  editPath: null,
+  queryPathTemplate: '/kling/v1/images/generations/{task_id}',
+  requiresAsync: true,
+  effectiveWatermark: null,
+  paramSpec: {
+    supportedOperations: ['generate'],
+    requiresAsync: true,
+    maxN: 1,
+    allowExplicitN: true,
+    allowedSizes: null,
+    allowCustomDimensions: false,
+    maxReferenceImages: 0,
+    allowGenerateReferences: false,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    allowOutputCompression: false,
+    allowUserField: false,
+    allowedAspectRatios: [],
+    allowWatermarkOverride: false,
+    async: { operations: ['generate'], maxQueries: 16, maxAgeSeconds: 3600 },
+  },
+  requestDefaults: {},
+  outputSpec: { fixedOutputFormat: null },
+};
+
+function testVidu(transport: typeof fetch, read: ReadImage, customDownload?: ImageDownload) {
+  return createRoutedViduImageProtocol(
+    VIDU_ROUTE,
+    transport,
+    read,
+    customDownload ??
+      (async (url, signal, consume) =>
+        consume(await transport(url, { method: 'GET', redirect: 'error', signal }))),
   );
 }
 
 function testKling(transport: typeof fetch) {
-  return createKlingAsyncImageTransport(transport, async (url, signal, consume) =>
-    consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
+  return createRoutedKlingImageProtocol(
+    KLING_MINIMAL_ROUTE,
+    transport,
+    undefined,
+    async (url, signal, consume) =>
+      consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
   );
 }
 
@@ -40,7 +187,8 @@ function queryCommand() {
     jobId: randomUUID(),
     ownerId: 'owner',
     expiresAt: Date.now() + 60_000,
-    profile: 'gpt-images-v1' as const,
+    profile: 'openai-images' as const,
+    route: GPT_ROUTE,
     operation: 'generate' as const,
     input: { ...input, async: true },
     upstreamTaskId: 'task-1',
@@ -56,7 +204,7 @@ function queryCommand() {
   };
 }
 
-describe('GPT image protocol', () => {
+describe('Routed vendor image protocols', () => {
   it('builds the documented Vidu async request and preserves downloaded output format', async () => {
     const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
     const ref = {
@@ -222,8 +370,8 @@ describe('GPT image protocol', () => {
         { headers: { 'content-type': 'image/jpeg' } },
       );
     });
-    const protocol = createImageProtocol(
-      'vidu-image-v1',
+    const protocol = createRoutedImageProtocol(
+      VIDU_ROUTE,
       'generate',
       transport,
       undefined,
@@ -264,8 +412,8 @@ describe('GPT image protocol', () => {
         images: [{ base64 }],
       })),
     };
-    const protocol = createImageProtocol(
-      'gpt-images-v1',
+    const protocol = createRoutedImageProtocol(
+      GPT_ROUTE,
       'generate',
       synchronous,
       undefined,
@@ -307,20 +455,20 @@ describe('GPT image protocol', () => {
       .mockResolvedValue(Response.json({ task_id: 'task-alt' }));
     const read = async () => new Uint8Array();
     const asyncTransport = testVidu(transport, read);
-    const input = { model: 'fixture-vidu-alt', prompt: 'model fixture', async: true };
-    const protocol = createImageProtocol(
-      'vidu-image-v1',
+    const reqInput = { model: 'fixture-vidu-alt', prompt: 'model fixture', async: true };
+    const protocol = createRoutedImageProtocol(
+      VIDU_ROUTE,
       'generate',
       transport,
       read,
       asyncTransport,
     );
-    await expect(protocol.submit(input, key)).resolves.toEqual({
+    await expect(protocol.submit(reqInput, key)).resolves.toEqual({
       state: 'rejected',
       code: 'IMAGE_INPUT_INVALID',
     });
     expect(transport).not.toHaveBeenCalled();
-    await expect(protocol.submitAsync(input, key)).resolves.toMatchObject({
+    await expect(protocol.submitAsync(reqInput, key)).resolves.toMatchObject({
       state: 'submitted',
       upstreamTaskId: 'task-alt',
     });
@@ -418,7 +566,7 @@ describe('GPT image protocol', () => {
     const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
     const ref = {
       assetId: '00000000-0000-4000-8000-000000000001',
-      key: 'mio/raw/00000000-0000-4000-8000-000000000002',
+      key: 'mio/raw/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002',
       sizeBytes: bytes.length,
       etag: 'private-etag',
       contentType: 'image/jpeg' as const,
@@ -450,7 +598,7 @@ describe('GPT image protocol', () => {
     const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
     const ref = {
       assetId: '00000000-0000-4000-8000-000000000001',
-      key: 'mio/raw/00000000-0000-4000-8000-000000000002',
+      key: 'mio/raw/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002',
       sizeBytes: bytes.length,
       etag: 'private-etag',
       contentType: 'image/jpeg' as const,
@@ -516,7 +664,7 @@ describe('GPT image protocol', () => {
         creations: [{ url: 'https://new-provider.example/result' }],
       }),
     );
-    const protocol = createViduAsyncImageTransport(
+    const protocol = testVidu(
       transport,
       async () => new Uint8Array(),
       async (_url, _signal, consume) =>
@@ -575,13 +723,17 @@ describe('GPT image protocol', () => {
     ).toThrow('IMAGE_MESSAGE_INVALID');
   });
 
-  it('dispatches only explicit implemented operations', () => {
-    expect(() => createImageProtocol('guess-from-model', 'generate')).toThrow(
-      'IMAGE_PROTOCOL_UNSUPPORTED',
-    );
-    expect(() => createImageProtocol('gpt-images-v1', 'edit')).not.toThrow();
-    expect(() => createImageProtocol('gpt-images-v1', 'outpaint')).not.toThrow();
+  it('dispatches only explicit implemented routes and operations', () => {
+    expect(() =>
+      createRoutedImageProtocol(
+        { ...GPT_ROUTE, driver: 'guess-from-model' as ImageDriver },
+        'generate',
+      ),
+    ).toThrow('IMAGE_PROTOCOL_UNSUPPORTED');
+    expect(() => createRoutedImageProtocol(GPT_ROUTE, 'edit')).not.toThrow();
+    expect(() => createRoutedImageProtocol(GPT_ROUTE, 'outpaint')).not.toThrow();
   });
+
   it('posts GPT edit as multipart without leaking COS identity fields', async () => {
     const transport = vi
       .fn<typeof fetch>()
@@ -602,7 +754,7 @@ describe('GPT image protocol', () => {
       contentType: 'image/png' as const,
     };
     const read = vi.fn(async () => bytes);
-    const result = await createImageProtocol('gpt-images-v1', 'edit', transport, read).submit(
+    const result = await createRoutedImageProtocol(GPT_ROUTE, 'edit', transport, read).submit(
       { ...input, operation: 'edit', image, mask, n: 1, quality: 'high' },
       key,
     );
@@ -621,6 +773,7 @@ describe('GPT image protocol', () => {
     expect(JSON.stringify(options?.body)).not.toContain(image.key);
     expect(JSON.stringify(options?.body)).not.toContain(image.etag);
   });
+
   it('posts ordered GPT reference arrays and explicit outpaint geometry in one multipart request', async () => {
     const transport = vi
       .fn<typeof fetch>()
@@ -642,7 +795,7 @@ describe('GPT image protocol', () => {
       '00000000-0000-4000-8000-000000000004',
     );
     const read = vi.fn(async () => bytes);
-    const result = await createImageProtocol('gpt-images-v1', 'outpaint', transport, read).submit(
+    const result = await createRoutedImageProtocol(GPT_ROUTE, 'outpaint', transport, read).submit(
       {
         ...input,
         operation: 'outpaint',
@@ -662,6 +815,7 @@ describe('GPT image protocol', () => {
     expect(JSON.stringify(options?.body)).not.toContain(first.key);
     expect(JSON.stringify(options?.body)).not.toContain(first.etag);
   });
+
   it('uses one fixed POST, preserves optional defaults, and strips unrelated response fields', async () => {
     const transport = vi
       .fn<typeof fetch>()
@@ -669,7 +823,11 @@ describe('GPT image protocol', () => {
         Response.json({ data: [{ b64_json: 'YWJj', revised_prompt: key }], secret: key }),
       );
     expect(
-      await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(
+        { ...GPT_ROUTE, requestDefaults: {} },
+        'generate',
+        transport,
+      ).submit(input, key),
     ).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
     expect(transport).toHaveBeenCalledOnce();
     const [url, options] = transport.mock.calls[0]!;
@@ -681,7 +839,8 @@ describe('GPT image protocol', () => {
       'Content-Type': 'application/json',
     });
   });
-  it('uses the explicit Seedream profile for one watermarked JPEG and retains only safe usage', async () => {
+
+  it('uses the explicit Volcengine route for one watermarked JPEG and retains only safe usage', async () => {
     const transport = vi.fn<typeof fetch>().mockResolvedValue(
       Response.json(
         {
@@ -704,7 +863,7 @@ describe('GPT image protocol', () => {
       size: '1024x1024',
     };
     expect(
-      await createImageProtocol('seedream-4-images-v1', 'generate', transport).submit(request, key),
+      await createRoutedImageProtocol(SEEDREAM_ROUTE, 'generate', transport).submit(request, key),
     ).toEqual({
       state: 'returned',
       images: [{ base64: 'YWJj' }],
@@ -729,7 +888,8 @@ describe('GPT image protocol', () => {
       watermark: true,
     });
   });
-  it('uses only the GPT usage fields documented for that profile', async () => {
+
+  it('uses only the GPT usage fields documented for openai-images', async () => {
     const transport = vi.fn<typeof fetch>().mockResolvedValue(
       Response.json({
         data: [{ b64_json: 'YWJj' }],
@@ -737,7 +897,7 @@ describe('GPT image protocol', () => {
       }),
     );
     expect(
-      await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({
       state: 'returned',
       images: [{ base64: 'YWJj' }],
@@ -745,9 +905,10 @@ describe('GPT image protocol', () => {
     });
     expect(transport).toHaveBeenCalledOnce();
   });
-  it('rejects unsupported Seedream parameters and unknown profiles without outbound requests', async () => {
+
+  it('rejects unsupported Volcengine parameters and invalid routes without outbound requests', async () => {
     const transport = vi.fn<typeof fetch>();
-    const protocol = createImageProtocol('seedream-4-images-v1', 'generate', transport);
+    const protocol = createRoutedImageProtocol(SEEDREAM_ROUTE, 'generate', transport);
     for (const extra of [
       { n: 2 },
       { size: '2048x2048' },
@@ -761,11 +922,16 @@ describe('GPT image protocol', () => {
         state: 'rejected',
         code: 'IMAGE_INPUT_INVALID',
       });
-    expect(() => createImageProtocol('seedream-unknown', 'generate', transport)).toThrow(
-      'IMAGE_PROTOCOL_UNSUPPORTED',
-    );
+    expect(() =>
+      createRoutedImageProtocol(
+        { ...SEEDREAM_ROUTE, driver: 'seedream-unknown' as ImageDriver },
+        'generate',
+        transport,
+      ),
+    ).toThrow('IMAGE_PROTOCOL_UNSUPPORTED');
     expect(transport).not.toHaveBeenCalled();
   });
+
   it('ignores malformed or credential-echo observations without discarding valid output', async () => {
     const transport = vi.fn<typeof fetch>().mockResolvedValue(
       Response.json(
@@ -777,13 +943,14 @@ describe('GPT image protocol', () => {
       ),
     );
     expect(
-      await createImageProtocol('seedream-4-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(SEEDREAM_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({
       state: 'returned',
       images: [{ base64: 'YWJj' }],
     });
     expect(transport).toHaveBeenCalledOnce();
   });
+
   it('retains a safe request ID if the response stream fails after headers without replay', async () => {
     const broken = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -794,7 +961,7 @@ describe('GPT image protocol', () => {
       .fn<typeof fetch>()
       .mockResolvedValue(new Response(broken, { headers: { 'x-request-id': 'req-stream-1' } }));
     expect(
-      await createImageProtocol('seedream-4-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(SEEDREAM_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({
       state: 'unknown',
       code: 'IMAGE_SUBMISSION_UNKNOWN',
@@ -802,9 +969,10 @@ describe('GPT image protocol', () => {
     });
     expect(transport).toHaveBeenCalledOnce();
   });
+
   it('rejects invalid or untrusted request fields before any supplier call', async () => {
     const transport = vi.fn<typeof fetch>();
-    const protocol = createImageProtocol('gpt-images-v1', 'generate', transport);
+    const protocol = createRoutedImageProtocol(GPT_ROUTE, 'generate', transport);
     for (const extra of [
       { n: 11 },
       { n: 1.5 },
@@ -820,13 +988,15 @@ describe('GPT image protocol', () => {
     }
     expect(transport).not.toHaveBeenCalled();
   });
+
   it('keeps connection loss unknown without retry or raw error disclosure', async () => {
     const transport = vi.fn<typeof fetch>().mockRejectedValue(new Error(key));
     expect(
-      await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({ state: 'unknown', code: 'IMAGE_SUBMISSION_UNKNOWN' });
     expect(transport).toHaveBeenCalledOnce();
   });
+
   it.each([
     [{ data: [{ url: 'https://untrusted.example/result' }] }, [null]],
     [{ data: [{ b64_json: 'bad!' }] }, [null]],
@@ -836,20 +1006,22 @@ describe('GPT image protocol', () => {
     async (payload, images) => {
       const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json(payload));
       expect(
-        await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+        await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(input, key),
       ).toEqual({ state: 'returned', images });
       expect(transport).toHaveBeenCalledOnce();
     },
   );
+
   it('keeps an over-count response unknown without resubmission', async () => {
     const transport = vi
       .fn<typeof fetch>()
       .mockResolvedValue(Response.json({ data: [{ b64_json: 'YWJj' }, { b64_json: 'YWJj' }] }));
     expect(
-      await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({ state: 'unknown', code: 'IMAGE_SUBMISSION_UNKNOWN' });
     expect(transport).toHaveBeenCalledOnce();
   });
+
   it('uses only an injected async transport and preserves the upstream task identity', async () => {
     const transport = vi.fn<typeof fetch>();
     const attempts: number[] = [];
@@ -862,8 +1034,8 @@ describe('GPT image protocol', () => {
           : { state: 'returned' as const, upstreamTaskId: taskId, images: [{ base64: 'YWJj' }] };
       }),
     };
-    const protocol = createImageProtocol(
-      'gpt-images-v1',
+    const protocol = createRoutedImageProtocol(
+      GPT_ROUTE,
       'generate',
       transport,
       undefined,
@@ -888,13 +1060,14 @@ describe('GPT image protocol', () => {
     expect(attempts).toEqual([1, 2]);
     expect(transport).not.toHaveBeenCalled();
   });
+
   it('rejects malformed async task identities without allowing a second submit', async () => {
     const asyncTransport = {
       submit: vi.fn(async () => ({ state: 'submitted' as const, upstreamTaskId: 'bad task' })),
       query: vi.fn(),
     };
-    const protocol = createImageProtocol(
-      'gpt-images-v1',
+    const protocol = createRoutedImageProtocol(
+      GPT_ROUTE,
       'generate',
       vi.fn(),
       undefined,
@@ -907,6 +1080,7 @@ describe('GPT image protocol', () => {
     expect(asyncTransport.submit).toHaveBeenCalledOnce();
     expect(asyncTransport.query).not.toHaveBeenCalled();
   });
+
   it('does not turn a provider content-length header into an image storage policy', async () => {
     const transport = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ data: [{ b64_json: 'YWJj' }] }), {
@@ -914,9 +1088,10 @@ describe('GPT image protocol', () => {
       }),
     );
     expect(
-      await createImageProtocol('gpt-images-v1', 'generate', transport).submit(input, key),
+      await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(input, key),
     ).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
   });
+
   it.each([
     [401, 'IMAGE_AUTH'],
     [429, 'IMAGE_LIMITED'],
@@ -926,7 +1101,7 @@ describe('GPT image protocol', () => {
     const transport = vi
       .fn<typeof fetch>()
       .mockResolvedValue(new Response(key, { status: Number(status) }));
-    const result = await createImageProtocol('gpt-images-v1', 'generate', transport).submit(
+    const result = await createRoutedImageProtocol(GPT_ROUTE, 'generate', transport).submit(
       input,
       key,
     );
@@ -934,46 +1109,28 @@ describe('GPT image protocol', () => {
     expect(transport).toHaveBeenCalledOnce();
   });
 
-  it('keeps IMAGE_PROFILE_RULES exhaustive across IMAGE_PROFILES and fails closed on unknown profiles', async () => {
-    const ruleKeys = Object.keys(IMAGE_PROFILE_RULES).sort();
-    expect(ruleKeys).toEqual([...IMAGE_PROFILES].sort());
-    const expected: Record<ImageProfile, ImageProfileRule> = {
-      'gpt-images-v1': {
-        supportedOperations: ['generate', 'edit', 'outpaint'],
-        requiresAsync: false,
-        allowGenerateReferences: false,
-        fixedOutputFormat: null,
-      },
-      'seedream-4-images-v1': {
-        supportedOperations: ['generate'],
-        requiresAsync: false,
-        allowGenerateReferences: false,
-        fixedOutputFormat: 'jpeg',
-      },
-      'vidu-image-v1': {
-        supportedOperations: ['generate'],
-        requiresAsync: true,
-        allowGenerateReferences: true,
-        fixedOutputFormat: null,
-      },
-      'kling-image-v1': {
-        supportedOperations: ['generate'],
-        requiresAsync: true,
-        allowGenerateReferences: false,
-        fixedOutputFormat: null,
-      },
-    };
-    expect(IMAGE_PROFILE_RULES).toEqual(expected);
-    expect(validImageInput(input, 'unknown-profile-v1' as ImageProfile)).toBe(false);
+  it('validates all four vendor drivers and fails closed on sync submit for async-only routes', async () => {
+    expect(IMAGE_DRIVERS).toEqual([
+      'openai-images',
+      'volcengine-ark-images',
+      'vidu-images',
+      'kling-images',
+    ]);
+    for (const route of [GPT_ROUTE, SEEDREAM_ROUTE, VIDU_ROUTE, KLING_MINIMAL_ROUTE]) {
+      expect(validateImageRouteConfig(route)).toBe(true);
+    }
+    expect(
+      validateImageInputByRoute(input, { ...GPT_ROUTE, driver: 'unknown' as ImageDriver }),
+    ).toBe(false);
     const transport = vi.fn<typeof fetch>();
     await expect(
-      createImageProtocol('vidu-image-v1', 'generate', transport).submit(
+      createRoutedImageProtocol(VIDU_ROUTE, 'generate', transport).submit(
         { model: 'image-vidu-q2', prompt: 'async only', async: true },
         key,
       ),
     ).resolves.toEqual({ state: 'rejected', code: 'IMAGE_INPUT_INVALID' });
     await expect(
-      createImageProtocol('kling-image-v1', 'generate', transport).submit(
+      createRoutedImageProtocol(KLING_MINIMAL_ROUTE, 'generate', transport).submit(
         { model: 'image-kling-v3', prompt: 'async only', async: true },
         key,
       ),
@@ -981,12 +1138,15 @@ describe('GPT image protocol', () => {
     expect(transport).not.toHaveBeenCalled();
   });
 
-  it('validates minimal Kling async generate inputs and rejects unsupported parameters', () => {
+  it('validates minimal Kling async generate inputs by route and rejects unsupported parameters', () => {
     const validBase = { model: 'image-kling-v3', prompt: 'a blue square', async: true as const };
-    expect(validImageInput(validBase, 'kling-image-v1')).toBe(true);
-    expect(validImageInput({ ...validBase, n: 1 }, 'kling-image-v1')).toBe(true);
+    expect(validateImageInputByRoute(validBase, KLING_MINIMAL_ROUTE)).toBe(true);
+    expect(validateImageInputByRoute({ ...validBase, n: 1 }, KLING_MINIMAL_ROUTE)).toBe(true);
     expect(
-      validImageInput({ ...validBase, operation: 'generate' as const }, 'kling-image-v1'),
+      validateImageInputByRoute(
+        { ...validBase, operation: 'generate' as const },
+        KLING_MINIMAL_ROUTE,
+      ),
     ).toBe(true);
     const ref = {
       assetId: '00000000-0000-4000-8000-000000000001',
@@ -994,6 +1154,10 @@ describe('GPT image protocol', () => {
       sizeBytes: 4,
       etag: 'etag',
       contentType: 'image/png' as const,
+    };
+    const noSizeRoute: ImageRouteConfig = {
+      ...KLING_MINIMAL_ROUTE,
+      paramSpec: { ...KLING_MINIMAL_ROUTE.paramSpec, allowedSizes: ['custom-only'] },
     };
     for (const invalid of [
       { model: 'image-kling-v3', prompt: 'sync' },
@@ -1015,7 +1179,7 @@ describe('GPT image protocol', () => {
       { ...validBase, mask: ref },
       { ...validBase, geometry: { left: 16, top: 0, right: 0, bottom: 0 } },
     ]) {
-      expect(validImageInput(invalid, 'kling-image-v1')).toBe(false);
+      expect(validateImageInputByRoute(invalid, noSizeRoute)).toBe(false);
     }
   });
 

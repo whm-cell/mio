@@ -30,19 +30,19 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 ## POST /api/v1/compute/images
 
-身份：当前登录用户；各图片切片的已接受范围以[图片能力成果](../tasks/onelink-image-generation/complete/report.md)为准，尚未记入该成果入口的切片以及真实 GPT（当前 Key 目录 0 项 `gpt-image-*`）、Seedream edit、Kling omni（`image-kling-v3-omni`）、Gemini 与上游 outpaint `geometry` 仍保持待接受或 pending。
+身份：当前登录用户；各图片切片与供应商路由的已接受范围分别以[图片能力成果](../tasks/onelink-image-generation/complete/report.md)和[供应商路由 PRD](../tasks/onelink-vendor-routing/prd.md) 所属成果入口为准，尚未记入已接受成果的真实模型闭环与上游 outpaint `geometry` 仍保持待接受或 pending。
 
-输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前动态目录且具有已实现图片 profile 的显式声明，parameters 至少有 `prompt`。`parameters.operation` 省略时为 `generate`；`edit` 可使用本人 `imageAssetId` 或有序 `imageAssetIds` 数组，`outpaint` 还必须携带几何边界，因上游 `geometry` 协议尚未验证（`DESIGN-OVER-001`），默认关闭，仅在当前图片适配的 capability metadata 同时显式声明 `outpaint` 与 `geometry` 时可用；可选本人 `maskAssetId` 只接受 PNG。`parameters.async:true` 仅在当前 profile 显式声明 `image.async.operations` 时受理；任务先返回脱敏状态，后续由内部 `image.query` 按声明的 maxQueries/maxAgeSeconds 有界推进，HTTP 状态不返回上游任务 ID。A 逐项按系统 `user_id` 查询 ready/original 图片资产并冻结 raw ETag/长度，B 从私有 COS 以 If-Match 读取后向供应商发送白名单 multipart `image` 字段；Asset ID、对象键、ETag 和用户凭据不会透传。GPT 使用 `gpt-images-v1`；`seedream-4-images-v1` 当前只接受 prompt、可省略或为 1 的 n、以及由该 profile/供应商契约决定的 `size`，固定输出带水印 JPEG，其他字段拒绝；`vidu-image-v1` 要求 `async:true`，支持 `generate`、受声明 `references` 约束的参考图及 `1080p`/`2K`/`4K` `size`；`kling-image-v1` 要求 `async:true`，当前只接受 `generate`、`prompt` 及可省略或为 1 的 `n`（排除使用独立 `/kling/v1/images/omni-image` 的 `image-kling-v3-omni` 及未验证参考图/多图选项）。这里的 `size` 是供应商生成参数，不是 W3/COS 对象容量策略。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
+输入：`{requestId,modelRef,parameters}`；requestId 是 UUID v4，modelRef 必须属于本人当前动态目录且命中已启用平台模型路由（`mio_provider_model_routes`），parameters 至少有 `prompt`。A 在受理时强制按路由的 `ImageRouteConfig` 校验参数，把完整路由作为必填 `route`（`profile` 为对应 `ImageDriver`）封入命令并持久化至 `mio_image_jobs.route_snapshot`，同时连同命令输入一起纳入一次性凭据信封的 AEAD AAD（`imageCommandCredentialBinding`；存量未发 `image.request` 若缺失合法 `route`/`profile` 则 fail-closed 结算 `rejected` / `IMAGE_HANDLER_UNAVAILABLE`，后续异步恢复或 `image.query` 若缺失或损坏 `route_snapshot` 则直接 fail-closed 结算 `failed` / `IMAGE_QUERY_FAILED`，不回退任何静态规则表）。`parameters.operation` 省略时为 `generate` 且须属于 `route.paramSpec.supportedOperations`；`size`、`aspect_ratio`、`n`（上限 `route.paramSpec.maxN`，协议最多 16 张）均按 `route.paramSpec` 白名单校验。`generate`（`allowGenerateReferences:true`）与 `edit` 在 `maxReferenceImages > 0` 时可使用本人 `imageAssetId` 或有序 `imageAssetIds` 数组；可选本人 `maskAssetId` 仅在 `allowMaskPng:true` 时开放且只接受 PNG；`outpaint` 因上游 `geometry` 协议尚未验证（`DESIGN-OVER-001`），仅在路由同时声明 `outpaint` 与 `allowOutpaintGeometry:true` 时可用。`allowWatermarkOverride:true` 时，A 按用户供应商配置中的 `defaultImageWatermark` 合成冻结 `route.effectiveWatermark`（未设时取 `requestDefaults.watermark`）；`allowWatermarkOverride:false` 时固定使用路由声明的水印默认值，请求 `parameters` 不直接接收 `watermark`。`parameters.async:true` 仅在 `route.paramSpec.async` 声明该操作时受理（`requiresAsync:true` 的异步模型必须显式传 `async:true`），任务有效期按 `maxAgeSeconds` 放宽至最高 24 小时（同步任务为 10 分钟）；任务先返回脱敏状态，后续由内部 `image.query` 按声明的 `maxQueries`/`maxAgeSeconds` 有界推进，HTTP 状态不返回上游任务 ID。A 逐项按系统 `user_id` 查询 ready/original 图片资产并冻结 raw ETag/长度；B 在写本地提交 journal 与发起上游请求前，统一从私有 COS 以 `If-Match` 读取全部参考图/遮罩并核对真实文件签名，再按 `route.driver`（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`）编码为对应原厂请求体，Asset ID、对象键、ETag 和用户凭据不会透传。这里的 `size` 与 `aspect_ratio` 是供应商生成参数，不是 W3/COS 对象容量策略。HTTP 正文上限 160000 字节，且含加密信封的最终 MQ 命令也必须在该上限内。
 
-首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为 capability 时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
+首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为路由异步时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
 
-已知上游任务的查询使用该任务所属 `user_id` 当前保存且可解密的 OneLink Key；停止新准入、目录变化或 Key 版本变化不改变既有任务和资产的归属。无可用 Key 时保留任务身份并报告 `IMAGE_CREDENTIAL_UNAVAILABLE`，恢复后可在原次数与期限内继续查询；供应商拒绝当前 Key 时如实报告，不能保证不同上游账户有权读取同一任务。
+已知上游任务的查询使用该任务所属 `user_id` 当前保存且可解密的 OneLink Key，且 `queryCredential` AAD 同时绑定冻结的 `route`（`imageQueryCredentialBinding`）；停止新准入、目录变化或 Key 版本变化不改变既有任务和资产的归属。无可用 Key 时保留任务身份并报告 `IMAGE_CREDENTIAL_UNAVAILABLE`，恢复后可在原次数与期限内继续查询；供应商拒绝当前 Key 时如实报告，不能保证不同上游账户有权读取同一任务。图片任务终态完成落库后，按该用户当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组将单用户验证记录更新为 `verified`，不影响其他用户或平台路由定义。
 
 成功：202 返回图片任务视图；相同 owner/requestId 和输入返回同一任务，不重复生图。
 
 错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 ASSET_NOT_FOUND、409 REQUEST_CONFLICT/IMAGE_OPERATION_UNSUPPORTED 或供应商资格错误、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
 
-副作用：受理会占用与视频共享的执行名额并建立待投递命令，Worker 随后执行一次供应商调用；edit/generate reference 的输入快照保存在现有图片任务命令中，COS 读取失败发生在提交上游前；Vidu/Kling async 结果按公网 HTTPS、限时下载及完整性核对后进入既有 COS/Asset 物化，不依赖固定结果域名清单；Mio 不记录费用、计费、余额或预算。
+副作用：受理会占用与视频共享的执行名额并建立待投递命令，Worker 随后执行一次供应商调用；参考图与遮罩输入快照保存在图片任务命令中，COS `If-Match` 读取或签名校验失败均发生在写提交 journal 与调用上游之前（0 次上游 POST）；四个原厂图片驱动（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`）返回的 URL 结果统一按公网 HTTPS、限时有界下载及真实图片格式核对后进入既有 COS/Asset 物化，不依赖固定结果域名清单；Mio 不记录费用、计费、余额或预算。
 
 停用或轮换 A 的图片 Key 只阻止新图片准入；已受理任务和已登记输出按系统 `user_id` 保留，资源查询和恢复不因 Key 变化失效。任务中的 provider/model/upstream 身份用于恢复，Key 版本只记录提交上下文；撤销配置不删除或重绑既有 COS 资产，也不改变未知结果。
 
@@ -52,7 +52,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 输入：图片任务 UUID，无查询参数。
 
-成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是从 0 开始的原始输出序号，即使前项缺失也不重排。B 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；解码工具非零退出无法区分图片损坏与环境故障时保留原始结果，恢复可能再次失败，需要排查。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。
+成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是 `0..15`（单任务最多 16 张输出）的原始输出序号，即使前项缺失也不重排。B 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；解码工具非零退出无法区分图片损坏与环境故障时保留原始结果，恢复可能再次失败，需要排查。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。
 
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
 

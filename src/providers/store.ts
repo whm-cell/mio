@@ -4,14 +4,26 @@ import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { ProviderError } from './contracts.ts';
-import type { Discovery, ProviderView, Category, ChatRuntimeSnapshot } from './contracts.ts';
+import type {
+  Discovery,
+  ProviderView,
+  Category,
+  PlatformRouteRecord,
+  VerificationSnapshot,
+} from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { DiscoveredModel } from '../integrations/onelink/models.ts';
 import { encryptCredential } from './credentials.ts';
 import { checkProviderSchema } from './schema.ts';
 import { providerStateSQL, providerView } from './state.ts';
 import type { ProviderRow, ProviderState } from './state.ts';
-import { findModel, membershipError, chatAdaptation, validateDeclaration } from './catalog.ts';
+import {
+  findModel,
+  membershipError,
+  resolveEffectiveChat,
+  resolveEffectiveImage,
+} from './catalog.ts';
+import { canonicalRouteComparable, validateRouteImportPayload } from './onelink/router.ts';
 
 const log = createLogger('app', 'provider-store');
 
@@ -26,6 +38,12 @@ export interface ModelPatch {
   usage?: Category;
   name?: string | null;
   description?: string | null;
+}
+export interface RouteImportSummary {
+  total: number;
+  inserted: number;
+  updated: number;
+  unchanged: number;
 }
 /** All mutations serialize on the configuration row; network calls run outside the transaction. */
 export class ProviderStore {
@@ -78,7 +96,7 @@ export class ProviderStore {
     const row = await this.current(owner);
     return row ? providerView(row) : null;
   }
-  /** One MVCC statement: credentials, membership, declarations and preferences agree. */
+  /** One MVCC statement: credentials, membership, routes, verifications and preferences agree. */
   async state(owner: string): Promise<ProviderState | null> {
     return (await this.pool.query<ProviderState>(providerStateSQL, [owner])).rows[0] ?? null;
   }
@@ -130,7 +148,7 @@ export class ProviderStore {
           [id],
         );
         await client.query(
-          "UPDATE mio_provider_model_adaptations SET verification_status='unverified' WHERE provider_id=$1",
+          "UPDATE mio_provider_model_verifications SET verification_status='unverified' WHERE provider_id=$1",
           [id],
         );
       }
@@ -172,7 +190,7 @@ export class ProviderStore {
         if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
         if (usage !== 'chat')
           throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_USAGE_UNSUPPORTED');
-        if (!chatAdaptation(state.adaptations, model!.model_key))
+        if (!resolveEffectiveChat(state, model!))
           throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
         const old = state.preferences.find(
           (p) => p.model_key === model!.model_key && p.usage === usage,
@@ -219,49 +237,91 @@ export class ProviderStore {
       );
     });
   }
-  async declare(owner: string, expected: number, input: unknown): Promise<ProviderView> {
-    const entry = validateDeclaration(input);
+  /** Controlled deployment route import. Never creates user catalog members or sets verified. */
+  async importRoutes(input: unknown): Promise<RouteImportSummary> {
+    const entries = validateRouteImportPayload(input);
     return this.transaction(async (client) => {
-      const row = await this.locked(client, owner, expected);
-      const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0]!;
-      const model = findModel(state.models, entry.modelRef);
-      const reason = membershipError(row, model);
-      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
-      await client.query(
-        `INSERT INTO mio_provider_model_adaptations(provider_id,model_key,operation,profile,declaration_version,
-          source_kind,source,source_version,capability_metadata) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8::jsonb)
-          ON CONFLICT(provider_id,model_key,operation) DO UPDATE SET profile=$4,
-          declaration_version=mio_provider_model_adaptations.declaration_version+1,source_kind=$5,source=$6,source_version=$7,
-          capability_metadata=$8::jsonb,verification_status='unverified'`,
-        [
-          row.id,
-          model!.model_key,
-          entry.operation,
-          entry.profile,
-          entry.sourceKind,
-          entry.source,
-          entry.sourceVersion,
-          JSON.stringify(entry.metadata ?? {}),
-        ],
-      );
-      if (entry.classification !== undefined)
-        await client.query(
-          'UPDATE mio_provider_models SET classification=$3,classification_source=$4 WHERE provider_id=$1 AND model_key=$2',
-          [
-            row.id,
-            model!.model_key,
-            entry.classification,
-            `deployment:${entry.source}@${entry.sourceVersion}`,
-          ],
-        );
-      return providerView(
-        (
-          await client.query<ProviderRow>(
-            'UPDATE mio_provider_configs SET revision=revision+1,updated_at=now() WHERE id=$1 RETURNING *',
-            [row.id],
+      let inserted = 0;
+      let updated = 0;
+      let unchanged = 0;
+      for (const entry of entries) {
+        const existing = (
+          await client.query<PlatformRouteRecord>(
+            `SELECT * FROM mio_provider_model_routes
+              WHERE provider_type=$1 AND raw_model_id=$2 COLLATE "C" AND operation=$3
+              FOR UPDATE`,
+            [entry.providerType, entry.rawModelId, entry.operation],
           )
-        ).rows[0]!,
-      );
+        ).rows[0];
+        if (!existing) {
+          await client.query(
+            `INSERT INTO mio_provider_model_routes (
+              provider_type, raw_model_id, operation, vendor, driver, classification,
+              submit_path, edit_path, query_path_template, param_spec, request_defaults,
+              output_spec, capability_metadata, source_kind, source, source_version,
+              declaration_version, enabled
+            ) VALUES (
+              $1, $2, $3, $4, $5, $6, $7, $8, $9,
+              $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb,
+              $14, $15, $16, 1, $17
+            )`,
+            [
+              entry.providerType,
+              entry.rawModelId,
+              entry.operation,
+              entry.vendor,
+              entry.driver,
+              entry.classification,
+              entry.submitPath,
+              entry.editPath,
+              entry.queryPathTemplate,
+              JSON.stringify(entry.paramSpec),
+              JSON.stringify(entry.requestDefaults),
+              JSON.stringify(entry.outputSpec),
+              JSON.stringify(entry.capabilityMetadata),
+              entry.sourceKind,
+              entry.source,
+              entry.sourceVersion,
+              entry.enabled,
+            ],
+          );
+          inserted += 1;
+        } else if (canonicalRouteComparable(existing) === canonicalRouteComparable(entry)) {
+          unchanged += 1;
+        } else {
+          await client.query(
+            `UPDATE mio_provider_model_routes SET
+              vendor=$4, driver=$5, classification=$6, submit_path=$7, edit_path=$8,
+              query_path_template=$9, param_spec=$10::jsonb, request_defaults=$11::jsonb,
+              output_spec=$12::jsonb, capability_metadata=$13::jsonb, source_kind=$14,
+              source=$15, source_version=$16, enabled=$17,
+              declaration_version=mio_provider_model_routes.declaration_version+1,
+              updated_at=now()
+              WHERE provider_type=$1 AND raw_model_id=$2 COLLATE "C" AND operation=$3`,
+            [
+              entry.providerType,
+              entry.rawModelId,
+              entry.operation,
+              entry.vendor,
+              entry.driver,
+              entry.classification,
+              entry.submitPath,
+              entry.editPath,
+              entry.queryPathTemplate,
+              JSON.stringify(entry.paramSpec),
+              JSON.stringify(entry.requestDefaults),
+              JSON.stringify(entry.outputSpec),
+              JSON.stringify(entry.capabilityMetadata),
+              entry.sourceKind,
+              entry.source,
+              entry.sourceVersion,
+              entry.enabled,
+            ],
+          );
+          updated += 1;
+        }
+      }
+      return { total: entries.length, inserted, updated, unchanged };
     });
   }
   async beginRefresh(owner: string): Promise<ProviderRow> {
@@ -313,7 +373,7 @@ export class ProviderStore {
           [row.id, version],
         );
         await client.query(
-          "UPDATE mio_provider_model_adaptations SET verification_status='unverified' WHERE provider_id=$1",
+          "UPDATE mio_provider_model_verifications SET verification_status='unverified' WHERE provider_id=$1",
           [row.id],
         );
       } else if (discovery.error === 'UPSTREAM_AUTH_REJECTED') {
@@ -332,7 +392,7 @@ export class ProviderStore {
   /** Only an observed successful runtime call may mark the exact tested tuple; old references stay visible. */
   async recordVerification(
     owner: string,
-    snapshot: ChatRuntimeSnapshot,
+    snapshot: VerificationSnapshot,
     evidence: string,
   ): Promise<void> {
     await this.transaction(async (client) => {
@@ -344,6 +404,19 @@ export class ProviderStore {
         row.catalog_version === snapshot.catalogVersion;
       // Late completion remains in its request observation and cannot overwrite a newer tuple's verification.
       if (!current) return;
+      const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0];
+      const model = state?.models.find((item) => item.model_key === snapshot.modelKey);
+      if (!state || !model) return;
+      const effective =
+        snapshot.operation === 'chat'
+          ? resolveEffectiveChat(state, model)
+          : resolveEffectiveImage(state, model);
+      if (
+        !effective ||
+        effective.declarationVersion !== snapshot.adaptationVersion ||
+        effective.profile !== snapshot.profile
+      )
+        return;
       const tuple = {
         credentialVersion: snapshot.credentialVersion,
         catalogVersion: snapshot.catalogVersion,
@@ -352,17 +425,22 @@ export class ProviderStore {
         profile: snapshot.profile,
       };
       await client.query(
-        `UPDATE mio_provider_model_adaptations SET verification_status='verified',verified_at=now(),
-          verification_evidence=$5,tested_tuple=$6::jsonb
-          WHERE provider_id=$1 AND model_key=$2 AND operation=$3 AND declaration_version=$4 AND profile=$7`,
+        `INSERT INTO mio_provider_model_verifications (
+          provider_id, model_key, operation, declaration_version, driver,
+          verification_status, verified_at, verification_evidence, tested_tuple
+        ) VALUES ($1, $2, $3, $4, $5, 'verified', now(), $6, $7::jsonb)
+        ON CONFLICT (provider_id, model_key, operation) DO UPDATE SET
+          declaration_version=$4, driver=$5,
+          verification_status='verified', verified_at=now(),
+          verification_evidence=$6, tested_tuple=$7::jsonb`,
         [
           row.id,
           snapshot.modelKey,
           snapshot.operation,
           snapshot.adaptationVersion,
+          snapshot.profile,
           evidence,
           JSON.stringify(tuple),
-          snapshot.profile,
         ],
       );
     });

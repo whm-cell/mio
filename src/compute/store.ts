@@ -3,7 +3,14 @@ import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
-import { COMPUTE_PROFILE, COMPUTE_VERSION, imageOutputIndex } from '@mio/compute-contracts';
+import {
+  COMPUTE_PROFILE,
+  COMPUTE_VERSION,
+  canonicalImageRouteConfig,
+  imageOutputIndex,
+  isImageDriver,
+  validateImageRouteConfig,
+} from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import type {
   ImageCommandV1,
@@ -11,6 +18,7 @@ import type {
   ImageQueryCommandV1,
   ImageRecoveryCommandV1,
   ImageResultV1,
+  ImageRouteConfig,
 } from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
 import { ComputeError } from './errors.ts';
@@ -53,10 +61,20 @@ function command(job: JobRow): ComputeCommandV1 {
   };
 }
 
+function validRouteSnapshot(
+  source: ImageCommandV1,
+  routeSnapshot: unknown,
+): ImageRouteConfig | null {
+  if (!validateImageRouteConfig(routeSnapshot) || routeSnapshot.driver !== source.profile)
+    return null;
+  return canonicalImageRouteConfig(routeSnapshot);
+}
+
 function imageQueryCommand(
   source: ImageCommandV1,
   upstreamTaskId: string,
   queryAttempt: number,
+  route: ImageRouteConfig,
 ): ImageQueryCommandV1 {
   return {
     version: 1,
@@ -67,6 +85,7 @@ function imageQueryCommand(
     ownerId: source.ownerId,
     expiresAt: source.expiresAt,
     profile: source.profile,
+    route,
     operation: source.input.operation ?? 'generate',
     input: source.input,
     upstreamTaskId,
@@ -175,8 +194,10 @@ export class ComputeStore {
               ),
             ).toISOString()
           : null;
+      if (!validateImageRouteConfig(command.route) || command.profile !== command.route.driver)
+        throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
       const saved = await client.query(
-        "INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,async_max_queries,async_deadline,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'accepted') ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING id",
+        "INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,route_snapshot,async_max_queries,async_deadline,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'accepted') ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING id",
         [
           command.jobId,
           owner,
@@ -184,6 +205,7 @@ export class ComputeStore {
           hash,
           JSON.stringify(command),
           JSON.stringify(admitted),
+          JSON.stringify(canonicalImageRouteConfig(command.route)),
           asyncMaxQueries,
           asyncDeadline,
         ],
@@ -266,8 +288,39 @@ export class ComputeStore {
         )
       ).rows[0];
       if (!row) return undefined;
-      if (row.command.type === 'image.query' && row.command.ownerId !== row.owner_id)
-        throw new Error('IMAGE_QUERY_OWNER_MISMATCH');
+      if (row.command.type === 'image.request') {
+        if (row.command.ownerId !== row.owner_id) throw new Error('IMAGE_REQUEST_OWNER_MISMATCH');
+        if (
+          !isImageDriver(row.command.profile) ||
+          !validateImageRouteConfig(row.command.route) ||
+          row.command.route.driver !== row.command.profile
+        ) {
+          await client.query(
+            "UPDATE mio_image_jobs SET state='rejected',error_code='IMAGE_HANDLER_UNAVAILABLE',next_query_at=NULL,command=command-'credential' WHERE id=$1",
+            [row.id],
+          );
+          await client.query('UPDATE mio_image_outbox SET sent_at=now() WHERE job_id=$1', [row.id]);
+          return undefined;
+        }
+      }
+      if (row.command.type === 'image.query') {
+        if (row.command.ownerId !== row.owner_id) throw new Error('IMAGE_QUERY_OWNER_MISMATCH');
+        if (
+          !isImageDriver(row.command.profile) ||
+          !validateImageRouteConfig(row.command.route) ||
+          row.command.route.driver !== row.command.profile
+        ) {
+          await client.query(
+            "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_FAILED',next_query_at=NULL,command=command-'credential' WHERE id=$1",
+            [row.id],
+          );
+          await client.query(
+            'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+            [row.id],
+          );
+          return undefined;
+        }
+      }
       if (row.query_expired) {
         await client.query(
           "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_LIMIT',next_query_at=NULL,command=command-'credential' WHERE id=$1",
@@ -399,6 +452,7 @@ export class ComputeStore {
         await client.query<{
           state: string;
           command: ImageCommandV1;
+          route_snapshot: ImageRouteConfig | null;
           active_recovery_seq: number;
           upstream_task_id: string | null;
           query_attempt: number;
@@ -407,7 +461,7 @@ export class ComputeStore {
           next_query_at: Date | null;
           async_expired: boolean;
         }>(
-          `SELECT state,command,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
+          `SELECT state,command,route_snapshot,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
             async_deadline IS NULL OR LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))<=statement_timestamp() AS async_expired
           FROM mio_image_jobs WHERE id=$1 AND owner_id=$2`,
           [id, owner],
@@ -438,7 +492,9 @@ export class ComputeStore {
         }
         const nextAttempt = job.query_attempt + 1;
         if (nextAttempt > job.async_max_queries) throw new ComputeError(409, 'RESULT_CONFLICT');
-        const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt);
+        const route = validRouteSnapshot(job.command, job.route_snapshot);
+        if (!route) throw new ComputeError(409, 'RESULT_CONFLICT');
+        const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt, route);
         await client.query(
           "UPDATE mio_image_jobs SET state='processing',error_code=NULL,query_attempt=$2,next_query_at=now() WHERE id=$1",
           [id, nextAttempt],
@@ -470,13 +526,17 @@ export class ComputeStore {
       ]);
     });
   }
-  async imageAccept(result: ImageResultV1) {
-    await transaction(this.pool, async (client) => {
+  async imageAccept(
+    result: ImageResultV1,
+  ): Promise<{ ownerId: string; admitted: Record<string, unknown> } | undefined> {
+    return transaction(this.pool, async (client) => {
       await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 FOR UPDATE', [result.jobId]);
       const job = (
         await client.query<{
           owner_id: string;
           command: ImageCommandV1;
+          admitted: Record<string, unknown>;
+          route_snapshot: ImageRouteConfig | null;
           state: string;
           active_recovery_id: string | null;
           upstream_task_id: string | null;
@@ -485,7 +545,7 @@ export class ComputeStore {
           async_deadline: Date | null;
           async_expired: boolean;
         }>(
-          `SELECT owner_id,command,state,active_recovery_id,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
+          `SELECT owner_id,command,admitted,route_snapshot,state,active_recovery_id,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,
             async_deadline IS NULL OR LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))<=statement_timestamp() AS async_expired
           FROM mio_image_jobs WHERE id=$1`,
           [result.jobId],
@@ -544,7 +604,19 @@ export class ComputeStore {
             );
             return;
           }
-          const query = imageQueryCommand(job.command, result.upstreamTaskId, nextAttempt);
+          const route = validRouteSnapshot(job.command, job.route_snapshot);
+          if (!route) {
+            await client.query(
+              "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_FAILED',upstream_task_id=$2,next_query_at=NULL,command=command-'credential' WHERE id=$1",
+              [result.jobId, result.upstreamTaskId],
+            );
+            await client.query(
+              'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+              [result.jobId],
+            );
+            return;
+          }
+          const query = imageQueryCommand(job.command, result.upstreamTaskId, nextAttempt, route);
           await client.query(
             "UPDATE mio_image_jobs SET state='submitted',error_code=NULL,upstream_task_id=$2,query_attempt=$3,next_query_at=now()+interval '250 milliseconds' WHERE id=$1",
             [result.jobId, result.upstreamTaskId, nextAttempt],
@@ -578,7 +650,19 @@ export class ComputeStore {
             );
             return;
           }
-          const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt);
+          const route = validRouteSnapshot(job.command, job.route_snapshot);
+          if (!route) {
+            await client.query(
+              "UPDATE mio_image_jobs SET state='failed',error_code='IMAGE_QUERY_FAILED',next_query_at=NULL,command=command-'credential' WHERE id=$1",
+              [result.jobId],
+            );
+            await client.query(
+              'UPDATE mio_image_outbox SET query_command=NULL,sent_at=now() WHERE job_id=$1',
+              [result.jobId],
+            );
+            return;
+          }
+          const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt, route);
           await client.query(
             `UPDATE mio_image_jobs SET state='processing',error_code=NULL,query_attempt=$2,
               next_query_at=statement_timestamp()+(LEAST(async_deadline,to_timestamp((command->>'expiresAt')::double precision/1000))-statement_timestamp())/$3::double precision
@@ -682,6 +766,9 @@ export class ComputeStore {
         ]);
         await client.query('DELETE FROM mio_image_outbox WHERE job_id=$1', [result.jobId]);
       }
+      return result.state === 'completed'
+        ? { ownerId: job.owner_id, admitted: job.admitted ?? {} }
+        : undefined;
     });
   }
 

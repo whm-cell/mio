@@ -5,6 +5,8 @@ export interface ChatResponseFacts {
   providerRequestId?: string;
 }
 
+const SAFE_CHAT_PATH = /^\/[A-Za-z0-9._/-]+$/;
+
 /** A request-owned transport. No credentials, redirects or retries escape this destination. */
 export function chatTransport(
   apiKey: string,
@@ -13,6 +15,8 @@ export function chatTransport(
   transport: typeof fetch = fetch,
 ): typeof fetch {
   return async (input, init) => {
+    if (!SAFE_CHAT_PATH.test(path) || path.includes('..') || path.includes('//'))
+      throw new Error('ONELINK_DESTINATION_DENIED');
     const request = new Request(input, init);
     const endpoint = `${ONELINK_ORIGIN}${path}`;
     // The fixed Anthropic SDK uses its beta Messages entry point. No other query is allowed.

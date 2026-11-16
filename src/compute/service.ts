@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { sealImageKey } from './image-credentials.ts';
+import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
 import {
-  IMAGE_PROFILE_RULES,
-  canonicalImageInput,
+  canonicalImageRouteConfig,
+  imageCommandCredentialBinding,
   imageQueryCredentialBinding,
+  isImageDriver,
   parseImageCommand,
-  validImageInput,
+  validateImageInputByRoute,
+  validateImageRouteConfig,
 } from '@mio/compute-contracts';
 import type { ImageAssetRef, ImageInput, ImageRequestParameters } from '@mio/compute-contracts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
@@ -161,12 +164,42 @@ export function createComputeService(
                       permanent: true,
                     });
                 }
+                let accepted: Awaited<ReturnType<ComputeStore['imageAccept']>>;
                 try {
-                  await store.imageAccept(result);
+                  accepted = await store.imageAccept(result);
                 } catch (error) {
                   if (error instanceof ComputeError && error.code === 'RESULT_CONFLICT')
                     throw Object.assign(error, { permanent: true });
                   throw error;
+                }
+                if (accepted && result.state === 'completed') {
+                  const provider = imageConfig?.provider();
+                  const { admitted } = accepted;
+                  if (
+                    typeof provider?.recordVerification === 'function' &&
+                    typeof admitted.providerConfigId === 'string' &&
+                    typeof admitted.modelKey === 'string' &&
+                    typeof admitted.credentialVersion === 'number' &&
+                    typeof admitted.catalogVersion === 'number' &&
+                    typeof admitted.adaptationVersion === 'number' &&
+                    typeof admitted.profile === 'string'
+                  ) {
+                    await provider
+                      .recordVerification(
+                        { userId: accepted.ownerId },
+                        {
+                          providerConfigId: admitted.providerConfigId,
+                          modelKey: admitted.modelKey,
+                          credentialVersion: admitted.credentialVersion,
+                          catalogVersion: admitted.catalogVersion,
+                          adaptationVersion: admitted.adaptationVersion,
+                          operation: 'image.generate',
+                          profile: admitted.profile,
+                        },
+                        `image:${result.jobId}`,
+                      )
+                      .catch(() => log.error('PROVIDER_VERIFICATION_UNAVAILABLE'));
+                  }
                 }
               }),
           );
@@ -284,6 +317,7 @@ export function createComputeService(
                 'moderation',
                 'quality',
                 'size',
+                'aspect_ratio',
                 'output_format',
                 'output_compression',
                 'user',
@@ -382,43 +416,60 @@ export function createComputeService(
         if ((operation === 'edit' || operation === 'outpaint') && requestedImageIds.length < 1)
           throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
         const snapshot = await imageConfig.provider()!.resolveImage(actor, modelRef);
+        if (
+          !isImageDriver(snapshot.profile) ||
+          !validateImageRouteConfig(snapshot.route) ||
+          snapshot.route.driver !== snapshot.profile
+        )
+          throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
         const imageCapability = snapshot.capabilityMetadata?.image;
+        const route = snapshot.route;
         if (
           operation === 'generate' &&
           requestedImageIds.length > 0 &&
-          (!IMAGE_PROFILE_RULES[snapshot.profile].allowGenerateReferences ||
-            !imageCapability?.references)
+          (!route.paramSpec.allowGenerateReferences || !imageCapability?.references)
         )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
         if (
           (operation === 'edit' || operation === 'outpaint') &&
-          !imageCapability?.modes.includes(operation)
+          (!route.paramSpec.supportedOperations.includes(operation) ||
+            !imageCapability?.modes.includes(operation))
         )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
         if (
           requestedImageIds.length > 0 &&
           (!imageCapability?.references ||
-            requestedImageIds.length > imageCapability.references.maxImages)
+            requestedImageIds.length > imageCapability.references.maxImages ||
+            requestedImageIds.length > route.paramSpec.maxReferenceImages)
         )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
-        if (operation === 'outpaint' && !imageCapability?.geometry)
+        if (
+          operation === 'outpaint' &&
+          (!imageCapability?.geometry || !route.paramSpec.allowOutpaintGeometry)
+        )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
         if (
           parameters.async === true &&
           (!imageCapability?.async || !imageCapability.async.operations.includes(operation))
         )
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
-        if (maskAssetId !== undefined && !imageCapability?.mask)
+        if (maskAssetId !== undefined && (!imageCapability?.mask || !route.paramSpec.allowMaskPng))
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'IMAGE_OPERATION_UNSUPPORTED');
         const images = await Promise.all(requestedImageIds.map((assetId) => imageAsset(assetId)));
         const mask = maskAssetId !== undefined ? await imageAsset(maskAssetId, true) : undefined;
+        const effectiveRoute = canonicalImageRouteConfig({
+          ...route,
+          effectiveWatermark: route.paramSpec.allowWatermarkOverride
+            ? (snapshot.defaultImageWatermark ?? route.requestDefaults.watermark ?? null)
+            : (route.effectiveWatermark ?? route.requestDefaults.watermark ?? null),
+        });
         const jobId = randomUUID();
+        const asyncMaxAgeSeconds =
+          effectiveRoute.paramSpec.async?.maxAgeSeconds ?? imageCapability?.async?.maxAgeSeconds;
         const expiresAt =
-          Date.now() +
-          Math.min(
-            10 * 60_000,
-            parameters.async === true ? imageCapability!.async!.maxAgeSeconds * 1000 : 10 * 60_000,
-          );
+          parameters.async === true
+            ? Date.now() + Math.min(86_400_000, (asyncMaxAgeSeconds ?? 600) * 1000)
+            : Date.now() + 10 * 60_000;
         const input: ImageInput = {
           ...providerParameters,
           model: snapshot.modelId,
@@ -436,15 +487,17 @@ export function createComputeService(
               ? { images }
               : {}),
         };
-        if (!validImageInput(input, snapshot.profile))
+        if (!validateImageInputByRoute(input, effectiveRoute))
           throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
-        const binding = JSON.stringify([
+        const commandBase = {
           jobId,
-          actor.userId,
+          ownerId: actor.userId,
           expiresAt,
-          snapshot.profile,
-          canonicalImageInput(input),
-        ]);
+          profile: snapshot.profile,
+          route: effectiveRoute,
+          input,
+        };
+        const binding = imageCommandCredentialBinding(commandBase);
         const credential = sealImageKey(
           snapshot.apiKey,
           binding,
@@ -455,11 +508,7 @@ export function createComputeService(
           version: 1,
           type: 'image.request',
           messageId: randomUUID(),
-          jobId,
-          ownerId: actor.userId,
-          expiresAt,
-          profile: snapshot.profile,
-          input,
+          ...commandBase,
           credential,
         };
         try {
@@ -475,6 +524,8 @@ export function createComputeService(
           credentialVersion: snapshot.credentialVersion,
           catalogVersion: snapshot.catalogVersion,
           adaptationVersion: snapshot.adaptationVersion,
+          vendor: snapshot.vendor,
+          ...(snapshot.modelKey ? { modelKey: snapshot.modelKey } : {}),
           ...(parameters.async === true && imageCapability?.async
             ? { async: imageCapability.async }
             : {}),

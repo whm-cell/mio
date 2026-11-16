@@ -4,7 +4,8 @@ import type {
   ProviderView,
   ModelRecord,
   ModelPreference,
-  AdaptationRecord,
+  PlatformRouteRecord,
+  VerificationRecord,
 } from './contracts.ts';
 
 export interface ProviderRow extends CredentialEnvelope {
@@ -31,13 +32,21 @@ export interface ProviderRow extends CredentialEnvelope {
 export interface ProviderState extends ProviderRow {
   models: ModelRecord[];
   preferences: ModelPreference[];
-  adaptations: AdaptationRecord[];
+  routes?: PlatformRouteRecord[];
+  verifications?: VerificationRecord[];
 }
 export const providerStateSQL = `SELECT c.*,
   COALESCE((SELECT jsonb_agg(m ORDER BY m.raw_model_id COLLATE "C",m.model_key)
     FROM mio_provider_models m WHERE m.provider_id=c.id),'[]') AS models,
   COALESCE((SELECT jsonb_agg(p) FROM mio_provider_model_preferences p WHERE p.provider_id=c.id),'[]') AS preferences,
-  COALESCE((SELECT jsonb_agg(a) FROM mio_provider_model_adaptations a WHERE a.provider_id=c.id),'[]') AS adaptations
+  COALESCE((SELECT jsonb_agg(r ORDER BY r.raw_model_id COLLATE "C",r.operation)
+    FROM mio_provider_model_routes r
+    WHERE r.provider_type=c.provider_type AND r.enabled=true
+      AND EXISTS (
+        SELECT 1 FROM mio_provider_models m
+        WHERE m.provider_id=c.id AND m.raw_model_id=r.raw_model_id COLLATE "C"
+      )),'[]') AS routes,
+  COALESCE((SELECT jsonb_agg(v) FROM mio_provider_model_verifications v WHERE v.provider_id=c.id),'[]') AS verifications
   FROM mio_provider_configs c WHERE c.owner_id=$1`;
 
 export function providerView(row: ProviderRow): ProviderView {

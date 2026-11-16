@@ -32,6 +32,7 @@ import { readProviderConfig } from '../../src/providers/config.ts';
 import { decryptCredential } from '../../src/providers/credentials.ts';
 import type { CredentialEnvelope } from '../../src/providers/credentials.ts';
 import { validateImage } from '../../compute/src/adapters/media.ts';
+import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';
 
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
@@ -528,88 +529,80 @@ async function prepare() {
         selected.catalogVersion === models.provider.catalog.version,
       'LIVE_MODEL_NOT_FOUND',
     );
-    const view = await request(origin, '/api/v1/providers/onelink', 'GET', undefined, cookie);
-    const revision = ((await view.json()) as { revision: number }).revision;
     const declaration = join(directory, 'declaration.json');
     const expectedProfile =
       scenario === 'vidu-async'
-        ? 'vidu-image-v1'
+        ? 'vidu-images'
         : scenario === 'kling-async'
-          ? 'kling-image-v1'
+          ? 'kling-images'
           : scenario === 'seedream-sync'
-            ? 'seedream-4-images-v1'
-            : 'gpt-images-v1';
+            ? 'volcengine-ark-images'
+            : 'openai-images';
+    const viduBase = findFixtureRoute('image-vidu-q2', 'image.generate');
+    const klingBase = findFixtureRoute('image-kling-v3', 'image.generate');
+    const seedreamBase = findFixtureRoute('doubao-seedream-4.0', 'image.generate');
+    const gptBase = findFixtureRoute('gpt-image-2', 'image.generate');
     save(
       declaration,
       scenario === 'vidu-async'
         ? {
-            modelRef: selected.modelRef,
-            operation: 'image.generate',
-            profile: 'vidu-image-v1',
+            ...viduBase,
+            rawModelId: selected.modelId,
             sourceKind: 'protocol-reference',
             source: 'https://docs.onelinkai.cloud/8653257m0',
             sourceVersion: '2026-11-14',
-            classification: 'image',
-            metadata: {
-              image: {
-                modes: ['generate'],
-                references: { maxImages: 7 },
-                async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-              },
+            paramSpec: {
+              ...viduBase.paramSpec!,
+              async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
             },
           }
         : scenario === 'kling-async'
           ? {
-              modelRef: selected.modelRef,
-              operation: 'image.generate',
-              profile: 'kling-image-v1',
-              sourceKind: 'protocol-reference',
-              source: 'https://docs.onelinkai.cloud/8653497m0',
-              sourceVersion: '2026-09-08',
-              classification: 'image',
-              metadata: {
-                image: {
-                  modes: ['generate'],
-                  async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-                },
+              ...klingBase,
+              rawModelId: selected.modelId,
+              paramSpec: {
+                ...klingBase.paramSpec!,
+                maxN: 1,
+                maxReferenceImages: 0,
+                allowGenerateReferences: false,
+                async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
               },
+              requestDefaults: {},
             }
           : scenario === 'seedream-sync'
             ? {
-                modelRef: selected.modelRef,
-                operation: 'image.generate',
-                profile: 'seedream-4-images-v1',
+                ...seedreamBase,
+                rawModelId: selected.modelId,
                 sourceKind: 'protocol-reference',
                 source: 'https://docs.onelinkai.cloud/8655248m0',
                 sourceVersion: '2026-11-14',
-                classification: 'image',
               }
             : {
-                modelRef: selected.modelRef,
-                operation: 'image.generate',
-                profile: 'gpt-images-v1',
+                ...gptBase,
+                rawModelId: selected.modelId,
                 sourceKind: 'protocol-reference',
                 source: 'https://docs.onelinkai.cloud/8882392m0',
                 sourceVersion: '2026-11-14',
-                classification: 'image',
-                metadata: {
-                  image:
-                    scenario === 'gpt-edit'
-                      ? {
-                          modes: ['generate', 'edit'],
-                          mask: { format: 'png' },
-                          references: { maxImages: 4 },
-                        }
-                      : { modes: ['generate'] },
-                },
+                ...(scenario === 'gpt-edit'
+                  ? {
+                      paramSpec: {
+                        ...gptBase.paramSpec!,
+                        maxReferenceImages: 4,
+                      },
+                    }
+                  : {
+                      editPath: null,
+                      paramSpec: {
+                        ...gptBase.paramSpec!,
+                        supportedOperations: ['generate'],
+                        maxReferenceImages: 0,
+                        allowMaskPng: false,
+                      },
+                    }),
               },
       true,
     );
-    command(
-      'scripts/service/import-provider-adaptation.ts',
-      [owner.userId, String(revision), declaration],
-      a,
-    );
+    command('scripts/service/import-provider-route.ts', [declaration], a);
     const adapted = await request(
       origin,
       '/api/v1/providers/onelink/models',
@@ -1011,12 +1004,12 @@ async function execute() {
   const isAsync = activeScenario === 'vidu-async' || activeScenario === 'kling-async';
   const expectedProfile =
     activeScenario === 'vidu-async'
-      ? 'vidu-image-v1'
+      ? 'vidu-images'
       : activeScenario === 'kling-async'
-        ? 'kling-image-v1'
+        ? 'kling-images'
         : activeScenario === 'seedream-sync'
-          ? 'seedream-4-images-v1'
-          : 'gpt-images-v1';
+          ? 'volcengine-ark-images'
+          : 'openai-images';
   state.b.MIO_LIVE_IMAGE_SCENARIO = activeScenario;
   const aCos = privateEnv(first!);
   const rawBCos = privateEnv(second!);

@@ -2,10 +2,12 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
+import { legacyReference } from '../../src/providers/catalog.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import type { ModelTransport } from '../../src/integrations/onelink/models.ts';
+import { findFixtureRoute, makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -13,18 +15,36 @@ const services: ReturnType<typeof createProviderService>[] = [];
 const masterKey = randomBytes(32);
 const metadata = (ids: string[]) =>
   Response.json({ data: ids.map((id) => ({ id, object: 'model', owned_by: 'fixture' })) });
+
 beforeAll(async () => {
   database = await authDatabase();
   pool = new Pool({ connectionString: database.url });
   await pool.query(providerSchemaSQL);
 }, 30000);
+
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.close()));
 });
+
 afterAll(async () => {
   await pool?.end();
   await database?.close();
 });
+
+async function resolveRawIdFromRef(ref: string): Promise<string> {
+  const legacy = legacyReference(ref);
+  if (legacy) return legacy.id;
+  if (ref.startsWith('onelink:model:')) {
+    const key = ref.slice('onelink:model:'.length);
+    const { rows } = await pool.query<{ raw_model_id: string }>(
+      'SELECT raw_model_id FROM mio_provider_models WHERE model_key = $1',
+      [key],
+    );
+    if (rows[0]?.raw_model_id) return rows[0].raw_model_id;
+  }
+  return ref;
+}
+
 async function fixture(transport: ModelTransport) {
   const config = { databaseURL: database.url, masterKey, masterKeyId: 'refresh-fixture' };
   const store = await createProviderStore(config);
@@ -35,15 +55,16 @@ async function fixture(transport: ModelTransport) {
   const declare = async (
     ref: string,
     profile: 'openai-chat' | 'anthropic-messages' = 'openai-chat',
-  ) =>
-    store.declare(actor.userId, (await service.get(actor))!.revision, {
-      modelRef: ref,
-      operation: 'chat',
-      profile,
-      sourceKind: 'protocol-reference',
-      source: 'deterministic protocol fixture',
-      sourceVersion: 'v1',
-    });
+  ) => {
+    const rawModelId = await resolveRawIdFromRef(ref);
+    await store.importRoutes([
+      makeChatRouteFixture(rawModelId, profile === 'anthropic-messages' ? 'anthropic' : 'openai', {
+        driver: profile,
+        source: 'deterministic protocol fixture',
+        sourceVersion: 'v1',
+      }),
+    ]);
+  };
   const choose = async (ref: string) =>
     service.preference(actor, (await service.get(actor))!.revision, ref, {
       usage: 'chat',
@@ -130,21 +151,18 @@ it("resolves an existing task owner's current key independently of admission and
   expect(transport).not.toHaveBeenCalled();
 });
 
-it('shows image declaration and eligibility separately while preserving the chat view', async () => {
-  let ids = ['gpt-image-2'];
+it('shows image route and eligibility separately while preserving the chat view', async () => {
+  let ids = ['gpt-image-2-elig'];
   const f = await fixture(async () => metadata(ids));
   await f.service.discover(f.actor);
   const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
-  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-    modelRef: ref,
-    operation: 'image.generate',
-    profile: 'gpt-images-v1',
-    sourceKind: 'protocol-reference',
-    source: 'protocol fixture',
-    sourceVersion: 'v1',
-    metadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
-    classification: 'image',
-  });
+  const baseFixture = findFixtureRoute('gpt-image-2', 'image.generate');
+  await f.store.importRoutes([
+    {
+      ...baseFixture,
+      rawModelId: 'gpt-image-2-elig',
+    },
+  ]);
   const item = (await f.service.catalog(f.actor)).items[0]!;
   expect(item).toMatchObject({
     adaptation: null,
@@ -152,10 +170,17 @@ it('shows image declaration and eligibility separately while preserving the chat
     unavailableReason: 'ADAPTER_PENDING',
     image: {
       adaptation: {
+        vendor: 'openai',
         operation: 'image.generate',
-        profile: 'gpt-images-v1',
+        profile: 'openai-images',
         sourceKind: 'protocol-reference',
-        metadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
+        metadata: {
+          image: {
+            modes: ['generate', 'edit'],
+            references: { maxImages: 16 },
+            mask: { format: 'png' },
+          },
+        },
         verification: { status: 'unverified' },
       },
       enabled: true,
@@ -164,8 +189,16 @@ it('shows image declaration and eligibility separately while preserving the chat
     },
   });
   expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
-    modelId: 'gpt-image-2',
-    capabilityMetadata: { image: { modes: ['generate', 'edit'], mask: { format: 'png' } } },
+    modelId: 'gpt-image-2-elig',
+    vendor: 'openai',
+    profile: 'openai-images',
+    capabilityMetadata: {
+      image: {
+        modes: ['generate', 'edit'],
+        references: { maxImages: 16 },
+        mask: { format: 'png' },
+      },
+    },
   });
   ids = [];
   await f.service.discover(f.actor);
@@ -175,40 +208,30 @@ it('shows image declaration and eligibility separately while preserving the chat
   });
 });
 
-it('requires explicit async capability for Vidu without inferring it from a discovered model id', async () => {
-  const f = await fixture(async () => metadata(['fixture-vidu-alt', 'fixture-vidu-incomplete']));
+it('requires an enabled async route for Vidu without inferring it from a discovered model id', async () => {
+  const f = await fixture(async () => metadata(['fixture-vidu-alt', 'fixture-vidu-unrouted']));
   await f.service.discover(f.actor);
   const items = (await f.service.catalog(f.actor)).items;
   const supported = items.find((item) => item.modelId === 'fixture-vidu-alt')!;
-  const incomplete = items.find((item) => item.modelId === 'fixture-vidu-incomplete')!;
-  const declaration = {
-    operation: 'image.generate' as const,
-    profile: 'vidu-image-v1' as const,
-    sourceKind: 'protocol-reference' as const,
-    source: 'synthetic Vidu protocol fixture',
-    sourceVersion: 'v1',
-    classification: 'image' as const,
-  };
-  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-    ...declaration,
-    modelRef: incomplete.modelRef,
-  });
+  const unrouted = items.find((item) => item.modelId === 'fixture-vidu-unrouted')!;
+  const viduFixture = findFixtureRoute('image-vidu-q2', 'image.generate');
+  await f.store.importRoutes([
+    {
+      ...viduFixture,
+      rawModelId: 'fixture-vidu-unrouted',
+      enabled: false,
+    },
+    {
+      ...viduFixture,
+      rawModelId: 'fixture-vidu-alt',
+    },
+  ]);
   expect(
-    (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === incomplete.modelRef)
+    (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === unrouted.modelRef)
       ?.image,
   ).toMatchObject({
     runnable: false,
     unavailableReason: 'ADAPTER_PENDING',
-  });
-  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-    ...declaration,
-    modelRef: supported.modelRef,
-    metadata: {
-      image: {
-        modes: ['generate'],
-        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-      },
-    },
   });
   expect(
     (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === supported.modelRef)
@@ -216,99 +239,78 @@ it('requires explicit async capability for Vidu without inferring it from a disc
   ).toBe(true);
   expect(await f.service.resolveImage(f.actor, supported.modelRef)).toMatchObject({
     modelId: 'fixture-vidu-alt',
-    profile: 'vidu-image-v1',
+    vendor: 'vidu',
+    profile: 'vidu-images',
   });
 });
 
-it('requires an explicit Seedream declaration and freezes the image profile without guessing the model name', async () => {
-  const f = await fixture(async () => metadata(['doubao-seedream-4.0']));
+it('requires an explicit Volcengine route and freezes the image driver without guessing the model name', async () => {
+  const f = await fixture(async () => metadata(['doubao-seedream-4.0-freeze']));
   await f.service.discover(f.actor);
   const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
   await expect(f.service.resolveImage(f.actor, ref)).rejects.toThrow('ADAPTER_PENDING');
-  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-    modelRef: ref,
-    operation: 'image.generate',
-    profile: 'seedream-4-images-v1',
-    sourceKind: 'protocol-reference',
-    source: 'protocol fixture',
-    sourceVersion: 'v1',
-    classification: 'image',
-  });
+  const volcFixture = findFixtureRoute('doubao-seedream-4.0', 'image.generate');
+  await f.store.importRoutes([{ ...volcFixture, rawModelId: 'doubao-seedream-4.0-freeze' }]);
   const item = (await f.service.catalog(f.actor)).items[0]!;
   expect(item.image).toMatchObject({
     runnable: true,
-    adaptation: { profile: 'seedream-4-images-v1' },
+    adaptation: { vendor: 'volcengine', profile: 'volcengine-ark-images' },
   });
   expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
-    modelId: 'doubao-seedream-4.0',
-    profile: 'seedream-4-images-v1',
+    modelId: 'doubao-seedream-4.0-freeze',
+    vendor: 'volcengine',
+    profile: 'volcengine-ark-images',
     adaptationVersion: 1,
   });
 });
 
-it('rejects adaptations without a current successful directory member', async () => {
+it('rejects runtime selection and preferences without a current successful directory member despite DB routes', async () => {
   let ids = ['directory-member'];
   const f = await fixture(async () => metadata(ids));
+  await f.store.importRoutes([
+    makeChatRouteFixture('directory-member', 'openai'),
+    makeChatRouteFixture('docs-only-model', 'openai'),
+  ]);
   const missing = 'onelink:model:00000000-0000-4000-8000-000000000000';
-  await expect(
-    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-      modelRef: missing,
-      operation: 'chat',
-      profile: 'openai-chat',
-      sourceKind: 'protocol-reference',
-      source: 'protocol fixture',
-      sourceVersion: 'v1',
-    }),
-  ).rejects.toThrow('MODEL_CATALOG_NOT_DISCOVERED');
+  await expect(f.service.selectChat(f.actor, missing)).rejects.toThrow(
+    'MODEL_CATALOG_NOT_DISCOVERED',
+  );
   await f.service.discover(f.actor);
-  await expect(
-    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-      modelRef: 'onelink:chat:docs-only-model',
-      operation: 'chat',
-      profile: 'openai-chat',
-      sourceKind: 'protocol-reference',
-      source: 'https://docs.onelinkai.cloud/8882610m0',
-      sourceVersion: '2026-11-15',
-    }),
-  ).rejects.toThrow('MODEL_NOT_FOUND');
+  await expect(f.service.selectChat(f.actor, 'onelink:chat:docs-only-model')).rejects.toThrow(
+    'MODEL_NOT_FOUND',
+  );
   const member = (await f.service.catalog(f.actor)).items[0]!;
   ids = ['different-member'];
   await f.service.discover(f.actor);
-  await expect(
-    f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, {
-      modelRef: member.modelRef,
-      operation: 'chat',
-      profile: 'openai-chat',
-      sourceKind: 'protocol-reference',
-      source: 'protocol fixture',
-      sourceVersion: 'v1',
-    }),
-  ).rejects.toThrow('MODEL_REMOVED');
+  await expect(f.service.selectChat(f.actor, member.modelRef)).rejects.toThrow('MODEL_REMOVED');
 });
 
-it('retains explicit multi-reference and geometry capability metadata without guessing it', async () => {
-  const f = await fixture(async () => metadata(['gpt-image-2']));
+it('derives explicit multi-reference and geometry capability metadata from route paramSpec without guessing it', async () => {
+  const f = await fixture(async () => metadata(['gpt-image-2-geom']));
   await f.service.discover(f.actor);
   const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
-  const declaration = {
-    modelRef: ref,
-    operation: 'image.generate' as const,
-    profile: 'gpt-images-v1' as const,
-    sourceKind: 'protocol-reference' as const,
-    source: 'protocol fixture',
-    sourceVersion: 'v2',
-    metadata: {
-      image: {
-        modes: ['generate', 'edit', 'outpaint'] as const,
-        references: { maxImages: 4 },
-        geometry: { unit: 'pixels' as const, edges: ['left', 'top', 'right', 'bottom'] as const },
+  const baseFixture = findFixtureRoute('gpt-image-2', 'image.generate');
+  await f.store.importRoutes([
+    {
+      ...baseFixture,
+      rawModelId: 'gpt-image-2-geom',
+      paramSpec: {
+        ...baseFixture.paramSpec!,
+        supportedOperations: ['generate', 'edit', 'outpaint'],
+        maxReferenceImages: 4,
+        allowMaskPng: false,
+        allowOutpaintGeometry: true,
       },
     },
-    classification: 'image' as const,
-  };
-  await f.store.declare(f.actor.userId, (await f.service.get(f.actor))!.revision, declaration);
+  ]);
   expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
-    capabilityMetadata: declaration.metadata,
+    capabilityMetadata: {
+      image: {
+        modes: ['generate', 'edit', 'outpaint'],
+        references: { maxImages: 4 },
+        geometry: { unit: 'pixels', edges: ['left', 'top', 'right', 'bottom'] },
+      },
+    },
   });
 });
 
@@ -413,15 +415,15 @@ it('rejects conflicting duplicates and partial/malformed metadata without replac
   }
 });
 
-it('does not manufacture members or verification through deployment data and keeps ownership and default targets', async () => {
+it('does not manufacture members or verification through route data and isolates per-user verification and default targets', async () => {
   const one = await fixture(async () => metadata(['Same-ID']));
   const two = await fixture(async () => metadata(['Same-ID']));
   await one.service.discover(one.actor);
   await two.service.discover(two.actor);
   const ref = (await one.service.catalog(one.actor)).items[0]!.modelRef;
-  await expect(two.declare(ref)).rejects.toThrow('MODEL_NOT_FOUND');
-  await expect(one.declare('onelink:chat:missing')).rejects.toThrow('MODEL_NOT_FOUND');
   await one.declare(ref);
+  await expect(two.choose(ref)).rejects.toThrow('MODEL_NOT_FOUND');
+  await expect(one.choose('onelink:chat:missing')).rejects.toThrow('MODEL_NOT_FOUND');
   await one.choose(ref);
   const snapshot = await one.service.resolveChat(
     one.actor,
@@ -430,6 +432,9 @@ it('does not manufacture members or verification through deployment data and kee
   await one.store.recordVerification(one.actor.userId, snapshot, 'fixture:actual-success');
   expect((await one.service.catalog(one.actor)).items[0]!.adaptation!.verification.status).toBe(
     'verified',
+  );
+  expect((await two.service.catalog(two.actor)).items[0]!.adaptation!.verification.status).toBe(
+    'unverified',
   );
   await one.declare(ref, 'anthropic-messages');
   const changed = (await one.service.catalog(one.actor)).items[0]!.adaptation!;

@@ -5,15 +5,22 @@ export {
   parseImageResult,
   imageOutputKey,
   imageOutputIndex,
+  imageCommandCredentialBinding,
   imageQueryCredentialBinding,
-  IMAGE_PROFILES,
-  IMAGE_PROFILE_RULES,
   IMAGE_OPERATIONS,
   IMAGE_GEOMETRY_EDGES,
   canonicalImageInput,
-  isImageProfile,
-  validImageInput,
 } from './images.ts';
+export {
+  IMAGE_DRIVERS,
+  IMAGE_DRIVER_PATH_PREFIX,
+  isImageDriver,
+  isSafeRouteIdentifier,
+  isValidImageRoutePath,
+  validateImageRouteConfig,
+  validateImageInputByRoute,
+  canonicalImageRouteConfig,
+} from './image-routes.ts';
 export type {
   ImageAssetRef,
   ImageInput,
@@ -21,8 +28,6 @@ export type {
   ImageGeometryEdge,
   ImageGeometry,
   ImageRequestParameters,
-  ImageProfile,
-  ImageProfileRule,
   ImageEnvelope,
   ImageCommandV1,
   ImageRecoveryCommandV1,
@@ -31,6 +36,15 @@ export type {
   ImageOutput,
   ImageErrorCode,
 } from './images.ts';
+export type {
+  ImageDriver,
+  KlingReferenceFormat,
+  ImageRouteAsyncSpec,
+  ImageRouteParamSpec,
+  ImageRouteRequestDefaults,
+  ImageRouteOutputSpec,
+  ImageRouteConfig,
+} from './image-routes.ts';
 /** Shared message v1. The transport authenticates publishers separately from these values. */
 export const COMPUTE_VERSION = 1 as const;
 export const COMPUTE_PROFILE = 'mp4-h264-aac-720p24-v1' as const;

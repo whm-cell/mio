@@ -1,6 +1,5 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
-import { isImageProfile } from '@mio/compute-contracts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -8,6 +7,8 @@ import type {
   ProviderPrincipal,
   ChatSelection,
   ChatRuntimeSnapshot,
+  ImageRuntimeSnapshot,
+  VerificationSnapshot,
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
@@ -16,7 +17,8 @@ import {
   catalogView,
   findModel,
   membershipError,
-  chatAdaptation,
+  resolveEffectiveChat,
+  resolveEffectiveImage,
   modelReference,
   legacyReference,
 } from './catalog.ts';
@@ -51,7 +53,7 @@ export function createProviderService(
     if (!ref) throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DEFAULT_NOT_SET');
     if (reason)
       throw new ProviderError(HTTP_STATUS.CONFLICT, modelRef ? reason : 'MODEL_DEFAULT_INVALID');
-    const adaptation = chatAdaptation(row.adaptations, model!.model_key);
+    const adaptation = resolveEffectiveChat(row, model!);
     const enabled =
       row.preferences.find((pref) => pref.model_key === model!.model_key && pref.usage === 'chat')
         ?.enabled ?? true;
@@ -117,7 +119,7 @@ export function createProviderService(
         config,
       );
     },
-    async resolveImage(actor: ProviderPrincipal, modelRef: string) {
+    async resolveImage(actor: ProviderPrincipal, modelRef: string): Promise<ImageRuntimeSnapshot> {
       assertOpen();
       const row = await store.state(actor.userId);
       assertOpen();
@@ -125,14 +127,8 @@ export function createProviderService(
       const model = findModel(row.models, modelRef);
       const reason = membershipError(row, model);
       if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
-      const adaptation = row.adaptations.find(
-        (entry) =>
-          entry.model_key === model!.model_key &&
-          entry.operation === 'image.generate' &&
-          isImageProfile(entry.profile),
-      );
-      if (!adaptation || !isImageProfile(adaptation.profile))
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+      const adaptation = resolveEffectiveImage(row, model!);
+      if (!adaptation) throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
       if (
         row.preferences.some(
           (pref) => pref.model_key === model!.model_key && pref.usage === 'image' && !pref.enabled,
@@ -141,13 +137,17 @@ export function createProviderService(
         throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
       return {
         modelId: model!.raw_model_id!,
+        modelKey: model!.model_key,
+        vendor: adaptation.vendor,
         profile: adaptation.profile,
-        capabilityMetadata: adaptation.capability_metadata,
+        route: adaptation.route,
+        defaultImageWatermark: row.default_image_watermark,
+        capabilityMetadata: adaptation.capabilityMetadata,
         providerRevision: row.revision,
         providerConfigId: row.id,
         credentialVersion: row.credential_version,
         catalogVersion: row.catalog_version!,
-        adaptationVersion: adaptation.declaration_version,
+        adaptationVersion: adaptation.declarationVersion,
         apiKey: decryptCredential(
           row,
           { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
@@ -180,19 +180,20 @@ export function createProviderService(
         providerRevision: row.revision,
         credentialVersion: row.credential_version,
         catalogVersion: row.catalog_version!,
-        adaptationVersion: adaptation.declaration_version,
+        adaptationVersion: adaptation.declarationVersion,
+        vendor: adaptation.vendor,
         operation: 'chat',
         profile: adaptation.profile,
-        capabilityVersion: `onelink-text:${adaptation.declaration_version}`,
-        ...(adaptation.capability_metadata.contextWindow
-          ? { contextWindow: adaptation.capability_metadata.contextWindow }
-          : {}),
+        submitPath: adaptation.submitPath,
+        maxOutputTokens: adaptation.maxOutputTokens,
+        capabilityVersion: `onelink-text:${adaptation.declarationVersion}`,
+        ...(adaptation.contextWindow ? { contextWindow: adaptation.contextWindow } : {}),
         apiKey,
       });
     },
     async recordVerification(
-      actor: ProviderPrincipal,
-      snapshot: ChatRuntimeSnapshot,
+      actor: Pick<ProviderPrincipal, 'userId'>,
+      snapshot: VerificationSnapshot,
       evidence: string,
     ) {
       assertOpen();

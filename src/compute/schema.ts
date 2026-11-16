@@ -43,6 +43,7 @@ ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS query_attempt integer NOT NU
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS async_max_queries integer;
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS async_deadline timestamptz;
 ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS next_query_at timestamptz;
+ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS route_snapshot jsonb;
 ALTER TABLE mio_image_outbox ADD COLUMN IF NOT EXISTS recovery_command jsonb;
 ALTER TABLE mio_image_outbox ADD COLUMN IF NOT EXISTS query_command jsonb;
 ALTER TABLE mio_image_jobs ADD CONSTRAINT mio_image_jobs_state_check
@@ -69,7 +70,7 @@ export async function checkComputeSchema(pool: Pool, images = false): Promise<vo
   await pool.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
   if (images) {
     await pool.query(
-      'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,active_recovery_id,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,state,created_at FROM mio_image_jobs LIMIT 0',
+      'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,active_recovery_id,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,route_snapshot,state,created_at FROM mio_image_jobs LIMIT 0',
     );
     await pool.query(
       'SELECT job_id,sent_at,recovery_command,query_command FROM mio_image_outbox LIMIT 0',

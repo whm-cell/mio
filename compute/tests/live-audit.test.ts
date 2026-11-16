@@ -127,7 +127,9 @@ it('reads the journal only after the worker releases its exclusive lock', () => 
 });
 
 it('keeps only a valid failure code when an assertion includes sensitive trailing details', async () => {
-  const directory = mkdtempSync(join(resolve('.runtime'), 'mio-live-safe-code-'));
+  const runtime = resolve('.runtime');
+  mkdirSync(runtime, { recursive: true });
+  const directory = mkdtempSync(join(runtime, 'mio-live-safe-code-'));
   const infrastructure = join(directory, 'infra');
   mkdirSync(infrastructure, { mode: 0o700 });
   const write = (name: string, content: string) =>

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
 import { sealImageKey } from './image-credentials.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
@@ -15,7 +15,7 @@ import type { ImageAssetRef, ImageInput, ImageRequestParameters } from '@mio/com
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
-import { isUuidV4 } from '@mio/foundation/identifiers';
+import { createId, isUuidV4 } from '@mio/foundation/identifiers';
 import { COMPUTE_MAX_MEDIA_BYTES, IMAGE_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
 import type { ImageCommandV1 } from '@mio/compute-contracts';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
@@ -294,7 +294,8 @@ export function createComputeService(
       parameters: ImageRequestParameters,
     ) {
       return admit(async () => {
-        if (!store.imagesAvailable) throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        if (!store.imagesAvailable)
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
         if (
           !isUuidV4(requestId) ||
           typeof modelRef !== 'string' ||
@@ -324,22 +325,21 @@ export function createComputeService(
               ].includes(k),
           )
         )
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         if (parameters.async !== undefined && typeof parameters.async !== 'boolean')
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const normalized = Object.fromEntries(
           Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
         );
-        const hash = createHash('sha256')
-          .update(JSON.stringify([modelRef, normalized]))
-          .digest('hex');
+        const hash = sha256Utf8(JSON.stringify([modelRef, normalized]));
         const previous = await store.imageRequest(actor.userId, requestId);
         if (previous) {
-          if (previous.input_hash !== hash) throw new ComputeError(409, 'REQUEST_CONFLICT');
+          if (previous.input_hash !== hash)
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
           return store.imageGet(actor.userId, previous.id);
         }
         if (!imageConfig || !imageConfig.provider())
-          throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
         const operation =
           parameters.operation ??
           (parameters.geometry !== undefined
@@ -359,9 +359,10 @@ export function createComputeService(
           (operation !== 'outpaint' && parameters.geometry !== undefined) ||
           !['generate', 'edit', 'outpaint'].includes(operation)
         )
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const imageAsset = async (assetId: string, mask = false): Promise<ImageAssetRef> => {
-          if (!isUuidV4(assetId)) throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          if (!isUuidV4(assetId))
+            throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
           const row = await store.imageInput(actor.userId, assetId);
           if (
             !row ||
@@ -399,12 +400,12 @@ export function createComputeService(
         const { imageAssetId, imageAssetIds, maskAssetId, geometry, ...providerParameters } =
           parameters;
         if (imageAssetId !== undefined && imageAssetIds !== undefined)
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         if (
           maskAssetId !== undefined &&
           (typeof maskAssetId !== 'string' || !isUuidV4(maskAssetId))
         )
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const requestedImageIds =
           imageAssetIds ?? (imageAssetId !== undefined ? [imageAssetId] : []);
         if (
@@ -412,9 +413,9 @@ export function createComputeService(
           requestedImageIds.some((assetId) => typeof assetId !== 'string') ||
           new Set(requestedImageIds).size !== requestedImageIds.length
         )
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         if ((operation === 'edit' || operation === 'outpaint') && requestedImageIds.length < 1)
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const snapshot = await imageConfig.provider()!.resolveImage(actor, modelRef);
         if (
           !isImageDriver(snapshot.profile) ||
@@ -463,13 +464,13 @@ export function createComputeService(
             ? (snapshot.defaultImageWatermark ?? route.requestDefaults.watermark ?? null)
             : (route.effectiveWatermark ?? route.requestDefaults.watermark ?? null),
         });
-        const jobId = randomUUID();
+        const jobId = createId();
         const asyncMaxAgeSeconds =
           effectiveRoute.paramSpec.async?.maxAgeSeconds ?? imageCapability?.async?.maxAgeSeconds;
         const expiresAt =
           parameters.async === true
-            ? Date.now() + Math.min(86_400_000, (asyncMaxAgeSeconds ?? 600) * 1000)
-            : Date.now() + 10 * 60_000;
+            ? epochMs() + Math.min(86_400_000, (asyncMaxAgeSeconds ?? 600) * 1000)
+            : epochMs() + 10 * 60_000;
         const input: ImageInput = {
           ...providerParameters,
           model: snapshot.modelId,
@@ -488,7 +489,7 @@ export function createComputeService(
               : {}),
         };
         if (!validateImageInputByRoute(input, effectiveRoute))
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const commandBase = {
           jobId,
           ownerId: actor.userId,
@@ -507,17 +508,17 @@ export function createComputeService(
         const command: ImageCommandV1 = {
           version: 1,
           type: 'image.request',
-          messageId: randomUUID(),
+          messageId: createId(),
           ...commandBase,
           credential,
         };
         try {
           parseImageCommand(command);
         } catch {
-          throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
         }
         if (Buffer.byteLength(JSON.stringify(command), 'utf8') > IMAGE_MAX_MESSAGE_BYTES)
-          throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+          throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
         const id = await store.imageCreate(actor.userId, requestId, hash, command, {
           providerConfigId: snapshot.providerConfigId,
           providerRevision: snapshot.providerRevision,
@@ -547,7 +548,8 @@ export function createComputeService(
     },
     recoverImage(actor: AssetPrincipal, id: string) {
       return admit(async () => {
-        if (!store.imagesAvailable) throw new ComputeError(503, 'IMAGE_UNAVAILABLE');
+        if (!store.imagesAvailable)
+          throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
         await store.imageRecover(actor.userId, id);
         return store.imageGet(actor.userId, id);
       });

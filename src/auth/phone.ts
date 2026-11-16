@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { createId } from '@mio/foundation/identifiers';
+import { epochMs } from '@mio/foundation/time';
 import type { BetterAuthPlugin } from 'better-auth';
 import {
   APIError,
@@ -93,7 +94,7 @@ export function phonePlugin(
         let binding: BindingIdentity | undefined;
         if (purpose === 'bind') {
           const session = await getAuthoritativeSessionFromCtx(ctx);
-          if (!session || Date.now() - session.session.createdAt.getTime() >= 600_000)
+          if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
             return failure('SESSION_REQUIRED');
           binding = { userId: session.user.id, sessionId: session.session.id };
         }
@@ -128,7 +129,7 @@ export function phonePlugin(
         let binding: BindingIdentity | undefined;
         if (purpose === 'bind') {
           const session = await getAuthoritativeSessionFromCtx(ctx);
-          if (!session || Date.now() - session.session.createdAt.getTime() >= 600_000)
+          if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
             return failure('SESSION_REQUIRED');
           binding = { userId: session.user.id, sessionId: session.session.id };
         }
@@ -162,7 +163,7 @@ export function phonePlugin(
         if (!user)
           user = await ctx.context.internalAdapter.createUser(
             {
-              email: `phone-${randomUUID()}@${domain}`,
+              email: `phone-${createId()}@${domain}`,
               emailVerified: false,
               name: '用户',
               phoneNumber: phone,

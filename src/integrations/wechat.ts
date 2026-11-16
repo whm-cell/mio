@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
+import { epochMs, monotonicMs } from '@mio/foundation/time';
 
 export interface WechatConfig {
   appId: string;
@@ -18,7 +19,7 @@ const REQUEST_TIMEOUT = 5000;
 
 /** Both requests have a fixed destination, a real abort deadline and bounded response body. */
 async function wechatJSON(path: string, parameters: Record<string, string>) {
-  const started = performance.now();
+  const started = monotonicMs();
   try {
     const url = new URL(path, 'https://api.weixin.qq.com');
     for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
@@ -55,7 +56,7 @@ async function wechatJSON(path: string, parameters: Record<string, string>) {
       typeof data !== 'object' ||
       Array.isArray(data) ||
       ('errcode' in data && data.errcode !== 0) ||
-      performance.now() - started >= REQUEST_TIMEOUT
+      monotonicMs() - started >= REQUEST_TIMEOUT
     )
       throw new Error('invalid response');
     return data as Record<string, unknown>;
@@ -96,7 +97,7 @@ export function createWechatClient(config: WechatConfig, placeholderDomain: stri
       return {
         accessToken: data.access_token,
         ...(typeof data.refresh_token === 'string' ? { refreshToken: data.refresh_token } : {}),
-        accessTokenExpiresAt: new Date(Date.now() + data.expires_in * 1000),
+        accessTokenExpiresAt: new Date(epochMs() + data.expires_in * 1000),
         scopes: data.scope.split(',').filter(Boolean),
         openid: data.openid,
       };
@@ -111,7 +112,7 @@ export function createWechatClient(config: WechatConfig, placeholderDomain: stri
       });
       if (data.openid !== tokens.openid) throw new Error('WECHAT_UNAVAILABLE');
       const id = wechatAccountId(config.appId, tokens.openid);
-      const hash = createHash('sha256').update(id).digest('hex').slice(0, 56);
+      const hash = sha256Utf8(id).slice(0, 56);
       return {
         user: {
           name: typeof data.nickname === 'string' ? data.nickname : '微信用户',

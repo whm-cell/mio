@@ -1,4 +1,6 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
+import { createId } from '@mio/foundation/identifiers';
+import { epochMs } from '@mio/foundation/time';
 import {
   canonicalImageRouteConfig,
   imageCommandCredentialBinding,
@@ -120,7 +122,7 @@ async function materializeSaved(
     if (!image) saved.invalidIndices.push(index);
     else {
       const format = image.format ?? saved.format;
-      const fileId = randomUUID();
+      const fileId = createId();
       saved.pendingFileIds[index] = fileId;
       (saved.attemptedFileIds[index] ??= []).push(fileId);
       // Persist the attempted physical identity before any COS request. If
@@ -230,16 +232,14 @@ export function createImageWorker(
     const binding = route
       ? imageCommandCredentialBinding({ ...command, route })
       : JSON.stringify([command.jobId, command.ownerId, command.expiresAt, command.profile, null]);
-    const identity = createHash('sha256')
-      .update(binding)
-      .update(
+    const identity = sha256Utf8(
+      binding +
         JSON.stringify(
           Object.fromEntries(
             Object.entries(command.credential).sort(([a], [b]) => a.localeCompare(b)),
           ),
         ),
-      )
-      .digest('hex');
+    );
     if (active.has(command.jobId)) throw new Error('IMAGE_BUSY');
     active.add(command.jobId);
     try {
@@ -352,7 +352,7 @@ export function createImageWorker(
             queryAttempt: command.queryAttempt,
           };
         }
-        if (command.queryDeadline <= Date.now() || command.expiresAt <= Date.now()) {
+        if (command.queryDeadline <= epochMs() || command.expiresAt <= epochMs()) {
           journal.imagePhase(
             command.jobId,
             'failed',
@@ -471,7 +471,7 @@ export function createImageWorker(
           journal.imagePhase(command.jobId, 'rejected', 'IMAGE_HANDLER_UNAVAILABLE');
           return { state: 'rejected', errorCode: 'IMAGE_HANDLER_UNAVAILABLE' };
         }
-        if (!keyId || !privateKey || command.expiresAt <= Date.now()) {
+        if (!keyId || !privateKey || command.expiresAt <= epochMs()) {
           const errorCode =
             !keyId || !privateKey ? 'IMAGE_HANDLER_UNAVAILABLE' : 'IMAGE_CREDENTIAL_UNAVAILABLE';
           journal.imagePhase(command.jobId, 'rejected', errorCode);

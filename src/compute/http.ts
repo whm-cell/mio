@@ -67,10 +67,11 @@ export function createComputeHandler(
         actor = await identity(headers);
         if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
         if (recover) {
-          if (Object.keys(value).length) return fail(400, 'IMAGE_INPUT_INVALID');
+          if (Object.keys(value).length)
+            return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
           const result = await service.recoverImage(actor, id!);
           response
-            .writeHead(202, { 'content-type': 'application/json' })
+            .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
             .end(JSON.stringify(result));
           return;
         }
@@ -83,7 +84,7 @@ export function createComputeHandler(
             typeof value.parameters !== 'object' ||
             Array.isArray(value.parameters)
           )
-            return fail(400, 'IMAGE_INPUT_INVALID');
+            return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
           const result = await service.createImage(
             actor,
             value.requestId,
@@ -91,7 +92,7 @@ export function createComputeHandler(
             value.parameters as { prompt: string },
           );
           response
-            .writeHead(202, { 'content-type': 'application/json' })
+            .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
             .end(JSON.stringify(result));
           return;
         }

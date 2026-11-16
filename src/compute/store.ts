@@ -1,5 +1,6 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
+import { epochMs } from '@mio/foundation/time';
 import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
@@ -171,7 +172,8 @@ export class ComputeStore {
         )
       ).rows[0];
       if (existing) {
-        if (existing.input_hash !== hash) throw new ComputeError(409, 'REQUEST_CONFLICT');
+        if (existing.input_hash !== hash)
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return existing.id;
       }
       await checkCapacity(client, owner, true);
@@ -190,12 +192,12 @@ export class ComputeStore {
           ? new Date(
               Math.min(
                 command.expiresAt,
-                Date.now() + Number(asyncCapability?.maxAgeSeconds) * 1000,
+                epochMs() + Number(asyncCapability?.maxAgeSeconds) * 1000,
               ),
             ).toISOString()
           : null;
       if (!validateImageRouteConfig(command.route) || command.profile !== command.route.driver)
-        throw new ComputeError(400, 'IMAGE_INPUT_INVALID');
+        throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
       const saved = await client.query(
         "INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,route_snapshot,async_max_queries,async_deadline,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'accepted') ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING id",
         [
@@ -218,7 +220,7 @@ export class ComputeStore {
           [owner, requestId],
         )
       ).rows[0]!;
-      if (row.input_hash !== hash) throw new ComputeError(409, 'REQUEST_CONFLICT');
+      if (row.input_hash !== hash) throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
       return row.id;
     });
   }
@@ -234,7 +236,7 @@ export class ComputeStore {
         id,
       ])
     ).rows[0];
-    if (!row) throw new ComputeError(404, 'JOB_NOT_FOUND');
+    if (!row) throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
     const outputs = await this.pool.query<{ output_index: number; asset_id: string }>(
       'SELECT output_index,asset_id FROM mio_image_outputs WHERE job_id=$1 ORDER BY output_index',
       [id],
@@ -467,14 +469,14 @@ export class ComputeStore {
           [id, owner],
         )
       ).rows[0];
-      if (!job) throw new ComputeError(404, 'JOB_NOT_FOUND');
+      if (!job) throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
       if (job.state === 'materializing') return;
       if (
         job.upstream_task_id &&
         ['submitted', 'processing', 'failed', 'unknown'].includes(job.state)
       ) {
         if (!job.async_max_queries || job.async_expired)
-          throw new ComputeError(409, 'RESULT_CONFLICT');
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         if (job.state === 'submitted' || job.state === 'processing') {
           const pending = (
             await client.query<{ query_command: ImageQueryCommandV1 | null }>(
@@ -487,13 +489,14 @@ export class ComputeStore {
             pending.upstreamTaskId !== job.upstream_task_id ||
             pending.queryAttempt !== job.query_attempt
           )
-            throw new ComputeError(409, 'RESULT_CONFLICT');
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
           return;
         }
         const nextAttempt = job.query_attempt + 1;
-        if (nextAttempt > job.async_max_queries) throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (nextAttempt > job.async_max_queries)
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         const route = validRouteSnapshot(job.command, job.route_snapshot);
-        if (!route) throw new ComputeError(409, 'RESULT_CONFLICT');
+        if (!route) throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         const query = imageQueryCommand(job.command, job.upstream_task_id, nextAttempt, route);
         await client.query(
           "UPDATE mio_image_jobs SET state='processing',error_code=NULL,query_attempt=$2,next_query_at=now() WHERE id=$1",
@@ -505,8 +508,10 @@ export class ComputeStore {
         );
         return;
       }
-      if (job.state !== 'materialization_failed') throw new ComputeError(409, 'RESULT_CONFLICT');
-      if (job.active_recovery_seq >= 2147483647) throw new ComputeError(409, 'RESULT_CONFLICT');
+      if (job.state !== 'materialization_failed')
+        throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
+      if (job.active_recovery_seq >= 2147483647)
+        throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
       await checkCapacity(client, owner, true);
       const recovery: ImageRecoveryCommandV1 = {
         version: 1,
@@ -552,7 +557,7 @@ export class ComputeStore {
         )
       ).rows[0];
       if (!job || job.command.messageId !== result.commandId)
-        throw new ComputeError(409, 'RESULT_CONFLICT');
+        throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
       if (job.active_recovery_id !== (result.recoveryId ?? null)) return;
       if (
         [
@@ -584,10 +589,10 @@ export class ComputeStore {
           typeof result.upstreamTaskId !== 'string' ||
           (result.upstreamTaskId !== job.upstream_task_id && result.state !== 'submitted')
         )
-          throw new ComputeError(409, 'RESULT_CONFLICT');
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         if (result.state === 'submitted') {
           if (job.state !== 'accepted' || result.queryAttempt !== 0 || job.upstream_task_id)
-            throw new ComputeError(409, 'RESULT_CONFLICT');
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
           const nextAttempt = 1;
           if (!job.async_max_queries || nextAttempt > job.async_max_queries || job.async_expired) {
             await client.query(
@@ -633,7 +638,7 @@ export class ComputeStore {
             result.queryAttempt !== job.query_attempt ||
             !job.upstream_task_id
           )
-            throw new ComputeError(409, 'RESULT_CONFLICT');
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
           const nextAttempt = Number(result.queryAttempt) + 1;
           if (!job.async_max_queries || nextAttempt > job.async_max_queries || job.async_expired) {
             await client.query(
@@ -676,10 +681,10 @@ export class ComputeStore {
           return;
         }
         if (result.queryAttempt === undefined || !job.upstream_task_id)
-          throw new ComputeError(409, 'RESULT_CONFLICT');
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         if (result.queryAttempt < job.query_attempt) return;
         if (result.queryAttempt !== job.query_attempt)
-          throw new ComputeError(409, 'RESULT_CONFLICT');
+          throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         await client.query(
           'UPDATE mio_image_jobs SET state=$2,error_code=$3,next_query_at=NULL WHERE id=$1',
           [result.jobId, 'failed', result.errorCode ?? 'IMAGE_QUERY_FAILED'],
@@ -706,7 +711,7 @@ export class ComputeStore {
         (result.state === 'completed' && result.outputs.length !== requested) ||
         (result.state === 'partial' && result.outputs.length >= requested)
       )
-        throw new ComputeError(409, 'RESULT_CONFLICT');
+        throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
       if (
         ['completed', 'partial', 'materializing', 'materialization_failed'].includes(result.state)
       ) {
@@ -714,7 +719,7 @@ export class ComputeStore {
         for (const output of result.outputs) {
           const index = imageOutputIndex(result.jobId, output.key, output.contentType);
           if (index === null || index >= requested || index <= previousIndex)
-            throw new ComputeError(409, 'RESULT_CONFLICT');
+            throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
           previousIndex = index;
           const existing = await client.query<{
             raw_key: string;
@@ -732,7 +737,7 @@ export class ComputeStore {
               Number(asset.size_bytes) !== output.sizeBytes ||
               asset.content_type !== output.contentType
             )
-              throw new ComputeError(409, 'RESULT_CONFLICT');
+              throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
             continue;
           }
           const asset = createId();

@@ -1,3 +1,4 @@
+import { ApplicationError } from '@mio/foundation/errors';
 import { isDeepStrictEqual } from 'node:util';
 
 /** Fixed destination. A complete response establishes membership, not a protocol declaration. */
@@ -7,11 +8,9 @@ export interface DiscoveredModel {
   id: string;
   metadata: Record<string, unknown>;
 }
-export class DiscoveryError extends Error {
-  readonly code: string;
+export class DiscoveryError extends ApplicationError {
   constructor(code: string) {
     super(code);
-    this.code = code;
   }
 }
 

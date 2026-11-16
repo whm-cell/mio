@@ -1,4 +1,6 @@
-import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
+import { createId } from '@mio/foundation/identifiers';
 import type { Pool, PoolClient } from 'pg';
 
 export type PhonePurpose = 'login' | 'bind';
@@ -16,8 +18,7 @@ export interface BindingIdentity {
 
 const hour = 60 * 60 * 1000;
 const day = 24 * hour;
-const digest = (value: string) => createHash('sha256').update(value).digest('hex');
-const challengeKey = (purpose: PhonePurpose, phone: string) => digest(`${purpose}\0${phone}`);
+const challengeKey = (purpose: PhonePurpose, phone: string) => sha256Utf8(`${purpose}\0${phone}`);
 const codeDigest = (
   secret: string,
   id: string,
@@ -78,17 +79,17 @@ export async function reservePhoneChallenge(
   ip: string,
   binding?: BindingIdentity,
 ) {
-  const id = randomUUID();
+  const id = createId();
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
   return transaction(pool, async (client) => {
     const keys = [
       {
-        id: `phone:${digest(phone)}`,
+        id: `phone:${sha256Utf8(phone)}`,
         hour: limits.phoneHour,
         day: limits.phoneDay,
         cooldown: true,
       },
-      { id: `ip:${digest(ip)}`, hour: limits.ipHour, day: limits.ipDay, cooldown: false },
+      { id: `ip:${sha256Utf8(ip)}`, hour: limits.ipHour, day: limits.ipDay, cooldown: false },
       { id: 'global', hour: Infinity, day: limits.globalDay, cooldown: false },
     ].sort((a, b) => a.id.localeCompare(b.id));
     const rows: BudgetRow[] = [];

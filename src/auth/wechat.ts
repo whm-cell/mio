@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
+import { epochMs } from '@mio/foundation/time';
 import type { BetterAuthOptions, BetterAuthPlugin } from 'better-auth';
 import {
   APIError,
@@ -65,7 +66,7 @@ export function wechatPlugin(config: WechatConfig | undefined, domain: string): 
             const session = await getAuthoritativeSessionFromCtx(ctx);
             if (
               !session ||
-              Date.now() - new Date(session.session.createdAt).getTime() >= MAX_BINDING_AGE
+              epochMs() - new Date(session.session.createdAt).getTime() >= MAX_BINDING_AGE
             )
               return reject('SESSION_REQUIRED');
             const accounts = await ctx.context.internalAdapter.findAccounts(session.user.id);
@@ -84,11 +85,11 @@ export function wechatPlugin(config: WechatConfig | undefined, domain: string): 
             const signedState = await ctx.getSignedCookie(cookie.name, ctx.context.secret);
             if (typeof state !== 'string' || !state || state !== signedState)
               return reject('STATE_MISMATCH');
-            const digest = createHash('sha256').update(state).digest('hex');
+            const digest = sha256Utf8(state);
             const reserved = await ctx.context.internalAdapter.reserveVerificationValue({
               identifier: `mio-wechat-state:${digest}`,
               value: 'used',
-              expiresAt: new Date(Date.now() + STATE_RESERVATION_AGE),
+              expiresAt: new Date(epochMs() + STATE_RESERVATION_AGE),
             });
             if (!reserved) return reject('STATE_REPLAY');
           }),
@@ -117,7 +118,7 @@ export const validateWechatUser: ValidateUser = async ({ user, source }, ctx) =>
     current.session.id !== expected.sessionId ||
     current.user.id !== state.link.userId ||
     current.user.id !== user.id ||
-    Date.now() - new Date(current.session.createdAt).getTime() >= MAX_BINDING_AGE
+    epochMs() - new Date(current.session.createdAt).getTime() >= MAX_BINDING_AGE
   )
     return { error: 'SESSION_REQUIRED' };
 };

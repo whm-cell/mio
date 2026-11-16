@@ -1,4 +1,4 @@
-import { randomUUID, generateKeyPairSync } from 'node:crypto';
+import { createHash, randomUUID, generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -228,7 +228,8 @@ describe('durable image execution', () => {
     try {
       const worker = createImageWorker(journal, 'b1', keys.privateKey, vi.fn(), transport);
       const expired = command();
-      expired.expiresAt = Date.now() - 1;
+      expired.expiresAt = Date.now();
+      vi.spyOn(Date, 'now').mockReturnValue(expired.expiresAt);
       expect(await worker(expired)).toEqual({
         state: 'rejected',
         errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
@@ -247,6 +248,7 @@ describe('durable image execution', () => {
       });
       expect(transport).not.toHaveBeenCalled();
     } finally {
+      vi.restoreAllMocks();
       journal.close();
       rmSync(directory, { recursive: true });
     }
@@ -375,6 +377,58 @@ describe('durable image execution', () => {
         journal.close();
         rmSync(directory, { recursive: true });
       }
+    }
+  });
+
+  it('resumes a legacy double-update journal identity without a supplier request', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'mio-image-legacy-'));
+    const instance = randomUUID();
+    let journal = new Journal(directory, instance, true);
+    const request = command({ prompt: '历史图像 🌙\u0000é', n: 1 });
+    // This is the pre-migration algorithm; do not derive this fixture from foundation/hash.
+    const identity = createHash('sha256')
+      .update(imageCommandCredentialBinding(request))
+      .update(
+        JSON.stringify(
+          Object.fromEntries(
+            Object.entries(request.credential).sort(([a], [b]) => a.localeCompare(b)),
+          ),
+        ),
+      )
+      .digest('hex');
+    const transport = vi.fn<typeof fetch>();
+    const materialize = vi.fn(
+      async (job: string, index: number, _data: string, format: string, fileId: string) =>
+        imageOutput(job, index, fileId, format, 3),
+    );
+    try {
+      journal.beginImage(request.jobId, identity);
+      journal.imagePhase(
+        request.jobId,
+        'returned',
+        JSON.stringify({
+          commandId: request.messageId,
+          format: 'png',
+          expectedCount: 1,
+          images: [{ base64: 'YWJj' }],
+          outputs: [],
+        }),
+      );
+      journal.close();
+      journal = new Journal(directory, instance);
+      const worker = createImageWorker(journal, 'b1', keys.privateKey, materialize, transport);
+      const result = await worker(request);
+      expect(result).toMatchObject({ state: 'completed', outputs: [{ sizeBytes: 3 }] });
+      expect(await worker(request)).toEqual(result);
+      expect(journal.image(request.jobId)?.identity).toBe(identity);
+      expect(materialize).toHaveBeenCalledOnce();
+      expect(transport).not.toHaveBeenCalled();
+      await expect(
+        worker({ ...request, input: { ...request.input, prompt: 'changed' } }),
+      ).rejects.toThrow('IMAGE_COMMAND_CONFLICT');
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
     }
   });
 

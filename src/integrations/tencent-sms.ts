@@ -1,3 +1,4 @@
+import { monotonicMs } from '@mio/foundation/time';
 import { sms } from 'tencentcloud-sdk-nodejs-sms';
 import { Agent } from 'node:https';
 import type { RequestOptions } from 'node:https';
@@ -37,7 +38,7 @@ export function createTencentSmsSender(config: TencentSmsConfig): SmsSender {
   return async (phoneNumber, code) => {
     const agent = new SingleConnectionAgent();
     try {
-      const started = performance.now();
+      const started = monotonicMs();
       const client = new sms.v20210111.Client({
         credential: { secretId: config.secretId, secretKey: config.secretKey },
         region: config.region,
@@ -58,7 +59,7 @@ export function createTencentSmsSender(config: TencentSmsConfig): SmsSender {
         { signal: AbortSignal.timeout(5000) },
       )) as { SendStatusSet?: { Code?: string }[] };
       if (
-        performance.now() - started >= 5000 ||
+        monotonicMs() - started >= 5000 ||
         result.SendStatusSet?.length !== 1 ||
         result.SendStatusSet[0]?.Code !== 'Ok'
       )

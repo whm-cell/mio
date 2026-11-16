@@ -1,3 +1,4 @@
+import { ApplicationError } from '@mio/foundation/errors';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -81,17 +82,16 @@ export function validateImage(bytes: Buffer, format: string): void {
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
 
-export class MediaError extends Error {
-  readonly code:
-    | 'INPUT_INVALID'
-    | 'INPUT_TOO_LONG'
-    | 'TRANSCODE_FAILED'
-    | 'OUTPUT_INVALID'
-    | 'EXECUTION_TIMEOUT'
-    | 'DISK_FULL';
+export class MediaError extends ApplicationError<
+  | 'INPUT_INVALID'
+  | 'INPUT_TOO_LONG'
+  | 'TRANSCODE_FAILED'
+  | 'OUTPUT_INVALID'
+  | 'EXECUTION_TIMEOUT'
+  | 'DISK_FULL'
+> {
   constructor(code: MediaError['code']) {
     super(code);
-    this.code = code;
   }
 }
 

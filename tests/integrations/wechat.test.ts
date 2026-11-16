@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -25,7 +26,11 @@ it('uses fixed destinations, refuses redirects and hides provider failures', asy
   );
   const tokens = await client.exchangeCode('fixture-code');
   const profile = await client.getUserInfo(tokens);
-  expect(profile.user.email).toMatch(/^wechat-[a-f0-9]{56}@auth\.mio\.invalid$/);
+  const legacyHash = createHash('sha256')
+    .update(JSON.stringify(['fixture-app', 'fixture-openid']))
+    .digest('hex')
+    .slice(0, 56);
+  expect(profile.user.email).toBe(`wechat-${legacyHash}@auth.mio.invalid`);
   expect(profile.user.emailVerified).toBe(false);
   expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
     '/sns/oauth2/access_token',
@@ -50,7 +55,7 @@ it('uses fixed destinations, refuses redirects and hides provider failures', asy
   fetcher.mockResolvedValueOnce(Response.json({ openid: 'different-openid' }));
   await expect(client.getUserInfo(tokens)).rejects.toThrow('WECHAT_UNAVAILABLE');
   const time = vi.spyOn(performance, 'now');
-  time.mockReturnValueOnce(0).mockReturnValueOnce(5001);
+  time.mockReturnValueOnce(0).mockReturnValueOnce(5000);
   fetcher.mockResolvedValueOnce(Response.json({ openid: 'fixture-openid' }));
   await expect(client.getUserInfo(tokens)).rejects.toThrow('WECHAT_UNAVAILABLE');
 });

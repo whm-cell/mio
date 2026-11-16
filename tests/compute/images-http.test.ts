@@ -1112,12 +1112,12 @@ it('continues a previously admitted image and allows output recovery after new i
     jobId,
     ownerId: 'owner',
     expiresAt: Date.now() + 60000,
-    input: { model: 'gpt-image-2', prompt: 'previously admitted' },
+    input: { model: 'gpt-image-2', prompt: '先前图像 🌙é', n: 1 },
     credential: sealImageKey('key', 'binding', 'b1', keys.publicKey),
   };
   const requestId = randomUUID();
   const hash = createHash('sha256')
-    .update(JSON.stringify(['model', { prompt: 'previously admitted' }]))
+    .update(JSON.stringify(['model', { n: 1, prompt: '先前图像 🌙é' }]))
     .digest('hex');
   await store.imageCreate('owner', requestId, hash, command);
   const sent: (ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1)[] = [];
@@ -1141,7 +1141,7 @@ it('continues a previously admitted image and allows output recovery after new i
   try {
     const actor = { userId: 'owner', sessionId: 'session' };
     expect(
-      (await service.createImage(actor, requestId, 'model', { prompt: 'previously admitted' }))
+      (await service.createImage(actor, requestId, 'model', { prompt: '先前图像 🌙é', n: 1 }))
         .jobId,
     ).toBe(jobId);
     await expect(

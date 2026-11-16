@@ -28,6 +28,21 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 服务也可使用 library 的已登记公开入口；library 只依赖自身源码及精确的 `node:crypto`、`node:perf_hooks`，contract 不依赖 library。库源码不得依赖自身生成目录，即使旧产物仍存在；正常同包源码和公共入口引用仍可用。使用 library 的规范包名与子路径时，类型与构建解析须分别指向该子路径登记的入口，避免别名指向另一公开入口。library 的 manifest exports 必须与 publicEntries 完全一致，不得额外开放根入口、通配或私有入口；运行和类型条件仍须对应同一入口的输出。生产源码的 no-console 范围由同一 `sourceRoots` 生产分类产生，输出仅由基础日志 sink 负责；静态检查不替代脱敏和运行故障验证。
 
+## Foundation 原语定向防回退
+
+`pnpm lint` 通过 `eslint.config.mjs` 注册 `foundation/consumer-primitives`，从 `harness.config.json` 的 service sources 与 production 角色交集产生检查范围。规则复用现有 TypeScript ESLint parser 的 AST 和 scopeManager，不创建 TypeScript Program／TypeChecker，不依赖 Node 类型声明的物理路径。`pnpm guard` 继续负责项目、导入及源码覆盖边界；UUID／系统时间阻断由 lint 执行。
+
+- 系统随机 UUID 使用 `@mio/foundation/identifiers` 的 `createId`：阻断 `node:crypto`／`crypto` 的具名导入（含导入别名）、模块命名空间／默认导入的 `randomUUID()`，以及全局 `crypto.randomUUID()`。
+- 系统当前 epoch／单调时间使用 `@mio/foundation/time` 的 `epochMs`、`monotonicMs`：阻断系统 `Date.now()`、全局及 `node:perf_hooks`／`perf_hooks` 导入的 `performance.now()`，以及无输入的 `new Date()`；当前 UTC 字符串可用 `utcISOString`。带输入的日期转换／解析、`Date.parse` 和已有时间格式化合法。
+
+成员支持点号、静态字符串下标及 `globalThis` 的相同入口，支持常见 TS 表达式包装。判断依据是实际值引用与 Node import binding；不会只因第三方对象名叫 Date、performance 或 crypto 就阻断。局部／参数／导入／解构／catch／for／block 遮蔽及 var 提升由 ESLint 作用域解析；函数体 var 不遮蔽参数默认表达式中的系统全局引用。library、contract、测试与开发脚本不启用此规则。规则不读取 foundation 导出以决定是否启用，最小 guard fixture 无须伪造库能力；`tests/harness/foundation-lint.test.ts` 独立核对真实仓库的公开入口和值导出，避免 API 改名静默失效。
+
+这是一组明确静态形式的防回退检查，不追踪任意变量／解构别名、函数传递、重导出包装、动态属性、反射及自定义对象语义。不推断 HTTP 数值用途：`HTTP_STATUS`、`sha256Utf8` 和 `ApplicationError` 均由既有 `quality-review` 的 reuse 维度审阅，包括 `fail`／`writeApiError` 和改写参数的错误构造器。此处移除旧 HTTP 静态断言是方案 A 的政策收窄，不是 HTTP 复用通过的证据。不禁止 `createHash`、HMAC/RSA/AES、二进制／流式摘要、MD5 或服务端时间，不强制所有 Error 继承 ApplicationError。
+
+聚焦测试通过实际 ESLint 有效配置的 `lintText` 和 CLI stdin 验证正负例、作用域及角色；`tests/harness/guardrail-projects.test.ts` 保留真实 guard CLI 的项目／公开入口和最小桩兼容测试。既有 CI harness 路径及全量 `pnpm check` 均含 lint 与这些测试，静态命中不证明任意复用或业务行为正确。
+
+## 其他源码依赖与检查边界
+
 非根服务可通过 `capabilities` 对 `fs`、`child_process`、`sqlite` 分别登记本项目内真实存在的精确 TS adapter 文件；`node:` 前缀及 `fs/promises` 按对应能力核对，根服务仍不开放这些能力。直接的 `process.getBuiltinModule(...)` 和 `globalThis.process` 的静态属性/字符串下标形式也受检查：目标须为字面量，脱离调用的引用拒绝。计算属性、任意别名、第三方内部行为和运行时反射不在承诺内，静态规则不是进程沙箱。
 
 `packageAdapters` 可按服务的真实 adapter 文件精确登记 `amqplib`，并允许非根服务登记 `cos-nodejs-sdk-v5`；未知包键、跨项目和不存在的文件拒绝。A 的 COS SDK 仍只允许 `src/integrations/cos.ts`，声明不覆盖 DSH、认证、PG 或 Redis 等既有边界。包名、类型包身份及解析目标的包归属共同参与核对。P2 增加这项声明是因为 B 使用独立凭据访问 COS、A/B 都可能需要各自的 MQ adapter；逐服务在检查器源码中硬编码路径会把正常新增服务变成护栏实现修改。代价是维护显式声明与正反例，不能据此推断运行时隔离。

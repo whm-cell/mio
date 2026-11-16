@@ -227,6 +227,27 @@ async function libraryFixture() {
   return root;
 }
 
+it('guard leaves primitive policy to ESLint for ordinary service fixtures', async () => {
+  const root = await libraryFixture();
+  await put(
+    root,
+    'src/index.ts',
+    "import { randomUUID as uuid } from 'node:crypto'; export const native = [uuid(), Date.now()];\n",
+  );
+  const result = check(root);
+  expect(result.status, result.output).toBe(0);
+});
+
+it('guard accepts a minimal foundation stub without requiring primitive exports', async () => {
+  const root = await libraryFixture();
+  await json(root, 'packages/foundation/package.json', (config) => {
+    Object.assign(config, { name: '@mio/foundation' });
+  });
+  await put(root, 'src/index.ts', 'export const native = Date.now();\n');
+  const result = check(root);
+  expect(result.status, result.output).toBe(0);
+});
+
 it('limits library consumers to public entries and prevents contract and library reverse dependencies', async () => {
   const root = await libraryFixture();
   await put(root, 'src/index.ts', "export { hash } from '@fixture/foundation/hash';\n");

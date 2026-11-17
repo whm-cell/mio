@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -44,9 +45,16 @@ async function fixture() {
 }
 
 function start(root: string, args: string[], env: NodeJS.ProcessEnv = {}, detached = false) {
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    GITHUB_ACTIONS: '',
+    MARKER: join(root, 'marker'),
+  };
+  delete childEnv.MIO_TEST_DATABASE_URL;
+  Object.assign(childEnv, env);
   return spawn(process.execPath, [entry, ...args], {
     cwd: root,
-    env: { ...process.env, GITHUB_ACTIONS: '', MARKER: join(root, 'marker'), ...env },
+    env: childEnv,
     detached,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -264,3 +272,85 @@ if (step === 'check:static:base') {
     'check:static:base\nformat:check\ntypecheck\nlint\nguard\ntest\nbuild\n',
   );
 }, 20000);
+
+it('auto-reuses a reachable local regression database without leaking private app settings', async () => {
+  const root = await fixture();
+  await writeFile(
+    join(root, 'tests/auth/env-probe.test.ts'),
+    `import { writeFileSync } from 'node:fs';
+import { test } from 'vitest';
+test('captures env', () => {
+  writeFileSync(process.env.MARKER, JSON.stringify({
+    testDb: process.env.MIO_TEST_DATABASE_URL ?? null,
+    authDb: process.env.MIO_AUTH_DATABASE_URL ?? null,
+    authSecret: process.env.MIO_AUTH_SECRET ?? null,
+  }));
+});
+`,
+  );
+  const regPass = 'c'.repeat(64);
+  const server = createServer();
+  await new Promise<void>((ok, fail) => {
+    server.once('error', fail);
+    server.listen(0, '127.0.0.1', ok);
+  });
+  let port = 0;
+  try {
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('missing port');
+    port = addr.port;
+    const expectedUrl = `postgresql://mio_regression:${regPass}@127.0.0.1:${port}/mio_regression_test`;
+    await writeFile(
+      join(root, '.env'),
+      [
+        'MIO_ENVIRONMENT=dev',
+        'MIO_AUTH_SECRET=private-dev-secret-must-not-leak',
+        `MIO_AUTH_DATABASE_URL=postgresql://mio:app-secret@127.0.0.1:${port}/mio_dev`,
+        `MIO_LOCAL_POSTGRES_PORT=${port}`,
+        `MIO_LOCAL_REGRESSION_PASSWORD=${regPass}`,
+        `MIO_TEST_DATABASE_URL=${expectedUrl}`,
+      ].join('\n') + '\n',
+      { mode: 0o600 },
+    );
+    const detected = await finish(
+      start(root, ['test', 'tests/auth/env-probe.test.ts'], { MIO_TEST_DATABASE_URL: '' }),
+    );
+    expect(detected.code, detected.output).toBe(0);
+    expect(JSON.parse(await readFile(join(root, 'marker'), 'utf8'))).toEqual({
+      testDb: expectedUrl,
+      authDb: null,
+      authSecret: null,
+    });
+
+    const explicit = await finish(
+      start(root, ['test', 'tests/auth/env-probe.test.ts'], {
+        MIO_TEST_DATABASE_URL: 'postgresql://explicit@127.0.0.1:5432/custom_test',
+      }),
+    );
+    expect(explicit.code, explicit.output).toBe(0);
+    expect(JSON.parse(await readFile(join(root, 'marker'), 'utf8')).testDb).toBe(
+      'postgresql://explicit@127.0.0.1:5432/custom_test',
+    );
+  } finally {
+    await new Promise<void>((ok) => server.close(() => ok()));
+  }
+
+  // Closed port falls back cleanly without injecting an unreachable URL.
+  const closed = await finish(
+    start(root, ['test', 'tests/auth/env-probe.test.ts'], { MIO_TEST_DATABASE_URL: '' }),
+  );
+  expect(closed.code, closed.output).toBe(0);
+  expect(JSON.parse(await readFile(join(root, 'marker'), 'utf8')).testDb).toBeNull();
+
+  // Tampered regression target fails closed instead of silently pointing at mio_dev.
+  await writeFile(
+    join(root, '.env'),
+    `MIO_ENVIRONMENT=dev\nMIO_LOCAL_POSTGRES_PORT=${port}\nMIO_LOCAL_REGRESSION_PASSWORD=${regPass}\nMIO_TEST_DATABASE_URL=postgresql://mio:bad@127.0.0.1:${port}/mio_dev\n`,
+    { mode: 0o600 },
+  );
+  const tampered = await finish(
+    start(root, ['test', 'tests/auth/env-probe.test.ts'], { MIO_TEST_DATABASE_URL: '' }),
+  );
+  expect(tampered.code).not.toBe(0);
+  expect(tampered.output).toContain('LOCAL_REGRESSION_TARGET');
+}, 30000);

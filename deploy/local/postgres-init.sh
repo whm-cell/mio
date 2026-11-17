@@ -10,7 +10,7 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA public TO mio;
 SQL
 
-if [ "$MIO_ENVIRONMENT" = test ]; then
+if [ -n "${MIO_LOCAL_REGRESSION_PASSWORD:-}" ]; then
   psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
     --set=password="$MIO_LOCAL_REGRESSION_PASSWORD" <<'SQL'
 CREATE ROLE mio_regression LOGIN PASSWORD :'password';

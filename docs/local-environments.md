@@ -8,6 +8,7 @@
 | Compose 项目                    | `mio-dev`               | `mio-test`              |
 | HTTP origin                     | `http://localhost:4310` | `http://127.0.0.1:4311` |
 | PostgreSQL 回环端口／人工使用库 | `55432` / `mio_dev`     | `55433` / `mio_test`    |
+| 同实例隔离自动化回归库          | `mio_regression_test`   | `mio_regression_test`   |
 | Redis 回环端口／namespace       | `56379` / `dev`         | `56380` / `test`        |
 | RabbitMQ AMQP／管理回环端口     | `56720` / `15680`       | `56721` / `15681`       |
 | RabbitMQ vhost                  | `mio-dev`               | `mio-test`              |
@@ -18,12 +19,14 @@
 
 ## 初始化与日常入口
 
-`pnpm env:init` 生成两份 mode 600 的配置及各自随机秘密；旧版完全没有 MQ/Worker 配置的文件只追加该组设置，已有数据库和认证秘密保留。部分缺失的 MQ/Worker 配置拒绝自动补密钥，须恢复原配置；完整文件重复初始化不变。公开格式见 [模板](../.env.example)，实际配置和 `.runtime/` 不入库。文件丢失时先恢复原配置，不能对已有卷换一套随机密码后期待账号自动更新。
+`pnpm env:init` 生成两份 mode 600 的配置及各自随机秘密；旧版缺少 MQ/Worker 配置或缺少回归库配置的文件只无损追加缺失组设置，已有数据库和认证秘密保留。部分缺失的 MQ/Worker 或回归库配置拒绝自动补密钥，须恢复原配置；完整文件重复初始化不变。公开格式见 [模板](../.env.example)，实际配置和 `.runtime/` 不入库。文件丢失时先恢复原配置，不能对已有卷换一套随机密码后期待账号自动更新。
 
 ```sh
 pnpm env:init
 pnpm infra:up:dev
+pnpm regression:init:dev
 pnpm infra:up:test
+pnpm regression:init:test
 pnpm build
 pnpm broker:init:dev
 pnpm broker:init:test
@@ -50,7 +53,7 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。完整转码以及
 
 本地 A 使用原 `MIO_COS_SECRET_ID/KEY`；本地 B 必须在同一私有环境文件另设受限的 `MIO_LOCAL_COMPUTE_COS_SECRET_ID/KEY`，缺失不回退 A，ID 与 A 相同时拒绝启动。升级已有本地 COS 配置时先补 B 独立身份，再启动 Worker；桶与地域继续共用。长期受限 Key 可直接使用；若选定临时凭据，A 使用 `MIO_COS_SESSION_TOKEN`、B 使用 `MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN`，B 字段不会注入 A。两进程由同一本地用户管理，该约定不隔离同用户对环境文件的读取权限。不得使用 Root 凭据；临时凭据失效后操作会失败，签名下载 URL 也不会超出其实际有效期，此时更换同一权限边界的凭据并重新启动对应进程即可。本配置不自动续期。
 
-`pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 或 `compute`，例如 `pnpm migrate:test conversations --apply`；资产必须先于计算迁移，分库供应商引用迁移沿[供应商规范](providers.md)。未启用域不自动迁移。
+`pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 或 `compute`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算迁移，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。未启用域不自动迁移。
 
 ## 常驻 dev 的 OneLink 与对话
 
@@ -92,10 +95,10 @@ pnpm start:dev
    curl -sS -X PATCH -b .runtime/dev/onelink-review/cookies -H 'Origin: http://localhost:4310' -H 'Content-Type: application/json' -d '{"modelRef":"MODEL_REF","expectedRevision":REV,"name":"我的模型","description":"开发用途"}' http://localhost:4310/api/v1/providers/onelink/models
    ```
 
-4. 只为当前发现且有可靠协议依据的模型建立[部署声明](providers.md#受控适配声明与实际验证)：先取得当前 Key 的成功模型目录，再将该节 JSON 的 modelRef、profile、sourceKind（`protocol-reference` 或 `runtime-observation`）、source 和 sourceVersion 填成实际值，存为私有 `declaration.json`。官方文档仅提供协议参考，不能补成员；OWNER_ID 取 `/api/v1/me` 的 `userId`，REV 取最新 ProviderView。如下显式读取 dev 文件，清除 shell 可能继承的其他环境设置；声明不会创建成员或直接标为 verified。
+4. 只为当前发现且有可靠协议依据的模型导入[单轨模型路由目录](providers.md#受控适配声明与实际验证)：先取得当前 Key 的成功模型目录，再按路由契约准备私有 `routes.json`。官方文档仅提供协议参考，不能创建或替代本人已发现的目录成员；如下通过 `route:dev` 显式导入 `mio_dev`（清除 shell 继承的其他环境设置），导入不会创建成员或直接标为 `verified`。
 
    ```sh
-   env -i PATH="$PATH" node --env-file=.env scripts/service/import-provider-adaptation.ts OWNER_ID REV .runtime/dev/onelink-review/declaration.json
+   pnpm route:dev .runtime/dev/onelink-review/routes.json
    ```
 
 5. 重新 GET 模型目录取得 revision，以稳定引用设置 chat 默认。然后创建对话并发送唯一 requestId；`202` 仅是受理，按原 requestId 查询终态并读历史，不用新 ID 重发状态未知的请求。发送会产生真实模型调用和可能费用。
@@ -124,9 +127,17 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 ## 自动化回归与人工数据
 
-测试 PostgreSQL 另建 `mio_regression_test` 和独立账号 `mio_regression`。该账号不能连接人工使用的 `mio_test`；集成测试仍仅创建/删除本轮 schema。准备原有隔离 Redis 测试二进制后，`pnpm check:local <测试范围>` 使用该回归库执行定向测试，不会把 `.env.test` 的业务开关或人工数据库注入测试进程。
+两套常驻 PostgreSQL 实例均在同一容器内另建权限隔离的 `mio_regression_test` 与专属账号 `mio_regression`（首次空卷由初始化脚本建立，既有数据卷通过 `pnpm env:init && pnpm regression:init:dev` 或 `regression:init:test` 无损幂等补建，不重置已有密码、不清业务表）。`mio_regression` 无权连接 `mio_dev` 或 `mio_test`；集成测试仅在 `mio_regression_test` 内创建并删除本轮随机 schema。
 
-Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。普通 `pnpm test <范围>` / CI 不自动加载私有环境文件，不依赖作者环境才能运行；CI 使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
+准备原有隔离 Redis 测试二进制后，本地运行 `pnpm test <测试范围>` 或 `pnpm check:local <测试范围>` 均会自动检测并优先复用本机已启动容器（优先 `mio-dev` `55432`，其次 `mio-test` `55433`）中的 `mio_regression_test`，仅注入回归库连接串，不加载 `.env`／`.env.test` 中的业务开关、万联 Key 或 COS 凭据；仅当本地两套容器均未启动或无环境文件时，`pnpm test` 才退回 `initdb` 临时集群兜底。需要真实 RabbitMQ 的本地集成测试同样自动连接已启动的本地 broker（`mio-dev` 或 `mio-test`）创建并清理独立临时 vhost 与临时账号，不触碰常驻 `mio-dev`／`mio-test` 业务队列，日常开发只需保持 `mio-dev` 运行即可。
+
+区分**破坏性自动化回归**与**获授权的本地真实业务／模型验收**：
+
+- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，始终运行在 `mio_regression_test` 随机 schema 及临时 vhost／临时 Redis 夹具中，严禁连接 `mio_dev` 或 `mio_test`。
+- **获授权的本地真实业务／模型验收**：默认直接在常驻 `dev` 环境（`.env` + `mio_dev` + `.runtime/dev/{dsh,compute}` + `mio-dev` MQ/Redis）执行——先对 `mio_dev` 预览并执行增量迁移（`pnpm migrate:dev <domain> --apply`）及路由同步（`pnpm route:dev`），再复用本人既有账号、万联凭据、主密钥和常驻 Worker 完成非破坏性真实验证，既检验既有开发数据的增量升级兼容性，也让验证通过的路由、`verified` 记录、会话和资产直接保留在 `mio_dev` 可继续使用；不再为普通模型／业务验收在 `.runtime/dev/` 反复新建一次性空数据库与临时密钥目录。
+- **破坏性中间件／重放故障演练**：如强杀在途 Worker、向交换机重投重复密文命令（`tests/compute/live-image-loop.ts`）或逐套重启容器（下述 `local-environments-live.ts`、`local-brokers-live.ts`），因会中断在途进程或抢占结果消费，才按场景使用显式隔离现场，且演练通过不替代常驻 `mio_dev` 的增量迁移同步。
+
+Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。CI 不读取私有环境文件，使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
 
 显式现场探针 `node tests/environment/local-environments-live.ts --restart-local-environments` 要求两套中间件已经 up、认证迁移完成且应用已停止。它真实注册同邮箱的独立账号、检查跨环境凭据拒绝、依次重启各套中间件并实际等待 65 秒，验证账号、旧会话和 Redis AOF 数据保留。探针不属于普通测试，会保留账号和 Redis 标记；私有账号记录及日志在 `.runtime/local-acceptance/<run>/`。退出后关闭它启动的应用，中间件继续运行。
 

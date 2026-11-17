@@ -1,14 +1,12 @@
 import assert from 'node:assert/strict';
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { parseEnv } from 'node:util';
 import type { ConsumeMessage } from 'amqplib';
 import {
   COMMAND_EXCHANGE,
@@ -33,13 +31,9 @@ import { Journal } from '../../compute/src/adapters/journal.ts';
 import { createImageWorker, recoverImageMaterialization } from '../../compute/src/image-worker.ts';
 import { Maintenance } from '../../compute/src/maintenance.ts';
 import { Worker } from '../../compute/src/worker.ts';
-import {
-  computeCapacity,
-  computePermissions,
-  computeTopology,
-} from '../../scripts/service/compute-broker-topology.ts';
 import { findFixtureImageRouteConfig } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { provisionLocalTestBroker } from '../support/local-broker-fixture.ts';
 
 const GPT_ROUTE = findFixtureImageRouteConfig('gpt-image-2');
 const VALID_PNG_BASE64 =
@@ -217,73 +211,18 @@ it('processes 15 concurrent image jobs without head-of-line blocking or quota st
     let expectedResultUser: string;
     let workerBrokerUrl: string;
 
-    if (existsSync(resolve('.env.test'))) {
-      const envTest = parseEnv(await readFile(resolve('.env.test'), 'utf8'));
-      const mgmtPort = envTest.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT;
-      const amqpPort = envTest.MIO_LOCAL_RABBITMQ_PORT;
-      const adminPass = envTest.MIO_LOCAL_RABBITMQ_PASSWORD;
-      assert(mgmtPort && amqpPort && adminPass, 'LOCAL_TEST_RABBITMQ_ENV_REQUIRED');
-      const token = randomBytes(6).toString('hex');
-      const vhost = `mio-img-conc-${token}`;
-      const userA = `mio-a-${token}`;
-      const passA = randomBytes(24).toString('base64url');
-      const userB = `mio-b-${token}`;
-      const passB = randomBytes(24).toString('base64url');
-      const adminAuth = Buffer.from(`mio-test-admin:${adminPass}`).toString('base64');
-      const mgmtBase = `http://127.0.0.1:${mgmtPort}/api/`;
-      const mgmtApi = async (method: string, path: string, body?: Record<string, unknown>) => {
-        const res = await fetch(new URL(path, mgmtBase), {
-          method,
-          headers: {
-            authorization: `Basic ${adminAuth}`,
-            ...(body ? { 'content-type': 'application/json' } : {}),
-          },
-          ...(body ? { body: JSON.stringify(body) } : {}),
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!res.ok && !(method === 'DELETE' && res.status === 404)) {
-          throw new Error(`RABBITMQ_MGMT_${res.status}:${method}:${path}`);
-        }
-      };
-      const encVhost = encodeURIComponent(vhost);
-      await mgmtApi('PUT', `vhosts/${encVhost}`, {});
-      await mgmtApi('PUT', `operator-policies/${encVhost}/mio-capacity`, {
-        pattern: '.*',
-        definition: computeCapacity,
-        priority: 0,
-        'apply-to': 'queues',
-      });
-      for (const item of computeTopology(vhost)) {
-        await mgmtApi(item.method, item.path, item.body);
-      }
-      for (const [role, username, password] of [
-        ['a', userA, passA],
-        ['b', userB, passB],
-      ] as const) {
-        await mgmtApi('PUT', `users/${encodeURIComponent(username)}`, {
-          password,
-          tags: '',
-        });
-        await mgmtApi(
-          'PUT',
-          `permissions/${encVhost}/${encodeURIComponent(username)}`,
-          computePermissions(role),
-        );
-      }
-      cleanups.push(async () => {
-        await mgmtApi('DELETE', `vhosts/${encVhost}`).catch(() => {});
-        await mgmtApi('DELETE', `users/${encodeURIComponent(userA)}`).catch(() => {});
-        await mgmtApi('DELETE', `users/${encodeURIComponent(userB)}`).catch(() => {});
-      });
-      appBrokerUrl = `amqp://${encodeURIComponent(userA)}:${encodeURIComponent(passA)}@127.0.0.1:${amqpPort}/${encVhost}`;
-      appBrokerUser = userA;
-      expectedResultUser = userB;
-      workerBrokerUrl = `amqp://${encodeURIComponent(userB)}:${encodeURIComponent(passB)}@127.0.0.1:${amqpPort}/${encVhost}`;
+    const localBroker = await provisionLocalTestBroker('mio-img-conc');
+    if (localBroker) {
+      cleanups.push(() => localBroker.close());
+      appBrokerUrl = localBroker.appBrokerUrl;
+      appBrokerUser = localBroker.userA;
+      expectedResultUser = localBroker.userB;
+      workerBrokerUrl = localBroker.workerBrokerUrl;
     } else {
       assert.equal(
         process.env.GITHUB_ACTIONS,
         'true',
-        'Local runs require .env.test and mio-test RabbitMQ',
+        'Local runs require a running local RabbitMQ container (mio-dev or mio-test)',
       );
       const hub = createInMemoryAmqpHub();
       vi.doMock('amqplib', () => ({ connect: hub.connect }));

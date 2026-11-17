@@ -1,6 +1,10 @@
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
-import { createLocalEnvironment, readLocalEnvironment } from './local-environment.ts';
+import {
+  createLocalEnvironment,
+  expectedRegressionDatabaseUrl,
+  readLocalEnvironment,
+} from './local-environment.ts';
 import { prepareProfile } from './profile.ts';
 import { localWorkerEnvironment } from './local-compute-environment.ts';
 
@@ -39,10 +43,15 @@ async function main(name: 'dev' | 'test') {
     console.log(`${name}: private configuration ${await createLocalEnvironment(name)}`);
     return;
   }
-  if (action === 'check' && name === 'test' && args.length === 0)
+  if (action === 'check' && args.length === 0)
     throw new Error('LOCAL_CHECK_SCOPE: provide a test file or directory');
   const environment = await readLocalEnvironment(name);
   const { runtime, values, host, file } = environment;
+  if (action === 'regression-init' && args.length === 0) {
+    const { prepareLocalRegression } = await import('./local-regression.ts');
+    await prepareLocalRegression(name, values);
+    return;
+  }
   if (action === 'broker-init' && args.length === 0) {
     const { prepareLocalBroker } = await import('./local-broker.ts');
     await prepareLocalBroker(name, values);
@@ -107,10 +116,16 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);
     return;
   }
-  if (action === 'check' && name === 'test') {
-    const expected = `postgresql://mio_regression:${values.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:${values.MIO_LOCAL_POSTGRES_PORT}/mio_regression_test`;
-    if (values.MIO_TEST_DATABASE_URL !== expected)
-      throw new Error('LOCAL_REGRESSION_TARGET: use the dedicated regression database');
+  if (
+    action === 'route' &&
+    args.length === 1 &&
+    (args[0] === '--stdin' || !args[0]!.startsWith('--'))
+  ) {
+    await run(process.execPath, ['scripts/service/import-provider-route.ts', args[0]!], runtime);
+    return;
+  }
+  if (action === 'check') {
+    const expected = expectedRegressionDatabaseUrl(values);
     await run('pnpm', ['test', ...args], {
       ...host,
       MIO_TEST_DATABASE_URL: expected,
@@ -121,7 +136,7 @@ async function main(name: 'dev' | 'test') {
     return;
   }
   throw new Error(
-    'LOCAL_ACTION: expected init, infra up|stop|status, broker-init, compute init|start, start, migrate or test check',
+    'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, compute init|start, start, migrate, route or check',
   );
 }
 

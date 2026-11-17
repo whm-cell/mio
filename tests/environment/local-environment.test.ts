@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -94,6 +95,25 @@ it('upgrades pre-MQ files without changing old secrets, and rejects partial iden
   expect(
     (await readFile(file, 'utf8')).includes(config.values.MIO_LOCAL_RABBITMQ_A_PASSWORD!),
   ).toBe(true);
+
+  const preRegression = upgraded
+    .split('\n')
+    .filter((line) => !/^(MIO_LOCAL_REGRESSION_PASSWORD|MIO_TEST_DATABASE_URL)=/.test(line))
+    .join('\n');
+  await writeFile(file, preRegression);
+  const preConfig = await readLocalEnvironment('dev', root, {});
+  expect(preConfig.values.MIO_TEST_DATABASE_URL).toBeUndefined();
+  expect(await createLocalEnvironment('dev', root)).toBe('upgraded');
+  const regUpgraded = await readFile(file, 'utf8');
+  expect(regUpgraded.startsWith(preRegression)).toBe(true);
+  const afterReg = await readLocalEnvironment('dev', root, {});
+  expect(afterReg.values.MIO_TEST_DATABASE_URL).toBe(
+    `postgresql://mio_regression:${afterReg.values.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:55432/mio_regression_test`,
+  );
+  expect(afterReg.runtime.MIO_TEST_DATABASE_URL).toBeUndefined();
+  expect(afterReg.runtime.MIO_LOCAL_REGRESSION_PASSWORD).toBeUndefined();
+  await writeFile(file, regUpgraded.replace(/^MIO_TEST_DATABASE_URL=.*\n/m, ''));
+  await expect(createLocalEnvironment('dev', root)).rejects.toThrow('LOCAL_REGRESSION_PARTIAL');
 });
 
 it('gives B only its own environment identity and rejects a swapped broker or journal', async () => {
@@ -349,4 +369,31 @@ it('requires a scope before reading the test environment and preserves isolated 
   expect(rejected.code).not.toBe(0);
   expect(rejected.output).toContain('LOCAL_REGRESSION_TARGET');
   await expect(readFile(env.TARGET)).rejects.toThrow();
+
+  await writeFile(path, contents);
+  await createLocalEnvironment('dev', root);
+  const listener = createServer();
+  await new Promise<void>((ok, fail) => {
+    listener.once('error', fail);
+    listener.listen(0, '127.0.0.1', ok);
+  });
+  try {
+    const bound = listener.address();
+    if (!bound || typeof bound === 'string') throw new Error('missing port');
+    const devPath = join(root, '.env');
+    const devContents = await readFile(devPath, 'utf8');
+    await writeFile(
+      devPath,
+      devContents
+        .replace(/^MIO_LOCAL_POSTGRES_PORT=55432$/m, `MIO_LOCAL_POSTGRES_PORT=${bound.port}`)
+        .replaceAll('@127.0.0.1:55432/', `@127.0.0.1:${bound.port}/`),
+    );
+    const devValues = (await readLocalEnvironment('dev', root, {})).values;
+    const viaDev = await command(entry, ['local', 'tests/auth']);
+    expect(viaDev.code, viaDev.output).toBe(0);
+    const capturedDev = JSON.parse(await readFile(env.TARGET, 'utf8'));
+    expect(capturedDev.db).toBe(devValues.MIO_TEST_DATABASE_URL);
+  } finally {
+    await new Promise<void>((ok) => listener.close(() => ok()));
+  }
 }, 30000);

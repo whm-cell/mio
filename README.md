@@ -61,15 +61,13 @@ pnpm test tests/integrations/redis.test.ts
 ```sh
 pnpm env:init
 pnpm infra:up:dev
-pnpm infra:up:test
+pnpm regression:init:dev
 pnpm build
 pnpm broker:init:dev
-pnpm broker:init:test
 pnpm migrate:dev --apply
-pnpm migrate:test --apply
-# 分别在两个终端运行；pnpm start 默认为开发。
+# 按需启用第二套人工测试环境：pnpm infra:up:test && pnpm regression:init:test && pnpm broker:init:test && pnpm migrate:test --apply
+# 分别在独立终端运行；pnpm start 默认为开发。
 pnpm start:dev
-pnpm start:test
 ```
 
 开发入口 `http://localhost:4310`，测试入口 `http://127.0.0.1:4311`。两套服务使用独立账号库；认证 POST 需要对应 Origin 和 JSON，注册/登录见[认证 HTTP](docs/apis/auth.md)。检查就绪：
@@ -79,7 +77,7 @@ curl http://127.0.0.1:4310/readyz
 curl http://127.0.0.1:4311/readyz
 ```
 
-启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。测试中间件启动后可使用 `pnpm check:local tests/auth` 对独立回归库执行定向测试，Redis 故障夹具仍需按安装章节准备。
+启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。常驻 `mio-dev`（或 `mio-test`）PostgreSQL 启动后，`pnpm test <范围>` 与 `pnpm check:local <范围>` 均自动复用同实例内权限隔离的 `mio_regression_test`（既有数据卷首次可执行 `pnpm regression:init:dev` 无损补建），不再每次通过 `initdb` 拉起临时集群，也不会访问 `mio_dev`／`mio_test` 业务数据；Redis 故障夹具仍需按安装章节准备。获授权的本地真实业务与模型验收默认在常驻 `mio_dev` 上增量迁移（`pnpm migrate:dev`、`pnpm route:dev`）并验证既有数据兼容性。
 
 配置：`MIO_HOST` 默认 `127.0.0.1`，`MIO_PORT` 默认 `4310`，`MIO_ALLOWED_ORIGINS` 默认 `[]`。DSH 当前不接受 `0.0.0.0` 通配绑定；远程部署使用明确的接口地址和已配置的 TLS 终止/反向代理。当前没有公网部署验收。
 

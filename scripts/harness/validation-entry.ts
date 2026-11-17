@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
-import { realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, realpath, stat } from 'node:fs/promises';
+import { connect } from 'node:net';
 import { resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 
 const [action, ...args] = process.argv.slice(2);
 const allowedOptions = new Set([
@@ -52,6 +54,89 @@ function within(path: string, root: string) {
   return path === root || path.startsWith(`${root}${sep}`);
 }
 
+type LocalRegressionCandidate = {
+  name: 'dev' | 'test';
+  file: string;
+  exists: boolean;
+  hasRegressionKeys: boolean;
+  validUrl: string | null;
+  port: number | null;
+};
+
+async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegressionCandidate> {
+  const file = name === 'dev' ? '.env' : '.env.test';
+  const path = resolve(file);
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { name, file, exists: false, hasRegressionKeys: false, validUrl: null, port: null };
+    }
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
+    return { name, file, exists: true, hasRegressionKeys: false, validUrl: null, port: null };
+  }
+  const values = parseEnv(await readFile(path, 'utf8'));
+  const port = Number(values.MIO_LOCAL_POSTGRES_PORT);
+  const validPort = Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : null;
+  const hasRegressionKeys =
+    values.MIO_LOCAL_REGRESSION_PASSWORD !== undefined ||
+    values.MIO_TEST_DATABASE_URL !== undefined;
+  const password = values.MIO_LOCAL_REGRESSION_PASSWORD;
+  const expected =
+    values.MIO_ENVIRONMENT === name && validPort !== null && /^[a-f0-9]{64}$/.test(password ?? '')
+      ? `postgresql://mio_regression:${password}@127.0.0.1:${validPort}/mio_regression_test`
+      : null;
+  const validUrl = expected !== null && values.MIO_TEST_DATABASE_URL === expected ? expected : null;
+  return { name, file, exists: true, hasRegressionKeys, validUrl, port: validPort };
+}
+
+function canConnectLoopback(port: number): Promise<boolean> {
+  return new Promise((done) => {
+    const socket = connect({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      done(ok);
+    };
+    socket.setTimeout(250, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+async function selectLocalCheckEnvironment(): Promise<'dev' | 'test'> {
+  const [dev, test] = await Promise.all([
+    inspectLocalRegression('dev'),
+    inspectLocalRegression('test'),
+  ]);
+  if (!dev.exists && test.exists) return 'test';
+  if (dev.exists && !test.exists) return 'dev';
+  if (dev.hasRegressionKeys && !dev.validUrl) return 'dev';
+  if (dev.validUrl && dev.port !== null && (await canConnectLoopback(dev.port))) return 'dev';
+  if (test.exists && test.port !== null && (await canConnectLoopback(test.port))) return 'test';
+  return dev.validUrl ? 'dev' : 'test';
+}
+
+async function resolveAutoRegressionDatabaseUrl(): Promise<string | null> {
+  for (const name of ['dev', 'test'] as const) {
+    const candidate = await inspectLocalRegression(name);
+    if (!candidate.exists) continue;
+    if (candidate.hasRegressionKeys && !candidate.validUrl) {
+      throw new Error(
+        `LOCAL_REGRESSION_TARGET: invalid regression database setting in ${candidate.file}`,
+      );
+    }
+    if (candidate.validUrl && candidate.port !== null && (await canConnectLoopback(candidate.port)))
+      return candidate.validUrl;
+  }
+  return null;
+}
+
 async function main() {
   if (action === 'check') {
     if (process.env.GITHUB_ACTIONS !== 'true')
@@ -76,7 +161,8 @@ async function main() {
     throw new Error('TEST_OPTION: option changes discovery or is not supported by this entry');
 
   if (action === 'local') {
-    await run(process.execPath, ['scripts/service/local.ts', 'test', 'check', ...args]);
+    const targetEnv = await selectLocalCheckEnvironment();
+    await run(process.execPath, ['scripts/service/local.ts', targetEnv, 'check', ...args]);
     return;
   }
 
@@ -96,6 +182,11 @@ async function main() {
       return { scope, path, target, directory: metadata.isDirectory() };
     }),
   );
+  if (!process.env.MIO_TEST_DATABASE_URL) delete process.env.MIO_TEST_DATABASE_URL;
+  if (process.env.GITHUB_ACTIONS !== 'true' && !process.env.MIO_TEST_DATABASE_URL) {
+    const detected = await resolveAutoRegressionDatabaseUrl();
+    if (detected) process.env.MIO_TEST_DATABASE_URL = detected;
+  }
   process.env.TEST = 'true';
   process.env.VITEST = 'true';
   process.env.NODE_ENV ??= 'test';

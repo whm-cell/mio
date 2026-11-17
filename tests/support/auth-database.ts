@@ -66,6 +66,17 @@ export async function authDatabase() {
       await pool.query(`CREATE SCHEMA "${schema}"`);
     } catch (error) {
       await pool.end();
+      const code = (error as { code?: unknown }).code;
+      if (
+        !started &&
+        (code === '28P01' || code === '3D000') &&
+        new URL(url).pathname === '/mio_regression_test'
+      ) {
+        throw new Error(
+          `LOCAL_REGRESSION_UNINITIALIZED: mio_regression_test is not initialized on this PostgreSQL volume (${code}); run pnpm regression:init:dev (or pnpm regression:init:test)`,
+          { cause: error },
+        );
+      }
       throw error;
     }
     const scoped = new URL(url);

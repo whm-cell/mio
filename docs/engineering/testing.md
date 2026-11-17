@@ -6,7 +6,7 @@
 
 直接浏览源码时从 [tests 目录索引](../../tests/README.md)进入；目录按稳定能力归属，不随 PRD 拆分或完成迁移。
 
-本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。`pnpm check:local <范围>` 以隔离回归环境运行定向测试；完整 `pnpm check` 由 GitHub Actions 执行。
+本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。常驻 `mio-dev`（或 `mio-test`）启动后，`pnpm test <范围>` 与 `pnpm check:local <范围>` 均自动优先复用同容器内权限隔离的 `mio_regression_test`（既有数据卷先执行一次 `pnpm env:init && pnpm regression:init:dev`），需要真实 RabbitMQ 的本地集成测试同样自动在已启动的本地 broker 上创建并清理临时 vhost；仅本地容器均未启动时 `pnpm test` 才退回 `initdb` 临时集群。完整 `pnpm check` 由 GitHub Actions 执行。
 
 本地可运行 `pnpm check:static:base`，依次执行格式、类型、lint 和护栏；`pnpm check:static` 运行这四项后再构建，均不运行测试或插件装载 smoke。完整 `pnpm check` 先验证 GitHub Actions 环境，再依次运行相同的四项静态检查、全部测试、完整构建和 `test:smoke`，使最终 smoke 使用测试后的构建产物；静态通过不能替代测试、完整覆盖或业务验收结论。
 
@@ -24,9 +24,9 @@
 
 名称模式只用于定位。文件发现以 [Vitest 配置](../../vitest.config.ts)和实际文件为准，例如 `rg --files tests compute/tests -g '*.test.ts'`；同域新增测试不逐个登记，未知或未匹配文件保持待判断。新增能力只补对应入口；PRD 迁移追查身份、链接和交付，不按目录名重新分配运行时测试。
 
-共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。`*-live.ts` 等现场入口按领域契约单独核对环境、凭据和费用授权，发现入口不等于授权执行。
+共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。获授权的本地真实业务与模型验收默认在[常驻 dev 环境](../local-environments.md#自动化回归与人工数据)上执行增量迁移（`pnpm migrate:dev`、`pnpm route:dev`）与既有账号／凭据的非破坏验证，不再为普通业务验收新建空数据库；`*-live.ts` 等破坏性故障或重放演练入口按领域契约单独核对环境、凭据和费用授权，发现入口不等于授权执行。
 
-已授权的图片真实闭环按阶段传入不同参数：
+已授权的图片破坏性中断／重复消息重放演练按阶段传入不同参数（保留独立空库与队列隔离互锁，不替代常驻 `mio_dev` 的增量迁移与业务验证）：
 
 ```sh
 MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] prepare <.runtime/run-dir> <infrastructure-dir> <provider-key-file> <task-id>

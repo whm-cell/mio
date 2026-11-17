@@ -6,7 +6,7 @@ import { Readable } from 'node:stream';
 import COS from 'cos-nodejs-sdk-v5';
 import { ObjectStore } from '../../compute/src/adapters/cos.ts';
 
-// Explicitly run only with an authorized isolated test bucket and a B identity.
+// Explicitly run only with an authorized target bucket and a separate B identity.
 if (process.env.MIO_RUN_IMAGE_UPLOAD_COS_PROBE !== 'yes')
   throw new Error('IMAGE_UPLOAD_COS_PROBE_OPT_IN_REQUIRED');
 const bucket = process.env.MIO_COS_BUCKET;

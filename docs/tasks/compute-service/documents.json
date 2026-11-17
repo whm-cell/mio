@@ -15,6 +15,11 @@
       "identity": "docs/tasks/compute-service/protocol.md",
       "kind": "design",
       "path": "docs/tasks/compute-service/protocol.md"
+    },
+    {
+      "identity": "docs/tasks/compute-service/changes/image-upload-verification/change.md",
+      "kind": "change",
+      "path": "docs/tasks/compute-service/changes/image-upload-verification/change.md"
     }
   ]
 }

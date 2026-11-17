@@ -13,3 +13,5 @@
 进程启动意图已提交而 PID 尚未持久化时，Worker 会发送 `PROCESS_UNKNOWN` 并停止新计算；重启不能证明旧进程结束。人工应先停止 Worker，核对同一宿主、启动周期和进程命名空间，并通过覆盖该运行环境的进程/隔离运行时记录，确认对应 FFmpeg 及其子进程均已终止。无法确认就保持 HOLD。**只有人工实际完成确认后**，以同一目录及实例身份运行 `node compute/dist/main.js resolve-no-pid <attempt-id> --confirmed-process-terminated '<确认依据>'`；它只接受无 PID 的 unknown 记录，保存依据并持久创建 interrupted 事件。再次启动后有界对账会发布该事件。该操作不会重新执行原 attempt。
 
 上传结果未知时保留原输出、attempted fileId 和 journal；每次图片物化重试使用新的 `index-fileId` 对象键，成功 winner 的键稳定用于下载，未知对象只保留身份供后续只读对账，不能复用或覆盖。视频上传仍按固定 attempt 键和其对账规则处理。连接或读写无进度的 60 秒超时与总预算不同；本地超时不证明远端 PUT 已取消。未知对象内容不符或本地输出缺失时保持待对账，不删除 COS 资产。
+
+图片成功物化使用本地内容校验和 COS Content-MD5 提交校验，并核对 PUT 与 HEAD 的 ETag、大小及 SHA-256 元数据；HEAD 不重算对象 SHA-256。视频未知上传恢复仍通过 GET 流式校验内容。

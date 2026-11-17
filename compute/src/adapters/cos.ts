@@ -184,13 +184,14 @@ export class ObjectStore {
     void settled.then(() => {
       if (this.#pendingUploads.get(key) === settled) this.#pendingUploads.delete(key);
     });
-    await within(() => request, signal);
+    const uploaded = await within(() => request, signal);
+    if (!uploaded?.ETag) throw new Error('IMAGE_OUTPUT_MISMATCH');
     const existing = await this.head(key, signal);
     if (
       !existing ||
       existing.sizeBytes !== bytes.length ||
       existing.sha256 !== sha256 ||
-      !(await this.verify(key, bytes.length, sha256, signal))
+      existing.etag !== uploaded.ETag
     )
       throw new Error('IMAGE_OUTPUT_MISMATCH');
     return {

@@ -66,7 +66,7 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 
 `image.query` 的原 `credential` 信封只用于核对提交时 journal 身份；A 首次发布某次 query 前按任务的可信 owner 取得当前 Key，另封装 `queryCredential` 并持久冻结供 B 查询使用；同一消息重投复用该信封，不同 attempt 重新取当前 Key。`queryDeadline` 取 PG 异步截止与原命令有效期较早者；query 信封绑定任务、owner、profile、输入、原命令、上游 task ID、attempt、消息 ID 和截止时间。首次封装与并发轮换并非原子。旧消息允许解析但缺少 `queryCredential` 或 `queryDeadline` 时不访问供应商，返回可对账的 credential unavailable；迟到消息不执行 GET。同一已知任务以更高 queryAttempt 恢复，重复或更旧 attempt 不重复 GET。不能取得当前 Key 或消息超限时保留任务与上游 ID，不重发提交。首次查询尽快执行，处理中的后续查询按有效截止与剩余次数分配，过期后不再派发。
 
-图片结果使用 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，其中 `index` 是原始输出序号、`fileId` 是小写 UUID v4。B 在每次实际 PUT 前把该 fileId 追加到 journal；PUT、超时或进程异常后均不得复用同一对象键，下一次物化必须生成新的 fileId。图片 PUT 不先 HEAD 复用对象，也不依赖 `x-cos-forbid-overwrite`；成功后仍 HEAD 并按长度、SHA-256 元数据和实际读取内容核验。结果携带完整唯一键，A 严格解析 jobId、index、fileId、扩展名和 MIME，并在 PG 中把首个有效键绑定为该输出序号的 owner 资产；旧键保留为可对账孤儿，不覆盖已登记 winner。视频结果仍遵守上一段固定 attempt 键及其禁止覆盖前提；这两类约束不得混用。
+图片结果使用 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，其中 `index` 是原始输出序号、`fileId` 是小写 UUID v4。B 在每次实际 PUT 前把该 fileId 追加到 journal；PUT、超时或进程异常后均不得复用同一对象键，下一次物化必须生成新的 fileId。B 本地校验图片并计算 SHA-256 和 Content-MD5，PUT 以流发送并携带禁止覆盖头；COS 按 Content-MD5 校验提交内容。PUT 必须成功并返回 ETag，随后 HEAD 的长度、SHA-256 元数据及 ETag 须与本次 PUT 一致，成功路径不再 GET 全量内容。HEAD 只核对对象关联和元数据，不代表服务端重新计算 SHA-256；ETag 是对象标识，不当作 MD5。结果携带完整唯一键，A 严格解析 jobId、index、fileId、扩展名和 MIME，并在 PG 中把首个有效键绑定为该输出序号的 owner 资产；旧键保留为可对账孤儿，不覆盖已登记 winner。视频结果仍遵守上一段固定 attempt 键及其禁止覆盖前提；这两类约束不得混用。
 
 ## 路由、回执与状态
 

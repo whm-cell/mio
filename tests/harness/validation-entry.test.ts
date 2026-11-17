@@ -24,6 +24,7 @@ async function fixture() {
   );
   await symlink(resolve('node_modules'), join(root, 'node_modules'), 'dir');
   await symlink(entry, join(root, 'scripts/harness/validation-entry.ts'));
+  await writeFile(join(root, 'package.json'), '{"type":"module"}\n');
   await writeFile(
     join(root, 'vitest.config.ts'),
     "export default { test: { include: ['tests/**/*.test.ts', 'compute/tests/**/*.test.ts'] } };\n",
@@ -190,11 +191,13 @@ it('runs the static sequence locally and gates the full sequence to Actions', as
   await writeFile(
     join(root, 'pnpm'),
     `#!${process.execPath}
+import { spawnSync } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 const step = process.argv[2];
-require('node:fs').appendFileSync(process.env.MARKER, step + '\\n');
+appendFileSync(process.env.MARKER, step + '\\n');
 if (process.env.FAIL_AT === step) process.exit(9);
 if (step === 'check:static') {
-  const result = require('node:child_process').spawnSync(
+  const result = spawnSync(
     '/bin/sh', ['-c', ${JSON.stringify(pkg.scripts['check:static'])}],
     { stdio: 'inherit', env: process.env },
   );

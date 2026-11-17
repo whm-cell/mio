@@ -1,7 +1,15 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -129,7 +137,47 @@ it('reads the journal only after the worker releases its exclusive lock', () => 
 it('keeps only a valid failure code when an assertion includes sensitive trailing details', async () => {
   const runtime = resolve('.runtime');
   mkdirSync(runtime, { recursive: true });
-  const directory = mkdtempSync(join(runtime, 'mio-live-safe-code-'));
+  const directory = realpathSync(mkdtempSync(join(realpathSync(runtime), 'mio-live-safe-code-')));
+  const workspacePath = join(directory, 'fixture');
+  mkdirSync(workspacePath);
+  const workspace = realpathSync(workspacePath);
+  writeFileSync(join(workspace, '.gitignore'), '.work/\n.runtime/\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: workspace, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  git('init', '-q');
+  git('add', '.gitignore');
+  git(
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'commit',
+    '-qm',
+    'fixture',
+  );
+  const commit = git('rev-parse', 'HEAD');
+  const taskId = 'live-safe-code';
+  const taskDirectory = join(workspace, '.work', 'tasks', taskId);
+  mkdirSync(taskDirectory, { recursive: true, mode: 0o700 });
+  mkdirSync(join(workspace, '.runtime'), { mode: 0o700 });
+  writeFileSync(
+    join(taskDirectory, 'state.json'),
+    JSON.stringify({
+      workspace,
+      plan: { id: taskId },
+      stage: 'C1_EVIDENCE_PENDING',
+      contractRevision: 0,
+      checkpoint: { candidate: { commit, contractRevision: 0 } },
+    }),
+    { mode: 0o600 },
+  );
   const infrastructure = join(directory, 'infra');
   mkdirSync(infrastructure, { mode: 0o700 });
   const write = (name: string, content: string) =>
@@ -171,18 +219,19 @@ assert.equal = (...args) => {
   );
   try {
     for (const invalid of [false, true]) {
-      const run = join(directory, invalid ? 'invalid' : 'valid');
+      const run = join(workspace, '.runtime', invalid ? 'invalid' : 'valid');
       const child = spawn(
         process.execPath,
         [
-          'tests/compute/live-image-loop.ts',
+          resolve('tests/compute/live-image-loop.ts'),
           'prepare',
           run,
           infrastructure,
           '/unused',
-          'a'.repeat(64),
+          taskId,
         ],
         {
+          cwd: workspace,
           env: {
             ...process.env,
             MIO_RUN_LIVE_IMAGE: 'yes',

@@ -20,11 +20,12 @@ import {
   type ImageRouteParamSpec,
 } from '@mio/compute-contracts';
 import { Journal } from '../src/adapters/journal.ts';
+import { validateImage } from '../src/adapters/media.ts';
 import { createImageWorker } from '../src/image-worker.ts';
 import { createRoutedImageProtocol, defaultRouteAsyncTransport } from '../src/images.ts';
 import { sealImageKey } from '../../src/compute/image-credentials.ts';
 
-function encodeSample(codec: 'png' | 'mjpeg'): Uint8Array {
+function encodeSample(codec: 'png' | 'mjpeg' | 'libwebp'): Uint8Array {
   const encoded = spawnSync(
     'ffmpeg',
     [
@@ -427,6 +428,203 @@ describe('four OneLink vendor image drivers', () => {
       rmSync(directory, { recursive: true });
     }
   });
+
+  it('materializes an unspecified-format Seedream Base64 JPEG with its actual format', async () => {
+    const route = makeRoute(
+      'volcengine-ark-images',
+      'volcengine',
+      '/volc/api/v3/images/generations',
+      { allowedSizes: ['2K'], maxReferenceImages: 1, allowGenerateReferences: true },
+    );
+    const directory = mkdtempSync(join(tmpdir(), 'mio-volc-jpeg-'));
+    const journal = new Journal(directory, randomUUID(), true);
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        Response.json({ data: [{ b64_json: Buffer.from(JPEG_BYTES).toString('base64') }] }),
+      );
+    const materialize = vi.fn(
+      async (job: string, index: number, base64: string, format: string, fileId: string) => {
+        const bytes = Buffer.from(base64, 'base64');
+        validateImage(bytes, format);
+        return {
+          key: imageOutputKey(job, index, fileId, format as 'jpeg'),
+          sizeBytes: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+          etag: 'etag',
+          contentType: `image/${format}`,
+        };
+      },
+    );
+    try {
+      const worker = createImageWorker(
+        journal,
+        'b1',
+        keys.privateKey,
+        materialize,
+        transport,
+        async () => PNG_BYTES,
+      );
+      const cmd = routedCommand(route, {
+        model: 'doubao-seedream-4.5',
+        prompt: 'one reference',
+        n: 1,
+        size: '2K',
+        images: [assetRef()],
+      });
+      const outcome = await worker(cmd);
+      expect(outcome).toMatchObject({
+        state: 'completed',
+        outputs: [
+          {
+            sizeBytes: JPEG_BYTES.length,
+            sha256: createHash('sha256').update(JPEG_BYTES).digest('hex'),
+            contentType: 'image/jpeg',
+          },
+        ],
+      });
+      expect(materialize.mock.calls[0]?.[3]).toBe('jpeg');
+      expect(await worker(cmd)).toEqual(outcome);
+      expect(transport).toHaveBeenCalledOnce();
+    } finally {
+      journal.close();
+      rmSync(directory, { recursive: true });
+    }
+  });
+
+  it('detects unspecified Base64 formats without changing existing URL fallback rules', async () => {
+    const route = makeRoute(
+      'volcengine-ark-images',
+      'volcengine',
+      '/volc/api/v3/images/generations',
+      {},
+    );
+    const samples = [
+      ['png', PNG_BYTES],
+      ['jpeg', JPEG_BYTES],
+      ['webp', encodeSample('libwebp')],
+    ] as const;
+    for (const [format, bytes] of samples) {
+      const base64 = Buffer.from(bytes).toString('base64');
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(Response.json({ data: [{ b64_json: base64 }] }));
+      expect(
+        await createRoutedImageProtocol(route, 'generate', transport).submit(
+          { model: 'sample', prompt: 'sample' },
+          'fixture-secret',
+        ),
+      ).toEqual({ state: 'returned', images: [{ base64, format }] });
+      expect(transport).toHaveBeenCalledOnce();
+    }
+
+    let downloadCalls = 0;
+    const download = async <T>(
+      _url: URL,
+      _signal: AbortSignal,
+      action: (response: Response) => Promise<T>,
+    ): Promise<T> => {
+      downloadCalls++;
+      return action(new Response(Buffer.from(JPEG_BYTES)));
+    };
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ data: [{ b64_json: 'YWJj', url: 'https://cdn.example.com/image' }] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ data: [{ b64_json: 'bad!', url: 'https://cdn.example.com/image' }] }),
+      );
+    const protocol = createRoutedImageProtocol(
+      route,
+      'generate',
+      transport,
+      undefined,
+      undefined,
+      download,
+    );
+    const input = { model: 'sample', prompt: 'sample' };
+    expect(await protocol.submit(input, 'fixture-secret')).toEqual({
+      state: 'returned',
+      images: [{ base64: 'YWJj' }],
+    });
+    expect(downloadCalls).toBe(0);
+    expect(await protocol.submit(input, 'fixture-secret')).toEqual({
+      state: 'returned',
+      images: [{ base64: Buffer.from(JPEG_BYTES).toString('base64'), format: 'jpeg' }],
+    });
+    expect(downloadCalls).toBe(1);
+  });
+
+  it.each([
+    ['explicit png', 'png', null, JPEG_BYTES, 'partial'],
+    ['fixed jpeg', undefined, 'jpeg', JPEG_BYTES, 'completed'],
+    ['fixed jpeg mismatch', undefined, 'jpeg', PNG_BYTES, 'partial'],
+    ['truncated jpeg', undefined, null, Uint8Array.from([0xff, 0xd8, 0xff]), 'validation-failure'],
+  ] as const)(
+    'retains image validation for %s',
+    async (_name, requestedFormat, fixedFormat, bytes, expectedState) => {
+      const route = makeRoute(
+        'volcengine-ark-images',
+        'volcengine',
+        '/volc/api/v3/images/generations',
+        { allowedOutputFormats: ['png', 'jpeg', 'webp'] },
+        { fixedOutputFormat: fixedFormat },
+      );
+      const directory = mkdtempSync(join(tmpdir(), 'mio-volc-format-'));
+      const journal = new Journal(directory, randomUUID(), true);
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          Response.json({ data: [{ b64_json: Buffer.from(bytes).toString('base64') }] }),
+        );
+      const materialize = vi.fn(
+        async (job: string, index: number, base64: string, format: string, fileId: string) => {
+          const decoded = Buffer.from(base64, 'base64');
+          validateImage(decoded, format);
+          return {
+            key: imageOutputKey(job, index, fileId, format as 'png' | 'jpeg' | 'webp'),
+            sizeBytes: decoded.length,
+            sha256: createHash('sha256').update(decoded).digest('hex'),
+            etag: 'etag',
+            contentType: `image/${format}`,
+          };
+        },
+      );
+      try {
+        const worker = createImageWorker(journal, 'b1', keys.privateKey, materialize, transport);
+        const cmd = routedCommand(route, {
+          model: 'sample',
+          prompt: 'sample',
+          ...(requestedFormat ? { output_format: requestedFormat } : {}),
+        });
+        const outcome = await worker(cmd);
+        if (expectedState === 'validation-failure') {
+          let validationCode = '';
+          try {
+            validateImage(Buffer.from(bytes), 'jpeg');
+          } catch (error) {
+            validationCode = error instanceof Error ? error.message : '';
+          }
+          expect(['IMAGE_OUTPUT_INVALID', 'IMAGE_VALIDATION_INCOMPLETE']).toContain(validationCode);
+          const firstState =
+            validationCode === 'IMAGE_OUTPUT_INVALID' ? 'partial' : 'materializing';
+          expect(outcome).toMatchObject({ state: firstState, outputs: [] });
+          expect((await worker(cmd)).state).toBe(firstState);
+          if (firstState === 'materializing')
+            expect((await worker(cmd)).state).toBe('materialization_failed');
+        } else {
+          expect(outcome.state).toBe(expectedState);
+          if (expectedState !== 'completed') expect(outcome).toMatchObject({ outputs: [] });
+        }
+        expect(materialize.mock.calls[0]?.[3]).toBe(requestedFormat ?? fixedFormat ?? 'jpeg');
+        expect(transport).toHaveBeenCalledOnce();
+      } finally {
+        journal.close();
+        rmSync(directory, { recursive: true });
+      }
+    },
+  );
 
   it('runs vidu-images custom route submit and {task_id} query template substitution', async () => {
     const route = makeRoute(

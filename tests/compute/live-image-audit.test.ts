@@ -266,6 +266,8 @@ describe('offline live scenario preparation', () => {
       n: 1,
     });
     expect(liveImageParameters('seedream-50-lite-sync')).toMatchObject({
+      prompt:
+        'Generate exactly two separate images: first a blue square on a white background; second a blue circle on a white background.',
       size: '2K',
       output_format: 'png',
       n: 2,
@@ -432,6 +434,7 @@ describe('offline live scenario preparation', () => {
     );
     const body = JSON.parse(String(transport.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
     expect(body).toMatchObject({
+      prompt: parameters.prompt,
       size: '2K',
       output_format: 'png',
       sequential_image_generation: 'auto',

@@ -352,7 +352,13 @@ export function liveImageParameters(selectedScenario: Scenario, referenceAssetId
     };
   }
   if (selectedScenario === 'seedream-50-lite-sync')
-    return { prompt, n: 2, size: '2K', output_format: 'png' };
+    return {
+      prompt:
+        'Generate exactly two separate images: first a blue square on a white background; second a blue circle on a white background.',
+      n: 2,
+      size: '2K',
+      output_format: 'png',
+    };
   if (selectedScenario === 'gpt-edit') {
     assert(referenceAssetId, 'LIVE_REFERENCE_REQUIRED');
     return {

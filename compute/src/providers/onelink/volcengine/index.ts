@@ -103,7 +103,14 @@ export async function submitVolcengineImage(
         continue;
       }
       if (validBase64(item.b64_json) && !item.b64_json.includes(apiKey)) {
-        images.push({ base64: item.b64_json });
+        let format: 'png' | 'jpeg' | 'webp' | undefined;
+        if (!input.output_format && !route.outputSpec.fixedOutputFormat) {
+          const prefix = Buffer.from(item.b64_json.slice(0, 16), 'base64');
+          format = (['png', 'jpeg', 'webp'] as const).find((candidate) =>
+            matchesImageSignature(prefix, `image/${candidate}`),
+          );
+        }
+        images.push({ base64: item.b64_json, ...(format ? { format } : {}) });
         continue;
       }
       if (typeof item.url === 'string') {

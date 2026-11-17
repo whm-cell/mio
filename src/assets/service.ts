@@ -1,8 +1,10 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
-import { AssetError, MAX_ASSET_BYTES } from './contracts.ts';
-import type { AssetObjectStore, AssetPrincipal } from './contracts.ts';
+import { createHash } from 'node:crypto';
+import { isValidImageAssetObjectKey } from '@mio/compute-contracts';
+import { AssetError, MAX_ASSET_BYTES, MAX_VISION_SOURCE_BYTES } from './contracts.ts';
+import type { AssetObjectStore, AssetPrincipal, VisionSource } from './contracts.ts';
 import type { AssetRow, AssetStore } from './store.ts';
 
 const log = createLogger('app', 'assets');
@@ -45,13 +47,13 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
   };
   // The SDK does not expose cancellation for these calls. Stop waiting after the drain
   // deadline; a late copy has a unique key and cannot register through this operation.
-  const waitObject = <T>(start: () => Promise<T>): Promise<T> => {
-    if (stop.signal.aborted)
+  const waitObject = <T>(start: () => Promise<T>, signal = stop.signal): Promise<T> => {
+    if (signal.aborted)
       return Promise.reject(new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE'));
     return new Promise<T>((resolve, reject) => {
       const finish = () => {
         clearTimeout(deadline);
-        stop.signal.removeEventListener('abort', abort);
+        signal.removeEventListener('abort', abort);
       };
       const abort = () => {
         finish();
@@ -61,7 +63,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         finish();
         reject(new Error('ASSET_OBJECT_TIMEOUT'));
       }, 180_000);
-      stop.signal.addEventListener('abort', abort, { once: true });
+      signal.addEventListener('abort', abort, { once: true });
       Promise.resolve()
         .then(start)
         .then(
@@ -138,6 +140,72 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         if (stop.signal.aborted)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         return view(row, objects);
+      });
+    },
+    readVisionSource(
+      ownerId: string,
+      id: string,
+      expected: { etagDigest: string; sourceDigest: string } | undefined,
+      signal: AbortSignal,
+    ): Promise<VisionSource> {
+      return admit(async () => {
+        const combined = AbortSignal.any([signal, stop.signal, AbortSignal.timeout(60_000)]);
+        combined.throwIfAborted();
+        const row = await store.owned(id, ownerId);
+        const size = Number(row.size_bytes);
+        if (
+          row.state !== 'ready' ||
+          !row.raw_key ||
+          !isValidImageAssetObjectKey(id, row.raw_key, row.content_type)
+        )
+          throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+        if (!Number.isSafeInteger(size) || size < 1 || size > MAX_VISION_SOURCE_BYTES)
+          throw new AssetError(HTTP_STATUS.BAD_REQUEST, 'ASSET_INPUT_INVALID');
+        if (!objects.readImage)
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
+        let head: Awaited<ReturnType<AssetObjectStore['head']>>;
+        let data: Uint8Array;
+        try {
+          head = await waitObject(() => objects.head(row.raw_key!), combined);
+          combined.throwIfAborted();
+          if (
+            head.size !== size ||
+            !head.etag ||
+            head.etag.length > 256 ||
+            /[\x00-\x1f\x7f]/.test(head.etag)
+          )
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+          const etagDigest = createHash('sha256').update(head.etag).digest('hex');
+          if (expected && expected.etagDigest !== etagDigest)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+          data = await objects.readImage(row.raw_key, head.etag, size, combined);
+          combined.throwIfAborted();
+          if (data.byteLength !== size)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+          const sourceDigest = createHash('sha256').update(data).digest('hex');
+          if (expected && expected.sourceDigest !== sourceDigest)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+          const current = await store.owned(id, ownerId);
+          if (
+            current.state !== 'ready' ||
+            current.raw_key !== row.raw_key ||
+            current.size_bytes !== row.size_bytes ||
+            current.content_type !== row.content_type
+          )
+            throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+          return {
+            assetId: id,
+            contentType: row.content_type as VisionSource['contentType'],
+            data,
+            etagDigest,
+            sourceDigest,
+          };
+        } catch (error) {
+          if (error instanceof AssetError) throw error;
+          if (statusCode(error) === 412)
+            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
+        }
       });
     },
     complete(actor: AssetPrincipal, id: string) {

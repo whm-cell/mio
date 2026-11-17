@@ -5,6 +5,11 @@
       "identity": "docs/tasks/conversation-service/prd.md",
       "kind": "prd",
       "path": "docs/tasks/conversation-service/prd.md"
+    },
+    {
+      "identity": "docs/tasks/conversation-service/changes/conversation-vision-input/change.md",
+      "kind": "change",
+      "path": "docs/tasks/conversation-service/changes/conversation-vision-input/change.md"
     }
   ]
 }

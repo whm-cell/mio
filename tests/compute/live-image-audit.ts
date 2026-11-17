@@ -12,12 +12,12 @@ import { join, resolve } from 'node:path';
 // Acceptance-only safety interlock: no headers, request body, URL token or credential is logged.
 const maxUpstreamGeneratePosts = 1;
 const SCENARIO_POST_ENDPOINTS = {
-  'vidu-async': [
-    'https://api.onelinkai.cloud/vidu/ent/v2/reference2image',
-    'https://api.onelinkai.cloud/vidu/ent/v2/img2img',
-  ],
+  'vidu-async': ['https://api.onelinkai.cloud/vidu/ent/v2/reference2image'],
   'kling-async': ['https://api.onelinkai.cloud/kling/v1/images/generations'],
+  'kling-omni-async': ['https://api.onelinkai.cloud/kling/v1/images/omni-image'],
   'seedream-sync': ['https://api.onelinkai.cloud/volc/api/v3/images/generations'],
+  'seedream-45-sync': ['https://api.onelinkai.cloud/volc/api/v3/images/generations'],
+  'seedream-50-lite-sync': ['https://api.onelinkai.cloud/volc/api/v3/images/generations'],
   'gpt-sync': ['https://api.onelinkai.cloud/v1/images/generations'],
   'gpt-edit': ['https://api.onelinkai.cloud/v1/images/edits'],
 } as const;
@@ -26,7 +26,8 @@ const rawScenario = process.env.MIO_LIVE_IMAGE_SCENARIO;
 const scenario = (
   rawScenario && rawScenario.length > 0 ? rawScenario : 'vidu-async'
 ) as AuditScenario;
-if (!(scenario in SCENARIO_POST_ENDPOINTS)) throw new Error('LIVE_IMAGE_SCENARIO_INVALID');
+if (!Object.hasOwn(SCENARIO_POST_ENDPOINTS, scenario))
+  throw new Error('LIVE_IMAGE_SCENARIO_INVALID');
 const allowedPostEndpoints: readonly string[] = SCENARIO_POST_ENDPOINTS[scenario];
 const directory = process.env.MIO_LIVE_IMAGE_AUDIT_DIRECTORY;
 if (!directory) throw new Error('LIVE_IMAGE_AUDIT_DIRECTORY_REQUIRED');
@@ -92,7 +93,7 @@ async function observeQuery(response: Response, attempt: number) {
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         const payload = value as Record<string, unknown>;
         let creations: unknown;
-        if (scenario === 'kling-async') {
+        if (scenario === 'kling-async' || scenario === 'kling-omni-async') {
           facts.codeZero = payload.code === 0;
           const data =
             payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
@@ -183,10 +184,16 @@ globalThis.fetch = (input, init) => {
   const query =
     method === 'GET' &&
     target.origin === 'https://api.onelinkai.cloud' &&
+    !target.username &&
+    !target.password &&
+    !target.search &&
+    !target.hash &&
     ((scenario === 'vidu-async' &&
       /^\/vidu\/ent\/v2\/tasks\/[^/]+\/creations$/.test(target.pathname)) ||
       (scenario === 'kling-async' &&
-        /^\/kling\/v1\/images\/generations\/[^/]+$/.test(target.pathname)));
+        /^\/kling\/v1\/images\/generations\/[^/]+$/.test(target.pathname)) ||
+      (scenario === 'kling-omni-async' &&
+        /^\/kling\/v1\/images\/omni-image\/[^/]+$/.test(target.pathname)));
   const providerPost = !query;
   let queryAttempt = 0;
   if (query && process.env.MIO_LIVE_IMAGE_HOLD_FIRST_QUERY === 'yes') {
@@ -249,7 +256,8 @@ globalThis.fetch = (input, init) => {
     if (!expected) throw new Error('LIVE_IMAGE_UNEXPECTED_PROVIDER_POST');
     mark(allowed);
   }
-  const result = originalFetch(input, init);
+  // Redirects must not bypass the endpoint allowlist or the durable POST lock.
+  const result = originalFetch(input, { ...init, redirect: 'error' });
   return result.then(
     (response) => {
       if (query) {

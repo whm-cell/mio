@@ -113,7 +113,7 @@ export function createConversationHandler(
       }
       const expected =
         action === 'messages'
-          ? ['requestId', 'text']
+          ? ['requestId', 'text', 'imageAssetIds']
           : (base && method === 'POST') || action === 'model'
             ? ['modelRef']
             : [];
@@ -167,12 +167,25 @@ export function createConversationHandler(
           !requestIdPattern.test(value.requestId) ||
           typeof value.text !== 'string' ||
           !value.text.trim() ||
-          Buffer.byteLength(value.text) > MAX_BODY
+          Buffer.byteLength(value.text) > MAX_BODY ||
+          (value.imageAssetIds !== undefined &&
+            (!Array.isArray(value.imageAssetIds) ||
+              value.imageAssetIds.length > 4 ||
+              value.imageAssetIds.some(
+                (assetId: unknown) => typeof assetId !== 'string' || !isUuidV4(assetId),
+              ) ||
+              new Set(value.imageAssetIds).size !== value.imageAssetIds.length))
         )
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(
           HTTP_STATUS.ACCEPTED,
-          await service.send(actor, id!, value.requestId, value.text),
+          await service.send(
+            actor,
+            id!,
+            value.requestId,
+            value.text,
+            value.imageAssetIds as string[] | undefined,
+          ),
         );
       }
       if (action === 'cancel') return send(HTTP_STATUS.ACCEPTED, await service.cancel(actor, id!));

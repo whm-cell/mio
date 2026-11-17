@@ -1,0 +1,60 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-agent-tools/prd.md",
+  "results": [
+    {
+      "key": "onelink-conversation-image-tools",
+      "title": "对话受控意图级生图工具闭环、单调预算守卫升级与多原厂资产流转",
+      "locations": [
+        {
+          "path": "src/dsh/policy.ts",
+          "purpose": "根级与会话 Agent 单调工具拒绝守卫（模块私有 WeakMap 活动轮次授权与单轮 12 次调用/4 次提交预算互锁）"
+        },
+        {
+          "path": "src/dsh/image-tools.ts",
+          "purpose": "会话级 list_image_models、submit_image_job、get_image_job 意图级工具注册、确定性 UUID v4 幂等键派生与 mio.image-job 严格结构白名单解析"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "单轮硬步数熔断（MAX_TURN_STEPS=8）、会话工具授权生命周期绑定及公开历史/SSE mio.image-job 白名单投影"
+        },
+        {
+          "path": "src/conversations/contracts.ts",
+          "purpose": "无 DSH/Compute 内部导入的窄桥接 ConversationImageTools 及 role:'tool'/type:'tool' 公开契约扩展"
+        },
+        {
+          "path": "src/providers/service.ts",
+          "purpose": "零联网零解密的 listImageModels 与 inspectImageRoute 动态目录与单轨路由能力读取"
+        },
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "支持本人 ready 图片 derived 资产（经共享 isValidImageAssetObjectKey 协议校验）作为后续轮次编辑/参考图输入"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "BYOK 与图片计算就绪时注入窄桥接，并在 compute 卸载前先等待对话排空"
+        },
+        {
+          "path": "docs/tasks/onelink-agent-tools/prd.md",
+          "purpose": "O7 采纳契约与 Unit 1（onelink-conversation-image-tools）范围、非目标、C0/C1 与验收判据"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "受控会话生图工具边界、窄桥接、卸载顺序与隔离端到端验证规范"
+        },
+        {
+          "path": "tests/conversations/conversation-image-tools.test.ts",
+          "purpose": "隔离 PostgreSQL、独立临时 vhost RabbitMQ、真实 Worker B、官方 DSH Loop 与正式打包 Profile 多轮跨原厂生图/改图与安全负向闭环测试"
+        }
+      ],
+      "outcomes": "在不破坏 Foundation 全局 tools:[] 与默认全拒绝安全基线的前提下，打通多轮对话经官方 DSH Agent Loop 调用会话级受控意图工具（list_image_models、submit_image_job、get_image_job）驱动 OpenAI、火山方舟 Seedream、Vidu、可灵标准/Omni 生图与本人派生图片资产二次参考/编辑闭环；落实 WeakMap 活动轮次单调守卫、单轮 12 次总调用/4 次提交预算与 8 步硬熔断、clientOperationKey 确定性 UUID v4 幂等去重、isUuidV4 防御、mio.image-job 历史/SSE 严格白名单投影及 compute 卸载顺序保护，并同步全部受影响公共规范。",
+      "verification": "当前候选 a5b80c21bd6ba2a8de345abef173697bf5f4fad68a3245f8e7d671c4f9cd9e94 已通过 format:check、typecheck、lint、guard、build、test:smoke、work documents、compute/tests（9 文件 176 用例）及 check:local 全受影响范围（27 文件 281 用例，含真实隔离 PG + mio-test RabbitMQ 独立临时 vhost + 真实 Worker B + 受控上游/COS + 打包正式 Profile 全闭环），完成 full-check 增量复核、quality-review、v2 norms-review 及 @tools-verifier 独立只读复核。",
+      "limitations": "本地验证使用受控上游与 COS 替身及本机隔离数据库/队列，未发起外部真实付费 OneLink 请求，也尚未在 GitHub Actions 远端执行云端工作流；视频、音频与素材库 Agent 工具仍为后续独立条件切片，成果待人类真实审阅与接受后方可 complete。",
+      "acceptance": {
+        "candidate": "a5b80c21bd6ba2a8de345abef173697bf5f4fad68a3245f8e7d671c4f9cd9e94",
+        "statement": "用户明确确认接受 Unit 1（onelink-conversation-image-tools）交付并授权启动 Unit 2",
+        "reference": "conversation://068fe1a5-4ad0-473c-ab98-a0657a827cc4 (2026-11-17T06:48:06+08:00)"
+      }
+    }
+  ]
+}

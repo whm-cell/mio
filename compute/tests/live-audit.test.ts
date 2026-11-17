@@ -11,11 +11,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { expect, it, vi } from 'vitest';
 import { Journal } from '../src/adapters/journal.ts';
+import { captureLiveArtifacts } from '../../tests/compute/live-image-loop.ts';
 
 it('records the first real-provider attempt and blocks a second without forwarding credentials', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
@@ -138,73 +139,97 @@ it('keeps only a valid failure code when an assertion includes sensitive trailin
   const runtime = resolve('.runtime');
   mkdirSync(runtime, { recursive: true });
   const directory = realpathSync(mkdtempSync(join(realpathSync(runtime), 'mio-live-safe-code-')));
-  const workspacePath = join(directory, 'fixture');
-  mkdirSync(workspacePath);
-  const workspace = realpathSync(workspacePath);
-  writeFileSync(join(workspace, '.gitignore'), '.work/\n.runtime/\n');
-  const git = (...args: string[]) => {
-    const result = spawnSync('git', args, { cwd: workspace, encoding: 'utf8' });
-    expect(result.status, result.stderr).toBe(0);
-    return result.stdout.trim();
-  };
-  git('init', '-q');
-  git('add', '.gitignore');
-  git(
-    '-c',
-    'user.name=Fixture',
-    '-c',
-    'user.email=fixture@example.test',
-    '-c',
-    'commit.gpgsign=false',
-    '-c',
-    'core.hooksPath=/dev/null',
-    'commit',
-    '-qm',
-    'fixture',
-  );
-  const commit = git('rev-parse', 'HEAD');
-  const taskId = 'live-safe-code';
-  const taskDirectory = join(workspace, '.work', 'tasks', taskId);
-  mkdirSync(taskDirectory, { recursive: true, mode: 0o700 });
-  mkdirSync(join(workspace, '.runtime'), { mode: 0o700 });
-  writeFileSync(
-    join(taskDirectory, 'state.json'),
-    JSON.stringify({
-      workspace,
-      plan: { id: taskId },
-      stage: 'C1_EVIDENCE_PENDING',
-      contractRevision: 0,
-      checkpoint: { candidate: { commit, contractRevision: 0 } },
-    }),
-    { mode: 0o600 },
-  );
-  const infrastructure = join(directory, 'infra');
-  mkdirSync(infrastructure, { mode: 0o700 });
-  const write = (name: string, content: string) =>
-    writeFileSync(join(infrastructure, name), content, { mode: 0o600 });
-  write(
-    'manifest.json',
-    JSON.stringify({
-      runDirectory: infrastructure,
-      project: 'miow3safe',
-      postgresDatabase: 'mio_w3_safe',
-      rabbitVhost: 'mio-w3-safe',
-      ports: { postgres: 12345, amqp: 12346, management: 12347 },
-    }),
-  );
-  write('postgres.env', 'MIO_TEST_DATABASE_URL=postgres://a:b@127.0.0.1:12345/mio_w3_safe\n');
-  write(
-    'rabbit-a.env',
-    'MIO_COMPUTE_BROKER_USER=a\nMIO_COMPUTE_EXPECTED_RESULT_USER=b\nRABBITMQ_URL=amqp://a:b@127.0.0.1:12346/mio-w3-safe\n',
-  );
-  write(
-    'rabbit-b.env',
-    'MIO_COMPUTE_BROKER_USER=b\nMIO_COMPUTE_EXPECTED_COMMAND_USER=a\nRABBITMQ_URL=amqp://b:b@127.0.0.1:12346/mio-w3-safe\n',
-  );
-  const preload = join(directory, 'preload.mjs');
-  writeFileSync(
-    preload,
-    `import assert from 'node:assert/strict';
+  try {
+    const projectPath = join(directory, 'project');
+    mkdirSync(projectPath);
+    const project = realpathSync(projectPath);
+    // Build a private synthetic artifact tree; pnpm check runs tests before app/worker build.
+    for (let remaining = 100; ; remaining--) {
+      try {
+        captureLiveArtifacts(project);
+        break;
+      } catch (error) {
+        const missing = error as NodeJS.ErrnoException;
+        if (
+          remaining === 0 ||
+          missing.code !== 'ENOENT' ||
+          !missing.path?.startsWith(`${project}${sep}`)
+        )
+          throw error;
+        if (basename(missing.path) === 'dist') {
+          mkdirSync(missing.path, { recursive: true });
+          writeFileSync(join(missing.path, 'fixture.js'), 'synthetic');
+        } else {
+          mkdirSync(dirname(missing.path), { recursive: true });
+          writeFileSync(missing.path, 'synthetic');
+        }
+      }
+    }
+    const fixtureRuntime = join(project, '.runtime');
+    mkdirSync(fixtureRuntime);
+    writeFileSync(join(project, '.gitignore'), '.work/\n.runtime/\ndist/\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: project, encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init', '-q');
+    git('add', '-A');
+    git(
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+      'commit',
+      '-qm',
+      'fixture',
+    );
+    const commit = git('rev-parse', 'HEAD');
+    const taskId = 'live-safe-code';
+    const taskDirectory = join(project, '.work', 'tasks', taskId);
+    mkdirSync(taskDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(taskDirectory, 'state.json'),
+      JSON.stringify({
+        workspace: project,
+        plan: { id: taskId },
+        stage: 'C1_EVIDENCE_PENDING',
+        contractRevision: 0,
+        checkpoint: { candidate: { commit, contractRevision: 0 } },
+      }),
+      { mode: 0o600 },
+    );
+    const infrastructure = join(directory, 'infra');
+    mkdirSync(infrastructure, { mode: 0o700 });
+    const write = (name: string, content: string) =>
+      writeFileSync(join(infrastructure, name), content, { mode: 0o600 });
+    write(
+      'manifest.json',
+      JSON.stringify({
+        runDirectory: infrastructure,
+        project: 'miow3safe',
+        postgresDatabase: 'mio_w3_safe',
+        rabbitVhost: 'mio-w3-safe',
+        ports: { postgres: 12345, amqp: 12346, management: 12347 },
+      }),
+    );
+    write('postgres.env', 'MIO_TEST_DATABASE_URL=postgres://a:b@127.0.0.1:12345/mio_w3_safe\n');
+    write(
+      'rabbit-a.env',
+      'MIO_COMPUTE_BROKER_USER=a\nMIO_COMPUTE_EXPECTED_RESULT_USER=b\nRABBITMQ_URL=amqp://a:b@127.0.0.1:12346/mio-w3-safe\n',
+    );
+    write(
+      'rabbit-b.env',
+      'MIO_COMPUTE_BROKER_USER=b\nMIO_COMPUTE_EXPECTED_COMMAND_USER=a\nRABBITMQ_URL=amqp://b:b@127.0.0.1:12346/mio-w3-safe\n',
+    );
+    const preload = join(directory, 'preload.mjs');
+    writeFileSync(
+      preload,
+      `import assert from 'node:assert/strict';
 import pg from 'pg';
 pg.Pool.prototype.query = async () => ({ rows: [{ count: '0' }] });
 pg.Pool.prototype.end = async () => {};
@@ -215,11 +240,10 @@ assert.equal = (...args) => {
     : 'LIVE_DATABASE_NOT_EMPTY\\nprivate-sensitive-tail');
   return equal(...args);
 };`,
-    { mode: 0o600 },
-  );
-  try {
+      { mode: 0o600 },
+    );
     for (const invalid of [false, true]) {
-      const run = join(workspace, '.runtime', invalid ? 'invalid' : 'valid');
+      const run = join(fixtureRuntime, invalid ? 'invalid' : 'valid');
       const child = spawn(
         process.execPath,
         [
@@ -231,7 +255,7 @@ assert.equal = (...args) => {
           taskId,
         ],
         {
-          cwd: workspace,
+          cwd: project,
           env: {
             ...process.env,
             MIO_RUN_LIVE_IMAGE: 'yes',
@@ -381,7 +405,7 @@ it('allows only the saved task and at most eight query attempts without logging 
 });
 
 it.each([
-  ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/img2img'],
+  ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/reference2image'],
   ['kling-async', 'https://api.onelinkai.cloud/kling/v1/images/generations'],
   ['seedream-sync', 'https://api.onelinkai.cloud/volc/api/v3/images/generations'],
   ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/generations'],

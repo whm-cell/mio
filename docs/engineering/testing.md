@@ -33,6 +33,6 @@ MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>]
 MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] execute <.runtime/run-dir> <service-cos-env> <worker-cos-env> <task-id>
 ```
 
-任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`，prepare／execute 核对同一 `{commit, contractRevision}`；旧私人运行历史只读，不自动恢复。实际执行仍须核对场景、环境、凭据和费用授权。
+任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`，prepare／execute 核对同一 task ID、`{commit, contractRevision}` 和运行产物摘要；旧私人运行历史只读，不自动恢复。实际执行仍须核对场景、环境、凭据和费用授权。
 
 在已有任务记录简记目标、差异、所选入口与理由、复用原件及覆盖缺口。区分文件发现、正文展开、实际执行和证据覆盖：局部成功不自动产生完整通过，同候选的简短结论不能替代原件，失败仍保留。复用方法沿[证据协议](../work-records.md#增量验证与同输入复用)，完整验证条件沿[验证协议](../coordination.md#验证与接受)；导航不改变 `pnpm check`、CI 或人工接受。

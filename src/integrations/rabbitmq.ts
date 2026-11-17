@@ -4,6 +4,8 @@ import {
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
   COMPUTE_MAX_MESSAGE_BYTES,
+  IMAGE_COMMAND_ROUTING_KEY,
+  IMAGE_WORKER_PREFETCH,
   RESULT_QUEUE,
   parseComputeResultV1,
   parseImageResult,
@@ -62,6 +64,8 @@ export class ComputeBroker {
   private readonly expectedUserId: string;
   private readonly lifecycle: { closed: boolean; callback: (() => void) | undefined };
   private readonly closedConnections: WeakSet<ChannelModel>;
+  private readonly inFlight = new Set<Promise<void>>();
+  private accepting = true;
   private closing: Promise<void> | undefined;
   private constructor(
     consumerConnection: ChannelModel,
@@ -122,7 +126,7 @@ export class ComputeBroker {
         const consumer = await consumerConnection.createChannel();
         consumer.on('error', () => {});
         consumer.once('close', closed);
-        await consumer.prefetch(1);
+        await consumer.prefetch(IMAGE_WORKER_PREFETCH);
         const publisher = await publisherConnection.createConfirmChannel();
         publisher.on('error', () => {});
         publisher.once('close', closed);
@@ -161,10 +165,12 @@ export class ComputeBroker {
     let onDrain: (() => void) | undefined;
     try {
       let drain: Promise<void> = Promise.resolve();
+      const routingKey =
+        message.type === 'transcode.request' ? COMMAND_ROUTING_KEY : IMAGE_COMMAND_ROUTING_KEY;
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.publisher.publish(
           COMMAND_EXCHANGE,
-          COMMAND_ROUTING_KEY,
+          routingKey,
           Buffer.from(JSON.stringify(message)),
           {
             persistent: true,
@@ -201,6 +207,7 @@ export class ComputeBroker {
     await this.consumer.consume(
       RESULT_QUEUE,
       (message: ConsumeMessage | null) => {
+        if (!this.accepting || this.lifecycle.closed) return;
         if (!message) {
           failed();
           return;
@@ -223,35 +230,49 @@ export class ComputeBroker {
           if (message.properties.messageId !== result.messageId)
             throw new Error('RESULT_ID_MISMATCH');
         } catch {
-          this.consumer.reject(message, false);
+          try {
+            this.consumer.reject(message, false);
+          } catch {
+            if (this.accepting) failed();
+          }
           return;
         }
-        void Promise.resolve()
-          .then(() => {
+        let shouldFail = false;
+        const task = (async () => {
+          try {
             if (result.type === 'image.result') {
               if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
-              return imageHandle(result);
+              await imageHandle(result);
+            } else {
+              await handle(result);
             }
-            return handle(result);
-          })
-          .then(
-            () => {
-              try {
-                this.consumer.ack(message);
-              } catch {
-                failed();
-              }
-            },
-            (error: unknown) => {
+          } catch (error) {
+            if (!this.lifecycle.closed) {
               if ((error as { permanent?: boolean })?.permanent) {
                 try {
                   this.consumer.reject(message, false);
                 } catch {
-                  failed();
+                  shouldFail = true;
                 }
-              } else failed();
-            },
-          );
+              } else {
+                shouldFail = true;
+              }
+            }
+            return;
+          }
+          if (!this.lifecycle.closed) {
+            try {
+              this.consumer.ack(message);
+            } catch {
+              shouldFail = true;
+            }
+          }
+        })();
+        const tracked = task.finally(() => {
+          this.inFlight.delete(tracked);
+          if (shouldFail && this.accepting) failed();
+        });
+        this.inFlight.add(tracked);
       },
       { noAck: false },
     );
@@ -261,8 +282,12 @@ export class ComputeBroker {
     else this.lifecycle.callback = callback;
   }
   close(): Promise<void> {
+    this.accepting = false;
     if (!this.closing)
       this.closing = Promise.resolve().then(async () => {
+        if (this.inFlight.size > 0) {
+          await Promise.allSettled([...this.inFlight]);
+        }
         await Promise.all([
           closeConnection(this.consumerConnection, this.closedConnections),
           closeConnection(this.publisherConnection, this.closedConnections),

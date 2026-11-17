@@ -37,8 +37,7 @@
         host: !!js process.env.MIO_HOST ?? '127.0.0.1'
         port: !!js Number(process.env.MIO_PORT ?? 4310)
     - id: mio-foundation
-      name: '@mio/plugin'
-      inject: [mioKernel]
+      name: '@mio/plugin/profile'
       config:
         tokenEnv: MIO_API_TOKEN
         allowedOrigins: !!js JSON.parse(process.env.MIO_ALLOWED_ORIGINS ?? '[]')

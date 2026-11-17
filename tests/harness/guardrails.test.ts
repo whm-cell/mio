@@ -11,6 +11,37 @@ import { legacyBuild, legacyHarness, legacyTypecheck } from './fixtures/guardrai
 const project = resolve('.');
 const scratch: string[] = [];
 it.each([
+  ['src/profile.ts', 0],
+  ['src/other.ts', 1],
+  ['src/dsh/profile.ts', 1],
+] as const)(
+  'limits the formal Profile entry edge into the main plugin: %s',
+  async (file, status) => {
+    const target = file.startsWith('src/dsh/') ? '../plugin.ts' : './plugin.ts';
+    const root = await fixture({
+      'src/plugin.ts': 'export const apply = 1;',
+      [file]: `export { apply } from '${target}';`,
+    });
+    const result = check(root);
+    expect(result.status, result.output).toBe(status);
+    if (status) expect(result.output).toContain(`ADAPTER_DIRECTION ${file}`);
+  },
+);
+it.each(['src/other.ts', 'src/conversations/indirect.ts', 'src/dsh/indirect.ts'])(
+  'rejects production imports and re-exports of the Profile entry: %s',
+  async (file) => {
+    const target = file === 'src/other.ts' ? './profile.ts' : '../profile.ts';
+    const root = await fixture({
+      'src/plugin.ts': 'export const apply = 1;',
+      'src/profile.ts': "export { apply } from './plugin.ts';",
+      [file]: `export { apply } from '${target}';`,
+    });
+    const result = check(root);
+    expect(result.status, result.output).toBe(1);
+    expect(result.output).toContain(`ADAPTER_DIRECTION ${file}: src/profile.ts`);
+  },
+);
+it.each([
   '@earendil-works/pi-ai',
   '@earendil-works/pi-ai/models',
   '@earendil-works/pi-ai/api/openai-completions.lazy',

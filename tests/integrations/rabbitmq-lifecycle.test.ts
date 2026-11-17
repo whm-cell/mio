@@ -3,6 +3,12 @@ import { randomUUID } from 'node:crypto';
 import type { ConsumeMessage } from 'amqplib';
 import { connect } from 'amqplib';
 import { beforeEach, expect, it, vi } from 'vitest';
+import {
+  COMMAND_EXCHANGE,
+  COMMAND_ROUTING_KEY,
+  IMAGE_COMMAND_ROUTING_KEY,
+  IMAGE_WORKER_PREFETCH,
+} from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { createComputeService } from '../../src/compute/service.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
@@ -364,3 +370,238 @@ it.each([true, false])(
     }
   },
 );
+
+it('routes video commands to transcode.v1, image commands to image.v1, and sets result prefetch(4)', async () => {
+  const pair = connections();
+  pair.publisher.channel.publish.mockImplementation(
+    (_exchange, _routingKey, _body, _options, confirm) => {
+      queueMicrotask(() => confirm(null));
+      return true;
+    },
+  );
+  const broker = await open();
+  expect(pair.consumer.channel.prefetch).toHaveBeenCalledWith(IMAGE_WORKER_PREFETCH);
+  expect(pair.publisher.channel.prefetch).toHaveBeenCalledWith(1);
+
+  const assetId = randomUUID();
+  await broker.publish({
+    version: 1,
+    type: 'transcode.request',
+    messageId: randomUUID(),
+    jobId: randomUUID(),
+    attemptId: randomUUID(),
+    attempt: 1,
+    profile: 'mp4-h264-aac-720p24-v1',
+    input: { assetId, key: `mio/raw/${assetId}/${randomUUID()}`, sizeBytes: 1, etag: 'etag' },
+  });
+  await broker.publish({
+    version: 1,
+    type: 'image.recover',
+    messageId: randomUUID(),
+    commandId: randomUUID(),
+    jobId: randomUUID(),
+    sequence: 1,
+  });
+
+  expect(pair.publisher.channel.publish.mock.calls[0]?.[0]).toBe(COMMAND_EXCHANGE);
+  expect(pair.publisher.channel.publish.mock.calls[0]?.[1]).toBe(COMMAND_ROUTING_KEY);
+  expect(pair.publisher.channel.publish.mock.calls[1]?.[0]).toBe(COMMAND_EXCHANGE);
+  expect(pair.publisher.channel.publish.mock.calls[1]?.[1]).toBe(IMAGE_COMMAND_ROUTING_KEY);
+  await broker.close();
+});
+
+it('drains concurrent in-flight result handlers (including COS head) before closing connections and store', async () => {
+  const pair = connections();
+  const events: string[] = [];
+  let releaseHeads: () => void = () => {};
+  const headGate = new Promise<void>((resolve) => {
+    releaseHeads = resolve;
+  });
+
+  const store = {
+    imagesAvailable: true,
+    imagePending: vi.fn().mockResolvedValue(undefined),
+    imageAccept: vi.fn(async () => {
+      events.push('imageAccept');
+      return undefined;
+    }),
+    claim: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn(async () => {
+      events.push('store.close');
+    }),
+  } as unknown as ComputeStore;
+
+  const objects = {
+    head: vi.fn(async () => {
+      events.push('head.start');
+      await headGate;
+      events.push('head.end');
+      return { size: 3, etag: 'etag', sha256: 'a'.repeat(64) };
+    }),
+  } as unknown as AssetObjectStore;
+
+  pair.consumer.close.mockImplementation(async () => {
+    events.push('consumer.close');
+    pair.consumer.emit('close');
+  });
+
+  const service = createComputeService(store, objects, {
+    brokerURL: 'amqp://a:secret@127.0.0.1/test',
+    brokerUser: 'a',
+    expectedResultUser: 'b',
+  });
+
+  await vi.waitFor(() => expect(pair.consumer.channel.consume).toHaveBeenCalled(), {
+    timeout: 2000,
+  });
+
+  const makeImageResult = () => {
+    const jobId = randomUUID();
+    const messageId = randomUUID();
+    const payload = {
+      version: 1,
+      type: 'image.result',
+      messageId,
+      commandId: randomUUID(),
+      jobId,
+      state: 'completed',
+      outputs: [
+        {
+          key: `mio/derived/${jobId}/images/0-${randomUUID()}.png`,
+          sizeBytes: 3,
+          etag: 'etag',
+          sha256: 'a'.repeat(64),
+          contentType: 'image/png',
+        },
+      ],
+    };
+    return {
+      properties: { userId: 'b', messageId, contentType: 'application/json' },
+      content: Buffer.from(JSON.stringify(payload)),
+    } as ConsumeMessage;
+  };
+
+  const m1 = makeImageResult();
+  const m2 = makeImageResult();
+  const late = makeImageResult();
+  pair.consumer.channel.delivery!(m1);
+  pair.consumer.channel.delivery!(m2);
+  await vi.waitFor(() => expect(objects.head).toHaveBeenCalledTimes(2));
+
+  const closing = service.close();
+  pair.consumer.channel.delivery!(late);
+  expect(objects.head).toHaveBeenCalledTimes(2);
+  expect(pair.consumer.close).not.toHaveBeenCalled();
+  expect(store.close).not.toHaveBeenCalled();
+
+  releaseHeads();
+  await closing;
+
+  expect(pair.consumer.channel.ack).toHaveBeenCalledWith(m1);
+  expect(pair.consumer.channel.ack).toHaveBeenCalledWith(m2);
+  expect(pair.consumer.channel.ack).not.toHaveBeenCalledWith(late);
+  expect(events.indexOf('imageAccept')).toBeGreaterThan(-1);
+  expect(events.lastIndexOf('imageAccept')).toBeLessThan(events.indexOf('consumer.close'));
+  expect(events.indexOf('consumer.close')).toBeLessThan(events.indexOf('store.close'));
+});
+
+it('wakes batch outbox draining immediately on admission and coalesces concurrent wakeups without spinning on backoff', async () => {
+  const pair = connections();
+  pair.publisher.channel.publish.mockImplementation(
+    (_exchange, _routingKey, _body, _options, confirm) => {
+      queueMicrotask(() => confirm(null));
+      return true;
+    },
+  );
+  const pendingQueue: (
+    | {
+        version: 1;
+        type: 'image.recover';
+        messageId: string;
+        commandId: string;
+        jobId: string;
+        sequence: number;
+      }
+    | {
+        version: 1;
+        type: 'image.query';
+        messageId: string;
+        commandId: string;
+        jobId: string;
+        ownerId: string;
+        upstreamTaskId: string;
+        queryAttempt: number;
+        queryDeadline: number;
+        queryCredential: {
+          keyId: string;
+          wrappedKey: string;
+          iv: string;
+          ciphertext: string;
+          tag: string;
+        };
+      }
+  )[] = [
+    {
+      version: 1,
+      type: 'image.query',
+      messageId: randomUUID(),
+      commandId: randomUUID(),
+      jobId: randomUUID(),
+      ownerId: 'u1',
+      upstreamTaskId: 'expired-task',
+      queryAttempt: 1,
+      queryDeadline: Date.now() + 10_000,
+      queryCredential: { keyId: 'k1', wrappedKey: 'w', iv: 'i', ciphertext: 'c', tag: 't' },
+    },
+  ];
+  const store = {
+    imagesAvailable: true,
+    imagePending: vi.fn(async () => pendingQueue.shift()),
+    imagePrepareQuery: vi.fn(async () => undefined),
+    imageSent: vi.fn(async () => {}),
+    imageRecover: vi.fn(async (_owner: string, jobId: string) => {
+      pendingQueue.push({
+        version: 1,
+        type: 'image.recover',
+        messageId: randomUUID(),
+        commandId: randomUUID(),
+        jobId,
+        sequence: 1,
+      });
+    }),
+    imageGet: vi.fn(async (_owner: string, jobId: string) => ({
+      jobId,
+      status: 'materializing',
+      requestedCount: 1,
+      errorCode: null,
+      assetIds: [],
+      outputs: [],
+    })),
+    claim: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  } as unknown as ComputeStore;
+
+  const service = createComputeService(store, {} as AssetObjectStore, {
+    brokerURL: 'amqp://a:secret@127.0.0.1/test',
+    brokerUser: 'a',
+    expectedResultUser: 'b',
+  });
+  try {
+    await vi.waitFor(() => expect(pair.consumer.channel.consume).toHaveBeenCalled(), {
+      timeout: 2000,
+    });
+    const startedAt = Date.now();
+    await Promise.all(
+      Array.from({ length: 15 }, () =>
+        service.recoverImage({ userId: 'u1', sessionId: 's1' }, randomUUID()),
+      ),
+    );
+    await vi.waitFor(() => expect(store.imageSent).toHaveBeenCalledTimes(15), {
+      timeout: 500,
+      interval: 10,
+    });
+    expect(Date.now() - startedAt).toBeLessThan(800);
+  } finally {
+    await service.close();
+  }
+});

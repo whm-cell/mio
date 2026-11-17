@@ -1,7 +1,12 @@
 import COS from 'cos-nodejs-sdk-v5';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { readAssetConfig } from '../../src/assets/config.ts';
+import { createAssetService } from '../../src/assets/service.ts';
+import type { AssetStore } from '../../src/assets/store.ts';
 
 it('uses a supplied temporary session token in signed URLs without changing long-term key support', () => {
   const token = 'synthetic+token=/&%#?';
@@ -107,5 +112,271 @@ it('passes conditional copy and non-overwrite headers to the official SDK', asyn
   } finally {
     copy.mockRestore();
     head.mockRestore();
+  }
+});
+
+it('aborts the SDK sender on oversized and cancelled image streams and forwards If-Match', async () => {
+  const seen = Promise.withResolvers<string | undefined>();
+  const disconnected = Promise.withResolvers<void>();
+  const server = createServer((request, response) => {
+    seen.resolve(request.headers['if-match']);
+    response.on('close', () => disconnected.resolve());
+    if (request.url?.includes('oversized')) {
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.write(Buffer.alloc(32));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const original = COS.prototype.getObject;
+  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
+    this: COS,
+    ...args
+  ) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${address.port}`;
+    client.options.Protocol = 'http:';
+    return original.apply(this, args);
+  });
+  try {
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'example-id',
+      secretKey: 'example-key',
+    });
+    const controller = new AbortController();
+    await expect(
+      storage.readImage!('oversized', '"fixture-etag"', 4, controller.signal),
+    ).rejects.toThrow('ASSET_SIZE_MISMATCH');
+    expect(await seen.promise).toBe('"fixture-etag"');
+    await Promise.race([
+      disconnected.promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('sender remained open')), 3000),
+      ),
+    ]);
+
+    const already = new AbortController();
+    already.abort();
+    const calls = get.mock.calls.length;
+    await expect(storage.readImage!('never-started', 'etag', 4, already.signal)).rejects.toThrow();
+    expect(get).toHaveBeenCalledTimes(calls);
+  } finally {
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+it('cancels an SDK image request while the server has not responded', async () => {
+  const entered = Promise.withResolvers<void>();
+  const disconnected = Promise.withResolvers<void>();
+  const server = createServer((_request, response) => {
+    entered.resolve();
+    response.on('close', () => disconnected.resolve());
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const original = COS.prototype.getObject;
+  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
+    this: COS,
+    ...args
+  ) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${address.port}`;
+    client.options.Protocol = 'http:';
+    return original.apply(this, args);
+  });
+  try {
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'example-id',
+      secretKey: 'example-key',
+    });
+    const controller = new AbortController();
+    const read = storage.readImage!('waiting', '"etag"', 4, controller.signal);
+    await entered.promise;
+    controller.abort();
+    await expect(read).rejects.toThrow();
+    await Promise.race([
+      disconnected.promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('sender remained open')), 3000),
+      ),
+    ]);
+  } finally {
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+it.each([
+  [
+    'longer than expected',
+    '<Error><Code>PreconditionFailed</Code><Message>changed</Message></Error>',
+  ],
+  ['equal to expected', 'oops'],
+  ['empty', ''],
+])('preserves the SDK precondition failure when its body is %s', async (_name, body) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(412, { 'content-type': 'application/xml' });
+    response.end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const original = COS.prototype.getObject;
+  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
+    this: COS,
+    ...args
+  ) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${address.port}`;
+    client.options.Protocol = 'http:';
+    return original.apply(this, args);
+  });
+  try {
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'example-id',
+      secretKey: 'example-key',
+    });
+    await expect(
+      storage.readImage!('changed', '"old"', 4, new AbortController().signal),
+    ).rejects.toMatchObject({ statusCode: 412 });
+  } finally {
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+it('waits for SDK completion after the exact response bytes arrive', async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = createServer((_request, response) => response.end('data'));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const original = COS.prototype.getObject;
+  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
+    this: COS,
+    ...args
+  ) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${address.port}`;
+    client.options.Protocol = 'http:';
+    const values = args as unknown as [
+      COS.GetObjectParams,
+      (error: COS.CosError, result: COS.GetObjectResult) => void,
+    ];
+    const callback = values[1];
+    values[1] = (error, result) => {
+      entered.resolve();
+      void release.promise.then(() => callback(error, result));
+    };
+    return original.apply(this, args);
+  });
+  try {
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'example-id',
+      secretKey: 'example-key',
+    });
+    let settled = false;
+    const read = storage.readImage!('exact', '"etag"', 4, new AbortController().signal);
+    void read.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await entered.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    release.resolve();
+    expect(Buffer.from(await read).toString()).toBe('data');
+  } finally {
+    release.resolve();
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+it.each([
+  ['short', 'ab'],
+  ['long', 'abcdefgh'],
+])('maps an actual SDK %s response to the asset size conflict', async (_name, body) => {
+  const server = createServer((_request, response) => response.end(body));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const original = COS.prototype.getObject;
+  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
+    this: COS,
+    ...args
+  ) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${address.port}`;
+    client.options.Protocol = 'http:';
+    return original.apply(this, args);
+  });
+  const head = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
+    statusCode: 200,
+    ETag: '"etag"',
+    headers: { 'content-length': '4' },
+  });
+  const assetId = randomUUID();
+  const store = {
+    owned: async () => ({
+      id: assetId,
+      owner_id: 'owner',
+      state: 'ready',
+      raw_key: `mio/raw/${assetId}/${randomUUID()}`,
+      content_type: 'image/png',
+      size_bytes: '4',
+    }),
+    expiredStaging: async () => [],
+    close: async () => {},
+  } as unknown as AssetStore;
+  const service = createAssetService(
+    store,
+    createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'example-id',
+      secretKey: 'example-key',
+    }),
+  );
+  try {
+    await expect(
+      service.readVisionSource('owner', assetId, undefined, new AbortController().signal),
+    ).rejects.toMatchObject({ status: 409, code: 'ASSET_SIZE_MISMATCH' });
+  } finally {
+    await service.close();
+    head.mockRestore();
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
   }
 });

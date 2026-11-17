@@ -160,6 +160,25 @@ export class ConversationStore {
     if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'REQUEST_NOT_FOUND');
     return receipt(row);
   }
+  /** Authorize and check an existing request before any mutable provider or asset lookup. */
+  async existing(
+    actor: Principal,
+    id: string,
+    requestId: string,
+    digest: string,
+  ): Promise<Receipt | undefined> {
+    await this.owned(actor, id);
+    const old = (
+      await this.pool.query<RequestRow>(
+        'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+        [id, requestId],
+      )
+    ).rows[0];
+    if (!old) return undefined;
+    if (old.digest !== digest)
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
+    return receipt(old);
+  }
   async latest(actor: Principal, id: string): Promise<Receipt | null> {
     await this.owned(actor, id);
     const row = (

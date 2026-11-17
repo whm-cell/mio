@@ -20,6 +20,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [docs/tasks/compute-service/design.md](../design.md) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/tasks/compute-service/prd.md](../prd.md)
 
+## image-io-concurrency
+
+**图片 I/O 计算队列解耦、独立配额、批量唤醒排空与 Worker 有界并发**
+
+[scripts/service/compute-broker-topology.ts](../../../../scripts/service/compute-broker-topology.ts) · [scripts/service/local-broker.ts](../../../../scripts/service/local-broker.ts) · [src/compute/store.ts](../../../../src/compute/store.ts) · [src/compute/service.ts](../../../../src/compute/service.ts) · [src/integrations/rabbitmq.ts](../../../../src/integrations/rabbitmq.ts) · [docs/tasks/compute-service/changes/image-io-concurrency/change.md](../changes/image-io-concurrency/change.md) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/rabbitmq.md](../../../integrations/rabbitmq.md) · [docs/apis/compute.md](../../../apis/compute.md) · [tests/compute/image-concurrency.test.ts](../../../../tests/compute/image-concurrency.test.ts)
+
 ## image-upload-verification
 
 **图片上传完整性与对象关联**

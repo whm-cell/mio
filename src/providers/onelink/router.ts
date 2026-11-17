@@ -13,13 +13,19 @@ import type {
   ImageRouteConfig,
   ImageRouteParamSpec,
 } from '@mio/compute-contracts';
-import { CHAT_PROFILES, ProviderError, categories } from '../contracts.ts';
+import {
+  CHAT_PROFILES,
+  DEFAULT_CHAT_IMAGE_BUDGET,
+  ProviderError,
+  categories,
+} from '../contracts.ts';
 import type {
   AdaptationCapabilityMetadata,
   AdaptationSourceKind,
   Category,
   ChatProfile,
   ImageCapabilityMetadata,
+  ChatImageBudget,
   PlatformRouteRecord,
   VerificationRecord,
 } from '../contracts.ts';
@@ -118,7 +124,18 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
   if (value === undefined) return {};
   if (!isPlainObject(value)) invalidRoute();
   for (const key of Object.keys(value)) {
-    if (key !== 'contextWindow' && key !== 'maxOutputTokens') invalidRoute();
+    if (
+      ![
+        'contextWindow',
+        'maxOutputTokens',
+        'inputModalities',
+        'maxRequestImages',
+        'maxRequestImageBytes',
+        'requestImagePixelBudget',
+        'requestImageMaxBytes',
+      ].includes(key)
+    )
+      invalidRoute();
   }
   if (
     'contextWindow' in value &&
@@ -132,10 +149,49 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
       Number(value.maxOutputTokens) > 65_536)
   )
     invalidRoute();
+  if (
+    value.inputModalities !== undefined &&
+    (!Array.isArray(value.inputModalities) ||
+      !value.inputModalities.includes('text') ||
+      value.inputModalities.some((item: unknown) => item !== 'text' && item !== 'image') ||
+      new Set(value.inputModalities).size !== value.inputModalities.length)
+  )
+    invalidRoute();
+  for (const [key, maximum] of [
+    ['maxRequestImages', 16],
+    ['maxRequestImageBytes', 20 * 1024 * 1024],
+    ['requestImagePixelBudget', 16_777_216],
+    ['requestImageMaxBytes', 10 * 1024 * 1024],
+  ] as const) {
+    if (
+      value[key] !== undefined &&
+      (!Array.isArray(value.inputModalities) ||
+        !value.inputModalities.includes('image') ||
+        !Number.isSafeInteger(value[key]) ||
+        Number(value[key]) < 1 ||
+        Number(value[key]) > maximum)
+    )
+      invalidRoute();
+  }
   return {
     ...(typeof value.contextWindow === 'number' ? { contextWindow: value.contextWindow } : {}),
     ...(typeof value.maxOutputTokens === 'number'
       ? { maxOutputTokens: value.maxOutputTokens }
+      : {}),
+    ...(Array.isArray(value.inputModalities)
+      ? { inputModalities: value.inputModalities.includes('image') ? ['text', 'image'] : ['text'] }
+      : {}),
+    ...(typeof value.maxRequestImages === 'number'
+      ? { maxRequestImages: value.maxRequestImages }
+      : {}),
+    ...(typeof value.maxRequestImageBytes === 'number'
+      ? { maxRequestImageBytes: value.maxRequestImageBytes }
+      : {}),
+    ...(typeof value.requestImagePixelBudget === 'number'
+      ? { requestImagePixelBudget: value.requestImagePixelBudget }
+      : {}),
+    ...(typeof value.requestImageMaxBytes === 'number'
+      ? { requestImageMaxBytes: value.requestImageMaxBytes }
       : {}),
   };
 }
@@ -348,6 +404,8 @@ export interface ResolvedChatRoute {
   readonly submitPath: string;
   readonly maxOutputTokens: number;
   readonly contextWindow?: number;
+  readonly inputModalities: readonly ('text' | 'image')[];
+  readonly imageBudget: ChatImageBudget;
   readonly declarationVersion: number;
   readonly sourceKind: AdaptationSourceKind;
   readonly source: string;
@@ -378,6 +436,12 @@ export function resolveChatRoute(row: PlatformRouteRecord): ResolvedChatRoute | 
     !isValidChatSubmitPath(row.submit_path, row.driver)
   )
     return undefined;
+  let metadata: AdaptationCapabilityMetadata;
+  try {
+    metadata = validateChatMetadata(row.capability_metadata ?? {});
+  } catch {
+    return undefined;
+  }
   const maxTokens = row.capability_metadata?.maxOutputTokens;
   const maxOutputTokens =
     typeof maxTokens === 'number' &&
@@ -400,11 +464,21 @@ export function resolveChatRoute(row: PlatformRouteRecord): ResolvedChatRoute | 
     submitPath: row.submit_path,
     maxOutputTokens,
     ...(contextWindow !== undefined ? { contextWindow } : {}),
+    inputModalities: metadata.inputModalities ?? ['text'],
+    imageBudget: {
+      maxRequestImages: metadata.maxRequestImages ?? DEFAULT_CHAT_IMAGE_BUDGET.maxRequestImages,
+      maxRequestImageBytes:
+        metadata.maxRequestImageBytes ?? DEFAULT_CHAT_IMAGE_BUDGET.maxRequestImageBytes,
+      requestImagePixelBudget:
+        metadata.requestImagePixelBudget ?? DEFAULT_CHAT_IMAGE_BUDGET.requestImagePixelBudget,
+      requestImageMaxBytes:
+        metadata.requestImageMaxBytes ?? DEFAULT_CHAT_IMAGE_BUDGET.requestImageMaxBytes,
+    },
     declarationVersion: row.declaration_version,
     sourceKind: row.source_kind,
     source: row.source,
     sourceVersion: row.source_version,
-    capabilityMetadata: row.capability_metadata ?? {},
+    capabilityMetadata: metadata,
   };
 }
 

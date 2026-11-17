@@ -7,6 +7,8 @@ import type { PoolClient } from 'pg';
 import {
   COMPUTE_PROFILE,
   COMPUTE_VERSION,
+  IMAGE_GLOBAL_QUOTA,
+  IMAGE_USER_QUOTA,
   canonicalImageRouteConfig,
   imageOutputIndex,
   isImageDriver,
@@ -118,24 +120,30 @@ const retryable = new Set([
   'OUTPUT_INVALID',
 ]);
 
-async function checkCapacity(client: PoolClient, owner: string, images: boolean): Promise<void> {
+const VIDEO_QUOTA_LOCK = 672049923;
+const IMAGE_QUOTA_LOCK = 672049924;
+
+async function checkVideoCapacity(client: PoolClient, owner: string): Promise<void> {
   const video = (
     await client.query<{ global_count: string; owner_count: string }>(
       "SELECT count(*) AS global_count, count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_compute_jobs WHERE state IN ('accepted','queued','running')",
       [owner],
     )
   ).rows[0]!;
-  const image = images
-    ? (
-        await client.query<{ global_count: string; owner_count: string }>(
-          "SELECT count(*) AS global_count, count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_image_jobs WHERE state IN ('accepted','materializing')",
-          [owner],
-        )
-      ).rows[0]!
-    : { global_count: '0', owner_count: '0' };
+  if (Number(video.global_count) >= 500 || Number(video.owner_count) >= 10)
+    throw new ComputeError(HTTP_STATUS.TOO_MANY_REQUESTS, 'COMPUTE_QUOTA_EXCEEDED');
+}
+
+async function checkImageCapacity(client: PoolClient, owner: string): Promise<void> {
+  const image = (
+    await client.query<{ global_count: string; owner_count: string }>(
+      "SELECT count(*) AS global_count, count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_image_jobs WHERE state IN ('accepted','materializing')",
+      [owner],
+    )
+  ).rows[0]!;
   if (
-    Number(video.global_count) + Number(image.global_count) >= 500 ||
-    Number(video.owner_count) + Number(image.owner_count) >= 10
+    Number(image.global_count) >= IMAGE_GLOBAL_QUOTA ||
+    Number(image.owner_count) >= IMAGE_USER_QUOTA
   )
     throw new ComputeError(HTTP_STATUS.TOO_MANY_REQUESTS, 'COMPUTE_QUOTA_EXCEEDED');
 }
@@ -164,7 +172,7 @@ export class ComputeStore {
     admitted: Record<string, unknown> = {},
   ) {
     return transaction(this.pool, async (client) => {
-      await client.query('SELECT pg_advisory_xact_lock($1)', [672049923]);
+      await client.query('SELECT pg_advisory_xact_lock($1)', [IMAGE_QUOTA_LOCK]);
       const existing = (
         await client.query<{ id: string; input_hash: string }>(
           'SELECT id,input_hash FROM mio_image_jobs WHERE owner_id=$1 AND request_id=$2',
@@ -176,7 +184,7 @@ export class ComputeStore {
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return existing.id;
       }
-      await checkCapacity(client, owner, true);
+      await checkImageCapacity(client, owner);
       const asyncCapability =
         admitted.async && typeof admitted.async === 'object'
           ? (admitted.async as { maxQueries?: unknown; maxAgeSeconds?: unknown })
@@ -265,7 +273,7 @@ export class ComputeStore {
       const candidate = (
         await client.query<{ id: string }>(
           `SELECT j.id FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id
-           WHERE ${due} ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j`,
+           WHERE ${due} ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED`,
         )
       ).rows[0];
       if (!candidate) return undefined;
@@ -445,7 +453,7 @@ export class ComputeStore {
   }
   async imageRecover(owner: string, id: string) {
     return transaction(this.pool, async (client) => {
-      await client.query('SELECT pg_advisory_xact_lock($1)', [672049923]);
+      await client.query('SELECT pg_advisory_xact_lock($1)', [IMAGE_QUOTA_LOCK]);
       await client.query('SELECT id FROM mio_image_jobs WHERE id=$1 AND owner_id=$2 FOR UPDATE', [
         id,
         owner,
@@ -512,7 +520,7 @@ export class ComputeStore {
         throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
       if (job.active_recovery_seq >= 2147483647)
         throw new ComputeError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
-      await checkCapacity(client, owner, true);
+      await checkImageCapacity(client, owner);
       const recovery: ImageRecoveryCommandV1 = {
         version: 1,
         type: 'image.recover',
@@ -808,10 +816,23 @@ export class ComputeStore {
   async imageInput(
     owner: string,
     id: string,
-  ): Promise<{ raw_key: string; size_bytes: string; content_type: string } | undefined> {
+  ): Promise<
+    | {
+        raw_key: string;
+        size_bytes: string;
+        content_type: string;
+        asset_kind: 'original' | 'derived';
+      }
+    | undefined
+  > {
     return (
-      await this.pool.query<{ raw_key: string; size_bytes: string; content_type: string }>(
-        "SELECT raw_key,size_bytes,content_type FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' AND raw_key IS NOT NULL",
+      await this.pool.query<{
+        raw_key: string;
+        size_bytes: string;
+        content_type: string;
+        asset_kind: 'original' | 'derived';
+      }>(
+        "SELECT raw_key,size_bytes,content_type,asset_kind FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind IN ('original','derived') AND raw_key IS NOT NULL",
         [id, owner],
       )
     ).rows[0];
@@ -826,8 +847,8 @@ export class ComputeStore {
     etag: string,
   ): Promise<{ job: JobRow; created: boolean }> {
     return transaction(this.pool, async (client) => {
-      // Serializing admission keeps both quotas exact, including concurrent first requests.
-      await client.query('SELECT pg_advisory_xact_lock($1)', [672049923]);
+      // Serializing video admission keeps per-user and global video quotas exact.
+      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
       const existing = (
         await client.query<JobRow>(
           'SELECT * FROM mio_compute_jobs WHERE owner_id=$1 AND request_id=$2',
@@ -839,7 +860,7 @@ export class ComputeStore {
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return { job: existing, created: false };
       }
-      await checkCapacity(client, owner, this.imagesAvailable);
+      await checkVideoCapacity(client, owner);
       const asset = (
         await client.query<{ raw_key: string; size_bytes: string }>(
           "SELECT raw_key,size_bytes FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' FOR SHARE",

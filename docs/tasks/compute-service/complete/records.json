@@ -81,6 +81,60 @@
       }
     },
     {
+      "key": "image-io-concurrency",
+      "title": "图片 I/O 计算队列解耦、独立配额、批量唤醒排空与 Worker 有界并发",
+      "locations": [
+        {
+          "path": "scripts/service/compute-broker-topology.ts",
+          "purpose": "独立图片命令队列 mio.compute.image.commands.v1（image.v1）、独立 DLX/DLQ（image.dead.v1）及 B 双队列读权限拓扑定义"
+        },
+        {
+          "path": "scripts/service/local-broker.ts",
+          "purpose": "broker:init 仅针对精确旧版 v1 B 权限的无损幂等增量升级与未知漂移 LOCAL_BROKER_CONFLICT 保护"
+        },
+        {
+          "path": "src/compute/store.ts",
+          "purpose": "视频活动任务锁（672049923，10/500）与图片活动任务锁（672049924，32/1000，accepted/materializing）彻底分离及 SKIP LOCKED 出站扫描"
+        },
+        {
+          "path": "src/compute/service.ts",
+          "purpose": "单轮有界批量排空（32 图片/10 视频）、准入落库立即 wakePoll 合并续跑、指数退避与优雅关闭收敛"
+        },
+        {
+          "path": "src/integrations/rabbitmq.ts",
+          "purpose": "transcode.v1 与 image.v1 路由分流、RESULT_QUEUE prefetch(4) 及关闭前排空全部在途结果处理（含 COS head）"
+        },
+        {
+          "path": "docs/tasks/compute-service/changes/image-io-concurrency/change.md",
+          "purpose": "image-io-concurrency 轻量变更卡、冻结契约、C0/C1 安排与技术约束（含 Worker B 独立图片通道与同 jobId 互斥）"
+        },
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "双命令队列路由、独立配额、Worker B 图片通道 prefetch=4、冲突毒消息死信及单条图片异常通道级隔离恢复协议说明"
+        },
+        {
+          "path": "docs/integrations/rabbitmq.md",
+          "purpose": "RabbitMQ 双命令队列拓扑、A/B 权限正则与本地 broker:init 无损幂等升级契约"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "视频与图片计算接口独立活动配额及并发处理副作用契约"
+        },
+        {
+          "path": "tests/compute/image-concurrency.test.ts",
+          "purpose": "隔离 PostgreSQL、mio-test 临时 vhost RabbitMQ 与真实 Service A/Worker B 在满 10 视频阻塞下 15 并发图片物化、33 活动图片精确 429 与通道隔离重投零重复 POST 端到端测试"
+        }
+      ],
+      "outcomes": "在不改变视频转码队列 mio.compute.commands.v1 单并发（prefetch 1）与 10/500 配额、且保持已接受对话生图工具能力完全兼容的前提下，落地独立图片命令队列 mio.compute.image.commands.v1（routing key image.v1，配持久 quorum DLX/DLQ image.dead.v1）及本地 broker:init 针对精确旧版 v1 B 权限的无损幂等升级；在 Service A 解耦视频与图片活动任务配额及事务锁（图片每用户 32 / 全局 1000，统计 accepted 与 materializing），升级 RESULT_QUEUE prefetch=4 与关闭在途结果排空，提供准入落库后 wakePoll 立即唤醒与单轮最多 32 图片 / 10 视频的有界批量排空；在 Worker B（compute/src/{adapters/rabbitmq,maintenance,main}.ts）新增独立图片消费通道（prefetch 4），按 jobId 做进程内串行互斥并保留旧队列遗留图片兼容，对 IMAGE_COMMAND_CONFLICT / IMAGE_QUERY_UNKNOWN 毒消息直接死信，对单条图片可重试异常执行图片通道级隔离排空与有界重开而不中断慢速 FFmpeg 视频转码或其他并发健康图片，同步全部受影响公共规范与任务文档。",
+      "verification": "当前候选 8429d75bddae0c61662d1d041fc388d7b740aee325a664e73716eb6775bb9b1e 已通过 work-documents、format:check、typecheck、lint、guard（360 文件 AST 护栏通过）、build、正式打包 test:smoke、真实 mio-test broker:init:test 首次 6 项升级与二次 0 项幂等核验，以及 check:local 全受影响子系统测试全集（含 local-broker、rabbitmq-lifecycle、compute/tests 19 项通道并发/互斥/毒消息死信/通道隔离恢复测试、image-concurrency 满 10 视频阻塞下 15 并发图片快速物化 + 第 33 活动图片 429 + 通道隔离重投 0 重复 POST、以及 Unit 1 conversation-image-tools 正式 Profile 全闭环回归）；已完成锚定有效基线的 incremental full-check 复核、quality-review、v2 norms-review 及 @compute-verifier 独立审查与返修闭环。",
+      "limitations": "本地端到端验证基于隔离回归 PostgreSQL、mio-test RabbitMQ 独立临时 vhost 及受控上游/COS 替身，未触碰共享 mio_dev/mio-dev，未发起外部真实付费生图请求；多机多实例承载性能观察仍随父 PRD 延期项保留，远端 GitHub Actions 全量 CI 与真实人类接受待后续独立完成。",
+      "acceptance": {
+        "candidate": "8429d75bddae0c61662d1d041fc388d7b740aee325a664e73716eb6775bb9b1e",
+        "statement": "用户明确确认接受 Unit 2（image-io-concurrency）并推向 complete",
+        "reference": "conversation://068fe1a5-4ad0-473c-ab98-a0657a827cc4 (2026-11-17T09:10:14+08:00)"
+      }
+    },
+    {
       "key": "image-upload-verification",
       "title": "图片上传完整性与对象关联",
       "locations": [

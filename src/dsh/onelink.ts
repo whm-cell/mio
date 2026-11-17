@@ -1,5 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis';
-import { LlmAdapter, LlmError, resolveRetryPolicy } from '@deepseek-ai/dsh-llm';
+import {
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+  LlmAdapter,
+  LlmError,
+  resolveRetryPolicy,
+} from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai';
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai';
@@ -7,11 +12,17 @@ import { createProvider } from '@earendil-works/pi-ai/models';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messages.lazy';
 import type { CredentialStore, SimpleStreamOptions, Model, Api } from '@earendil-works/pi-ai';
-import type { ConversationRun, ModelObservation } from '../conversations/contracts.ts';
+import type {
+  ConversationRun,
+  ConversationVision,
+  ModelObservation,
+} from '../conversations/contracts.ts';
 import type { ChatProfile, ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
+import { DEFAULT_CHAT_IMAGE_BUDGET } from '../providers/contracts.ts';
 import { ONELINK_ORIGIN } from '../integrations/onelink/models.ts';
 import { chatTransport } from '../integrations/onelink/chat.ts';
 import type { ChatResponseFacts } from '../integrations/onelink/chat.ts';
+import { prepareVisionRequest, visionAttachmentStore } from './vision-request.ts';
 
 const retryPolicy = resolveRetryPolicy({ mode: 'normal', maxRetries: 0 }, 'Mio OneLink');
 const noCredentials: CredentialStore = {
@@ -91,19 +102,28 @@ function metadata(
     provider,
     id: model,
     name: model,
-    inputModalities: ['text'],
+    inputModalities: [...(snapshot.inputModalities ?? ['text'])],
     defaultMaxTokens: snapshotMaxTokens(snapshot),
     ...(snapshot.contextWindow ? { context: { contextWindow: snapshot.contextWindow } } : {}),
   };
 }
 
 /** One immutable request's SDK provider; only the public protocol factories perform encoding. */
-function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAdapter {
+function requestAdapter(
+  run: ConversationRun,
+  facts: ChatResponseFacts,
+  vision: ConversationVision | undefined,
+  expected: Parameters<typeof visionAttachmentStore>[2],
+  execution: { started: boolean },
+): PiAiAdapter {
   const { protocol, submitPath, baseUrl } = resolveChatEndpoint(run.snapshot);
   const maxTokens = snapshotMaxTokens(run.snapshot);
   const provider = protocol.provider;
   const api = protocol.api();
-  const transport = chatTransport(run.snapshot.apiKey, submitPath, facts);
+  const transport = chatTransport(run.snapshot.apiKey, submitPath, facts, (input, init) => {
+    execution.started = true;
+    return fetch(input, init);
+  });
   const requestOptions = (options: SimpleStreamOptions | undefined): SimpleStreamOptions => {
     const rest = { ...options };
     delete rest.apiKey;
@@ -124,7 +144,7 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
     provider,
     api: protocol.apiId,
     baseUrl,
-    input: ['text'],
+    input: [...(run.snapshot.inputModalities ?? ['text'])],
     reasoning: false,
     // SDK 1.5.0 treats zero as unknown. Never expose this as supplier metadata.
     contextWindow: run.snapshot.contextWindow ?? 0,
@@ -151,6 +171,7 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
         api.streamSimple(selected, context, requestOptions(options)),
     },
   });
+  const budget = run.snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET;
   const profile: ResolvedPiAiProviderProfile = {
     provider,
     displayName: 'OneLinkAI',
@@ -162,11 +183,11 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
     timeoutMs: 30_000,
     transport: 'sse',
     cacheRetention: 'none',
-    maxRequestImageBytes: 1,
-    maxRequestImages: 1,
+    maxRequestImageBytes: budget.maxRequestImageBytes,
+    maxRequestImages: budget.maxRequestImages,
     imageOffloadCountQuantum: 1,
-    requestImagePixelBudget: 1,
-    requestImageMaxBytes: 1,
+    requestImagePixelBudget: budget.requestImagePixelBudget,
+    requestImageMaxBytes: budget.requestImageMaxBytes,
   };
   const profiles = new Map([[provider, profile]]);
   return new PiAiAdapter({
@@ -176,11 +197,19 @@ function requestAdapter(run: ConversationRun, facts: ChatResponseFacts): PiAiAda
       credentials: noCredentials,
       authContext: { env: async () => undefined, fileExists: async () => false },
     },
+    ...(vision
+      ? { resolveAttachments: () => visionAttachmentStore(vision, run.userId, expected) }
+      : {}),
   });
 }
 
 /** Stable registration, request-owned snapshots. A Session id by itself grants no billing authority. */
 export class OneLinkAdapter extends LlmAdapter {
+  private readonly vision: ConversationVision | undefined;
+  constructor(vision?: ConversationVision) {
+    super();
+    this.vision = vision;
+  }
   private readonly bindings = new WeakMap<AbortSignal, ConversationRun>();
   bind(signal: AbortSignal, run: ConversationRun): () => void {
     const old = this.bindings.get(signal);
@@ -213,11 +242,17 @@ export class OneLinkAdapter extends LlmAdapter {
   override async prepareCall(provider: string, model: string, signal?: AbortSignal) {
     const run = this.bound(provider, model, signal);
     const facts: ChatResponseFacts = {};
-    const inner = await requestAdapter(run, facts).prepareCall(provider, model, signal);
+    const expected = new Map();
+    const execution = { started: false };
+    const inner = await requestAdapter(run, facts, this.vision, expected, execution).prepareCall(
+      provider,
+      model,
+      signal,
+    );
     return {
       model: metadata(provider, model, run.snapshot),
       stream: (options: GenerateOptions) =>
-        this.dispatch(options, signal!, run, facts, inner.stream),
+        this.dispatch(options, signal!, run, facts, inner.stream, expected, execution),
     };
   }
   async *stream(): AsyncIterable<StreamChunk> {
@@ -229,6 +264,10 @@ export class OneLinkAdapter extends LlmAdapter {
     run: ConversationRun,
     facts: ChatResponseFacts,
     stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
+    expected: Parameters<typeof visionAttachmentStore>[2] extends ReadonlyMap<infer K, infer V>
+      ? Map<K, V>
+      : never,
+    execution: { started: boolean },
   ): AsyncIterable<StreamChunk> {
     const maxTokens = snapshotMaxTokens(run.snapshot);
     if (
@@ -242,14 +281,18 @@ export class OneLinkAdapter extends LlmAdapter {
       !options.maxTokens ||
       options.maxTokens > maxTokens ||
       options.stop !== undefined ||
-      options.messages.some((message) =>
-        message.content.some((block) => block.type === 'image' || block.type === 'file'),
-      )
+      options.messages.some((message) => message.content.some((block) => block.type === 'file')) ||
+      (options.messages.some((message) =>
+        message.content.some((block) => block.type === 'image'),
+      ) &&
+        (!run.snapshot.inputModalities?.includes('image') || !this.vision))
     )
       throw new LlmError('OneLink request does not match its binding', 'BINDING_REQUIRED');
     let usage: ModelObservation['usage'];
     let failureCode: string | undefined;
     let observed = false;
+    let release: (() => void) | undefined;
+    execution.started = false;
     const observation = (finish: string): ModelObservation => {
       if (!usage || (usage.inputTokens === 0 && usage.outputTokens === 0))
         return {
@@ -270,7 +313,20 @@ export class OneLinkAdapter extends LlmAdapter {
       };
     };
     try {
-      for await (const chunk of stream(options)) {
+      const containsImages = options.messages.some((message) =>
+        message.content.some((block) => block.type === 'image'),
+      );
+      if (containsImages) release = await this.vision!.acquireRequest(signal);
+      const projected = containsImages
+        ? await prepareVisionRequest(
+            options,
+            run,
+            this.vision!,
+            run.snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET,
+            expected,
+          )
+        : options;
+      for await (const chunk of stream(projected)) {
         if (chunk.type === 'usage') usage = chunk.usage;
         if (chunk.type === 'finish') {
           if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
@@ -307,12 +363,18 @@ export class OneLinkAdapter extends LlmAdapter {
                   },
                 }
               : chunk;
-          observed = true;
-          await run.observe(observation(safe.reason.kind));
+          if (execution.started) {
+            observed = true;
+            await run.observe(observation(safe.reason.kind));
+          }
           yield safe;
         } else yield chunk;
       }
     } catch (error) {
+      if (error instanceof LlmError && error.code === IMAGE_OFFLOAD_REQUIRED_CODE) {
+        failureCode = IMAGE_OFFLOAD_REQUIRED_CODE;
+        throw error;
+      }
       failureCode = signal.aborted
         ? 'ABORTED'
         : error instanceof LlmError && error.code === 'TIMEOUT'
@@ -320,8 +382,9 @@ export class OneLinkAdapter extends LlmAdapter {
           : 'ONELINK_FAILED';
       throw new LlmError('OneLink model request failed', failureCode);
     } finally {
+      release?.();
       // The loop may stop consuming immediately after abort; it need not request a terminal chunk.
-      if (!observed) {
+      if (!observed && execution.started) {
         failureCode ??= signal.aborted ? 'ABORTED' : 'ONELINK_UNKNOWN';
         try {
           await run.observe(observation(signal.aborted ? 'aborted' : 'unknown'));
@@ -333,8 +396,8 @@ export class OneLinkAdapter extends LlmAdapter {
   }
 }
 
-export function registerOneLink(ctx: Context): OneLinkAdapter {
-  const adapter = new OneLinkAdapter();
+export function registerOneLink(ctx: Context, vision?: ConversationVision): OneLinkAdapter {
+  const adapter = new OneLinkAdapter(vision);
   ctx.llm.registerAdapter(
     Object.values(chatProfiles).map((profile) => profile.provider),
     adapter,

@@ -16,6 +16,7 @@ import { decryptCredential } from './credentials.ts';
 import {
   catalogView,
   findModel,
+  indexEffectiveImageRoutes,
   membershipError,
   resolveEffectiveChat,
   resolveEffectiveImage,
@@ -106,6 +107,24 @@ export function createProviderService(
     if (credentialFailure) throw credentialFailure;
     return result;
   };
+  const imageState = async (actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) => {
+    assertOpen();
+    const row = await store.state(actor.userId);
+    assertOpen();
+    if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
+    const model = findModel(row.models, modelRef);
+    const reason = membershipError(row, model);
+    if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+    const adaptation = resolveEffectiveImage(row, model!);
+    if (!adaptation) throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+    if (
+      row.preferences.some(
+        (pref) => pref.model_key === model!.model_key && pref.usage === 'image' && !pref.enabled,
+      )
+    )
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
+    return { row, model: model!, adaptation };
+  };
   return {
     /** Resolve only the current owner's credential for an already admitted task. */
     async resolveImageTaskCredential(ownerId: string) {
@@ -119,25 +138,61 @@ export function createProviderService(
         config,
       );
     },
-    async resolveImage(actor: ProviderPrincipal, modelRef: string): Promise<ImageRuntimeSnapshot> {
+    async listImageModels(actor: Pick<ProviderPrincipal, 'userId'>) {
       assertOpen();
       const row = await store.state(actor.userId);
       assertOpen();
       if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
-      const model = findModel(row.models, modelRef);
-      const reason = membershipError(row, model);
-      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
-      const adaptation = resolveEffectiveImage(row, model!);
-      if (!adaptation) throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
-      if (
-        row.preferences.some(
-          (pref) => pref.model_key === model!.model_key && pref.usage === 'image' && !pref.enabled,
-        )
-      )
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
+      const providerReason = membershipError(row, undefined);
+      if (providerReason && providerReason !== 'MODEL_NOT_FOUND')
+        throw new ProviderError(HTTP_STATUS.CONFLICT, providerReason);
+      const indexedRoutes = indexEffectiveImageRoutes(row.routes);
+      const disabledKeys = new Set(
+        row.preferences
+          .filter((pref) => pref.usage === 'image' && !pref.enabled)
+          .map((pref) => pref.model_key),
+      );
+      const models = [];
+      for (const model of row.models) {
+        if (membershipError(row, model) !== null || disabledKeys.has(model.model_key)) continue;
+        const adaptation = resolveEffectiveImage(row, model, indexedRoutes);
+        if (!adaptation || !adaptation.asyncReady) continue;
+        const { paramSpec, requestDefaults, requiresAsync } = adaptation.route;
+        models.push({
+          modelRef: modelReference(model.model_key),
+          modelId: model.raw_model_id!,
+          name: model.display_name ?? model.raw_model_id!,
+          vendor: adaptation.vendor,
+          driver: adaptation.profile,
+          supportedOperations: [...paramSpec.supportedOperations],
+          requiresAsync,
+          maxN: paramSpec.maxN,
+          allowExplicitN: paramSpec.allowExplicitN !== false,
+          allowedSizes: paramSpec.allowedSizes ? [...paramSpec.allowedSizes] : null,
+          defaultSize: requestDefaults.defaultSize ?? null,
+          allowCustomDimensions: paramSpec.allowCustomDimensions,
+          allowedAspectRatios: [...paramSpec.allowedAspectRatios],
+          maxReferenceImages: paramSpec.maxReferenceImages,
+          allowGenerateReferences: paramSpec.allowGenerateReferences,
+          allowMaskPng: paramSpec.allowMaskPng,
+          allowedQualities: [...paramSpec.allowedQualities],
+          allowedBackgrounds: [...paramSpec.allowedBackgrounds],
+          allowedOutputFormats: [...paramSpec.allowedOutputFormats],
+        });
+      }
+      return models;
+    },
+    async inspectImageRoute(actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) {
+      return (await imageState(actor, modelRef)).adaptation.route;
+    },
+    async resolveImage(
+      actor: { readonly userId: string; readonly sessionId?: string },
+      modelRef: string,
+    ): Promise<ImageRuntimeSnapshot> {
+      const { row, model, adaptation } = await imageState(actor, modelRef);
       return {
-        modelId: model!.raw_model_id!,
-        modelKey: model!.model_key,
+        modelId: model.raw_model_id!,
+        modelKey: model.model_key,
         vendor: adaptation.vendor,
         profile: adaptation.profile,
         route: adaptation.route,
@@ -187,6 +242,8 @@ export function createProviderService(
         submitPath: adaptation.submitPath,
         maxOutputTokens: adaptation.maxOutputTokens,
         capabilityVersion: `onelink-text:${adaptation.declarationVersion}`,
+        inputModalities: Object.freeze([...adaptation.inputModalities]),
+        imageBudget: Object.freeze({ ...adaptation.imageBudget }),
         ...(adaptation.contextWindow ? { contextWindow: adaptation.contextWindow } : {}),
         apiKey,
       });

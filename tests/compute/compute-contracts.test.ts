@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import {
   COMPUTE_PROFILE,
+  isValidImageAssetObjectKey,
   parseComputeCommandV1,
   parseComputeResultV1,
 } from '../../contracts/compute/src/index.ts';
@@ -103,4 +104,45 @@ it('accepts state-specific result shapes and rejects forged output paths or code
     { ...base, state: 'succeeded', output: { ...output, sizeBytes: 1024 ** 3 + 1 } },
   ])
     expect(() => parseComputeResultV1(value)).toThrow('COMPUTE_MESSAGE_INVALID');
+});
+
+it('accepts owner raw and image derived object keys and rejects video derived or mismatched keys', () => {
+  const fileId = '77777777-7777-4777-8777-777777777777';
+  expect(isValidImageAssetObjectKey(assetId, `mio/raw/${assetId}/${rawId}`, 'image/png')).toBe(
+    true,
+  );
+  expect(
+    isValidImageAssetObjectKey(assetId, `mio/derived/${jobId}/images/0-${fileId}.png`, 'image/png'),
+  ).toBe(true);
+  expect(
+    isValidImageAssetObjectKey(
+      assetId,
+      `mio/derived/${jobId}/images/15-${fileId}.jpeg`,
+      'image/jpeg',
+    ),
+  ).toBe(true);
+
+  // Reject video derived key, extension/contentType mismatch, out-of-range index (>15), and wrong raw owner assetId
+  expect(
+    isValidImageAssetObjectKey(
+      assetId,
+      `mio/derived/${jobId}/${attemptId}/result.mp4`,
+      'image/png',
+    ),
+  ).toBe(false);
+  expect(
+    isValidImageAssetObjectKey(
+      assetId,
+      `mio/derived/${jobId}/images/0-${fileId}.png`,
+      'image/jpeg',
+    ),
+  ).toBe(false);
+  expect(
+    isValidImageAssetObjectKey(
+      assetId,
+      `mio/derived/${jobId}/images/16-${fileId}.png`,
+      'image/png',
+    ),
+  ).toBe(false);
+  expect(isValidImageAssetObjectKey(assetId, `mio/raw/${jobId}/${rawId}`, 'image/png')).toBe(false);
 });

@@ -142,7 +142,7 @@ it('reserves shared capacity for owner recovery, ignores stale results and remov
   expect(await store.imagePending()).toBeUndefined();
 });
 
-it('counts image and video admission together and rechecks capacity before explicit recovery', async () => {
+it('decouples image active quota (32 per owner) from video admission and rechecks capacity before explicit recovery', async () => {
   const owner = randomUUID();
   const make = (): ImageCommandV1 => ({
     version: 1,
@@ -156,17 +156,25 @@ it('counts image and video admission together and rechecks capacity before expli
     input: { model: 'gpt-image-2', prompt: 'square' },
     credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
   });
-  const images = Array.from({ length: 9 }, make);
-  for (const image of images) await store.imageCreate(owner, randomUUID(), image.jobId, image);
   const assetId = randomUUID(),
     key = `mio/raw/${assetId}/${randomUUID()}`;
   await pool.query(
     "INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at) VALUES($1,$2,'x.mp4','video/mp4',3,$3,$4,'ready',now())",
     [assetId, owner, `mio/staging/${assetId}`, key],
   );
-  await store.create(owner, randomUUID(), assetId, key, 3, 'etag');
-  const tenthImage = make();
-  await expect(store.imageCreate(owner, randomUUID(), 'over', tenthImage)).rejects.toMatchObject({
+  for (let i = 0; i < 10; i++) {
+    await store.create(owner, randomUUID(), assetId, key, 3, 'etag');
+  }
+  await expect(store.create(owner, randomUUID(), assetId, key, 3, 'etag')).rejects.toMatchObject({
+    code: 'COMPUTE_QUOTA_EXCEEDED',
+  });
+
+  const images = Array.from({ length: 32 }, make);
+  for (const image of images) await store.imageCreate(owner, randomUUID(), image.jobId, image);
+  const overQuotaImage = make();
+  await expect(
+    store.imageCreate(owner, randomUUID(), 'over', overQuotaImage),
+  ).rejects.toMatchObject({
     code: 'COMPUTE_QUOTA_EXCEEDED',
   });
   const failed: ImageResultV1 = {
@@ -179,7 +187,7 @@ it('counts image and video admission together and rechecks capacity before expli
     outputs: [],
   };
   await store.imageAccept(failed);
-  await store.imageCreate(owner, randomUUID(), 'replacement', tenthImage);
+  await store.imageCreate(owner, randomUUID(), 'replacement', overQuotaImage);
   await expect(store.imageRecover(owner, failed.jobId)).rejects.toMatchObject({
     code: 'COMPUTE_QUOTA_EXCEEDED',
   });
@@ -196,11 +204,11 @@ it('counts image and video admission together and rechecks capacity before expli
 });
 
 it.each([
-  { imageCount: 250, videoCount: 249, owners: 'distinct' },
-  { imageCount: 5, videoCount: 4, owners: 'same' },
+  { existingImages: 999, existingVideos: 500, owners: 'distinct' },
+  { existingImages: 31, existingVideos: 10, owners: 'same' },
 ] as const)(
-  'serializes concurrent mixed admission at the $owners capacity boundary',
-  async ({ imageCount, videoCount, owners }) => {
+  'serializes concurrent image admissions at the $owners image capacity boundary without video interference',
+  async ({ existingImages, existingVideos, owners }) => {
     const owner = `race-${randomUUID()}`;
     const assetId = randomUUID(),
       key = `mio/raw/${assetId}/${randomUUID()}`;
@@ -208,7 +216,7 @@ it.each([
       "INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at) VALUES($1,$2,'x.mp4','video/mp4',3,$3,$4,'ready',now())",
       [assetId, owner, `mio/staging/${assetId}`, key],
     );
-    const image: ImageCommandV1 = {
+    const makeImage = (): ImageCommandV1 => ({
       version: 1,
       type: 'image.request',
       profile: 'openai-images',
@@ -219,20 +227,21 @@ it.each([
       expiresAt: Date.now() + 60000,
       input: { model: 'gpt-image-2', prompt: 'square' },
       credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
-    };
+    });
+    const seed = makeImage();
     await pool.query(
       `INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,state)
     SELECT gen_random_uuid(),CASE WHEN $2='same' THEN $3 ELSE 'image-'||n END,gen_random_uuid(),n::text,$4::jsonb,'accepted' FROM generate_series(1,$1) n`,
-      [imageCount, owners, owner, JSON.stringify(image)],
+      [existingImages, owners, owner, JSON.stringify(seed)],
     );
     await pool.query(
       `INSERT INTO mio_compute_jobs(id,owner_id,request_id,input_asset_id,input_key,input_size,input_etag,state,attempt,attempt_id,command_id)
     SELECT gen_random_uuid(),CASE WHEN $2='same' THEN $3 ELSE 'video-'||n END,gen_random_uuid(),$4,$5,3,'etag','queued',1,gen_random_uuid(),gen_random_uuid() FROM generate_series(1,$1) n`,
-      [videoCount, owners, owner, assetId, key],
+      [existingVideos, owners, owner, assetId, key],
     );
     const results = await Promise.allSettled([
-      store.imageCreate(owner, randomUUID(), 'race', image),
-      store.create(owner, randomUUID(), assetId, key, 3, 'etag'),
+      store.imageCreate(owner, randomUUID(), 'race-1', makeImage()),
+      store.imageCreate(owner, randomUUID(), 'race-2', makeImage()),
     ]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     const rejected = results.find((result) => result.status === 'rejected');

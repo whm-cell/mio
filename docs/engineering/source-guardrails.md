@@ -8,6 +8,8 @@
 
 根服务 A 中 COS SDK 包仅允许 `src/integrations/cos.ts` 导入，开发工具和其他 A 模块不得直接或经别名导入；B 的精确适配器按下述多项目声明约束。检查按导入名称、解析包身份和真实归属识别。类型、别名及邻近非法文件反例见同一 fixture；运行权限仍由 COS 凭据、桶策略与实际测试保证。
 
+正式 Profile 薄入口 `src/profile.ts` 可指向 `src/plugin.ts`，用于在不改变独立插件装载条件的前提下声明内核依赖；其他生产模块不得依赖这两个入口。AST 检查解析后的导入和重导出，合法组合边与业务、邻近模块的反例由 guardrail fixture 覆盖。
+
 Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工具也不能直接或通过本职责内 helper 导入 Redis 驱动。公共 Redis 不反向依赖消费者、插件、脚本或测试，只允许独立公共契约作为本地依赖；插件和认证可消费公共资源，迁移工具仍由已有 developmentDependencies 禁止导入该运行模块。AST 与包归属解析覆盖类型导入、重导出和别名；真实 Redis 测试夹具允许导入驱动。新增文件继承 `src` / `tests` 既有分类、类型检查与构建范围，不为目录形状新增冗余配置。这是静态导入边界，不能拦截任意宿主子进程或网络副作用。正反例见同一 guardrail fixture。
 
 共同请求模块 `src/http-request.ts` 限定依赖 `node:http` 和基础库的 `errors`、`http-status`；共同响应模块 `src/http-response.ts` 限定依赖 `node:http`、基础库 `identifiers` 与解析后指向 `src/contracts.ts` 的本地模块。基础库导入名与解析目标须对应同一个已登记入口，不能借别名指向另一公开入口。业务模块、认证、插件入口、其他包和开发脚本均不可作为其依赖；正常业务消费者可导入这两个原语，无需登记消费者。现有 AST 导入/导出采集与模块解析统一检查 type-only、重导出、类型查询、别名和字面量动态导入，分别报告 `HTTP_REQUEST_DEPENDENCY` 与 `HTTP_RESPONSE_DEPENDENCY`；合法和违规场景在同一 guardrail fixture 验证。此规则检查模块方向，不是对 Node 包内符号的数据流沙箱；公开符号及真实消费者继续由 quality-review 核对，不据此宣称全部 `src` 内部方向均已隔离。

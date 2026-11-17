@@ -25,9 +25,9 @@ docker compose --env-file "$RABBITMQ_ENV_FILE" -p mio-compute -f deploy/rabbitmq
 node scripts/service/prepare-compute-broker.ts "$RABBITMQ_ENV_FILE" .runtime/compute-environment/broker-p3
 ```
 
-输出目录必须是 `.runtime` 下尚不存在的目录；脚本只连接 `127.0.0.1` 的管理接口，拒绝覆盖既有用户或固定拓扑。它先记录计划并将随机 A/B 凭据写入 0600 文件，再创建固定持久 direct exchange、quorum queue、各自的 direct DLX 和持久 quorum DLQ；来源队列指定 `dead-letter-strategy=at-least-once`、`overflow=reject-publish`、`delivery-limit=-1`，先核对 `stream_queue` feature flag 和原 vhost 的 1 GiB operator policy。脚本额外建立两个独立测试 vhost，不清空已有业务数据。网络请求结果未知时停止，先查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源，再决定如何恢复；不可删除或重建已有业务队列来重试。
+输出目录必须是 `.runtime` 下尚不存在的目录；脚本只连接 `127.0.0.1` 的管理接口，拒绝覆盖既有用户或固定拓扑。它先记录计划并将随机 A/B 凭据写入 0600 文件，再创建固定持久 direct exchange（`mio.compute.commands.v1`、`mio.compute.results.v1`）、quorum queue（视频命令 `mio.compute.commands.v1`、图片命令 `mio.compute.image.commands.v1`、结果 `mio.compute.results.v1`）、各自的 direct DLX 和持久 quorum DLQ；来源队列指定 `dead-letter-strategy=at-least-once`、`overflow=reject-publish`、`delivery-limit=-1`，先核对 `stream_queue` feature flag 和原 vhost 的 1 GiB operator policy。脚本额外建立两个独立测试 vhost，不清空已有业务数据。网络请求结果未知时停止，先查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源，再决定如何恢复；不可删除或重建已有业务队列来重试。
 
-`runtime-a.env` 和 `runtime-b.env` 是业务 vhost 的不同账户配置；`worker-test-a.env` 与 `worker-test-b.env` 指向独立测试 vhost。各文件提供 `RABBITMQ_URL`、`MIO_COMPUTE_BROKER_USER` 和对应的 `MIO_COMPUTE_EXPECTED_RESULT_USER` 或 `MIO_COMPUTE_EXPECTED_COMMAND_USER`；A 启用计算服务时还需单独设置 `MIO_COMPUTE_ENABLED=true`。两个账户均无管理或 impersonator 标签，也没有 configure 权限：A 仅发布命令、消费结果，B 仅消费命令、发布结果。运行时不声明拓扑。消息发布方设置自身 `userId`，消费者核对预期身份；确认收到不代表业务执行成功。
+`runtime-a.env` 和 `runtime-b.env` 是业务 vhost 的不同账户配置；`worker-test-a.env` 与 `worker-test-b.env` 指向独立测试 vhost。各文件提供 `RABBITMQ_URL`、`MIO_COMPUTE_BROKER_USER` 和对应的 `MIO_COMPUTE_EXPECTED_RESULT_USER` 或 `MIO_COMPUTE_EXPECTED_COMMAND_USER`；A 启用计算服务时还需单独设置 `MIO_COMPUTE_ENABLED=true`。两个账户均无管理或 impersonator 标签，也没有 configure 权限：A 仅写 `mio.compute.commands.v1`、读 `mio.compute.results.v1`，B 仅读 `mio.compute.commands.v1` 与 `mio.compute.image.commands.v1`、写 `mio.compute.results.v1`。运行时不声明拓扑。消息发布方设置自身 `userId`，消费者核对预期身份；确认收到不代表业务执行成功。
 
 配置将默认队列类型设为 quorum，并将消费者确认超时设为 75 分钟。客户端仍须显式声明和核验 quorum 队列：RabbitMQ 4.3 起该超时不适用于 classic 队列。禁用投递次数限制不等于业务已实现最多三次实际执行；异常退出、重新投递和终态恢复仍由应用完成并验证。
 

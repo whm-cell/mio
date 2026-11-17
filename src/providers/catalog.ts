@@ -1,5 +1,11 @@
 import { categories } from './contracts.ts';
-import type { Category, ModelRecord, ModelPreference, VerificationRecord } from './contracts.ts';
+import type {
+  Category,
+  ModelRecord,
+  ModelPreference,
+  PlatformRouteRecord,
+  VerificationRecord,
+} from './contracts.ts';
 import type { ProviderRow, ProviderState } from './state.ts';
 import { providerView } from './state.ts';
 import { resolveChatRoute, resolveImageRoute, resolveVerificationView } from './onelink/router.ts';
@@ -48,11 +54,25 @@ export function resolveEffectiveChat(
   return route ? resolveChatRoute(route) : undefined;
 }
 
+export function indexEffectiveImageRoutes(
+  routes: readonly PlatformRouteRecord[] | undefined,
+): Map<string, ResolvedImageRoute> {
+  const byRawId = new Map<string, ResolvedImageRoute>();
+  for (const route of routes ?? []) {
+    if (route.operation !== 'image.generate') continue;
+    const resolved = resolveImageRoute(route);
+    if (resolved) byRawId.set(route.raw_model_id, resolved);
+  }
+  return byRawId;
+}
+
 export function resolveEffectiveImage(
   state: ProviderState,
   model: ModelRecord,
+  indexed?: ReadonlyMap<string, ResolvedImageRoute>,
 ): ResolvedImageRoute | undefined {
   if (!model.raw_model_id) return undefined;
+  if (indexed) return indexed.get(model.raw_model_id);
   const route = (state.routes ?? []).find(
     (item) => item.raw_model_id === model.raw_model_id && item.operation === 'image.generate',
   );
@@ -91,14 +111,11 @@ function buildAdaptationView(
 /** O(models + routes + preferences + verifications); no supplier I/O, decryption or bundled product model list. */
 export function catalogView(state: ProviderState | null, category?: Category) {
   const chatByRawId = new Map<string, ResolvedChatRoute>();
-  const imageByRawId = new Map<string, ResolvedImageRoute>();
+  const imageByRawId = indexEffectiveImageRoutes(state?.routes);
   for (const route of state?.routes ?? []) {
     if (route.operation === 'chat') {
       const resolved = resolveChatRoute(route);
       if (resolved) chatByRawId.set(route.raw_model_id, resolved);
-    } else if (route.operation === 'image.generate') {
-      const resolved = resolveImageRoute(route);
-      if (resolved) imageByRawId.set(route.raw_model_id, resolved);
     }
   }
   const prefs = new Map<string, ModelPreference[]>();

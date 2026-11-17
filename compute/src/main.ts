@@ -110,7 +110,7 @@ async function start(): Promise<void> {
         void failed.catch(() => {});
         const closed = broker.closed();
         const imageBroker = broker;
-        maintenance = new Maintenance(broker, current, fail, async (command, ack) => {
+        const handleImage: NonNullable<Parameters<Broker['consume']>[3]> = async (command, ack) => {
           let outcome;
           if (command.type === 'image.recover') {
             try {
@@ -148,7 +148,8 @@ async function start(): Promise<void> {
           });
           if (outcome.state === 'materializing') throw new Error('IMAGE_MATERIALIZATION_PENDING');
           ack();
-        });
+        };
+        maintenance = new Maintenance(broker, current, fail, handleImage);
         const initialized = await Promise.race([
           maintenance.tick().then(() => true),
           closed.then(() => false),

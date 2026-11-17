@@ -16,6 +16,7 @@ export {
   IMAGE_DRIVER_PATH_PREFIX,
   isImageDriver,
   isSafeRouteIdentifier,
+  isValidImageAssetObjectKey,
   isValidImageRoutePath,
   validateImageRouteConfig,
   validateImageInputByRoute,
@@ -54,6 +55,11 @@ export const COMPUTE_MAX_MEDIA_BYTES = 1024 ** 3;
 export const COMMAND_EXCHANGE = 'mio.compute.commands.v1';
 export const COMMAND_QUEUE = 'mio.compute.commands.v1';
 export const COMMAND_ROUTING_KEY = 'transcode.v1';
+export const IMAGE_COMMAND_QUEUE = 'mio.compute.image.commands.v1';
+export const IMAGE_COMMAND_ROUTING_KEY = 'image.v1';
+export const IMAGE_WORKER_PREFETCH = 4;
+export const IMAGE_USER_QUOTA = 32;
+export const IMAGE_GLOBAL_QUOTA = 1000;
 export const RESULT_EXCHANGE = 'mio.compute.results.v1';
 export const RESULT_QUEUE = 'mio.compute.results.v1';
 export const RESULT_ROUTING_KEY = 'transcode.result.v1';

@@ -1,9 +1,10 @@
-import { artifact, assess } from './context.ts';
-import { digest, json, loadTask } from './records.ts';
+import { artifact, assess, requireCandidate } from './context.ts';
+import { contractPlan, digest, json, loadTask, taskRevision } from './records.ts';
 import type { Task } from './records.ts';
 import { finiteOutput, hasReadReference, readPage } from './output.ts';
 import type { ReadOptions } from './output.ts';
 import { normsDraft, normsIssues } from './norms-review.ts';
+import { qualityDraft } from './quality-review.ts';
 
 async function currentAssessment(root: string, task: Task) {
   try {
@@ -31,7 +32,6 @@ export function inspectionOutput(result: Record<string, unknown>) {
   const task = result.task as Record<string, unknown>;
   const assessment = result.assessment as Record<string, unknown>;
   const id = String(task.id);
-  const revision = String(result.revision);
   const taskView = finiteOutput(task, (pointer) => {
     const [field, ...rest] = pointer.slice(1).split('/');
     const meta = ['id', 'stage', 'reviewDecision', 'releaseDisposition', 'archived', 'delivery'];
@@ -45,14 +45,11 @@ export function inspectionOutput(result: Record<string, unknown>) {
             : '';
     return {
       argv: ['read', id, 'task', '--select', selected + (rest.length ? `/${rest.join('/')}` : '')],
-      sha256: revision,
     };
   });
   const readableAssessment = assessmentSource(assessment, task.reviewDecision);
-  const assessmentHash = digest(json(readableAssessment));
   const assessmentView = finiteOutput(readableAssessment, (pointer) => ({
     argv: ['read', id, 'check', '--select', pointer],
-    sha256: assessmentHash,
   }));
   const critical = ['authorization', 'scope', 'nonGoals', 'decisions', 'blockers', 'dependencies'];
   const omitted = critical.filter((field) => {
@@ -84,7 +81,6 @@ export function inspectionOutput(result: Record<string, unknown>) {
       // Keep the declaration visible even when the rest of the task folds to a root read.
       result: finiteOutput(task.result ?? null, (pointer) => ({
         argv: ['read', id, 'task', '--select', `/plan/result${pointer}`],
-        sha256: revision,
       })),
     },
     assessment: {
@@ -110,13 +106,9 @@ export function inspectionOutput(result: Record<string, unknown>) {
   };
 }
 
-export function assessmentOutput(
-  task: Task,
-  assessment: Record<string, unknown>,
-  revision: string,
-) {
+export function assessmentOutput(task: Task, assessment: Record<string, unknown>) {
   const result = inspectionOutput({
-    revision,
+    revision: taskRevision(task),
     task: {
       id: task.plan.id,
       result: task.plan.result ?? null,
@@ -141,9 +133,9 @@ export async function readTask(
   options: ReadOptions,
   entry?: string,
 ) {
-  const { task, raw } = await loadTask(root, id);
+  const { task } = await loadTask(root, id);
   const command = ['read', id, kind];
-  if (kind === 'task') return readPage(task, options, command, digest(raw));
+  if (kind === 'task') return readPage(task, options, command);
   if (kind === 'check') {
     const assessment = await currentAssessment(root, task);
     return readPage(assessment, options, command);
@@ -156,10 +148,49 @@ export async function readTask(
         [...assessment.errors, ...issues].join('\n') ||
           'WORK_NORMS_CONTRACT: reconcile the current task',
       );
-    return readPage(await normsDraft(root, task.plan, task.checkpoint), options, command);
+    const candidate = await requireCandidate(root, task);
+    return readPage(await normsDraft(root, task, { candidate }), options, command);
+  }
+  if (kind === 'quality-draft')
+    return readPage(qualityDraft(task, await requireCandidate(root, task)), options, command);
+  if (kind === 'evidence-draft') {
+    const criterion = task.plan.acceptance.find((item) => item.id === entry);
+    if (!criterion) throw new Error('WORK_CRITERION: select an acceptance id from this task');
+    if (['quality-review', 'norms-review'].includes(criterion.id))
+      throw new Error('WORK_READ: use quality-draft or norms-draft for this review');
+    const candidate = await requireCandidate(root, task);
+    const common = {
+      candidate,
+      contract: contractPlan(task),
+      criterion: criterion.id,
+      result: 'pending',
+    };
+    const coverage = criterion.method === 'automated';
+    const body = coverage
+      ? {
+          ...common,
+          mode: 'manual',
+          executionCount: 0,
+          reviewer: '',
+          source: '',
+          scope: '',
+          environment: '',
+          uncovered: '',
+          assessment: '',
+        }
+      : { ...common, observation: '' };
+    const language = coverage ? 'mio-coverage' : 'mio-evidence';
+    command.push(criterion.id);
+    return readPage(
+      `# Evidence: incomplete draft\n\nFill in actual observations before registration.\n\n\`\`\`${language}\n${json(body)}\`\`\`\n`,
+      options,
+      command,
+    );
   }
   if (kind !== 'evidence' || !entry || !/^(?:0|[1-9]\d{0,8})$/.test(entry))
-    throw new Error('WORK_READ: choose task/check/norms-draft, or evidence with its ledger index');
+    throw new Error(
+      'WORK_READ: choose task/check/norms-draft/quality-draft/evidence-draft, or evidence with its ledger index',
+    );
   const evidence = task.evidence[Number(entry)];
   if (!evidence) throw new Error('WORK_READ_EVIDENCE: ledger entry does not exist');
   command.push(entry);
@@ -170,20 +201,24 @@ export async function readTask(
   } catch {
     throw new Error('WORK_READ_ENCODING: bound evidence is not UTF-8 text');
   }
-  const actualSha256 = digest(bytes);
+  const actualSha256 = evidence.sha256 === undefined ? null : digest(bytes);
   const source = {
     entry: evidence,
-    integrity: actualSha256 === evidence.sha256 ? 'verified' : 'mismatch',
+    integrity:
+      actualSha256 === null
+        ? 'pending'
+        : actualSha256 === evidence.sha256
+          ? 'verified'
+          : 'mismatch',
     actualSha256,
     text,
   };
-  const hash = digest(json({ revision: digest(raw), evidence, actualSha256 }));
   // The default expands only this original's text. Metadata can be selected independently.
   const chosen = { ...options, select: options.select || '/text' };
   return {
     integrity: source.integrity,
-    expectedSha256: evidence.sha256,
+    ...(evidence.sha256 === undefined ? {} : { expectedSha256: evidence.sha256 }),
     actualSha256,
-    ...readPage(source, chosen, command, hash),
+    ...readPage(source, chosen, command),
   };
 }

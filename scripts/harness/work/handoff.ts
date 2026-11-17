@@ -1,29 +1,32 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { assess, capture, contractIssues } from './context.ts';
-import { checkedPath, digest, json, member, parseTask, saveTask } from './records.ts';
+import { assess, capture, contractIssues, requireCandidate } from './context.ts';
+import {
+  checkedPath,
+  digest,
+  json,
+  member,
+  parseTask,
+  sameCandidate,
+  saveTask,
+} from './records.ts';
 import type { Task } from './records.ts';
 import { bookPaths, readBook } from './reports.ts';
 import { draft } from './records.ts';
 import { documentCatalog, resolveDocument, resultDocument } from '../task-documents.ts';
 import { withTaskCommand } from './command.ts';
 
-/** A portable proposal plus candidate manifest; local authority and evidence never transfer implicitly. */
+/** A portable proposal plus committed candidate; local authority and evidence never transfer implicitly. */
 export async function handoff(root: string, task: Task) {
-  const current = await capture(root, task);
-  if (
-    !task.checkpoint ||
-    task.checkpoint.candidate !== current.candidate ||
-    task.checkpoint.head !== current.head ||
-    task.checkpoint.branch !== current.branch
-  )
-    throw new Error('WORK_HANDOFF_STALE: reconcile before preparing a handoff');
+  const candidate = await requireCandidate(root, task);
   const incomplete = contractIssues(task).filter((error) => error.startsWith('WORK_CONTRACT'));
   if (incomplete.length) throw new Error(incomplete.join('\n'));
   const plan = task.plan;
   const assessment = await assess(root, task);
   const portable: Task = {
     version: 1,
+    revision: 0,
+    contractRevision: task.contractRevision ?? 0,
     member: task.member,
     workspace: '',
     stage: null,
@@ -32,7 +35,7 @@ export async function handoff(root: string, task: Task) {
     evidence: [],
     archived: false,
     ...(task.delivery ? { delivery: { version: task.delivery.version } } : {}),
-    checkpoint: task.checkpoint,
+    checkpoint: { candidate },
     plan: {
       id: plan.id,
       ...(plan.requirement ? { requirement: plan.requirement } : {}),
@@ -54,7 +57,7 @@ export async function handoff(root: string, task: Task) {
     },
     notes: assessment.evidence.map(
       (entry) =>
-        `Current ${entry.criterion}: ${entry.result}; basis ${'basis' in entry ? entry.basis : entry.method}; candidate ${current.candidate}; retrieve and reverify the complete original chain; acceptance does not transfer.`,
+        `Current ${entry.criterion}: ${entry.result}; basis ${'basis' in entry ? entry.basis : entry.method}; candidate ${JSON.stringify(candidate)}; retrieve and reverify originals; acceptance does not transfer.`,
     ),
   };
   const path = await checkedPath(
@@ -86,7 +89,6 @@ export async function receive(root: string, source: string, key?: string) {
     );
   const catalog = await documentCatalog(root);
   if (!source.startsWith('.work/inbox/')) resolveDocument(source, catalog);
-  const markdown = await readFile(await checkedPath(root, source), 'utf8');
   if (resultDocument(source) && source.endsWith('/report.md')) {
     const entry = catalog.documents.find(
       (entry) => entry.kind === 'prd' && bookPaths(entry.identity, catalog).report === source,
@@ -115,30 +117,32 @@ export async function receive(root: string, source: string, key?: string) {
     task.delivery = {
       version: 2,
       accepted: {
-        path: source,
+        path: bookPaths(book.prd, catalog).records,
         key: result.key,
-        sha256: digest(json(result)),
         candidate: result.acceptance.candidate,
       },
     };
     task.notes.push(
-      `Read accepted result ${source}#${result.key}; candidate label ${result.acceptance.candidate}. Entry points: ${result.locations.map((entry) => entry.path).join(', ')}. Public summaries cannot restore code or evidence and are not current verification.`,
+      `Read accepted result ${source}#${result.key}; candidate ${JSON.stringify(result.acceptance.candidate)}. Entry points: ${result.locations.map((entry) => entry.path).join(', ')}. Public summaries cannot restore code or evidence and are not current verification.`,
     );
     await withTaskCommand(root, task.plan.id, 'receive', () => saveTask(root, task));
     return task;
   }
+  const markdown = await readFile(await checkedPath(root, source), 'utf8');
   const blocks = [...markdown.matchAll(/^```mio-work-handoff\r?\n([\s\S]*?)^```\s*$/gm)];
   if (blocks.length !== 1)
     throw new Error('WORK_HANDOFF_FORMAT: expected one mio-work-handoff block');
   const incoming = parseTask(blocks[0]![1]!);
-  if (!incoming.checkpoint) throw new Error('WORK_HANDOFF_FORMAT: candidate manifest missing');
+  if (!incoming.checkpoint) throw new Error('WORK_HANDOFF_FORMAT: candidate missing');
   const current = await capture(root, incoming);
-  if (json(incoming.checkpoint.files) !== json(current.files))
+  if (!sameCandidate(incoming.checkpoint.candidate, current.candidate))
     throw new Error(
-      'WORK_HANDOFF_CODE: required code/documents differ; retrieve the pinned candidate first',
+      'WORK_HANDOFF_CODE: retrieve the pinned commit and use a clean working tree first',
     );
   const task: Task = {
     ...incoming,
+    revision: 0,
+    contractRevision: 0,
     member: await member(root),
     workspace: root,
     stage: null,
@@ -154,7 +158,7 @@ export async function receive(root: string, source: string, key?: string) {
     },
     notes: [
       ...incoming.notes,
-      `Received ${source} from ${incoming.member}; verified file manifest ${incoming.checkpoint.candidate}; source HEAD ${incoming.checkpoint.head ?? 'unborn'}. Reconcile local authority and retrieve required raw evidence.`,
+      `Received ${source} from ${incoming.member}; verified commit ${current.head}. Reconcile local authority and retrieve required raw evidence.`,
     ],
   };
   await withTaskCommand(root, task.plan.id, 'receive', () => saveTask(root, task));

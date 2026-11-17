@@ -1,15 +1,13 @@
 import { Buffer } from 'node:buffer';
-import { digest, json } from './records.ts';
+import { json } from './records.ts';
 
 export interface ReadOptions {
   offset: number;
   limit?: number;
-  hash?: string;
   select: string;
 }
 export interface ReadReference {
   argv: string[];
-  sha256: string;
 }
 export const outputBytes = 24576;
 const size = (value: unknown) => Buffer.byteLength(json(value));
@@ -71,7 +69,7 @@ export function finiteOutput(
     const preview = typeof value === 'string' ? textSlice(value, 0, 240, 240) : undefined;
     return {
       $read: {
-        argv: [...ref.argv, '--hash', ref.sha256, '--limit', unit === 'codepoints' ? '1024' : '1'],
+        argv: [...ref.argv, '--limit', unit === 'codepoints' ? '1024' : '1'],
       },
       unit,
       total: preview
@@ -114,14 +112,7 @@ export function hasReadReference(value: unknown): boolean {
 }
 
 /** One shared page format for task fields, assessments, guides and public result readers. */
-export function readPage(
-  source: unknown,
-  options: ReadOptions,
-  command: string[],
-  sha256 = digest(json(source)),
-) {
-  if (options.hash !== undefined && options.hash !== sha256)
-    throw new Error('WORK_READ_STALE: content changed; restart from the first page');
+export function readPage(source: unknown, options: ReadOptions, command: string[]) {
   const selected = selectValue(source, options.select);
   const isText = typeof selected === 'string';
   const limit = options.limit ?? (isText ? 1024 : 10);
@@ -135,7 +126,6 @@ export function readPage(
     throw new Error('WORK_READ_OPTIONS: limit is 1..20 items or 1..2048 codepoints');
   const reference = (pointer: string): ReadReference => ({
     argv: [...command, '--select', pointer],
-    sha256,
   });
   let total: number;
   let body: Record<string, unknown>;
@@ -188,7 +178,6 @@ export function readPage(
       limit,
       count,
       total,
-      sha256,
       next:
         next < total
           ? {
@@ -200,8 +189,6 @@ export function readPage(
                 String(next),
                 '--limit',
                 String(limit),
-                '--hash',
-                sha256,
               ],
             }
           : null,

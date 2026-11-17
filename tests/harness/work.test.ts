@@ -19,10 +19,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import type { Task } from '../../scripts/harness/work/records.ts';
-import { digest } from '../../scripts/harness/work/records.ts';
+import { contractPlan, digest, taskRevision } from '../../scripts/harness/work/records.ts';
 import { reviewFixture, reviewMarkdown } from './fixtures/quality-review-fixture.ts';
 import { artifact } from '../../scripts/harness/work/context.ts';
 import { withTaskCommand } from '../../scripts/harness/work/command.ts';
+import { recordsPath } from '../../scripts/harness/work/compact-store.ts';
+import { renderBook } from '../../scripts/harness/work/reports.ts';
 
 const project = resolve('.');
 const cli = join(project, 'scripts/harness/work/cli.ts');
@@ -72,12 +74,12 @@ function begin(root: string, args: string[], timeout = 10_000) {
 }
 
 async function fixture(actor = 'alice') {
-  const root = await mkdtemp(join(tmpdir(), 'mio-work-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'mio-work-')));
   scratch.push(root);
   await cp(join(project, 'harness.config.json'), join(root, 'harness.config.json'));
   for (const [file, source] of Object.entries({
     'package.json': '{"type":"module"}\n',
-    '.gitignore': '.work/\n',
+    '.gitignore': '.work/\n.env.test\n',
     'AGENTS.md': '# Development\n',
     'docs/api.md': '# API\n',
     'src/value.ts': 'export const value = 1;\n',
@@ -94,6 +96,13 @@ async function fixture(actor = 'alice') {
     await cp(join(project, file), join(root, file));
   }
   expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root }).status).toBe(0);
+  for (const args of [
+    ['config', 'user.name', 'Fixture'],
+    ['config', 'user.email', 'fixture@example.test'],
+    ['add', '-A'],
+    ['commit', '-q', '-m', 'Initial fixture'],
+  ])
+    expect(spawnSync('git', args, { cwd: root }).status).toBe(0);
   expect(invoke(root, ['init', actor]).status).toBe(0);
   return root;
 }
@@ -113,6 +122,35 @@ function invoke(root: string, args: string[], input?: unknown) {
 const statePath = (root: string, id = 'probe') => join(root, `.work/tasks/${id}/state.json`);
 const state = async (root: string, id = 'probe'): Promise<Task> =>
   JSON.parse(await readFile(statePath(root, id), 'utf8'));
+
+function commitFixture(root: string, message: string, paths: string[]) {
+  const added = spawnSync('git', ['add', '-A', '--', ...paths], { cwd: root, encoding: 'utf8' });
+  expect(added.status, added.stderr).toBe(0);
+  const committed = spawnSync('git', ['commit', '-q', '-m', message], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  expect(committed.status, committed.stderr).toBe(0);
+  return spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim();
+}
+
+function fetchFixtureCommit(receiver: string, sender: string) {
+  const commit = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: sender,
+    encoding: 'utf8',
+  }).stdout.trim();
+  const fetched = spawnSync('git', ['fetch', '-q', sender, commit], {
+    cwd: receiver,
+    encoding: 'utf8',
+  });
+  expect(fetched.status, fetched.stderr).toBe(0);
+  const checkout = spawnSync('git', ['checkout', '-q', '--detach', 'FETCH_HEAD'], {
+    cwd: receiver,
+    encoding: 'utf8',
+  });
+  expect(checkout.status, checkout.stderr).toBe(0);
+  return commit;
+}
 
 it.each(['checks', 'verification'])(
   'keeps the full %s failure after a successful partial probe',
@@ -260,7 +298,7 @@ it('rejects malformed declared commands before creating a task', async () => {
   }
 });
 
-it('allows implementation before choosing a check command but blocks evidence until it is declared', async () => {
+it('permits dirty implementation but requires a declared check and clean candidate for evidence', async () => {
   const root = await fixture();
   const request = proposal();
   const created = JSON.parse(
@@ -268,80 +306,47 @@ it('allows implementation before choosing a check command but blocks evidence un
       ...request,
       plan: {
         ...request.plan,
-        acceptance: [
-          { id: 'checks', criterion: 'The implemented value is 2.', method: 'automated' },
-        ],
+        acceptance: [{ id: 'checks', criterion: 'The value is 2.', method: 'automated' }],
       },
     }).output,
   );
   const id = created.task.id as string;
-  expect(created.task.stage).toBe('C0_READY');
-  expect(created.assessment.ready).toBe(true);
-  expect(created.assessment.evidence[0].result).toBe('pending');
-  const implementation = invoke(root, ['update', id, '--stdin'], {
+  const started = invoke(root, ['update', id, '--stdin'], {
     revision: created.revision,
-    reason: 'The result and method are known; develop the implementation and its check.',
+    reason: 'Implement before choosing the check command.',
     stage: 'C1_IMPLEMENTATION',
     plan: { nextAction: 'Implement the value and its check.' },
   });
-  expect(implementation.status, implementation.output).toBe(0);
-  expect(
-    invoke(root, [
-      'exec',
-      id,
-      '--',
-      process.execPath,
-      '-e',
-      'require("node:fs").writeFileSync("src/value.ts", "export const value = 2;\\n")',
-    ]).status,
-  ).toBe(0);
-  expect(await readFile(join(root, 'src/value.ts'), 'utf8')).toContain('value = 2');
-  expect(invoke(root, ['sync', id, 'Inspected the implemented value.']).status).toBe(0);
-  verifying(root, id);
-  const before = await state(root, id);
+  expect(started.status, started.output).toBe(0);
+  await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
   const pending = JSON.parse(invoke(root, ['context', id, 'verify']).output);
-  expect(pending.assessment.errors.join()).toContain('WORK_CHECK_COMMAND');
-  expect(pending.assessment.readyForAcceptance).toBe(false);
-  for (const argv of [
-    ['run', id, 'checks'],
-    [
-      'run',
-      id,
-      'checks',
-      '--',
-      process.execPath,
-      '-e',
-      'require("node:fs").writeFileSync(".work/forbidden", "bad")',
-    ],
-    ['evidence', id, 'quality-review', '.work/missing.md', 'Cannot bypass missing command'],
-  ])
-    expect(invoke(root, argv).output).toContain('WORK_CHECK_COMMAND');
-  await expect(readFile(join(root, '.work/forbidden'))).rejects.toThrow();
-  expect((await state(root, id)).evidence).toEqual(before.evidence);
-  const returned = invoke(root, ['update', id, '--stdin'], {
+  const transition = invoke(root, ['update', id, '--stdin'], {
     revision: pending.revision,
-    reason: 'Return to authorized implementation to create the check script.',
-    stage: 'C1_IMPLEMENTATION',
-    plan: { nextAction: 'Create the value check, then declare its command.' },
+    reason: 'Observe verification without a command or committed candidate.',
+    stage: 'C1_EVIDENCE_PENDING',
+    plan: { nextAction: 'Run the check.' },
   });
-  expect(returned.status, returned.output).toBe(0);
-  expect((await state(root, id)).checkpoint!.candidate).toBe(before.checkpoint!.candidate);
+  if (transition.status === 0) {
+    expect(invoke(root, ['run', id, 'checks']).status).toBe(1);
+    const back = JSON.parse(invoke(root, ['context', id, 'implement']).output);
+    expect(
+      invoke(root, ['update', id, '--stdin'], {
+        revision: back.revision,
+        reason: 'Resume implementation of the missing check.',
+        stage: 'C1_IMPLEMENTATION',
+        plan: { nextAction: 'Declare the check.' },
+      }).status,
+    ).toBe(0);
+  } else {
+    expect(transition.output).toMatch(/WORK_CHECK_COMMAND|WORK_CANDIDATE/);
+  }
   const script =
     'import assert from "node:assert/strict"; import { value } from "./value.ts"; assert.equal(value, 2);\n';
-  expect(
-    invoke(root, [
-      'exec',
-      id,
-      '--',
-      process.execPath,
-      '-e',
-      `require("node:fs").writeFileSync("src/check.ts", ${JSON.stringify(script)})`,
-    ]).status,
-  ).toBe(0);
-  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  await writeFile(join(root, 'src/check.ts'), script);
+  const current = JSON.parse(invoke(root, ['context', id, 'implement']).output);
   const declared = invoke(root, ['update', id, '--stdin'], {
     revision: current.revision,
-    reason: 'The implemented check now covers the original value criterion.',
+    reason: 'Declare the check for the implemented value.',
     plan: {
       acceptance: (await state(root, id)).plan.acceptance.map((entry) =>
         entry.id === 'checks' ? { ...entry, command: [process.execPath, 'src/check.ts'] } : entry,
@@ -349,39 +354,14 @@ it('allows implementation before choosing a check command but blocks evidence un
     },
   });
   expect(declared.status, declared.output).toBe(0);
-  expect(JSON.parse(declared.output).assessment.errors.join()).toContain('WORK_CONTEXT_CHANGED');
-  expect(invoke(root, ['sync', id, 'Reviewed the check implementation and command.']).status).toBe(
-    0,
+  expect(invoke(root, ['sync', id, 'Reject a dirty candidate.']).output).toContain(
+    'WORK_CANDIDATE',
   );
+  commitFixture(root, 'Implement and check value', ['src/value.ts', 'src/check.ts']);
+  expect(invoke(root, ['sync', id, 'Reviewed the committed fixture and check.']).status).toBe(0);
   verifying(root, id);
-  expect((await state(root, id)).checkpoint!.candidate).not.toBe(before.checkpoint!.candidate);
   expect(invoke(root, ['run', id, 'checks']).status).toBe(0);
   expect(JSON.parse(invoke(root, ['check', id]).output).evidence[0].result).toBe('pass');
-});
-
-it('still rejects actual drift when returning from missing-command verification to implementation', async () => {
-  const root = await fixture();
-  await ready(root);
-  await edit(root, (task) => {
-    delete task.plan.acceptance[0]!.command;
-  });
-  invoke(root, ['sync', 'probe', 'Inspected the missing command contract.']);
-  verifying(root);
-  await writeFile(join(root, 'src/value.ts'), 'export const value = 3;\n');
-  const current = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output);
-  const before = await readFile(statePath(root), 'utf8');
-  const rejected = invoke(root, ['update', 'probe', '--stdin'], {
-    revision: current.revision,
-    reason: 'Attempt a phase change without acknowledging changed inputs.',
-    stage: 'C1_IMPLEMENTATION',
-    plan: { nextAction: 'Implement the missing check.' },
-  });
-  expect(rejected.status).toBe(1);
-  expect(rejected.output).toContain('WORK_CONTEXT_CHANGED');
-  expect(await readFile(statePath(root), 'utf8')).toBe(before);
-  invoke(root, ['sync', 'probe', 'Inspected the changed value before resuming implementation.']);
-  await implementing(root);
-  expect((await state(root)).stage).toBe('C1_IMPLEMENTATION');
 });
 
 it('preserves evidence across phase updates but invalidates it when the declared check changes', async () => {
@@ -391,7 +371,7 @@ it('preserves evidence across phase updates but invalidates it when the declared
   const before = await state(root);
   await implementing(root);
   verifying(root);
-  expect((await state(root)).checkpoint!.candidate).toBe(before.checkpoint!.candidate);
+  expect((await state(root)).checkpoint!.candidate).toEqual(before.checkpoint!.candidate);
   expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pass');
   const revision = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output).revision;
   expect(
@@ -414,7 +394,7 @@ it('preserves evidence across phase updates but invalidates it when the declared
 
 async function ready(root: string, id = 'probe') {
   expect(invoke(root, ['start', id, 'Verify the probe', 'docs/api.md']).status).toBe(0);
-  const revision = digest(await readFile(statePath(root, id)));
+  const revision = taskRevision(await state(root, id));
   const updated = invoke(root, ['update', id, '--stdin'], {
     revision,
     reason: 'Derived the probe contract from the fixture user request.',
@@ -440,7 +420,7 @@ async function ready(root: string, id = 'probe') {
 }
 
 async function implementing(root: string) {
-  const revision = digest(await readFile(statePath(root)));
+  const revision = taskRevision(await state(root));
   const result = invoke(root, ['update', 'probe', '--stdin'], {
     revision,
     reason: 'The fixture user authorized the implementation command.',
@@ -465,7 +445,7 @@ it('rejects competing task writes before launching them while reads and another 
   const before = await readFile(statePath(root), 'utf8');
   const revision = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output).revision;
   const script =
-    'const fs=require("node:fs");fs.writeFileSync(".work/started","ready");setInterval(()=>{if(fs.existsSync(".work/finish"))process.exit(0)},20)';
+    'const fs=require("node:fs");const t=JSON.parse(fs.readFileSync(".work/tasks/probe/state.json"));fs.writeFileSync(".work/child-observation",JSON.stringify(t.evidence.at(-1)));fs.writeFileSync(".work/started","ready");setInterval(()=>{if(fs.existsSync(".work/finish"))process.exit(0)},20)';
   const running = begin(
     root,
     ['run', 'probe', 'checks', '--', process.execPath, '-e', script],
@@ -481,13 +461,17 @@ it('rejects competing task writes before launching them while reads and another 
     ...(JSON.parse(before) as Task).evidence,
     expect.objectContaining({ result: 'pending' }),
   ]);
+  expect(JSON.parse(await readFile(join(root, '.work/child-observation'), 'utf8'))).toEqual(start);
+  expect(start).not.toHaveProperty('sha256');
+  expect(JSON.parse(invoke(root, ['read', 'probe', 'evidence', '0']).output).integrity).toBe(
+    'pending',
+  );
   const write = [
     process.execPath,
     '-e',
     'require("node:fs").writeFileSync(".work/forbidden","bad")',
   ];
   for (const args of [
-    ['exec', 'probe', '--', ...write],
     ['run', 'probe', 'checks', '--', ...write],
     ['sync', 'probe', 'Must not sync a running check.'],
     ['archive', 'probe', 'Must not archive.'],
@@ -508,7 +492,7 @@ it('rejects competing task writes before launching them while reads and another 
   );
   expect(await readFile(statePath(root), 'utf8')).toBe(inFlight);
   await expect(readFile(join(root, '.work/forbidden'))).rejects.toHaveProperty('code', 'ENOENT');
-  expect(await readdir(join(root, '.work/tasks/probe/evidence'))).toHaveLength(2);
+  expect(await readdir(join(root, '.work/tasks/probe/evidence'))).toHaveLength(1);
   for (const args of [
     ['check', 'probe'],
     ['context', 'probe', 'resume'],
@@ -533,12 +517,12 @@ it('rejects competing task writes before launching them while reads and another 
   const settled = (await state(root)).evidence;
   expect(settled).toHaveLength(1);
   expect(settled[0]!.result).toBe('pass');
-  const log = await readFile(join(root, settled[0]!.artifact), 'utf8');
-  expect(JSON.parse(log.slice(0, log.indexOf('\n}\n') + 2)).start).toEqual({
-    artifact: start.artifact,
-    sha256: start.sha256,
-  });
-  expect(digest(await readFile(join(root, start.artifact)))).toBe(start.sha256);
+  expect(settled[0]!.artifact).toBe(start.artifact);
+  expect(settled[0]!.candidate).toEqual(start.candidate);
+  expect(digest(await readFile(join(root, start.artifact)))).toBe(settled[0]!.sha256);
+  expect(JSON.parse(invoke(root, ['read', 'probe', 'evidence', '0']).output).integrity).toBe(
+    'verified',
+  );
   await expect(readFile(join(root, '.work/tasks/probe.command.json'))).rejects.toHaveProperty(
     'code',
     'ENOENT',
@@ -559,7 +543,7 @@ it('never turns cancellation into a pass even when the child handles SIGTERM by 
   running.child.kill('SIGTERM');
   const result = await running.finished;
   expect(result.status, result.output).toBe(1);
-  const evidence = (await state(root)).evidence[0]!;
+  const evidence = (await state(root)).evidence.at(-1)!;
   expect(evidence.result).toBe(process.platform === 'win32' ? 'pending' : 'fail');
   const log = await readFile(join(root, evidence.artifact), 'utf8');
   expect(log).toContain('"cancelled": true');
@@ -604,14 +588,14 @@ it.skipIf(process.platform === 'win32').each([false, true])(
     expect(task.plan.nextAction).toBe(
       'Confirm the execution group has stopped, inspect the provisional log, then recover the retained command marker before continuing.',
     );
-    const observation = JSON.parse(await readFile(join(root, evidence.artifact), 'utf8'));
-    const length = (await readFile(join(root, observation.rawLog))).length;
+    expect(evidence).not.toHaveProperty('sha256');
+    const length = (await readFile(join(root, evidence.artifact))).length;
     await expect
-      .poll(async () => (await readFile(join(root, observation.rawLog))).length)
+      .poll(async () => (await readFile(join(root, evidence.artifact))).length)
       .toBeGreaterThan(length);
     if (inputChanged) await writeFile(join(root, 'src/value.ts'), 'export const value = 1;\n');
     const check = JSON.parse(invoke(root, ['check', 'probe']).output);
-    expect(check.candidate).toBe(baseline.checkpoint!.candidate);
+    expect(check.candidate).toEqual(baseline.checkpoint!.candidate);
     expect(
       check.evidence.find((entry: { criterion: string }) => entry.criterion === 'checks').result,
     ).toBe('pending');
@@ -630,6 +614,8 @@ it.skipIf(process.platform === 'win32')(
     const root = await fixture();
     await ready(root);
     verifying(root);
+    expect(run(root).status).toBe(0);
+    expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pass');
     const running = begin(root, [
       'run',
       'probe',
@@ -653,12 +639,14 @@ it.skipIf(process.platform === 'win32')(
     ).toContain('WORK_BUSY');
     expect(await readFile(path, 'utf8')).toBe(marker);
     const evidence = (await state(root)).evidence;
-    expect(evidence).toHaveLength(1);
-    expect(evidence[0]!.result).toBe('pending');
-    const start = await readFile(join(root, evidence[0]!.artifact), 'utf8');
-    expect(digest(start)).toBe(evidence[0]!.sha256);
-    expect(await readFile(join(root, JSON.parse(start).rawLog), 'utf8')).toContain('"started"');
+    expect(evidence).toHaveLength(2);
+    expect(evidence[1]!.result).toBe('pending');
+    expect(evidence[1]).not.toHaveProperty('sha256');
+    expect(await readFile(join(root, evidence[1]!.artifact), 'utf8')).toContain('"started"');
     expect(await readdir(join(root, '.work/tasks/probe/evidence'))).toHaveLength(2);
+    expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pending');
+    await rm(join(root, evidence[1]!.artifact));
+    expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).not.toBe('pass');
     expect(invoke(root, ['context', 'probe', 'resume']).status).toBe(0);
   },
 );
@@ -675,30 +663,6 @@ it('applies occupancy to ensure and does not mistake a retained marker for a tas
   expect(invoke(root, ['ensure', '--stdin'], proposal()).output).toContain('WORK_BUSY');
   expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
   expect(invoke(root, ['check', id]).status).toBe(0);
-});
-
-it('keeps shell redirection inside the checked subprocess and releases occupancy after launch errors', async () => {
-  const root = await fixture();
-  await ready(root);
-  const args = [
-    'exec',
-    'probe',
-    '--',
-    'sh',
-    '-c',
-    'printf "%s\\n" "export const value = 2;" > src/value.ts',
-  ];
-  const before = await readFile(join(root, 'src/value.ts'), 'utf8');
-  expect(invoke(root, args).output).toContain('WORK_EXEC_STAGE');
-  expect(await readFile(join(root, 'src/value.ts'), 'utf8')).toBe(before);
-  await implementing(root);
-  expect(invoke(root, ['exec', 'probe', '--', 'mio-command-does-not-exist']).status).toBe(1);
-  await expect(readFile(join(root, '.work/tasks/probe.command.json'))).rejects.toHaveProperty(
-    'code',
-    'ENOENT',
-  );
-  expect(invoke(root, args).status).toBe(0);
-  expect(await readFile(join(root, 'src/value.ts'), 'utf8')).toBe('export const value = 2;\n');
 });
 
 it('keeps pre-record occupancy and retained markers outside task listings', async () => {
@@ -745,9 +709,15 @@ it('keeps pre-record occupancy and retained markers outside task listings', asyn
 
 function verifying(root: string, id = 'probe') {
   const raw = readFileSync(statePath(root, id));
-  if ((JSON.parse(raw.toString()) as Task).stage === 'C1_EVIDENCE_PENDING') return;
+  const current = JSON.parse(raw.toString()) as Task;
+  if (current.stage === 'C1_EVIDENCE_PENDING') return;
+  if (!current.checkpoint) {
+    const synced = invoke(root, ['sync', id, 'Reviewed the clean fixture commit and contract.']);
+    expect(synced.status, synced.output).toBe(0);
+  }
+  const latest = JSON.parse(readFileSync(statePath(root, id), 'utf8')) as Task;
   const result = invoke(root, ['update', id, '--stdin'], {
-    revision: digest(raw),
+    revision: taskRevision(latest),
     reason: 'The fixture explicitly chooses verification of its existing candidate.',
     stage: 'C1_EVIDENCE_PENDING',
     plan: { nextAction: 'Collect the authorized fixture observations.' },
@@ -760,75 +730,20 @@ function run(root: string, script = 'console.log("observed probe")', id = 'probe
   return invoke(root, ['run', id, 'checks', '--', process.execPath, '-e', script]);
 }
 
-it('checks task existence and C1 before starting an implementation command', async () => {
-  const root = await fixture();
-  const argv = [
-    '--',
-    process.execPath,
-    '-e',
-    'require("node:fs").writeFileSync(".work/started", "yes")',
-  ];
-  expect(invoke(root, ['exec', 'missing', ...argv]).status).toBe(1);
-  await ready(root);
-  expect(invoke(root, ['exec', 'probe', ...argv]).output).toContain('WORK_EXEC_STAGE');
-  await expect(readFile(join(root, '.work/started'))).rejects.toThrow();
-  await implementing(root);
-  const before = await state(root);
-  const result = invoke(root, ['exec', 'probe', ...argv]);
-  expect(result.status, result.output).toBe(0);
-  expect(await readFile(join(root, '.work/started'), 'utf8')).toBe('yes');
-  expect((await state(root)).evidence).toEqual([]);
-  expect((await state(root)).plan.nextAction).toContain('then sync');
-  expect(
-    invoke(root, ['sync', 'probe', 'The command only wrote its private sentinel.']).status,
-  ).toBe(0);
-  expect((await state(root)).checkpoint).toEqual(before.checkpoint);
-  expect((await state(root)).plan.nextAction).toContain('enter verification');
-  expect((await state(root)).plan.nextAction).not.toContain('then sync');
-});
-
-it('refuses drift and non-implementation phases without running the child', async () => {
+it('does not execute the retired work exec command', async () => {
   const root = await fixture();
   await ready(root);
   await implementing(root);
-  const args = [
+  const attempt = invoke(root, [
     'exec',
     'probe',
     '--',
     process.execPath,
     '-e',
-    'require("node:fs").writeFileSync(".work/started", "yes")',
-  ];
-  const file = join(root, 'src/value.ts');
-  const before = await readFile(file, 'utf8');
-  await writeFile(file, 'export const value = 9;\n');
-  expect(invoke(root, args).output).toContain('WORK_CONTEXT_CHANGED');
-  await writeFile(file, before);
-  await edit(root, (task) => {
-    task.stage = 'C1_EVIDENCE_PENDING';
-  });
-  expect(invoke(root, args).output).toContain('WORK_EXEC_STAGE');
-  await expect(readFile(join(root, '.work/started'))).rejects.toThrow();
-});
-
-it('retains implementation changes and child failure without syncing or inventing evidence', async () => {
-  const root = await fixture();
-  await ready(root);
-  await implementing(root);
-  const before = await state(root);
-  const result = invoke(root, [
-    'exec',
-    'probe',
-    '--',
-    process.execPath,
-    '-e',
-    'require("node:fs").writeFileSync("src/value.ts", "export const value = 2;\\n");process.exit(7)',
+    'require("node:fs").writeFileSync(".work/forbidden", "executed")',
   ]);
-  expect(result.status, result.output).toBe(7);
-  expect(await readFile(join(root, 'src/value.ts'), 'utf8')).toContain('value = 2');
-  expect((await state(root)).checkpoint).toEqual(before.checkpoint);
-  expect((await state(root)).evidence).toEqual([]);
-  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CONTEXT_CHANGED');
+  expect(attempt.status).toBe(1);
+  await expect(readFile(join(root, '.work/forbidden'))).rejects.toHaveProperty('code', 'ENOENT');
 });
 
 async function accept(root: string) {
@@ -838,7 +753,10 @@ async function accept(root: string) {
   await mkdir(dirname(join(root, relative)), { recursive: true });
   await writeFile(
     join(root, relative),
-    reviewMarkdown(reviewFixture(current.checkpoint!.candidate)),
+    reviewMarkdown({
+      ...reviewFixture(current.checkpoint!.candidate),
+      contract: contractPlan(current),
+    }),
   );
   expect(
     invoke(root, ['evidence', 'probe', 'quality-review', relative, 'Fixture review.']).status,
@@ -904,13 +822,15 @@ it('requires a real unique requirement heading rather than a nonempty label or f
 });
 
 it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
-  'requires explicit reconciliation after a same-stage conflict in %s',
+  'rejects stale updates without persisting a conflict gate in %s',
   async (stage) => {
     const root = await fixture();
     const first = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
     const id = first.task.id as string;
+    expect(invoke(root, ['sync', id, 'Reviewed the clean fixture commit.']).status).toBe(0);
+    const synced = JSON.parse(invoke(root, ['context', id, 'resume']).output);
     const staged = invoke(root, ['update', id, '--stdin'], {
-      revision: first.revision,
+      revision: synced.revision,
       reason: 'Choose the fixture phase.',
       stage,
       plan: { nextAction: 'Perform the authorized fixture action.' },
@@ -932,48 +852,128 @@ it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
         plan: { nextAction: 'Obsolete action.' },
       }).output,
     ).toContain('WORK_CONFLICT');
-    const receipt = await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8');
     expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
-    const script = 'require("node:fs").writeFileSync(".work/forbidden","started")';
-    for (const args of [
-      ['exec', id, '--', process.execPath, '-e', script],
-      ['run', id, 'checks', '--', process.execPath, '-e', script],
-      ['sync', id, 'Cannot acknowledge away the conflict.'],
-      ['archive', id, 'Cannot hide the conflict.'],
-      ['handoff', id],
-    ])
-      expect(invoke(root, args).output).toContain('WORK_RECONCILE');
-    expect(invoke(root, ['ensure', '--stdin'], { requirement }).output).toContain('WORK_RECONCILE');
-    const observed = JSON.parse(invoke(root, ['context', id, 'resume']).output);
-    expect(observed.assessment.ready).toBe(false);
-    expect(invoke(root, ['check', id]).output).toContain('WORK_RECONCILE');
-    expect(invoke(root, ['read', id, 'task']).status).toBe(0);
-    expect(invoke(root, ['status']).status).toBe(0);
-    expect(invoke(root, ['exec', id, '--', process.execPath, '-e', script]).output).toContain(
-      'WORK_RECONCILE',
-    );
-    await expect(readFile(join(root, '.work/forbidden'))).rejects.toHaveProperty('code', 'ENOENT');
-    expect((await state(root, id)).evidence).toHaveLength(0);
-    const recovered = invoke(root, ['update', id, '--stdin'], {
-      revision: observed.revision,
-      reason:
-        'Compared the rejected request with current authority and retained the current action.',
-      plan: { nextAction: 'Execute the reconciled fixture action.' },
-    });
-    expect(recovered.status, recovered.output).toBe(0);
     await expect(readFile(join(root, `.work/tasks/${id}/conflict.json`))).rejects.toHaveProperty(
       'code',
       'ENOENT',
     );
-    expect((await state(root, id)).notes.join('\n')).toContain(receipt.trim());
-    const args =
-      stage === 'C1_IMPLEMENTATION'
-        ? ['exec', id, '--', process.execPath, '-e', script]
-        : ['run', id, 'checks', '--', process.execPath, '-e', script];
-    expect(invoke(root, args).status).toBe(0);
-    expect(await readFile(join(root, '.work/forbidden'), 'utf8')).toBe('started');
+    // Existing receipts are historical files: leave them untouched and do not resurrect a gate.
+    const legacyReceipt = '{"message":"historical conflict"}\n';
+    await writeFile(join(root, `.work/tasks/${id}/conflict.json`), legacyReceipt);
+    const observed = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+    expect(observed.assessment.ready).toBe(true);
+    expect(observed.task.nextAction).toBe('Current authorized action.');
+    if (stage === 'C1_IMPLEMENTATION') {
+      expect(
+        invoke(root, ['update', id, '--stdin'], {
+          revision: observed.revision,
+          reason: 'Continue using the current revision.',
+          plan: { nextAction: 'Continue implementation.' },
+        }).status,
+      ).toBe(0);
+    } else {
+      expect(invoke(root, ['run', id, 'checks']).status).toBe(0);
+    }
+    expect(await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8')).toBe(
+      legacyReceipt,
+    );
   },
 );
+
+it('serializes same-revision updates and never revives an older revision after reverting a value', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  expect(created.revision).toBe(1);
+  const originalAction = created.task.nextAction as string;
+  const request = {
+    revision: created.revision,
+    reason: 'A concurrent actor updates the next action.',
+    plan: { nextAction: 'Changed action.' },
+  };
+  const update = () => {
+    const child = spawn(process.execPath, [cli, 'update', id, '--stdin'], {
+      cwd: root,
+      env: { PATH: process.env.PATH ?? '' },
+    });
+    let output = '';
+    child.stdout.on('data', (bytes: Buffer) => (output += bytes.toString()));
+    child.stderr.on('data', (bytes: Buffer) => (output += bytes.toString()));
+    child.stdin.end(JSON.stringify(request));
+    return new Promise<{ status: number | null; output: string }>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (status) => resolve({ status, output }));
+    });
+  };
+  const results = await Promise.all([update(), update()]);
+  expect(results.filter((result) => result.status === 0)).toHaveLength(1);
+  expect(results.find((result) => result.status !== 0)!.output).toMatch(/WORK_BUSY|WORK_CONFLICT/);
+  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  expect(current.revision).toBe(created.revision + 1);
+  expect(invoke(root, ['update', id, '--stdin'], request).output).toContain('WORK_CONFLICT');
+  const restored = invoke(root, ['update', id, '--stdin'], {
+    revision: current.revision,
+    reason: 'Return to the original action.',
+    plan: { nextAction: originalAction },
+  });
+  expect(restored.status, restored.output).toBe(0);
+  expect(JSON.parse(restored.output).revision).toBe(current.revision + 1);
+  expect(invoke(root, ['update', id, '--stdin'], request).output).toContain('WORK_CONFLICT');
+});
+
+it('reads a legacy record with revision zero and writes the current integer on its first change', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  await edit(
+    root,
+    (task) => {
+      delete task.revision;
+    },
+    id,
+  );
+  const legacy = await state(root, id);
+  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  expect(current.revision).toBe(0);
+  const result = invoke(root, ['update', id, '--stdin'], {
+    revision: 0,
+    reason: 'Record a new action for the existing task.',
+    plan: { nextAction: 'Continue the existing task.' },
+  });
+  expect(result.status, result.output).toBe(0);
+  const saved = await state(root, id);
+  expect(saved.revision).toBe(1);
+  expect(saved.checkpoint).toEqual(legacy.checkpoint);
+  expect(saved.evidence).toEqual(legacy.evidence);
+});
+
+it('increments the contract revision only for actual contract changes, including A to B to A', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  const original = (await state(root, id)).plan.goal;
+  const progress = invoke(root, ['update', id, '--stdin'], {
+    revision: created.revision,
+    reason: 'Update progress without changing the contract.',
+    plan: { nextAction: 'Review the next step.' },
+  });
+  expect(progress.status, progress.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(0);
+  const changed = invoke(root, ['update', id, '--stdin'], {
+    revision: JSON.parse(progress.output).revision,
+    reason: 'Change the agreed goal.',
+    plan: { goal: 'A different goal.' },
+  });
+  expect(changed.status, changed.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(1);
+  const reverted = invoke(root, ['update', id, '--stdin'], {
+    revision: JSON.parse(changed.output).revision,
+    reason: 'Restore the original goal.',
+    plan: { goal: original },
+  });
+  expect(reverted.status, reverted.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(2);
+});
 
 it('does not use verification to complete a failed phase transition and replaces consumed next actions', async () => {
   const root = await fixture();
@@ -1027,7 +1027,7 @@ it('repairs the current section on the same task without changing identity or re
     ).toBe(1);
     expect((await state(root, id)).plan.requirement).toEqual(requirement);
   }
-  // A stale update leaves a conflict while the source itself needs a valid section correction.
+  // A stale update must not prevent a valid section correction.
   expect(
     invoke(root, ['update', id, '--stdin'], {
       ...request,
@@ -1050,7 +1050,8 @@ it('repairs the current section on the same task without changing identity or re
     'code',
     'ENOENT',
   );
-  expect(JSON.parse(repaired.output).assessment.errors.join()).toContain('WORK_CONTEXT_CHANGED');
+  expect(JSON.parse(repaired.output).assessment.errors.join()).toContain('WORK_CANDIDATE');
+  commitFixture(root, 'Rename the requirement heading', ['docs/api.md']);
   expect(invoke(root, ['sync', id, 'Reconciled the source heading repair.']).status).toBe(0);
   const checked = JSON.parse(invoke(root, ['check', id]).output);
   expect(checked.errors).toEqual([]);
@@ -1146,8 +1147,9 @@ it('automatically creates a PRD subtask and resumes it after interruption withou
   await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
   const stale = JSON.parse(invoke(root, ['ensure', '--stdin'], { requirement }).output);
   expect(stale.assessment.ready).toBe(false);
-  expect(stale.assessment.errors.join()).toContain('WORK_CONTEXT_CHANGED');
+  expect(stale.assessment.errors.join()).toContain('WORK_CANDIDATE');
   expect(await readFile(statePath(root, id), 'utf8')).toBe(reconciled);
+  commitFixture(root, 'Implement the fixture value', ['src/value.ts']);
   expect(
     invoke(root, ['sync', id, 'Reviewed the value change against the PRD subtask.']).status,
   ).toBe(0);
@@ -1155,7 +1157,7 @@ it('automatically creates a PRD subtask and resumes it after interruption withou
   const final = await state(root, id);
   expect(final.evidence.map((entry) => entry.result)).toEqual(['fail', 'pass']);
   expect(final.reviewDecision).toBe('PENDING');
-  expect(final.evidence[0]!.candidate).not.toBe(final.evidence[1]!.candidate);
+  expect(final.evidence[0]!.candidate).not.toEqual(final.evidence[1]!.candidate);
   expect(await readdir(join(root, '.work/tasks'))).toEqual([id]);
   expect(
     invoke(root, ['ensure', '--stdin'], {
@@ -1197,68 +1199,52 @@ it('rejects stale structured updates, protected fields and invalid contracts wit
 });
 
 it.each([false, true])(
-  'keeps rejected C1 requests unsaved and recovers the intended contract (already implementing: %s)',
-  async (alreadyImplementing) => {
+  'allows authorized contract changes during C1 without requiring a checkpoint (dirty: %s)',
+  async (dirty) => {
     const root = await fixture();
     await ready(root);
-    if (alreadyImplementing) await implementing(root);
-    const saved = await readFile(statePath(root), 'utf8');
     const original = await state(root);
-    const plan = { goal: 'An authorized revised goal.', nextAction: 'Implement the revised goal.' };
-    const rejected = invoke(root, ['update', 'probe', '--stdin'], {
-      revision: digest(saved),
-      reason: 'Revise the goal while requesting C1.',
-      stage: 'C1_IMPLEMENTATION',
-      plan,
-    });
-    expect(rejected.status).toBe(1);
-    expect(rejected.output).toContain('WORK_CONTEXT_CHANGED');
-    expect(rejected.output).toContain('rejected before saving any task changes');
-    expect(await readFile(statePath(root), 'utf8')).toBe(saved);
-    expect(
-      invoke(root, ['sync', 'probe', 'Inspect the persisted record after rejection.']).status,
-    ).toBe(0);
-    expect((await state(root)).plan.goal).toBe(original.plan.goal);
-    expect((await state(root)).stage).toBe(original.stage);
-    const current = JSON.parse(invoke(root, ['context', 'probe', 'resume']).output);
+    if (dirty) await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
     const changed = invoke(root, ['update', 'probe', '--stdin'], {
-      revision: current.revision,
-      reason: 'Save only the intended contract before reconciliation.',
-      plan,
+      revision: taskRevision(original),
+      reason: 'Revise the authorized goal and start implementation.',
+      stage: 'C1_IMPLEMENTATION',
+      plan: { goal: 'An authorized revised goal.', nextAction: 'Implement the revised goal.' },
     });
     expect(changed.status, changed.output).toBe(0);
-    expect(JSON.parse(changed.output).assessment.checkedReady).toBe(false);
-    expect((await state(root)).plan.goal).toBe(plan.goal);
-    expect(
-      invoke(root, ['sync', 'probe', 'Reconciled the saved goal and actual files.']).status,
-    ).toBe(0);
-    await implementing(root);
-    expect((await state(root)).stage).toBe('C1_IMPLEMENTATION');
-    expect((await state(root)).plan.goal).toBe(plan.goal);
+    const current = await state(root);
+    expect(current.stage).toBe('C1_IMPLEMENTATION');
+    expect(current.plan.goal).toBe('An authorized revised goal.');
+    expect(current.contractRevision).toBe((original.contractRevision ?? 0) + 1);
+    if (dirty)
+      expect(invoke(root, ['sync', 'probe', 'Attempt to sync dirty files.']).output).toContain(
+        'WORK_CANDIDATE',
+      );
+    else expect(invoke(root, ['sync', 'probe', 'Review the revised contract.']).status).toBe(0);
   },
 );
 
-it('recovers a C1 request rejected for file drift without inventing a contract update', async () => {
+it('allows dirty C1 implementation but requires commit before candidate sync', async () => {
   const root = await fixture();
   await ready(root);
-  const saved = await readFile(statePath(root), 'utf8');
   const original = await state(root);
   await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
-  const rejected = invoke(root, ['update', 'probe', '--stdin'], {
-    revision: digest(saved),
-    reason: 'Request C1 before reconciling an actual file change.',
+  const started = invoke(root, ['update', 'probe', '--stdin'], {
+    revision: taskRevision(original),
+    reason: 'Continue authorized implementation with dirty files.',
     stage: 'C1_IMPLEMENTATION',
-    plan: { nextAction: 'Continue authorized implementation.' },
+    plan: { nextAction: 'Review and commit the source.' },
   });
-  expect(rejected.status).toBe(1);
-  expect(rejected.output).toContain('WORK_CONTEXT_CHANGED: src/value.ts');
-  expect(await readFile(statePath(root), 'utf8')).toBe(saved);
-  expect(invoke(root, ['sync', 'probe', 'Reviewed the changed source file.']).status).toBe(0);
-  await implementing(root);
-  const final = await state(root);
-  expect(final.stage).toBe('C1_IMPLEMENTATION');
-  expect(final.checkpoint!.contract).toBe(original.checkpoint!.contract);
-  expect(final.checkpoint!.candidate).not.toBe(original.checkpoint!.candidate);
+  expect(started.status, started.output).toBe(0);
+  expect(invoke(root, ['sync', 'probe', 'Reject the dirty source.']).output).toContain(
+    'WORK_CANDIDATE',
+  );
+  const commit = commitFixture(root, 'Review changed value', ['src/value.ts']);
+  expect(invoke(root, ['sync', 'probe', 'Reviewed the committed value.']).status).toBe(0);
+  expect((await state(root)).checkpoint!.candidate).toEqual({
+    commit,
+    contractRevision: original.contractRevision,
+  });
 });
 
 it('invalidates release on structured contract changes while preserving old evidence and requiring sync', async () => {
@@ -1298,7 +1284,7 @@ it('invalidates release on structured contract changes while preserving old evid
   expect(task.evidence).toEqual(original.evidence);
   expect(task.checkpoint).toEqual(original.checkpoint);
   expect(task.plan.nextAction).toContain('Reconcile the changed contract');
-  expect(JSON.parse(changed.output).assessment.errors.join()).toContain('WORK_CONTEXT_CHANGED');
+  expect(JSON.parse(changed.output).assessment.errors.join()).toContain('WORK_CANDIDATE');
   expect(invoke(root, ['sync', 'probe', 'Reconciled the new acceptance target.']).status).toBe(0);
   expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pending');
 });
@@ -1307,7 +1293,8 @@ it('keeps PRD source binding and requires explicit current authorization to reop
   const root = await fixture();
   const result = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
   const id = result.task.id as string;
-  expect((await state(root, id)).checkpoint!.files).toHaveProperty('docs/api.md');
+  expect((await state(root, id)).checkpoint).toBeNull();
+  expect(invoke(root, ['sync', id, 'Reviewed the current fixture commit.']).status).toBe(0);
   expect(invoke(root, ['archive', id, 'Paused by user.']).status).toBe(0);
   const archived = JSON.parse(invoke(root, ['ensure', '--stdin'], { requirement }).output);
   expect(archived.task.archived).toBe(true);
@@ -1328,10 +1315,9 @@ it('keeps PRD source binding and requires explicit current authorization to reop
     }).status,
   ).toBe(0);
   expect((await state(root, id)).archived).toBe(false);
-  expect(invoke(root, ['check', id]).output).toContain('WORK_CONTEXT_CHANGED');
   expect(invoke(root, ['sync', id, 'Reconciled the new authorization.']).status).toBe(0);
   await writeFile(join(root, 'docs/api.md'), '# API\nUpdated PRD contract.\n');
-  expect(invoke(root, ['check', id]).output).toContain('WORK_CONTEXT_CHANGED');
+  expect(invoke(root, ['sync', id, 'Do not sync a dirty PRD.']).output).toContain('WORK_CANDIDATE');
   const original = await readFile(statePath(root, id), 'utf8');
   expect(
     invoke(root, ['ensure', '--stdin'], { requirement: { ...requirement, section: 'Other' } })
@@ -1350,9 +1336,11 @@ it('preserves requirement identity across handoff while clearing recipient autho
   const sender = await fixture();
   const first = JSON.parse(invoke(sender, ['ensure', '--stdin'], proposal()).output);
   const id = first.task.id as string;
+  expect(invoke(sender, ['sync', id, 'Reviewed the committed handoff candidate.']).status).toBe(0);
   const portable = invoke(sender, ['handoff', id]);
   expect(portable.status, portable.output).toBe(0);
   const receiver = await fixture('bob');
+  fetchFixtureCommit(receiver, sender);
   await mkdir(join(receiver, '.work/inbox'));
   await cp(portable.output, join(receiver, '.work/inbox/task.md'));
   expect(invoke(receiver, ['receive', '.work/inbox/task.md']).status).toBe(0);
@@ -1581,73 +1569,76 @@ it('preserves failed raw evidence and records the actual success separately', as
   expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pass');
 });
 
-it('detects changed child documents read-only, rejects execution, and retains stale evidence after reconciliation', async () => {
+it('requires a clean committed candidate after a source change and retains old evidence', async () => {
   const root = await fixture();
   await ready(root);
   expect(run(root).status).toBe(0);
-  await accept(root);
-  await writeFile(join(root, 'docs/api.md'), '# Changed API contract\n');
+  const original = await state(root);
+  await writeFile(join(root, 'docs/api.md'), '# API\nChanged contract.\n');
   const before = await readFile(statePath(root), 'utf8');
-  const check = invoke(root, ['check', 'probe']);
-  expect(check.status).toBe(1);
-  expect(check.output).toContain('docs/api.md');
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CANDIDATE');
   expect(await readFile(statePath(root), 'utf8')).toBe(before);
-  expect(run(root).output).toContain('WORK_CONTEXT_CHANGED');
-  expect(invoke(root, ['sync', 'probe', 'Read changed API and rechecked its impact.']).status).toBe(
-    0,
+  expect(run(root).output).toContain('WORK_CANDIDATE');
+  expect(invoke(root, ['sync', 'probe', 'Cannot sync a dirty source.']).output).toContain(
+    'WORK_CANDIDATE',
   );
+  const commit = commitFixture(root, 'Change requirement', ['docs/api.md']);
+  expect(invoke(root, ['sync', 'probe', 'Reviewed the committed requirement.']).status).toBe(0);
   const task = await state(root);
-  expect(task.evidence).toHaveLength(2);
-  expect(task.stage).toBe('C1_EVIDENCE_PENDING');
-  expect(task.reviewDecision).toBe('PENDING');
+  expect(task.checkpoint!.candidate).toEqual({
+    commit,
+    contractRevision: original.contractRevision,
+  });
+  expect(task.evidence).toEqual(original.evidence);
   expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pending');
   expect(run(root).status).toBe(0);
 });
 
-it('captures new untracked scoped files and fails an otherwise successful check that changes its own input', async () => {
+it('rejects untracked files and a check that leaves its tracked input dirty', async () => {
   const root = await fixture();
   await ready(root);
   await writeFile(join(root, 'src/new.ts'), 'export const next = 2;');
-  expect(invoke(root, ['check', 'probe']).output).toContain('src/new.ts');
+  expect(invoke(root, ['sync', 'probe', 'Reject an untracked source.']).output).toContain(
+    'WORK_CANDIDATE',
+  );
+  commitFixture(root, 'Add fixture source', ['src/new.ts']);
   expect(invoke(root, ['sync', 'probe', 'Reviewed the new source.']).status).toBe(0);
   const outcome = run(
     root,
     'require("node:fs").writeFileSync("src/value.ts", "export const value = 3;")',
   );
   expect(outcome.status).toBe(1);
-  expect(outcome.output).toContain('WORK_CONTEXT_CHANGED');
   const task = await state(root);
-  expect(task.evidence[0]!.result).toBe('pending');
-  expect(task.plan.nextAction).toBe(
-    'Inspect the observed input changes and current authorization before sync and verification of the resulting candidate.',
-  );
+  expect(task.evidence.at(-1)!.result).toBe('pending');
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CANDIDATE');
 });
 
 it('binds evidence to acceptance changes while allowing next-action updates without a new candidate', async () => {
   const root = await fixture();
   await ready(root);
   expect(run(root).status).toBe(0);
-  await edit(root, (task) => {
-    task.plan.nextAction = 'Return results.';
+  const original = await state(root);
+  const progress = invoke(root, ['update', 'probe', '--stdin'], {
+    revision: taskRevision(original),
+    reason: 'Update only the next action.',
+    plan: { nextAction: 'Return results.' },
   });
-  expect(invoke(root, ['check', 'probe']).status).toBe(0);
-  await edit(root, (task) => {
-    task.plan.acceptance[0]!.criterion = 'Different required behavior.';
+  expect(progress.status, progress.output).toBe(0);
+  expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pass');
+  const changed = invoke(root, ['update', 'probe', '--stdin'], {
+    revision: JSON.parse(progress.output).revision,
+    reason: 'Change the acceptance criterion.',
+    plan: {
+      acceptance: original.plan.acceptance.map((entry) =>
+        entry.id === 'checks' ? { ...entry, criterion: 'Different required behavior.' } : entry,
+      ),
+    },
   });
-  expect(invoke(root, ['check', 'probe']).output).toContain('task contract');
-});
-
-it('does not pass evidence for temporary input bytes that a command restores before exiting', async () => {
-  const root = await fixture();
-  await ready(root);
-  const original = await readFile(join(root, 'src/value.ts'), 'utf8');
-  const script =
-    'const fs=require("node:fs");const p="src/value.ts";const original=fs.readFileSync(p);fs.writeFileSync(p,"temporary candidate");if(fs.readFileSync(p,"utf8")!=="temporary candidate")process.exit(2);fs.writeFileSync(p,original);';
-  expect(run(root, script).status).toBe(1);
-  expect(await readFile(join(root, 'src/value.ts'), 'utf8')).toBe(original);
-  expect((await state(root)).evidence[0]!.result).toBe('pending');
-  await accept(root);
-  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_RELEASE');
+  expect(changed.status, changed.output).toBe(0);
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CANDIDATE');
+  expect(invoke(root, ['sync', 'probe', 'Reviewed the revised criterion.']).status).toBe(0);
+  expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pending');
+  expect((await state(root)).evidence).toEqual(original.evidence);
 });
 
 it('can refresh missing release evidence without manually bypassing release checks', async () => {
@@ -1656,7 +1647,13 @@ it('can refresh missing release evidence without manually bypassing release chec
   expect(run(root).status).toBe(0);
   await accept(root);
   const task = await state(root);
-  await rm(join(root, task.evidence[0]!.artifact));
+  await rm(
+    join(
+      root,
+      task.evidence.find((entry) => entry.criterion === 'checks' && entry.result === 'pass')!
+        .artifact,
+    ),
+  );
   expect(invoke(root, ['check', 'probe']).output).toContain('WORK_RELEASE');
   expect(run(root).status).toBe(0);
   const refreshed = await state(root);
@@ -1666,37 +1663,21 @@ it('can refresh missing release evidence without manually bypassing release chec
   expect(invoke(root, ['check', 'probe']).status).toBe(0);
 });
 
-it('requires revision reconciliation and reuses same-content evidence after a commit', async () => {
+it('requires a fresh evidence binding even for a same-content new Git commit', async () => {
   const root = await fixture();
   await ready(root);
   expect(run(root).status).toBe(0);
-  const candidate = (await state(root)).checkpoint!.candidate;
-  expect(spawnSync('git', ['add', '.'], { cwd: root }).status).toBe(0);
-  expect(
-    spawnSync(
-      'git',
-      [
-        '-c',
-        'user.name=Fixture',
-        '-c',
-        'user.email=fixture@example.invalid',
-        '-c',
-        'commit.gpgsign=false',
-        '-c',
-        'core.hooksPath=/dev/null',
-        'commit',
-        '-qm',
-        'fixture',
-      ],
-      { cwd: root },
-    ).status,
-  ).toBe(0);
-  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_REVISION_CHANGED');
-  expect(invoke(root, ['sync', 'probe', 'Verified the commit preserved task inputs.']).status).toBe(
-    0,
-  );
-  expect((await state(root)).checkpoint!.candidate).toBe(candidate);
-  expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pass');
+  const previous = await state(root);
+  const committed = spawnSync('git', ['commit', '--allow-empty', '-qm', 'New fixture commit'], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  expect(committed.status, committed.stderr).toBe(0);
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CANDIDATE');
+  expect(invoke(root, ['sync', 'probe', 'Reviewed the new clean commit.']).status).toBe(0);
+  expect((await state(root)).checkpoint!.candidate).not.toEqual(previous.checkpoint!.candidate);
+  expect((await state(root)).evidence).toEqual(previous.evidence);
+  expect(JSON.parse(invoke(root, ['check', 'probe']).output).evidence[0].result).toBe('pending');
 });
 
 it('keeps sibling tasks independent and archives in place without deleting their evidence', async () => {
@@ -1706,7 +1687,7 @@ it('keeps sibling tasks independent and archives in place without deleting their
   const second = await readFile(statePath(root, 'second'), 'utf8');
   expect(run(root).status).toBe(0);
   const originals = (await readdir(join(root, '.work/tasks/probe/evidence'))).sort();
-  expect(originals).toHaveLength(2);
+  expect(originals).toHaveLength(1);
   expect(
     invoke(root, ['archive', 'probe', 'Cancelled by the fixture user; preserve the result.'])
       .status,
@@ -1717,10 +1698,12 @@ it('keeps sibling tasks independent and archives in place without deleting their
   expect((await readdir(join(root, '.work/tasks/probe/evidence'))).sort()).toEqual(originals);
 });
 
-it('captures the public environment template while leaving private environment files outside candidate inputs', async () => {
+it('binds a committed public environment template while an ignored private file stays outside Git', async () => {
   const root = await fixture();
   await writeFile(join(root, '.env.example'), 'MIO_ENVIRONMENT=dev\n');
   await writeFile(join(root, '.env.test'), 'SECRET=private\n');
+  expect(spawnSync('git', ['check-ignore', '.env.test'], { cwd: root }).status).toBe(0);
+  commitFixture(root, 'Add public environment template', ['.env.example']);
   await ready(root);
   await edit(root, (task) => {
     task.plan.inputs.push('.env.example');
@@ -1728,11 +1711,15 @@ it('captures the public environment template while leaving private environment f
   expect(invoke(root, ['sync', 'probe', 'Include the public environment template.']).status).toBe(
     0,
   );
-  const task = await state(root);
-  expect(task.checkpoint!.files['.env.example']).toBeDefined();
-  expect(task.checkpoint!.files['.env.test']).toBeUndefined();
+  expect(
+    spawnSync('git', ['ls-files', '--error-unmatch', '.env.example'], { cwd: root }).status,
+  ).toBe(0);
+  expect(
+    spawnSync('git', ['ls-files', '--error-unmatch', '.env.test'], { cwd: root }).status,
+  ).not.toBe(0);
+  verifying(root);
   await writeFile(join(root, '.env.example'), 'MIO_ENVIRONMENT=test\n');
-  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CONTEXT_CHANGED');
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_CANDIDATE');
 });
 
 it('rejects private/traversal/symlink inputs, missing sources, and foreign workspace ownership', async () => {
@@ -1754,8 +1741,12 @@ it('rejects private/traversal/symlink inputs, missing sources, and foreign works
   }
   await writeFile(statePath(root), JSON.stringify(original));
   await symlink(join(root, 'docs/api.md'), join(root, 'src/alias.ts'));
-  expect(invoke(root, ['check', 'probe']).output).toContain('INVENTORY_SYMLINK');
+  await edit(root, (task) => {
+    task.plan.inputs.push('src/alias.ts');
+  });
+  expect(invoke(root, ['check', 'probe']).output).toContain('WORK_SYMLINK');
   await rm(join(root, 'src/alias.ts'));
+  await writeFile(statePath(root), JSON.stringify(original));
   await edit(root, (task) => {
     task.workspace = '/different-workspace';
   });
@@ -1782,10 +1773,9 @@ it('does not overwrite state edited during a check and preserves the unbound raw
   expect(task.plan.nextAction).toBe('Concurrent author update');
   expect(task.evidence).toHaveLength(1);
   expect(task.evidence[0]!.result).toBe('pending');
-  const start = await readFile(join(root, task.evidence[0]!.artifact), 'utf8');
-  expect(digest(start)).toBe(task.evidence[0]!.sha256);
-  expect(await readFile(join(root, JSON.parse(start).rawLog), 'utf8')).toContain('"exitCode": 0');
-  expect(await readdir(join(root, '.work/tasks/probe/evidence'))).toHaveLength(2);
+  expect(task.evidence[0]).not.toHaveProperty('sha256');
+  expect(await readFile(join(root, task.evidence[0]!.artifact), 'utf8')).toContain('"exitCode": 0');
+  expect(await readdir(join(root, '.work/tasks/probe/evidence'))).toHaveLength(1);
 });
 
 it('checks retrieved manual evidence and refuses release after its artifact is corrupted or missing', async () => {
@@ -1801,12 +1791,15 @@ it('checks retrieved manual evidence and refuses release after its artifact is c
   verifying(root);
   const relative = '.work/tasks/probe/evidence/observation.md';
   await mkdir(dirname(join(root, relative)), { recursive: true });
+  const current = await state(root);
   const original =
     '# Actual observation\nEnvironment and actions.\n\n```mio-evidence\n' +
     JSON.stringify({
-      candidate: (await state(root)).checkpoint!.candidate,
+      candidate: current.checkpoint!.candidate,
+      contract: contractPlan(current),
       criterion: 'observe',
       result: 'pass',
+      observation: 'Observed the fixture behavior in this isolated workspace.',
     }) +
     '\n```\n';
   await writeFile(join(root, relative), original);
@@ -1888,21 +1881,37 @@ it('binds ordinary manual observations to their declared candidate, criterion an
   verifying(root);
   const relative = '.work/tasks/probe/evidence/observation.md';
   await mkdir(dirname(join(root, relative)), { recursive: true });
-  const candidateA = (await state(root)).checkpoint!.candidate;
+  const current = await state(root);
+  const candidateA = current.checkpoint!.candidate;
   const original = (report: unknown) =>
     '# Actual fixture observation\n\n```mio-evidence\n' + JSON.stringify(report) + '\n```\n';
-  const report = { candidate: candidateA, criterion: 'observe', result: 'pass' };
+  const report = {
+    candidate: candidateA,
+    contract: contractPlan(current),
+    criterion: 'observe',
+    result: 'pass',
+    observation: 'Observed the fixture candidate in this isolated workspace.',
+  };
   await writeFile(join(root, relative), original(report));
   await implementing(root);
   await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
+  commitFixture(root, 'Change the observed candidate', ['src/value.ts']);
   expect(invoke(root, ['sync', 'probe', 'Reviewed the changed fixture source.']).status).toBe(0);
   verifying(root);
   const candidateB = (await state(root)).checkpoint!.candidate;
-  expect(candidateB).not.toBe(candidateA);
+  expect(candidateB).not.toEqual(candidateA);
   const before = await readFile(statePath(root), 'utf8');
   for (const body of [
     original(report),
     'An unbound historical observation.',
+    original({
+      candidate: candidateB,
+      criterion: 'observe',
+      result: 'pass',
+      observation: report.observation,
+    }),
+    original({ ...report, candidate: candidateB, observation: '' }),
+    original({ ...report, candidate: candidateB, contract: { ...report.contract, id: 'other' } }),
     original({ ...report, candidate: candidateB, criterion: 'different' }),
     original({ ...report, candidate: candidateB, result: 'unknown' }),
   ]) {
@@ -1917,12 +1926,12 @@ it('binds ordinary manual observations to their declared candidate, criterion an
     expect(rejected.status, rejected.output).toBe(1);
     expect(await readFile(statePath(root), 'utf8')).toBe(before);
   }
-  expect(
-    invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Old call.']).output,
-  ).toContain('WORK_EVIDENCE');
+  expect(invoke(root, ['evidence', 'probe', 'observe', 'pass', relative, 'Old call.']).status).toBe(
+    1,
+  );
   expect(
     invoke(root, ['evidence', 'probe', 'checks', relative, 'Pretend automated.']).output,
-  ).toContain('automated checks use work run');
+  ).toContain('mio-coverage');
   expect(await readFile(statePath(root), 'utf8')).toBe(before);
   for (const result of ['fail', 'pending']) {
     const path = `.work/tasks/probe/evidence/observation-${result}.md`;
@@ -1953,7 +1962,7 @@ it('binds ordinary manual observations to their declared candidate, criterion an
       (entry: { criterion: string }) => entry.criterion === 'observe',
     ).result,
   ).toBe('invalid');
-  expect((await state(root)).evidence.at(-1)!.candidate).toBe(candidateB);
+  expect((await state(root)).evidence.at(-1)!.candidate).toEqual(candidateB);
 }, 30_000);
 
 it('rejects linked original aliases at registration and when checking previously registered evidence', async () => {
@@ -1962,7 +1971,11 @@ it('rejects linked original aliases at registration and when checking previously
   verifying(root);
   const relative = '.work/tasks/probe/evidence/review.md';
   await mkdir(dirname(join(root, relative)), { recursive: true });
-  const content = reviewMarkdown(reviewFixture((await state(root)).checkpoint!.candidate));
+  const current = await state(root);
+  const content = reviewMarkdown({
+    ...reviewFixture(current.checkpoint!.candidate),
+    contract: contractPlan(current),
+  });
   await writeFile(join(root, relative), content);
   const alias = join(root, '.work/review-alias.md');
   await link(join(root, relative), alias);
@@ -1986,7 +1999,7 @@ it('rejects linked original aliases at registration and when checking previously
   expect(register().output).toContain('WORK_ARTIFACT');
 });
 
-it('rejects a manual original that is itself a candidate input before attempting candidate binding', async () => {
+it('rejects public candidate inputs as manual originals and accepts a private copy', async () => {
   const root = await fixture();
   await ready(root);
   const relative = 'docs/shared-review.md';
@@ -1999,6 +2012,7 @@ it('rejects a manual original that is itself a candidate input before attempting
       criterion: 'Observe actual behavior.',
     });
   });
+  commitFixture(root, 'Add the shared review input', [relative]);
   expect(invoke(root, ['sync', 'probe', 'Bound the shared observation as an input.']).status).toBe(
     0,
   );
@@ -2011,17 +2025,20 @@ it('rejects a manual original that is itself a candidate input before attempting
     relative,
     'Must not create a self-bound observation.',
   ]);
-  expect(rejected.output).toContain('WORK_EVIDENCE_INPUT');
+  expect(rejected.output).toMatch(/WORK_ARTIFACT|WORK_EVIDENCE/);
   expect(await readFile(statePath(root), 'utf8')).toBe(before);
   const copy = '.work/tasks/probe/evidence/shared-review-copy.md';
   await mkdir(dirname(join(root, copy)), { recursive: true });
+  const current = await state(root);
   await writeFile(
     join(root, copy),
     '# Retrieved observation\n\n```mio-evidence\n' +
       JSON.stringify({
-        candidate: (await state(root)).checkpoint!.candidate,
+        candidate: current.checkpoint!.candidate,
+        contract: contractPlan(current),
         criterion: 'inspect',
         result: 'pending',
+        observation: 'The independent fixture observation has not yet been completed.',
       }) +
       '\n```\n',
   );
@@ -2069,6 +2086,7 @@ it('receives a handoff into another member workspace only after retrieving match
   );
   await expect(readFile(statePath(receiver))).rejects.toThrow();
   await cp(join(sender, 'src/value.ts'), join(receiver, 'src/value.ts'));
+  fetchFixtureCommit(receiver, sender);
   expect(invoke(receiver, ['receive', '.work/inbox/probe.md']).status).toBe(0);
   const received = await state(receiver);
   expect(received.member).toBe('bob');
@@ -2091,6 +2109,111 @@ it('receives a handoff into another member workspace only after retrieving match
   ).toBe(0);
   expect(run(receiver).status).toBe(0);
   expect(invoke(sender, ['handoff', 'probe']).output).toBe(prepared.output);
+});
+
+it('receives a selected public result from records without inheriting authority, acceptance or evidence', async () => {
+  const root = await fixture();
+  const prd = 'docs/tasks/product/prd.md';
+  await mkdir(dirname(join(root, prd)), { recursive: true });
+  await writeFile(join(root, prd), '# Capability PRD\n');
+  await writeTaskDocuments(root, [{ kind: 'prd', identity: prd, path: prd }]);
+  const result = (key: string) => ({
+    key,
+    title: `Accepted ${key}`,
+    outcomes: 'Historical outcome.',
+    locations: [{ path: 'src/value.ts', purpose: 'Existing entry.' }],
+    verification: 'Prior observation.',
+    limitations: 'Historical only.',
+    acceptance: {
+      candidate: 'a'.repeat(64),
+      statement: 'The user accepted the historical result.',
+      reference: 'Prior acceptance.',
+    },
+  });
+  const book = {
+    version: 5 as const,
+    prd,
+    results: [result('alpha'), result('beta'), result('gamma')],
+  };
+  const records = recordsPath(prd);
+  const report = 'docs/tasks/product/complete/report.md';
+  await mkdir(dirname(join(root, records)), { recursive: true });
+  await writeFile(join(root, records), JSON.stringify(book, null, 2) + '\n');
+  await expect(readFile(join(root, report))).rejects.toHaveProperty('code', 'ENOENT');
+  expect(invoke(root, ['receive', report]).output).toContain('WORK_RESULT_SELECTION');
+  const received = invoke(root, ['receive', report, 'alpha']);
+  expect(received.status, received.output).toBe(0);
+  const id = received.output.match(/Received draft ([^;]+)/)![1]!;
+  const task = await state(root, id);
+  expect(task.plan.result).toEqual({ prd, key: 'alpha' });
+  expect(task.plan.authorization).toBe('');
+  expect(task.plan.scope).toEqual([]);
+  expect(task.plan.acceptance).toEqual([]);
+  expect(task.checkpoint).toBeNull();
+  expect(task.evidence).toEqual([]);
+  expect(task.reviewDecision).toBe('PENDING');
+  expect(task.releaseDisposition).toBe('HOLD_FOR_EVIDENCE');
+  expect(invoke(root, ['check', id]).output).toContain('WORK_CONTRACT');
+  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  expect(
+    invoke(root, ['update', id, '--stdin'], {
+      revision: current.revision,
+      reason: 'An accepted result cannot be cleared.',
+      plan: { result: null },
+    }).output,
+  ).toContain('WORK_DELIVERY_RESULT');
+  expect((await state(root, id)).plan.result).toEqual({ prd, key: 'alpha' });
+  await writeFile(join(root, report), 'A stale report with no result metadata.\n');
+  const staleReport = invoke(root, ['receive', report, 'beta']);
+  expect(staleReport.status, staleReport.output).toBe(0);
+  const secondId = staleReport.output.match(/Received draft ([^;]+)/)![1]!;
+  const second = await state(root, secondId);
+  expect(second.plan.result).toEqual({ prd, key: 'beta' });
+  expect(second.plan.authorization).toBe('');
+  expect(second.evidence).toEqual([]);
+  const beforeCorruption = await readFile(statePath(root, id), 'utf8');
+  const secondBeforeCorruption = await readFile(statePath(root, secondId), 'utf8');
+  await writeFile(join(root, report), renderBook(book, prd));
+  await writeFile(join(root, records), '{broken records');
+  const rejected = invoke(root, ['receive', report, 'gamma']);
+  expect(rejected.status, rejected.output).toBe(1);
+  expect(await readFile(statePath(root, id), 'utf8')).toBe(beforeCorruption);
+  expect(await readFile(statePath(root, secondId), 'utf8')).toBe(secondBeforeCorruption);
+  expect((await readdir(join(root, '.work/tasks'))).sort()).toEqual([id, secondId].sort());
+});
+
+it('does not publish a public result for maintenance', async () => {
+  const root = await fixture();
+  await ready(root);
+  expect(run(root).status).toBe(0);
+  expect(invoke(root, ['deliver', 'probe', '--stdin'], { action: 'prepare' }).status).toBe(1);
+  expect((await state(root)).plan.result).toBeNull();
+  await expect(readFile(join(root, 'docs/tasks/complete/records.json'))).rejects.toHaveProperty(
+    'code',
+    'ENOENT',
+  );
+});
+
+it('retains a legacy accepted result binding during an ordinary task update', async () => {
+  const root = await fixture();
+  await ready(root);
+  const prd = 'docs/tasks/product/prd.md';
+  await mkdir(dirname(join(root, prd)), { recursive: true });
+  await writeFile(join(root, prd), '# Historical PRD\n');
+  await writeTaskDocuments(root, [{ kind: 'prd', identity: prd, path: prd }]);
+  const historical = { path: 'docs/tasks/product/complete/report.md', candidate: 'a'.repeat(64) };
+  await edit(root, (task) => {
+    task.plan.result = { prd, key: 'old' };
+    task.delivery = { version: 1, accepted: historical };
+  });
+  const current = await state(root);
+  const changed = invoke(root, ['update', 'probe', '--stdin'], {
+    revision: taskRevision(current),
+    reason: 'Preserve accepted history while changing progress only.',
+    plan: { nextAction: 'Inspect the old accepted result.' },
+  });
+  expect(changed.status, changed.output).toBe(0);
+  expect((await state(root)).delivery?.accepted).toEqual(historical);
 });
 
 it('rejects corrupt/unknown-version records and damaged handoff data without replacing originals', async () => {
@@ -2127,6 +2250,7 @@ it('uses the same CLI identity before and after a source move and binds the curr
     },
   ];
   await writeTaskDocuments(root, documents);
+  commitFixture(root, 'Register the initial source', ['docs']);
   const request = {
     ...proposal(),
     plan: { ...proposal().plan, result: { prd: requirement.source, key: 'value' } },
@@ -2163,22 +2287,24 @@ it('uses the same CLI identity before and after a source move and binds the curr
   });
   expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
   const changed = JSON.parse(invoke(root, ['check', id]).output);
-  expect(changed.candidate).not.toBe(first.assessment.candidate);
+  expect(changed.errors.join(' ')).toContain('WORK_CANDIDATE');
   expect(
     changed.evidence.find((item: { criterion: string }) => item.criterion === 'checks').result,
   ).toBe('pending');
+  const movedCommit = commitFixture(root, 'Move the registered source', ['docs']);
   expect(invoke(root, ['sync', id, 'Inspected the moved source and stable mapping.']).status).toBe(
     0,
   );
   const current = await state(root, id);
-  expect(Object.keys(current.checkpoint!.files)).toEqual(
-    expect.arrayContaining(['docs/tasks/example/prd.md', 'docs/api.md', 'harness.config.json']),
-  );
+  expect(current.checkpoint!.candidate).toEqual({
+    commit: movedCommit,
+    contractRevision: current.contractRevision,
+  });
   await writeFile(
     join(root, 'docs/tasks/example/prd.md'),
     '# API\n\nChanged actual requirement.\n',
   );
-  expect(invoke(root, ['check', id]).output).toContain('docs/tasks/example/prd.md');
+  expect(invoke(root, ['check', id]).output).toContain('WORK_CANDIDATE');
   expect((await state(root, id)).checkpoint).toEqual(current.checkpoint);
   const illegal = invoke(root, ['ensure', '--stdin'], {
     requirement: { ...requirement, key: 'bad-result' },
@@ -2200,6 +2326,7 @@ it('resumes the same task after retiring its identity redirect and binds only cu
     { identity: requirement.source, kind: 'prd', path, aliases: [requirement.source] },
   ];
   await writeTaskDocuments(root, documents);
+  commitFixture(root, 'Register the source redirect', ['docs']);
   const request = {
     ...proposal(),
     plan: { ...proposal().plan, result: { prd: requirement.source, key: 'value' } },
@@ -2223,26 +2350,28 @@ it('resumes the same task after retiring its identity redirect and binds only cu
   });
   expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
   const changed = JSON.parse(invoke(root, ['check', id]).output);
-  expect(changed.errors.join(' ')).toContain('WORK_CONTEXT_CHANGED');
+  expect(changed.errors.join(' ')).toContain('WORK_CANDIDATE');
   expect(changed.errors.join(' ')).not.toContain('WORK_SOURCE');
+  const retiredCommit = commitFixture(root, 'Retire the source redirect', ['docs']);
   expect(
     invoke(root, ['sync', id, 'Inspected removal of an unused physical redirect.']).status,
   ).toBe(0);
   const current = await state(root, id);
-  expect(Object.keys(current.checkpoint!.files)).toContain(path);
-  expect(Object.keys(current.checkpoint!.files)).toContain('harness.config.json');
-  expect(Object.keys(current.checkpoint!.files)).not.toContain(requirement.source);
+  expect(current.checkpoint!.candidate).toEqual({
+    commit: retiredCommit,
+    contractRevision: current.contractRevision,
+  });
   expect(current.evidence).toEqual(JSON.parse(before).evidence);
   expect(JSON.parse(invoke(root, ['check', id]).output).evidence[0].result).toBe('pending');
   await writeFile(join(root, path), '# API\n\nChanged current requirement.\n');
-  expect(invoke(root, ['check', id]).output).toContain(path);
+  expect(invoke(root, ['check', id]).output).toContain('WORK_CANDIDATE');
 });
 
 it('retrieves classified tasks artifacts and receives an exact-code handoff from a registered task proposal', async () => {
   const sender = await fixture('alice');
   const receiver = await fixture('bob');
   const shared = 'docs/tasks/example/handoff.md';
-  for (const root of [sender, receiver]) {
+  for (const root of [sender]) {
     await mkdir(join(root, 'docs/tasks/example'), { recursive: true });
     await writeFile(join(root, 'docs/tasks/example/prd.md'), '# API\n');
     await writeFile(join(root, shared), '# Placeholder outside the candidate inputs.\n');
@@ -2261,15 +2390,22 @@ it('retrieves classified tasks artifacts and receives an exact-code handoff from
     ];
     await writeTaskDocuments(root, documents);
   }
+  commitFixture(sender, 'Register fixture documents', ['docs']);
+  fetchFixtureCommit(receiver, sender);
   const first = invoke(sender, ['ensure', '--stdin'], proposal());
   expect(first.status, first.output).toBe(0);
   const id = JSON.parse(first.output).task.id as string;
+  expect(invoke(sender, ['sync', id, 'Reviewed the committed handoff candidate.']).status).toBe(0);
   const portable = invoke(sender, ['handoff', id]);
   expect(portable.status, portable.output).toBe(0);
   const bytes = await readFile(portable.output, 'utf8');
   await writeFile(join(receiver, shared), bytes);
   expect((await artifact(receiver, id, shared)).toString('utf8')).toBe(bytes);
-  const received = invoke(receiver, ['receive', shared]);
+  expect(invoke(receiver, ['receive', shared]).output).toContain('WORK_HANDOFF_CODE');
+  await writeFile(join(receiver, shared), '# Placeholder outside the candidate inputs.\n');
+  await mkdir(join(receiver, '.work/inbox'), { recursive: true });
+  await writeFile(join(receiver, '.work/inbox/task.md'), bytes);
+  const received = invoke(receiver, ['receive', '.work/inbox/task.md']);
   expect(received.status, received.output).toBe(0);
   expect((await state(receiver, id)).plan.authorization).toBe('');
   await writeFile(join(receiver, 'docs/tasks/unclassified.md'), '# Unknown');

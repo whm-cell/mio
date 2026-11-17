@@ -25,8 +25,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/onelink-integration/prd.md",
   "records": {
-    "path": "docs/tasks/onelink-integration/complete/records.json",
-    "sha256": "a5609150120dea65cb23b8cb796577a79c4458fedb3e2b8bb3dbcad8c871fb2d"
+    "path": "docs/tasks/onelink-integration/complete/records.json"
   }
 }
 ```

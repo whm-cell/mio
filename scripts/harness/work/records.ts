@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 export const stages = ['C0_READY', 'C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING', 'C1_RELEASED'];
 export const methods = ['automated', 'review', 'behavior'];
@@ -13,7 +14,7 @@ export interface TaskPlan {
   id: string;
   requirement?: Requirement;
   result?: { prd: string; key: string } | null;
-  norms?: { version?: 2; paths: string[]; reason: string };
+  norms?: { version?: 1 | 2; paths: string[]; reason: string };
   goal: string;
   scope: string[];
   inputs: string[];
@@ -28,25 +29,47 @@ export interface TaskPlan {
   stopCondition: string;
   sharedRef: string;
 }
+export interface Candidate {
+  commit: string;
+  contractRevision: number;
+}
+export type CandidateRef = Candidate | string;
 export interface Checkpoint {
-  head: string | null;
-  branch: string | null;
-  files: Record<string, string>;
-  contract: string;
-  candidate: string;
+  candidate: CandidateRef;
+  head?: string | null;
+  branch?: string | null;
+  files?: Record<string, string>;
+  contract?: string;
 }
 export interface Evidence {
   criterion: string;
   method: string;
   result: string;
-  candidate: string;
+  candidate: CandidateRef;
   artifact: string;
-  sha256: string;
+  sha256?: string;
   summary: string;
   environment: string;
 }
+export interface ResultDetails {
+  key: string;
+  title: string;
+  outcomes: string;
+  locations: { path: string; purpose: string }[];
+  verification: string;
+  limitations: string;
+}
+export interface ResultDraft {
+  id: string;
+  prd: string;
+  candidate: Candidate;
+  result: ResultDetails;
+  evidence: Evidence[];
+}
 export interface Task {
   version: 1;
+  revision?: number;
+  contractRevision?: number;
   member: string;
   workspace: string;
   plan: TaskPlan;
@@ -59,14 +82,66 @@ export interface Task {
   archived: boolean;
   delivery?: {
     version: 1 | 2;
-    draft?: { path: string; sha256: string; candidate: string };
-    accepted?: { path: string; sha256: string; candidate: string; key?: string };
+    draft?: ResultDraft | { path: string; sha256: string; candidate: string };
+    accepted?: { path: string; sha256?: string; candidate: CandidateRef; key?: string };
   };
 }
 
 export const digest = (bytes: string | Buffer): string =>
   createHash('sha256').update(bytes).digest('hex');
 export const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+export const taskRevision = (task: Task): number => task.revision ?? 0;
+export const contractRevision = (task: Task): number => task.contractRevision ?? 0;
+
+/** Strings are historical labels, never inferred to be Git identities. */
+export function candidateRef(value: unknown): CandidateRef {
+  if (typeof value === 'string' && value.trim()) return value;
+  const candidate = object(value);
+  if (
+    typeof candidate.commit !== 'string' ||
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(candidate.commit) ||
+    !Number.isSafeInteger(candidate.contractRevision) ||
+    (candidate.contractRevision as number) < 0 ||
+    Object.keys(candidate).some((key) => !['commit', 'contractRevision'].includes(key))
+  )
+    throw new Error('WORK_CANDIDATE: expected a complete Git commit and contract revision');
+  return candidate as unknown as Candidate;
+}
+
+export function sameCandidate(
+  a: CandidateRef | null | undefined,
+  b: CandidateRef | null | undefined,
+) {
+  return (
+    typeof a === 'object' &&
+    a !== null &&
+    typeof b === 'object' &&
+    b !== null &&
+    a.commit === b.commit &&
+    a.contractRevision === b.contractRevision
+  );
+}
+
+/** Progress and notes do not change the agreed work or its acceptance criteria. */
+export function contractPlan(task: Task) {
+  const plan = task.plan;
+  return {
+    id: plan.id,
+    goal: plan.goal,
+    scope: plan.scope,
+    inputs: plan.inputs,
+    sources: plan.sources,
+    authorization: plan.authorization,
+    nonGoals: plan.nonGoals,
+    acceptance: plan.acceptance,
+    decisions: plan.decisions,
+    dependencies: plan.dependencies,
+    stopCondition: plan.stopCondition,
+    ...(plan.requirement ? { requirement: plan.requirement } : {}),
+    ...(plan.result !== undefined ? { result: plan.result } : {}),
+    ...(plan.norms ? { norms: { paths: plan.norms.paths, reason: plan.norms.reason } } : {}),
+  };
+}
 
 export function identifier(value: string): string {
   if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,79}$/.test(value))
@@ -144,7 +219,7 @@ export function parseTask(raw: string): Task {
       new Set(norms.paths).size !== norms.paths.length ||
       typeof norms.reason !== 'string' ||
       !norms.reason.trim() ||
-      (norms.version !== undefined && norms.version !== 2) ||
+      (norms.version !== undefined && ![1, 2].includes(norms.version as number)) ||
       Object.keys(norms).some((key) => !['version', 'paths', 'reason'].includes(key))
     )
       throw new Error('WORK_SCHEMA: norms requires unique paths and a reconciliation reason');
@@ -190,6 +265,10 @@ export function parseTask(raw: string): Task {
     throw new Error('WORK_SCHEMA: duplicate criterion id');
   if (
     task.version !== 1 ||
+    (task.revision !== undefined &&
+      (!Number.isSafeInteger(task.revision) || (task.revision as number) < 0)) ||
+    (task.contractRevision !== undefined &&
+      (!Number.isSafeInteger(task.contractRevision) || (task.contractRevision as number) < 0)) ||
     typeof task.member !== 'string' ||
     typeof task.workspace !== 'string' ||
     (task.stage !== null && !stages.includes(task.stage as string)) ||
@@ -204,23 +283,7 @@ export function parseTask(raw: string): Task {
     throw new Error('WORK_SCHEMA: task metadata');
   if (task.checkpoint !== null) {
     const checkpoint = object(task.checkpoint);
-    if (
-      (checkpoint.head !== null && typeof checkpoint.head !== 'string') ||
-      (checkpoint.branch !== null && typeof checkpoint.branch !== 'string') ||
-      typeof checkpoint.candidate !== 'string' ||
-      typeof checkpoint.contract !== 'string' ||
-      !/^[a-f0-9]{64}$/.test(checkpoint.contract)
-    )
-      throw new Error('WORK_SCHEMA: checkpoint');
-    for (const hash of Object.values(object(checkpoint.files))) {
-      if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash))
-        throw new Error('WORK_SCHEMA: file hash');
-    }
-    if (
-      checkpoint.candidate !==
-      digest(json({ files: checkpoint.files, contract: checkpoint.contract }))
-    )
-      throw new Error('WORK_SCHEMA: candidate binding');
+    candidateRef(checkpoint.candidate);
   }
   if (task.delivery !== undefined) {
     const delivery = object(task.delivery);
@@ -229,30 +292,49 @@ export function parseTask(raw: string): Task {
       Object.keys(delivery).some((key) => !['version', 'draft', 'accepted'].includes(key))
     )
       throw new Error('WORK_SCHEMA: delivery');
-    if (delivery.version === 2 && !plan.result)
-      throw new Error('WORK_SCHEMA: delivery result binding');
     for (const kind of ['draft', 'accepted']) {
       if (delivery[kind] === undefined) continue;
       const ref = object(delivery[kind]);
+      const candidate = candidateRef(ref.candidate);
+      if (kind === 'draft' && 'id' in ref) {
+        const result = object(ref.result);
+        if (
+          typeof ref.id !== 'string' ||
+          !ref.id.trim() ||
+          typeof ref.prd !== 'string' ||
+          !ref.prd.trim() ||
+          typeof candidate === 'string' ||
+          !Array.isArray(ref.evidence) ||
+          ['key', 'title', 'outcomes', 'verification', 'limitations'].some(
+            (key) => typeof result[key] !== 'string' || !(result[key] as string).trim(),
+          ) ||
+          !Array.isArray(result.locations) ||
+          !result.locations.length
+        )
+          throw new Error('WORK_SCHEMA: frozen delivery draft');
+      } else {
+        if (
+          typeof ref.path !== 'string' ||
+          (ref.sha256 !== undefined &&
+            (typeof ref.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(ref.sha256))) ||
+          (kind === 'draft' &&
+            typeof candidate === 'string' &&
+            (typeof ref.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(ref.sha256))) ||
+          (kind === 'draft'
+            ? ref.path !== `.work/tasks/${plan.id}/delivery/draft.md`
+            : !/^docs\/tasks\/[a-z0-9/_-]+\/(?:report\.md|records\.json)$/.test(ref.path))
+        )
+          throw new Error('WORK_SCHEMA: delivery reference');
+      }
       if (
-        typeof ref.path !== 'string' ||
-        typeof ref.sha256 !== 'string' ||
-        !/^[a-f0-9]{64}$/.test(ref.sha256) ||
-        typeof ref.candidate !== 'string' ||
-        !/^[a-f0-9]{64}$/.test(ref.candidate)
-      )
-        throw new Error('WORK_SCHEMA: delivery reference');
-      // Historical personal references remain readable; public operations resolve current ownership.
-      if (
-        kind === 'draft'
-          ? ref.path !== `.work/tasks/${plan.id}/delivery/draft.md`
-          : !/^docs\/tasks\/[a-z0-9/_-]+\/report\.md$/.test(ref.path)
-      )
-        throw new Error('WORK_SCHEMA: delivery path');
-      if (
-        delivery.version === 2 &&
+        typeof candidate !== 'string' &&
         (!plan.result ||
-          (kind === 'accepted' && ref.key !== (plan.result as NonNullable<TaskPlan['result']>).key))
+          (kind === 'accepted' &&
+            ref.key !== (plan.result as NonNullable<TaskPlan['result']>).key) ||
+          (kind === 'draft' &&
+            'id' in ref &&
+            (ref.prd !== (plan.result as NonNullable<TaskPlan['result']>).prd ||
+              object(ref.result).key !== (plan.result as NonNullable<TaskPlan['result']>).key)))
       )
         throw new Error('WORK_SCHEMA: delivery result binding');
     }
@@ -260,14 +342,17 @@ export function parseTask(raw: string): Task {
   for (const item of task.evidence) {
     const entry = object(item);
     if (
-      ['criterion', 'candidate', 'artifact', 'sha256', 'summary', 'environment'].some(
+      ['criterion', 'artifact', 'summary', 'environment'].some(
         (key) => typeof entry[key] !== 'string',
       ) ||
       !methods.includes(entry.method as string) ||
       !['pass', 'fail', 'pending'].includes(entry.result as string) ||
-      !/^[a-f0-9]{64}$/.test(entry.sha256 as string)
+      (entry.sha256 !== undefined &&
+        (typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256))) ||
+      (entry.result !== 'pending' && entry.sha256 === undefined)
     )
       throw new Error('WORK_SCHEMA: evidence');
+    candidateRef(entry.candidate);
   }
   return value as Task;
 }
@@ -319,6 +404,8 @@ export async function initializeMember(root: string, actor?: string): Promise<st
 export function draft(root: string, actor: string, id: string, goal: string): Task {
   return {
     version: 1,
+    revision: 0,
+    contractRevision: 0,
     member: actor,
     workspace: root,
     plan: {
@@ -356,36 +443,39 @@ export async function loadTask(root: string, id: string) {
   return { task, raw, path };
 }
 
-/** Shared read-only recovery guard; full operation validation belongs to delivery-store. */
-export async function deliveryPending(root: string, id: string): Promise<boolean> {
-  try {
-    const operation = JSON.parse(
-      await readFile(
-        await checkedPath(root, `.work/tasks/${identifier(id)}/delivery/operation.json`),
-        'utf8',
-      ),
-    );
-    return operation.version !== 1 && operation.done !== true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return false;
-  }
-}
-
 /** One writer per task. Refuse changes made while a command was running; keep raw evidence. */
 export async function saveTask(root: string, task: Task, previous?: string) {
   const path = await checkedPath(root, `.work/tasks/${identifier(task.plan.id)}/state.json`);
-  parseTask(json(task));
-  if (await deliveryPending(root, task.plan.id))
-    throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request');
+  const revision = taskRevision(task);
+  if (revision >= Number.MAX_SAFE_INTEGER) throw new Error('WORK_REVISION: revision exhausted');
+  const prior = previous === undefined ? null : parseTask(previous);
+  if (
+    prior &&
+    (taskRevision(prior) !== revision || contractRevision(prior) !== contractRevision(task))
+  )
+    throw new Error('WORK_CONFLICT: stale task revision');
+  const changedContract =
+    prior !== null && !isDeepStrictEqual(contractPlan(prior), contractPlan(task));
+  if (changedContract && contractRevision(task) >= Number.MAX_SAFE_INTEGER)
+    throw new Error('WORK_REVISION: contract revision exhausted');
+  const next = {
+    ...task,
+    revision: revision + 1,
+    contractRevision: contractRevision(task) + (changedContract ? 1 : 0),
+  };
+  parseTask(json(next));
   await mkdir(dirname(path), { recursive: true });
-  if (previous === undefined) return writeFile(path, json(task), { flag: 'wx' });
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, json(task), { flag: 'wx' });
-    if ((await readFile(path, 'utf8')) !== previous)
-      throw new Error('WORK_CONFLICT: state changed; reconcile without overwriting it');
-    await rename(temporary, path);
+    await writeFile(temporary, json(next), { flag: 'wx' });
+    if (previous === undefined) await link(temporary, path);
+    else {
+      if ((await readFile(path, 'utf8')) !== previous)
+        throw new Error('WORK_CONFLICT: state changed; reconcile without overwriting it');
+      await rename(temporary, path);
+    }
+    task.revision = next.revision;
+    task.contractRevision = next.contractRevision;
   } finally {
     await rm(temporary, { force: true });
   }

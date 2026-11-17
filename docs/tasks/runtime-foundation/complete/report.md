@@ -13,8 +13,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/runtime-foundation/prd.md",
   "records": {
-    "path": "docs/tasks/runtime-foundation/complete/records.json",
-    "sha256": "1983613b738614e3ff6175c2abbf964a9e0a77044fde1aefe8806869e3d8e14d"
+    "path": "docs/tasks/runtime-foundation/complete/records.json"
   }
 }
 ```

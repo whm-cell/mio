@@ -19,8 +19,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/conversation-service/prd.md",
   "records": {
-    "path": "docs/tasks/conversation-service/complete/records.json",
-    "sha256": "7df1b24d78563e9f26b86633634668563920d74d0017e9b8c0f603d742bf8887"
+    "path": "docs/tasks/conversation-service/complete/records.json"
   }
 }
 ```

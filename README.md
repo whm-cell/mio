@@ -46,7 +46,7 @@ pnpm --filter @mio/foundation build
 pnpm test tests/integrations/redis.test.ts
 ```
 
-`pnpm test` 本地须显式指定测试文件或业务子目录，也可指定多个范围及名称、报告等常用选项；不接受仓库根或 `tests` 总目录。`pnpm check` 仅在 GitHub Actions 执行完整格式、类型、lint、文档/结构/索引护栏、全部测试、构建和官方 Profile 产物 smoke。本地分别运行受影响检查；完整结论按[验证协议](docs/coordination.md#验证与接受)取得。安装不执行依赖构建脚本；当前最小 Profile 不使用需要额外原生构建的运行能力。
+`pnpm test` 本地须显式指定测试文件或业务子目录，也可指定多个范围及名称、报告等常用选项；不接受仓库根或 `tests` 总目录。本地 `pnpm check:static:base` 依次执行格式、类型、lint 和护栏检查，`pnpm check:static` 再执行构建。`pnpm check` 先核验 GitHub Actions 环境，再依次执行上述四项静态检查、全部测试、构建和官方 Profile 产物 smoke。静态通过不表示全量测试或业务验收通过；完整结论按[验证协议](docs/coordination.md#验证与接受)取得。安装不执行依赖构建脚本；当前最小 Profile 不使用需要额外原生构建的运行能力。
 
 `pnpm build` 先构建共享基础库和计算合同，再构建 A 与 B。部署产物必须随各服务提供这些工作区运行时依赖；仓库内 smoke 的依赖链接不单独证明工作区外产物完整。
 
@@ -93,7 +93,7 @@ curl http://127.0.0.1:4311/readyz
 
 一般修改执行相关测试与检查，交付前按[验证协议](docs/coordination.md#验证与接受)取得覆盖 `pnpm check` 的当前有效结论，可由 GitHub Actions 完整检查或复用有效基线并补齐受影响回归；缺可靠结论时等待 CI。业务工具/权限变化必须测试真实执行链；接口变化更新同一份 API 契约。新增源文件自动继承所属模块规则，新模块需要在护栏配置中说明允许依赖。体量报告是审阅信号，不是自动拆分指令。
 
-新目标从 `pnpm work guide start` 开始，原任务用 `status` 定位后取 `context`，记录阶段不代表现场已核验。编辑前建档并进入 C1，命令型实施经 `work exec`；源码质量审查与交回前三方对账按[验证协议](docs/coordination.md#验证与接受)执行。完整命令与字段查[记录索引](docs/work-records.md)。
+新目标从 `pnpm work guide start` 开始，原任务用 `status` 定位后取 `context`，记录阶段不代表现场已核验。编辑前建档并进入 C1；正式取证使用干净 Git 提交和当前任务契约，源码质量审查与交回前三方对账按[验证协议](docs/coordination.md#验证与接受)执行。完整命令与字段查[记录索引](docs/work-records.md)。
 
 公共资料的职责、稳定身份和增长规则见[资料导航](docs/index.md)，各 PRD 在本目录 `documents.json` 登记，`pnpm work documents` 只读列出资料与成果入口。静态[任务入口](docs/tasks/index.md)不随交付改写；complete 仅写所属 PRD 的 records/report，成果可按 key 读取，无需作者 `.work`。整理旧资料时，把仍有效的独有内容并入权威入口，核对必要证据和引用后删除被替代文档。
 

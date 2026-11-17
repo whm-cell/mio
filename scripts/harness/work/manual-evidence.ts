@@ -1,8 +1,9 @@
 import { lstat } from 'node:fs/promises';
-import { checkedPath } from './records.ts';
-import type { Checkpoint, Task, TaskPlan } from './records.ts';
-import { hasResultSelector, parseSelector } from './compact-store.ts';
-import { hashField, metadata, record, textField } from './report-format.ts';
+import { isDeepStrictEqual } from 'node:util';
+import { beneath } from '../inventory.ts';
+import { candidateRef, checkedPath, contractPlan, sameCandidate } from './records.ts';
+import type { Checkpoint, Task } from './records.ts';
+import { metadata, record, textField } from './report-format.ts';
 import { qualityCriterion, qualityReviewResult } from './quality-review.ts';
 import { normsCriterion, normsReviewResult } from './norms-review.ts';
 
@@ -16,17 +17,10 @@ export async function checkManualOriginal(
   const original = await lstat(await checkedPath(root, path));
   const sameFile = (other: typeof original) =>
     original.dev === other.dev && original.ino === other.ino;
-  const inputs = new Set(
-    Object.keys(task.checkpoint!.files).map((input) =>
-      hasResultSelector(input) ? parseSelector(input).path : input,
-    ),
-  );
-  for (const input of inputs) {
-    if (sameFile(await lstat(await checkedPath(root, input))))
-      throw new Error(
-        'WORK_EVIDENCE_INPUT: original is a candidate input; retrieve an independent private copy before binding the observation',
-      );
-  }
+  if (!beneath(path, `.work/tasks/${task.plan.id}/evidence`))
+    throw new Error(
+      'WORK_EVIDENCE_INPUT: use an independent original in this task evidence directory',
+    );
   const changed = new Set(
     task.evidence.filter((entry) => entry.sha256 !== sha256).map((entry) => entry.artifact),
   );
@@ -55,17 +49,29 @@ export async function checkManualOriginal(
 export async function manualEvidenceResult(
   root: string,
   source: string,
-  plan: TaskPlan,
+  task: Task,
   checkpoint: Checkpoint,
   criterion: string,
 ): Promise<'pass' | 'fail' | 'pending'> {
-  if (criterion === qualityCriterion.id) return qualityReviewResult(source, checkpoint.candidate);
-  if (criterion === normsCriterion.id) return normsReviewResult(root, source, plan, checkpoint);
-  const report = record(metadata(source, 'mio-evidence'));
-  if (hashField(report.candidate) !== checkpoint.candidate)
+  if (typeof checkpoint.candidate === 'string')
+    throw new Error('WORK_EVIDENCE: historical candidate cannot bind a new observation');
+  const language =
+    criterion === qualityCriterion.id
+      ? 'mio-quality-review'
+      : criterion === normsCriterion.id
+        ? 'mio-norms-review'
+        : 'mio-evidence';
+  const report = record(metadata(source, language));
+  if (!isDeepStrictEqual(report.contract, contractPlan(task)))
+    throw new Error('WORK_EVIDENCE_CONTRACT: original contract does not match this task');
+  if (criterion === qualityCriterion.id) return qualityReviewResult(report, checkpoint.candidate);
+  if (criterion === normsCriterion.id)
+    return normsReviewResult(root, report, task.plan, checkpoint);
+  if (!sameCandidate(candidateRef(report.candidate), checkpoint.candidate))
     throw new Error('WORK_EVIDENCE: original candidate mismatch; review the current candidate');
   if (textField(report.criterion) !== criterion)
     throw new Error('WORK_EVIDENCE: original criterion mismatch');
+  textField(report.observation);
   if (report.result !== 'pass' && report.result !== 'fail' && report.result !== 'pending')
     throw new Error('WORK_EVIDENCE: original result must be pass, fail or pending');
   return report.result;

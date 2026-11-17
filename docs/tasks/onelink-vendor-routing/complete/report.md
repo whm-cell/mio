@@ -13,8 +13,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/onelink-vendor-routing/prd.md",
   "records": {
-    "path": "docs/tasks/onelink-vendor-routing/complete/records.json",
-    "sha256": "2e3b3e5129da2ba17a5b5ccfb51f2ee0cd1511d56857bb2a5795fed4a0e56ee4"
+    "path": "docs/tasks/onelink-vendor-routing/complete/records.json"
   }
 }
 ```

@@ -10,6 +10,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
@@ -36,6 +37,10 @@ import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.t
 
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
+// Usage: MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>]
+//   prepare <.runtime/run-dir> <infrastructure-dir> <provider-key-file> <task-id>
+//   execute <.runtime/run-dir> <service-cos-env> <worker-cos-env> <task-id>
+// Both phases require the task's clean, synced Git candidate; never replay historical runs.
 assert.equal(process.env.MIO_RUN_LIVE_IMAGE, 'yes', 'LIVE_OPT_IN');
 const SCENARIOS = ['vidu-async', 'kling-async', 'seedream-sync', 'gpt-sync', 'gpt-edit'] as const;
 type Scenario = (typeof SCENARIOS)[number];
@@ -68,19 +73,58 @@ function parseCliArguments(argv: string[]) {
 const {
   scenario,
   explicitScenario,
-  positional: [phase, runArgument, first, second, candidate, ...extra],
+  positional: [phase, runArgument, first, second, taskId, ...extra],
 } = parseCliArguments(process.argv.slice(2));
 assert(
   ['prepare', 'execute'].includes(phase ?? '') &&
     runArgument &&
     first &&
     second &&
-    candidate &&
+    taskId &&
     !extra.length,
-  'LIVE_ARGUMENTS',
+  'LIVE_ARGUMENTS: prepare <run-dir> <infrastructure-dir> <provider-key-file> <task-id>; execute <run-dir> <service-cos-env> <worker-cos-env> <task-id>',
 );
-assert.match(candidate, /^[a-f0-9]{64}$/, 'LIVE_CANDIDATE');
-const project = resolve('.');
+assert.match(taskId, /^[a-z0-9][a-z0-9_-]{0,79}$/, 'LIVE_TASK');
+const project = realpathSync('.');
+const taskPath = join(project, '.work', 'tasks', taskId, 'state.json');
+for (const path of [
+  join(project, '.work'),
+  join(project, '.work', 'tasks'),
+  join(project, '.work', 'tasks', taskId),
+  taskPath,
+])
+  assert(!lstatSync(path).isSymbolicLink(), 'LIVE_TASK_PATH');
+type Candidate = { commit: string; contractRevision: number };
+const task = JSON.parse(readFileSync(taskPath, 'utf8')) as {
+  workspace: string;
+  plan: { id: string };
+  stage: string;
+  contractRevision?: number;
+  checkpoint: { candidate: Candidate | string } | null;
+};
+assert(task.workspace === project && task.plan.id === taskId, 'LIVE_TASK_OWNER');
+assert.equal(task.stage, 'C1_EVIDENCE_PENDING', 'LIVE_TASK_STAGE');
+const reference = task.checkpoint?.candidate;
+assert(reference && typeof reference === 'object', 'LIVE_CANDIDATE');
+const candidate: Candidate = reference;
+assert(
+  Number.isSafeInteger(candidate.contractRevision) && candidate.contractRevision >= 0,
+  'LIVE_CANDIDATE',
+);
+assert.equal(candidate.contractRevision, task.contractRevision ?? 0, 'LIVE_CONTRACT_CHANGED');
+const gitOptions = {
+  cwd: project,
+  encoding: 'utf8' as const,
+  env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+};
+const head = spawnSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], gitOptions);
+const status = spawnSync(
+  'git',
+  ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+  gitOptions,
+);
+assert(head.status === 0 && head.stdout.trim() === candidate.commit, 'LIVE_CANDIDATE_CHANGED');
+assert(status.status === 0 && status.stdout.length === 0, 'LIVE_DIRTY');
 const directory = resolve(runArgument);
 assert(directory.startsWith(`${resolve('.runtime')}${sep}`), 'LIVE_PRIVATE_DIRECTORY');
 const originPath = join(directory, 'state.json');
@@ -94,7 +138,7 @@ type Infrastructure = {
   ports: { postgres: number; amqp: number; management: number };
 };
 type State = {
-  candidate: string;
+  candidate: Candidate;
   scenario?: Scenario;
   origin: string;
   a: Environment;
@@ -998,7 +1042,7 @@ async function replay(state: State, command: ImageCommandV1) {
 }
 async function execute() {
   const state = JSON.parse(readFileSync(originPath, 'utf8')) as State;
-  assert.equal(state.candidate, candidate, 'LIVE_CANDIDATE_CHANGED');
+  assert.deepEqual(state.candidate, candidate, 'LIVE_CANDIDATE_CHANGED');
   const activeScenario: Scenario = state.scenario ?? 'vidu-async';
   assert(!explicitScenario || activeScenario === scenario, 'LIVE_SCENARIO_CHANGED');
   const isAsync = activeScenario === 'vidu-async' || activeScenario === 'kling-async';

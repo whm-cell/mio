@@ -31,8 +31,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/onelink-image-generation/prd.md",
   "records": {
-    "path": "docs/tasks/onelink-image-generation/complete/records.json",
-    "sha256": "493315efce94f328d2f9bacfb7cd1d4bc15040877035f957748207d75c0c9694"
+    "path": "docs/tasks/onelink-image-generation/complete/records.json"
   }
 }
 ```

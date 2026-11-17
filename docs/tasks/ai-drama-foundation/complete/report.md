@@ -25,8 +25,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/prd-ai-drama-foundation.md",
   "records": {
-    "path": "docs/tasks/ai-drama-foundation/complete/records.json",
-    "sha256": "b84723e5b510e1b10a79610b44097372ba4c44d44f8f4636913c064ebdd76144"
+    "path": "docs/tasks/ai-drama-foundation/complete/records.json"
   }
 }
 ```

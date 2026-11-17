@@ -31,8 +31,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/compute-service/prd.md",
   "records": {
-    "path": "docs/tasks/compute-service/complete/records.json",
-    "sha256": "fe91c74e0fbe3e5248adb25c53fe73be3a15a174db23f4e8c3584074c044ac9a"
+    "path": "docs/tasks/compute-service/complete/records.json"
   }
 }
 ```

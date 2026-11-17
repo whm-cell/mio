@@ -1,6 +1,6 @@
 import { readdir } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
-import { checkedPath, digest, json, loadTask, stages } from './records.ts';
+import { checkedPath, json, loadTask, stages } from './records.ts';
 import { readPage } from './output.ts';
 import type { ReadOptions } from './output.ts';
 
@@ -23,12 +23,10 @@ export async function readStatus(
     entries = [];
   }
   const tasks = [];
-  const identities = [];
   const query = flags.query?.toLocaleLowerCase();
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    const { task, raw } = await loadTask(root, entry.name);
-    identities.push([entry.name, digest(raw)]);
+    const { task } = await loadTask(root, entry.name);
     if (archived !== 'all' && task.archived !== (archived === 'archived')) continue;
     if (flags.stage && (task.stage ?? 'draft') !== flags.stage) continue;
     if (
@@ -66,12 +64,7 @@ export async function readStatus(
   const command = ['status'];
   for (const name of ['query', 'stage', 'archived'])
     if (flags[name] !== undefined) command.push(`--${name}`, flags[name]!);
-  const page = readPage(
-    tasks,
-    options,
-    command,
-    digest(json({ identities, query, stage: flags.stage, archived })),
-  );
+  const page = readPage(tasks, options, command);
   const { items, ...rest } = page as typeof page & { items?: unknown[] };
   return options.select ? page : { tasks: items ?? [], ...rest };
 }

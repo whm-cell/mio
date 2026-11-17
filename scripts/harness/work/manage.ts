@@ -1,8 +1,8 @@
 import { isDeepStrictEqual } from 'node:util';
-import { assess, capture, contractIssues } from './context.ts';
+import { assess, contractIssues, validateInputs } from './context.ts';
 import { taskSummary } from './guide.ts';
 import {
-  deliveryPending,
+  contractPlan,
   digest,
   draft,
   initializeMember,
@@ -48,7 +48,7 @@ function fields(value: unknown, allowed: string[]): Record<string, unknown> {
 }
 
 /** No history, raw evidence or unrelated operation guides enter the response. */
-export async function inspectTask(root: string, task: Task, raw: string, action = 'resume') {
+export async function inspectTask(root: string, task: Task, action = 'resume') {
   let assessment;
   try {
     assessment = await assess(root, task);
@@ -60,7 +60,6 @@ export async function inspectTask(root: string, task: Task, raw: string, action 
   }
   return {
     revision: taskRevision(task),
-    taskHash: digest(raw),
     task: taskSummary(task, action),
     assessment,
   };
@@ -71,8 +70,6 @@ export async function ensureTask(root: string, raw: string) {
   const request = fields(JSON.parse(raw), ['requirement', 'plan']);
   const requirement = fields(request.requirement, ['source', 'section', 'key']);
   const patch = fields(request.plan === undefined ? {} : request.plan, planFields);
-  if (patch.norms && typeof patch.norms === 'object' && !Array.isArray(patch.norms))
-    patch.norms = { version: 2, ...patch.norms };
   const catalog = await documentCatalog(root);
   if (typeof requirement.source === 'string')
     requirement.source = resolveDocument(requirement.source, catalog).identity;
@@ -97,8 +94,6 @@ export async function ensureTask(root: string, raw: string) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     if (existing) {
-      if (await deliveryPending(root, id))
-        throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
       const compared = { ...existing.task.plan, ...patch };
       registerQualityReview(compared, await loadConfig(root));
       registerNormsReview(compared);
@@ -113,7 +108,7 @@ export async function ensureTask(root: string, raw: string) {
         )
       )
         throw new Error(`WORK_CONFLICT: inspect ${id}; use update with its current revision`);
-      return { created: false, ...(await inspectTask(root, existing.task, existing.raw)) };
+      return { created: false, ...(await inspectTask(root, existing.task)) };
     }
     if (typeof patch.goal !== 'string' || !patch.goal.trim())
       throw new Error(
@@ -124,12 +119,11 @@ export async function ensureTask(root: string, raw: string) {
     if (task.plan.result) task.delivery = { version: 2 };
     registerQualityReview(task.plan, await loadConfig(root));
     registerNormsReview(task.plan);
-    task.checkpoint = await capture(root, task);
     const sourceIssues = await requirementIssues(root, task.plan);
     if (sourceIssues.length) throw new Error(sourceIssues.join('\n'));
     if (!contractIssues(task).length) task.stage = 'C0_READY';
     await saveTask(root, task);
-    return { created: true, ...(await inspectTask(root, task, json(task))) };
+    return { created: true, ...(await inspectTask(root, task)) };
   });
 }
 
@@ -147,8 +141,6 @@ export async function updateTask(root: string, id: string, raw: string) {
     ...planFields,
     'requirement',
   ]);
-  if (patch.norms && typeof patch.norms === 'object' && !Array.isArray(patch.norms))
-    patch.norms = { version: 2, ...patch.norms };
   if (patch.result && typeof patch.result === 'object') {
     const result = patch.result as Record<string, unknown>;
     if (typeof result.prd === 'string') {
@@ -156,8 +148,6 @@ export async function updateTask(root: string, id: string, raw: string) {
     }
   }
   const task = loaded.task;
-  if (await deliveryPending(root, id))
-    throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
   if (request.revision !== taskRevision(task))
     throw new Error('WORK_CONFLICT: read the current context before updating');
   if (
@@ -188,27 +178,20 @@ export async function updateTask(root: string, id: string, raw: string) {
       throw new Error('WORK_DELIVERY_RESULT: cannot remove an accepted result binding');
     if (task.delivery.draft)
       task.notes.push(
-        `Previous unaccepted draft remains historical: ${task.delivery.draft.path}. The corrected maintenance declaration cannot publish it.`,
+        `Previous unaccepted draft remains historical: ${'path' in task.delivery.draft ? task.delivery.draft.path : task.delivery.draft.id}. The corrected maintenance declaration cannot publish it.`,
       );
     delete task.delivery;
   }
-  if (task.plan.result && task.delivery?.version !== 2) {
-    if (task.delivery?.accepted)
-      task.notes.push(
-        `Previous v1 accepted result remains historical: ${task.delivery.accepted.path}; ${task.delivery.accepted.candidate}. No passes transfer to the new result contract.`,
-      );
-    task.delivery = { version: 2 };
-  }
+  if (task.plan.result && !task.delivery) task.delivery = { version: 2 };
   parseTask(json(task));
   registerQualityReview(task.plan, await loadConfig(root));
   registerNormsReview(task.plan);
-  const current = await capture(root, task);
   if (patch.requirement !== undefined) {
     const sourceIssues = await requirementIssues(root, task.plan);
     if (sourceIssues.length) throw new Error(sourceIssues.join('\n'));
   }
   if (
-    current.candidate !== task.checkpoint?.candidate ||
+    !isDeepStrictEqual(contractPlan(parseTask(loaded.raw)), contractPlan(task)) ||
     contractIssues(task).length ||
     request.stage !== undefined ||
     request.reopen
@@ -226,19 +209,23 @@ export async function updateTask(root: string, id: string, raw: string) {
     if (!['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'].includes(request.stage as string))
       throw new Error('WORK_REQUEST: update cannot record release or human acceptance');
     if (request.stage === 'C1_IMPLEMENTATION') {
-      const assessment = await assess(root, { ...task, stage: 'C1_IMPLEMENTATION' });
-      if (!assessment.ready)
+      const errors = [
+        ...contractIssues({ ...task, stage: 'C1_IMPLEMENTATION' }),
+        ...(await requirementIssues(root, task.plan)),
+      ];
+      if (errors.length)
         throw new Error(
           [
-            'Setting C1_IMPLEMENTATION was rejected before saving any task changes; sync cannot apply rejected changes. Read the current context. If changing the intended contract, save it without stage, then inspect/sync before retrying C1 with the current revision.',
-            ...assessment.errors,
+            'Setting C1_IMPLEMENTATION was rejected before saving any task changes; inspect the contract and authorization.',
+            ...errors,
           ].join('\n'),
         );
+      await validateInputs(root, task);
     }
     task.stage = request.stage as string;
   }
   task.notes.push(`${new Date().toISOString()} ${request.reason}`);
   // Contract edits invalidate the old checkpoint; only an explicit sync acknowledges the diff.
   await saveTask(root, task, loaded.raw);
-  return inspectTask(root, task, json(task));
+  return inspectTask(root, task);
 }

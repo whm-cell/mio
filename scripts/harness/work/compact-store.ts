@@ -1,6 +1,7 @@
 import { dirname } from 'node:path';
-import { identifier, json } from './records.ts';
-import { fields, hashField, publicText, record, textField } from './report-format.ts';
+import { candidateRef, identifier, json } from './records.ts';
+import type { CandidateRef, ResultDetails } from './records.ts';
+import { fields, publicText, record, textField } from './report-format.ts';
 
 /** Paths take the registered current PRD path, never its possibly historical identity. */
 export function prdDirectory(currentPath: string) {
@@ -12,8 +13,6 @@ export const reportPath = (currentPath: string) =>
   `${prdDirectory(currentPath)}/complete/report.md`;
 export const recordsPath = (currentPath: string) =>
   `${prdDirectory(currentPath)}/complete/records.json`;
-export const resultSelector = (currentPath: string, key: string) =>
-  `${recordsPath(currentPath)}#result=${identifier(key)}`;
 export const hasResultSelector = (value: string) =>
   value.includes('/records.json#') || value.includes('#result');
 export const recordsFile = (path: string) =>
@@ -28,16 +27,8 @@ export function parseSelector(value: string) {
   return { path: match[1]!, key: match[2]! };
 }
 
-export interface ResultDetails {
-  key: string;
-  title: string;
-  outcomes: string;
-  locations: { path: string; purpose: string }[];
-  verification: string;
-  limitations: string;
-}
-export interface PublicResult extends ResultDetails {
-  acceptance: { candidate: string; statement: string; reference: string };
+interface PublicResult extends ResultDetails {
+  acceptance: { candidate: CandidateRef; statement: string; reference: string };
 }
 export interface ResultBook {
   version: 5;
@@ -60,8 +51,8 @@ export function parseDetails(value: unknown): ResultDetails {
     textField(location.purpose);
     if (
       seen.has(path) ||
-      !/^(?:src|scripts|tests|docs)\//.test(path) ||
       path.includes('\\') ||
+      path.includes('\0') ||
       path.split('/').some((part) => !part || part === '.' || part === '..') ||
       path.split('/').some((part) => part.startsWith('.'))
     )
@@ -75,7 +66,7 @@ export function parseDetails(value: unknown): ResultDetails {
 export function parseAcceptance(value: unknown): PublicResult['acceptance'] {
   const acceptance = record(value);
   fields(acceptance, ['candidate', 'statement', 'reference']);
-  hashField(acceptance.candidate);
+  candidateRef(acceptance.candidate);
   textField(acceptance.statement);
   textField(acceptance.reference);
   publicText(json(acceptance));

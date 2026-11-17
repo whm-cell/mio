@@ -79,21 +79,15 @@ it('reads and pages v5 facts without author records, and rejects retired evidenc
     '2048',
   ];
   let recovered = '';
-  let firstHash = '';
   for (;;) {
     const page = await readPublicResult(root, args.slice(1));
     expect(Buffer.byteLength(json(page))).toBeLessThanOrEqual(outputBytes);
-    firstHash ||= page.page.sha256;
     if (!('text' in page) || typeof page.text !== 'string') throw new Error('Expected text page');
     recovered += page.text;
     if (!page.page.next) break;
     args = page.page.next.argv;
   }
   expect(recovered).toBe(result.verification);
-  expect(firstHash).toMatch(/^[a-f0-9]{64}$/);
-  await expect(readPublicResult(root, [prd, result.key, '--hash', '0'.repeat(64)])).rejects.toThrow(
-    'WORK_READ_STALE',
-  );
   await expect(
     readPublicResult(root, [prd, result.key, '--select', '/artifacts/checks']),
   ).rejects.toThrow();

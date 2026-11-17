@@ -157,7 +157,7 @@ it('validates change ownership, stable paths, metadata and a unique real parent 
   );
 });
 
-it('recovers a missing and stale index through work exec and leaves identical output untouched', async () => {
+it('recovers a missing and stale index and leaves identical output untouched', async () => {
   const { root, config } = await fixture(['bug', 'another']);
   const issues = async () =>
     (await checkDocuments(root, (await inventory(root, config)).files, config)).errors;
@@ -185,8 +185,7 @@ it('recovers a missing and stale index through work exec and leaves identical ou
     plan: { nextAction: 'Generate index' },
   });
   expect(started.status, started.output).toBe(0);
-  const generate = () =>
-    invoke(root, ['exec', task.id, '--', process.execPath, cli, 'changes', prd, '--write-index']);
+  const generate = () => invoke(root, ['changes', prd, '--write-index']);
   const first = generate();
   expect(first.status, first.output).toBe(0);
   expect(first.output).toContain('"changed": true');
@@ -195,7 +194,6 @@ it('recovers a missing and stale index through work exec and leaves identical ou
   expect(original).toBe(await format(original, { parser: 'markdown', printWidth: 100 }));
   expect(await readFile(join(root, cardPath('bug')), 'utf8')).toBe(card('bug'));
   expect(original.indexOf('another')).toBeLessThan(original.indexOf('bug'));
-  expect(invoke(root, ['sync', task.id, 'Reviewed index creation']).status).toBe(0);
   const before = await stat(join(root, index), { bigint: true });
   const repeated = generate();
   expect(repeated.status, repeated.output).toBe(0);
@@ -203,7 +201,6 @@ it('recovers a missing and stale index through work exec and leaves identical ou
   expect((await stat(join(root, index), { bigint: true })).mtimeNs).toBe(before.mtimeNs);
   await writeFile(join(root, index), 'outdated\n');
   expect((await issues()).join('\n')).toContain('TASK_CHANGE_INDEX_STALE');
-  expect(invoke(root, ['sync', task.id, 'Reviewed the stale index fixture']).status).toBe(0);
   const fixed = generate();
   expect(fixed.status, fixed.output).toBe(0);
   expect(await readFile(join(root, index), 'utf8')).toBe(original);
@@ -233,7 +230,64 @@ it('refuses an empty index and unsafe output aliases without changing other file
   expect(await readFile(source, 'utf8')).toBe(original);
 });
 
-it('pages only selected summaries or a single body and rejects stale continuations', async () => {
+it('lists valid records during report drift but blocks mixed invalid or orphaned results', async () => {
+  const { root } = await fixture(['bug']);
+  expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+  const records = 'docs/tasks/product/complete/records.json';
+  await mkdir(dirname(join(root, records)), { recursive: true });
+  await writeFile(
+    join(root, records),
+    JSON.stringify({
+      version: 5,
+      prd,
+      results: [
+        {
+          key: 'accepted',
+          title: 'Accepted fixture',
+          outcomes: 'Fixture result',
+          locations: [{ path: prd, purpose: 'Requirement' }],
+          verification: 'Fixture review',
+          limitations: 'Fixture only',
+          acceptance: { candidate: 'a'.repeat(64), statement: 'Accepted', reference: 'Fixture' },
+        },
+      ],
+    }),
+  );
+  const drift = invoke(root, ['documents']);
+  expect(drift.status).toBe(1);
+  expect(drift.value().issues.join('\n')).toContain('WORK_REPORT_DRIFT');
+  expect(drift.value().results).toMatchObject([{ prd, report: null, records, keys: ['accepted'] }]);
+
+  const otherPrd = 'docs/tasks/z-other/prd.md';
+  const otherRegistry = 'docs/tasks/z-other/documents.json';
+  const otherRecords = 'docs/tasks/z-other/complete/records.json';
+  await mkdir(dirname(join(root, otherRecords)), { recursive: true });
+  await writeFile(join(root, otherPrd), '# Other\n');
+  await writeFile(
+    join(root, otherRegistry),
+    JSON.stringify({
+      version: 1,
+      documents: [{ kind: 'prd', identity: otherPrd, path: otherPrd }],
+    }),
+  );
+  await writeFile(join(root, otherRecords), 'invalid JSON');
+  const mixed = invoke(root, ['documents']);
+  expect(mixed.status).toBe(1);
+  expect(mixed.value().issues.join('\n')).toContain('WORK_REPORT_DRIFT');
+  expect(mixed.value().issues.length).toBeGreaterThan(1);
+  expect(mixed.value().results).toEqual([]);
+
+  await rm(join(root, 'docs/tasks/z-other'), { recursive: true });
+  const orphan = 'docs/tasks/unregistered/complete/orphan.md';
+  await mkdir(dirname(join(root, orphan)), { recursive: true });
+  await writeFile(join(root, orphan), '# Orphan\n');
+  const unowned = invoke(root, ['documents']);
+  expect(unowned.status).toBe(1);
+  expect(unowned.value().issues.join('\n')).toContain('WORK_REPORT_ORPHAN');
+  expect(unowned.value().results).toEqual([]);
+});
+
+it('pages selected summaries or one body with explicit offsets', async () => {
   const ids = Array.from({ length: 13 }, (_, index) => `bug-${String(index).padStart(2, '0')}`);
   const { root } = await fixture(ids);
   const listed = invoke(root, ['changes', prd, '--limit', '4']);
@@ -248,13 +302,16 @@ it('pages only selected summaries or a single body and rejects stale continuatio
   expect(selected.status, selected.output).toBe(0);
   expect(selected.output).not.toContain('bug-01');
   const bodyPage = selected.value();
+  expect(bodyPage.page.next.argv).not.toContain('--hash');
   await writeFile(join(root, cardPath(ids[0]!)), card(ids[0]!) + 'More detail.\n');
-  expect(invoke(root, bodyPage.page.next.argv).output).toContain('WORK_READ_STALE');
+  expect(invoke(root, bodyPage.page.next.argv).status).toBe(0);
   await writeFile(
     join(root, cardPath(ids[4]!)),
     card(ids[4]!).replace('Change bug-04', 'Updated title'),
   );
-  expect(invoke(root, first.page.next.argv).output).toContain('WORK_READ_STALE');
+  const updated = invoke(root, first.page.next.argv);
+  expect(updated.status).toBe(0);
+  expect(updated.output).toContain('Updated title');
   expect(invoke(root, ['changes', prd, 'unknown']).output).toContain('change key not found');
 });
 
@@ -285,7 +342,7 @@ it('reuses a task for the same problem while binding its card and shared registr
   });
   await writeFile(join(root, cardPath('sibling')), card('sibling') + 'Changed unrelated body.\n');
   const unchanged = invoke(root, ['check', created.task.id]).value();
-  expect(unchanged.candidate).toBe(created.assessment.candidate);
+  expect(unchanged.candidate).toBeNull();
   expect(unchanged.ready).toBe(true);
   const added = cardPath('new-issue');
   await mkdir(dirname(join(root, added)), { recursive: true });
@@ -295,8 +352,8 @@ it('reuses a task for the same problem while binding its card and shared registr
     JSON.stringify({ version: 1, documents: [...documents, registration('new-issue')] }),
   );
   const changed = invoke(root, ['check', created.task.id]).value();
-  expect(changed.candidate).not.toBe(created.assessment.candidate);
-  expect(JSON.stringify(changed)).toContain('documents.json');
+  expect(changed.candidate).toBeNull();
+  expect(changed.git.dirty).toBe(true);
   const other = invoke(root, ['ensure', '--stdin'], {
     requirement: { ...requirement, key: 'new-issue' },
     plan: {
@@ -367,6 +424,16 @@ it('retains the change key and task across a PRD directory move and rejects a si
     plan: { scope: [movedCard], nextAction: 'Continue the same repair at its current path.' },
   });
   expect(reconciled.status, reconciled.output).toBe(0);
+  expect(invoke(root, ['sync', original.task.id, 'Uncommitted move']).output).toContain(
+    'WORK_CANDIDATE',
+  );
+  for (const args of [
+    ['config', 'user.name', 'Fixture'],
+    ['config', 'user.email', 'fixture@example.test'],
+    ['add', '-A'],
+    ['commit', '-q', '-m', 'Move the registered source'],
+  ])
+    expect(spawnSync('git', args, { cwd: root }).status).toBe(0);
   expect(invoke(root, ['sync', original.task.id, 'Reviewed moved sources and scope']).status).toBe(
     0,
   );

@@ -1,316 +1,319 @@
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, expect, it } from 'vitest';
-import { matchingEvidence } from '../../scripts/harness/work/reports.ts';
-import { observe } from '../../scripts/harness/work/verification-proof.ts';
-import { refKey } from '../../scripts/harness/work/verification-format.ts';
+import { expect, it } from 'vitest';
+import { digest } from '../../scripts/harness/work/records.ts';
+import type { Candidate } from '../../scripts/harness/work/records.ts';
 import {
   check,
+  cloneFixture,
+  commit,
   create,
   fixture,
-  fullCommand,
-  inspect,
+  git,
   invoke,
   ok,
-  record,
-  ref,
-  run,
   state,
+  verifyReady,
 } from './fixtures/verification-fixture.ts';
 
-const scratch: string[] = [];
-async function setup() {
-  const root = await fixture();
-  scratch.push(root);
-  return root;
+const checks = (root: string, id: string) =>
+  check(root, id).evidence.find((entry: { criterion: string }) => entry.criterion === 'checks');
+
+function evidenceDraft(root: string, id: string, criterion: string, language: string) {
+  let text = '';
+  let args = ['read', id, 'evidence-draft', criterion, '--limit', '256'];
+  let paged = false;
+  for (;;) {
+    const page = JSON.parse(ok(root, args));
+    text += page.text;
+    if (!page.page.next) break;
+    args = page.page.next.argv;
+    expect(args.slice(0, 4)).toEqual(['read', id, 'evidence-draft', criterion]);
+    paged = true;
+  }
+  expect(paged).toBe(true);
+  const match = text.match(new RegExp('```' + language + '\\n([\\s\\S]*?)```'));
+  if (!match) throw new Error('Missing evidence draft block');
+  return JSON.parse(match[1]!);
 }
-afterEach(async () => {
-  await Promise.all(scratch.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
 
-it('runs once for four different tasks and uses the same resolver for assessment and delivery', async () => {
-  const root = await setup();
-  const ids = Array.from({ length: 4 }, (_, i) => create(root, `task-${i}`));
-  const baseline = await run(root, ids[0]!);
-  expect(baseline.status, baseline.output).toBe(0);
-  for (const id of ids.slice(1)) {
-    const reused = record(root, id, baseline.ref);
-    expect(reused.status, reused.output).toBe(0);
-    expect(check(root, id)).toMatchObject({ result: 'pass', basis: 'reuse' });
+async function writeOriginal(root: string, id: string, language: string, report: unknown) {
+  const path = `.work/tasks/${id}/evidence/contract-collision.md`;
+  await mkdir(join(root, `.work/tasks/${id}/evidence`), { recursive: true });
+  await writeFile(join(root, path), `\`\`\`${language}\n${JSON.stringify(report)}\n\`\`\`\n`);
+  return path;
+}
+
+it('rejects coverage copied between different tasks even when commit and revision coincide', async () => {
+  const root = await fixture();
+  const a = create(root, 'contract-a');
+  const b = create(root, 'contract-b');
+  verifyReady(root, a);
+  verifyReady(root, b);
+  const first = await state(root, a);
+  const second = await state(root, b);
+  expect(first.checkpoint!.candidate).toEqual(second.checkpoint!.candidate);
+  const report = evidenceDraft(root, a, 'checks', 'mio-coverage');
+  expect(report).toMatchObject({
+    candidate: first.checkpoint!.candidate,
+    result: 'pending',
+    executionCount: 0,
+  });
+  const pathA = await writeOriginal(root, a, 'mio-coverage', { ...report, result: 'pass' });
+  expect(invoke(root, ['evidence', a, 'checks', pathA, 'Incomplete draft.']).status).toBe(1);
+  Object.assign(report, {
+    reviewer: 'Fixture reviewer',
+    source: 'Reviewed fixture source',
+    scope: 'Entire fixture check',
+    environment: 'Isolated fixture',
+    uncovered: 'None',
+    assessment: 'Fixture coverage reviewed.',
+    result: 'pass',
+  });
+  const oldReport = { ...report };
+  delete oldReport.contract;
+  await writeOriginal(root, a, 'mio-coverage', oldReport);
+  expect(
+    invoke(root, ['evidence', a, 'checks', pathA, 'Original without contract.']).output,
+  ).toContain('WORK_EVIDENCE_CONTRACT');
+  await writeOriginal(root, a, 'mio-coverage', report);
+  ok(root, ['evidence', a, 'checks', pathA, 'Reviewed fixture coverage.']);
+  expect(checks(root, a).result).toBe('pass');
+  const pathB = await writeOriginal(root, b, 'mio-coverage', report);
+  expect(
+    invoke(root, ['evidence', b, 'checks', pathB, 'Attempt reused observation.']).output,
+  ).toContain('WORK_EVIDENCE_CONTRACT');
+  const forged = await state(root, b);
+  const original = (await state(root, a)).evidence.at(-1)!;
+  forged.evidence.push({ ...original, artifact: pathB });
+  await writeFile(join(root, `.work/tasks/${b}/state.json`), JSON.stringify(forged));
+  expect(checks(root, b).result).toBe('invalid');
+}, 30000);
+
+it('rejects a manual original from a different contract at the same task id and revision', async () => {
+  const a = await fixture();
+  const b = await cloneFixture(a);
+  const id = create(a, 'same-task');
+  expect(create(b, 'same-task')).toBe(id);
+  for (const [root, goal] of [
+    [a, 'First contract'],
+    [b, 'Second contract'],
+  ] as const) {
     const task = await state(root, id);
-    expect(task.plan.nextAction).toBe(
-      'Review remaining criteria and current originals; verification reuse does not grant human acceptance.',
-    );
-    await observe(root, ref(id, task.evidence.at(-1)!));
-    expect(await matchingEvidence(root, task, task.checkpoint!.candidate)).toHaveLength(1);
-  }
-  expect(await readFile(join(root, '.work/count'), 'utf8')).toBe('full\n');
-});
-
-it('composes two successive local changes without running the full command again', async () => {
-  const root = await setup();
-  const id = create(root);
-  let baseline = (await run(root, id)).ref;
-  for (const value of [2, 3]) {
-    await writeFile(join(root, 'src/value.ts'), `export const value = ${value};\n`);
-    ok(root, ['sync', id, 'Reviewed the changed value and its only consumer.']);
-    const rerun = await run(
-      root,
-      id,
-      `if(!require('node:fs').readFileSync('src/value.ts','utf8').includes('= ${value}'))process.exit(1)`,
-    );
-    const result = record(root, id, baseline, {
-      mode: 'incremental',
-      runs: [rerun.ref],
-      impact: [
-        {
-          path: 'src/value.ts',
-          disposition: 'retest',
-          reason: 'Only exported value changes; verify its consumer.',
-          runs: [rerun.ref],
-        },
-      ],
-    });
-    expect(result.status, result.output).toBe(0);
-    expect(check(root, id).result).toBe('pass');
-    baseline = ref(id, (await state(root, id)).evidence.at(-1)!);
-  }
-  expect(await readFile(join(root, '.work/count'), 'utf8')).toBe('full\n');
-});
-
-it.each([
-  ['same task', 'none'],
-  ['another task', 'none'],
-  ['another task', 'source failure'],
-  ['another task', 'damaged original'],
-])('uses scoped receipts across unrelated changes (%s, %s)', async (owner, damage) => {
-  const root = await setup();
-  const source = create(root);
-  const baseline = await run(root, source);
-  expect(baseline.status, baseline.output).toBe(0);
-  const script = "require('node:fs').appendFileSync('.work/count','probe\\n')";
-  const command = [process.execPath, '-e', script];
-  const original = await run(root, source, script);
-  expect(original.status, original.output).toBe(0);
-  const bytes = await readFile(join(root, (await state(root, source)).evidence.at(-1)!.artifact));
-  const scoped = owner === 'same task' ? source : create(root, 'scoped', command);
-  const criterion = owner === 'same task' ? 'scoped' : 'checks';
-  if (owner === 'same task') {
-    const current = JSON.parse(ok(root, ['context', source, 'resume']));
-    ok(root, ['update', source, '--stdin'], {
-      revision: current.revision,
-      reason: 'Declare the actual supplemental command without narrowing full checks.',
+    ok(root, ['update', id, '--stdin'], {
+      revision: task.revision,
+      reason: 'Define the local observed behavior.',
       plan: {
+        goal,
         acceptance: [
-          {
-            id: 'checks',
-            method: 'automated',
-            criterion: 'Full fixture check',
-            command: fullCommand,
-          },
-          { id: criterion, method: 'automated', criterion: 'Focused fixture check', command },
+          ...task.plan.acceptance,
+          { id: 'observed', criterion: 'Review behavior.', method: 'behavior' },
         ],
       },
     });
+    verifyReady(root, id);
   }
-  await writeFile(join(root, 'src/stable.ts'), 'export const stable = false;\n');
-  for (const id of new Set([source, scoped]))
-    ok(root, ['sync', id, 'Reviewed an unrelated stable input; the focused command is unchanged.']);
-  const retained = record(
-    root,
-    scoped,
-    original.ref,
-    {
-      mode: 'incremental',
-      impact: [
-        {
-          path: 'src/stable.ts',
-          disposition: 'retain',
-          reason: 'The focused command reads Node builtins and its counter only.',
-          runs: [],
-        },
-      ],
-    },
-    criterion,
-  );
-  expect(retained.status, retained.output).toBe(0);
-  const scopedRef = ref(scoped, (await state(root, scoped)).evidence.at(-1)!);
-  const combined = record(root, source, baseline.ref, {
-    mode: 'incremental',
-    runs: [scopedRef],
-    impact: [
-      {
-        path: 'src/stable.ts',
-        disposition: 'retest',
-        reason: 'The current scoped receipt retains the actual focused observation.',
-        runs: [scopedRef],
-      },
-    ],
+  const first = await state(a, id);
+  const second = await state(b, id);
+  expect(first.checkpoint!.candidate).toEqual(second.checkpoint!.candidate);
+  expect(first.contractRevision).toBe(1);
+  const report = evidenceDraft(a, id, 'observed', 'mio-evidence');
+  const pathA = await writeOriginal(a, id, 'mio-evidence', { ...report, result: 'pass' });
+  expect(invoke(a, ['evidence', id, 'observed', pathA, 'Incomplete observation.']).status).toBe(1);
+  report.observation = 'Inspected the fixture behavior.';
+  report.result = 'pass';
+  report.contract = Object.fromEntries(Object.entries(report.contract).reverse());
+  await writeOriginal(a, id, 'mio-evidence', report);
+  ok(a, ['evidence', id, 'observed', pathA, 'Reviewed behavior.']);
+  const pathB = await writeOriginal(b, id, 'mio-evidence', report);
+  expect(
+    invoke(b, ['evidence', id, 'observed', pathB, 'Attempt reused observation.']).output,
+  ).toContain('WORK_EVIDENCE_CONTRACT');
+  const forged = await state(b, id);
+  forged.evidence.push({ ...(await state(a, id)).evidence.at(-1)!, artifact: pathB });
+  await writeFile(join(b, `.work/tasks/${id}/state.json`), JSON.stringify(forged));
+  expect(
+    check(b, id).evidence.find((entry: { criterion: string }) => entry.criterion === 'observed')
+      .result,
+  ).toBe('invalid');
+}, 30000);
+
+it('allows dirty implementation but refuses to sync or collect formal evidence', async () => {
+  const root = await fixture();
+  await writeFile(join(root, 'new-untracked.txt'), 'unfinished\n');
+  const id = create(root);
+  const implementation = JSON.parse(ok(root, ['context', id, 'implement']));
+  expect(implementation.task.stage).toBe('C1_IMPLEMENTATION');
+  expect(implementation.assessment.git.dirty).toBe(true);
+  expect(implementation.assessment.candidate).toBeNull();
+  expect(invoke(root, ['sync', id, 'Inspect dirty changes.']).output).toContain('WORK_CANDIDATE');
+  git(root, ['add', 'new-untracked.txt']);
+  expect(invoke(root, ['sync', id, 'Inspect staged changes.']).output).toContain('WORK_CANDIDATE');
+  const context = JSON.parse(ok(root, ['context', id, 'verify']));
+  ok(root, ['update', id, '--stdin'], {
+    revision: context.revision,
+    reason: 'Fixture attempts evidence on a dirty tree.',
+    stage: 'C1_EVIDENCE_PENDING',
+    plan: { nextAction: 'Attempt checks.' },
   });
-  expect(combined.status, combined.output).toBe(0);
-  expect(check(root, source)).toMatchObject({ result: 'pass', basis: 'incremental' });
-  expect(JSON.parse(ok(root, ['context', source, 'resume'])).assessment.evidence[0].result).toBe(
-    'pass',
-  );
-  const task = await state(root, source);
-  await matchingEvidence(root, task, task.checkpoint!.candidate);
-  expect(task.evidence.at(-1)!.summary).toContain('1 supplemental observations');
-  expect(await readFile(join(root, '.work/count'), 'utf8')).toBe('full\nprobe\n');
-  const originalEntry = task.evidence.find((entry) => entry.sha256 === original.ref.sha256)!;
-  expect(await readFile(join(root, originalEntry.artifact))).toEqual(bytes);
-  if (damage === 'source failure') await run(root, scoped, 'process.exit(1)');
-  if (damage === 'damaged original') await writeFile(join(root, originalEntry.artifact), 'damaged');
-  if (damage !== 'none') {
-    expect(check(root, source).result).not.toBe('pass');
-    await expect(matchingEvidence(root, task, task.checkpoint!.candidate)).rejects.toThrow(
-      'WORK_DELIVERY_EVIDENCE',
-    );
-  }
+  expect(invoke(root, ['run', id, 'checks']).output).toContain('WORK_CANDIDATE');
+  expect((await state(root, id)).evidence).toEqual([]);
 });
 
-it.each(['modify', 'add', 'delete'])(
-  'rejects omitted %s inputs and direct reuse after drift',
-  async (change) => {
-    const root = await setup();
+it('rejects private C1 scope or inputs without saving, while allowing a planned new file', async () => {
+  const root = await fixture();
+  await writeFile(join(root, 'new-untracked.txt'), 'unfinished\n');
+  const id = create(root);
+  const path = join(root, `.work/tasks/${id}/state.json`);
+  const before = await readFile(path, 'utf8');
+  const revision = (await state(root, id)).revision;
+  for (const plan of [{ scope: ['.work'] }, { inputs: ['.work'] }]) {
+    const result = invoke(root, ['update', id, '--stdin'], {
+      revision,
+      reason: 'Attempt a private implementation boundary.',
+      stage: 'C1_IMPLEMENTATION',
+      plan: { ...plan, nextAction: 'Continue implementation.' },
+    });
+    expect(result.output).toContain('WORK_PRIVATE');
+    expect(await readFile(path, 'utf8')).toBe(before);
+    expect((await state(root, id)).revision).toBe(revision);
+  }
+  const allowed = invoke(root, ['update', id, '--stdin'], {
+    revision,
+    reason: 'Declare a planned public source.',
+    stage: 'C1_IMPLEMENTATION',
+    plan: { scope: ['src/planned.ts'], nextAction: 'Implement the planned file.' },
+  });
+  expect(allowed.status, allowed.output).toBe(0);
+});
+
+it('does not bind an ignored declared source that is absent from the clean commit', async () => {
+  const root = await fixture();
+  await writeFile(join(root, '.gitignore'), '.work/\ndocs/ignored.md\n');
+  commit(root, 'Ignore a fixture document');
+  await writeFile(join(root, 'docs/ignored.md'), '# Ignored\n');
+  const id = create(root);
+  const current = JSON.parse(ok(root, ['context', id, 'implement']));
+  expect(current.assessment.git.dirty).toBe(false);
+  ok(root, ['update', id, '--stdin'], {
+    revision: current.revision,
+    reason: 'Declare a source that exists only in the worktree.',
+    plan: { sources: ['docs/api.md', 'docs/ignored.md'] },
+  });
+  expect(invoke(root, ['sync', id, 'Attempt to bind the ignored source.']).output).toContain(
+    'WORK_INPUT_UNCOMMITTED: docs/ignored.md',
+  );
+  expect((await state(root, id)).checkpoint).toBeNull();
+});
+
+it('keeps historical strings and originals without treating an old head as a current candidate', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const original = task.evidence.at(-1)!;
+  const bytes = await readFile(join(root, original.artifact));
+  const historical = 'a'.repeat(64);
+  task.checkpoint = { candidate: historical, head: git(root, ['rev-parse', 'HEAD']) };
+  task.evidence = task.evidence.map((entry) => ({ ...entry, candidate: historical }));
+  await writeFile(join(root, `.work/tasks/${id}/state.json`), JSON.stringify(task));
+  expect(checks(root, id).result).toBe('pending');
+  ok(root, ['sync', id, 'Bind the clean commit as a new candidate.']);
+  const current = await state(root, id);
+  expect(current.checkpoint?.candidate).toEqual({
+    commit: git(root, ['rev-parse', 'HEAD']),
+    contractRevision: current.contractRevision,
+  });
+  expect(current.evidence.every((entry) => entry.candidate === historical)).toBe(true);
+  expect(await readFile(join(root, original.artifact))).toEqual(bytes);
+  expect(checks(root, id).result).toBe('pending');
+});
+
+it('does not revive evidence after a contract changes from A to B and back to A', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  expect(checks(root, id).result).toBe('pass');
+  const before = await state(root, id);
+  const originalGoal = before.plan.goal;
+  for (const goal of ['Different agreed goal', originalGoal]) {
+    const context = JSON.parse(ok(root, ['context', id, 'resume']));
+    ok(root, ['update', id, '--stdin'], {
+      revision: context.revision,
+      reason: 'Change the fixture contract.',
+      plan: { goal },
+    });
+    ok(root, ['sync', id, 'Bind the changed contract to the clean commit.']);
+  }
+  const after = await state(root, id);
+  expect(after.contractRevision).toBe((before.contractRevision ?? 0) + 2);
+  expect(after.evidence).toEqual(before.evidence);
+  expect(checks(root, id).result).toBe('pending');
+});
+
+it('keeps failures despite later passing supplements until a new complete execution', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  expect(checks(root, id).result).toBe('pass');
+  expect(
+    invoke(root, ['run', id, 'checks', '--', process.execPath, '-e', 'process.exit(4)']).status,
+  ).toBe(1);
+  ok(root, ['run', id, 'checks', '--', process.execPath, '-e', 'process.exit(0)']);
+  expect(checks(root, id).result).toBe('fail');
+  const before = await state(root, id);
+  ok(root, ['run', id, 'checks']);
+  expect(checks(root, id).result).toBe('pass');
+  expect((await state(root, id)).evidence.slice(0, before.evidence.length)).toEqual(
+    before.evidence,
+  );
+});
+
+it.each(['dirty', 'head'])(
+  'keeps an otherwise successful execution pending after persistent %s drift',
+  async (kind) => {
+    const root = await fixture();
     const id = create(root);
-    const baseline = (await run(root, id)).ref;
-    if (change === 'delete') await rm(join(root, 'src/value.ts'));
-    else
-      await writeFile(
-        join(root, change === 'add' ? 'src/new.ts' : 'src/value.ts'),
-        'export const value = 2;',
-      );
-    ok(root, ['sync', id, 'Reviewed input delta.']);
-    expect(record(root, id, baseline).output).toContain('WORK_VERIFY_INPUTS');
-    expect(record(root, id, baseline, { mode: 'incremental' }).output).toContain(
-      'WORK_VERIFY_COVERAGE',
+    verifyReady(root, id);
+    const head = git(root, ['rev-parse', 'HEAD']);
+    ok(root, ['run', id, 'checks']);
+    const script =
+      kind === 'dirty'
+        ? 'require("node:fs").writeFileSync("src/value.ts","export const value = 2;\\n")'
+        : 'require("node:child_process").execFileSync("git",["commit","--allow-empty","-qm","moved"])';
+    expect(invoke(root, ['run', id, 'checks', '--', process.execPath, '-e', script]).status).toBe(
+      1,
     );
+    const observation = (await state(root, id)).evidence.at(-1)!;
+    expect(observation.result).toBe('pending');
+    const log = await readFile(join(root, observation.artifact));
+    expect(digest(log)).toBe(observation.sha256);
+    expect(log.toString()).toContain('"contextChanged": true');
+    if (kind === 'dirty') git(root, ['restore', 'src/value.ts']);
+    else git(root, ['checkout', '-q', '--detach', head]);
+    expect(checks(root, id).result).toBe('pending');
   },
 );
 
-it('keeps failures until an explicit reviewed resolution binds an actual rerun', async () => {
-  const root = await setup();
+it('records the actual command, contract, environment and settled outcome', async () => {
+  const root = await fixture();
   const id = create(root);
-  const baseline = (await run(root, id)).ref;
-  const failure = await run(root, id, 'process.exit(2)');
-  const recovery = await run(root, id, 'console.log("recovered")');
-  expect(check(root, id).result).toBe('fail');
-  expect(record(root, id, baseline).output).toContain('WORK_VERIFY_ISSUES');
-  const result = record(root, id, baseline, {
-    mode: 'incremental',
-    runs: [recovery.ref],
-    resolves: [
-      {
-        issue: failure.ref,
-        reason: 'Reproduced transient fixture failure and verified the repaired boundary.',
-        runs: [recovery.ref],
-      },
-    ],
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks', '--stdin'], {
+    conditions: { dependencies: 'Node builtins', configuration: 'fixture', external: 'none' },
   });
-  expect(result.status, result.output).toBe(0);
-  expect(check(root, id).result).toBe('pass');
-  expect((await state(root, id)).evidence.map((entry) => entry.result)).toEqual([
-    'pass',
-    'fail',
-    'pass',
-    'pass',
-  ]);
-});
-
-it('revokes reused conclusions when a source records a later failure', async () => {
-  const root = await setup();
-  const source = create(root);
-  const target = create(root, 'target');
-  const baseline = (await run(root, source)).ref;
-  expect(record(root, target, baseline).status).toBe(0);
-  await run(root, source, 'process.exit(3)');
-  expect(check(root, target).result).not.toBe('pass');
-  const task = await state(root, target);
-  await expect(matchingEvidence(root, task, task.checkpoint!.candidate)).rejects.toThrow(
-    'WORK_DELIVERY_EVIDENCE',
-  );
-});
-
-it.each(['missing', 'corrupt'])('rejects %s originals after registration', async (damage) => {
-  const root = await setup();
-  const source = create(root);
-  const target = create(root, 'target');
-  const baseline = (await run(root, source)).ref;
-  expect(record(root, target, baseline).status).toBe(0);
-  const original = (await state(root, source)).evidence[0]!;
-  if (damage === 'missing') await rm(join(root, original.artifact));
-  else await writeFile(join(root, original.artifact), 'changed original');
-  expect(check(root, target).result).not.toBe('pass');
-});
-
-it('requires a matching environment, unchanged request revision and exclusive target writer', async () => {
-  const root = await setup();
-  const source = create(root);
-  const target = create(root, 'target');
-  const baseline = (await run(root, source)).ref;
-  expect(
-    record(root, target, baseline, {
-      environment: { identity: 'other runtime', reason: 'Not comparable' },
-    }).output,
-  ).toContain('WORK_VERIFY_ENVIRONMENT');
-  expect(record(root, target, baseline, { revision: 'stale' }).output).toContain(
-    'WORK_VERIFY_STALE',
-  );
-  await writeFile(join(root, `.work/tasks/${target}.command.json`), '{"pid":0,"command":"run"}');
-  expect(inspect(root, target, baseline).changed).toEqual([]);
-  expect(record(root, target, baseline).output).toContain('WORK_BUSY');
-});
-
-it('rejects a supplemental-only baseline and a changed declared command', async () => {
-  const root = await setup();
-  const source = create(root);
-  const target = create(root, 'target');
-  const partial = (await run(root, source, 'console.log("partial")')).ref;
-  expect(record(root, target, partial).output).toContain('WORK_VERIFY_COMMAND');
-  const baseline = (await run(root, source)).ref;
-  const current = JSON.parse(ok(root, ['context', target, 'resume']));
-  ok(root, ['update', target, '--stdin'], {
-    revision: current.revision,
-    reason: 'Fixture changes the required check',
-    plan: {
-      acceptance: [
-        {
-          id: 'checks',
-          method: 'automated',
-          criterion: 'Different required check',
-          command: [process.execPath, '-e', 'console.log("different")'],
-        },
-      ],
-    },
-  });
-  ok(root, ['sync', target, 'Reviewed required command change']);
-  expect(record(root, target, baseline).output).toContain('WORK_VERIFY_COMMAND');
-});
-
-it('retains read-only inspect and fails closed for cycles and active source writers', async () => {
-  const root = await setup();
-  const source = create(root);
-  const target = create(root, 'target');
-  const baseline = (await run(root, source)).ref;
-  const before = JSON.stringify(await state(root, target));
-  inspect(root, target, baseline);
-  expect(JSON.stringify(await state(root, target))).toBe(before);
-  await expect(observe(root, baseline, undefined, new Set([refKey(baseline)]))).rejects.toThrow(
-    'WORK_VERIFY_CYCLE',
-  );
-  await writeFile(join(root, `.work/tasks/${source}.command.json`), '{"pid":0,"command":"run"}');
-  expect(record(root, target, baseline).output).toContain('WORK_VERIFY_BUSY');
-});
-
-it('requires a new reviewed conclusion after candidate changes', async () => {
-  const root = await setup();
-  const id = create(root);
-  const baseline = (await run(root, id)).ref;
-  expect(record(root, id, baseline).status).toBe(0);
-  await writeFile(join(root, 'src/value.ts'), 'export const value = 4;');
-  ok(root, ['sync', id, 'Reviewed new input']);
-  expect(check(root, id).result).toBe('pending');
-  expect(
-    invoke(root, ['verify', id, 'checks', '--stdin'], { action: 'record', baseline }).status,
-  ).toBe(1);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const log = await readFile(join(root, entry.artifact), 'utf8');
+  const end = log.indexOf('\n}\n');
+  const header = JSON.parse(log.slice(0, end + 2));
+  expect(header.candidate).toEqual(task.checkpoint!.candidate as Candidate);
+  expect(header.contract.goal).toBe(task.plan.goal);
+  expect(header.environment.conditions.external).toBe('none');
+  expect(log).toContain('"exitCode": 0');
+  expect(log).toContain('"cancelled": false');
+  expect(checks(root, id)).toMatchObject({ result: 'pass', basis: 'execution', executionCount: 1 });
 });

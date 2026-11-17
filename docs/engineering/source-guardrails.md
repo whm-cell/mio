@@ -14,9 +14,9 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 已登记的 TS 文件还必须进入类型检查配置；生产 TS 必须同时进入构建配置。新增根目录仅登记归属不足以通过，检查器会对账编译器实际匹配的文件集合。
 
-源码根中的 Markdown 须显式进入 `documentRoots`，例如 `tests/README.md`；它仍参与文档链接核对与候选摘要。该文档声明不豁免其他扩展名，也不代替 TS 分类与编译覆盖。
+源码根中的 Markdown 须显式进入 `documentRoots`，例如 `tests/README.md`；它仍参与文档链接核对。正式候选是干净的 Git 提交与任务契约修订号。该文档声明不豁免其他扩展名，也不代替 TS 分类与编译覆盖。
 
-私有 `.env` / `.env.*` 不进入源码清单或任务候选。唯一例外是仓库根的公开 `.env.example`：须在 `configurationFiles` 登记，参与候选摘要，且不能是符号链接；模板只放占位值，真实秘密留在忽略的私有文件。
+私有 `.env` / `.env.*` 不得进入源码清单或 Git 提交。唯一例外是仓库根的公开 `.env.example`：须在 `configurationFiles` 登记，且不能是符号链接；模板只放占位值，真实秘密留在忽略的私有文件。
 
 多项目使用 `harness.config.json` 的 `projects` 具名对象：每项声明 `kind`（`service`、`contract` 或 `library`）、`packageRoot`、`sources`、`typecheck` 和 `build`。根服务的 `packageRoot` 为 `.`，且现有 `src` 只能归属根服务；其他生产根须在 `sourceRoots` 中登记并唯一分配给一个项目。项目的配置路径各自独立，源码根不得重叠，也不得与生成或私有排除路径重叠；未知 role、重复 JSON 键、越界路径及未声明的生成目录显式失败。未配置 `projects` 时仅支持现有 `src` 单生产根，不因出现第二个目录自动推断项目。
 

@@ -1,7 +1,8 @@
 import { beneath } from '../inventory.ts';
 import type { HarnessConfig } from '../inventory.ts';
-import type { TaskPlan } from './records.ts';
-import { hashField, metadata, record, textField } from './reports.ts';
+import { candidateRef, contractPlan, json, sameCandidate } from './records.ts';
+import type { Candidate, Task, TaskPlan } from './records.ts';
+import { record, textField } from './report-format.ts';
 
 export const qualityCriterion = {
   id: 'quality-review',
@@ -28,13 +29,26 @@ export function registerQualityReview(plan: TaskPlan, config: HarnessConfig): vo
     plan.acceptance = [...plan.acceptance, { ...qualityCriterion }];
 }
 
+export function qualityDraft(task: Task, candidate: Candidate) {
+  const report = {
+    candidate,
+    contract: contractPlan(task),
+    reviewer: '',
+    scope: [],
+    dimensions: Object.fromEntries(
+      ['algorithm', 'unused', 'reuse'].map((name) => [name, { result: 'pending', evidence: '' }]),
+    ),
+    limitations: '',
+  };
+  return `# Quality review: incomplete draft\n\nFill in actual observations before registration.\n\n\`\`\`mio-quality-review\n${json(report)}\`\`\`\n`;
+}
+
 /** Validate a reviewer's original, not the truth or independence of their observations. */
 export function qualityReviewResult(
-  source: string,
-  candidate: string,
+  report: Record<string, unknown>,
+  candidate: Candidate,
 ): 'pass' | 'fail' | 'pending' {
-  const report = record(metadata(source, 'mio-quality-review'));
-  if (hashField(report.candidate) !== candidate)
+  if (!sameCandidate(candidateRef(report.candidate), candidate))
     throw new Error('WORK_QUALITY_EVIDENCE: review candidate mismatch');
   textField(report.reviewer);
   textField(report.limitations);

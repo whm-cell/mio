@@ -1,5 +1,7 @@
+import type { CandidateRef } from '../../../scripts/harness/work/records.ts';
+
 /** Synthetic observations for testing the evidence protocol, never a real source-review verdict. */
-export function reviewFixture(candidate: string) {
+export function reviewFixture(candidate: CandidateRef) {
   return {
     candidate,
     reviewer: 'isolated fixture reviewer',

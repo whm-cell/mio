@@ -7,9 +7,9 @@ import {
   resultDocument,
   taskNavigation,
 } from '../task-documents.ts';
-import { identifier, json } from './records.ts';
-import type { Checkpoint, TaskPlan } from './records.ts';
-import { hashField, metadata, record, textField } from './reports.ts';
+import { candidateRef, contractPlan, identifier, json, sameCandidate } from './records.ts';
+import type { Checkpoint, Task, TaskPlan } from './records.ts';
+import { record, textField } from './report-format.ts';
 
 export const normsCriterion = {
   id: 'norms-review',
@@ -30,16 +30,12 @@ export function registerNormsReview(plan: TaskPlan) {
 export async function normsIssues(
   root: string,
   plan: TaskPlan,
-  newWrite = false,
+  required = false,
 ): Promise<string[]> {
-  if (!plan.result && !plan.norms && !newWrite) return [];
+  if (!plan.result && !plan.norms && !required) return [];
   const errors: string[] = [];
   if (!plan.norms)
     errors.push('WORK_NORMS_CONTRACT: use work update to declare plan.norms.paths and reason');
-  else if (newWrite && plan.norms.version !== 2)
-    errors.push(
-      'WORK_NORMS_CONTRACT: use work update to declare plan.norms.version 2 for reconciliation',
-    );
   if (!plan.acceptance.some((item) => item.id === normsCriterion.id && item.method === 'review'))
     errors.push('WORK_NORMS_CONTRACT: register norms-review with method review using work update');
   const catalog = await documentCatalog(root);
@@ -62,19 +58,14 @@ function result(value: unknown): 'pass' | 'fail' | 'pending' {
   return value as 'pass' | 'fail' | 'pending';
 }
 
-function pages(value: unknown, paths: string[], current: Checkpoint, outcomes?: string[]) {
+function pages(value: unknown, paths: string[], outcomes?: string[]) {
   if (!Array.isArray(value) || value.length !== paths.length)
     throw new Error('WORK_NORMS_EVIDENCE: observations for every declared page required');
   const expected = new Set(paths);
   for (const entry of value) {
     const observation = record(entry);
     const path = textField(observation.path);
-    if (
-      !expected.delete(path) ||
-      !current.files[path] ||
-      observation.sha256 !== current.files[path]
-    )
-      throw new Error('WORK_NORMS_EVIDENCE: page hash/path mismatch');
+    if (!expected.delete(path)) throw new Error('WORK_NORMS_EVIDENCE: page path mismatch');
     textField(observation.assessment);
     if (outcomes) outcomes.push(result(observation.result));
   }
@@ -103,22 +94,23 @@ function requirementPages(plan: TaskPlan, catalog: Awaited<ReturnType<typeof doc
 }
 
 /** A read-only starting point; empty observations cannot be registered as a completed review. */
-export async function normsDraft(root: string, plan: TaskPlan, current: Checkpoint) {
+export async function normsDraft(root: string, task: Task, current: Checkpoint) {
+  const plan = task.plan;
   const catalog = await documentCatalog(root);
   const sourcePages = requirementPages(plan, catalog);
   const report = {
     version: 2,
     candidate: current.candidate,
+    contract: contractPlan(task),
     reviewer: '',
     reason: plan.norms!.reason,
     requirements: {
       result: 'pending',
       assessment: '',
-      documents: sourcePages.map((path) => ({ path, sha256: current.files[path], assessment: '' })),
+      documents: sourcePages.map((path) => ({ path, assessment: '' })),
     },
     documents: plan.norms!.paths.map((path) => ({
       path,
-      sha256: current.files[path],
       result: 'pending',
       assessment: '',
     })),
@@ -133,55 +125,49 @@ export async function normsDraft(root: string, plan: TaskPlan, current: Checkpoi
 /** The operator supplies real observations; the CLI checks binding and shape, never accepted-state truth. */
 export async function normsReviewResult(
   root: string,
-  source: string,
+  report: Record<string, unknown>,
   plan: TaskPlan,
   current: Checkpoint,
 ) {
-  const report = record(metadata(source, 'mio-norms-review'));
-  if (report.candidate !== current.candidate || !plan.norms || report.reason !== plan.norms.reason)
+  if (
+    !sameCandidate(candidateRef(report.candidate), current.candidate) ||
+    !plan.norms ||
+    report.reason !== plan.norms.reason
+  )
     throw new Error('WORK_NORMS_EVIDENCE: candidate or declaration mismatch');
   textField(report.reviewer);
   textField(report.limitations);
   const outcomes: string[] = [];
-  pages(
-    report.documents,
-    plan.norms.paths,
-    current,
-    plan.norms.version === 2 ? outcomes : undefined,
-  );
+  pages(report.documents, plan.norms.paths, outcomes);
   const conclusion = record(report.conclusion);
   const overall = result(conclusion.result);
   textField(conclusion.evidence);
-  if (plan.norms.version === 2) {
-    if (report.version !== 2)
-      throw new Error('WORK_NORMS_EVIDENCE: version 2 reconciliation original required');
-    const catalog = await documentCatalog(root);
-    const requirements = record(report.requirements);
-    textField(requirements.assessment);
-    outcomes.push(result(requirements.result));
-    pages(requirements.documents, requirementPages(plan, catalog), current);
-    const accepted = record(report.accepted);
-    textField(accepted.assessment);
-    outcomes.push(result(accepted.result));
-    if (!Array.isArray(accepted.results))
-      throw new Error(
-        'WORK_NORMS_EVIDENCE: reviewed accepted results or an explicit empty set required',
-      );
-    for (const value of accepted.results) {
-      const observed = record(value);
-      resolvePrd(textField(observed.prd), catalog);
-      identifier(textField(observed.key));
-      hashField(observed.candidate);
-      textField(observed.assessment);
-    }
-    textField(report.remaining);
-    const derived = outcomes.includes('fail')
-      ? 'fail'
-      : outcomes.includes('pending')
-        ? 'pending'
-        : 'pass';
-    if (overall !== derived)
-      throw new Error('WORK_NORMS_EVIDENCE: conclusion disagrees with reconciliation observations');
+  const catalog = await documentCatalog(root);
+  const requirements = record(report.requirements);
+  textField(requirements.assessment);
+  outcomes.push(result(requirements.result));
+  pages(requirements.documents, requirementPages(plan, catalog));
+  const accepted = record(report.accepted);
+  textField(accepted.assessment);
+  outcomes.push(result(accepted.result));
+  if (!Array.isArray(accepted.results))
+    throw new Error(
+      'WORK_NORMS_EVIDENCE: reviewed accepted results or an explicit empty set required',
+    );
+  for (const value of accepted.results) {
+    const observed = record(value);
+    resolvePrd(textField(observed.prd), catalog);
+    identifier(textField(observed.key));
+    candidateRef(observed.candidate);
+    textField(observed.assessment);
   }
+  textField(report.remaining);
+  const derived = outcomes.includes('fail')
+    ? 'fail'
+    : outcomes.includes('pending')
+      ? 'pending'
+      : 'pass';
+  if (overall !== derived)
+    throw new Error('WORK_NORMS_EVIDENCE: conclusion disagrees with reconciliation observations');
   return overall;
 }

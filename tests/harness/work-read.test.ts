@@ -56,6 +56,13 @@ async function fixture() {
     await cp(join(project, file), join(root, file));
   }
   expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root }).status).toBe(0);
+  for (const args of [
+    ['config', 'user.name', 'Fixture'],
+    ['config', 'user.email', 'fixture@example.test'],
+    ['add', '-A'],
+    ['commit', '-q', '-m', 'Initial fixture'],
+  ])
+    expect(spawnSync('git', args, { cwd: root }).status).toBe(0);
   expect(invoke(root, ['init', 'alice']).status).toBe(0);
   return root;
 }
@@ -87,7 +94,10 @@ async function ready(root: string, authorization = 'Fixture user authorizes this
   });
   expect(ensured.status, ensured.output).toBe(0);
   const result = ensured.value();
-  return { id: result.task.id as string, result };
+  const id = result.task.id as string;
+  const synced = invoke(root, ['sync', id, 'Reviewed the clean fixture commit and contract.']);
+  expect(synced.status, synced.output).toBe(0);
+  return { id, result: invoke(root, ['context', id, 'resume']).value() };
 }
 
 it('keeps 27, 47 and 227 task listings bounded, searchable and explicitly unassessed', async () => {
@@ -133,7 +143,7 @@ it('keeps 27, 47 and 227 task listings bounded, searchable and explicitly unasse
   ).toBe(true);
 });
 
-it('locates a long task field and rejects stale pages and oversized selectors', async () => {
+it('locates a long task field with bounded pages and rejects oversized selectors', async () => {
   const root = await fixture();
   const goal = '任务𠮷'.repeat(40000);
   const task = draft(root, 'alice', 'long', goal);
@@ -145,28 +155,33 @@ it('locates a long task field and rejects stale pages and oversized selectors', 
   expect(first.page.total).toBe(120000);
   task.plan.goal += 'changed';
   await save(root, task);
-  expect(invoke(root, first.page.next.argv).output).toContain('WORK_READ_STALE');
+  expect(first.page.next.argv).not.toContain('--hash');
+  const next = invoke(root, first.page.next.argv).value();
+  expect(next.page.offset).toBe(1024);
+  expect(next.text).toBe([...task.plan.goal].slice(1024, 2048).join(''));
   expect(
     invoke(root, ['read', 'long', 'task', '--select', `/${'x'.repeat(20000)}`]).output,
   ).toContain('WORK_READ_ARGUMENT');
   expect(invoke(root, ['read', 'long', 'task', '/__proto__']).output).toContain('WORK_READ_SELECT');
 });
 
-it('keeps long manifest path identities readable within the object page budget', async () => {
+it('exposes a committed candidate through bounded task field reads', async () => {
   const root = await fixture();
   const { id } = await ready(root);
   const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
-  const file = `docs/${'segment/'.repeat(40)}file.md`;
-  const sha256 = digest('historical file bytes');
-  task.checkpoint!.files[file] = sha256;
-  task.checkpoint!.candidate = digest(
-    json({ files: task.checkpoint!.files, contract: task.checkpoint!.contract }),
+  const candidate = task.checkpoint!.candidate;
+  expect(candidate).toEqual({
+    commit: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim(),
+    contractRevision: task.contractRevision,
+  });
+  const page = invoke(root, ['read', id, 'task', '/checkpoint/candidate', '--limit', '1']).value();
+  expect(page.entries).toHaveLength(1);
+  expect(page.page.next.argv).not.toContain('--hash');
+  const next = invoke(root, page.page.next.argv).value();
+  expect(next.page.offset).toBe(1);
+  expect(invoke(root, ['read', id, 'task', '/checkpoint/candidate/commit']).value().text).toBe(
+    (candidate as { commit: string }).commit,
   );
-  await save(root, task);
-  const page = invoke(root, ['read', id, 'task', '/checkpoint/files', '--limit', '20']).value();
-  expect(page.entries).toContainEqual({ key: file, value: sha256 });
-  const selected = `/checkpoint/files/${file.replaceAll('/', '~1')}`;
-  expect(invoke(root, ['read', id, 'task', selected]).value().text).toBe(sha256);
 });
 
 it('separates omitted authority from readiness while still blocking late OPEN decisions', async () => {
@@ -195,6 +210,13 @@ it('separates omitted authority from readiness while still blocking late OPEN de
   });
   expect(changed.status, changed.output).toBe(0);
   expect(changed.value().task.nextAction.$read).toBeDefined();
+  const verification = invoke(root, ['update', id, '--stdin'], {
+    revision: changed.value().revision,
+    reason: 'Enter verification before exercising a later blocking decision.',
+    stage: 'C1_EVIDENCE_PENDING',
+    plan: { nextAction: 'Check the actual blocker.' },
+  });
+  expect(verification.status, verification.output).toBe(0);
   const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
   task.plan.decisions = Array.from({ length: 1000 }, (_, index) => ({
     status: index === 999 ? 'OPEN' : 'CONFIRMED',
@@ -210,44 +232,38 @@ it('separates omitted authority from readiness while still blocking late OPEN de
   expect(decision.entries.find((entry: { key: string }) => entry.key === 'status').value).toBe(
     'OPEN',
   );
-  const run = invoke(root, [
-    'exec',
-    id,
-    '--',
-    process.execPath,
-    '-e',
-    'require("node:fs").writeFileSync(".work/unexpected", "executed")',
-  ]);
+  const run = invoke(root, ['run', id, 'checks']);
   expect(run.status).toBe(1);
   expect(run.output).toContain('WORK_BLOCKED');
   await expect(readFile(join(root, '.work/unexpected'))).rejects.toThrow();
 });
 
-it('paginates large current errors and changed-file collections without treating them as pass', async () => {
+it('paginates a large decision collection while preserving an actual blocker', async () => {
   const root = await fixture();
   const { id } = await ready(root);
   const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
-  for (let index = 0; index < 1000; index++)
-    task.checkpoint!.files[`src/removed-${String(index).padStart(4, '0')}-${'x'.repeat(80)}.ts`] =
-      digest('old content');
-  task.checkpoint!.candidate = digest(
-    json({ files: task.checkpoint!.files, contract: task.checkpoint!.contract }),
-  );
+  task.plan.decisions = Array.from({ length: 1000 }, (_, index) => ({
+    status: index === 999 ? 'OPEN' : 'CONFIRMED',
+    text: `Decision ${index}`,
+    source: 'Fixture human request',
+  }));
   await save(root, task);
   const checked = invoke(root, ['check', id]);
   expect(checked.status).toBe(1);
   const assessment = checked.value();
   expect(assessment.ready).toBe(false);
-  expect(assessment.blocking.errors).toBeGreaterThan(0);
-  expect(assessment.errors[0].$read).toBeDefined();
-  const error = invoke(root, assessment.errors[0].$read.argv).value();
-  expect(error.text).toContain('WORK_CONTEXT_CHANGED');
-  const changes = invoke(root, ['read', id, 'check', '/changed']).value();
-  expect(changes.page.total).toBe(1000);
-  expect(changes.items).toHaveLength(10);
-  expect(invoke(root, ['read', id, 'check', '/changed/999']).value().text).toContain(
-    'removed-0999',
-  );
+  expect(assessment.blocking.openDecisions).toBe(1);
+  const decisions = invoke(root, [
+    'read',
+    id,
+    'task',
+    '/plan/decisions',
+    '--offset',
+    '990',
+  ]).value();
+  expect(decisions.page.total).toBe(1000);
+  expect(decisions.items).toHaveLength(10);
+  expect(decisions.items[9].status).toBe('OPEN');
 });
 
 it('keeps a recorded request for changes distinct from a valid execution assessment', async () => {
@@ -434,7 +450,6 @@ it('reads one ledger-bound failed original in exact Unicode segments and reports
   const second = invoke(root, first.page.next.argv).value();
   expect(second.text).toBe([...original].slice(1024, 2048).join(''));
   await writeFile(join(root, task.evidence[0]!.artifact), 'tampered original');
-  expect(invoke(root, second.page.next.argv).output).toContain('WORK_READ_STALE');
   const corrupted = invoke(root, ['read', id, 'evidence', '0']).value();
   expect(corrupted.integrity).toBe('mismatch');
   expect(invoke(root, ['check', id]).value().evidence[0].result).toBe('corrupt');
@@ -466,9 +481,8 @@ it('navigates guides without shared prose and expands only the selected stable s
       '## 验证与接受\nChanged current section.',
     ),
   );
-  expect(
-    invoke(root, ['guide', 'verify', '--section', ref, '--hash', page.page.sha256]).output,
-  ).toContain('WORK_READ_STALE');
+  const refreshed = invoke(root, ['guide', 'verify', '--section', ref]).value();
+  expect(refreshed.ref).toBe(ref);
 });
 
 it('offers testing navigation without prose or records, and shares it with task context', async () => {
@@ -501,7 +515,7 @@ it('offers testing navigation without prose or records, and shares it with task 
   expect(next.status, next.output).toBe(0);
   expect(next.value().page.offset).toBe(1);
   await writeFile(join(root, 'docs/engineering/testing.md'), `${source}\nChanged navigation.\n`);
-  expect(invoke(root, first.page.next.argv).output).toContain('WORK_READ_STALE');
+  expect(invoke(root, first.page.next.argv).status).toBe(0);
 });
 
 it('reports an invalid testing navigation target without breaking unrelated guide actions', async () => {
@@ -577,7 +591,6 @@ it('uses the same finite semantic pages for wide objects, large children and inv
   expect(() => selectValue(source, '/collection/~2')).toThrow('WORK_READ_SELECT');
   const view = finiteOutput(source, (pointer) => ({
     argv: ['read', 'fixture', 'task', '--select', pointer],
-    sha256: digest(json(source)),
   }));
   expect(Buffer.byteLength(json(view))).toBeLessThanOrEqual(outputBytes);
 });

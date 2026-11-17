@@ -28,12 +28,6 @@ export function textField(value: unknown): string {
   return value;
 }
 
-export function hashField(value: unknown): string {
-  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value))
-    throw new Error('WORK_REPORT_FORMAT: expected SHA256');
-  return value;
-}
-
 export function publicText(text: string) {
   if (/\/(?:Users|Volumes|home)\//.test(text) || /(?:^|[\s"'(/])\.work\//m.test(text))
     throw new Error('WORK_DELIVERY_PRIVATE: redact personal paths before sharing');

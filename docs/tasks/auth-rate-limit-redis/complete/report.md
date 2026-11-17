@@ -13,8 +13,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
   "version": 5,
   "prd": "docs/tasks/auth-rate-limit-redis/prd.md",
   "records": {
-    "path": "docs/tasks/auth-rate-limit-redis/complete/records.json",
-    "sha256": "9a754688aed6421e2ce6243aae491959cad5651e59fc0cacc47ff54630d3a2cd"
+    "path": "docs/tasks/auth-rate-limit-redis/complete/records.json"
   }
 }
 ```

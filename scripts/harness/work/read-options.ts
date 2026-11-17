@@ -13,7 +13,7 @@ export function readOptions(args: string[], extraFlags: string[] = []) {
       continue;
     }
     const name = arg.slice(2);
-    if (!['offset', 'limit', 'hash', 'select', ...extraFlags].includes(name))
+    if (!['offset', 'limit', 'select', ...extraFlags].includes(name))
       throw new Error('WORK_READ_OPTIONS: unsupported option');
     const value = args[++index];
     if (value === undefined || value.startsWith('--') || Object.hasOwn(flags, name))
@@ -25,10 +25,7 @@ export function readOptions(args: string[], extraFlags: string[] = []) {
     if (flags[name] !== undefined && !/^(?:0|[1-9]\d{0,8})$/.test(flags[name]!))
       throw new Error('WORK_READ_OPTIONS: offset/limit must be bounded nonnegative integers');
   }
-  if (flags.hash !== undefined && !/^[a-f0-9]{64}$/.test(flags.hash))
-    throw new Error('WORK_READ_OPTIONS: hash must be a SHA-256 digest');
   const options: ReadOptions = { offset: Number(flags.offset ?? 0), select: flags.select ?? '' };
   if (flags.limit !== undefined) options.limit = Number(flags.limit);
-  if (flags.hash !== undefined) options.hash = flags.hash;
   return { positionals, options, flags };
 }

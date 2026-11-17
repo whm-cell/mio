@@ -90,7 +90,7 @@ export async function guide(
       ]),
     };
   }
-  if (options && (options.offset || options.limit !== undefined || options.hash || options.select))
+  if (options && (options.offset || options.limit !== undefined || options.select))
     throw new Error('WORK_GUIDE_SECTION: select one section before paging');
   return {
     action,

@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { watch } from 'node:fs';
-import { lstat, mkdir, open, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
   addEvidence,
@@ -9,7 +8,8 @@ import {
   capture,
   contractIssues,
   environment,
-  inputStamp,
+  requireCandidate,
+  validateInputs,
 } from './context.ts';
 import { handoff, receive } from './handoff.ts';
 import { guide } from './guide.ts';
@@ -28,17 +28,20 @@ import { readPublicResult } from './public-read.ts';
 import { changeCommand } from './change-read.ts';
 import { bookPaths, readBook } from './reports.ts';
 import { runCommand, withTaskCommand } from './command.ts';
-import { verify } from './verification.ts';
-import { captureEnvironment, conditions, environmentStamp } from './verification-environment.ts';
+import { conditions } from './verification-environment.ts';
+import { coverageEvidenceResult, resultMarker } from './evidence.ts';
+import { requirementIssues } from './requirements.ts';
 import type { CommandActivity } from './command.ts';
 import {
   checkedPath,
+  contractPlan,
   digest,
   draft,
   initializeMember,
   json,
   loadTask,
   member,
+  sameCandidate,
   saveTask,
 } from './records.ts';
 
@@ -57,23 +60,22 @@ Agent operates this CLI; the user supplies goals and decisions.
   guide <action> [--section ref]         navigate one action; expand one stable section ref
   context <task> <action>               read current task summary, checks and one action
   read <task> <task|check> [pointer]     page selected record fields or current checks
-  read <task> norms-draft               page an incomplete norms review draft on demand
+  read <task> norms-draft|quality-draft page an incomplete review draft with its candidate
+  read <task> evidence-draft <criterion> page a pending manual or coverage draft
   read <task> evidence <index>          page one ledger-bound original (UTF-8 text)
   read-result <prd> [key] [read options] page a public result without personal records
   changes <prd> [key] [read options]     page change summaries or one card
   changes <prd> --write-index            regenerate that PRD's change index
   check <task>                          read-only context/evidence assessment
-  sync <task> <reason>                  acknowledge inspected changes; retain evidence
+  sync <task> <reason>                  bind the current clean commit and contract
   run <task> <criterion> [-- <argv ...>] capture the declared check or a supplemental probe
     --stdin                            JSON command (optional) and observed conditions
-  verify <task> <criterion> --stdin     inspect or record reviewed reuse/incremental verification
-  exec <task> -- <argv ...>             check C1 before launching an implementation command
-  evidence <task> <criterion> <artifact> <summary>  record the original's result
+  evidence <task> <criterion> <artifact> <summary>  record manual review or coverage original
   handoff <task>                        prepare a local portable Markdown handoff
   receive <shared.md> [result-key]      verify a result/handoff, create this member's draft
   archive <task> <reason>               mark history; retain all files
 Actions: start, resume, implement, verify, deliver, handoff, archive
-Read options: --select /JSON/pointer --offset N --limit N --hash SHA256
+Read options: --select /JSON/pointer --offset N --limit N
 Agent entry: guide start, then ensure --stdin; expand only the current action.`;
 
 async function input() {
@@ -87,10 +89,6 @@ async function main(activity?: CommandActivity) {
   if (!command || command === 'help') return console.log(help);
   // Commands are a repository development tool, never a product-runtime dependency.
   await readFile(await checkedPath(root, 'harness.config.json'));
-  if (command === 'verify') {
-    if (args.length !== 3 || args[2] !== '--stdin') throw new Error(help);
-    return console.log(json(await verify(root, args[0]!, args[1]!, JSON.parse(await input()))));
-  }
   if (command === 'guide') {
     const { positionals, options, flags } = readOptions(args, ['section']);
     if (positionals.length !== 1) throw new Error(help);
@@ -112,7 +110,7 @@ async function main(activity?: CommandActivity) {
         aliases: entry.aliases ?? [],
         registry: entry.registry,
       })),
-      results: issues.length
+      results: issues.some((issue) => !issue.startsWith('WORK_REPORT_DRIFT:'))
         ? []
         : await Promise.all(
             registry.documents
@@ -124,11 +122,15 @@ async function main(activity?: CommandActivity) {
                   registries: registry.registries,
                 };
                 const paths = bookPaths(entry.identity, catalog);
-                const { book, source } = await readBook(root, entry.identity, catalog);
+                const { book, source, recordsSource } = await readBook(
+                  root,
+                  entry.identity,
+                  catalog,
+                );
                 return {
                   prd: entry.identity,
                   report: source === null ? null : paths.report,
-                  records: source === null ? null : paths.records,
+                  records: recordsSource === null ? null : paths.records,
                   keys: book.results.map((result) => result.key),
                   read: ['read-result', entry.identity],
                 };
@@ -138,11 +140,10 @@ async function main(activity?: CommandActivity) {
     };
     console.log(
       json(
-        options.select || options.offset || options.limit !== undefined || options.hash
+        options.select || options.offset || options.limit !== undefined
           ? readPage(source, options, ['documents'])
           : finiteOutput(source, (pointer) => ({
               argv: ['documents', '--select', pointer],
-              sha256: digest(json(source)),
             })),
       ),
     );
@@ -165,12 +166,10 @@ async function main(activity?: CommandActivity) {
   if (command === 'deliver') {
     if (args.length !== 2 || args[1] !== '--stdin') throw new Error(help);
     const result = await deliver(root, args[0]!, await input());
-    const { raw } = await loadTask(root, args[0]!);
     return console.log(
       json(
         finiteOutput(result, () => ({
           argv: ['read', args[0]!, 'task', '--select', '/delivery'],
-          sha256: digest(raw),
         })),
       ),
     );
@@ -184,12 +183,13 @@ async function main(activity?: CommandActivity) {
     const { positionals, options } = readOptions(args);
     if (positionals.length < 2 || positionals.length > 3) throw new Error(help);
     const [id, kind, selected] = positionals;
-    if (kind !== 'evidence' && selected !== undefined) {
+    const indexed = kind === 'evidence' || kind === 'evidence-draft';
+    if (!indexed && selected !== undefined) {
       if (options.select) throw new Error('WORK_READ_SELECT: supply the pointer once');
       options.select = selected;
     }
     return console.log(
-      json(await readTask(root, id!, kind!, options, kind === 'evidence' ? selected : undefined)),
+      json(await readTask(root, id!, kind!, options, indexed ? selected : undefined)),
     );
   }
   if (command === 'read-result') return console.log(json(await readPublicResult(root, args)));
@@ -215,13 +215,13 @@ async function main(activity?: CommandActivity) {
   if (command === 'context') {
     if (args.length !== 2) throw new Error(help);
     const reading = await guide(root, args[1]!);
-    const inspected = await inspectTask(root, task, raw, args[1]!);
+    const inspected = await inspectTask(root, task, args[1]!);
     return console.log(json({ ...inspectionOutput(inspected), ...reading }));
   }
   if (command === 'check') {
     if (args.length !== 1) throw new Error(help);
     const result = await assess(root, task);
-    console.log(json(assessmentOutput(task, result, raw)));
+    console.log(json(assessmentOutput(task, result)));
     if (!result.ready) process.exitCode = 1;
     return;
   }
@@ -231,39 +231,24 @@ async function main(activity?: CommandActivity) {
   }
   if (task.archived)
     throw new Error('WORK_ARCHIVED: explicitly reopen the record after reconciling authorization');
-  if (command === 'exec') {
-    if (args[1] !== '--' || args.length < 3) throw new Error(help);
-    if (task.stage !== 'C1_IMPLEMENTATION')
-      throw new Error('WORK_EXEC_STAGE: enter C1_IMPLEMENTATION before implementation commands');
-    const assessment = await assess(root, task);
-    if (!assessment.ready) {
-      console.error(json(assessmentOutput(task, assessment, raw)));
-      process.exitCode = 1;
-      return;
-    }
-    const outcome = await runCommand(root, args.slice(2), 'inherit', activity!);
-    task.plan.nextAction = outcome.unsettled
-      ? 'Confirm the execution group has stopped and reconcile the retained command marker and actual changes.'
-      : 'Inspect the command exit and actual changes; finish authorized changes, then sync and enter verification.';
-    await saveTask(root, task, raw);
-    if (outcome.error) throw outcome.error;
-    process.exitCode = outcome.cancelled || outcome.unsettled ? 1 : (outcome.status ?? 1);
-    console.log(
-      `Implementation command exited ${outcome.status}${outcome.cancelled ? '; interrupted' : ''}${outcome.unsettled ? '; execution group not confirmed stopped' : ''}; inspect changes before work sync.`,
-    );
-    return;
-  }
   if (command === 'sync') {
     if (args.length !== 2 || !args[1]!.trim()) throw new Error(help);
-    const checkpoint = await capture(root, task);
-    if (task.checkpoint && task.checkpoint.candidate !== checkpoint.candidate) {
+    const issues = [...contractIssues(task), ...(await requirementIssues(root, task.plan))];
+    if (issues.length) throw new Error(issues.join('\n'));
+    const current = await capture(root, task);
+    if (!current.candidate)
+      throw new Error('WORK_CANDIDATE: commit all tracked and untracked changes before sync');
+    await validateInputs(root, task, current.candidate.commit);
+    if (!sameCandidate((await capture(root, task)).candidate, current.candidate))
+      throw new Error('WORK_CANDIDATE: HEAD or working tree changed during sync');
+    if (task.checkpoint && !sameCandidate(task.checkpoint.candidate, current.candidate)) {
       task.reviewDecision = 'PENDING';
       task.releaseDisposition = 'HOLD_FOR_EVIDENCE';
       if (task.stage === 'C1_RELEASED') task.stage = 'C1_EVIDENCE_PENDING';
     }
-    task.checkpoint = checkpoint;
+    task.checkpoint = { candidate: current.candidate };
     task.notes.push(
-      `${new Date().toISOString()} ${args[1]}; candidate ${task.checkpoint.candidate}`,
+      `${new Date().toISOString()} ${args[1]}; candidate ${JSON.stringify(current.candidate)}`,
     );
     if (task.stage === null && !contractIssues(task).length) task.stage = 'C0_READY';
     task.plan.nextAction =
@@ -274,7 +259,7 @@ async function main(activity?: CommandActivity) {
           : 'Confirm the current scope and authorization; continue implementation or explicitly enter verification when ready.';
     await saveTask(root, task, raw);
     const result = await assess(root, task);
-    console.log(json(assessmentOutput(task, result, json(task))));
+    console.log(json(assessmentOutput(task, result)));
     if (!result.ready) process.exitCode = 1;
     return;
   }
@@ -294,17 +279,15 @@ async function main(activity?: CommandActivity) {
     );
   const state = await assess(root, task);
   if (!state.ready) {
-    console.error(json(assessmentOutput(task, state, raw)));
+    console.error(json(assessmentOutput(task, state)));
     process.exitCode = 1;
     return;
   }
   const criterion = task.plan.acceptance.find((entry) => entry.id === args[1]);
   if (!criterion) throw new Error('WORK_CRITERION: use an acceptance id from this task');
+  const candidate = await requireCandidate(root, task);
   if (command === 'evidence') {
-    if (args.length !== 4 || criterion.method === 'automated')
-      throw new Error(
-        'WORK_EVIDENCE: automated checks use work run; manual evidence needs artifact and summary; result comes from the original',
-      );
+    if (args.length !== 4 || !args[3]!.trim()) throw new Error(help);
     const bytes = await artifact(root, task.plan.id, args[2]!);
     const sha256 = digest(bytes);
     await checkManualOriginal(root, task, args[2]!, sha256);
@@ -312,20 +295,29 @@ async function main(activity?: CommandActivity) {
       const issues = await normsIssues(root, task.plan, true);
       if (issues.length) throw new Error(issues.join('\n'));
     }
-    const result = await manualEvidenceResult(
-      root,
-      bytes.toString('utf8'),
-      task.plan,
-      task.checkpoint!,
-      criterion.id,
-    );
+    const result =
+      criterion.method === 'automated'
+        ? coverageEvidenceResult(
+            bytes.toString('utf8'),
+            candidate,
+            criterion.id,
+            contractPlan(task),
+          )
+        : await manualEvidenceResult(
+            root,
+            bytes.toString('utf8'),
+            task,
+            { candidate },
+            criterion.id,
+          );
+    await requireCandidate(root, task);
     addEvidence(task, {
       criterion: criterion.id,
       method: criterion.method,
       result,
       artifact: args[2]!,
       sha256,
-      candidate: state.candidate,
+      candidate,
       summary: args[3]!,
       environment: environment(),
     });
@@ -345,123 +337,74 @@ async function main(activity?: CommandActivity) {
     : args.length === 2
       ? criterion.command!
       : args.slice(3);
-  if (!Array.isArray(argv) || !argv.length || argv.some((part) => typeof part !== 'string'))
+  if (
+    !Array.isArray(argv) ||
+    !argv.length ||
+    argv.some((part) => typeof part !== 'string') ||
+    !argv[0]!.trim()
+  )
     throw new Error('WORK_COMMAND: invalid argv');
-  const executionEnvironment = await captureEnvironment(
-    root,
-    runInput ? conditions(runInput.conditions) : null,
-  );
+  const executionEnvironment = {
+    runtime: environment(),
+    conditions: runInput?.conditions === undefined ? null : conditions(runInput.conditions),
+  };
   const completeCheck = json(argv) === json(criterion.command);
-  const beforeEnvironment = await environmentStamp(root, executionEnvironment);
-  const beforeRoot = await lstat(root, { bigint: true });
-  const rootEvents = new Set<string>();
-  let environmentTouched = false;
-  const environmentWatch = watch(root, { persistent: false }, (_event, name) => {
-    if (name !== null) rootEvents.add(name);
-    if (name === null || name === '.env' || name.startsWith('.env.')) environmentTouched = true;
-  });
-  environmentWatch.on('error', () => {
-    environmentTouched = true;
-  });
-  const beforeStamp = await inputStamp(root, task.checkpoint!);
   const relative = `.work/tasks/${task.plan.id}/evidence/${randomUUID()}.log`;
   const path = await checkedPath(root, relative);
   await mkdir(dirname(path), { recursive: true });
   const started = new Date().toISOString();
-  const startArtifact = `${relative}.start.json`;
   const runIdentity = {
-    candidate: state.candidate,
+    candidate,
+    contract: contractPlan(task),
     argv,
-    environment: environment(),
-    environmentSnapshot: executionEnvironment,
-    inputMap: digest(json(task.checkpoint!.files)),
+    environment: executionEnvironment,
     rawLog: relative,
   };
-  const startBytes = json({
-    ...runIdentity,
-    started,
-    result: 'pending',
-    reason: 'No settled observation has been registered for this execution.',
-  });
-  const start = { artifact: startArtifact, sha256: digest(startBytes) };
   const startEntry = {
     criterion: criterion.id,
     method: 'automated',
     result: 'pending',
-    candidate: state.candidate,
-    ...start,
+    candidate,
+    artifact: relative,
     summary: 'Execution started or awaiting launch; no settled observation registered.',
-    environment: runIdentity.environment,
+    environment: json(executionEnvironment).trim(),
   };
   const log = await open(path, 'wx');
   console.log(`Recording: ${relative}`);
   let inFlight: string;
-  let outcome;
+  let outcome: Awaited<ReturnType<typeof runCommand>>;
+  let changed = true;
+  let contextError = '';
+  const entryIndex = task.evidence.length;
   try {
-    await log.write(`${json({ ...runIdentity, checkpoint: task.checkpoint, started, start })}\n`);
+    await log.write(`${json({ ...runIdentity, checkpoint: task.checkpoint, started })}\n`);
     // Persist the observation before launching, so removing an interrupted marker cannot restore an old pass.
-    await writeFile(await checkedPath(root, startArtifact), startBytes, { flag: 'wx' });
     addEvidence(task, startEntry);
     await saveTask(root, task, raw);
     inFlight = json(task);
     outcome = await runCommand(root, argv, ['ignore', log.fd, log.fd], activity!);
+    try {
+      const after = await capture(root, task);
+      changed = !sameCandidate(after.candidate, candidate);
+    } catch (error) {
+      contextError = error instanceof Error ? error.message : String(error);
+    }
     await log.write(
-      `\n${json({ exitCode: outcome.status, signal: outcome.signal, error: outcome.error?.message, cancelled: outcome.cancelled, unsettled: outcome.unsettled, finished: new Date().toISOString() })}`,
+      `${resultMarker}${json({
+        exitCode: outcome.status,
+        signal: outcome.signal,
+        error: outcome.error?.message,
+        cancelled: outcome.cancelled,
+        unsettled: outcome.unsettled,
+        contextChanged: changed,
+        finished: new Date().toISOString(),
+      })}`,
     );
-  } catch (error) {
-    environmentWatch.close();
-    throw error;
   } finally {
     await log.close();
   }
-  let changed = true;
-  let contextError = '';
-  try {
-    const after = await capture(root, task);
-    const afterRoot = await lstat(root, { bigint: true });
-    const unobservedRootChange =
-      rootEvents.size === 0 &&
-      (beforeRoot.mtimeNs !== afterRoot.mtimeNs || beforeRoot.ctimeNs !== afterRoot.ctimeNs);
-    changed =
-      after.candidate !== state.candidate ||
-      beforeStamp !== (await inputStamp(root, after)) ||
-      json(await captureEnvironment(root, executionEnvironment.conditions)) !==
-        json(executionEnvironment) ||
-      beforeEnvironment !== (await environmentStamp(root, executionEnvironment)) ||
-      environmentTouched ||
-      unobservedRootChange;
-    if (unobservedRootChange)
-      contextError =
-        'Root directory changed without usable events; configuration stability is unknown.';
-  } catch (error) {
-    contextError = error instanceof Error ? error.message : String(error);
-  } finally {
-    environmentWatch.close();
-  }
   const passed =
     outcome.status === 0 && !outcome.error && !outcome.cancelled && !outcome.unsettled && !changed;
-  let evidencePath = relative;
-  if (outcome.unsettled) {
-    // Descendants may still append to their inherited log fd. Bind an immutable observation,
-    // not the provisional log, and let pending evidence invalidate any earlier pass.
-    evidencePath = `${relative}.pending.json`;
-    await writeFile(
-      await checkedPath(root, evidencePath),
-      json({
-        ...runIdentity,
-        start,
-        exitCode: outcome.status,
-        signal: outcome.signal,
-        result: 'pending',
-        cancelled: outcome.cancelled,
-        reason: 'Execution is not confirmed stopped; rawLog is provisional and may still change.',
-      }),
-      { flag: 'wx' },
-    );
-  }
-  if (task.evidence.at(-1) !== startEntry)
-    throw new Error('WORK_RUN_SETTLEMENT: execution start is no longer the last observation');
-  task.evidence.pop();
   const nextAction = outcome.unsettled
     ? 'Confirm the execution group has stopped, inspect the provisional log, then recover the retained command marker before continuing.'
     : changed
@@ -475,17 +418,18 @@ async function main(activity?: CommandActivity) {
       criterion: criterion.id,
       method: 'automated',
       result: changed || outcome.unsettled ? 'pending' : passed ? 'pass' : 'fail',
-      artifact: evidencePath,
-      sha256: digest(await readFile(await checkedPath(root, evidencePath))),
-      candidate: state.candidate,
+      artifact: relative,
+      ...(outcome.unsettled ? {} : { sha256: digest(await readFile(path)) }),
+      candidate,
       summary: `exit ${outcome.status}; cancelled=${outcome.cancelled}; unsettled=${outcome.unsettled}; contextChanged=${changed}; coverage=${completeCheck ? 'complete' : 'supplement'}${contextError ? `; ${contextError}` : ''}`,
-      environment: environment(),
+      environment: json(executionEnvironment).trim(),
     },
     nextAction,
+    entryIndex,
   );
   await saveTask(root, task, inFlight);
   console.log(
-    `${completeCheck ? '' : 'SUPPLEMENTAL '}${passed ? 'PASS' : 'NOT PASSED'}: ${evidencePath}${changed ? '; WORK_CONTEXT_CHANGED during command' : ''}`,
+    `${completeCheck ? '' : 'SUPPLEMENTAL '}${passed ? 'PASS' : 'NOT PASSED'}: ${relative}${outcome.unsettled ? '; provisional log' : ''}${changed ? '; WORK_CONTEXT_CHANGED during command' : ''}`,
   );
   if (!passed) process.exitCode = 1;
 }
@@ -495,7 +439,6 @@ try {
     'start',
     'update',
     'deliver',
-    'exec',
     'sync',
     'archive',
     'run',
@@ -513,7 +456,6 @@ try {
       json({
         error: [...message].slice(0, 512).join(''),
         incomplete: true,
-        sha256: digest(message),
         bytes: Buffer.byteLength(message),
         detail: 'The full exception text was not persisted. Inspect the original request/input.',
       }),

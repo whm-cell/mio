@@ -1,34 +1,28 @@
 import { spawnSync } from 'node:child_process';
-import { lstat, readFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import { beneath, inventory, loadConfig } from '../inventory.ts';
-import { checkedPath, contractPlan, deliveryPending, digest, json } from './records.ts';
-import type { Checkpoint, Evidence, Task } from './records.ts';
-import { compactInputs, deliveryOutput, readDraft, readResultInput } from './reports.ts';
-import { hasResultSelector, parseSelector, recordsFile } from './compact-store.ts';
+import { lstat } from 'node:fs/promises';
+import { beneath, loadConfig } from '../inventory.ts';
+import { checkedPath, contractPlan, contractRevision, digest, sameCandidate } from './records.ts';
+import type { Candidate, Evidence, Task } from './records.ts';
+import { deliveryOutput, readDraft, readResultInput } from './reports.ts';
+import { hasResultSelector, parseSelector } from './compact-store.ts';
 import { needsQualityReview, qualityCriterion } from './quality-review.ts';
 import { documentCatalog, resolveDocument } from '../task-documents.ts';
 import { normsCriterion, normsIssues } from './norms-review.ts';
 import { requirementIssues } from './requirements.ts';
 import { manualEvidenceResult } from './manual-evidence.ts';
 import { artifact, automatedEvidence } from './evidence.ts';
-export { runtimeEnvironment as environment } from './verification-proof.ts';
+export { runtimeEnvironment as environment } from './verification-environment.ts';
 
 export { artifact } from './evidence.ts';
 
-export const requiredSources = ['AGENTS.md', 'docs/coordination.md', 'docs/work-records.md'];
-
-export async function captureFiles(root: string, task: Task): Promise<Checkpoint['files']> {
+/** Validate declared ownership and paths without computing a tree of file contents. */
+export async function validateInputs(root: string, task: Task, commit?: string): Promise<void> {
   const config = await loadConfig(root);
-  const scan = await inventory(root, config);
-  if (scan.errors.length) throw new Error(scan.errors.join('\n'));
   const catalog = await documentCatalog(root, config);
-  const selected = new Set<string>(['harness.config.json']);
   for (const [kind, paths] of [
     [
       'source',
       [
-        ...requiredSources,
         ...task.plan.sources,
         ...(task.plan.requirement ? [task.plan.requirement.source] : []),
         ...(task.plan.result ? [task.plan.result.prd] : []),
@@ -46,9 +40,12 @@ export async function captureFiles(root: string, task: Task): Promise<Checkpoint
         if (deliveryOutput(task, reference, catalog))
           throw new Error('WORK_DELIVERY_INPUT: own result cannot be an input');
         await readResultInput(root, reference, catalog);
-        selected.add(reference);
-        for (const entry of catalog.documents)
-          if (beneath(selector.path, dirname(entry.registry))) selected.add(entry.registry);
+        if (
+          commit &&
+          spawnSync('git', ['cat-file', '-e', `${commit}:${selector.path}`], { cwd: root })
+            .status !== 0
+        )
+          throw new Error(`WORK_INPUT_UNCOMMITTED: ${selector.path}`);
         continue;
       }
       const path = kind === 'source' ? resolveDocument(reference, catalog).currentPath : reference;
@@ -58,73 +55,59 @@ export async function captureFiles(root: string, task: Task): Promise<Checkpoint
         (path !== '.env.example' && path.split('/').some((part) => /^\.env(?:\.|$)/.test(part)))
       )
         throw new Error(`WORK_PRIVATE: ${path}`);
-      const matches = scan.files.filter((file) => path === '.' || beneath(file, path));
-      if (kind === 'source' && (!path.endsWith('.md') || !scan.files.includes(path)))
-        throw new Error(`WORK_SOURCE: name an existing public Markdown file: ${path}`);
-      if (!matches.length && kind !== 'scope') throw new Error(`WORK_INPUT_MISSING: ${path}`);
       if (deliveryOutput(task, path, catalog) && kind === 'source')
         throw new Error('WORK_DELIVERY_INPUT: own delivery output cannot be a requirement/source');
-      matches.forEach((file) => {
-        if (!deliveryOutput(task, file, catalog)) selected.add(file);
-      });
-      for (const entry of catalog.documents) {
-        const references = [entry.identity, entry.path, ...(entry.aliases ?? [])];
-        const readsDocument = references.some((file) => path === '.' || beneath(file, path));
-        if (readsDocument)
-          [entry.path, ...(entry.aliases ?? [])].forEach((file) => selected.add(file));
-        if (readsDocument || beneath(path, dirname(entry.registry))) selected.add(entry.registry);
+      if (kind !== 'scope') {
+        let stat;
+        try {
+          stat = await lstat(path === '.' ? root : await checkedPath(root, path));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          throw new Error(`WORK_INPUT_MISSING: ${path}`);
+        }
+        if (kind === 'source' && (!path.endsWith('.md') || !stat.isFile()))
+          throw new Error(`WORK_SOURCE: name an existing public Markdown file: ${path}`);
+        if (
+          commit &&
+          path !== '.' &&
+          spawnSync('git', ['cat-file', '-e', `${commit}:${path}`], { cwd: root }).status !== 0
+        )
+          throw new Error(`WORK_INPUT_UNCOMMITTED: ${path}`);
       }
     }
   }
-  const files: Record<string, string> = {};
-  for (const file of [...selected].sort()) {
-    if (recordsFile(file)) Object.assign(files, await compactInputs(root, file, task, catalog));
-    else if (hasResultSelector(file)) {
-      const content = await readResultInput(root, file, catalog);
-      if (content === null) throw new Error(`WORK_INPUT_MISSING: ${file}`);
-      files[file] = digest(content);
-    } else files[file] = digest(await readFile(await checkedPath(root, file)));
-  }
-  return files;
 }
 
-export async function captureCandidate(root: string, task: Task) {
-  const files = await captureFiles(root, task);
-  const contract = digest(json(contractPlan(task)));
-  return { files, contract, candidate: digest(json({ files, contract })) };
-}
-
-export async function capture(root: string, task: Task): Promise<Checkpoint> {
-  const { files, contract, candidate } = await captureCandidate(root, task);
+/** Git determines whether a committed candidate exists; ignored process records are outside it. */
+export async function capture(root: string, task: Task) {
   const git = (args: string[]) => {
-    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    const result = spawnSync('git', args, {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    });
     return result.status === 0 ? result.stdout.trim() : null;
   };
+  const status = git(['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  if (status === null) throw new Error('WORK_GIT: cannot inspect working tree status');
+  const head = git(['rev-parse', '--verify', 'HEAD^{commit}']);
+  const dirty = status.length !== 0;
   return {
-    head: git(['rev-parse', '--verify', 'HEAD']),
+    head,
     branch: git(['symbolic-ref', '--short', '-q', 'HEAD']),
-    files,
-    contract,
-    candidate,
+    dirty,
+    candidate: !dirty && head ? { commit: head, contractRevision: contractRevision(task) } : null,
   };
 }
 
-/** A restore can hide a write from byte snapshots. Observe file identity/change times and source directories too. */
-export async function inputStamp(root: string, checkpoint: Checkpoint): Promise<string> {
-  const physical = Object.keys(checkpoint.files).map((file) =>
-    hasResultSelector(file) ? parseSelector(file).path : file,
-  );
-  const paths = new Set(physical);
-  for (const file of physical) {
-    for (let parent = dirname(file); parent !== '.'; parent = dirname(parent)) paths.add(parent);
-  }
-  const stamps: Record<string, string> = {};
-  for (const path of [...paths].sort()) {
-    const stat = await lstat(await checkedPath(root, path), { bigint: true });
-    stamps[path] =
-      `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.mode}`;
-  }
-  return json(stamps);
+export async function requireCandidate(root: string, task: Task): Promise<Candidate> {
+  const current = await capture(root, task);
+  if (!current.candidate || !sameCandidate(current.candidate, task.checkpoint?.candidate))
+    throw new Error('WORK_CANDIDATE: commit and sync a clean HEAD for the current contract');
+  await validateInputs(root, task, current.candidate.commit);
+  if (!sameCandidate((await capture(root, task)).candidate, current.candidate))
+    throw new Error('WORK_CANDIDATE: HEAD or working tree changed during validation');
+  return current.candidate;
 }
 
 export function contractIssues(task: Task): string[] {
@@ -168,8 +151,7 @@ export async function assess(
   const { inspectDelivery = true } = options;
   const current = await capture(root, task);
   const errors = [...contractIssues(task), ...(await requirementIssues(root, task.plan))];
-  if (inspectDelivery && (await deliveryPending(root, task.plan.id)))
-    errors.push('WORK_DELIVERY_PENDING: resume the original delivery request');
+  await validateInputs(root, task);
   const qualityRequired = needsQualityReview(task.plan, await loadConfig(root));
   const normsErrors = await normsIssues(
     root,
@@ -181,34 +163,36 @@ export async function assess(
     errors.push(
       'WORK_QUALITY_CONTRACT: register quality-review with method review using work update',
     );
-  const previous = task.checkpoint;
-  const changed = [
-    ...new Set([...Object.keys(previous?.files ?? {}), ...Object.keys(current.files)]),
-  ].filter((path) => previous?.files[path] !== current.files[path]);
-  if (!previous) errors.push('WORK_CHECKPOINT: reconcile with work sync');
-  else {
-    if (changed.length || previous.contract !== current.contract)
-      errors.push(
-        `WORK_CONTEXT_CHANGED: ${changed.join(', ') || 'task contract'}; inspect changes before work sync`,
-      );
-    if (previous.head !== current.head || previous.branch !== current.branch)
-      errors.push('WORK_REVISION_CHANGED: inspect branch/HEAD and diff before work sync');
-  }
+  const candidate = sameCandidate(task.checkpoint?.candidate, current.candidate)
+    ? current.candidate
+    : null;
+  if (!candidate && ['C1_EVIDENCE_PENDING', 'C1_RELEASED'].includes(task.stage ?? ''))
+    errors.push('WORK_CANDIDATE: commit and sync a clean HEAD for the current contract');
   const evidence = [];
   for (const criterion of task.plan.acceptance) {
     const entries = task.evidence.filter(
       (item) =>
         item.criterion === criterion.id &&
         item.method === criterion.method &&
-        item.candidate === current.candidate,
+        sameCandidate(item.candidate, candidate),
     );
     if (criterion.method === 'automated') {
-      const observation = await automatedEvidence(root, task.plan.id, entries, criterion.command);
+      const observation = await automatedEvidence(
+        root,
+        task.plan.id,
+        entries,
+        criterion.command,
+        contractPlan(task),
+      );
       evidence.push({
         criterion: criterion.id,
         method: criterion.method,
         result: observation.result,
         ...('basis' in observation ? { basis: observation.basis } : {}),
+        ...('executionCount' in observation ? { executionCount: observation.executionCount } : {}),
+        ...('remoteExecution' in observation
+          ? { remoteExecution: observation.remoteExecution }
+          : {}),
       });
       continue;
     }
@@ -224,8 +208,8 @@ export async function assess(
               (await manualEvidenceResult(
                 root,
                 bytes.toString('utf8'),
-                task.plan,
-                current,
+                task,
+                { candidate: candidate! },
                 criterion.id,
               )) !== entry.result
             )
@@ -253,15 +237,16 @@ export async function assess(
   let draftIssue: string | null = null;
   if (
     inspectDelivery &&
-    task.delivery?.version === 2 &&
+    task.delivery &&
     !errors.length &&
     !normsErrors.length &&
     evidence.every((entry) => entry.result === 'pass') &&
     task.stage === 'C1_EVIDENCE_PENDING' &&
-    task.reviewDecision === 'PENDING'
+    task.reviewDecision === 'PENDING' &&
+    candidate
   ) {
     try {
-      await readDraft(root, task, current.candidate);
+      await readDraft(root, task, candidate);
       readyForAcceptance = true;
     } catch (error) {
       draftIssue = error instanceof Error ? error.message : String(error);
@@ -276,8 +261,9 @@ export async function assess(
   return {
     ready: errors.length === 0,
     stage: task.stage,
-    candidate: current.candidate,
-    changed,
+    candidate,
+    git: { head: current.head, branch: current.branch, dirty: current.dirty },
+    changed: [],
     errors,
     evidence,
     reviewDecision: task.reviewDecision,
@@ -302,10 +288,21 @@ export async function assess(
   };
 }
 
-export function addEvidence(task: Task, entry: Evidence, nextAction?: string) {
-  if (!task.checkpoint || entry.candidate !== task.checkpoint.candidate)
+export function addEvidence(
+  task: Task,
+  entry: Evidence,
+  nextAction?: string,
+  replaceIndex?: number,
+) {
+  if (!sameCandidate(entry.candidate, task.checkpoint?.candidate))
     throw new Error('WORK_EVIDENCE: checkpoint mismatch');
-  task.evidence.push(entry);
+  if (replaceIndex === undefined) task.evidence.push(entry);
+  else {
+    const pending = task.evidence[replaceIndex];
+    if (!pending || pending.result !== 'pending' || pending.artifact !== entry.artifact)
+      throw new Error('WORK_RUN_SETTLEMENT: pending observation mismatch');
+    task.evidence[replaceIndex] = entry;
+  }
   task.reviewDecision = 'PENDING';
   task.releaseDisposition = 'HOLD_FOR_EVIDENCE';
   task.stage = 'C1_EVIDENCE_PENDING';

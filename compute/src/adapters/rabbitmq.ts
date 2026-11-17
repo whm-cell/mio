@@ -5,7 +5,9 @@ import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, Message } f
 import {
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
+  IMAGE_COMMAND_QUEUE,
   IMAGE_MAX_MESSAGE_BYTES,
+  IMAGE_WORKER_PREFETCH,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
   parseComputeCommandV1,
@@ -21,6 +23,7 @@ import type {
   ImageRecoveryCommandV1,
   ImageResultV1,
 } from '@mio/compute-contracts';
+import { isJournalFailure } from './journal.ts';
 
 interface BrokerState {
   closed: boolean;
@@ -37,6 +40,8 @@ interface ConsumerGate {
   open: boolean;
   slot: ConsumerSlot;
 }
+type ImageCommand = ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1;
+type ImageHandler = (command: ImageCommand, ack: () => void) => Promise<void>;
 
 async function closeConnection(
   connection: ChannelModel,
@@ -100,6 +105,11 @@ export class Broker {
   #handling: Promise<void> | null = null;
   #pause: Promise<void> | null = null;
   #handlerFailure: unknown = null;
+  #imageConsumer: ConsumerSlot | null = null;
+  #imageGate: ConsumerGate | null = null;
+  readonly #imageHandling = new Set<Promise<void>>();
+  readonly #imageLocks = new Map<string, Promise<void>>();
+  #imageClose: Promise<void> | null = null;
 
   private constructor(
     consumerConnection: ChannelModel,
@@ -238,14 +248,25 @@ export class Broker {
     }
   }
 
+  #runImageSerial(jobId: string, run: () => Promise<void>): Promise<void> {
+    const previous = this.#imageLocks.get(jobId) ?? Promise.resolve();
+    const current = previous.then(run);
+    const tracked = current
+      .catch(() => {})
+      .finally(() => {
+        if (this.#imageLocks.get(jobId) === tracked) {
+          this.#imageLocks.delete(jobId);
+        }
+      });
+    this.#imageLocks.set(jobId, tracked);
+    return current;
+  }
+
   async consume(
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
-    imageHandle?: (
-      command: ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1,
-      ack: () => void,
-    ) => Promise<void>,
+    imageHandle?: ImageHandler,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -331,18 +352,28 @@ export class Broker {
               command.type === 'image.recover'
             ) {
               if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
-              return imageHandle(command, () => slot.channel.ack(message));
+              const runImage = imageHandle;
+              const imageCommand = command;
+              return this.#runImageSerial(imageCommand.jobId, async () => {
+                if (!gate.open || this.#state.closed) return;
+                await runImage(imageCommand, () => slot.channel.ack(message));
+              });
             }
             return handle(command, () => slot.channel.ack(message));
           })
           .catch((error: unknown) => {
-            if ((error as Error).message === 'ATTEMPT_CONFLICT') {
+            const code = error instanceof Error ? error.message : '';
+            if (
+              code === 'ATTEMPT_CONFLICT' ||
+              code === 'IMAGE_COMMAND_CONFLICT' ||
+              code === 'IMAGE_QUERY_UNKNOWN'
+            ) {
               try {
                 slot.channel.reject(message, false);
               } catch (rejectError) {
                 report(rejectError);
               }
-            } else if ((error as Error).message === 'WORKER_NOT_READY') {
+            } else if (code === 'WORKER_NOT_READY') {
               void this.pause().catch(report);
             } else report(error);
           })
@@ -355,8 +386,130 @@ export class Broker {
     );
   }
 
+  async consumeImages(
+    handle: ImageHandler,
+    failed: (error: unknown) => void,
+    onRetry?: () => void,
+  ): Promise<void> {
+    if (this.#state.closed || this.#imageGate || this.#imageClose || this.#imageHandling.size > 0)
+      throw new Error('BROKER_IMAGE_CONSUMER_BUSY');
+    let slot = this.#imageConsumer;
+    if (!slot) {
+      const channel = await this.#consumerConnection.createChannel();
+      slot = watchConsumer(channel, this.#state);
+      await channel.prefetch(IMAGE_WORKER_PREFETCH);
+      if (this.#state.closed || slot.closed || this.#imageClose) throw new Error('BROKER_CLOSED');
+      this.#imageConsumer = slot;
+    }
+    const activeSlot = slot;
+    const gate: ConsumerGate = { slot: activeSlot, open: true };
+    this.#imageGate = gate;
+    const report = (error: unknown) => {
+      gate.open = false;
+      failed(error);
+    };
+    const recycleImageChannel = () => {
+      if (this.#state.closed) return;
+      void this.closeImages().then(() => {
+        if (this.#state.closed) return;
+        if (activeSlot.failed) report(new Error('BROKER_CLOSED'));
+        else onRetry?.();
+      }, report);
+    };
+    await activeSlot.channel.consume(
+      IMAGE_COMMAND_QUEUE,
+      (message: ConsumeMessage | null) => {
+        if (!gate.open || this.#state.closed) return;
+        if (!message) {
+          gate.open = false;
+          if (this.#state.closed) report(new Error('CONSUMER_CANCELLED'));
+          else recycleImageChannel();
+          return;
+        }
+        let command: ImageCommand;
+        try {
+          if (
+            message.properties.userId !== this.#expectedUserId ||
+            message.properties.contentType !== 'application/json' ||
+            message.content.length > IMAGE_MAX_MESSAGE_BYTES
+          )
+            throw new Error('COMMAND_INVALID');
+          const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
+          const value: unknown = JSON.parse(body);
+          if (
+            value &&
+            typeof value === 'object' &&
+            'type' in value &&
+            value.type === 'image.request'
+          )
+            command = parseImageCommand(value);
+          else if (
+            value &&
+            typeof value === 'object' &&
+            'type' in value &&
+            value.type === 'image.query'
+          )
+            command = parseImageQuery(value);
+          else if (
+            value &&
+            typeof value === 'object' &&
+            'type' in value &&
+            value.type === 'image.recover'
+          )
+            command = parseImageRecovery(value);
+          else throw new Error('COMMAND_INVALID');
+          if (message.properties.messageId !== command.messageId)
+            throw new Error('COMMAND_ID_MISMATCH');
+        } catch {
+          try {
+            activeSlot.channel.reject(message, false);
+          } catch (error) {
+            report(error);
+          }
+          return;
+        }
+        let isolateChannelRetry = false;
+        const tracked = this.#runImageSerial(command.jobId, async () => {
+          if (!gate.open || this.#state.closed) return;
+          await handle(command, () => activeSlot.channel.ack(message));
+        })
+          .catch((error: unknown) => {
+            const code = error instanceof Error ? error.message : '';
+            if (code === 'IMAGE_COMMAND_CONFLICT' || code === 'IMAGE_QUERY_UNKNOWN') {
+              try {
+                activeSlot.channel.reject(message, false);
+              } catch (rejectError) {
+                report(rejectError);
+              }
+            } else if (isJournalFailure(error) || this.#state.closed) {
+              report(error);
+            } else {
+              gate.open = false;
+              isolateChannelRetry = true;
+            }
+          })
+          .finally(() => {
+            this.#imageHandling.delete(tracked);
+            if (isolateChannelRetry) {
+              recycleImageChannel();
+            }
+          });
+        this.#imageHandling.add(tracked);
+      },
+      { noAck: false, consumerTag: `mio-img-${createId()}` },
+    );
+  }
+
   get consuming(): boolean {
     return this.#gate?.open === true;
+  }
+
+  get imageConsuming(): boolean {
+    return this.#imageGate?.open === true;
+  }
+
+  get imageClosing(): boolean {
+    return this.#imageClose !== null;
   }
 
   /** Close the gate synchronously, drain accepted work, then close its channel to requeue late deliveries. */
@@ -393,6 +546,40 @@ export class Broker {
     return tracked;
   }
 
+  /** Close the image gate synchronously, drain active image handlers, then close the image channel. */
+  closeImages(): Promise<void> {
+    if (this.#imageClose) return this.#imageClose;
+    const gate = this.#imageGate;
+    const slot = this.#imageConsumer;
+    if (gate) gate.open = false;
+    const tracked = (async () => {
+      if (this.#imageHandling.size > 0) {
+        await Promise.allSettled([...this.#imageHandling]);
+      }
+      if (slot) {
+        if (!slot.closed) {
+          let onClose: () => void = () => {};
+          const closed = new Promise<void>((resolve) => {
+            onClose = resolve;
+            slot.channel.once('close', onClose);
+          });
+          slot.closing = true;
+          try {
+            await Promise.race([slot.channel.close().catch(() => closed), closed]);
+          } finally {
+            slot.channel.off('close', onClose);
+          }
+        }
+        if (this.#imageConsumer === slot) this.#imageConsumer = null;
+      }
+      if (this.#imageGate === gate) this.#imageGate = null;
+    })().finally(() => {
+      if (this.#imageClose === tracked) this.#imageClose = null;
+    });
+    this.#imageClose = tracked;
+    return tracked;
+  }
+
   closed(): Promise<void> {
     if (this.#state.closed) return Promise.resolve();
     return new Promise((resolve) => this.#state.events.once('closed', resolve));
@@ -400,9 +587,11 @@ export class Broker {
 
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
-    // Do not close the journal's owner while an admitted image handler can still write.
+    if (this.#imageGate) this.#imageGate.open = false;
+    // Do not close the journal's owner while any admitted video or image handler can still write.
     // The caller aborts its bounded operations if the shutdown grace period expires.
     if (this.#handling) await this.#handling;
+    await this.closeImages();
     this.#state.markClosed();
     await Promise.all([
       closeConnection(this.#consumerConnection, this.#closedConnections),

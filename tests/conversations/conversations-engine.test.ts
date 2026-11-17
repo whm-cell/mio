@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
+import { parseImageJobPresentationMeta } from '../../src/dsh/image-tools.ts';
+import { authorizeConversationImageTools } from '../../src/dsh/policy.ts';
 import { kernelRuntime, ScriptedModel, textResponse } from '../support/kernel-runtime.ts';
 import type { ModelScript } from '../support/kernel-runtime.ts';
 const contexts: Context[] = [];
@@ -110,4 +114,108 @@ it('keeps textless cancellation visible in history after a later completed round
     { status: 'completed' },
   ]);
   expect(history.items.filter((item) => item.role === 'assistant')).toHaveLength(1);
+});
+
+it('keeps budget denials monotonic across repeated guard checks, honors aborted signals, and validates projected output order', async () => {
+  const { ctx } = await setup([]);
+  let revoke: (() => void) | undefined;
+  const handle = await ctx.mioKernel.create('guard-monotonic', {}, (agentCtx, agent) => {
+    revoke = authorizeConversationImageTools(agentCtx, agent);
+  });
+  try {
+    const makeExec = (
+      id: string,
+      name: string,
+      signal = new AbortController().signal,
+    ): ToolExecution =>
+      Object.freeze({
+        callId: ToolCallId(id),
+        name,
+        args: {},
+        rawArguments: '{}',
+        agent: handle.agent,
+        signal,
+      }) as unknown as ToolExecution;
+
+    // 4 allowed submit_image_job calls remain idempotent when re-checked
+    for (let idx = 1; idx <= 4; idx += 1) {
+      const allowedExec = makeExec(`sub-${idx}`, 'submit_image_job');
+      expect(ctx.tools.checkGuards(allowedExec)).toBeUndefined();
+      expect(ctx.tools.checkGuards(allowedExec)).toBeUndefined();
+    }
+
+    // 5th submit_image_job must stay monotonically denied even if checkGuards is called twice on the same exec
+    const fifthSubmit = makeExec('sub-5', 'submit_image_job');
+    expect(ctx.tools.checkGuards(fifthSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
+    expect(ctx.tools.checkGuards(fifthSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
+
+    // Aborted signal is denied on both root and agent guard layers
+    const abortedController = new AbortController();
+    abortedController.abort();
+    expect(
+      ctx.tools.checkGuards(
+        makeExec('aborted-list', 'list_image_models', abortedController.signal),
+      ),
+    ).toContain('MIO_TOOL_DENIED');
+  } finally {
+    revoke?.();
+    await handle.dispose();
+  }
+
+  const jobId = '11111111-1111-4111-8111-111111111111';
+  const a1 = '22222222-2222-4222-8222-222222222222';
+  const a2 = '33333333-3333-4333-8333-333333333333';
+  expect(
+    parseImageJobPresentationMeta({
+      kind: 'mio.image-job',
+      tool: 'get_image_job',
+      job: {
+        jobId,
+        status: 'completed',
+        requestedCount: 2,
+        errorCode: null,
+        assetIds: [a1, a2],
+        outputs: [
+          { index: 0, assetId: a1 },
+          { index: 1, assetId: a2 },
+        ],
+      },
+    }),
+  ).not.toBeNull();
+
+  // Reject non-increasing output indices or mismatched assetId ordering
+  expect(
+    parseImageJobPresentationMeta({
+      kind: 'mio.image-job',
+      tool: 'get_image_job',
+      job: {
+        jobId,
+        status: 'completed',
+        requestedCount: 2,
+        errorCode: null,
+        assetIds: [a1, a2],
+        outputs: [
+          { index: 1, assetId: a1 },
+          { index: 0, assetId: a2 },
+        ],
+      },
+    }),
+  ).toBeNull();
+  expect(
+    parseImageJobPresentationMeta({
+      kind: 'mio.image-job',
+      tool: 'get_image_job',
+      job: {
+        jobId,
+        status: 'completed',
+        requestedCount: 2,
+        errorCode: null,
+        assetIds: [a1, a2],
+        outputs: [
+          { index: 0, assetId: a2 },
+          { index: 1, assetId: a1 },
+        ],
+      },
+    }),
+  ).toBeNull();
 });

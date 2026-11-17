@@ -38,7 +38,7 @@ pnpm start:test
 
 手机号短信默认关闭。需要使用时，仅在选定环境的私有配置文件中按[模板](../.env.example)填写该环境授权的腾讯短信应用、签名、模板和凭据，再设 `MIO_AUTH_SMS_ENABLED=true`；另一个环境不会继承这些设置。应用启动不发送短信，实际调用会产生外部费用；模板须有验证码与有效分钟数两个参数。认证结构仍需先预览并显式迁移，详见[认证底座](auth.md#配置与迁移)。
 
-`broker:init:dev/test` 是显式拓扑初始化入口：先核对全部已有资源，再补缺失的策略、持久队列、绑定和受限 A/B 用户；已有资源不匹配时停止，不覆盖、不清队列、不轮换密码。最后真实验证两个身份的 AMQP 登录。首次准备后日常 up 不改拓扑；请求结果未知时保留现场，核对后可重复执行初始化。权限与恢复边界见 [RabbitMQ 契约](integrations/rabbitmq.md)。
+`broker:init:dev/test` 是显式拓扑初始化入口：先核对全部已有资源，再补缺失的策略、持久队列（含独立图片命令队列 `mio.compute.image.commands.v1` 及其 DLX/DLQ）、绑定和受限 A/B 用户，且仅当现有 B 权限精确匹配旧版单命令队列读权限时执行无损幂等升级；任何其他已有资源不匹配时立即停止并报 `LOCAL_BROKER_CONFLICT`，不覆盖、不清队列、不轮换密码。最后真实验证两个身份的 AMQP 登录。首次准备后日常 up 不改拓扑；请求结果未知时保留现场，核对后可重复执行初始化。权限与恢复边界见 [RabbitMQ 契约](integrations/rabbitmq.md)。
 
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。
 
@@ -130,4 +130,4 @@ Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰
 
 显式现场探针 `node tests/environment/local-environments-live.ts --restart-local-environments` 要求两套中间件已经 up、认证迁移完成且应用已停止。它真实注册同邮箱的独立账号、检查跨环境凭据拒绝、依次重启各套中间件并实际等待 65 秒，验证账号、旧会话和 Redis AOF 数据保留。探针不属于普通测试，会保留账号和 Redis 标记；私有账号记录及日志在 `.runtime/local-acceptance/<run>/`。退出后关闭它启动的应用，中间件继续运行。
 
-MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-brokers` 要求拓扑已初始化、A/B 停止、四个队列为空且 Worker 无保留任务。它拒绝清理未知数据，检查 A/B 权限及跨环境连接拒绝，保留已确认消息后重复初始化、逐套停启 MQ 并验证另一环境继续收发。它还用不访问 COS 的配置实启空闲 Worker、停启两次并核对 journal 身份；不能据此宣称媒体处理或 COS 已验收。日志在 `.runtime/local-broker-acceptance/<run>/`，退出后关闭探针启动的 Worker 并保留中间件和 journal。自动故障回归须使用单独 vhost/身份或独立实例，不清空人工测试队列。
+MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-brokers` 要求拓扑已初始化、A/B 停止、六个队列（视频命令、图片命令、结果及各自 DLQ）为空且 Worker 无保留任务。它拒绝清理未知数据，检查 A/B 权限及跨环境连接拒绝，保留已确认消息后重复初始化、逐套停启 MQ 并验证另一环境继续收发。它还用不访问 COS 的配置实启空闲 Worker、停启两次并核对 journal 身份；不能据此宣称媒体处理或 COS 已验收。日志在 `.runtime/local-broker-acceptance/<run>/`，退出后关闭探针启动的 Worker 并保留中间件和 journal。自动故障回归须使用单独 vhost/身份或独立实例，不清空人工测试队列。

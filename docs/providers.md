@@ -85,7 +85,9 @@ pnpm providers:route <--stdin | routes.json>
 
 平台路由仅对用户已存在成员补充空缺分类，未知分类仍不自动归入 chat；可选文本 `capabilityMetadata.contextWindow` 为正整数，`capabilityMetadata.maxOutputTokens` 为 `1..65536` 正整数（缺省按 1024 执行）。未知上下文/价格/工具/媒体能力不补值。来源明确是部署路由声明，不冒充供应商元数据。入口不创造成员、不接收任意外部主机 URL/Key/verified，不开放普通用户管理 API。每次实质路由更新递增 `declaration_version` 并使旧版本验证回到 `unverified`，分类变化保留身份/偏好。
 
-验证只来自当前用户本人的成功运行观察（文本对话完成或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
+chat 路由可显式声明 `capabilityMetadata.inputModalities`；必须包含 `text`，仅接受互异的 `text`、`image`，缺省按纯文本处理。只有声明二者的路由可使用对话图片，并可声明四项正整数预算：`maxRequestImages` 默认 4、上限 16；`maxRequestImageBytes` 默认 10 MiB、上限 20 MiB，是每次请求全部图片的 Base64 硬上限；`requestImagePixelBudget` 默认 4,194,304、上限 16,777,216；`requestImageMaxBytes` 默认 5 MiB、上限 10 MiB，是单张预览的软目标。纯文本或未声明视觉的路由不能携带视觉预算。能力声明和预算不证明真实视觉调用成功。
+
+验证只来自当前用户本人的成功运行观察（文本对话完成或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。chat 现有 verified 维度不区分文本和视觉，历史文本成功不代表视觉已实证。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
 
 ### 模型扩展边界
 

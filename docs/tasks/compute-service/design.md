@@ -10,7 +10,7 @@ A 保留现有根项目，管理登录、资产归属、任务事实与对外 AP
 
 元数据放 Mio 媒体独立 PostgreSQL 域，不能把 DSH 会话或消息队列当作事实表。将任务和 outbox 同事务写入可避免已受理任务未留下待发送记录；消费者仍须以稳定任务和消息身份去重并处理不确定结果。恢复逻辑在 P3 依据实际协议设计，不能把重试等同于恰好一次。
 
-计算任务按 owner 与 requestId 绑定输入摘要：同输入重试返回原任务，异输入冲突；accepted、queued、running、succeeded、failed 的更新需拒绝晚到消息造成的回退。配额为每用户 10、全局 500 个未结束任务，必须在并发受理下维持。队列满时拒绝新发布并保留已存在消息，outbox 不因发布被拒绝而误记成功。B 初期串行处理（prefetch 1），FFmpeg 的 `-threads`、`-filter_threads` 与 `-filter_complex_threads` 参数设为 2，不把它们当成进程总线程数或 CPU 硬上限；输入及输出各不超过 1 GiB，单次执行和单次上传对账各最多 60 分钟、最多三次实际执行；保守启动记账可能少于三次实际执行。消费者 ACK 无 broker 收到确认，终态持久及结果确认后的本地清理和重投由 journal 幂等恢复，具体边界见[计算协议](protocol.md)。75 分钟配置已核对，隔离队列以 2 秒验证了取消及重投机制，未作 75 分钟墙钟等待。1 CPU、1 GiB 内存、10 GiB 存储是 RabbitMQ 初始预算，容量与磁盘告警以实测确定。
+计算任务按 owner 与 requestId 绑定输入摘要：同输入重试返回原任务，异输入冲突；accepted、queued、running、succeeded、failed 的更新需拒绝晚到消息造成的回退。视频配额为每用户 10、全局 500 个未结束任务，必须在并发受理下维持；后续 `image-io-concurrency` 变更将纯网络/对象存储 I/O 的图片任务分流至独立队列 `mio.compute.image.commands.v1`（`image.v1`，Worker 独立图片通道 `prefetch 4` + 同 `jobId` 串行互斥）并分离图片活动配额（每用户 32、全局 1000），详见[图片并发变更](changes/image-io-concurrency/change.md)与[计算协议](protocol.md)。队列满时拒绝新发布并保留已存在消息，outbox 不因发布被拒绝而误记成功。B 视频转码保持串行处理（prefetch 1），FFmpeg 的 `-threads`、`-filter_threads` 与 `-filter_complex_threads` 参数设为 2，不把它们当成进程总线程数或 CPU 硬上限；输入及输出各不超过 1 GiB，单次执行和单次上传对账各最多 60 分钟、最多三次实际执行；保守启动记账可能少于三次实际执行。消费者 ACK 无 broker 收到确认，终态持久及结果确认后的本地清理和重投由 journal 幂等恢复，具体边界见[计算协议](protocol.md)。75 分钟配置已核对，隔离队列以 2 秒验证了取消及重投机制，未作 75 分钟墙钟等待。1 CPU、1 GiB 内存、10 GiB 存储是 RabbitMQ 初始预算，容量与磁盘告警以实测确定。
 
 quorum 队列单节点仍是单点；其默认 delivery-limit 与业务执行次数不是同一计数。P3 计划禁用 broker 的隐式投递上限，由 journal 限制实际执行，毒消息显式进入持久死信并验证保留/排查；有界队列选 reject-publish，发布和消费分连接。需要实测 consumer_timeout、死信可靠投递及资源告警下恢复，配置本身不能证明无消息丢失。
 

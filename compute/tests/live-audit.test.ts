@@ -332,7 +332,7 @@ it('allows only the saved task and at most eight query attempts without logging 
 });
 
 it.each([
-  ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/img2img'],
+  ['vidu-async', 'https://api.onelinkai.cloud/vidu/ent/v2/reference2image'],
   ['kling-async', 'https://api.onelinkai.cloud/kling/v1/images/generations'],
   ['seedream-sync', 'https://api.onelinkai.cloud/volc/api/v3/images/generations'],
   ['gpt-sync', 'https://api.onelinkai.cloud/v1/images/generations'],

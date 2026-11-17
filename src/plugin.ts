@@ -17,6 +17,8 @@ import { createConversationService } from './conversations/service.ts';
 import type { ConversationService } from './conversations/service.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
+import { createConversationVision } from './dsh/vision.ts';
+import * as imageOffload from '@deepseek-ai/dsh-compaction-image-offload';
 import { readProviderConfig } from './providers/config.ts';
 import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
@@ -45,7 +47,7 @@ export const Config = z.object({
   allowedOrigins: z.array(z.string()).default([]),
 });
 
-/** Mount foundation and configured account routes. No model-facing tool is authorized. */
+/** Mount foundation and configured account routes. No global model-facing tool is authorized. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // Deny before awaiting optional dependencies, including when authentication startup fails.
   denyModelTools(ctx);
@@ -103,12 +105,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         handler: authHandler,
       }),
     );
+    let conversations: ConversationService | undefined;
+    let vision: ReturnType<typeof createConversationVision> | undefined;
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
       let assets: ReturnType<typeof createAssetService> | undefined;
       try {
         const acquired = (assets = createAssetService(store, createCosStorage(assetConfig)));
-        ctx.effect(() => async () => acquired.close());
+        vision = createConversationVision((owner, id, expected, signal) =>
+          acquired.readVisionSource(owner, id, expected, signal),
+        );
+        ctx.effect(() => async () => {
+          const failures: unknown[] = [];
+          try {
+            await conversations?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await acquired.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
+        });
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -122,23 +142,41 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
+    let compute: ReturnType<typeof createComputeService> | undefined;
     if (computeConfig && assetConfig) {
       const store = await createComputeStore(assetConfig.databaseURL, imageEnabled);
-      let compute: ReturnType<typeof createComputeService> | undefined;
+      let ownedCompute: ReturnType<typeof createComputeService> | undefined;
       try {
-        const acquired = (compute = createComputeService(
-          store,
-          createCosStorage(assetConfig),
-          computeConfig,
-          imageEnabled
-            ? {
-                provider: () => providers,
-                publicKey: process.env.MIO_IMAGE_PUBLIC_KEY!,
-                keyId: process.env.MIO_IMAGE_KEY_ID!,
-              }
-            : undefined,
-        ));
-        ctx.effect(() => async () => acquired.close());
+        const acquired =
+          (compute =
+          ownedCompute =
+            createComputeService(
+              store,
+              createCosStorage(assetConfig),
+              computeConfig,
+              imageEnabled
+                ? {
+                    provider: () => providers,
+                    publicKey: process.env.MIO_IMAGE_PUBLIC_KEY!,
+                    keyId: process.env.MIO_IMAGE_KEY_ID!,
+                  }
+                : undefined,
+            ));
+        ctx.effect(() => async () => {
+          // Parent/child effects may unload concurrently: drain conversations before closing compute.
+          const failures: unknown[] = [];
+          try {
+            await conversations?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await acquired.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
+        });
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -147,11 +185,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
-        await (compute ? compute.close() : store.close());
+        await (ownedCompute ? ownedCompute.close() : store.close());
         throw error;
       }
     }
-    let conversations: ConversationService | undefined;
     if (providerConfig) {
       const store = await createProviderStore(providerConfig, imageEnabled);
       providers = createProviderService(store, providerConfig);
@@ -188,29 +225,81 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (!ctx.get('mioKernel')) throw new Error('CONVERSATION_CONFIG: DSH kernel required');
       await ctx.plugin({
         name: 'mio-conversations',
-        inject: ['mioKernel', 'llm', 'webServer'],
+        inject: ['mioKernel', 'llm', 'webServer', 'agents', 'sessions'],
         async apply(conversationCtx: Context) {
-          const store = await createConversationStore(conversationConfig.databaseURL);
           let acquired: ConversationService | undefined;
           let http: ReturnType<typeof createConversationHandler> | undefined;
+          // Keep the plugin on the parent's retained service scope. A child with its
+          // own required injections may otherwise unload when those services begin
+          // shutting down, before the parent has drained history and active turns.
+          const offload = conversationCtx.plugin({
+            name: imageOffload.name,
+            apply: imageOffload.apply,
+          });
+          // Cordis unloads sibling effects concurrently. Collect the plugin disposer and
+          // conversation drain in one effect so the projection outlives every agent.
+          conversationCtx.effect(function* () {
+            yield offload.dispose;
+            yield async () => {
+              const failures: unknown[] = [];
+              try {
+                http?.close();
+              } catch (error) {
+                failures.push(error);
+              }
+              try {
+                await acquired?.close();
+              } catch (error) {
+                failures.push(error);
+              }
+              if (failures.length) {
+                try {
+                  await offload.dispose();
+                } catch (error) {
+                  failures.push(error);
+                }
+                throw new AggregateError(failures, 'Conversation cleanup failed');
+              }
+            };
+          });
+          await offload;
+          const store = await createConversationStore(conversationConfig.databaseURL);
           try {
+            const imageTools =
+              imageEnabled && compute && providers
+                ? {
+                    listModels: (actor: { userId: string }) => providers.listImageModels(actor),
+                    inspectRoute: (actor: { userId: string }, modelRef: string) =>
+                      providers.inspectImageRoute(actor, modelRef),
+                    createImage: (
+                      actor: { userId: string },
+                      requestId: string,
+                      modelRef: string,
+                      parameters: Parameters<typeof compute.createImage>[3],
+                    ) => compute.createImage(actor, requestId, modelRef, parameters),
+                    getImage: (actor: { userId: string }, jobId: string) =>
+                      compute.getImage(actor, jobId),
+                  }
+                : undefined;
             const ownedConversations =
               (conversations =
               acquired =
                 createConversationService(
                   store,
-                  createDshConversationEngine(conversationCtx, conversationConfig),
+                  createDshConversationEngine(
+                    conversationCtx,
+                    conversationConfig,
+                    imageTools,
+                    vision,
+                  ),
                   providers,
+                  vision,
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,
               auth.identity,
               authConfig.origins,
             ));
-            conversationCtx.effect(() => async () => {
-              ownedHttp.close();
-              await ownedConversations.close();
-            });
             conversationCtx.effect(() =>
               conversationCtx.webServer.register({
                 kind: 'prefix',
@@ -219,9 +308,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               }),
             );
           } catch (error) {
-            http?.close();
-            await (acquired ? acquired.close() : store.close());
-            throw error;
+            const failures: unknown[] = [error];
+            try {
+              http?.close();
+            } catch (failure) {
+              failures.push(failure);
+            }
+            try {
+              await (acquired ? acquired.close() : store.close());
+            } catch (failure) {
+              failures.push(failure);
+            }
+            if (failures.length === 1) throw error;
+            throw new AggregateError(failures, 'Conversation startup cleanup failed');
           }
         },
       });

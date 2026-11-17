@@ -6,7 +6,7 @@
 
 每次操作使用账号 Cookie 经数据库解析，服务 Bearer 不能替代用户；猜测他人 ID 与不存在 ID 均返回 404。正文不允许自授 owner、密钥、DSH ID 或额外字段；modelRef 只在创建和一次绑定入口接受。POST/PUT 必须有认证允许的精确 Origin 和 application/json；GET 有 Origin 时也须匹配。OPTIONS 不要求登录，实际调用仍需登录。错误为 `{error:{code,message,requestId}}`，requestId 是服务端 HTTP 追踪标识，与客户端去重 ID 不混用；均禁止缓存、带 X-Content-Type-Options 与 X-Request-Id。
 
-JSON 正文总上限 16 KiB，读取期限 10 秒；文本需非空。客户端 requestId 为 1–80 个字母/数字/下划线/连字符，随本地对话保留。通用错误：400 BODY_INVALID/QUERY_INVALID，401 UNAUTHORIZED，403 ORIGIN_DENIED/ORIGIN_REQUIRED，404 CONVERSATION_NOT_FOUND/REQUEST_NOT_FOUND/NOT_FOUND，405 METHOD_NOT_ALLOWED，408 BODY_TIMEOUT，413 BODY_TOO_LARGE，415 JSON_REQUIRED，503 CONVERSATION_UNAVAILABLE。源错误、路径、凭据、系统提示、推理、工具参数/结果与 trace 均不透传。
+JSON 正文总上限 16 KiB，读取期限 10 秒；文本需非空。客户端 requestId 为 1–80 个字母/数字/下划线/连字符，随本地对话保留。通用错误：400 BODY_INVALID/QUERY_INVALID，401 UNAUTHORIZED，403 ORIGIN_DENIED/ORIGIN_REQUIRED，404 CONVERSATION_NOT_FOUND/REQUEST_NOT_FOUND/NOT_FOUND，405 METHOD_NOT_ALLOWED，408 BODY_TIMEOUT，413 BODY_TOO_LARGE，415 JSON_REQUIRED，503 CONVERSATION_UNAVAILABLE。源错误、路径、凭据、系统提示、推理、原始工具调用参数、目录探测内部结果、工具拒绝/异常详情与 trace 均不透传。
 
 BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVIDER_DISABLED/PROVIDER_AUTH_REJECTED/MODEL_CATALOG_NOT_DISCOVERED/MODEL_NOT_FOUND/MODEL_REMOVED/LEGACY_MODEL_REF_INVALID/ADAPTER_PENDING/MODEL_DISABLED/MODEL_DEFAULT_NOT_SET/MODEL_DEFAULT_INVALID；解密失败为 503 PROVIDER_CREDENTIAL_UNAVAILABLE。稳定引用来自本人[动态模型目录](providers.md#get-apiv1providersonelinkmodels)，兼容旧分类引用；当前目录不可用不回退其他模型或 Key。
 
@@ -40,7 +40,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`afterSeq`（默认 -1，可原样复用空页/末页 cursor）、`limit`（默认 20、1–100）。
 
-成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}` 或 `{seq,role:'status',status}`。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本与终态，包括无文本取消及旧中断；瞬态 chunk 不保证存在。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
+成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
 
 错误：损坏/不可读日志返回脱敏 503，不伪装空历史；其余见本域共同约定。
 
@@ -50,13 +50,15 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 身份：当前登录用户与对话 owner；受理后登录失效仍允许该轮结算。
 
-输入：`{requestId,text}`，普通输入经官方 followup；不开放 steer。
+输入：`{requestId,text,imageAssetIds?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
 
 成功：202 原接收回执 `{conversationId,requestId,status,error?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
 
-错误：409 CONVERSATION_BUSY/REQUEST_ID_CONFLICT/CONVERSATION_UNKNOWN/CONVERSATION_MODEL_REQUIRED，以及共同约定的 BYOK 资格/解密错误；拒绝时不新增 fresh 接收。已有同 ID 原回执早于当前目录、启停、默认和解密；摘要不含可变化的凭据/目录/适配版本。接收 ACK/存储未知不重发，按原 ID 查询。
+错误：409 CONVERSATION_BUSY/REQUEST_ID_CONFLICT/CONVERSATION_UNKNOWN/CONVERSATION_MODEL_REQUIRED/MODEL_MODALITY_UNSUPPORTED/MODEL_VISION_CHANGED，以及共同约定的 BYOK 资格/解密错误；无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码/格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。拒绝时不新增 fresh 接收。已有同 ID 原回执早于当前目录、启停、默认、解密和资产检查；摘要不含可变化的凭据/目录/适配版本。接收 ACK/存储未知不重发，按原 ID 查询。
 
-副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求，生产工具仍全部拒绝。
+副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；仅当 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
+
+视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
 
 ## PUT /api/v1/conversations/:id/model
 
@@ -88,11 +90,11 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。先完成归属检查，再安装 listener 后重读基线；交接期间事件有界缓冲，基线可承接已结束请求的终态。事件按 requestId 关联，终态回执优先于较早中间状态；重连查持久历史/回执，不承诺早先瞬态 chunk 重放。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。先完成归属检查，再安装 listener 后重读基线；交接期间事件有界缓冲，基线可承接已结束请求的终态。事件按 requestId 关联，终态回执优先于较早中间状态；重连查持久历史/回执，不承诺早先瞬态 chunk 重放。
 
 错误：响应前遵循本域错误体；建流后只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
 
-副作用：持有临时 listener 和登录复核 timer；断开清理它们，不隐式取消已受理执行，不授权模型工具。
+副作用：持有临时 listener 和登录复核 timer；断开清理它们，不隐式取消已受理执行，建流本身不授予模型工具权限。
 
 ## POST /api/v1/conversations/:id/cancel
 

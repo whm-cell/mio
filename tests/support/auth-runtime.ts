@@ -19,6 +19,7 @@ export async function packedAuthRuntime(
     conversations?: boolean;
     modelFixture?: boolean;
     onelinkFixture?: boolean;
+    visionCosOrigin?: string;
     providerMasterKey?: string;
     providerKeyId?: string;
   } = {},
@@ -49,18 +50,20 @@ export async function packedAuthRuntime(
   const home = join(directory, 'home');
   await prepareProfile(home, packed);
   const observationsPath = join(directory, 'model-fixture/requests.jsonl');
-  if (options.modelFixture || options.onelinkFixture) {
+  if (options.modelFixture || options.onelinkFixture || options.visionCosOrigin) {
     const fixture = join(directory, 'model-fixture');
     await mkdir(fixture);
     await cp(
       resolve(
-        options.onelinkFixture
-          ? 'tests/onelink/profile-plugin.ts'
-          : 'tests/conversations/conversations-model-plugin.ts',
+        options.visionCosOrigin
+          ? 'tests/conversations/vision-profile-overlay.ts'
+          : options.onelinkFixture
+            ? 'tests/onelink/profile-plugin.ts'
+            : 'tests/conversations/conversations-model-plugin.ts',
       ),
       join(fixture, 'index.ts'),
     );
-    if (options.onelinkFixture)
+    if (options.onelinkFixture || options.visionCosOrigin)
       await cp(resolve('tests/onelink/fixture.ts'), join(fixture, 'fixture.ts'));
     await writeFile(
       join(fixture, 'package.json'),
@@ -102,6 +105,31 @@ export async function packedAuthRuntime(
   return {
     origin,
     nativeLogRoot: join(home, 'sessions'),
+    async blockVisionHistory() {
+      await writeFile(join(directory, 'model-fixture/block-history'), 'block');
+    },
+    async visionHistoryMarker(name: 'entered' | 'completed') {
+      return readFile(join(directory, `model-fixture/history-${name}`), 'utf8').then(
+        () => true,
+        () => false,
+      );
+    },
+    async releaseVisionHistory() {
+      await writeFile(join(directory, 'model-fixture/release-history'), 'release');
+    },
+    async visionHistoryError() {
+      return readFile(join(directory, 'model-fixture/history-error'), 'utf8').catch(() => '');
+    },
+    async visionHistoryState() {
+      return Promise.all(
+        ['history-state-before', 'history-state'].map((name) =>
+          readFile(join(directory, `model-fixture/${name}`), 'utf8').catch(() => ''),
+        ),
+      );
+    },
+    logs() {
+      return output;
+    },
     async onelinkPaused() {
       return readFile(join(directory, 'model-fixture/paused'), 'utf8').then(
         () => true,
@@ -152,6 +180,16 @@ export async function packedAuthRuntime(
           MIO_REDIS_URL: redisURL,
           MIO_REDIS_NAMESPACE: namespace,
           ...(options.conversations ? { MIO_CONVERSATIONS_DATABASE_URL: databaseURL } : {}),
+          ...(options.visionCosOrigin
+            ? {
+                MIO_ASSETS_DATABASE_URL: databaseURL,
+                MIO_COS_BUCKET: 'mio-test-1234567890',
+                MIO_COS_REGION: 'ap-shanghai',
+                MIO_COS_SECRET_ID: 'synthetic-id',
+                MIO_COS_SECRET_KEY: 'synthetic-key',
+                MIO_TEST_COS_ORIGIN: options.visionCosOrigin,
+              }
+            : {}),
           ...(options.providerMasterKey
             ? {
                 MIO_PROVIDERS_DATABASE_URL: databaseURL,

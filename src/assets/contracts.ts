@@ -1,6 +1,7 @@
 import { HttpError } from '@mio/foundation/errors';
 
 export const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
+export const MAX_VISION_SOURCE_BYTES = 10 * 1024 * 1024;
 
 export interface AssetPrincipal {
   userId: string;
@@ -11,6 +12,7 @@ export interface AssetObjectStore {
   uploadUrl(key: string, size: number): string;
   downloadUrl(key: string): string;
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
+  readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   copy(source: string, target: string, etag: string): Promise<void>;
   delete(key: string): Promise<void>;
 }
@@ -26,5 +28,13 @@ export type AssetErrorCode =
   | 'ASSET_SOURCE_CHANGED'
   | 'ASSET_BUSY'
   | 'ASSET_FINALIZE_SUPERSEDED';
+
+export interface VisionSource {
+  readonly assetId: string;
+  readonly contentType: 'image/png' | 'image/jpeg' | 'image/webp';
+  readonly data: Uint8Array;
+  readonly etagDigest: string;
+  readonly sourceDigest: string;
+}
 
 export class AssetError extends HttpError<AssetErrorCode> {}

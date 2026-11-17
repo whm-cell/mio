@@ -486,7 +486,12 @@ export async function checkSource(root: string, files: readonly string[], harnes
             beneath(localTarget, 'src/dsh')
           )
             errors.push(`DSH_BOUNDARY ${file}: business modules must not import src/dsh`);
-          if (localTarget === 'src/plugin.ts' && file !== localTarget)
+          if (
+            (localTarget === 'src/plugin.ts' &&
+              file !== localTarget &&
+              file !== 'src/profile.ts') ||
+            (localTarget === 'src/profile.ts' && file !== localTarget)
+          )
             errors.push(`ADAPTER_DIRECTION ${file}: ${localTarget}`);
           if (file === 'src/contracts.ts')
             errors.push(`CONTRACT_DIRECTION ${file}: contracts must be runtime-independent`);

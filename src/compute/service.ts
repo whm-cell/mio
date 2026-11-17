@@ -7,6 +7,7 @@ import {
   imageCommandCredentialBinding,
   imageQueryCredentialBinding,
   isImageDriver,
+  isValidImageAssetObjectKey,
   parseImageCommand,
   validateImageInputByRoute,
   validateImageRouteConfig,
@@ -16,7 +17,11 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
 import { createId, isUuidV4 } from '@mio/foundation/identifiers';
-import { COMPUTE_MAX_MEDIA_BYTES, IMAGE_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
+import {
+  COMPUTE_MAX_MEDIA_BYTES,
+  IMAGE_MAX_MESSAGE_BYTES,
+  IMAGE_USER_QUOTA,
+} from '@mio/compute-contracts';
 import type { ImageCommandV1 } from '@mio/compute-contracts';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
@@ -26,6 +31,8 @@ import { ComputeError } from './errors.ts';
 import type { ComputeStore, JobRow } from './store.ts';
 
 const log = createLogger('app', 'compute');
+const IMAGE_OUTBOX_BATCH = IMAGE_USER_QUOTA;
+const VIDEO_OUTBOX_BATCH = 10;
 
 function view(job: JobRow) {
   return {
@@ -54,9 +61,11 @@ export function createComputeService(
   let closing: Promise<void> | undefined;
   let broker: ComputeBroker | undefined;
   let polling: Promise<void> | undefined;
+  let pollRequested = false;
   let retryAt = 0;
   let retryDelay = 1000;
   const active = new Set<Promise<unknown>>();
+  const disconnecting = new Set<Promise<void>>();
   const stop = new AbortController();
   const admit = <T>(run: () => Promise<T>): Promise<T> => {
     if (stopping) throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_UNAVAILABLE');
@@ -127,10 +136,23 @@ export function createComputeService(
     });
   const disconnect = (instance: ComputeBroker) => {
     if (broker === instance) broker = undefined;
-    void instance.close().catch(() => {});
+    const task = instance.close().catch(() => {});
+    disconnecting.add(task);
+    void task.finally(() => disconnecting.delete(task));
   };
   const poll = () => {
-    if (stopping || polling || epochMs() < retryAt) return;
+    if (stopping) {
+      pollRequested = false;
+      return;
+    }
+    if (polling) {
+      pollRequested = true;
+      return;
+    }
+    if (epochMs() < retryAt) {
+      pollRequested = false;
+      return;
+    }
     polling = admit(async () => {
       if (!broker) {
         const acquired = await ComputeBroker.connect(
@@ -172,6 +194,9 @@ export function createComputeService(
                     throw Object.assign(error, { permanent: true });
                   throw error;
                 }
+                if (result.state === 'submitted') {
+                  wakePoll();
+                }
                 if (accepted && result.state === 'completed') {
                   const provider = imageConfig?.provider();
                   const { admitted } = accepted;
@@ -211,8 +236,9 @@ export function createComputeService(
       const instance = broker;
       if (!instance || stopping) return;
       if (store.imagesAvailable) {
-        const image = await store.imagePending();
-        if (image) {
+        for (let count = 0; count < IMAGE_OUTBOX_BATCH && !stopping; count++) {
+          const image = await store.imagePending();
+          if (!image) break;
           let outgoing = image;
           if (image.type === 'image.query') {
             if (!image.queryDeadline) {
@@ -221,7 +247,7 @@ export function createComputeService(
                 image.messageId,
                 'IMAGE_CREDENTIAL_UNAVAILABLE',
               );
-              return;
+              continue;
             }
             let queryCredential = image.queryCredential;
             if (!queryCredential) {
@@ -241,7 +267,7 @@ export function createComputeService(
                   image.messageId,
                   'IMAGE_CREDENTIAL_UNAVAILABLE',
                 );
-                return;
+                continue;
               }
             }
             const prepared = await store.imagePrepareQuery(
@@ -250,29 +276,37 @@ export function createComputeService(
               image.queryDeadline,
               queryCredential,
             );
-            if (!prepared) return;
+            if (!prepared) continue;
             outgoing = prepared;
             if (Buffer.byteLength(JSON.stringify(outgoing), 'utf8') > IMAGE_MAX_MESSAGE_BYTES) {
               await store.imageQueryUnavailable(image.jobId, image.messageId, 'IMAGE_QUERY_FAILED');
-              return;
+              continue;
             }
           }
-          await instance.publish(outgoing);
-          await store.imageSent(image.jobId, image.messageId);
+          try {
+            await instance.publish(outgoing);
+            await store.imageSent(image.jobId, image.messageId);
+          } catch (error) {
+            disconnect(instance);
+            throw error;
+          }
         }
       }
-      const item = await store.claim();
-      if (!item) return;
-      try {
-        await instance.publish(item.command);
-        await store.sent(item.command, item.lease);
-      } catch (error) {
-        await store.release(item.command.messageId, item.lease);
-        disconnect(instance);
-        throw error;
+      for (let count = 0; count < VIDEO_OUTBOX_BATCH && !stopping; count++) {
+        const item = await store.claim();
+        if (!item) break;
+        try {
+          await instance.publish(item.command);
+          await store.sent(item.command, item.lease);
+        } catch (error) {
+          await store.release(item.command.messageId, item.lease);
+          disconnect(instance);
+          throw error;
+        }
       }
     })
       .catch(() => {
+        pollRequested = false;
         if (!stopping) {
           log.error('COMPUTE_BROKER_RETRY');
           retryAt = epochMs() + retryDelay;
@@ -281,14 +315,28 @@ export function createComputeService(
       })
       .finally(() => {
         polling = undefined;
+        if (pollRequested && !stopping && epochMs() >= retryAt) {
+          pollRequested = false;
+          poll();
+        } else {
+          pollRequested = false;
+        }
       });
+  };
+  const wakePoll = () => {
+    if (stopping || epochMs() < retryAt) return;
+    if (polling) {
+      pollRequested = true;
+      return;
+    }
+    poll();
   };
   const timer = setInterval(poll, 1000);
   timer.unref();
   poll();
   return {
     createImage(
-      actor: AssetPrincipal,
+      actor: { readonly userId: string; readonly sessionId?: string },
       requestId: string,
       modelRef: string,
       parameters: ImageRequestParameters,
@@ -364,11 +412,12 @@ export function createComputeService(
           if (!isUuidV4(assetId))
             throw new ComputeError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
           const row = await store.imageInput(actor.userId, assetId);
+          const expectedPrefix =
+            row?.asset_kind === 'derived' ? 'mio/derived/' : `mio/raw/${assetId}/`;
           if (
             !row ||
-            !row.raw_key.startsWith(`mio/raw/${assetId}/`) ||
-            !isUuidV4(row.raw_key.slice(`mio/raw/${assetId}/`.length)) ||
-            !['image/png', 'image/jpeg', 'image/webp'].includes(row.content_type) ||
+            !row.raw_key.startsWith(expectedPrefix) ||
+            !isValidImageAssetObjectKey(assetId, row.raw_key, row.content_type) ||
             (mask && row.content_type !== 'image/png')
           )
             throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
@@ -540,10 +589,11 @@ export function createComputeService(
                 : 'image.generate',
           profile: snapshot.profile,
         });
+        wakePoll();
         return store.imageGet(actor.userId, id);
       });
     },
-    getImage(actor: AssetPrincipal, id: string) {
+    getImage(actor: { readonly userId: string; readonly sessionId?: string }, id: string) {
       return admit(() => store.imageGet(actor.userId, id));
     },
     recoverImage(actor: AssetPrincipal, id: string) {
@@ -551,6 +601,7 @@ export function createComputeService(
         if (!store.imagesAvailable)
           throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
         await store.imageRecover(actor.userId, id);
+        wakePoll();
         return store.imageGet(actor.userId, id);
       });
     },
@@ -590,6 +641,7 @@ export function createComputeService(
           size,
           object.etag,
         );
+        if (created.created) wakePoll();
         return { created: created.created, job: view(created.job) };
       });
     },
@@ -604,11 +656,13 @@ export function createComputeService(
     close(): Promise<void> {
       if (closing) return closing;
       stopping = true;
+      pollRequested = false;
       clearInterval(timer);
       closing = (async () => {
         const deadline = setTimeout(() => stop.abort(), 5000);
         try {
           if (broker) await broker.close();
+          if (disconnecting.size > 0) await Promise.allSettled([...disconnecting]);
           await Promise.allSettled([...active]);
           await store.close();
         } finally {

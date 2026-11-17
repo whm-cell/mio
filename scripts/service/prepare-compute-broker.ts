@@ -234,9 +234,11 @@ try {
       )
         throw new Error('BROKER_QUEUE_MISMATCH');
       if (
-        index < 2 &&
+        index < 3 &&
         (args['x-dead-letter-strategy'] !== 'at-least-once' ||
-          args['x-dead-letter-exchange'] !== exchanges[index + 2])
+          args['x-dead-letter-exchange'] !== exchanges[index + 2] ||
+          args['x-dead-letter-routing-key'] !==
+            ['transcode.dead.v1', 'image.dead.v1', 'transcode.result.dead.v1'][index])
       )
         throw new Error('BROKER_DEAD_LETTER_MISMATCH');
     }

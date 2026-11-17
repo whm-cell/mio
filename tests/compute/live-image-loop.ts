@@ -10,22 +10,26 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
 import { join, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { Pool } from 'pg';
 import {
   COMMAND_EXCHANGE,
-  COMMAND_QUEUE,
-  COMMAND_ROUTING_KEY,
+  IMAGE_COMMAND_QUEUE,
+  IMAGE_COMMAND_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  imageOutputIndex,
+  isValidImageAssetObjectKey,
 } from '@mio/compute-contracts';
-import type { ImageCommandV1, ImageResultV1 } from '@mio/compute-contracts';
+import type { ImageAssetRef, ImageCommandV1, ImageResultV1 } from '@mio/compute-contracts';
 import { connect } from 'amqplib';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
@@ -36,10 +40,21 @@ import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.t
 
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
-assert.equal(process.env.MIO_RUN_LIVE_IMAGE, 'yes', 'LIVE_OPT_IN');
-const SCENARIOS = ['vidu-async', 'kling-async', 'seedream-sync', 'gpt-sync', 'gpt-edit'] as const;
+const isMain = Boolean(
+  process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href,
+);
+const SCENARIOS = [
+  'vidu-async',
+  'kling-async',
+  'seedream-sync',
+  'gpt-sync',
+  'gpt-edit',
+  'seedream-45-sync',
+  'seedream-50-lite-sync',
+  'kling-omni-async',
+] as const;
 type Scenario = (typeof SCENARIOS)[number];
-function parseCliArguments(argv: string[]) {
+function parseCliArguments(argv: string[], envScenario: string | undefined) {
   let cliScenario: string | undefined;
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -54,7 +69,6 @@ function parseCliArguments(argv: string[]) {
       positional.push(arg);
     }
   }
-  const envScenario = process.env.MIO_LIVE_IMAGE_SCENARIO;
   assert(!cliScenario || !envScenario || cliScenario === envScenario, 'LIVE_ARGUMENTS');
   const raw = cliScenario ?? (envScenario && envScenario.length ? envScenario : undefined);
   const selected = raw ?? 'vidu-async';
@@ -65,24 +79,44 @@ function parseCliArguments(argv: string[]) {
     positional,
   };
 }
-const {
-  scenario,
-  explicitScenario,
-  positional: [phase, runArgument, first, second, candidate, ...extra],
-} = parseCliArguments(process.argv.slice(2));
-assert(
-  ['prepare', 'execute'].includes(phase ?? '') &&
-    runArgument &&
-    first &&
-    second &&
-    candidate &&
-    !extra.length,
-  'LIVE_ARGUMENTS',
-);
-assert.match(candidate, /^[a-f0-9]{64}$/, 'LIVE_CANDIDATE');
+export function parseLiveInvocation(
+  argv: string[],
+  optIn: string | undefined,
+  envScenario: string | undefined,
+) {
+  assert.equal(optIn, 'yes', 'LIVE_OPT_IN');
+  const { scenario, explicitScenario, positional } = parseCliArguments(argv, envScenario);
+  const [phase, runArgument, first, second, candidate, ...extra] = positional;
+  assert(
+    ['prepare', 'execute'].includes(phase ?? '') &&
+      runArgument &&
+      first &&
+      second &&
+      candidate &&
+      !extra.length,
+    'LIVE_ARGUMENTS',
+  );
+  assert.match(candidate, /^[a-f0-9]{64}$/, 'LIVE_CANDIDATE');
+  const directory = resolve(runArgument);
+  assert(directory.startsWith(`${resolve('.runtime')}${sep}`), 'LIVE_PRIVATE_DIRECTORY');
+  return { scenario, explicitScenario, phase, runArgument, first, second, candidate, directory };
+}
+const { scenario, explicitScenario, phase, first, second, candidate, directory } = isMain
+  ? parseLiveInvocation(
+      process.argv.slice(2),
+      process.env.MIO_RUN_LIVE_IMAGE,
+      process.env.MIO_LIVE_IMAGE_SCENARIO,
+    )
+  : {
+      scenario: 'vidu-async' as Scenario,
+      explicitScenario: false,
+      phase: '',
+      first: '',
+      second: '',
+      candidate: '',
+      directory: resolve('.'),
+    };
 const project = resolve('.');
-const directory = resolve(runArgument);
-assert(directory.startsWith(`${resolve('.runtime')}${sep}`), 'LIVE_PRIVATE_DIRECTORY');
 const originPath = join(directory, 'state.json');
 const history = join(directory, 'events.jsonl');
 type Environment = Record<string, string>;
@@ -95,6 +129,7 @@ type Infrastructure = {
 };
 type State = {
   candidate: string;
+  artifactsSha256: string;
   scenario?: Scenario;
   origin: string;
   a: Environment;
@@ -102,8 +137,208 @@ type State = {
   owner: { email: string; password: string; userId: string };
   other: { email: string; password: string };
   modelRef: string;
+  modelId: string;
   infrastructure: string;
 };
+type LiveModel = {
+  modelId: string;
+  modelRef: string;
+  discovered: boolean;
+  credentialVersion: number;
+  catalogVersion: number;
+};
+export function selectLiveModel(
+  selectedScenario: Scenario,
+  items: LiveModel[],
+  credentialVersion: number,
+  catalogVersion: number,
+) {
+  const selected = items.find((item) => {
+    if (!item.discovered) return false;
+    switch (selectedScenario) {
+      case 'vidu-async':
+        return item.modelId === 'image-vidu-q2';
+      case 'kling-async':
+        return item.modelId === 'image-kling-v3';
+      case 'kling-omni-async':
+        return item.modelId === 'image-kling-v3-omni';
+      case 'seedream-sync':
+        return item.modelId === 'doubao-seedream-4.0';
+      case 'seedream-45-sync':
+        return item.modelId === 'doubao-seedream-4.5';
+      case 'seedream-50-lite-sync':
+        return item.modelId === 'doubao-seedream-5.0-lite';
+      case 'gpt-sync':
+      case 'gpt-edit':
+        return item.modelId === 'gpt-image-1' || item.modelId.startsWith('gpt-image-');
+    }
+  });
+  assert(
+    selected &&
+      selected.credentialVersion === credentialVersion &&
+      selected.catalogVersion === catalogVersion,
+    'LIVE_MODEL_NOT_FOUND',
+  );
+  return selected;
+}
+function isAsyncScenario(selectedScenario: Scenario) {
+  return ['vidu-async', 'kling-async', 'kling-omni-async'].includes(selectedScenario);
+}
+function profileForScenario(selectedScenario: Scenario) {
+  if (selectedScenario === 'vidu-async') return 'vidu-images';
+  if (selectedScenario === 'kling-async' || selectedScenario === 'kling-omni-async')
+    return 'kling-images';
+  if (selectedScenario.startsWith('seedream-')) return 'volcengine-ark-images';
+  return 'openai-images';
+}
+export function liveRouteDeclaration(selectedScenario: Scenario, modelId: string) {
+  if (selectedScenario === 'vidu-async') {
+    const base = findFixtureRoute('image-vidu-q2', 'image.generate');
+    return {
+      ...base,
+      rawModelId: modelId,
+      sourceKind: 'protocol-reference',
+      source: 'https://docs.onelinkai.cloud/8653257m0',
+      sourceVersion: '2026-11-14',
+      paramSpec: {
+        ...base.paramSpec!,
+        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+    };
+  }
+  if (selectedScenario === 'kling-async' || selectedScenario === 'kling-omni-async') {
+    const base = findFixtureRoute(
+      selectedScenario === 'kling-async' ? 'image-kling-v3' : 'image-kling-v3-omni',
+      'image.generate',
+    );
+    return {
+      ...base,
+      rawModelId: modelId,
+      paramSpec: {
+        ...base.paramSpec!,
+        maxN: 1,
+        ...(selectedScenario === 'kling-async'
+          ? { maxReferenceImages: 0, allowGenerateReferences: false }
+          : {}),
+        async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
+      },
+      ...(selectedScenario === 'kling-async' ? { requestDefaults: {} } : {}),
+    };
+  }
+  if (selectedScenario.startsWith('seedream-')) {
+    const base = findFixtureRoute(
+      selectedScenario === 'seedream-45-sync'
+        ? 'doubao-seedream-4.5'
+        : selectedScenario === 'seedream-50-lite-sync'
+          ? 'doubao-seedream-5.0-lite'
+          : 'doubao-seedream-4.0',
+      'image.generate',
+    );
+    return {
+      ...base,
+      rawModelId: modelId,
+      sourceKind: 'protocol-reference',
+      source: 'https://docs.onelinkai.cloud/8655248m0',
+      sourceVersion: '2026-11-14',
+    };
+  }
+  const base = findFixtureRoute('gpt-image-2', 'image.generate');
+  return {
+    ...base,
+    rawModelId: modelId,
+    sourceKind: 'protocol-reference',
+    source: 'https://docs.onelinkai.cloud/8882392m0',
+    sourceVersion: '2026-11-14',
+    ...(selectedScenario === 'gpt-edit'
+      ? { paramSpec: { ...base.paramSpec!, maxReferenceImages: 4 } }
+      : {
+          editPath: null,
+          paramSpec: {
+            ...base.paramSpec!,
+            supportedOperations: ['generate'],
+            maxReferenceImages: 0,
+            allowMaskPng: false,
+          },
+        }),
+  };
+}
+export function liveImageParameters(selectedScenario: Scenario, referenceAssetId?: string) {
+  const prompt = 'A simple blue square on a white background.';
+  if (selectedScenario === 'vidu-async') return { prompt, async: true, size: '1080p' };
+  if (selectedScenario === 'kling-async') return { prompt, async: true };
+  if (selectedScenario === 'seedream-45-sync' || selectedScenario === 'kling-omni-async') {
+    assert(referenceAssetId, 'LIVE_REFERENCE_REQUIRED');
+    return {
+      prompt,
+      operation: 'generate',
+      imageAssetIds: [referenceAssetId],
+      n: 1,
+      ...(selectedScenario === 'seedream-45-sync' ? { size: '2K' } : { async: true }),
+    };
+  }
+  if (selectedScenario === 'seedream-50-lite-sync')
+    return { prompt, n: 2, size: '2K', output_format: 'png' };
+  if (selectedScenario === 'gpt-edit') {
+    assert(referenceAssetId, 'LIVE_REFERENCE_REQUIRED');
+    return {
+      prompt,
+      operation: 'edit',
+      imageAssetIds: [referenceAssetId],
+      n: 1,
+      size: '1024x1024',
+    };
+  }
+  return { prompt, n: 1, size: '1024x1024' };
+}
+export function assertFrozenScenario(
+  command: ImageCommandV1,
+  selectedScenario: Scenario,
+  modelId: string,
+  ownerId: string,
+  jobId: string,
+  referenceAsset?: ImageAssetRef,
+) {
+  const parameters = liveImageParameters(selectedScenario, referenceAsset?.assetId);
+  const declaration = liveRouteDeclaration(selectedScenario, modelId);
+  const input = command.input;
+  const references = input.images ?? (input.image ? [input.image] : []);
+  const expectedReferences = referenceAsset ? [referenceAsset] : [];
+  assert(
+    command.type === 'image.request' &&
+      command.jobId === jobId &&
+      command.ownerId === ownerId &&
+      Boolean(command.credential) &&
+      command.profile === profileForScenario(selectedScenario) &&
+      command.route.driver === command.profile &&
+      command.route.submitPath === declaration.submitPath &&
+      (command.route.editPath ?? null) === (declaration.editPath ?? null) &&
+      (command.route.queryPathTemplate ?? null) === (declaration.queryPathTemplate ?? null) &&
+      command.route.requestDefaults.referenceFormat ===
+        declaration.requestDefaults?.referenceFormat &&
+      (!isAsyncScenario(selectedScenario) || command.route.paramSpec.async?.maxQueries === 8) &&
+      input.model === modelId &&
+      input.prompt === parameters.prompt &&
+      input.operation === ('operation' in parameters ? parameters.operation : undefined) &&
+      input.size === ('size' in parameters ? parameters.size : undefined) &&
+      input.output_format ===
+        ('output_format' in parameters ? parameters.output_format : undefined) &&
+      input.async === ('async' in parameters ? parameters.async : undefined) &&
+      (input.n ?? 1) === ('n' in parameters ? parameters.n : 1) &&
+      !(input.image && input.images) &&
+      references.length === expectedReferences.length &&
+      references.every((reference, index) => {
+        const expected = expectedReferences[index];
+        return (
+          expected?.assetId === reference.assetId &&
+          expected.key === reference.key &&
+          expected.sizeBytes === reference.sizeBytes &&
+          expected.etag === reference.etag &&
+          expected.contentType === reference.contentType
+        );
+      }),
+    'LIVE_FROZEN_MISMATCH',
+  );
+}
 function privateEnv(path: string): Environment {
   const stat = lstatSync(path);
   assert(stat.isFile() && !stat.isSymbolicLink() && !(stat.mode & 0o077), 'LIVE_PRIVATE_ENV');
@@ -138,6 +373,77 @@ function record(event: string, data: Record<string, unknown> = {}) {
 }
 function fileHash(path: string) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+const LIVE_ARTIFACT_PATHS = [
+  'tests/compute/live-image-loop.ts',
+  'tests/compute/live-image-audit.ts',
+  'tests/providers/fixtures/onelink-routes-fixture.ts',
+  'scripts/service/profile.ts',
+  'scripts/service/import-provider-route.ts',
+  'scripts/service/migrate-auth.ts',
+  'scripts/service/migrate-assets.ts',
+  'scripts/service/migrate-compute.ts',
+  'scripts/service/migrate-providers.ts',
+  'src/auth/config.ts',
+  'src/assets/config.ts',
+  'src/assets/schema.ts',
+  'src/compute/schema.ts',
+  'src/providers/config.ts',
+  'src/providers/contracts.ts',
+  'src/providers/credentials.ts',
+  'src/providers/schema.ts',
+  'src/providers/onelink/router.ts',
+  'compute/src/adapters/media.ts',
+  'package.json',
+  'compute/package.json',
+  'contracts/compute/package.json',
+  'packages/foundation/package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  'cordis.patch.yml',
+  'dist',
+  'compute/dist',
+  'contracts/compute/dist',
+  'packages/foundation/dist',
+] as const;
+export function captureLiveArtifacts(root: string, paths: readonly string[] = LIVE_ARTIFACT_PATHS) {
+  const files: { path: string; sha256: string }[] = [];
+  function visit(relative: string) {
+    const full = resolve(root, relative);
+    assert(full.startsWith(`${resolve(root)}${sep}`), 'LIVE_ARTIFACT_PATH');
+    const stat = lstatSync(full);
+    assert(!stat.isSymbolicLink(), 'LIVE_ARTIFACT_PATH');
+    if (stat.isDirectory()) {
+      const entries = readdirSync(full).sort();
+      assert(entries.length > 0, 'LIVE_ARTIFACT_PATH');
+      for (const name of entries) {
+        assert(name !== 'node_modules', 'LIVE_ARTIFACT_PATH');
+        visit(`${relative}/${name}`);
+      }
+    } else {
+      assert(stat.isFile(), 'LIVE_ARTIFACT_PATH');
+      files.push({ path: relative, sha256: fileHash(full) });
+    }
+  }
+  for (const path of paths) visit(path);
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return {
+    version: 1 as const,
+    sha256: createHash('sha256').update(JSON.stringify(files)).digest('hex'),
+    files,
+  };
+}
+export function assertLiveArtifacts(
+  expected: string,
+  root: string,
+  paths: readonly string[] = LIVE_ARTIFACT_PATHS,
+) {
+  try {
+    assert(/^[a-f0-9]{64}$/.test(expected));
+    assert.equal(captureLiveArtifacts(root, paths).sha256, expected);
+  } catch {
+    throw new Error('LIVE_ARTIFACT_CHANGED');
+  }
 }
 function save(path: string, value: unknown, onceOnly = false) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, {
@@ -321,7 +627,9 @@ async function providerKey(path: string) {
   }
 }
 async function prepare() {
+  const artifacts = captureLiveArtifacts(project);
   mkdirSync(directory, { recursive: false, mode: 0o700 });
+  save(join(directory, 'runtime-artifacts.json'), artifacts, true);
   const infrastructure = resolve(first!);
   const manifest = infrastructureManifest(infrastructure);
   const pg = privateEnv(join(infrastructure, 'postgres.env'));
@@ -409,6 +717,7 @@ async function prepare() {
   record('prepare-start', {
     candidate,
     scenario,
+    artifactsSha256: artifacts.sha256,
     runnerSha256: fileHash('tests/compute/live-image-loop.ts'),
     auditSha256: fileHash('tests/compute/live-image-audit.ts'),
     appEntrySha256: fileHash('dist/plugin.js'),
@@ -512,96 +821,15 @@ async function prepare() {
       },
       true,
     );
-    const selected = models.items.find(
-      (item) =>
-        item.discovered &&
-        (scenario === 'vidu-async'
-          ? item.modelId === 'image-vidu-q2'
-          : scenario === 'kling-async'
-            ? item.modelId === 'image-kling-v3'
-            : scenario === 'seedream-sync'
-              ? item.modelId === 'doubao-seedream-4.0'
-              : item.modelId === 'gpt-image-1' || item.modelId.startsWith('gpt-image-')),
-    );
-    assert(
-      selected &&
-        selected.credentialVersion === models.provider.credentialVersion &&
-        selected.catalogVersion === models.provider.catalog.version,
-      'LIVE_MODEL_NOT_FOUND',
+    const selected = selectLiveModel(
+      scenario,
+      models.items,
+      models.provider.credentialVersion,
+      models.provider.catalog.version,
     );
     const declaration = join(directory, 'declaration.json');
-    const expectedProfile =
-      scenario === 'vidu-async'
-        ? 'vidu-images'
-        : scenario === 'kling-async'
-          ? 'kling-images'
-          : scenario === 'seedream-sync'
-            ? 'volcengine-ark-images'
-            : 'openai-images';
-    const viduBase = findFixtureRoute('image-vidu-q2', 'image.generate');
-    const klingBase = findFixtureRoute('image-kling-v3', 'image.generate');
-    const seedreamBase = findFixtureRoute('doubao-seedream-4.0', 'image.generate');
-    const gptBase = findFixtureRoute('gpt-image-2', 'image.generate');
-    save(
-      declaration,
-      scenario === 'vidu-async'
-        ? {
-            ...viduBase,
-            rawModelId: selected.modelId,
-            sourceKind: 'protocol-reference',
-            source: 'https://docs.onelinkai.cloud/8653257m0',
-            sourceVersion: '2026-11-14',
-            paramSpec: {
-              ...viduBase.paramSpec!,
-              async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-            },
-          }
-        : scenario === 'kling-async'
-          ? {
-              ...klingBase,
-              rawModelId: selected.modelId,
-              paramSpec: {
-                ...klingBase.paramSpec!,
-                maxN: 1,
-                maxReferenceImages: 0,
-                allowGenerateReferences: false,
-                async: { operations: ['generate'], maxQueries: 8, maxAgeSeconds: 600 },
-              },
-              requestDefaults: {},
-            }
-          : scenario === 'seedream-sync'
-            ? {
-                ...seedreamBase,
-                rawModelId: selected.modelId,
-                sourceKind: 'protocol-reference',
-                source: 'https://docs.onelinkai.cloud/8655248m0',
-                sourceVersion: '2026-11-14',
-              }
-            : {
-                ...gptBase,
-                rawModelId: selected.modelId,
-                sourceKind: 'protocol-reference',
-                source: 'https://docs.onelinkai.cloud/8882392m0',
-                sourceVersion: '2026-11-14',
-                ...(scenario === 'gpt-edit'
-                  ? {
-                      paramSpec: {
-                        ...gptBase.paramSpec!,
-                        maxReferenceImages: 4,
-                      },
-                    }
-                  : {
-                      editPath: null,
-                      paramSpec: {
-                        ...gptBase.paramSpec!,
-                        supportedOperations: ['generate'],
-                        maxReferenceImages: 0,
-                        allowMaskPng: false,
-                      },
-                    }),
-              },
-      true,
-    );
+    const expectedProfile = profileForScenario(scenario);
+    save(declaration, liveRouteDeclaration(scenario, selected.modelId), true);
     command('scripts/service/import-provider-route.ts', [declaration], a);
     const adapted = await request(
       origin,
@@ -649,7 +877,7 @@ async function prepare() {
         adaptation.sourceKind === 'protocol-reference' &&
         Number.isSafeInteger(adaptation.declarationVersion) &&
         adaptation.declarationVersion > 0 &&
-        (!(scenario === 'vidu-async' || scenario === 'kling-async') ||
+        (!isAsyncScenario(scenario) ||
           (JSON.stringify(asyncMetadata?.operations) === JSON.stringify(['generate']) &&
             asyncMetadata?.maxQueries === 8 &&
             asyncMetadata?.maxAgeSeconds === 600)) &&
@@ -672,10 +900,12 @@ async function prepare() {
       },
       true,
     );
+    assertLiveArtifacts(artifacts.sha256, project);
     save(
       originPath,
       {
         candidate: candidate!,
+        artifactsSha256: artifacts.sha256,
         scenario,
         origin,
         a,
@@ -683,6 +913,7 @@ async function prepare() {
         owner,
         other,
         modelRef: selected.modelRef,
+        modelId: selected.modelId,
         infrastructure,
       } satisfies State,
       true,
@@ -690,7 +921,10 @@ async function prepare() {
     record('prepare-complete', {
       scenario,
       modelId: selected.modelId,
-      selection: 'exact current successful discovery item; not a static model-count or prefix rule',
+      selection:
+        scenario === 'gpt-sync' || scenario === 'gpt-edit'
+          ? 'first current discovered gpt-image-* item'
+          : 'exact current discovered model ID',
       directoryMembers: models.items.length,
       discovered: true,
       credentialVersion: selectedAdaptation.credentialVersion,
@@ -711,8 +945,48 @@ async function prepare() {
   }
 }
 
-type ImageView = { jobId: string; status: string; errorCode: string | null; assetIds: string[] };
+type ImageView = {
+  jobId: string;
+  status: string;
+  requestedCount: number;
+  errorCode: string | null;
+  assetIds: string[];
+  outputs: { index: number; assetId: string }[];
+};
 type SavedOutput = { key: string; sizeBytes: number; sha256: string; contentType: string };
+export function matchCompletedOutputs(
+  image: ImageView,
+  outputs: SavedOutput[],
+  expectedCount: number,
+  selectedScenario: Scenario,
+) {
+  assert(
+    image.status === 'completed' &&
+      image.requestedCount === expectedCount &&
+      image.assetIds.length === expectedCount &&
+      image.outputs.length === expectedCount &&
+      outputs.length === expectedCount &&
+      new Set(image.assetIds).size === expectedCount &&
+      new Set(outputs.map((output) => output.key)).size === expectedCount,
+    'LIVE_IMAGE_INCOMPLETE',
+  );
+  return image.outputs.map(({ index, assetId }, position) => {
+    const matching = outputs.filter(
+      (output) => imageOutputIndex(image.jobId, output.key, output.contentType) === index,
+    );
+    assert(
+      index === position &&
+        image.assetIds[position] === assetId &&
+        matching.length === 1 &&
+        matching[0]!.sizeBytes > 0 &&
+        /^[a-f0-9]{64}$/.test(matching[0]!.sha256) &&
+        (selectedScenario !== 'seedream-sync' || matching[0]!.contentType === 'image/jpeg') &&
+        (selectedScenario !== 'seedream-50-lite-sync' || matching[0]!.contentType === 'image/png'),
+      'LIVE_JOURNAL_OBJECT',
+    );
+    return { assetId, output: matching[0]! };
+  });
+}
 type SanitizedSubmissionObservation = {
   statusCode?: number;
   requestIdPresent?: boolean;
@@ -799,12 +1073,12 @@ function journalSubmissionObservation(
     db.close();
   }
 }
-async function assetBytes(
-  state: State,
+export async function assetBytes(
+  state: Pick<State, 'origin' | 'a'>,
   cookie: string,
   otherCookie: string,
   assetId: string,
-  expected: SavedOutput,
+  expected: Omit<SavedOutput, 'key'> & { key?: string },
 ) {
   const path = `/api/v1/assets/${assetId}`;
   assert.equal((await request(state.origin, path)).status, 401, 'LIVE_ASSET_UNAUTHENTICATED');
@@ -816,20 +1090,34 @@ async function assetBytes(
   const response = await request(state.origin, path, 'GET', undefined, cookie);
   assert.equal(response.status, 200, 'LIVE_ASSET_GET');
   const asset = (await response.json()) as {
+    status: string;
     contentType: string;
     size: number;
     downloadUrl: string;
   };
   assert(
-    asset.contentType === expected.contentType && asset.size === expected.sizeBytes,
+    asset.status === 'ready' &&
+      asset.contentType === expected.contentType &&
+      asset.size === expected.sizeBytes,
     'LIVE_ASSET_METADATA',
   );
   const url = new URL(asset.downloadUrl);
   assert(
     url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      !url.hash &&
       url.hostname === `${state.a.MIO_COS_BUCKET}.cos.${state.a.MIO_COS_REGION}.myqcloud.com`,
     'LIVE_ASSET_HOST',
   );
+  let objectKey: string;
+  try {
+    objectKey = decodeURIComponent(url.pathname.slice(1));
+  } catch {
+    throw new Error('LIVE_ASSET_OBJECT_KEY');
+  }
+  if (expected.key !== undefined) assert.equal(objectKey, expected.key, 'LIVE_ASSET_OBJECT_KEY');
   const securityToken = url.searchParams.get('x-cos-security-token');
   if (state.a.MIO_COS_SESSION_TOKEN) {
     assert.equal(securityToken, state.a.MIO_COS_SESSION_TOKEN, 'LIVE_ASSET_TOKEN_ENCODING');
@@ -846,6 +1134,118 @@ async function assetBytes(
     'LIVE_ASSET_HASH',
   );
   validateImage(bytes, asset.contentType.slice('image/'.length));
+  return {
+    key: objectKey,
+    sizeBytes: bytes.length,
+    contentType: asset.contentType,
+    etag: download.headers.get('etag'),
+  };
+}
+export async function verifyReplayResult(
+  state: Pick<State, 'origin' | 'a'>,
+  cookie: string,
+  otherCookie: string,
+  observation: {
+    response: Response;
+    initial: ImageView;
+    outputs: ReturnType<typeof matchCompletedOutputs>;
+    expectedCount: number;
+    queryAttempts: number;
+    finalQueries: number;
+  },
+) {
+  const finalImage = (await observation.response.json()) as ImageView;
+  assert(
+    observation.response.status === 200 &&
+      finalImage.status === 'completed' &&
+      finalImage.requestedCount === observation.expectedCount &&
+      JSON.stringify(finalImage.assetIds) === JSON.stringify(observation.initial.assetIds) &&
+      JSON.stringify(finalImage.outputs) === JSON.stringify(observation.initial.outputs) &&
+      observation.finalQueries === observation.queryAttempts,
+    'LIVE_REPLAY_RESULT',
+  );
+  for (const { assetId, output } of observation.outputs)
+    await assetBytes(state, cookie, otherCookie, assetId, output);
+}
+export async function createReferenceAsset(
+  state: Pick<State, 'origin' | 'a'>,
+  cookie: string,
+  otherCookie: string,
+  bytes: Uint8Array,
+) {
+  const created = await request(
+    state.origin,
+    '/api/v1/assets/uploads',
+    'POST',
+    { filename: 'live-reference.png', contentType: 'image/png', size: bytes.byteLength },
+    cookie,
+  );
+  assert.equal(created.status, 201, 'LIVE_REFERENCE_CREATE');
+  const { assetId, uploadUrl } = (await created.json()) as { assetId: string; uploadUrl: string };
+  const url = new URL(uploadUrl);
+  assert(
+    url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      url.hostname === `${state.a.MIO_COS_BUCKET}.cos.${state.a.MIO_COS_REGION}.myqcloud.com`,
+    'LIVE_REFERENCE_HOST',
+  );
+  const upload = await fetch(url, {
+    method: 'PUT',
+    body: Buffer.from(bytes),
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert(upload.ok, 'LIVE_REFERENCE_UPLOAD');
+  const completed = await request(
+    state.origin,
+    `/api/v1/assets/${assetId}/complete`,
+    'POST',
+    {},
+    cookie,
+  );
+  assert.equal(completed.status, 200, 'LIVE_REFERENCE_COMPLETE');
+  const expected = {
+    contentType: 'image/png',
+    sizeBytes: bytes.byteLength,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+  const verified = await assetBytes(state, cookie, otherCookie, assetId, expected);
+  const etag = verified.etag;
+  assert(
+    verified.key.startsWith(`mio/raw/${assetId}/`) &&
+      isValidImageAssetObjectKey(assetId, verified.key, verified.contentType) &&
+      verified.contentType === 'image/png' &&
+      etag &&
+      etag.length <= 256 &&
+      !/[\x00-\x1f\x7f]/.test(etag),
+    'LIVE_REFERENCE_OBJECT',
+  );
+  return { ...verified, assetId, contentType: 'image/png', etag } satisfies ImageAssetRef;
+}
+function referencePng() {
+  const sample = spawnSync(
+    'ffmpeg',
+    [
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=c=blue:s=512x512',
+      '-frames:v',
+      '1',
+      '-c:v',
+      'png',
+      '-f',
+      'image2pipe',
+      'pipe:1',
+    ],
+    { timeout: 10_000, maxBuffer: 1024 * 1024 },
+  );
+  assert(sample.status === 0 && sample.stdout.length > 0, 'LIVE_REFERENCE_IMAGE');
+  return sample.stdout;
 }
 async function commandQueueState(infrastructure: string) {
   const manifest = infrastructureManifest(infrastructure);
@@ -858,7 +1258,7 @@ async function commandQueueState(infrastructure: string) {
     'LIVE_MANAGEMENT_SCOPE',
   );
   const endpoint = new URL(
-    `/api/queues/${encodeURIComponent(manifest.rabbitVhost)}/${encodeURIComponent(COMMAND_QUEUE)}`,
+    `/api/queues/${encodeURIComponent(manifest.rabbitVhost)}/${encodeURIComponent(IMAGE_COMMAND_QUEUE)}`,
     management,
   );
   const response = await fetch(endpoint, {
@@ -896,7 +1296,7 @@ async function waitHeldQueryRedelivery(infrastructure: string) {
   }
   throw new Error('LIVE_QUERY_NOT_REQUEUED');
 }
-async function openObserver(state: State, command: ImageCommandV1, expected: SavedOutput) {
+async function openObserver(state: State, command: ImageCommandV1, expected: SavedOutput[]) {
   const admin = privateEnv(join(state.infrastructure, 'rabbit-admin.env'));
   const url = new URL(state.b.RABBITMQ_URL!);
   url.username = admin.RABBITMQ_DEFAULT_USER!;
@@ -922,18 +1322,22 @@ async function openObserver(state: State, command: ImageCommandV1, expected: Sav
         }
         try {
           const result = JSON.parse(message.content.toString('utf8')) as ImageResultV1;
-          const output = result.outputs[0];
           if (
             message.properties.userId === state.b.MIO_COMPUTE_BROKER_USER &&
             result.type === 'image.result' &&
             result.jobId === command.jobId &&
             result.commandId === command.messageId &&
             result.state === 'completed' &&
-            result.outputs.length === 1 &&
-            output?.key === expected.key &&
-            output.sha256 === expected.sha256 &&
-            output.sizeBytes === expected.sizeBytes &&
-            output.contentType === expected.contentType
+            result.outputs.length === expected.length &&
+            expected.every((output, index) => {
+              const actual = result.outputs[index];
+              return (
+                actual?.key === output.key &&
+                actual.sha256 === output.sha256 &&
+                actual.sizeBytes === output.sizeBytes &&
+                actual.contentType === output.contentType
+              );
+            })
           )
             complete(result.messageId);
         } catch {
@@ -969,19 +1373,24 @@ async function openObserver(state: State, command: ImageCommandV1, expected: Sav
     throw error;
   }
 }
-async function replay(state: State, command: ImageCommandV1) {
+export async function replay(state: Pick<State, 'a'>, command: ImageCommandV1) {
   const connection = await connect(state.a.RABBITMQ_URL!);
   let failure: unknown;
   let closeFailed = false;
   try {
     const channel = await connection.createConfirmChannel();
-    channel.publish(COMMAND_EXCHANGE, COMMAND_ROUTING_KEY, Buffer.from(JSON.stringify(command)), {
-      persistent: true,
-      mandatory: true,
-      contentType: 'application/json',
-      messageId: command.messageId,
-      userId: state.a.MIO_COMPUTE_BROKER_USER!,
-    });
+    channel.publish(
+      COMMAND_EXCHANGE,
+      IMAGE_COMMAND_ROUTING_KEY,
+      Buffer.from(JSON.stringify(command)),
+      {
+        persistent: true,
+        mandatory: true,
+        contentType: 'application/json',
+        messageId: command.messageId,
+        userId: state.a.MIO_COMPUTE_BROKER_USER!,
+      },
+    );
     await bounded(channel.waitForConfirms());
   } catch (error) {
     failure = error;
@@ -999,17 +1408,11 @@ async function replay(state: State, command: ImageCommandV1) {
 async function execute() {
   const state = JSON.parse(readFileSync(originPath, 'utf8')) as State;
   assert.equal(state.candidate, candidate, 'LIVE_CANDIDATE_CHANGED');
+  assertLiveArtifacts(state.artifactsSha256, project);
   const activeScenario: Scenario = state.scenario ?? 'vidu-async';
+  assert((SCENARIOS as readonly string[]).includes(activeScenario), 'LIVE_SCENARIO');
   assert(!explicitScenario || activeScenario === scenario, 'LIVE_SCENARIO_CHANGED');
-  const isAsync = activeScenario === 'vidu-async' || activeScenario === 'kling-async';
-  const expectedProfile =
-    activeScenario === 'vidu-async'
-      ? 'vidu-images'
-      : activeScenario === 'kling-async'
-        ? 'kling-images'
-        : activeScenario === 'seedream-sync'
-          ? 'volcengine-ark-images'
-          : 'openai-images';
+  const isAsync = isAsyncScenario(activeScenario);
   state.b.MIO_LIVE_IMAGE_SCENARIO = activeScenario;
   const aCos = privateEnv(first!);
   const rawBCos = privateEnv(second!);
@@ -1066,26 +1469,18 @@ async function execute() {
       password: state.owner.password,
     });
     let otherCookie = await login(state.origin, state.other);
+    const needsReference = ['seedream-45-sync', 'kling-omni-async', 'gpt-edit'].includes(
+      activeScenario,
+    );
+    const referenceAsset = needsReference
+      ? await createReferenceAsset(state, cookie, otherCookie, referencePng())
+      : undefined;
+    const parameters = liveImageParameters(activeScenario, referenceAsset?.assetId);
+    const expectedCount = 'n' in parameters && parameters.n !== undefined ? parameters.n : 1;
     const body = {
       requestId: randomUUID(),
       modelRef: state.modelRef,
-      parameters:
-        activeScenario === 'vidu-async'
-          ? {
-              prompt: 'A simple blue square on a white background.',
-              async: true,
-              size: '1080p',
-            }
-          : activeScenario === 'kling-async'
-            ? {
-                prompt: 'A simple blue square on a white background.',
-                async: true,
-              }
-            : {
-                prompt: 'A simple blue square on a white background.',
-                n: 1,
-                size: '1024x1024',
-              },
+      parameters,
     };
     const created = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
     assert.equal(created.status, 202, 'LIVE_IMAGE_ADMISSION');
@@ -1107,7 +1502,15 @@ async function execute() {
       }
       await delay(200);
     }
-    assert(frozen && frozen.profile === expectedProfile && frozen.credential, 'LIVE_OUTBOX');
+    assert(frozen && accepted.requestedCount === expectedCount, 'LIVE_OUTBOX');
+    assertFrozenScenario(
+      frozen,
+      activeScenario,
+      state.modelId,
+      state.owner.userId,
+      accepted.jobId,
+      referenceAsset,
+    );
     save(join(directory, 'encrypted-command.json'), frozen, true);
     record('message-published', { jobId: accepted.jobId, messageId: frozen.messageId });
     let image: ImageView | undefined;
@@ -1385,7 +1788,7 @@ async function execute() {
         otherOwnerDenied: true,
       });
     }
-    assert(image?.status === 'completed' && image.assetIds.length === 1, 'LIVE_IMAGE_INCOMPLETE');
+    assert(image, 'LIVE_IMAGE_INCOMPLETE');
     assert(
       existsSync(join(directory, 'supplier-post-started.json')) &&
         existsSync(join(directory, 'supplier-post-allowed.json')) &&
@@ -1399,7 +1802,8 @@ async function execute() {
     const db = new DatabaseSync(join(state.b.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'), {
       readOnly: true,
     });
-    let output: SavedOutput;
+    let outputs: SavedOutput[];
+    let matchedOutputs: ReturnType<typeof matchCompletedOutputs>;
     try {
       const row = db
         .prepare('SELECT phase,payload FROM image_attempts WHERE job_id=?')
@@ -1409,31 +1813,28 @@ async function execute() {
         outputs: SavedOutput[];
         observation?: Record<string, unknown>;
       };
-      assert.equal(payload.outputs.length, 1, 'LIVE_JOURNAL_OUTPUT');
-      output = payload.outputs[0]!;
-      assert(
-        new RegExp(`^mio/derived/${accepted.jobId}/images/0-[0-9a-f-]{36}\\.(png|jpeg|webp)$`).test(
-          output.key,
-        ) &&
-          ['image/png', 'image/jpeg', 'image/webp'].includes(output.contentType) &&
-          (activeScenario !== 'seedream-sync' ||
-            (output.key.endsWith('.jpeg') && output.contentType === 'image/jpeg')),
-        'LIVE_JOURNAL_OBJECT',
-      );
+      outputs = payload.outputs;
+      matchedOutputs = matchCompletedOutputs(image, outputs, expectedCount, activeScenario);
       record('journal-complete', {
         jobId: accepted.jobId,
-        objectKey: output.key,
-        sha256: output.sha256,
-        size: output.sizeBytes,
+        outputs: matchedOutputs.map(({ assetId, output }) => ({
+          assetId,
+          objectKey: output.key,
+          sha256: output.sha256,
+          size: output.sizeBytes,
+        })),
         observation: payload.observation ?? null,
       });
     } finally {
       db.close();
     }
-    await assetBytes(state, cookie, otherCookie, image.assetIds[0]!, output);
+    for (const { assetId, output } of matchedOutputs)
+      await assetBytes(state, cookie, otherCookie, assetId, output);
     record('owner-download-verified', {
-      assetId: image.assetIds[0],
-      tokenRoundTrip: true,
+      assetIds: image.assetIds,
+      tokenVerification: state.a.MIO_COS_SESSION_TOKEN
+        ? 'present-and-matched'
+        : 'absent-as-expected',
       otherOwnerDenied: true,
     });
     await stop(app);
@@ -1451,10 +1852,11 @@ async function execute() {
       accepted.jobId,
       'LIVE_IDEMPOTENT_JOB',
     );
-    await assetBytes(state, cookie, otherCookie, image.assetIds[0]!, output);
+    for (const { assetId, output } of matchedOutputs)
+      await assetBytes(state, cookie, otherCookie, assetId, output);
     // B's first process has exited and drained before the exclusive observer exists.
     await waitCommandQueue(state.infrastructure, 0);
-    observer = await openObserver(state, frozen, output);
+    observer = await openObserver(state, frozen, outputs);
     worker = child(
       'compute/dist/main.js',
       ['start'],
@@ -1477,22 +1879,22 @@ async function execute() {
       undefined,
       cookie,
     );
-    const finalImage = (await final.json()) as ImageView;
     const finalQueries = Array.from({ length: 8 }, (_, index) =>
       existsSync(join(directory, `supplier-query-${index + 1}.json`)),
     ).filter(Boolean).length;
-    assert(
-      final.status === 200 &&
-        finalImage.status === 'completed' &&
-        finalImage.assetIds.length === 1 &&
-        finalImage.assetIds[0] === image.assetIds[0] &&
-        finalQueries === queryAttempts,
-      'LIVE_REPLAY_RESULT',
-    );
+    await verifyReplayResult(state, cookie, otherCookie, {
+      response: final,
+      initial: image,
+      outputs: matchedOutputs,
+      expectedCount,
+      queryAttempts,
+      finalQueries,
+    });
+    assertLiveArtifacts(state.artifactsSha256, project);
     record('restart-replay-verified', {
       scenario: activeScenario,
       jobId: accepted.jobId,
-      assetId: image.assetIds[0],
+      assetIds: image.assetIds,
       replayResultId,
       supplierPostAttempts: 1,
       supplierPostsAllowed: 1,
@@ -1552,6 +1954,13 @@ async function execute() {
     } catch {
       cleanupFailures.push('pool');
     }
+    try {
+      assertLiveArtifacts(state.artifactsSha256, project);
+      record('runtime-artifacts-checked', { sha256: state.artifactsSha256, matched: true });
+    } catch (error) {
+      record('runtime-artifacts-checked', { matched: false });
+      operationFailure ??= error;
+    }
     if (cleanupFailures.length)
       record('cleanup-failed', {
         components: cleanupFailures,
@@ -1567,12 +1976,14 @@ function safeCode(error: unknown) {
   const first = error instanceof Error ? error.message.split('\n', 1)[0]! : '';
   return /^LIVE_[A-Z_]+$/.test(first) ? first : 'LIVE_UNEXPECTED_FAILURE';
 }
-try {
-  if (phase === 'prepare') await prepare();
-  else await execute();
-} catch (error) {
-  const message = safeCode(error);
-  if (existsSync(directory)) record('failed', { code: message });
-  else console.error(message);
-  process.exitCode = 1;
+if (isMain) {
+  try {
+    if (phase === 'prepare') await prepare();
+    else await execute();
+  } catch (error) {
+    const message = safeCode(error);
+    if (existsSync(directory)) record('failed', { code: message });
+    else console.error(message);
+    process.exitCode = 1;
+  }
 }

@@ -4,11 +4,13 @@ import { IMAGE_DRIVERS } from '@mio/compute-contracts';
 import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
 import {
   deriveImageCapabilityMetadata,
+  resolveChatRoute,
   resolveImageRoute,
   validateModelRouteEntry,
   validateRouteImportPayload,
 } from '../../src/providers/onelink/router.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
+import type { PlatformRouteRecord } from '../../src/providers/contracts.ts';
 import {
   legacyPresets,
   legacySource,
@@ -94,6 +96,84 @@ it('limits route imports to sourced, implemented vendor drivers and rejects endp
     { classification: 'unknown' },
   ])
     expect(() => validateModelRouteEntry({ ...entry, ...patch })).toThrow('ROUTE_INVALID');
+});
+
+it('requires an explicit visual chat route for bounded image budgets', () => {
+  const entry = {
+    rawModelId: 'vision-fixture',
+    operation: 'chat',
+    vendor: 'openai',
+    driver: 'openai-chat',
+    classification: 'chat',
+    submitPath: '/v1/chat/completions',
+    sourceKind: 'protocol-reference',
+    source: 'fixture',
+    sourceVersion: 'v1',
+  };
+  for (const [key, maximum] of [
+    ['maxRequestImages', 16],
+    ['maxRequestImageBytes', 20 * 1024 * 1024],
+    ['requestImagePixelBudget', 16_777_216],
+    ['requestImageMaxBytes', 10 * 1024 * 1024],
+  ] as const) {
+    for (const inputModalities of [undefined, ['text']])
+      expect(() =>
+        validateModelRouteEntry({
+          ...entry,
+          capabilityMetadata: { ...(inputModalities ? { inputModalities } : {}), [key]: 1 },
+        }),
+      ).toThrow('ROUTE_INVALID');
+    for (const value of [0, maximum + 1, 1.5, '1'])
+      expect(() =>
+        validateModelRouteEntry({
+          ...entry,
+          capabilityMetadata: { inputModalities: ['text', 'image'], [key]: value },
+        }),
+      ).toThrow('ROUTE_INVALID');
+    expect(
+      validateModelRouteEntry({
+        ...entry,
+        capabilityMetadata: { inputModalities: ['image', 'text'], [key]: maximum },
+      }).capabilityMetadata,
+    ).toMatchObject({ inputModalities: ['text', 'image'], [key]: maximum });
+  }
+  for (const modalities of [[], ['image'], ['text', 'image', 'image'], ['text', 'audio']])
+    expect(() =>
+      validateModelRouteEntry({ ...entry, capabilityMetadata: { inputModalities: modalities } }),
+    ).toThrow('ROUTE_INVALID');
+
+  const row: PlatformRouteRecord = {
+    provider_type: 'onelink',
+    raw_model_id: 'vision-fixture',
+    operation: 'chat',
+    vendor: 'openai',
+    driver: 'openai-chat',
+    classification: 'chat',
+    submit_path: '/v1/chat/completions',
+    edit_path: null,
+    query_path_template: null,
+    param_spec: {},
+    request_defaults: {},
+    output_spec: {},
+    capability_metadata: {},
+    source_kind: 'protocol-reference',
+    source: 'fixture',
+    source_version: 'v1',
+    declaration_version: 1,
+    enabled: true,
+  };
+  expect(resolveChatRoute(row)).toMatchObject({
+    inputModalities: ['text'],
+    imageBudget: {
+      maxRequestImages: 4,
+      maxRequestImageBytes: 10 * 1024 * 1024,
+      requestImagePixelBudget: 4_194_304,
+      requestImageMaxBytes: 5 * 1024 * 1024,
+    },
+  });
+  expect(
+    resolveChatRoute({ ...row, capability_metadata: { maxRequestImages: 4 } }),
+  ).toBeUndefined();
 });
 
 it('validates explicit image route paramSpec, edit/mask/outpaint gates, and derives capability metadata', () => {

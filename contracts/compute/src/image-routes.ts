@@ -141,6 +141,9 @@ export interface ImageRouteConfig {
 const routePathPattern = /^\/[A-Za-z0-9._/{}-]+$/;
 const uuidText = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
 const uuidPattern = new RegExp(`^${uuidText}$`);
+const derivedImageKeyPattern = new RegExp(
+  `^mio/derived/${uuidText}/images/(?:[0-9]|1[0-5])-${uuidText}\\.(png|jpeg|webp)$`,
+);
 
 const routeFields = new Set([
   'driver',
@@ -414,22 +417,34 @@ export function validateImageRouteConfig(value: unknown): value is ImageRouteCon
   );
 }
 
+export function isValidImageAssetObjectKey(
+  assetId: string,
+  key: string,
+  contentType: string,
+): boolean {
+  if (!uuidPattern.test(assetId)) return false;
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(contentType)) return false;
+  const rawPrefix = `mio/raw/${assetId}/`;
+  if (key.startsWith(rawPrefix)) {
+    return uuidPattern.test(key.slice(rawPrefix.length));
+  }
+  const derivedMatch = derivedImageKeyPattern.exec(key);
+  return derivedMatch !== null && contentType === `image/${derivedMatch[1]}`;
+}
+
 function validImageAssetRef(value: unknown, mask = false): value is ImageAssetRef {
   if (!isRecord(value) || Object.keys(value).length !== 5) return false;
-  const prefix = typeof value.assetId === 'string' ? `mio/raw/${value.assetId}/` : '';
-  const key = typeof value.key === 'string' ? value.key : '';
   return (
     typeof value.assetId === 'string' &&
-    uuidPattern.test(value.assetId) &&
-    key.startsWith(prefix) &&
-    uuidPattern.test(key.slice(prefix.length)) &&
+    typeof value.key === 'string' &&
+    typeof value.contentType === 'string' &&
+    isValidImageAssetObjectKey(value.assetId, value.key, value.contentType) &&
     Number.isSafeInteger(value.sizeBytes) &&
     Number(value.sizeBytes) > 0 &&
     typeof value.etag === 'string' &&
     value.etag.length > 0 &&
     value.etag.length <= 256 &&
     !/[\x00-\x1f\x7f]/.test(value.etag) &&
-    ['image/png', 'image/jpeg', 'image/webp'].includes(String(value.contentType)) &&
     (!mask || value.contentType === 'image/png')
   );
 }

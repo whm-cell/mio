@@ -76,8 +76,27 @@ export interface ImageCapabilityMetadata {
 export interface AdaptationCapabilityMetadata {
   contextWindow?: number;
   maxOutputTokens?: number;
+  inputModalities?: ('text' | 'image')[];
+  maxRequestImages?: number;
+  maxRequestImageBytes?: number;
+  requestImagePixelBudget?: number;
+  requestImageMaxBytes?: number;
   image?: ImageCapabilityMetadata;
 }
+
+export interface ChatImageBudget {
+  readonly maxRequestImages: number;
+  readonly maxRequestImageBytes: number;
+  readonly requestImagePixelBudget: number;
+  readonly requestImageMaxBytes: number;
+}
+
+export const DEFAULT_CHAT_IMAGE_BUDGET: ChatImageBudget = Object.freeze({
+  maxRequestImages: 4,
+  maxRequestImageBytes: 10 * 1024 * 1024,
+  requestImagePixelBudget: 4_194_304,
+  requestImageMaxBytes: 5 * 1024 * 1024,
+});
 export interface ModelRecord {
   model_key: string;
   raw_model_id: string | null;
@@ -179,6 +198,8 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly submitPath?: string;
   readonly maxOutputTokens?: number;
   readonly contextWindow?: number;
+  readonly inputModalities?: readonly ('text' | 'image')[];
+  readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;
 }
 /** Request-owned memory only. Never serialize this object into logs, receipts or storage. */

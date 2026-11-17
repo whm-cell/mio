@@ -1,4 +1,10 @@
 import { HttpError } from '@mio/foundation/errors';
+import type {
+  ImageDriver,
+  ImageOperation,
+  ImageRequestParameters,
+  ImageRouteConfig,
+} from '@mio/compute-contracts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
@@ -27,6 +33,7 @@ export interface ConversationRun {
   readonly dshSessionId: string;
   readonly requestId: string;
   readonly snapshot: ChatRuntimeSnapshot;
+  offloadableImages?(): number;
   observe(observation: ModelObservation): Promise<void>;
 }
 export interface Receipt {
@@ -35,8 +42,105 @@ export interface Receipt {
   status: RequestStatus;
   error?: string;
 }
+/** Serializable image identity; binary content and private object keys stay outside history. */
+export interface ConversationImageReference {
+  readonly attachmentId: string;
+  readonly mediaType: 'image/png' | 'image/jpeg' | 'image/webp';
+  readonly bytes: number;
+  readonly width: number;
+  readonly height: number;
+}
+export interface ConversationImageTarget {
+  readonly width: number;
+  readonly height: number;
+  readonly maxBytes: number;
+}
+export interface ConversationImagePreview {
+  readonly variantId: string;
+  readonly attachment: ConversationImageReference;
+  readonly data: Uint8Array;
+  readonly mediaType: ConversationImageReference['mediaType'];
+  readonly bytes: number;
+  readonly width: number;
+  readonly height: number;
+  readonly depth: 'uchar';
+  readonly space: 'srgb';
+  readonly hasAlpha: boolean;
+  readonly fingerprint: string;
+}
+export interface ConversationVision {
+  prepare(
+    ownerId: string,
+    assetId: string,
+    signal: AbortSignal,
+  ): Promise<ConversationImageReference>;
+  target(
+    ref: ConversationImageReference,
+    budget: { maxPixels: number; maxBytes: number },
+  ): ConversationImageTarget;
+  preview(
+    ownerId: string,
+    ref: ConversationImageReference,
+    target: ConversationImageTarget,
+    signal: AbortSignal,
+  ): Promise<ConversationImagePreview>;
+  assetId(ref: ConversationImageReference): string;
+  acquireRequest(signal: AbortSignal): Promise<() => void>;
+}
+export type ConversationImageToolName = 'submit_image_job' | 'get_image_job';
+export interface ConversationImageJobOutput {
+  readonly index: number;
+  readonly assetId: string;
+}
+export interface ConversationImageJobView {
+  readonly jobId: string;
+  readonly status: string;
+  readonly requestedCount: number;
+  readonly errorCode: string | null;
+  readonly assetIds: string[];
+  readonly outputs: ConversationImageJobOutput[];
+}
+export interface ConversationImageModelSummary {
+  readonly modelRef: string;
+  readonly modelId: string;
+  readonly name: string;
+  readonly vendor: string;
+  readonly driver: ImageDriver;
+  readonly supportedOperations: ImageOperation[];
+  readonly requiresAsync: boolean;
+  readonly maxN: number;
+  readonly allowExplicitN: boolean;
+  readonly allowedSizes: string[] | null;
+  readonly defaultSize: string | null;
+  readonly allowCustomDimensions: boolean;
+  readonly allowedAspectRatios: string[];
+  readonly maxReferenceImages: number;
+  readonly allowGenerateReferences: boolean;
+  readonly allowMaskPng: boolean;
+  readonly allowedQualities: ('high' | 'medium' | 'low' | 'auto')[];
+  readonly allowedBackgrounds: ('transparent' | 'opaque' | 'auto')[];
+  readonly allowedOutputFormats: ('png' | 'jpeg' | 'webp')[];
+}
+export interface ConversationImageTools {
+  listModels(actor: { userId: string }): Promise<ConversationImageModelSummary[]>;
+  inspectRoute(actor: { userId: string }, modelRef: string): Promise<ImageRouteConfig>;
+  createImage(
+    actor: { userId: string },
+    requestId: string,
+    modelRef: string,
+    parameters: ImageRequestParameters,
+  ): Promise<ConversationImageJobView>;
+  getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
+}
 export type HistoryItem =
-  | { seq: number; role: 'user' | 'assistant'; text: string; interrupted?: true }
+  | {
+      seq: number;
+      role: 'user' | 'assistant';
+      text: string;
+      interrupted?: true;
+      imageAssetIds?: string[];
+    }
+  | { seq: number; role: 'tool'; tool: ConversationImageToolName; job: ConversationImageJobView }
   | {
       seq: number;
       role: 'status';
@@ -49,6 +153,12 @@ export interface HistoryPage {
 }
 export type ConversationEvent =
   | { type: 'text'; requestId: string; text: string }
+  | {
+      type: 'tool';
+      requestId: string;
+      tool: ConversationImageToolName;
+      job: ConversationImageJobView;
+    }
   | { type: 'state'; receipt: Receipt }
   | { type: 'error'; code: string };
 export interface ConversationEngine {
@@ -62,6 +172,7 @@ export interface ConversationEngine {
     durable: () => Promise<void>,
     emit: (event: ConversationEvent) => void,
     binding?: ConversationRun,
+    images?: readonly ConversationImageReference[],
   ): Promise<'completed' | 'cancelled' | 'failed' | 'unknown'>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;

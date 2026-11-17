@@ -110,7 +110,7 @@
   - 核对测试账号当前 `/v1/models` 快照中精确存在的目标模型 ID 与本次人类显式授权的真实生图调用预算（每个授权场景严格保持 `maxUpstreamGeneratePosts = 1` 单次提交安全互锁）。当前 Key 目录为 0 项的模型（如 `` `gpt-image-*` ``、`` `gemini-*` ``）不在无模型条件下强跑，须在出站前以 `LIVE_MODEL_NOT_FOUND` 零 POST 阻断并如实保留 `pending`。
 - **C1 实施与验收**：
   - 扩展 `tests/compute/live-image-audit.ts` 与 `tests/compute/live-image-loop.ts` 支持路由化场景选择与审计白名单（如 `/kling/v1/images/omni-image` 及对应查询路径），保持 `maxUpstreamGeneratePosts = 1`、脱敏诊断落盘与零密钥输出。
-  - 在隔离环境通过公开 HTTP -> MQ -> Worker -> OneLink -> 私有 COS -> `/api/v1/assets/{id}/content` 完成真实生成、SHA-256 校验、跨用户 `404`/未登录 `401` 权限核验，以及硬重启与消息重放下的 `0` 重复 POST 验证；若实测观察到新的网关字段或状态细节，同步记录至[万联集成契约](../../integrations/onelink.md)并在候选内完成 `quality-review`、`norms-review` 与 `deliver prepare`，由人类单独接受。
+  - 在隔离环境通过公开 HTTP -> MQ -> Worker -> OneLink -> 私有 COS -> `GET /api/v1/assets/{id}` 获取本人短期下载地址并从 COS 下载，完成真实生成、SHA-256 校验、跨用户 `404`/未登录 `401` 权限核验，以及硬重启与消息重放下的 `0` 重复 POST 验证；若实测观察到新的网关字段或状态细节，同步记录至[万联集成契约](../../integrations/onelink.md)并在候选内完成 `quality-review`、`norms-review` 与 `deliver prepare`，由人类单独接受。
 
 ## 4. 迁移、验证与接受边界
 

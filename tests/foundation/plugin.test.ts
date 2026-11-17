@@ -7,6 +7,7 @@ import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Mio from '../../src/plugin.ts';
+import * as MioProfile from '../../src/profile.ts';
 
 const contexts: Context[] = [];
 const token = randomBytes(32).toString('hex');
@@ -43,6 +44,15 @@ async function setup() {
 }
 
 describe('foundation through actual DSH HTTP and tool services', () => {
+  it('keeps the Profile pending without its kernel while standalone Mio still mounts', async () => {
+    const { ctx, origin } = await setup();
+    const profile = ctx.plugin(MioProfile, { tokenEnv, allowedOrigins: [] });
+    await profile;
+    expect(profile.state).toBe(0);
+    expect((await fetch(`${origin}/readyz`)).status).toBe(404);
+    await ctx.plugin(Mio, { tokenEnv, allowedOrigins: [] });
+    expect((await fetch(`${origin}/readyz`)).status).toBe(200);
+  });
   it('preserves foundation response headers, errors and Origin precedence at the registered entry', async () => {
     const { ctx, origin } = await setup();
     await ctx.plugin(Mio, { tokenEnv, allowedOrigins: ['https://frontend.example'] });

@@ -12,6 +12,7 @@ import {
   readFileSync,
   realpathSync,
   readdirSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
@@ -35,6 +36,7 @@ import { connect } from 'amqplib';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
 import { localWorkerEnvironment } from '../../scripts/service/local-compute-environment.ts';
 import { prepareLocalBroker } from '../../scripts/service/local-broker.ts';
+import { computeQueues } from '../../scripts/service/compute-broker-topology.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
 import { decryptCredential } from '../../src/providers/credentials.ts';
 import type { CredentialEnvelope } from '../../src/providers/credentials.ts';
@@ -1700,7 +1702,11 @@ async function execute() {
       } finally {
         before.close();
       }
-      save(join(directory, 'allowed-task.json'), { upstreamTaskId: persistedTask }, true);
+      save(
+        join(directory, 'allowed-task.json'),
+        { upstreamTaskId: persistedTask, deadline: Math.min(deadline.getTime(), frozen.expiresAt) },
+        true,
+      );
       record('query-held-before-network', {
         taskIdPresent: true,
         journalTaskMatches: true,
@@ -2053,6 +2059,124 @@ function safeCode(error: unknown) {
   return /^(?:LIVE|DEV)_[A-Z_]+$/.test(firstLine) ? firstLine : 'LIVE_UNEXPECTED_FAILURE';
 }
 
+async function inspectDevWindow(
+  values: NodeJS.ProcessEnv,
+  pool: Pool,
+  allowedJob: string | null,
+  allowedConnections: { a: number; b: number },
+  checkQueues: boolean,
+) {
+  const auth = Buffer.from(`mio-dev-admin:${values.MIO_LOCAL_RABBITMQ_PASSWORD}`).toString(
+    'base64',
+  );
+  const base = `http://127.0.0.1:${values.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT}/api/`;
+  const read = async (path: string) => {
+    const response = await fetch(new URL(path, base), {
+      headers: { authorization: `Basic ${auth}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(response.status, 200, 'LIVE_DEV_MQ_INSPECTION');
+    return (await response.json()) as unknown;
+  };
+  const connections = await read('connections?columns=user,vhost');
+  assert(Array.isArray(connections), 'LIVE_DEV_MQ_INSPECTION');
+  const devConnections = connections.filter((value) => value?.vhost === 'mio-dev');
+  assert(
+    devConnections.every((value) => ['mio-dev-a', 'mio-dev-b'].includes(value?.user)) &&
+      devConnections.filter((value) => value.user === 'mio-dev-a').length <= allowedConnections.a &&
+      devConnections.filter((value) => value.user === 'mio-dev-b').length <= allowedConnections.b,
+    'LIVE_DEV_WINDOW_OCCUPIED',
+  );
+  if (checkQueues) {
+    for (const queue of computeQueues) {
+      const value = (await read(`queues/mio-dev/${encodeURIComponent(queue)}`)) as {
+        messages_ready?: number;
+        messages_unacknowledged?: number;
+        consumers?: number;
+      };
+      assert(
+        value.messages_ready === 0 && value.messages_unacknowledged === 0 && value.consumers === 0,
+        'LIVE_DEV_QUEUE_OCCUPIED',
+      );
+    }
+  }
+  const pending = await pool.query<{
+    video: number;
+    image: number;
+    video_outbox: number;
+    image_outbox: number;
+  }>(
+    `SELECT
+      (SELECT count(*)::int FROM mio_compute_jobs WHERE state IN ('accepted','queued','running')) AS video,
+      (SELECT count(*)::int FROM mio_image_jobs WHERE state IN ('accepted','submitted','processing','materializing','unknown') AND ($1::uuid IS NULL OR id<>$1)) AS image,
+      (SELECT count(*)::int FROM mio_compute_outbox WHERE sent_at IS NULL) AS video_outbox,
+      (SELECT count(*)::int FROM mio_image_outbox WHERE sent_at IS NULL AND ($1::uuid IS NULL OR job_id<>$1)) AS image_outbox`,
+    [allowedJob],
+  );
+  const counts = pending.rows[0];
+  assert(
+    counts &&
+      counts.video === 0 &&
+      counts.image === 0 &&
+      counts.video_outbox === 0 &&
+      counts.image_outbox === 0,
+    'LIVE_DEV_JOBS_OCCUPIED',
+  );
+}
+
+function inspectDevJournal(workerDirectory: string, instanceId: string) {
+  const db = new DatabaseSync(join(workerDirectory, 'journal.sqlite3'), { readOnly: true });
+  try {
+    const integrity = db.prepare('PRAGMA quick_check').get();
+    assert.equal(integrity?.quick_check, 'ok', 'LIVE_DEV_JOURNAL_INVALID');
+    const metadata = db.prepare('SELECT instance_id,schema_version FROM metadata').all();
+    const version = metadata[0]?.schema_version;
+    assert(
+      metadata.length === 1 &&
+        metadata[0]?.instance_id === instanceId &&
+        (version === 3 || version === 4 || version === 5 || version === 6),
+      'LIVE_DEV_JOURNAL_IDENTITY',
+    );
+    const acknowledgment = version === 3 ? 'acknowledged' : 'ack_dispatched';
+    db.prepare(
+      `SELECT attempt_id,command_id,command_json,phase,pid,process_identity,output_size,output_sha256,${acknowledgment},cleaned,started_at FROM attempts LIMIT 0`,
+    ).all();
+    db.prepare('SELECT sequence,message_id,attempt_id,body,confirmed FROM events LIMIT 0').all();
+    db.prepare('SELECT attempt_id,evidence,resolved_at FROM manual_resolutions LIMIT 0').all();
+    const video = db
+      .prepare(
+        "SELECT count(*) AS count FROM attempts WHERE phase IS NULL OR phase NOT IN ('succeeded','failed') OR cleaned IS NULL OR cleaned<>1",
+      )
+      .get();
+    const events = db.prepare('SELECT count(*) AS count FROM events WHERE confirmed=0').get();
+    const invalidEvents = db
+      .prepare(
+        'SELECT count(*) AS count FROM events WHERE confirmed IS NULL OR confirmed NOT IN (0,1)',
+      )
+      .get();
+    const imageTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='image_attempts'")
+      .get();
+    assert(Number(version) < 5 === !imageTable, 'LIVE_DEV_JOURNAL_INVALID');
+    let imageCount = 0;
+    if (imageTable) {
+      db.prepare('SELECT job_id,identity,phase,payload FROM image_attempts LIMIT 0').all();
+      const image = db
+        .prepare(
+          "SELECT count(*) AS count FROM image_attempts WHERE phase IS NULL OR phase NOT IN ('completed','failed','rejected')",
+        )
+        .get();
+      imageCount = Number(image?.count);
+    }
+    assert(
+      video?.count === 0 && events?.count === 0 && invalidEvents?.count === 0 && imageCount === 0,
+      'LIVE_DEV_JOURNAL_OCCUPIED',
+    );
+  } finally {
+    db.close();
+  }
+}
+
 async function runPersistentDev() {
   const artifacts = captureLiveArtifacts(project);
   mkdirSync(directory, { recursive: false, mode: 0o700 });
@@ -2074,6 +2198,7 @@ async function runPersistentDev() {
   ]) {
     assert(aEnv[key], 'LIVE_DEV_CONFIG_MISSING');
   }
+  assert(aEnv.MIO_ASSETS_DATABASE_URL, 'LIVE_DEV_DATABASE_MISSING');
   const rawWorker = localWorkerEnvironment('dev', dev.values, dev.host, project);
   const bEnv: Environment = {
     ...Object.fromEntries(
@@ -2094,7 +2219,8 @@ async function runPersistentDev() {
   await prepareProfile(aEnv.DSH_HOME!, project);
 
   record('dev-live-start', {
-    environment: 'mio_dev',
+    environment: 'persistent-dev',
+    mediaDatabase: decodeURIComponent(new URL(aEnv.MIO_ASSETS_DATABASE_URL).pathname.slice(1)),
     retainedInDatabase: true,
     taskId,
     candidate,
@@ -2102,9 +2228,7 @@ async function runPersistentDev() {
     artifactsSha256: artifacts.sha256,
   });
 
-  const pool = new Pool({
-    connectionString: aEnv.MIO_COMPUTE_DATABASE_URL ?? aEnv.MIO_ASSETS_DATABASE_URL,
-  });
+  const pool = new Pool({ connectionString: aEnv.MIO_ASSETS_DATABASE_URL });
   let app: ChildProcess | undefined;
   let worker: ChildProcess | undefined;
   const state: State = {
@@ -2125,7 +2249,12 @@ async function runPersistentDev() {
     infrastructure: 'mio_dev',
   };
 
+  let operationFailure: unknown;
+  const cleanupFailures: string[] = [];
   try {
+    await inspectDevWindow(dev.values, pool, null, { a: 0, b: 0 }, true);
+    inspectDevJournal(bEnv.MIO_COMPUTE_DIRECTORY!, bEnv.MIO_COMPUTE_INSTANCE_ID!);
+    record('dev-window-checked', { queues: computeQueues.length, journalIdle: true });
     app = await startApp(state);
     const ownerAccount = await authenticateOrCreateRetainedDevOwner(
       state.origin,
@@ -2137,6 +2266,13 @@ async function runPersistentDev() {
       password: ownerAccount.password,
       userId: ownerAccount.userId,
     };
+    if (authInput.kind === 'apiKey') {
+      save(
+        join(directory, 'owner-login.json'),
+        { email: ownerAccount.email, password: ownerAccount.password },
+        true,
+      );
+    }
     let cookie = ownerAccount.cookie;
 
     const otherSignup = await request(state.origin, '/api/auth/sign-up/email', 'POST', {
@@ -2210,15 +2346,43 @@ async function runPersistentDev() {
       parameters,
     };
 
+    await inspectDevWindow(dev.values, pool, null, { a: 2, b: 0 }, false);
+    record('image-admission-started', { requestId: body.requestId });
     const created = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
     assert.equal(created.status, 202, 'LIVE_IMAGE_ADMISSION');
     const accepted = (await created.json()) as ImageView;
     record('image-accepted', {
-      environment: 'mio_dev',
+      environment: 'persistent-dev',
       scenario,
       jobId: accepted.jobId,
       requestId: body.requestId,
     });
+    assert.equal(
+      (
+        await request(
+          state.origin,
+          `/api/v1/compute/images/${accepted.jobId}`,
+          'GET',
+          undefined,
+          otherCookie,
+        )
+      ).status,
+      404,
+      'LIVE_IMAGE_OTHER_OWNER',
+    );
+    assert.equal(
+      (
+        await request(
+          state.origin,
+          `/api/v1/compute/images/${accepted.jobId}/recover`,
+          'POST',
+          {},
+          otherCookie,
+        )
+      ).status,
+      404,
+      'LIVE_IMAGE_OTHER_RECOVERY',
+    );
 
     let frozen: ImageCommandV1 | undefined;
     for (let i = 0; i < 100; i++) {
@@ -2242,16 +2406,87 @@ async function runPersistentDev() {
       referenceAsset,
     );
 
+    const timing = await pool.query<{
+      async_deadline: Date | null;
+      async_max_queries: number | null;
+    }>('SELECT async_deadline,async_max_queries FROM mio_image_jobs WHERE id=$1 AND owner_id=$2', [
+      accepted.jobId,
+      state.owner.userId,
+    ]);
+    const asyncTiming = timing.rows[0];
+    if (isAsyncScenario(scenario))
+      assert(
+        asyncTiming?.async_deadline && asyncTiming.async_max_queries === 8,
+        'LIVE_ASYNC_DEADLINE',
+      );
+    const deadline = Math.min(
+      frozen.expiresAt,
+      asyncTiming?.async_deadline?.getTime() ?? frozen.expiresAt,
+    );
+    assert(Number.isFinite(deadline) && deadline > Date.now(), 'LIVE_ASYNC_DEADLINE');
+    await inspectDevWindow(dev.values, pool, accepted.jobId, { a: 2, b: 0 }, false);
     worker = child(
       'compute/dist/main.js',
       ['start'],
-      { ...bEnv, NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}` },
+      {
+        ...bEnv,
+        ...(isAsyncScenario(scenario) ? { MIO_LIVE_IMAGE_AWAIT_TASK: 'yes' } : {}),
+        NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}`,
+      },
       'worker.log',
     );
 
     let image: ImageView | undefined;
-    for (let i = 0; i < 360; i++) {
+    let boundTask = false;
+    // Existing worker bounds: 180 seconds for request/download; per output and
+    // per materialization attempt, ffprobe/ffmpeg can take 25 seconds before a
+    // 180-second COS request. materializeSaved allows up to three serial rounds.
+    // The extra 30 seconds is observation margin, not a supplier deadline extension.
+    const observationDeadline = deadline + 180_000 + expectedCount * 3 * 205_000 + 30_000;
+    const terminalStatuses = [
+      'completed',
+      'partial',
+      'unknown',
+      'rejected',
+      'failed',
+      'materialization_failed',
+    ];
+    while (Date.now() <= observationDeadline) {
       assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
+      if (isAsyncScenario(scenario) && !boundTask) {
+        const result = await pool.query<{
+          upstream_task_id: string | null;
+          query_attempt: number;
+          state: string;
+          query_command: {
+            upstreamTaskId?: string;
+            queryAttempt?: number;
+            jobId?: string;
+            ownerId?: string;
+          } | null;
+        }>(
+          'SELECT j.upstream_task_id,j.query_attempt,j.state,o.query_command FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1 AND j.owner_id=$2',
+          [accepted.jobId, state.owner.userId],
+        );
+        const saved = result.rows[0];
+        if (saved?.upstream_task_id && ['submitted', 'processing'].includes(saved.state)) {
+          assert(
+            existsSync(join(directory, 'supplier-post-allowed.json')) &&
+              saved.query_attempt === 1 &&
+              saved.query_command?.upstreamTaskId === saved.upstream_task_id &&
+              saved.query_command.queryAttempt === 1 &&
+              saved.query_command.jobId === accepted.jobId &&
+              saved.query_command.ownerId === state.owner.userId,
+            'LIVE_QUERY_TASK_BINDING',
+          );
+          const temporary = join(directory, 'allowed-task.pending');
+          save(temporary, { upstreamTaskId: saved.upstream_task_id, deadline }, true);
+          renameSync(temporary, join(directory, 'allowed-task.json'));
+          boundTask = true;
+          record('query-task-bound', { jobId: accepted.jobId, taskIdPresent: true });
+        }
+      }
+      await inspectDevWindow(dev.values, pool, accepted.jobId, { a: 2, b: 2 }, false);
       const response = await request(
         state.origin,
         `/api/v1/compute/images/${accepted.jobId}`,
@@ -2261,20 +2496,31 @@ async function runPersistentDev() {
       );
       assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
       image = (await response.json()) as ImageView;
-      if (
-        [
-          'completed',
-          'partial',
-          'unknown',
-          'rejected',
-          'failed',
-          'materialization_failed',
-        ].includes(image.status)
-      )
-        break;
+      if (terminalStatuses.includes(image.status)) break;
       await delay(1000);
     }
-    assert(image, 'LIVE_IMAGE_INCOMPLETE');
+    if (!image || !terminalStatuses.includes(image.status)) {
+      record('image-outcome', {
+        jobId: accepted.jobId,
+        status: 'timeout',
+        lastStatus:
+          image && ['accepted', 'submitted', 'processing', 'materializing'].includes(image.status)
+            ? image.status
+            : image
+              ? 'other'
+              : null,
+        taskIdPresent: boundTask,
+        supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
+      });
+      throw new Error('LIVE_IMAGE_OBSERVATION_TIMEOUT');
+    }
+    record('image-outcome', {
+      jobId: accepted.jobId,
+      status: image.status,
+      errorCode: image.errorCode,
+      taskIdPresent: boundTask,
+      supplierPostObserved: existsSync(join(directory, 'supplier-post-started.json')),
+    });
     assert(
       existsSync(join(directory, 'supplier-post-started.json')) &&
         existsSync(join(directory, 'supplier-post-allowed.json')) &&
@@ -2282,7 +2528,19 @@ async function runPersistentDev() {
         !existsSync(join(directory, 'supplier-post-unexpected-blocked.json')),
       'LIVE_ATTEMPT_COUNT',
     );
-    if (isAsyncScenario(scenario)) await settleQueryAudit();
+    if (isAsyncScenario(scenario) && image.status === 'completed') {
+      await settleQueryAudit();
+      const audit = queryAuditSummary();
+      assert(
+        boundTask &&
+          audit.issued.length > 0 &&
+          audit.missingResponses.length === 0 &&
+          audit.missingTraces.length === 0 &&
+          audit.responses.length === audit.issued.length &&
+          audit.traces.length === audit.responses.length,
+        'LIVE_QUERY_AUDIT_INCOMPLETE',
+      );
+    }
     await stop(worker);
     worker = undefined;
 
@@ -2305,6 +2563,7 @@ async function runPersistentDev() {
       await assetBytes(state, cookie, otherCookie, assetId, output);
     }
 
+    const beforeRestartQueries = queryAuditSummary().issued;
     await stop(app);
     app = undefined;
     app = await startApp(state);
@@ -2323,21 +2582,35 @@ async function runPersistentDev() {
     for (const { assetId, output } of matchedOutputs) {
       await assetBytes(state, cookie, otherCookie, assetId, output);
     }
+    await delay(2000);
+    assert.deepEqual(queryAuditSummary().issued, beforeRestartQueries, 'LIVE_RESTART_QUERY');
+    assert(
+      !existsSync(join(directory, 'supplier-post-repeat-blocked.json')) &&
+        !existsSync(join(directory, 'supplier-post-unexpected-blocked.json')),
+      'LIVE_REPEAT_ATTEMPT',
+    );
     assertLiveArtifacts(artifacts.sha256, project);
     record('dev-live-verified', {
-      environment: 'mio_dev',
+      environment: 'persistent-dev',
       retainedInDatabase: true,
       scenario,
       jobId: accepted.jobId,
       assetIds: image.assetIds,
       supplierPostAttempts: 1,
+      restartCheck: 'app-http-idempotency-worker-stopped',
+      restartObservationMs: 2000,
       ...(isAsyncScenario(scenario) ? { queryAudit: queryAuditSummary() } : {}),
     });
+  } catch (error) {
+    operationFailure = error;
   } finally {
-    await stop(worker).catch(() => {});
-    await stop(app).catch(() => {});
-    await bounded(pool.end()).catch(() => {});
+    await stop(worker).catch(() => cleanupFailures.push('worker'));
+    await stop(app).catch(() => cleanupFailures.push('app'));
+    await bounded(pool.end()).catch(() => cleanupFailures.push('pool'));
+    if (cleanupFailures.length) record('cleanup-failed', { components: cleanupFailures });
   }
+  if (operationFailure) throw operationFailure;
+  if (cleanupFailures.length) throw new Error('LIVE_CLEANUP_INCOMPLETE');
 }
 
 if (isMain) {

@@ -1,7 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -901,7 +909,7 @@ describe('offline network audit interlock', () => {
     const directory = auditDirectory();
     writeFileSync(
       join(directory, 'allowed-task.json'),
-      JSON.stringify({ upstreamTaskId: 'task-1' }),
+      JSON.stringify({ upstreamTaskId: 'task-1', deadline: Date.now() + 600_000 }),
     );
     const transport = vi.fn(async () =>
       Response.json({ code: 0, data: { task_status: 'processing' } }),
@@ -925,5 +933,89 @@ describe('offline network audit interlock', () => {
       const { existsSync } = await import('node:fs');
       expect(existsSync(join(directory, 'supplier-query-8-trace.json'))).toBe(true);
     });
+  });
+
+  it('waits for the persisted task before forwarding and rejects an unrelated held query', async () => {
+    const directory = auditDirectory();
+    const transport = vi.fn(async () =>
+      Response.json({ code: 0, data: { task_status: 'processing' } }),
+    );
+    vi.stubEnv('MIO_LIVE_IMAGE_AWAIT_TASK', 'yes');
+    await installAudit('kling-async', directory, transport as typeof fetch);
+    const wrong = fetch('https://api.onelinkai.cloud/kling/v1/images/generations/wrong', {
+      headers: { authorization: 'synthetic-secret' },
+    });
+    expect(existsSync(join(directory, 'supplier-query-held.json'))).toBe(true);
+    expect(transport).not.toHaveBeenCalled();
+    writeFileSync(
+      join(directory, 'allowed-task.json'),
+      JSON.stringify({ upstreamTaskId: 'actual-task', deadline: Date.now() + 600_000 }),
+    );
+    await expect(wrong).rejects.toThrow('LIVE_QUERY_TASK_MISMATCH');
+    expect(transport).not.toHaveBeenCalled();
+    for (let i = 0; i < 8; i++)
+      await fetch('https://api.onelinkai.cloud/kling/v1/images/generations/actual-task', {
+        headers: { authorization: 'synthetic-secret' },
+      });
+    expect(() =>
+      fetch('https://api.onelinkai.cloud/kling/v1/images/generations/actual-task'),
+    ).toThrow('LIVE_QUERY_LIMIT_BLOCKED');
+    expect(transport).toHaveBeenCalledTimes(8);
+    expect(readFileSync(join(directory, 'supplier-http-events.jsonl'), 'utf8')).not.toContain(
+      'synthetic-secret',
+    );
+  });
+
+  it('does not forward a held query after its caller aborts', async () => {
+    const directory = auditDirectory();
+    const transport = vi.fn(async () => new Response('ok'));
+    vi.stubEnv('MIO_LIVE_IMAGE_AWAIT_TASK', 'yes');
+    await installAudit('kling-async', directory, transport as typeof fetch);
+    const controller = new AbortController();
+    const held = fetch('https://api.onelinkai.cloud/kling/v1/images/generations/actual-task', {
+      signal: controller.signal,
+    });
+    controller.abort();
+    writeFileSync(
+      join(directory, 'allowed-task.json'),
+      JSON.stringify({ upstreamTaskId: 'actual-task', deadline: Date.now() + 600_000 }),
+    );
+    await expect(held).rejects.toThrow();
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it('refuses a query whose persisted deadline expired while waiting for the task', async () => {
+    const directory = auditDirectory();
+    const transport = vi.fn(async () => new Response('ok'));
+    vi.stubEnv('MIO_LIVE_IMAGE_AWAIT_TASK', 'yes');
+    await installAudit('kling-async', directory, transport as typeof fetch);
+    const held = fetch('https://api.onelinkai.cloud/kling/v1/images/generations/actual-task');
+    writeFileSync(
+      join(directory, 'allowed-task.json'),
+      JSON.stringify({ upstreamTaskId: 'actual-task', deadline: Date.now() - 1 }),
+    );
+    await expect(held).rejects.toThrow('LIVE_QUERY_DEADLINE_EXCEEDED');
+    expect(transport).not.toHaveBeenCalled();
+    expect(existsSync(join(directory, 'supplier-query-deadline-blocked.json'))).toBe(true);
+  });
+
+  it('does not forward when recording the query budget crosses its deadline', async () => {
+    const directory = auditDirectory();
+    const transport = vi.fn(async () => new Response('ok'));
+    writeFileSync(
+      join(directory, 'allowed-task.json'),
+      JSON.stringify({ upstreamTaskId: 'actual-task', deadline: 1000 }),
+    );
+    await installAudit('kling-async', directory, transport as typeof fetch);
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(999).mockReturnValueOnce(1000);
+    try {
+      expect(() =>
+        fetch('https://api.onelinkai.cloud/kling/v1/images/generations/actual-task'),
+      ).toThrow('LIVE_QUERY_DEADLINE_EXCEEDED');
+      expect(existsSync(join(directory, 'supplier-query-1.json'))).toBe(true);
+      expect(transport).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
   });
 });

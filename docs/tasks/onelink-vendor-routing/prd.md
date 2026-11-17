@@ -106,11 +106,11 @@
 
 - **目标与成果归属**：绑定本 PRD 成果键 `onelink-route-live-expansion`，在 Unit 1 路由与原厂驱动基础上，对当前账号动态目录已存在、此前受硬编码限制的现网模型（如火山 `doubao-seedream-4.5` / `doubao-seedream-5.0-lite` 多规格同步生图，以及可灵 `image-kling-v3-omni` `/kling/v1/images/omni-image` 异步生图/单参考图）完成受控真实 OneLink + 私有 COS 闭环验证。
 - **C0 核对范围（编码前）**：
-  - 依赖 Unit 1 实施候选就绪；确认本机 `.runtime/dev/` 隔离 PostgreSQL、RabbitMQ、私有 COS 配置及本人测试 OneLink Key 可用。
+  - 依赖 Unit 1 实施候选就绪；确认本机常驻 `mio_dev`、RabbitMQ、私有 COS 配置及本人测试登录或 OneLink Key 可用，并为正常验收保持其他 A/B 与任务提交者停用的独占窗口。强杀与消息重放另用隔离现场。
   - 核对测试账号当前 `/v1/models` 快照中精确存在的目标模型 ID 与本次人类显式授权的真实生图调用预算（每个授权场景严格保持 `maxUpstreamGeneratePosts = 1` 单次提交安全互锁）。当前 Key 目录为 0 项的模型（如 `` `gpt-image-*` ``、`` `gemini-*` ``）不在无模型条件下强跑，须在出站前以 `LIVE_MODEL_NOT_FOUND` 零 POST 阻断并如实保留 `pending`。
 - **C1 实施与验收**：
   - 扩展 `tests/compute/live-image-audit.ts` 与 `tests/compute/live-image-loop.ts` 支持路由化场景选择与审计白名单（如 `/kling/v1/images/omni-image` 及对应查询路径），保持 `maxUpstreamGeneratePosts = 1`、脱敏诊断落盘与零密钥输出。
-  - 在隔离环境通过公开 HTTP -> MQ -> Worker -> OneLink -> 私有 COS -> `GET /api/v1/assets/{id}` 获取本人短期下载地址并从 COS 下载，完成真实生成、SHA-256 校验、跨用户 `404`/未登录 `401` 权限核验，以及硬重启与消息重放下的 `0` 重复 POST 验证；若实测观察到新的网关字段或状态细节，同步记录至[万联集成契约](../../integrations/onelink.md)并在候选内完成 `quality-review`、`norms-review` 与 `deliver prepare`，由人类单独接受。
+  - 正常 `dev` 入口直接读写常驻开发环境并保留数据（媒体数据库以 `MIO_ASSETS_DATABASE_URL` 实际配置为准），通过公开 HTTP -> MQ -> Worker -> OneLink -> 私有 COS -> `GET /api/v1/assets/{id}` 获取本人短期下载地址并从 COS 下载，核验真实生成、SHA-256、跨用户 `404`/未登录 `401` 和 A 重启后的同请求 HTTP 幂等；详见[测试入口](../../engineering/testing.md)。强杀在途 Worker 与重复消息重放在独立隔离现场通过 `prepare`／`execute` 验证 `0` 重复 POST，不能由 `dev` 的 HTTP 重启观察代替。若实测观察到新的网关字段或状态细节，同步记录至[万联集成契约](../../integrations/onelink.md)并在候选内完成 `quality-review`、`norms-review` 与 `deliver prepare`，由人类单独接受。
 
 ## 4. 迁移、验证与接受边界
 

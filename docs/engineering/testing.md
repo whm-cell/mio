@@ -26,7 +26,7 @@
 
 共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。获授权的本地真实业务与模型验收（含 `providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及下述图片 `dev` 模式）默认直接读写[常驻 mio_dev 环境](../local-environments.md#自动化回归与人工数据)并保留数据；发现入口不等于授权执行。
 
-已授权的图片真实闭环默认使用 `dev` 模式直接增量迁移并读写常驻 `mio_dev`（保留生成的资产、任务与路由）；仅演练强杀在途 Worker 与交换机重复消息重投时才使用 `prepare`/`execute` 隔离空库模式：
+已授权的图片真实闭环默认使用 `dev` 模式直接增量迁移并读写常驻开发环境（认证与供应商使用配置的 `mio_dev`，媒体任务和资产使用实际 `MIO_ASSETS_DATABASE_URL`，可为独立分域库；保留生成的资产、任务与路由）；仅演练强杀在途 Worker 与交换机重复消息重投时才使用 `prepare`/`execute` 隔离空库模式：
 
 ```sh
 MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] dev <.runtime/run-dir> <login-or-key-file> <task-id>
@@ -35,5 +35,9 @@ MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>]
 ```
 
 任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`，prepare／execute 核对同一 task ID、`{commit, contractRevision}` 和运行产物摘要；旧私人运行历史只读，不自动恢复。实际执行仍须核对场景、环境、凭据和费用授权。
+
+`dev` 使用已有登录 JSON（`email`、`password`，可选 `apiKey`）可复用账号；若输入原始 Key，则创建保留的专用账号并在本次私有运行目录的 `owner-login.json`（仅文件所有者可读写）保存登录信息，不保存 Key。登录文件包含 `apiKey` 时入口会保存并轮换该账号的供应商凭据；导入与现有声明不同的全局模型路由也会影响其他用户。执行前须核对账号、凭据及现有全局路由，确认这些写入符合本次授权。运行目录和登录文件不得提交或输出。执行者须在整个运行窗口停用其他 A/B 和任务提交者：入口检查六个计算队列、连接、未完成任务、outbox 和 Worker journal，运行中继续检查额外连接和其他在途任务，发现占用即停止，不清队列。检查是快照，不能替代保持独占窗口。
+
+异步场景只放行与本次实际提交后持久化的上游任务一致的查询，最多八次，查询期限仍以持久化的 600 秒契约和命令期限为准；观察可等待已发起操作的下载与 COS 物化结束，不延长上游查询期限。观察上界按现有查询／下载、逐输出最多三轮图片校验与 COS 超时加 30 秒余量计算；超过上界保留现场并记为未验证，不承诺覆盖任意故障。`dev` 停止 Worker 后重启 A 并检查同一 requestId 的 HTTP 幂等及短暂观察窗口，不代表 MQ 重放；强杀和重复消息重放仍由隔离的 `prepare`／`execute` 验证。未知结果保留原任务身份核对，不自动以新 requestId 重提。
 
 在已有任务记录简记目标、差异、所选入口与理由、复用原件及覆盖缺口。区分文件发现、正文展开、实际执行和证据覆盖：局部成功不自动产生完整通过，同候选的简短结论不能替代原件，失败仍保留。复用方法沿[证据协议](../work-records.md#增量验证与同输入复用)，完整验证条件沿[验证协议](../coordination.md#验证与接受)；导航不改变 `pnpm check`、CI 或人工接受。

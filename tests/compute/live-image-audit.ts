@@ -1,6 +1,7 @@
 import {
   appendFileSync,
   closeSync,
+  existsSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -42,6 +43,7 @@ const unexpected = join(root, 'supplier-post-unexpected-blocked.json');
 const held = join(root, 'supplier-query-held.json');
 const queryLimit = join(root, 'supplier-query-limit-blocked.json');
 const queryMismatch = join(root, 'supplier-query-mismatch-blocked.json');
+const queryDeadline = join(root, 'supplier-query-deadline-blocked.json');
 const events = join(root, 'supplier-http-events.jsonl');
 function mark(path: string) {
   try {
@@ -196,18 +198,43 @@ globalThis.fetch = (input, init) => {
         /^\/kling\/v1\/images\/omni-image\/[^/]+$/.test(target.pathname)));
   const providerPost = !query;
   let queryAttempt = 0;
+  let queryExpiresAt = 0;
   if (query && process.env.MIO_LIVE_IMAGE_HOLD_FIRST_QUERY === 'yes') {
     mark(held);
     return new Promise<Response>(() => {});
   }
+  if (
+    query &&
+    process.env.MIO_LIVE_IMAGE_AWAIT_TASK === 'yes' &&
+    !existsSync(join(root, 'allowed-task.json'))
+  ) {
+    mark(held);
+    return (async () => {
+      const deadline = Date.now() + 30_000;
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      while (!existsSync(join(root, 'allowed-task.json'))) {
+        signal?.throwIfAborted();
+        if (Date.now() >= deadline) throw new Error('LIVE_QUERY_TASK_NOT_READY');
+        await new Promise((done) => setTimeout(done, 100));
+      }
+      signal?.throwIfAborted();
+      return globalThis.fetch(input, init);
+    })();
+  }
   if (query) {
     const expected = JSON.parse(readFileSync(join(root, 'allowed-task.json'), 'utf8')) as {
       upstreamTaskId?: string;
+      deadline?: number;
     };
     if (decodeURIComponent(target.pathname.split('/')[5]!) !== expected.upstreamTaskId) {
       mark(queryMismatch);
       throw new Error('LIVE_QUERY_TASK_MISMATCH');
     }
+    if (!Number.isSafeInteger(expected.deadline) || Date.now() >= expected.deadline!) {
+      mark(queryDeadline);
+      throw new Error('LIVE_QUERY_DEADLINE_EXCEEDED');
+    }
+    queryExpiresAt = expected.deadline!;
     let allowedQuery = false;
     for (let attempt = 1; attempt <= 8; attempt++) {
       try {
@@ -257,6 +284,10 @@ globalThis.fetch = (input, init) => {
     mark(allowed);
   }
   // Redirects must not bypass the endpoint allowlist or the durable POST lock.
+  if (query && Date.now() >= queryExpiresAt) {
+    mark(queryDeadline);
+    throw new Error('LIVE_QUERY_DEADLINE_EXCEEDED');
+  }
   const result = originalFetch(input, { ...init, redirect: 'error' });
   return result.then(
     (response) => {

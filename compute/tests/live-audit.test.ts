@@ -293,7 +293,10 @@ it('marks a received response before its diagnostic trace is available', async (
   const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response(stream));
   vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
   vi.stubGlobal('fetch', transport);
-  writeFileSync(join(directory, 'allowed-task.json'), JSON.stringify({ upstreamTaskId: 'task' }));
+  writeFileSync(
+    join(directory, 'allowed-task.json'),
+    JSON.stringify({ upstreamTaskId: 'task', deadline: Date.now() + 600_000 }),
+  );
   try {
     await import('../../tests/compute/live-image-audit.ts');
     const response = await fetch('https://api.onelinkai.cloud/vidu/ent/v2/tasks/task/creations');
@@ -339,7 +342,7 @@ it('allows only the saved task and at most eight query attempts without logging 
   vi.stubGlobal('fetch', transport);
   writeFileSync(
     join(directory, 'allowed-task.json'),
-    JSON.stringify({ upstreamTaskId: 'private-task' }),
+    JSON.stringify({ upstreamTaskId: 'private-task', deadline: Date.now() + 600_000 }),
     {
       mode: 0o600,
     },
@@ -510,7 +513,7 @@ it('enforces Kling task-ID matching, eight-query cap, and sanitized envelope dia
   vi.stubGlobal('fetch', transport);
   writeFileSync(
     join(directory, 'allowed-task.json'),
-    JSON.stringify({ upstreamTaskId: 'private-kling-task' }),
+    JSON.stringify({ upstreamTaskId: 'private-kling-task', deadline: Date.now() + 600_000 }),
     { mode: 0o600 },
   );
   try {

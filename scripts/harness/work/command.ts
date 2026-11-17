@@ -3,8 +3,7 @@ import type { StdioOptions } from 'node:child_process';
 import { mkdir, open, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
-import { checkedPath, deliveryPending, identifier, json } from './records.ts';
-import { readConflict, recordConflict } from './reconciliation.ts';
+import { checkedPath, identifier, json } from './records.ts';
 
 export interface CommandActivity {
   path: string;
@@ -37,27 +36,7 @@ export async function withTaskCommand<T>(
   };
   try {
     await marker.writeFile(json(activity.owner));
-    if (command !== 'update' && (await readConflict(root, id)) !== null)
-      throw new Error(
-        `WORK_RECONCILE: ${id} has an unresolved conflict; inspect context and .work/tasks/${id}/conflict.json, then use update with the current revision and a reconciliation reason`,
-      );
-    try {
-      return await action(activity);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.startsWith('WORK_CONFLICT:')) {
-        // A pending delivery must be replayed first, not trapped behind another recovery gate.
-        if (await deliveryPending(root, id))
-          throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
-        try {
-          await recordConflict(root, id, command, message);
-        } catch (failure) {
-          activity.retain = true;
-          throw new Error(`${message}; WORK_RECONCILE_WRITE: ${failure}; retained ${path}`);
-        }
-      }
-      throw error;
-    }
+    return await action(activity);
   } finally {
     await marker.close();
     if (!activity.retain) await rm(path);

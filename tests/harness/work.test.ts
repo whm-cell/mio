@@ -904,7 +904,7 @@ it('requires a real unique requirement heading rather than a nonempty label or f
 });
 
 it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
-  'requires explicit reconciliation after a same-stage conflict in %s',
+  'rejects stale updates without persisting a conflict gate in %s',
   async (stage) => {
     const root = await fixture();
     const first = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
@@ -932,46 +932,25 @@ it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
         plan: { nextAction: 'Obsolete action.' },
       }).output,
     ).toContain('WORK_CONFLICT');
-    const receipt = await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8');
     expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
-    const script = 'require("node:fs").writeFileSync(".work/forbidden","started")';
-    for (const args of [
-      ['exec', id, '--', process.execPath, '-e', script],
-      ['run', id, 'checks', '--', process.execPath, '-e', script],
-      ['sync', id, 'Cannot acknowledge away the conflict.'],
-      ['archive', id, 'Cannot hide the conflict.'],
-      ['handoff', id],
-    ])
-      expect(invoke(root, args).output).toContain('WORK_RECONCILE');
-    expect(invoke(root, ['ensure', '--stdin'], { requirement }).output).toContain('WORK_RECONCILE');
-    const observed = JSON.parse(invoke(root, ['context', id, 'resume']).output);
-    expect(observed.assessment.ready).toBe(false);
-    expect(invoke(root, ['check', id]).output).toContain('WORK_RECONCILE');
-    expect(invoke(root, ['read', id, 'task']).status).toBe(0);
-    expect(invoke(root, ['status']).status).toBe(0);
-    expect(invoke(root, ['exec', id, '--', process.execPath, '-e', script]).output).toContain(
-      'WORK_RECONCILE',
-    );
-    await expect(readFile(join(root, '.work/forbidden'))).rejects.toHaveProperty('code', 'ENOENT');
-    expect((await state(root, id)).evidence).toHaveLength(0);
-    const recovered = invoke(root, ['update', id, '--stdin'], {
-      revision: observed.revision,
-      reason:
-        'Compared the rejected request with current authority and retained the current action.',
-      plan: { nextAction: 'Execute the reconciled fixture action.' },
-    });
-    expect(recovered.status, recovered.output).toBe(0);
     await expect(readFile(join(root, `.work/tasks/${id}/conflict.json`))).rejects.toHaveProperty(
       'code',
       'ENOENT',
     );
-    expect((await state(root, id)).notes.join('\n')).toContain(receipt.trim());
+    // Existing receipts are historical files: leave them untouched and do not resurrect a gate.
+    const legacyReceipt = '{"message":"historical conflict"}\n';
+    await writeFile(join(root, `.work/tasks/${id}/conflict.json`), legacyReceipt);
+    const observed = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+    expect(observed.assessment.ready).toBe(true);
+    expect(observed.task.nextAction).toBe('Current authorized action.');
+    const script = 'require("node:fs").writeFileSync(".work/forbidden","started")';
     const args =
       stage === 'C1_IMPLEMENTATION'
         ? ['exec', id, '--', process.execPath, '-e', script]
         : ['run', id, 'checks', '--', process.execPath, '-e', script];
     expect(invoke(root, args).status).toBe(0);
     expect(await readFile(join(root, '.work/forbidden'), 'utf8')).toBe('started');
+    expect(await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8')).toBe(legacyReceipt);
   },
 );
 
@@ -1027,7 +1006,7 @@ it('repairs the current section on the same task without changing identity or re
     ).toBe(1);
     expect((await state(root, id)).plan.requirement).toEqual(requirement);
   }
-  // A stale update leaves a conflict while the source itself needs a valid section correction.
+  // A stale update must not prevent a valid section correction.
   expect(
     invoke(root, ['update', id, '--stdin'], {
       ...request,

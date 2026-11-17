@@ -18,7 +18,6 @@ import { documentCatalog, resolveDocument, resolvePrd } from '../task-documents.
 import { registerNormsReview } from './norms-review.ts';
 import { withTaskCommand } from './command.ts';
 import { requirementIssues } from './requirements.ts';
-import { clearConflict, readConflict } from './reconciliation.ts';
 
 const planFields = [
   'result',
@@ -153,7 +152,6 @@ export async function updateTask(root: string, id: string, raw: string) {
     throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
   if (request.revision !== digest(loaded.raw))
     throw new Error('WORK_CONFLICT: read the current context before updating');
-  const conflict = await readConflict(root, id);
   if (
     (request.reopen || (request.stage !== undefined && request.stage !== task.stage)) &&
     (typeof patch.nextAction !== 'string' || !patch.nextAction.trim())
@@ -220,11 +218,7 @@ export async function updateTask(root: string, id: string, raw: string) {
     if (!['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'].includes(request.stage as string))
       throw new Error('WORK_REQUEST: update cannot record release or human acceptance');
     if (request.stage === 'C1_IMPLEMENTATION') {
-      const assessment = await assess(
-        root,
-        { ...task, stage: 'C1_IMPLEMENTATION' },
-        { reconciling: true },
-      );
+      const assessment = await assess(root, { ...task, stage: 'C1_IMPLEMENTATION' });
       if (!assessment.ready)
         throw new Error(
           [
@@ -235,11 +229,8 @@ export async function updateTask(root: string, id: string, raw: string) {
     }
     task.stage = request.stage as string;
   }
-  task.notes.push(
-    `${new Date().toISOString()} ${request.reason}${conflict === null ? '' : `; resolved conflict: ${conflict.trim()}`}`,
-  );
+  task.notes.push(`${new Date().toISOString()} ${request.reason}`);
   // Contract edits invalidate the old checkpoint; only an explicit sync acknowledges the diff.
   await saveTask(root, task, loaded.raw);
-  if (conflict !== null) await clearConflict(root, id);
   return inspectTask(root, task, json(task));
 }

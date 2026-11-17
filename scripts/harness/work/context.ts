@@ -10,7 +10,6 @@ import { needsQualityReview, qualityCriterion } from './quality-review.ts';
 import { documentCatalog, resolveDocument } from '../task-documents.ts';
 import { normsCriterion, normsIssues } from './norms-review.ts';
 import { requirementIssues } from './requirements.ts';
-import { readConflict } from './reconciliation.ts';
 import { manualEvidenceResult } from './manual-evidence.ts';
 import { artifact, automatedEvidence } from './evidence.ts';
 export { runtimeEnvironment as environment } from './verification-proof.ts';
@@ -182,15 +181,11 @@ export function contractIssues(task: Task): string[] {
 export async function assess(
   root: string,
   task: Task,
-  options: { inspectDelivery?: boolean; reconciling?: boolean } = {},
+  options: { inspectDelivery?: boolean } = {},
 ) {
-  const { inspectDelivery = true, reconciling = false } = options;
+  const { inspectDelivery = true } = options;
   const current = await capture(root, task);
   const errors = [...contractIssues(task), ...(await requirementIssues(root, task.plan))];
-  if (!reconciling && (await readConflict(root, task.plan.id)) !== null)
-    errors.push(
-      `WORK_RECONCILE: unresolved conflict at .work/tasks/${task.plan.id}/conflict.json; inspect current context, then update using its revision and a reconciliation reason`,
-    );
   if (inspectDelivery && (await deliveryPending(root, task.plan.id)))
     errors.push('WORK_DELIVERY_PENDING: resume the original delivery request');
   const qualityRequired = needsQualityReview(task.plan, await loadConfig(root));

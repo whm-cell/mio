@@ -33,15 +33,23 @@ import {
 import type { ImageAssetRef, ImageCommandV1, ImageResultV1 } from '@mio/compute-contracts';
 import { connect } from 'amqplib';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
+import { localWorkerEnvironment } from '../../scripts/service/local-compute-environment.ts';
+import { prepareLocalBroker } from '../../scripts/service/local-broker.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
 import { decryptCredential } from '../../src/providers/credentials.ts';
 import type { CredentialEnvelope } from '../../src/providers/credentials.ts';
 import { validateImage } from '../../compute/src/adapters/media.ts';
 import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';
+import {
+  authenticateOrCreateRetainedDevOwner,
+  parseLiveAuthInput,
+  preparePersistentDevEnvironment,
+} from '../support/local-dev-live.ts';
 
 // This is a single-run, explicitly opted-in acceptance entry, not an application launcher.
 // All credentials, cookies, output bodies and URLs remain in this process or private files.
 // Usage: MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>]
+//   dev <.runtime/run-dir> <login-or-key-file> <task-id>
 //   prepare <.runtime/run-dir> <infrastructure-dir> <provider-key-file> <task-id>
 //   execute <.runtime/run-dir> <service-cos-env> <worker-cos-env> <task-id>
 // Both phases require the task's clean, synced Git candidate; never replay historical runs.
@@ -91,16 +99,33 @@ export function parseLiveInvocation(
 ) {
   assert.equal(optIn, 'yes', 'LIVE_OPT_IN');
   const { scenario, explicitScenario, positional } = parseCliArguments(argv, envScenario);
-  const [phase, runArgument, first, second, taskId, ...extra] = positional;
-  assert(
-    ['prepare', 'execute'].includes(phase ?? '') &&
-      runArgument &&
-      first &&
-      second &&
-      taskId &&
-      !extra.length,
-    'LIVE_ARGUMENTS',
-  );
+  const phase = positional[0];
+  let runArgument: string | undefined;
+  let first: string | undefined;
+  let second = '';
+  let taskId: string | undefined;
+  if (phase === 'dev') {
+    const [, runArg, authArg, taskArg, ...extra] = positional;
+    assert(runArg && authArg && taskArg && !extra.length, 'LIVE_ARGUMENTS');
+    runArgument = runArg;
+    first = authArg;
+    taskId = taskArg;
+  } else {
+    const [, runArg, firstArg, secondArg, taskArg, ...extra] = positional;
+    assert(
+      ['prepare', 'execute'].includes(phase ?? '') &&
+        runArg &&
+        firstArg &&
+        secondArg &&
+        taskArg &&
+        !extra.length,
+      'LIVE_ARGUMENTS',
+    );
+    runArgument = runArg;
+    first = firstArg;
+    second = secondArg;
+    taskId = taskArg;
+  }
   assert.match(taskId, /^[a-z0-9][a-z0-9_-]{0,79}$/, 'LIVE_TASK');
   const directory = resolve(runArgument);
   assert(directory.startsWith(`${resolve('.runtime')}${sep}`), 'LIVE_PRIVATE_DIRECTORY');
@@ -2024,12 +2049,301 @@ async function execute() {
 }
 
 function safeCode(error: unknown) {
-  const first = error instanceof Error ? error.message.split('\n', 1)[0]! : '';
-  return /^LIVE_[A-Z_]+$/.test(first) ? first : 'LIVE_UNEXPECTED_FAILURE';
+  const firstLine = error instanceof Error ? error.message.split('\n', 1)[0]! : '';
+  return /^(?:LIVE|DEV)_[A-Z_]+$/.test(firstLine) ? firstLine : 'LIVE_UNEXPECTED_FAILURE';
 }
+
+async function runPersistentDev() {
+  const artifacts = captureLiveArtifacts(project);
+  mkdirSync(directory, { recursive: false, mode: 0o700 });
+  save(join(directory, 'runtime-artifacts.json'), artifacts, true);
+  const authInput = await parseLiveAuthInput(first!);
+  const dev = await preparePersistentDevEnvironment(['auth', 'assets', 'compute', 'providers']);
+  const aEnv: Environment = Object.fromEntries(
+    Object.entries(dev.runtimeEnv).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+  for (const key of [
+    'MIO_COS_BUCKET',
+    'MIO_COS_REGION',
+    'MIO_COS_SECRET_ID',
+    'MIO_COS_SECRET_KEY',
+    'MIO_IMAGE_KEY_ID',
+    'MIO_IMAGE_PUBLIC_KEY',
+  ]) {
+    assert(aEnv[key], 'LIVE_DEV_CONFIG_MISSING');
+  }
+  const rawWorker = localWorkerEnvironment('dev', dev.values, dev.host, project);
+  const bEnv: Environment = {
+    ...Object.fromEntries(
+      Object.entries(rawWorker).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      ),
+    ),
+    MIO_LIVE_IMAGE_AUDIT_DIRECTORY: directory,
+    MIO_LIVE_IMAGE_SCENARIO: scenario,
+  };
+  for (const key of ['MIO_COS_SECRET_ID', 'MIO_COS_SECRET_KEY', 'MIO_IMAGE_PRIVATE_KEY']) {
+    assert(bEnv[key], 'LIVE_DEV_WORKER_CONFIG_MISSING');
+  }
+  await prepareLocalBroker('dev', dev.values);
+  if (!existsSync(join(bEnv.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'))) {
+    command('compute/dist/main.js', ['init'], bEnv);
+  }
+  await prepareProfile(aEnv.DSH_HOME!, project);
+
+  record('dev-live-start', {
+    environment: 'mio_dev',
+    retainedInDatabase: true,
+    taskId,
+    candidate,
+    scenario,
+    artifactsSha256: artifacts.sha256,
+  });
+
+  const pool = new Pool({
+    connectionString: aEnv.MIO_COMPUTE_DATABASE_URL ?? aEnv.MIO_ASSETS_DATABASE_URL,
+  });
+  let app: ChildProcess | undefined;
+  let worker: ChildProcess | undefined;
+  const state: State = {
+    taskId,
+    candidate: candidate!,
+    artifactsSha256: artifacts.sha256,
+    scenario,
+    origin: dev.origin,
+    a: aEnv,
+    b: bEnv,
+    owner: { email: '', password: '', userId: '' },
+    other: {
+      email: `live-other-${randomUUID().slice(0, 8)}@mio.dev.local`,
+      password: randomBytes(24).toString('hex'),
+    },
+    modelRef: '',
+    modelId: '',
+    infrastructure: 'mio_dev',
+  };
+
+  try {
+    app = await startApp(state);
+    const ownerAccount = await authenticateOrCreateRetainedDevOwner(
+      state.origin,
+      authInput,
+      `image-${scenario}`,
+    );
+    state.owner = {
+      email: ownerAccount.email,
+      password: ownerAccount.password,
+      userId: ownerAccount.userId,
+    };
+    let cookie = ownerAccount.cookie;
+
+    const otherSignup = await request(state.origin, '/api/auth/sign-up/email', 'POST', {
+      name: 'Dev cross-owner check',
+      email: state.other.email,
+      password: state.other.password,
+    });
+    assert.equal(otherSignup.status, 200, 'LIVE_SIGNUP');
+    let otherCookie = await login(state.origin, state.other);
+
+    const providerView = (await (
+      await request(state.origin, '/api/v1/providers/onelink', 'GET', undefined, cookie)
+    ).json()) as { hasKey: boolean; revision: number };
+    if (ownerAccount.apiKey || !providerView.hasKey) {
+      assert(ownerAccount.apiKey, 'LIVE_PROVIDER_KEY_REQUIRED');
+      const saved = await request(
+        state.origin,
+        '/api/v1/providers/onelink/credential',
+        'PUT',
+        { apiKey: ownerAccount.apiKey, expectedRevision: providerView.revision },
+        cookie,
+      );
+      assert.equal(saved.status, 200, 'LIVE_PROVIDER_SAVE');
+    }
+
+    const discover = await request(
+      state.origin,
+      '/api/v1/providers/onelink/test',
+      'POST',
+      {},
+      cookie,
+    );
+    assert.equal(discover.status, 200, 'LIVE_DISCOVERY_HTTP');
+    const discovery = (await discover.json()) as { status: string };
+    assert.equal(discovery.status, 'connected', 'LIVE_DISCOVERY');
+
+    const catalogRes = await request(
+      state.origin,
+      '/api/v1/providers/onelink/models',
+      'GET',
+      undefined,
+      cookie,
+    );
+    assert.equal(catalogRes.status, 200, 'LIVE_CATALOG_HTTP');
+    const models = (await catalogRes.json()) as {
+      provider: { credentialVersion: number; catalog: { version: number } };
+      items: LiveModel[];
+    };
+    const selected = selectLiveModel(
+      scenario,
+      models.items,
+      models.provider.credentialVersion,
+      models.provider.catalog.version,
+    );
+    state.modelRef = selected.modelRef;
+    state.modelId = selected.modelId;
+
+    const declarationPath = join(directory, 'declaration.json');
+    save(declarationPath, liveRouteDeclaration(scenario, selected.modelId), true);
+    command('scripts/service/import-provider-route.ts', [declarationPath], aEnv);
+
+    const needsReference = ['seedream-45-sync', 'kling-omni-async', 'gpt-edit'].includes(scenario);
+    const referenceAsset = needsReference
+      ? await createReferenceAsset(state, cookie, otherCookie, referencePng())
+      : undefined;
+    const parameters = liveImageParameters(scenario, referenceAsset?.assetId);
+    const expectedCount = 'n' in parameters && parameters.n !== undefined ? parameters.n : 1;
+    const body = {
+      requestId: randomUUID(),
+      modelRef: state.modelRef,
+      parameters,
+    };
+
+    const created = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
+    assert.equal(created.status, 202, 'LIVE_IMAGE_ADMISSION');
+    const accepted = (await created.json()) as ImageView;
+    record('image-accepted', {
+      environment: 'mio_dev',
+      scenario,
+      jobId: accepted.jobId,
+      requestId: body.requestId,
+    });
+
+    let frozen: ImageCommandV1 | undefined;
+    for (let i = 0; i < 100; i++) {
+      const result = await pool.query<{ command: ImageCommandV1; sent_at: Date | null }>(
+        'SELECT j.command,o.sent_at FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1',
+        [accepted.jobId],
+      );
+      if (result.rows[0]?.sent_at) {
+        frozen = result.rows[0].command;
+        break;
+      }
+      await delay(200);
+    }
+    assert(frozen && accepted.requestedCount === expectedCount, 'LIVE_OUTBOX');
+    assertFrozenScenario(
+      frozen,
+      scenario,
+      state.modelId,
+      state.owner.userId,
+      accepted.jobId,
+      referenceAsset,
+    );
+
+    worker = child(
+      'compute/dist/main.js',
+      ['start'],
+      { ...bEnv, NODE_OPTIONS: `--import=${resolve('tests/compute/live-image-audit.ts')}` },
+      'worker.log',
+    );
+
+    let image: ImageView | undefined;
+    for (let i = 0; i < 360; i++) {
+      assert(worker.exitCode === null && worker.signalCode === null, 'LIVE_WORKER_EXITED');
+      const response = await request(
+        state.origin,
+        `/api/v1/compute/images/${accepted.jobId}`,
+        'GET',
+        undefined,
+        cookie,
+      );
+      assert.equal(response.status, 200, 'LIVE_IMAGE_GET');
+      image = (await response.json()) as ImageView;
+      if (
+        [
+          'completed',
+          'partial',
+          'unknown',
+          'rejected',
+          'failed',
+          'materialization_failed',
+        ].includes(image.status)
+      )
+        break;
+      await delay(1000);
+    }
+    assert(image, 'LIVE_IMAGE_INCOMPLETE');
+    assert(
+      existsSync(join(directory, 'supplier-post-started.json')) &&
+        existsSync(join(directory, 'supplier-post-allowed.json')) &&
+        !existsSync(join(directory, 'supplier-post-repeat-blocked.json')) &&
+        !existsSync(join(directory, 'supplier-post-unexpected-blocked.json')),
+      'LIVE_ATTEMPT_COUNT',
+    );
+    if (isAsyncScenario(scenario)) await settleQueryAudit();
+    await stop(worker);
+    worker = undefined;
+
+    const journalDb = new DatabaseSync(join(bEnv.MIO_COMPUTE_DIRECTORY!, 'journal.sqlite3'), {
+      readOnly: true,
+    });
+    let matchedOutputs: ReturnType<typeof matchCompletedOutputs>;
+    try {
+      const row = journalDb
+        .prepare('SELECT phase,payload FROM image_attempts WHERE job_id=?')
+        .get(accepted.jobId);
+      assert.equal(row?.phase, 'completed', 'LIVE_JOURNAL_PHASE');
+      const payload = JSON.parse(String(row.payload)) as { outputs: SavedOutput[] };
+      matchedOutputs = matchCompletedOutputs(image, payload.outputs, expectedCount, scenario);
+    } finally {
+      journalDb.close();
+    }
+
+    for (const { assetId, output } of matchedOutputs) {
+      await assetBytes(state, cookie, otherCookie, assetId, output);
+    }
+
+    await stop(app);
+    app = undefined;
+    app = await startApp(state);
+    cookie = await login(state.origin, {
+      email: state.owner.email,
+      password: state.owner.password,
+    });
+    otherCookie = await login(state.origin, state.other);
+    const duplicate = await request(state.origin, '/api/v1/compute/images', 'POST', body, cookie);
+    assert.equal(duplicate.status, 202, 'LIVE_IDEMPOTENT_HTTP');
+    assert.equal(
+      ((await duplicate.json()) as ImageView).jobId,
+      accepted.jobId,
+      'LIVE_IDEMPOTENT_JOB',
+    );
+    for (const { assetId, output } of matchedOutputs) {
+      await assetBytes(state, cookie, otherCookie, assetId, output);
+    }
+    assertLiveArtifacts(artifacts.sha256, project);
+    record('dev-live-verified', {
+      environment: 'mio_dev',
+      retainedInDatabase: true,
+      scenario,
+      jobId: accepted.jobId,
+      assetIds: image.assetIds,
+      supplierPostAttempts: 1,
+      ...(isAsyncScenario(scenario) ? { queryAudit: queryAuditSummary() } : {}),
+    });
+  } finally {
+    await stop(worker).catch(() => {});
+    await stop(app).catch(() => {});
+    await bounded(pool.end()).catch(() => {});
+  }
+}
+
 if (isMain) {
   try {
-    if (phase === 'prepare') await prepare();
+    if (phase === 'dev') await runPersistentDev();
+    else if (phase === 'prepare') await prepare();
     else await execute();
   } catch (error) {
     const message = safeCode(error);

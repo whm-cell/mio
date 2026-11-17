@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
-import { authDatabase } from '../support/auth-database.ts';
-import { packedAuthRuntime } from '../support/auth-runtime.ts';
 import { importDeclaration } from '../providers/fixtures/provider-declaration.ts';
+import {
+  authenticateOrCreateRetainedDevOwner,
+  createPersistentDevProfileController,
+  parseLiveAuthInput,
+  preparePersistentDevEnvironment,
+} from '../support/local-dev-live.ts';
 
 const diagnostic: {
   phase: string;
@@ -17,7 +20,8 @@ const diagnostic: {
 } = {
   phase: 'credential-input',
 };
-/** Explicit live process only; Vitest never discovers or imports this entry. No secret is printed. */
+
+/** Explicit live process against persistent mio_dev; retains conversation, receipts and DSH session logs. */
 async function main() {
   const path = process.argv[2];
   const modelId = process.argv[3] ?? 'deepseek-v4.1-flash';
@@ -25,58 +29,33 @@ async function main() {
   assert(
     path && process.argv.length <= 5 && ['openai-chat', 'anthropic-messages'].includes(protocol),
   );
-  const raw = await readFile(path, 'utf8');
-  assert(Buffer.byteLength(raw) <= 8192);
-  const line = raw.trim();
-  assert(line && !/[\r\n]/.test(line));
-  const assignment = /^[A-Za-z_][A-Za-z0-9_]{0,47}=(.*)$/.exec(line);
-  let apiKey = assignment ? assignment[1]! : line;
-  if (
-    (apiKey.startsWith('"') && apiKey.endsWith('"')) ||
-    (apiKey.startsWith("'") && apiKey.endsWith("'"))
-  )
-    apiKey = apiKey.slice(1, -1);
-  assert(apiKey && apiKey.length <= 4096 && !/[\s'"*•\u0000-\u001f\u007f]/.test(apiKey));
-  diagnostic.phase = 'isolated-migration';
-  const database = await authDatabase();
-  const observer = new Pool({ connectionString: database.observerURL });
-  let runtime: Awaited<ReturnType<typeof packedAuthRuntime>> | undefined;
+  const authInput = await parseLiveAuthInput(path);
+  const rawSecretForLeakScan = authInput.apiKey ?? null;
+
+  diagnostic.phase = 'dev-environment-migration';
+  const dev = await preparePersistentDevEnvironment(['auth', 'providers', 'conversations']);
+  const observer = new Pool({
+    connectionString: dev.runtimeEnv.MIO_CONVERSATIONS_DATABASE_URL ?? dev.databaseUrl,
+  });
+  const runtime = await createPersistentDevProfileController(dev.runtimeEnv, dev.origin);
   let streamAbort: AbortController | undefined;
   let reading: Promise<void> | undefined;
+  let conversationId: string | undefined;
   const seen: { requestId: string; text: string }[] = [];
   const terminalFrames = new Map<string, string>();
   let streamState = 'not-opened';
+  const runSuffix = randomUUID().slice(0, 8);
+  const reqOne = `live-one-${runSuffix}`;
+  const reqTwo = `live-two-${runSuffix}`;
+  const reqCancel = `live-cancel-${runSuffix}`;
+
   try {
-    const master = randomBytes(32).toString('base64');
-    const env = {
-      PATH: process.env.PATH ?? '',
-      MIO_AUTH_DATABASE_URL: database.url,
-      MIO_AUTH_BASE_URL: 'http://127.0.0.1:4311',
-      MIO_AUTH_SECRET: randomBytes(40).toString('hex'),
-      MIO_CONVERSATIONS_DATABASE_URL: database.url,
-      MIO_PROVIDERS_DATABASE_URL: database.url,
-      MIO_PROVIDERS_MASTER_KEY: master,
-      MIO_PROVIDERS_MASTER_KEY_ID: 'live-chat-isolated',
-    };
-    for (const name of ['auth', 'providers', 'conversations']) {
-      const result = spawnSync(
-        process.execPath,
-        [`scripts/service/migrate-${name}.ts`, '--apply'],
-        { env, encoding: 'utf8', timeout: 30000 },
-      );
-      assert.equal(result.status, 0);
-    }
-    diagnostic.phase = 'packed-profile';
-    runtime = await packedAuthRuntime(database.url, '', 'unused', {
-      conversations: true,
-      providerMasterKey: master,
-      providerKeyId: 'live-chat-isolated',
-    });
-    await runtime.start('database');
+    diagnostic.phase = 'dev-profile';
+    await runtime.start();
     const origin = runtime.origin;
     let cookie = '';
-    const call = async (path: string, method = 'GET', value?: unknown) => {
-      const response = await fetch(`${origin}${path}`, {
+    const call = async (targetPath: string, method = 'GET', value?: unknown) => {
+      const response = await fetch(`${origin}${targetPath}`, {
         method,
         signal: AbortSignal.timeout(15_000),
         headers: {
@@ -97,29 +76,33 @@ async function main() {
       }
       return response;
     };
-    diagnostic.phase = 'signup';
-    const signup = await call('/api/auth/sign-up/email', 'POST', {
-      name: 'Live text isolated',
-      email: 'live-text@example.test',
-      password: randomBytes(24).toString('hex'),
-    });
-    assert.equal(signup.status, 200);
-    cookie = signup.headers
-      .getSetCookie()
-      .map((value) => value.split(';')[0])
-      .join('; ');
-    const owner = ((await signup.json()) as { user: { id: string } }).user.id;
-    diagnostic.phase = 'save-owned-credential';
-    const saved = await call('/api/v1/providers/onelink/credential', 'PUT', {
-      apiKey,
-      expectedRevision: 0,
-    });
-    assert.equal(saved.status, 200);
-    const provider = (await saved.json()) as {
+
+    diagnostic.phase = 'dev-auth';
+    const ownerAccount = await authenticateOrCreateRetainedDevOwner(
+      origin,
+      authInput,
+      'conversations',
+    );
+    cookie = ownerAccount.cookie;
+
+    const existingProvider = (await (await call('/api/v1/providers/onelink')).json()) as {
       id: string;
+      hasKey: boolean;
       revision: number;
       credentialVersion: number;
     };
+    let providerId = existingProvider.id;
+    if (ownerAccount.apiKey || !existingProvider.hasKey) {
+      assert(ownerAccount.apiKey, 'LIVE_PROVIDER_KEY_REQUIRED');
+      diagnostic.phase = 'save-owned-credential';
+      const saved = await call('/api/v1/providers/onelink/credential', 'PUT', {
+        apiKey: ownerAccount.apiKey,
+        expectedRevision: existingProvider.revision,
+      });
+      assert.equal(saved.status, 200);
+      providerId = ((await saved.json()) as { id: string }).id;
+    }
+
     diagnostic.phase = 'exact-catalog';
     const discovered = await call('/api/v1/providers/onelink/test', 'POST', {});
     assert.equal(discovered.status, 200);
@@ -127,6 +110,10 @@ async function main() {
     assert.equal(discovery.status, 'connected');
     assert(discovery.ids.includes(modelId), 'Exact live model is absent from current directory');
     const directory = (await (await call('/api/v1/providers/onelink/models')).json()) as {
+      provider: {
+        credentialVersion: number;
+        catalog: { version: number };
+      };
       items: { modelId: string; modelRef: string; modelKey: string }[];
     };
     const model = directory.items.find((item) => item.modelId === modelId)!;
@@ -135,12 +122,12 @@ async function main() {
       revision: number;
     };
     const declared = await importDeclaration(
-      env,
-      owner,
+      dev.runtimeEnv,
+      ownerAccount.userId,
       current.revision,
       model.modelRef,
       protocol as 'openai-chat' | 'anthropic-messages',
-      'OneLink text protocol documentation and explicit authorized exact-model protocol probe',
+      'OneLink text protocol documentation and persistent mio_dev protocol probe',
     );
     assert.equal(
       (
@@ -153,12 +140,14 @@ async function main() {
       ).status,
       200,
     );
+
     diagnostic.phase = 'create-default-conversation';
     const created = await call('/api/v1/conversations', 'POST', {});
     assert.equal(created.status, 201);
     const conversation = (await created.json()) as { id: string; modelRef: string };
     assert.equal(conversation.modelRef, model.modelRef);
     const id = conversation.id;
+    conversationId = id;
     const cancelText = Promise.withResolvers<void>();
     streamAbort = new AbortController();
     const stream = await fetch(`${origin}/api/v1/conversations/${id}/events`, {
@@ -193,7 +182,7 @@ async function main() {
             };
             if (event.type === 'text' && event.requestId && event.text) {
               seen.push({ requestId: event.requestId, text: event.text });
-              if (event.requestId === 'live-cancel') cancelText.resolve();
+              if (event.requestId === reqCancel) cancelText.resolve();
             }
             if (
               event.type === 'state' &&
@@ -208,8 +197,8 @@ async function main() {
         if (!streamAbort?.signal.aborted) throw new Error('LIVE_STREAM_FAILED');
       }
     })();
-    // Observe early rejection; the original promise is still awaited and must fail the run.
     void reading.catch(() => {});
+
     const send = (requestId: string, text: string) =>
       call(`/api/v1/conversations/${id}/messages`, 'POST', { requestId, text });
     const terminal = async (requestId: string) => {
@@ -227,6 +216,8 @@ async function main() {
             console.log(
               JSON.stringify({
                 result: 'failed-request-observation',
+                environment: 'mio_dev',
+                conversationId: id,
                 modelId,
                 terminal: value.status,
                 serviceCode: value.error,
@@ -242,31 +233,33 @@ async function main() {
         await delay(100);
       }
     };
+
     diagnostic.phase = 'live-first-round';
     assert.equal(
-      (await send('live-one', 'Remember the code MIO-ORCHID-27. Reply only MIO-ORCHID-27.')).status,
+      (await send(reqOne, 'Remember the code MIO-ORCHID-27. Reply only MIO-ORCHID-27.')).status,
       202,
     );
-    assert.equal((await terminal('live-one')).status, 'completed');
+    assert.equal((await terminal(reqOne)).status, 'completed');
     diagnostic.phase = 'live-second-round';
     assert.equal(
-      (await send('live-two', 'What code did I ask you to remember? Reply only with that code.'))
+      (await send(reqTwo, 'What code did I ask you to remember? Reply only with that code.'))
         .status,
       202,
     );
-    assert.equal((await terminal('live-two')).status, 'completed');
+    assert.equal((await terminal(reqTwo)).status, 'completed');
     assert(
       seen
-        .filter((value) => value.requestId === 'live-two')
+        .filter((value) => value.requestId === reqTwo)
         .map((value) => value.text)
         .join('')
         .includes('MIO-ORCHID-27'),
     );
+
     diagnostic.phase = 'live-running-cancel';
     assert.equal(
       (
         await send(
-          'live-cancel',
+          reqCancel,
           'Write a numbered list of 10000 distinct short sentences, one sentence per line. Do not summarize.',
         )
       ).status,
@@ -284,12 +277,13 @@ async function main() {
     assert.equal(cancelled.status, 202);
     const cancellation = (await cancelled.json()) as { requested: boolean; requestId: string };
     diagnostic.cancellation = cancellation;
-    assert(cancellation.requested && cancellation.requestId === 'live-cancel');
+    assert(cancellation.requested && cancellation.requestId === reqCancel);
     diagnostic.phase = 'live-cancel-terminal';
-    const cancelReceipt = await terminal('live-cancel');
+    const cancelReceipt = await terminal(reqCancel);
     assert.equal(cancelReceipt.status, 'cancelled');
     streamAbort.abort();
     await reading;
+
     diagnostic.phase = 'history-and-observations';
     const history = await (await call(`/api/v1/conversations/${id}/history`)).json();
     assert(JSON.stringify(history).includes('MIO-ORCHID-27'));
@@ -307,11 +301,10 @@ async function main() {
     assert(
       observations.every(
         (row) =>
-          row.model_binding.providerConfigId === provider.id &&
-          row.model_binding.credentialVersion === 1 &&
-          row.model_binding.catalogVersion === 1 &&
+          row.model_binding.providerConfigId === providerId &&
+          row.model_binding.credentialVersion === directory.provider.credentialVersion &&
+          row.model_binding.catalogVersion === directory.provider.catalog.version &&
           row.model_binding.modelKey === model.modelKey &&
-          row.model_binding.adaptationVersion === 1 &&
           row.model_binding.profile === protocol &&
           row.model_observations.length === 1,
       ),
@@ -325,15 +318,18 @@ async function main() {
             row.model_observations[0]!.usageStatus === 'reported',
         ),
     );
-    assert(!JSON.stringify(observations).includes(apiKey));
+    if (rawSecretForLeakScan) {
+      assert(!JSON.stringify(observations).includes(rawSecretForLeakScan));
+    }
+
     diagnostic.phase = 'restart-no-replay';
     await runtime.stop();
-    await runtime.start('database');
+    await runtime.start();
     assert.equal(
-      (await send('live-one', 'Remember the code MIO-ORCHID-27. Reply only MIO-ORCHID-27.')).status,
+      (await send(reqOne, 'Remember the code MIO-ORCHID-27. Reply only MIO-ORCHID-27.')).status,
       202,
     );
-    assert.equal((await terminal('live-cancel')).status, 'cancelled');
+    assert.equal((await terminal(reqCancel)).status, 'cancelled');
     const after = await observer.query(
       'SELECT model_observations FROM mio_conversation_requests WHERE conversation_id=$1',
       [id],
@@ -344,17 +340,22 @@ async function main() {
         (row: { model_observations: unknown[] }) => row.model_observations.length === 1,
       ),
     );
-    const inspect = async (directory: string): Promise<void> => {
-      for (const entry of await readdir(directory, { withFileTypes: true })) {
-        const path = join(directory, entry.name);
-        if (entry.isDirectory()) await inspect(path);
-        else assert(!(await readFile(path, 'utf8')).includes(apiKey));
-      }
-    };
-    await inspect(runtime.nativeLogRoot);
+    if (rawSecretForLeakScan) {
+      const inspect = async (directoryPath: string): Promise<void> => {
+        for (const entry of await readdir(directoryPath, { withFileTypes: true })) {
+          const itemPath = join(directoryPath, entry.name);
+          if (entry.isDirectory()) await inspect(itemPath);
+          else assert(!(await readFile(itemPath, 'utf8')).includes(rawSecretForLeakScan));
+        }
+      };
+      await inspect(runtime.nativeLogRoot);
+    }
     console.log(
       JSON.stringify({
         result: 'pass',
+        environment: 'mio_dev',
+        retainedInDatabase: true,
+        conversationId: id,
         modelId,
         protocol,
         catalogDiscovered: discovery.ids.includes(modelId),
@@ -367,13 +368,17 @@ async function main() {
       }),
     );
   } catch (error) {
-    // Keep failure facts before isolated cleanup; never print arbitrary error messages or text.
     try {
-      const requests = await observer.query(
-        'SELECT request_id,status,error_code,model_binding,model_observations FROM mio_conversation_requests ORDER BY created_at',
-      );
+      const requests = conversationId
+        ? await observer.query(
+            'SELECT request_id,status,error_code,model_binding,model_observations FROM mio_conversation_requests WHERE conversation_id=$1 ORDER BY created_at',
+            [conversationId],
+          )
+        : { rows: [] };
       const observation = JSON.stringify({
         result: 'failed-run-observation',
+        environment: 'mio_dev',
+        conversationId: conversationId ?? null,
         ...diagnostic,
         requests: requests.rows,
         sseTextFrames: Object.fromEntries(
@@ -386,7 +391,7 @@ async function main() {
         streamState,
         fees: 'unknown',
       });
-      assert(!observation.includes(apiKey));
+      if (rawSecretForLeakScan) assert(!observation.includes(rawSecretForLeakScan));
       console.error(observation);
     } catch {
       console.error(JSON.stringify({ result: 'failed-observation-unavailable' }));
@@ -396,13 +401,13 @@ async function main() {
     streamAbort?.abort();
     await reading?.catch(() => {});
     try {
-      await runtime?.close();
+      await runtime.close();
     } finally {
       await observer.end();
-      await database.close();
     }
   }
 }
+
 try {
   await main();
 } catch {

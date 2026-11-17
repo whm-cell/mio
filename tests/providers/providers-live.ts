@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import { authDatabase } from '../support/auth-database.ts';
-import { packedAuthRuntime } from '../support/auth-runtime.ts';
 import { importDeclaration } from './fixtures/provider-declaration.ts';
-import type { ProviderView, Discovery } from '../../src/providers/contracts.ts';
+import type { Discovery, ProviderView } from '../../src/providers/contracts.ts';
+import {
+  authenticateOrCreateRetainedDevOwner,
+  createPersistentDevProfileController,
+  parseLiveAuthInput,
+  preparePersistentDevEnvironment,
+} from '../support/local-dev-live.ts';
 
 const diagnostic: { phase: string; httpStatus?: number; serviceCode?: string } = {
   phase: 'credential-input',
@@ -20,61 +21,25 @@ const knownDiscoveryErrors = new Set([
   'UPSTREAM_CANCELLED',
   'UPSTREAM_RESPONSE_OR_TRANSPORT_ERROR',
 ]);
-/** Explicit opt-in entry; not matched by Vitest. No key contents or raw errors are printed. */
+
+/** Explicit opt-in entry against persistent mio_dev; retains discovered catalog, routes and account data. */
 async function main() {
   const path = process.argv[2];
-  assert(path && process.argv.length === 3, 'Provide exactly one authorized private key file');
-  const raw = await readFile(path, 'utf8');
-  assert(Buffer.byteLength(raw) <= 8192, 'Invalid credential file');
-  const line = raw.trim();
-  assert(line && !/[\r\n]/.test(line), 'Invalid credential file');
-  const assignment = /^[A-Za-z_][A-Za-z0-9_]{0,47}=(.*)$/.exec(line);
-  let apiKey = assignment ? assignment[1]! : line;
-  if (
-    (apiKey.startsWith('"') && apiKey.endsWith('"')) ||
-    (apiKey.startsWith("'") && apiKey.endsWith("'"))
-  )
-    apiKey = apiKey.slice(1, -1);
   assert(
-    apiKey && apiKey.length <= 4096 && !/[\s'"*•\u0000-\u001f\u007f]/.test(apiKey),
-    'Invalid credential file',
+    path && process.argv.length === 3,
+    'Provide one authorized login.json or private key file',
   );
-  diagnostic.phase = 'isolated-database';
-  const database = await authDatabase();
-  let runtime: Awaited<ReturnType<typeof packedAuthRuntime>> | undefined;
+  const authInput = await parseLiveAuthInput(path);
+  diagnostic.phase = 'dev-environment-migration';
+  const dev = await preparePersistentDevEnvironment(['auth', 'providers']);
+  const runtime = await createPersistentDevProfileController(dev.runtimeEnv, dev.origin);
   try {
-    const master = randomBytes(32).toString('base64');
-    const env = {
-      PATH: process.env.PATH ?? '',
-      MIO_AUTH_BASE_URL: 'http://127.0.0.1:4311',
-      MIO_AUTH_SECRET: randomBytes(40).toString('hex'),
-      MIO_AUTH_DATABASE_URL: database.url,
-      MIO_PROVIDERS_DATABASE_URL: database.url,
-      MIO_PROVIDERS_MASTER_KEY: master,
-      MIO_PROVIDERS_MASTER_KEY_ID: 'live-isolated-v1',
-    };
-    for (const file of [
-      'scripts/service/migrate-auth.ts',
-      'scripts/service/migrate-providers.ts',
-    ]) {
-      diagnostic.phase = file.includes('migrate-auth') ? 'auth-migration' : 'provider-migration';
-      const result = spawnSync(process.execPath, [file, '--apply'], {
-        env,
-        encoding: 'utf8',
-        timeout: 30000,
-      });
-      assert.equal(result.status, 0, 'Isolated migration failed');
-    }
-    diagnostic.phase = 'packed-profile-start';
-    runtime = await packedAuthRuntime(database.url, '', 'unused', {
-      providerMasterKey: master,
-      providerKeyId: 'live-isolated-v1',
-    });
-    await runtime.start('database');
+    diagnostic.phase = 'dev-profile-start';
+    await runtime.start();
     const origin = runtime.origin;
     let cookie = '';
-    const call = (path: string, method = 'GET', value?: unknown) =>
-      fetch(`${origin}${path}`, {
+    const call = (targetPath: string, method = 'GET', value?: unknown) =>
+      fetch(`${origin}${targetPath}`, {
         method,
         headers: {
           origin,
@@ -83,27 +48,27 @@ async function main() {
         },
         ...(value === undefined ? {} : { body: JSON.stringify(value) }),
       });
-    diagnostic.phase = 'signup';
-    const signup = await call('/api/auth/sign-up/email', 'POST', {
-      name: 'Isolated live discovery',
-      email: 'onelink-live@example.test',
-      password: randomBytes(24).toString('hex'),
-    });
-    diagnostic.httpStatus = signup.status;
-    assert.equal(signup.status, 200, 'Isolated signup failed');
-    cookie = signup.headers
-      .getSetCookie()
-      .map((v) => v.split(';')[0])
-      .join('; ');
-    const owner = ((await signup.json()) as { user: { id: string } }).user.id;
+
+    diagnostic.phase = 'dev-auth';
+    const ownerAccount = await authenticateOrCreateRetainedDevOwner(origin, authInput, 'providers');
+    cookie = ownerAccount.cookie;
     const base = '/api/v1/providers/onelink';
-    diagnostic.phase = 'save-credential';
-    const saved = await call(`${base}/credential`, 'PUT', { apiKey, expectedRevision: 0 });
-    diagnostic.httpStatus = saved.status;
-    assert.equal(saved.status, 200, 'Provider save failed');
-    const provider = (await saved.json()) as ProviderView;
-    assert.equal(provider.credentialVersion, 1);
-    assert.equal(provider.discovery, null);
+
+    const existing = (await (await call(base)).json()) as ProviderView;
+    let expectedCredentialVersion = existing.credentialVersion;
+    if (ownerAccount.apiKey || !existing.hasKey) {
+      assert(ownerAccount.apiKey, 'LIVE_PROVIDER_KEY_REQUIRED');
+      diagnostic.phase = 'save-credential';
+      const saved = await call(`${base}/credential`, 'PUT', {
+        apiKey: ownerAccount.apiKey,
+        expectedRevision: existing.revision,
+      });
+      diagnostic.httpStatus = saved.status;
+      assert.equal(saved.status, 200, 'Provider save failed');
+      const updated = (await saved.json()) as ProviderView;
+      expectedCredentialVersion = updated.credentialVersion;
+    }
+
     diagnostic.phase = 'first-discovery';
     const tested = await call(`${base}/test`, 'POST', {});
     diagnostic.httpStatus = tested.status;
@@ -117,28 +82,38 @@ async function main() {
       discovery.ids.includes('deepseek-v4.1-flash'),
       'Requested exact text model was not discovered',
     );
+
+    const catalogBody = (await (await call(`${base}/models`)).json()) as {
+      items: { modelId: string; modelRef: string; modelKey: string }[];
+    };
+    const targetModel = catalogBody.items.find((item) => item.modelId === 'deepseek-v4.1-flash');
+    assert(targetModel, 'Discovered model missing from mio_dev catalog');
+
     diagnostic.phase = 'set-default';
     const declared = await importDeclaration(
-      env,
-      owner,
+      dev.runtimeEnv,
+      ownerAccount.userId,
       ((await (await call(base)).json()) as ProviderView).revision,
-      'onelink:chat:deepseek-v4.1-flash',
+      targetModel.modelRef,
       'openai-chat',
-      'OneLink text protocol documentation and prior authorized exact-model OpenAI observation',
+      'OneLink text protocol documentation and persistent mio_dev verification',
     );
     const setDefault = await call(`${base}/models`, 'PATCH', {
-      modelRef: 'onelink:chat:deepseek-v4.1-flash',
+      modelRef: targetModel.modelRef,
+      usage: 'chat',
       isDefault: true,
       expectedRevision: declared.revision,
     });
     diagnostic.httpStatus = setDefault.status;
     assert.equal(setDefault.status, 200, 'Default selection failed');
+
     diagnostic.phase = 'profile-restart';
     await runtime.stop();
-    await runtime.start('database');
+    await runtime.start();
     const restored = (await (await call(base)).json()) as ProviderView;
     assert.equal(restored.discovery?.status, 'connected');
-    assert.equal(restored.discovery?.credentialVersion, 1);
+    assert.equal(restored.discovery?.credentialVersion, expectedCredentialVersion);
+
     diagnostic.phase = 'restart-discovery';
     const afterRestart = await call(`${base}/test`, 'POST', {});
     diagnostic.httpStatus = afterRestart.status;
@@ -151,22 +126,25 @@ async function main() {
       'connected',
       'Post-restart credential decryption/discovery failed',
     );
-    assert.equal(rediscovered.credentialVersion, 1);
+    assert.equal(rediscovered.credentialVersion, expectedCredentialVersion);
     assert(rediscovered.ids.includes('deepseek-v4.1-flash'));
+
     diagnostic.phase = 'complete';
-    const found = new Set(discovery.ids);
     const dynamic = (await (await call(`${base}/models`)).json()) as {
-      items: { modelId: string; modelKey: string }[];
+      items: { modelId: string; modelKey: string; discovered: boolean }[];
     };
-    assert.equal(dynamic.items.length, rediscovered.ids.length);
+    const currentDiscovered = dynamic.items.filter((item) => item.discovered);
+    assert.equal(currentDiscovered.length, rediscovered.ids.length);
     console.log(
       JSON.stringify({
-        kind: 'mio-profile-model-discovery',
+        kind: 'mio-dev-model-discovery',
+        environment: 'mio_dev',
+        retainedInDatabase: true,
         scope: 'models-only',
-        credentialVersion: 1,
+        credentialVersion: expectedCredentialVersion,
         configuredDefault: 'deepseek-v4.1-flash',
-        count: found.size,
-        dynamicMemberCount: dynamic.items.length,
+        count: new Set(discovery.ids).size,
+        dynamicMemberCount: currentDiscovered.length,
         exactDefault: dynamic.items.find((item) => item.modelId === 'deepseek-v4.1-flash'),
         catalog: ((await (await call(base)).json()) as ProviderView).catalog,
         persistedAcrossRestart: true,
@@ -176,13 +154,10 @@ async function main() {
       }),
     );
   } finally {
-    try {
-      await runtime?.close();
-    } finally {
-      await database.close();
-    }
+    await runtime.close();
   }
 }
+
 try {
   await main();
 } catch {

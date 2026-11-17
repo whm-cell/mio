@@ -37,10 +37,10 @@
 
 ## 验证入口与变更影响
 
-`pnpm test` 需要 PATH 中的 Redis 8.2.11，或通过 `MIO_TEST_REDIS_SERVER` 指向该二进制；缺失/版本不符明确失败，不跳过。安装示例见 [README](../../README.md#安装与检查)。
+`pnpm test` 在涉及全局故障注入时使用 PATH、`MIO_TEST_REDIS_SERVER` 或自动识别的 `.runtime/redis-build/redis-8.2.11/src/redis-server` 中的 Redis 8.2.11 二进制；缺失/版本不符明确失败，不跳过。安装示例见 [README](../../README.md#安装与检查)。
 
-[Redis 夹具](../../tests/support/redis-server.ts)为每轮创建独占进程、随机回环端口和临时目录，结束后关闭并删除自己的资源，不接受任意共享 Redis URL 作为故障目标。[TCP 转发夹具](../../tests/support/redis-proxy.ts)将命令发往真实 Redis、扣留真实响应，用于核对已执行但结果丢失的计数及关闭。
+常驻容器的 [Redis 启动脚本](../../deploy/local/redis-start.sh)除应用账号 `mio` 外，另为自动化回归建立仅限 `~mio:regtest-*:*` 前缀且无 `CONFIG`/清库权限的 `mio_regression` 账号（无权读写 `mio:dev:*` 或 `mio:test:*`）。[共享测试辅助](../../tests/support/redis-server.ts)中的 `sharedTestRedis` 在本机常驻 Redis 启动时直接复用该账号并在结束后按临时前缀 `SCAN` + `DEL` 清理；涉及修改全局 `maxmemory=1`（真实 OOM）或进程停启的用例继续通过 `redisServer` 创建独占进程、随机回环端口和临时目录，不向常驻 Redis 注入全局故障。[TCP 转发夹具](../../tests/support/redis-proxy.ts)将命令发往故障夹具、扣留真实响应，用于核对已执行但结果丢失的计数及关闭。
 
-[公共能力测试](../../tests/integrations/redis.test.ts)验证原子性、TTL、受控时间边界、ACL、队列、OOM、损坏状态、DNS/TLS 取消、启动总期限与有界关闭。[认证普通回归](../../tests/auth/auth-redis.test.ts)以真实 PostgreSQL、Redis 和 DSH HTTP 验证规则/响应/身份/存储、旧账号会话及失败无业务写入；[独立 Profile 演练](../../tests/auth/auth-redis-rehearsal.test.ts)使用独占打包 Profile 验证受控切换、状态丢失恢复与回退，真实等待三次 65 秒，不使用假时间。两者可分别以 `pnpm test tests/auth/auth-redis.test.ts` 和 `pnpm test tests/auth/auth-redis-rehearsal.test.ts` 运行；完整检查包含两者。PostgreSQL 的隔离约束仍见[数据库契约](postgres.md#验证入口与变更影响)。
+[公共能力测试](../../tests/integrations/redis.test.ts)在独占夹具上验证原子性、TTL、受控时间边界、ACL、队列、OOM、损坏状态、DNS/TLS 取消、启动总期限与有界关闭。[认证普通回归](../../tests/auth/auth-redis.test.ts)常规规则与会话用例直接复用常驻 `mio-dev` Redis 的 `regtest-*` 临时前缀（CI 无常驻容器时自动回退独占进程），仅全局 OOM/丢包单测使用独占夹具；[独立 Profile 演练](../../tests/auth/auth-redis-rehearsal.test.ts)使用独占打包 Profile 验证受控切换、状态丢失恢复与回退，真实等待三次 65 秒，不使用假时间。两者可分别以 `pnpm test tests/auth/auth-redis.test.ts` 和 `pnpm test tests/auth/auth-redis-rehearsal.test.ts` 运行；完整检查包含两者。PostgreSQL 的隔离约束仍见[数据库契约](postgres.md#验证入口与变更影响)。
 
 改变版本、命令、错误分类、连接/关闭、资源策略或新消费者时，回归实际受影响的入口与状态转移、源码边界正反例，并完成质量/规范审查；覆盖 `pnpm check` 的当前有效结论按[验证协议](../coordination.md#验证与接受)取得。CI 配置和本地验证分别报告；这些入口不证明生产容量、多实例、任意代理链或远端门禁已通过。

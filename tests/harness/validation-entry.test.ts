@@ -51,6 +51,7 @@ function start(root: string, args: string[], env: NodeJS.ProcessEnv = {}, detach
     MARKER: join(root, 'marker'),
   };
   delete childEnv.MIO_TEST_DATABASE_URL;
+  delete childEnv.MIO_TEST_REDIS_URL;
   Object.assign(childEnv, env);
   return spawn(process.execPath, [entry, ...args], {
     cwd: root,
@@ -282,6 +283,7 @@ import { test } from 'vitest';
 test('captures env', () => {
   writeFileSync(process.env.MARKER, JSON.stringify({
     testDb: process.env.MIO_TEST_DATABASE_URL ?? null,
+    testRedis: process.env.MIO_TEST_REDIS_URL ?? null,
     authDb: process.env.MIO_AUTH_DATABASE_URL ?? null,
     authSecret: process.env.MIO_AUTH_SECRET ?? null,
   }));
@@ -300,6 +302,7 @@ test('captures env', () => {
     if (!addr || typeof addr === 'string') throw new Error('missing port');
     port = addr.port;
     const expectedUrl = `postgresql://mio_regression:${regPass}@127.0.0.1:${port}/mio_regression_test`;
+    const expectedRedisUrl = `redis://mio_regression:${regPass}@127.0.0.1:${port}`;
     await writeFile(
       join(root, '.env'),
       [
@@ -307,17 +310,22 @@ test('captures env', () => {
         'MIO_AUTH_SECRET=private-dev-secret-must-not-leak',
         `MIO_AUTH_DATABASE_URL=postgresql://mio:app-secret@127.0.0.1:${port}/mio_dev`,
         `MIO_LOCAL_POSTGRES_PORT=${port}`,
+        `MIO_LOCAL_REDIS_PORT=${port}`,
         `MIO_LOCAL_REGRESSION_PASSWORD=${regPass}`,
         `MIO_TEST_DATABASE_URL=${expectedUrl}`,
       ].join('\n') + '\n',
       { mode: 0o600 },
     );
     const detected = await finish(
-      start(root, ['test', 'tests/auth/env-probe.test.ts'], { MIO_TEST_DATABASE_URL: '' }),
+      start(root, ['test', 'tests/auth/env-probe.test.ts'], {
+        MIO_TEST_DATABASE_URL: '',
+        MIO_TEST_REDIS_URL: '',
+      }),
     );
     expect(detected.code, detected.output).toBe(0);
     expect(JSON.parse(await readFile(join(root, 'marker'), 'utf8'))).toEqual({
       testDb: expectedUrl,
+      testRedis: expectedRedisUrl,
       authDb: null,
       authSecret: null,
     });

@@ -52,7 +52,7 @@ pnpm test tests/integrations/redis.test.ts
 
 万联动态目录、稳定模型身份及文本消费者按[供应商规范](docs/providers.md)配置本域数据库与主密钥并显式迁移。分库历史引用迁移、部署适配声明和使用方式以该页为准；新 ID 由当前 Key 目录发现，不维护生产型号白名单。开发安排与实际接受见[万联 PRD](docs/tasks/onelink-integration/prd.md)及其成果入口。普通检查不自动访问万联；真实目录/文本须另行显式授权。目录成功不等于全部协议、媒体或生产验收。
 
-启用 provider 域后，对话创建使用准确 modelRef 或本人显式 chat 默认，旧无绑定会话由 owner 一次绑定；按[对话 API](docs/apis/conversations.md)操作并显式执行增量 `conversations:migrate --apply`。未启用 provider 域时保留显式 legacy 路由，BYOK 缺配置不回退。独立真实入口为 `node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id]`，默认 deepseek-v4.1-flash，不进入普通 check；执行前核对本人凭据、测试范围和费用授权，文本授权不扩大媒体、工具或部署范围，也不代表人类接受。
+启用 provider 域后，对话创建使用准确 modelRef 或本人显式 chat 默认，旧无绑定会话由 owner 一次绑定；按[对话 API](docs/apis/conversations.md)操作并显式执行增量 `conversations:migrate --apply`。未启用 provider 域时保留显式 legacy 路由，BYOK 缺配置不回退。独立真实入口为 `node tests/conversations/conversations-live.ts <login-json-or-key-file> [exact-model-id]`，默认 `deepseek-v4.1-flash`，直接读写常驻 `mio_dev` 并保留会话与验证记录，不进入普通 check；执行前核对本人凭据、测试范围和费用授权，文本授权不扩大媒体、工具或部署范围，也不代表人类接受。
 
 ## 本地运行
 
@@ -77,7 +77,7 @@ curl http://127.0.0.1:4310/readyz
 curl http://127.0.0.1:4311/readyz
 ```
 
-启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。常驻 `mio-dev`（或 `mio-test`）PostgreSQL 启动后，`pnpm test <范围>` 与 `pnpm check:local <范围>` 均自动复用同实例内权限隔离的 `mio_regression_test`（既有数据卷首次可执行 `pnpm regression:init:dev` 无损补建），不再每次通过 `initdb` 拉起临时集群，也不会访问 `mio_dev`／`mio_test` 业务数据；Redis 故障夹具仍需按安装章节准备。获授权的本地真实业务与模型验收默认在常驻 `mio_dev` 上增量迁移（`pnpm migrate:dev`、`pnpm route:dev`）并验证既有数据兼容性。
+启动命令自动准备所选 `DSH_HOME` 的 Profile 并链接当前插件，保留已有配置。底层 `profile:prepare` 仍支持显式目录，未设置 DSH_HOME 时保留旧 `.runtime/dsh` 默认。修改源码后重新构建并重启。`pnpm test:smoke` 使用打包产物和独立临时配置，结束后只清理自己的资源。常驻 `mio-dev` 启动后，`pnpm test <范围>` 与 `pnpm check:local <范围>` 自动统一复用同组容器内的隔离通道（PostgreSQL `mio_regression_test`、Redis `~mio:regtest-*:*` 前缀、RabbitMQ 临时 vhost；既有数据卷首次执行 `pnpm regression:init:dev` 无损补建），仅修改全局 `maxmemory`（OOM）或停进程的 Redis 故障用例自动调用 `.runtime/redis-build` 临时进程，绝不污染 `mio_dev` 业务数据。获授权的本地真实业务与模型验收（含 `*-live.ts`）默认直接增量迁移并读写常驻 `mio_dev` 保留数据。
 
 配置：`MIO_HOST` 默认 `127.0.0.1`，`MIO_PORT` 默认 `4310`，`MIO_ALLOWED_ORIGINS` 默认 `[]`。DSH 当前不接受 `0.0.0.0` 通配绑定；远程部署使用明确的接口地址和已配置的 TLS 终止/反向代理。当前没有公网部署验收。
 

@@ -61,6 +61,8 @@ type LocalRegressionCandidate = {
   hasRegressionKeys: boolean;
   validUrl: string | null;
   port: number | null;
+  redisUrl: string | null;
+  redisPort: number | null;
 };
 
 async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegressionCandidate> {
@@ -71,26 +73,63 @@ async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegres
     info = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { name, file, exists: false, hasRegressionKeys: false, validUrl: null, port: null };
+      return {
+        name,
+        file,
+        exists: false,
+        hasRegressionKeys: false,
+        validUrl: null,
+        port: null,
+        redisUrl: null,
+        redisPort: null,
+      };
     }
     throw error;
   }
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
-    return { name, file, exists: true, hasRegressionKeys: false, validUrl: null, port: null };
+    return {
+      name,
+      file,
+      exists: true,
+      hasRegressionKeys: false,
+      validUrl: null,
+      port: null,
+      redisUrl: null,
+      redisPort: null,
+    };
   }
   const values = parseEnv(await readFile(path, 'utf8'));
   const port = Number(values.MIO_LOCAL_POSTGRES_PORT);
   const validPort = Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : null;
+  const rawRedisPort = Number(values.MIO_LOCAL_REDIS_PORT);
+  const validRedisPort =
+    Number.isInteger(rawRedisPort) && rawRedisPort >= 1024 && rawRedisPort <= 65535
+      ? rawRedisPort
+      : null;
   const hasRegressionKeys =
     values.MIO_LOCAL_REGRESSION_PASSWORD !== undefined ||
     values.MIO_TEST_DATABASE_URL !== undefined;
   const password = values.MIO_LOCAL_REGRESSION_PASSWORD;
+  const validPassword = values.MIO_ENVIRONMENT === name && /^[a-f0-9]{64}$/.test(password ?? '');
   const expected =
-    values.MIO_ENVIRONMENT === name && validPort !== null && /^[a-f0-9]{64}$/.test(password ?? '')
+    validPassword && validPort !== null
       ? `postgresql://mio_regression:${password}@127.0.0.1:${validPort}/mio_regression_test`
       : null;
   const validUrl = expected !== null && values.MIO_TEST_DATABASE_URL === expected ? expected : null;
-  return { name, file, exists: true, hasRegressionKeys, validUrl, port: validPort };
+  const redisUrl =
+    validUrl !== null && validRedisPort !== null
+      ? `redis://mio_regression:${password}@127.0.0.1:${validRedisPort}`
+      : null;
+  return {
+    name,
+    file,
+    exists: true,
+    hasRegressionKeys,
+    validUrl,
+    port: validPort,
+    redisUrl,
+    redisPort: validRedisPort,
+  };
 }
 
 function canConnectLoopback(port: number): Promise<boolean> {
@@ -122,7 +161,12 @@ async function selectLocalCheckEnvironment(): Promise<'dev' | 'test'> {
   return dev.validUrl ? 'dev' : 'test';
 }
 
-async function resolveAutoRegressionDatabaseUrl(): Promise<string | null> {
+async function resolveAutoRegressionTargets(): Promise<{
+  databaseUrl: string | null;
+  redisUrl: string | null;
+}> {
+  let databaseUrl: string | null = null;
+  let redisUrl: string | null = null;
   for (const name of ['dev', 'test'] as const) {
     const candidate = await inspectLocalRegression(name);
     if (!candidate.exists) continue;
@@ -131,10 +175,24 @@ async function resolveAutoRegressionDatabaseUrl(): Promise<string | null> {
         `LOCAL_REGRESSION_TARGET: invalid regression database setting in ${candidate.file}`,
       );
     }
-    if (candidate.validUrl && candidate.port !== null && (await canConnectLoopback(candidate.port)))
-      return candidate.validUrl;
+    if (
+      !databaseUrl &&
+      candidate.validUrl &&
+      candidate.port !== null &&
+      (await canConnectLoopback(candidate.port))
+    ) {
+      databaseUrl = candidate.validUrl;
+    }
+    if (
+      !redisUrl &&
+      candidate.redisUrl &&
+      candidate.redisPort !== null &&
+      (await canConnectLoopback(candidate.redisPort))
+    ) {
+      redisUrl = candidate.redisUrl;
+    }
   }
-  return null;
+  return { databaseUrl, redisUrl };
 }
 
 async function main() {
@@ -183,9 +241,16 @@ async function main() {
     }),
   );
   if (!process.env.MIO_TEST_DATABASE_URL) delete process.env.MIO_TEST_DATABASE_URL;
-  if (process.env.GITHUB_ACTIONS !== 'true' && !process.env.MIO_TEST_DATABASE_URL) {
-    const detected = await resolveAutoRegressionDatabaseUrl();
-    if (detected) process.env.MIO_TEST_DATABASE_URL = detected;
+  if (!process.env.MIO_TEST_REDIS_URL) delete process.env.MIO_TEST_REDIS_URL;
+  if (
+    process.env.GITHUB_ACTIONS !== 'true' &&
+    (!process.env.MIO_TEST_DATABASE_URL || !process.env.MIO_TEST_REDIS_URL)
+  ) {
+    const detected = await resolveAutoRegressionTargets();
+    if (!process.env.MIO_TEST_DATABASE_URL && detected.databaseUrl)
+      process.env.MIO_TEST_DATABASE_URL = detected.databaseUrl;
+    if (!process.env.MIO_TEST_REDIS_URL && detected.redisUrl)
+      process.env.MIO_TEST_REDIS_URL = detected.redisUrl;
   }
   process.env.TEST = 'true';
   process.env.VITEST = 'true';

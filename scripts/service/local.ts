@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import {
   createLocalEnvironment,
   expectedRegressionDatabaseUrl,
+  expectedRegressionRedisUrl,
   readLocalEnvironment,
 } from './local-environment.ts';
 import { prepareProfile } from './profile.ts';
@@ -126,9 +127,11 @@ async function main(name: 'dev' | 'test') {
   }
   if (action === 'check') {
     const expected = expectedRegressionDatabaseUrl(values);
+    const expectedRedis = expectedRegressionRedisUrl(values);
     await run('pnpm', ['test', ...args], {
       ...host,
       MIO_TEST_DATABASE_URL: expected,
+      MIO_TEST_REDIS_URL: expectedRedis,
       ...(process.env.MIO_TEST_REDIS_SERVER
         ? { MIO_TEST_REDIS_SERVER: process.env.MIO_TEST_REDIS_SERVER }
         : {}),

@@ -38,6 +38,21 @@ export function expectedRegressionDatabaseUrl(values: NodeJS.ProcessEnv): string
   return expected;
 }
 
+export function expectedRegressionRedisUrl(values: NodeJS.ProcessEnv): string {
+  const password = values.MIO_LOCAL_REGRESSION_PASSWORD;
+  const port = Number(values.MIO_LOCAL_REDIS_PORT);
+  if (
+    !/^[a-f0-9]{64}$/.test(password ?? '') ||
+    !Number.isInteger(port) ||
+    port < 1024 ||
+    port > 65535
+  )
+    throw new Error(
+      'LOCAL_REGRESSION_TARGET: run pnpm env:init to configure the isolated regression settings',
+    );
+  return `redis://mio_regression:${password}@127.0.0.1:${port}`;
+}
+
 /** One-time creation only: existing database passwords and signing secrets must survive. */
 export async function createLocalEnvironment(name: LocalEnvironment, root = resolve('.')) {
   const file = resolve(root, fileName(name));

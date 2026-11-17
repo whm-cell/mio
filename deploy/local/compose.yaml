@@ -28,6 +28,7 @@ services:
     environment:
       MIO_REDIS_NAMESPACE: ${MIO_REDIS_NAMESPACE:?Set Redis namespace}
       MIO_LOCAL_REDIS_PASSWORD: ${MIO_LOCAL_REDIS_PASSWORD:?Set Redis password}
+      MIO_LOCAL_REGRESSION_PASSWORD: ${MIO_LOCAL_REGRESSION_PASSWORD:-}
     ports:
       - '127.0.0.1:${MIO_LOCAL_REDIS_PORT:?Set Redis port}:6379'
     volumes:

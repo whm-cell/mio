@@ -129,13 +129,13 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 两套常驻 PostgreSQL 实例均在同一容器内另建权限隔离的 `mio_regression_test` 与专属账号 `mio_regression`（首次空卷由初始化脚本建立，既有数据卷通过 `pnpm env:init && pnpm regression:init:dev` 或 `regression:init:test` 无损幂等补建，不重置已有密码、不清业务表）。`mio_regression` 无权连接 `mio_dev` 或 `mio_test`；集成测试仅在 `mio_regression_test` 内创建并删除本轮随机 schema。
 
-准备原有隔离 Redis 测试二进制后，本地运行 `pnpm test <测试范围>` 或 `pnpm check:local <测试范围>` 均会自动检测并优先复用本机已启动容器（优先 `mio-dev` `55432`，其次 `mio-test` `55433`）中的 `mio_regression_test`，仅注入回归库连接串，不加载 `.env`／`.env.test` 中的业务开关、万联 Key 或 COS 凭据；仅当本地两套容器均未启动或无环境文件时，`pnpm test` 才退回 `initdb` 临时集群兜底。需要真实 RabbitMQ 的本地集成测试同样自动连接已启动的本地 broker（`mio-dev` 或 `mio-test`）创建并清理独立临时 vhost 与临时账号，不触碰常驻 `mio-dev`／`mio-test` 业务队列，日常开发只需保持 `mio-dev` 运行即可。
+准备隔离 Redis 二进制（自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`）后，本地运行 `pnpm test <测试范围>` 或 `pnpm check:local <测试范围>` 会自动检测并统一复用本机已启动容器（优先 `mio-dev`）的三类隔离通道：PostgreSQL 复用同实例内权限隔离的 `mio_regression_test` 随机 schema，Redis 常规限流回归复用同实例内仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号并在结束后清理临时键，RabbitMQ 集成测试在同实例内动态创建并清理独立临时 vhost 与临时账号；测试进程不加载 `.env`／`.env.test` 中的业务开关、万联 Key 或 COS 凭据，日常开发只需保持一套 `mio-dev` 运行即可。仅修改全局 `maxmemory=1`（OOM）或停进程的 Redis 故障用例自动调用本地临时进程，本地容器均未启动时 PG 退回 `initdb`。
 
 区分**破坏性自动化回归**与**获授权的本地真实业务／模型验收**：
 
-- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，始终运行在 `mio_regression_test` 随机 schema 及临时 vhost／临时 Redis 夹具中，严禁连接 `mio_dev` 或 `mio_test`。
-- **获授权的本地真实业务／模型验收**：默认直接在常驻 `dev` 环境（`.env` + `mio_dev` + `.runtime/dev/{dsh,compute}` + `mio-dev` MQ/Redis）执行——先对 `mio_dev` 预览并执行增量迁移（`pnpm migrate:dev <domain> --apply`）及路由同步（`pnpm route:dev`），再复用本人既有账号、万联凭据、主密钥和常驻 Worker 完成非破坏性真实验证，既检验既有开发数据的增量升级兼容性，也让验证通过的路由、`verified` 记录、会话和资产直接保留在 `mio_dev` 可继续使用；不再为普通模型／业务验收在 `.runtime/dev/` 反复新建一次性空数据库与临时密钥目录。
-- **破坏性中间件／重放故障演练**：如强杀在途 Worker、向交换机重投重复密文命令（`tests/compute/live-image-loop.ts`）或逐套重启容器（下述 `local-environments-live.ts`、`local-brokers-live.ts`），因会中断在途进程或抢占结果消费，才按场景使用显式隔离现场，且演练通过不替代常驻 `mio_dev` 的增量迁移同步。
+- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，运行在常驻 `mio-dev` 容器的隔离通道（`mio_regression_test` 随机 schema、`~mio:regtest-*:*` 前缀、临时 vhost）及全局 OOM 临时夹具中，严禁读写 `mio_dev` 业务表、`mio:dev:*` 键或 `mio-dev` 业务队列。
+- **获授权的本地真实业务／模型验收（含 `*-live.ts` 验收脚本）**：统一直接读写常驻 `mio_dev`（`.env` + `mio_dev` + `mio-dev` Redis/MQ + `.runtime/dev/{dsh,compute}`）并保留测试数据——`providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及 `live-image-loop.ts dev` 模式均先对 `mio_dev` 执行增量迁移，再复用既有账号／凭据或保留的测试账号完成真实业务验证，不再新建即用即删的隔离库，使生成的路由、会话、资产与验证记录直接留在 `mio_dev` 中可查可用。
+- **破坏性中间件／重放故障演练**：如强杀在途 Worker 与向交换机重投重复密文命令（`live-image-loop.ts prepare/execute`）、容器停启探针（`local-environments-live.ts`、`local-brokers-live.ts`）或队列容量告警探针（`live-compute-queue-probe.ts`），因会中断在途进程或触发容器级告警，仍按场景使用显式隔离现场。
 
 Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。CI 不读取私有环境文件，使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
 

@@ -127,6 +127,34 @@ describe('offline live scenario preparation', () => {
     expect(() =>
       parseLiveInvocation([...valid, '--scenario', 'seedream-sync'], 'yes', undefined),
     ).toThrow('LIVE_ARGUMENTS');
+    expect(
+      parseLiveInvocation(
+        [
+          '--scenario',
+          'seedream-sync',
+          'dev',
+          '.runtime/fixture-not-created',
+          'login.json',
+          'live-task',
+        ],
+        'yes',
+        undefined,
+      ),
+    ).toMatchObject({
+      scenario: 'seedream-sync',
+      explicitScenario: true,
+      phase: 'dev',
+      first: 'login.json',
+      second: '',
+      taskId: 'live-task',
+    });
+    expect(() =>
+      parseLiveInvocation(
+        ['dev', '.runtime/fixture-not-created', 'a', 'b', 'live-task'],
+        'yes',
+        undefined,
+      ),
+    ).toThrow('LIVE_ARGUMENTS');
     expect(existsSync('.runtime/fixture-not-created')).toBe(false);
   });
 

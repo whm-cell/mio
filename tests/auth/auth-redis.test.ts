@@ -15,16 +15,16 @@ import { readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createRedisResource } from '../../src/integrations/redis.ts';
 import { authDatabase } from '../support/auth-database.ts';
-import { redisServer } from '../support/redis-server.ts';
+import { redisServer, sharedTestRedis } from '../support/redis-server.ts';
 import { redisProxy } from '../support/redis-proxy.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
-let server: Awaited<ReturnType<typeof redisServer>>;
+let server: Awaited<ReturnType<typeof sharedTestRedis>>;
 let pool: Pool;
 let ctx: Context;
 let plugin: ReturnType<Context['plugin']>;
 let origin: string;
-const namespace = `auth-${randomUUID()}`;
+const namespace = `regtest-${randomUUID()}`;
 const prefix = `mio:${namespace}:auth:rate-limit:v1:`;
 const password = 'correct-horse-redis-mio-91';
 const secret = randomBytes(40).toString('hex');
@@ -74,8 +74,7 @@ async function reload(backend: string, url = server.url, selectedNamespace = nam
 }
 async function resetLimits() {
   await pool.query('DELETE FROM "rateLimit"');
-  const keys = await server.client.keys(`${prefix}*`);
-  if (keys.length) await server.client.del(keys);
+  await server.clear(`${prefix}*`);
 }
 async function account(email: string) {
   const response = await call('/api/auth/sign-up/email', { name: 'Redis owner', email, password });
@@ -89,7 +88,7 @@ async function login(email: string, base = origin) {
 }
 beforeAll(async () => {
   database = await authDatabase();
-  server = await redisServer();
+  server = await sharedTestRedis(namespace);
   pool = new Pool({ connectionString: database.observerURL });
   ctx = new Context();
   await ctx.plugin(SystemPrompt);
@@ -384,7 +383,7 @@ it('keeps real accounts/sessions in PG, refresh/revocation ownership and HTTP gu
   expect((await call('/api/v1/me', undefined, valid)).status).toBe(401);
   expect((await call('/api/auth/sign-out', {}, foreign)).status).toBe(200);
   expect((await call('/api/v1/me', undefined, foreign)).status).toBe(401);
-  const keys = await server.client.keys(`${prefix}*`);
+  const keys = await server.keys(`${prefix}*`);
   const snapshot = await Promise.all(keys.map(async (key) => [key, await server.client.get(key)]));
   for (const [path, options, status] of [
     ['/api/auth/sign-in/email', { method: 'OPTIONS', headers: { origin } }, 204],
@@ -422,7 +421,7 @@ it('keeps real accounts/sessions in PG, refresh/revocation ownership and HTTP gu
   expect(await Promise.all(keys.map(async (key) => [key, await server.client.get(key)]))).toEqual(
     snapshot,
   );
-  expect((await server.client.keys(`${prefix}*`)).sort()).toEqual([...keys].sort());
+  expect((await server.keys(`${prefix}*`)).sort()).toEqual([...keys].sort());
 });
 
 it('observes actual PostgreSQL Client queries with a database positive control and Redis account/session traffic', async () => {
@@ -602,7 +601,7 @@ it('keeps Redis optional, rejects broken explicit configuration and closes a sta
     resume.resolve();
     await disposing;
     expect((await fetch(`${origin}/readyz`)).status).toBe(404);
-    expect((await server.client.clientList()).length).toBe(1);
+    await vi.waitFor(async () => expect(await server.activeClientCount()).toBe(1));
     expect(
       (
         await pool.query('SELECT count(*)::int n FROM pg_stat_activity WHERE application_name=$1', [
@@ -628,53 +627,60 @@ it('keeps Redis optional, rejects broken explicit configuration and closes a sta
 });
 
 it('maps real OOM to 503 only for that request and prevents business writes after a lost response', async () => {
-  await resetLimits();
-  await reload('redis');
-  const email = `failure-${randomUUID()}@example.test`;
-  const cookie = await account(email);
+  const faultServer = await redisServer();
   try {
-    await server.client.configSet('maxmemory', '1');
-    expect((await call('/api/auth/sign-in/email', { email, password })).status).toBe(503);
-    expect((await call('/api/v1/me', undefined, cookie)).status).toBe(200);
+    await pool.query('DELETE FROM "rateLimit"');
+    await reload('redis', faultServer.url);
+    const email = `failure-${randomUUID()}@example.test`;
+    const cookie = await account(email);
+    try {
+      await faultServer.client.configSet('maxmemory', '1');
+      expect((await call('/api/auth/sign-in/email', { email, password })).status).toBe(503);
+      expect((await call('/api/v1/me', undefined, cookie)).status).toBe(200);
+    } finally {
+      await faultServer.client.configSet('maxmemory', '128mb');
+    }
+    expect((await call('/api/auth/sign-in/email', { email, password: 'wrong' })).status).toBe(401);
+    const relay = await redisProxy(faultServer.port);
+    try {
+      await pool.query('DELETE FROM "rateLimit"');
+      const faultKeys = await faultServer.client.keys(`${prefix}*`);
+      if (faultKeys.length) await faultServer.client.del(faultKeys);
+      await reload('redis', relay.url);
+      const sessions = (await pool.query('SELECT count(*)::int n FROM session')).rows[0].n;
+      relay.hold();
+      const start = performance.now();
+      const pending = call('/api/auth/sign-in/email', { email, password });
+      await vi.waitFor(() => expect(relay.heldBytes).toBeGreaterThan(0));
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(performance.now() - start).toBeLessThan(1500);
+      const body = await response.json();
+      expect(body).toEqual({
+        error: {
+          code: 'AUTH_UNAVAILABLE',
+          message: 'AUTH_UNAVAILABLE',
+          requestId: response.headers.get('x-request-id'),
+        },
+      });
+      expect(response.headers.getSetCookie()).toEqual([]);
+      const sent = relay.received;
+      relay.release();
+      expect((await call('/api/v1/me', undefined, cookie)).status).toBe(200);
+      expect((await call('/api/auth/sign-in/email', { email, password })).status).toBe(503);
+      await delay(100);
+      expect(relay.received).toBe(sent);
+      expect((await pool.query('SELECT count(*)::int n FROM session')).rows[0].n).toBe(sessions);
+      const [key] = await faultServer.client.keys(`${prefix}*`);
+      expect(await faultServer.client.get(key!)).toMatch(/^1:/);
+      const stopped = performance.now();
+      await plugin.dispose();
+      expect(performance.now() - stopped).toBeLessThan(1300);
+      await vi.waitFor(() => expect(relay.connections).toBe(0));
+    } finally {
+      await relay.close();
+    }
   } finally {
-    await server.client.configSet('maxmemory', '128mb');
-  }
-  expect((await call('/api/auth/sign-in/email', { email, password: 'wrong' })).status).toBe(401);
-  const relay = await redisProxy(server.port);
-  try {
-    await resetLimits();
-    await reload('redis', relay.url);
-    const sessions = (await pool.query('SELECT count(*)::int n FROM session')).rows[0].n;
-    relay.hold();
-    const start = performance.now();
-    const pending = call('/api/auth/sign-in/email', { email, password });
-    await vi.waitFor(() => expect(relay.heldBytes).toBeGreaterThan(0));
-    const response = await pending;
-    expect(response.status).toBe(503);
-    expect(performance.now() - start).toBeLessThan(1500);
-    const body = await response.json();
-    expect(body).toEqual({
-      error: {
-        code: 'AUTH_UNAVAILABLE',
-        message: 'AUTH_UNAVAILABLE',
-        requestId: response.headers.get('x-request-id'),
-      },
-    });
-    expect(response.headers.getSetCookie()).toEqual([]);
-    const sent = relay.received;
-    relay.release();
-    expect((await call('/api/v1/me', undefined, cookie)).status).toBe(200);
-    expect((await call('/api/auth/sign-in/email', { email, password })).status).toBe(503);
-    await delay(100);
-    expect(relay.received).toBe(sent);
-    expect((await pool.query('SELECT count(*)::int n FROM session')).rows[0].n).toBe(sessions);
-    const [key] = await server.client.keys(`${prefix}*`);
-    expect(await server.client.get(key!)).toMatch(/^1:/);
-    const stopped = performance.now();
-    await plugin.dispose();
-    expect(performance.now() - stopped).toBeLessThan(1300);
-    await vi.waitFor(() => expect(relay.connections).toBe(0));
-  } finally {
-    await relay.close();
+    await faultServer.close();
   }
 });

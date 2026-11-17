@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { lstat, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { beneath, inventory, loadConfig } from '../inventory.ts';
-import { checkedPath, deliveryPending, digest, json } from './records.ts';
+import { checkedPath, contractPlan, deliveryPending, digest, json } from './records.ts';
 import type { Checkpoint, Evidence, Task } from './records.ts';
 import { compactInputs, deliveryOutput, readDraft, readResultInput } from './reports.ts';
 import { hasResultSelector, parseSelector, recordsFile } from './compact-store.ts';
@@ -90,25 +90,7 @@ export async function captureFiles(root: string, task: Task): Promise<Checkpoint
 
 export async function captureCandidate(root: string, task: Task) {
   const files = await captureFiles(root, task);
-  const plan = task.plan;
-  const contractPlan = {
-    id: plan.id,
-    goal: plan.goal,
-    scope: plan.scope,
-    inputs: plan.inputs,
-    sources: plan.sources,
-    authorization: plan.authorization,
-    nonGoals: plan.nonGoals,
-    acceptance: plan.acceptance,
-    decisions: plan.decisions,
-    dependencies: plan.dependencies,
-    stopCondition: plan.stopCondition,
-    ...(plan.requirement ? { requirement: plan.requirement } : {}),
-    ...(plan.result !== undefined ? { result: plan.result } : {}),
-    ...(plan.norms ? { norms: plan.norms } : {}),
-    ...(task.delivery ? { deliveryVersion: task.delivery.version } : {}),
-  };
-  const contract = digest(json(contractPlan));
+  const contract = digest(json(contractPlan(task)));
   return { files, contract, candidate: digest(json({ files, contract })) };
 }
 

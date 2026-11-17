@@ -24,6 +24,8 @@ export async function handoff(root: string, task: Task) {
   const assessment = await assess(root, task);
   const portable: Task = {
     version: 1,
+    revision: 0,
+    contractRevision: 0,
     member: task.member,
     workspace: '',
     stage: null,
@@ -139,6 +141,8 @@ export async function receive(root: string, source: string, key?: string) {
     );
   const task: Task = {
     ...incoming,
+    revision: 0,
+    contractRevision: 0,
     member: await member(root),
     workspace: root,
     stage: null,

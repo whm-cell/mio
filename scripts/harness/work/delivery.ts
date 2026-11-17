@@ -1,6 +1,6 @@
 import { format } from 'prettier';
 import { assess } from './context.ts';
-import { digest, json, loadTask } from './records.ts';
+import { digest, json, loadTask, taskRevision } from './records.ts';
 import type { Task } from './records.ts';
 import { commitDelivery, replayDelivery, requestDigest } from './delivery-store.ts';
 import { normsIssues } from './norms-review.ts';
@@ -76,11 +76,12 @@ export async function deliver(root: string, id: string, rawRequest: string) {
       : {
           replayed: true,
           readyForAcceptance: (await assess(root, restored)).readyForAcceptance,
-          revision: digest(json(restored)),
+          revision: taskRevision(restored),
           draft: restored.delivery!.draft,
         };
   }
-  if (request.revision !== digest(raw)) throw new Error('WORK_CONFLICT: read current revision');
+  if (request.revision !== taskRevision(task))
+    throw new Error('WORK_CONFLICT: read current revision');
   if (task.archived) throw new Error('WORK_ARCHIVED: reopen before delivery');
   return request.action === 'prepare'
     ? prepare(root, task, raw, request, token)
@@ -123,7 +124,7 @@ async function prepare(
     'Return the current private draft for actual acceptance of this candidate.';
   task.notes.push(`Prepared private v5 draft ${digest(source)}; acceptance remains pending.`);
   await commitDelivery(root, task, raw, token, 'prepare', { [path]: source }, {});
-  return { revision: digest(json(task)), draft: task.delivery!.draft, readyForAcceptance: true };
+  return { revision: taskRevision(task), draft: task.delivery!.draft, readyForAcceptance: true };
 }
 
 async function complete(
@@ -178,7 +179,7 @@ async function complete(
   await commitDelivery(root, task, raw, token, 'complete', outputs, expected);
   return {
     completed: true,
-    revision: digest(json(task)),
+    revision: taskRevision(task),
     report: accepted,
     files: Object.keys(outputs),
   };

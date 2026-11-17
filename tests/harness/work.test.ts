@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import type { Task } from '../../scripts/harness/work/records.ts';
-import { digest } from '../../scripts/harness/work/records.ts';
+import { digest, taskRevision } from '../../scripts/harness/work/records.ts';
 import { reviewFixture, reviewMarkdown } from './fixtures/quality-review-fixture.ts';
 import { artifact } from '../../scripts/harness/work/context.ts';
 import { withTaskCommand } from '../../scripts/harness/work/command.ts';
@@ -745,9 +745,10 @@ it('keeps pre-record occupancy and retained markers outside task listings', asyn
 
 function verifying(root: string, id = 'probe') {
   const raw = readFileSync(statePath(root, id));
-  if ((JSON.parse(raw.toString()) as Task).stage === 'C1_EVIDENCE_PENDING') return;
+  const current = JSON.parse(raw.toString()) as Task;
+  if (current.stage === 'C1_EVIDENCE_PENDING') return;
   const result = invoke(root, ['update', id, '--stdin'], {
-    revision: digest(raw),
+    revision: taskRevision(current),
     reason: 'The fixture explicitly chooses verification of its existing candidate.',
     stage: 'C1_EVIDENCE_PENDING',
     plan: { nextAction: 'Collect the authorized fixture observations.' },
@@ -950,9 +951,106 @@ it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
         : ['run', id, 'checks', '--', process.execPath, '-e', script];
     expect(invoke(root, args).status).toBe(0);
     expect(await readFile(join(root, '.work/forbidden'), 'utf8')).toBe('started');
-    expect(await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8')).toBe(legacyReceipt);
+    expect(await readFile(join(root, `.work/tasks/${id}/conflict.json`), 'utf8')).toBe(
+      legacyReceipt,
+    );
   },
 );
+
+it('serializes same-revision updates and never revives an older revision after reverting a value', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  expect(created.revision).toBe(1);
+  const originalAction = created.task.nextAction as string;
+  const request = {
+    revision: created.revision,
+    reason: 'A concurrent actor updates the next action.',
+    plan: { nextAction: 'Changed action.' },
+  };
+  const update = () => {
+    const child = spawn(process.execPath, [cli, 'update', id, '--stdin'], {
+      cwd: root,
+      env: { PATH: process.env.PATH ?? '' },
+    });
+    let output = '';
+    child.stdout.on('data', (bytes: Buffer) => (output += bytes.toString()));
+    child.stderr.on('data', (bytes: Buffer) => (output += bytes.toString()));
+    child.stdin.end(JSON.stringify(request));
+    return new Promise<{ status: number | null; output: string }>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (status) => resolve({ status, output }));
+    });
+  };
+  const results = await Promise.all([update(), update()]);
+  expect(results.filter((result) => result.status === 0)).toHaveLength(1);
+  expect(results.find((result) => result.status !== 0)!.output).toMatch(/WORK_BUSY|WORK_CONFLICT/);
+  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  expect(current.revision).toBe(created.revision + 1);
+  expect(invoke(root, ['update', id, '--stdin'], request).output).toContain('WORK_CONFLICT');
+  const restored = invoke(root, ['update', id, '--stdin'], {
+    revision: current.revision,
+    reason: 'Return to the original action.',
+    plan: { nextAction: originalAction },
+  });
+  expect(restored.status, restored.output).toBe(0);
+  expect(JSON.parse(restored.output).revision).toBe(current.revision + 1);
+  expect(invoke(root, ['update', id, '--stdin'], request).output).toContain('WORK_CONFLICT');
+});
+
+it('reads a legacy record with revision zero and writes the current integer on its first change', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  await edit(
+    root,
+    (task) => {
+      delete task.revision;
+    },
+    id,
+  );
+  const legacy = await state(root, id);
+  const current = JSON.parse(invoke(root, ['context', id, 'resume']).output);
+  expect(current.revision).toBe(0);
+  const result = invoke(root, ['update', id, '--stdin'], {
+    revision: 0,
+    reason: 'Record a new action for the existing task.',
+    plan: { nextAction: 'Continue the existing task.' },
+  });
+  expect(result.status, result.output).toBe(0);
+  const saved = await state(root, id);
+  expect(saved.revision).toBe(1);
+  expect(saved.checkpoint).toEqual(legacy.checkpoint);
+  expect(saved.evidence).toEqual(legacy.evidence);
+});
+
+it('increments the contract revision only for actual contract changes, including A to B to A', async () => {
+  const root = await fixture();
+  const created = JSON.parse(invoke(root, ['ensure', '--stdin'], proposal()).output);
+  const id = created.task.id as string;
+  const original = (await state(root, id)).plan.goal;
+  const progress = invoke(root, ['update', id, '--stdin'], {
+    revision: created.revision,
+    reason: 'Update progress without changing the contract.',
+    plan: { nextAction: 'Review the next step.' },
+  });
+  expect(progress.status, progress.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(0);
+  const changed = invoke(root, ['update', id, '--stdin'], {
+    revision: JSON.parse(progress.output).revision,
+    reason: 'Change the agreed goal.',
+    plan: { goal: 'A different goal.' },
+  });
+  expect(changed.status, changed.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(1);
+  const reverted = invoke(root, ['update', id, '--stdin'], {
+    revision: JSON.parse(changed.output).revision,
+    reason: 'Restore the original goal.',
+    plan: { goal: original },
+  });
+  expect(reverted.status, reverted.output).toBe(0);
+  expect((await state(root, id)).contractRevision).toBe(2);
+});
 
 it('does not use verification to complete a failed phase transition and replaces consumed next actions', async () => {
   const root = await fixture();
@@ -1185,7 +1283,7 @@ it.each([false, true])(
     const original = await state(root);
     const plan = { goal: 'An authorized revised goal.', nextAction: 'Implement the revised goal.' };
     const rejected = invoke(root, ['update', 'probe', '--stdin'], {
-      revision: digest(saved),
+      revision: taskRevision(original),
       reason: 'Revise the goal while requesting C1.',
       stage: 'C1_IMPLEMENTATION',
       plan,
@@ -1224,7 +1322,7 @@ it('recovers a C1 request rejected for file drift without inventing a contract u
   const original = await state(root);
   await writeFile(join(root, 'src/value.ts'), 'export const value = 2;\n');
   const rejected = invoke(root, ['update', 'probe', '--stdin'], {
-    revision: digest(saved),
+    revision: taskRevision(original),
     reason: 'Request C1 before reconciling an actual file change.',
     stage: 'C1_IMPLEMENTATION',
     plan: { nextAction: 'Continue authorized implementation.' },

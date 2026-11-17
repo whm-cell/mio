@@ -1,5 +1,5 @@
 import { artifact, assess } from './context.ts';
-import { digest, json, loadTask } from './records.ts';
+import { digest, json, loadTask, taskRevision } from './records.ts';
 import type { Task } from './records.ts';
 import { finiteOutput, hasReadReference, readPage } from './output.ts';
 import type { ReadOptions } from './output.ts';
@@ -31,7 +31,8 @@ export function inspectionOutput(result: Record<string, unknown>) {
   const task = result.task as Record<string, unknown>;
   const assessment = result.assessment as Record<string, unknown>;
   const id = String(task.id);
-  const revision = String(result.revision);
+  const { taskHash, ...visible } = result;
+  const snapshotHash = String(taskHash);
   const taskView = finiteOutput(task, (pointer) => {
     const [field, ...rest] = pointer.slice(1).split('/');
     const meta = ['id', 'stage', 'reviewDecision', 'releaseDisposition', 'archived', 'delivery'];
@@ -45,7 +46,7 @@ export function inspectionOutput(result: Record<string, unknown>) {
             : '';
     return {
       argv: ['read', id, 'task', '--select', selected + (rest.length ? `/${rest.join('/')}` : '')],
-      sha256: revision,
+      sha256: snapshotHash,
     };
   });
   const readableAssessment = assessmentSource(assessment, task.reviewDecision);
@@ -78,13 +79,13 @@ export function inspectionOutput(result: Record<string, unknown>) {
   };
   const ready = assessment.ready === true && !Object.values(blocking).some(Boolean);
   return {
-    ...result,
+    ...visible,
     task: {
       ...(taskView as Record<string, unknown>),
       // Keep the declaration visible even when the rest of the task folds to a root read.
       result: finiteOutput(task.result ?? null, (pointer) => ({
         argv: ['read', id, 'task', '--select', `/plan/result${pointer}`],
-        sha256: revision,
+        sha256: snapshotHash,
       })),
     },
     assessment: {
@@ -110,13 +111,10 @@ export function inspectionOutput(result: Record<string, unknown>) {
   };
 }
 
-export function assessmentOutput(
-  task: Task,
-  assessment: Record<string, unknown>,
-  revision: string,
-) {
+export function assessmentOutput(task: Task, assessment: Record<string, unknown>, raw: string) {
   const result = inspectionOutput({
-    revision,
+    revision: taskRevision(task),
+    taskHash: digest(raw),
     task: {
       id: task.plan.id,
       result: task.plan.result ?? null,

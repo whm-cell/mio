@@ -10,6 +10,7 @@ import {
   loadTask,
   parseTask,
   saveTask,
+  taskRevision,
 } from './records.ts';
 import type { Task, TaskPlan } from './records.ts';
 import { loadConfig } from '../inventory.ts';
@@ -57,7 +58,12 @@ export async function inspectTask(root: string, task: Task, raw: string, action 
       errors: [error instanceof Error ? error.message : String(error)],
     };
   }
-  return { revision: digest(raw), task: taskSummary(task, action), assessment };
+  return {
+    revision: taskRevision(task),
+    taskHash: digest(raw),
+    task: taskSummary(task, action),
+    assessment,
+  };
 }
 
 /** Stable requirement identity locates the record; a retry never replaces existing progress. */
@@ -91,6 +97,8 @@ export async function ensureTask(root: string, raw: string) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     if (existing) {
+      if (await deliveryPending(root, id))
+        throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
       const compared = { ...existing.task.plan, ...patch };
       registerQualityReview(compared, await loadConfig(root));
       registerNormsReview(compared);
@@ -130,7 +138,7 @@ export async function updateTask(root: string, id: string, raw: string) {
   const request = fields(JSON.parse(raw), ['revision', 'reason', 'plan', 'stage', 'reopen']);
   const loaded = await loadTask(root, id);
   if (
-    typeof request.revision !== 'string' ||
+    !Number.isSafeInteger(request.revision) ||
     typeof request.reason !== 'string' ||
     !request.reason.trim()
   )
@@ -150,7 +158,7 @@ export async function updateTask(root: string, id: string, raw: string) {
   const task = loaded.task;
   if (await deliveryPending(root, id))
     throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request first');
-  if (request.revision !== digest(loaded.raw))
+  if (request.revision !== taskRevision(task))
     throw new Error('WORK_CONFLICT: read the current context before updating');
   if (
     (request.reopen || (request.stage !== undefined && request.stage !== task.stage)) &&

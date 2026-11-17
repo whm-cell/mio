@@ -221,7 +221,7 @@ async function main(activity?: CommandActivity) {
   if (command === 'check') {
     if (args.length !== 1) throw new Error(help);
     const result = await assess(root, task);
-    console.log(json(assessmentOutput(task, result, digest(raw))));
+    console.log(json(assessmentOutput(task, result, raw)));
     if (!result.ready) process.exitCode = 1;
     return;
   }
@@ -237,7 +237,7 @@ async function main(activity?: CommandActivity) {
       throw new Error('WORK_EXEC_STAGE: enter C1_IMPLEMENTATION before implementation commands');
     const assessment = await assess(root, task);
     if (!assessment.ready) {
-      console.error(json(assessmentOutput(task, assessment, digest(raw))));
+      console.error(json(assessmentOutput(task, assessment, raw)));
       process.exitCode = 1;
       return;
     }
@@ -274,7 +274,7 @@ async function main(activity?: CommandActivity) {
           : 'Confirm the current scope and authorization; continue implementation or explicitly enter verification when ready.';
     await saveTask(root, task, raw);
     const result = await assess(root, task);
-    console.log(json(assessmentOutput(task, result, digest(json(task)))));
+    console.log(json(assessmentOutput(task, result, json(task))));
     if (!result.ready) process.exitCode = 1;
     return;
   }
@@ -294,7 +294,7 @@ async function main(activity?: CommandActivity) {
     );
   const state = await assess(root, task);
   if (!state.ready) {
-    console.error(json(assessmentOutput(task, state, digest(raw))));
+    console.error(json(assessmentOutput(task, state, raw)));
     process.exitCode = 1;
     return;
   }
@@ -402,8 +402,8 @@ async function main(activity?: CommandActivity) {
     // Persist the observation before launching, so removing an interrupted marker cannot restore an old pass.
     await writeFile(await checkedPath(root, startArtifact), startBytes, { flag: 'wx' });
     addEvidence(task, startEntry);
-    inFlight = json(task);
     await saveTask(root, task, raw);
+    inFlight = json(task);
     outcome = await runCommand(root, argv, ['ignore', log.fd, log.fd], activity!);
     await log.write(
       `\n${json({ exitCode: outcome.status, signal: outcome.signal, error: outcome.error?.message, cancelled: outcome.cancelled, unsettled: outcome.unsettled, finished: new Date().toISOString() })}`,

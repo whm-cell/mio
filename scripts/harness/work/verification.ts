@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { addEvidence, assess, capture, inputStamp } from './context.ts';
-import { checkedPath, digest, json, loadTask, saveTask } from './records.ts';
+import { checkedPath, digest, json, loadTask, saveTask, taskRevision } from './records.ts';
 import {
   changedFiles,
   checkpoint as verificationLegacy,
@@ -51,7 +51,7 @@ export async function verify(root: string, id: string, criterionId: string, requ
     const priorIssues = history.issues;
     if (value.action === 'inspect')
       return {
-        revision: digest(raw),
+        revision: taskRevision(task),
         candidate: current.candidate,
         baseline: base.checkpoint.candidate,
         changed: changedFiles(base.checkpoint, current),
@@ -67,7 +67,7 @@ export async function verify(root: string, id: string, criterionId: string, requ
           ).values(),
         ],
       };
-    if (value.revision !== digest(raw))
+    if (value.revision !== taskRevision(task))
       throw new Error('WORK_VERIFY_STALE: inspect the current revision');
     if (task.stage !== 'C1_EVIDENCE_PENDING')
       throw new Error('WORK_VERIFY_STAGE: enter C1_EVIDENCE_PENDING');

@@ -38,6 +38,7 @@ import {
   loadTask,
   parseTask,
   saveTask,
+  taskRevision,
 } from '../../scripts/harness/work/records.ts';
 import { inventory, loadConfig } from '../../scripts/harness/inventory.ts';
 import { documentCatalog, resolveDocument } from '../../scripts/harness/task-documents.ts';
@@ -246,7 +247,7 @@ async function passing(root: string, id = 'probe') {
 async function prepareRequest(root: string, id = 'probe') {
   return {
     action: 'prepare',
-    revision: digest((await loadTask(root, id)).raw),
+    revision: taskRevision((await loadTask(root, id)).task),
     title: 'Capability query',
     outcomes: 'Returns the requested capability.',
     locations: [
@@ -365,10 +366,10 @@ it.each(['probe', 'source'])(
 );
 
 async function completeRequest(root: string, id = 'probe') {
-  const { task, raw } = await loadTask(root, id);
+  const { task } = await loadTask(root, id);
   return {
     action: 'complete',
-    revision: digest(raw),
+    revision: taskRevision(task),
     draftSha256: task.delivery!.draft!.sha256,
     acceptance: {
       candidate: task.checkpoint!.candidate,
@@ -571,7 +572,7 @@ it('adds siblings and replaces only a newly accepted key without requiring a com
     root,
     'alpha',
     json({
-      revision: digest(loaded.raw),
+      revision: taskRevision(loaded.task),
       reason: 'Fixture user requests repair',
       reopen: true,
       plan: {
@@ -648,7 +649,7 @@ it('keeps failed repairs and later accepted repairs on one change key while pres
     root,
     'bug',
     json({
-      revision: digest(loaded.raw),
+      revision: taskRevision(loaded.task),
       reason: 'Fixture user requests another repair',
       reopen: true,
       plan: { authorization: 'Repair the same issue.', nextAction: 'Verify the new candidate.' },
@@ -709,7 +710,7 @@ it.each(['C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING'])(
       deliver(
         root,
         'probe',
-        json({ ...complete, revision: digest((await loadTask(root, 'probe')).raw) }),
+        json({ ...complete, revision: taskRevision((await loadTask(root, 'probe')).task) }),
       ),
     ).rejects.toThrow(/WORK_CHECK_COMMAND|WORK_DELIVERY_EVIDENCE|WORK_DELIVERY_STALE/);
     expect(await publicFiles(root)).toEqual(before);
@@ -768,7 +769,7 @@ it.each([false, true])(
     const draft = before.task.delivery?.draft;
     const draftBytes = draft ? await readFile(join(root, draft.path), 'utf8') : null;
     const corrected = invoke(root, ['update', 'probe', '--stdin'], {
-      revision: digest(before.raw),
+      revision: taskRevision(before.task),
       reason:
         'This is maintenance; correct the accidental capability declaration before acceptance.',
       plan: { result: null, nextAction: 'Verify the maintenance contract.' },
@@ -806,7 +807,7 @@ it('does not erase an accepted result by reclassifying it as maintenance', async
   const before = await loadTask(root, 'probe');
   const files = await publicFiles(root);
   const result = invoke(root, ['update', 'probe', '--stdin'], {
-    revision: digest(before.raw),
+    revision: taskRevision(before.task),
     reason: 'Try to remove an already accepted binding.',
     plan: { result: null },
   });
@@ -831,7 +832,7 @@ it.each(['code', 'original', 'draft', 'evidence-binding', 'acceptance'])(
     if (changed === 'evidence-binding') {
       task.evidence[0]!.environment = 'Different observation';
       await saveTask(root, task, raw);
-      request.revision = digest((await loadTask(root, 'probe')).raw);
+      request.revision = taskRevision((await loadTask(root, 'probe')).task);
     }
     if (changed === 'acceptance') request.acceptance.candidate = '0'.repeat(64);
     else
@@ -906,7 +907,7 @@ it('prioritizes an unfinished delivery over stale update and ensure conflicts wi
   await rewind(root, id, 0);
   const stateBefore = (await loadTask(root, id)).raw;
   const stale = invoke(root, ['update', id, '--stdin'], {
-    revision: '0'.repeat(64),
+    revision: 0,
     reason: 'This obsolete update must not obstruct journal recovery.',
   });
   expect(stale.stderr).toContain('WORK_DELIVERY_PENDING');

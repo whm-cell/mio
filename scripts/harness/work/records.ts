@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 export const stages = ['C0_READY', 'C1_IMPLEMENTATION', 'C1_EVIDENCE_PENDING', 'C1_RELEASED'];
 export const methods = ['automated', 'review', 'behavior'];
@@ -47,6 +48,8 @@ export interface Evidence {
 }
 export interface Task {
   version: 1;
+  revision?: number;
+  contractRevision?: number;
   member: string;
   workspace: string;
   plan: TaskPlan;
@@ -67,6 +70,30 @@ export interface Task {
 export const digest = (bytes: string | Buffer): string =>
   createHash('sha256').update(bytes).digest('hex');
 export const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+export const taskRevision = (task: Task): number => task.revision ?? 0;
+export const contractRevision = (task: Task): number => task.contractRevision ?? 0;
+
+/** Progress and notes do not change the agreed work or its acceptance criteria. */
+export function contractPlan(task: Task) {
+  const plan = task.plan;
+  return {
+    id: plan.id,
+    goal: plan.goal,
+    scope: plan.scope,
+    inputs: plan.inputs,
+    sources: plan.sources,
+    authorization: plan.authorization,
+    nonGoals: plan.nonGoals,
+    acceptance: plan.acceptance,
+    decisions: plan.decisions,
+    dependencies: plan.dependencies,
+    stopCondition: plan.stopCondition,
+    ...(plan.requirement ? { requirement: plan.requirement } : {}),
+    ...(plan.result !== undefined ? { result: plan.result } : {}),
+    ...(plan.norms ? { norms: plan.norms } : {}),
+    ...(task.delivery ? { deliveryVersion: task.delivery.version } : {}),
+  };
+}
 
 export function identifier(value: string): string {
   if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,79}$/.test(value))
@@ -190,6 +217,10 @@ export function parseTask(raw: string): Task {
     throw new Error('WORK_SCHEMA: duplicate criterion id');
   if (
     task.version !== 1 ||
+    (task.revision !== undefined &&
+      (!Number.isSafeInteger(task.revision) || (task.revision as number) < 0)) ||
+    (task.contractRevision !== undefined &&
+      (!Number.isSafeInteger(task.contractRevision) || (task.contractRevision as number) < 0)) ||
     typeof task.member !== 'string' ||
     typeof task.workspace !== 'string' ||
     (task.stage !== null && !stages.includes(task.stage as string)) ||
@@ -319,6 +350,8 @@ export async function initializeMember(root: string, actor?: string): Promise<st
 export function draft(root: string, actor: string, id: string, goal: string): Task {
   return {
     version: 1,
+    revision: 0,
+    contractRevision: 0,
     member: actor,
     workspace: root,
     plan: {
@@ -375,17 +408,38 @@ export async function deliveryPending(root: string, id: string): Promise<boolean
 /** One writer per task. Refuse changes made while a command was running; keep raw evidence. */
 export async function saveTask(root: string, task: Task, previous?: string) {
   const path = await checkedPath(root, `.work/tasks/${identifier(task.plan.id)}/state.json`);
-  parseTask(json(task));
+  const revision = taskRevision(task);
+  if (revision >= Number.MAX_SAFE_INTEGER) throw new Error('WORK_REVISION: revision exhausted');
+  const prior = previous === undefined ? null : parseTask(previous);
+  if (
+    prior &&
+    (taskRevision(prior) !== revision || contractRevision(prior) !== contractRevision(task))
+  )
+    throw new Error('WORK_CONFLICT: stale task revision');
+  const changedContract =
+    prior !== null && !isDeepStrictEqual(contractPlan(prior), contractPlan(task));
+  if (changedContract && contractRevision(task) >= Number.MAX_SAFE_INTEGER)
+    throw new Error('WORK_REVISION: contract revision exhausted');
+  const next = {
+    ...task,
+    revision: revision + 1,
+    contractRevision: contractRevision(task) + (changedContract ? 1 : 0),
+  };
+  parseTask(json(next));
   if (await deliveryPending(root, task.plan.id))
     throw new Error('WORK_DELIVERY_PENDING: resume the original delivery request');
   await mkdir(dirname(path), { recursive: true });
-  if (previous === undefined) return writeFile(path, json(task), { flag: 'wx' });
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, json(task), { flag: 'wx' });
-    if ((await readFile(path, 'utf8')) !== previous)
-      throw new Error('WORK_CONFLICT: state changed; reconcile without overwriting it');
-    await rename(temporary, path);
+    await writeFile(temporary, json(next), { flag: 'wx' });
+    if (previous === undefined) await link(temporary, path);
+    else {
+      if ((await readFile(path, 'utf8')) !== previous)
+        throw new Error('WORK_CONFLICT: state changed; reconcile without overwriting it');
+      await rename(temporary, path);
+    }
+    task.revision = next.revision;
+    task.contractRevision = next.contractRevision;
   } finally {
     await rm(temporary, { force: true });
   }

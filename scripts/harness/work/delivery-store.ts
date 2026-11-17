@@ -1,7 +1,7 @@
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { checkedPath, digest, json, parseTask, loadTask } from './records.ts';
+import { checkedPath, digest, json, parseTask, loadTask, taskRevision } from './records.ts';
 import type { Task } from './records.ts';
 import { captureCandidate, captureFiles } from './context.ts';
 import { bookPaths, optionalText } from './reports.ts';
@@ -133,6 +133,11 @@ export async function commitDelivery(
   const statePath = `.work/tasks/${id}/state.json`;
   if ((await optionalText(root, statePath)) !== raw)
     throw new Error('WORK_CONFLICT: task changed before delivery');
+  if (taskRevision(task) !== taskRevision(parseTask(raw)))
+    throw new Error('WORK_CONFLICT: stale task revision');
+  if (taskRevision(task) >= Number.MAX_SAFE_INTEGER)
+    throw new Error('WORK_REVISION: revision exhausted');
+  task.revision = taskRevision(task) + 1;
   changes.push({ path: statePath, before: raw, after: json(task) });
   const captured = await captureCandidate(root, task);
   if (captured.candidate !== task.checkpoint?.candidate)

@@ -20,6 +20,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [docs/tasks/compute-service/design.md](../design.md) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/tasks/compute-service/prd.md](../prd.md)
 
+## image-upload-verification
+
+**图片上传完整性与对象关联**
+
+[compute/src/adapters/cos.ts](../../../../compute/src/adapters/cos.ts) · [compute/tests/cos-recovery.test.ts](../../../../compute/tests/cos-recovery.test.ts) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/cos.md](../../../integrations/cos.md)
+
 ## private-user-assets
 
 **登录用户私有视频资产与 COS 直传**

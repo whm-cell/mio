@@ -81,6 +81,39 @@
       }
     },
     {
+      "key": "image-upload-verification",
+      "title": "图片上传完整性与对象关联",
+      "locations": [
+        {
+          "path": "compute/src/adapters/cos.ts",
+          "purpose": "图片结果的本地校验、COS Content-MD5 上传与 PUT/HEAD 对象关联"
+        },
+        {
+          "path": "compute/tests/cos-recovery.test.ts",
+          "purpose": "图片成功与失败路径、未知上传及视频恢复回归"
+        },
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "图片和视频对象身份、校验及恢复协议"
+        },
+        {
+          "path": "docs/integrations/cos.md",
+          "purpose": "COS 提交完整性及对象关联规范"
+        }
+      ],
+      "outcomes": "图片成功上传保留本地格式校验、SHA-256、Content-MD5、唯一键和禁止覆盖；仅当 PUT 返回 ETag 且 HEAD 的长度、SHA-256 元数据与 ETag 对应本次上传时返回结果，正常成功路径不再 GET 全量图片。视频未知上传恢复仍完整 GET 并校验内容。",
+      "verification": "固定提交 b8f02dc4450caae8f11339e1b4847cfe62858109 的 GitHub Actions 全量 pnpm check 通过：64 文件 877 项测试、构建与 smoke 成功，其中 COS 17 项通过；此前失败的 live 审计用例在修复后对应 28 项中通过。用户明确授权的配置桶曾在 207e674 上用 103 字节 PNG 实测正确 Content-MD5 上传、HEAD 与独立 GET 摘要一致，错误 MD5 得到 400 BadDigest；当前图片运行代码和依赖未变，已人工复核该历史观察的适用性，本次复核未重复云调用。",
+      "limitations": "真实 COS 观察仅限一次 PNG 样本及当时配置的桶和 B 身份，未证明桶隔离、其他格式实云行为、完整供应商生成、生产部署或容量。每张成功图片可避免一次 GET 和对应大小下载，未测真实网络速度或百分比。HEAD 不重算服务端 SHA-256；未知写入仍需按原身份对账。",
+      "acceptance": {
+        "candidate": {
+          "commit": "b8f02dc4450caae8f11339e1b4847cfe62858109",
+          "contractRevision": 3
+        },
+        "statement": "接受这次变更。",
+        "reference": "2026-11-17 本会话用户明确回复：接受这次变更。先核对 main 的在途修改，再将 codex/image-upload-verification 安全合并到 main 并推送，保留其他任务的改动，暂不部署。"
+      }
+    },
+    {
       "key": "private-user-assets",
       "title": "登录用户私有视频资产与 COS 直传",
       "locations": [

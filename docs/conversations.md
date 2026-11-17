@@ -57,11 +57,11 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 在途历史读取同样参与关闭排空；官方图片卸载投影必须保留到会话及读取结束。已开始执行的运行若没有可证明的 turn/end，回执为 unknown，冷读按 DSH 已持久前缀展示 interrupted。正式 Profile 的薄入口等待内核就绪，原 `@mio/plugin` 独立装载不增加内核前置。
 
-断网只释放订阅，已受理轮次继续。登录过期/撤销后新操作拒绝；SSE 每秒重新验证同一登录会话，失败时发送脱敏错误并关闭，已受理轮次可完成。legacy 固定路由变化在下一次 setup model.select 生效；BYOK 始终恢复冻结的逻辑模型和 fresh 快照，不跟随默认项变化。关闭必须先等待对话 admissions/run 排空（含在途生图工具调用），再分别关闭 `compute` 池与 `providers` 池；即使前者失败也释放后者并保留 `AggregateError`，不能只靠 effect 注册顺序。
+断网只释放订阅，已受理轮次继续。登录过期/撤销后新操作拒绝；SSE 每秒重新验证同一登录会话，失败时发送脱敏错误并关闭，已受理轮次可完成。legacy 固定路由变化在下一次 setup model.select 生效；BYOK 始终恢复冻结的逻辑模型和 fresh 快照，不跟随默认项变化。关闭必须先等待对话 admissions/run 排空（含在途生图工具调用），再关闭 `generations`；即使排空或 generations 关闭失败，也须继续释放 `providers` 池并保留 `AggregateError`。`compute` 清理单独加入对话排空后再执行，不能只靠 effect 注册顺序。
 
 ## 验证及限制
 
-`tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/conversations-engine.test.ts` 验证多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile、多轮、正常重启及 SIGKILL；`tests/conversations/conversation-image-tools.test.ts` 经隔离 PG、队列通道（本机 `.env.test` 环境下使用 `mio-test` 真实 RabbitMQ 独立临时 vhost，无 RabbitMQ 容器的 `GITHUB_ACTIONS=true` 环境由真实 PG outbox 驱动同一 Worker B）、Worker B（受控上游与 COS 替身）、官方 loop、真实 JSONL 与正式打包 Profile 验证多轮生图/改图工具闭环、权限隔离、注入拦截、预算/步数熔断、幂等去重、取消与重启恢复。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
+`tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/conversations-engine.test.ts` 验证多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile、多轮、正常重启及 SIGKILL；`tests/conversations/conversation-image-tools.test.ts` 经 A 内的 generations、隔离 PG、受控上游与 COS 替身、官方 loop、真实 JSONL 与正式打包 Profile，在不启动 B 和图片 MQ 的条件下验证多轮生图/改图工具闭环、权限隔离、注入拦截、预算/步数熔断、幂等去重、取消与重启恢复。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
 
 `tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
 

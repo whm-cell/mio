@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -11,11 +11,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { expect, it, vi } from 'vitest';
 import { Journal } from '../src/adapters/journal.ts';
+import { captureLiveArtifacts } from '../../tests/compute/live-image-loop.ts';
 
 it('records the first real-provider attempt and blocks a second without forwarding credentials', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
@@ -206,6 +207,192 @@ globalThis.Error = class extends OriginalError {
       expect(output.trim()).toBe(invalid ? 'LIVE_UNEXPECTED_FAILURE' : 'LIVE_DATABASE_NOT_EMPTY');
       expect(output).not.toContain('private-sensitive-tail');
       expect(existsSync(run)).toBe(false);
+    }
+  } finally {
+    rmSync(directory, { recursive: true });
+  }
+}, 10000);
+
+it('sanitizes current dev failures in both CLI output and retained events without external operations', async () => {
+  const runtime = resolve('.runtime');
+  mkdirSync(runtime, { recursive: true });
+  const directory = realpathSync(mkdtempSync(join(realpathSync(runtime), 'mio-dev-safe-events-')));
+  try {
+    const project = join(directory, 'project');
+    mkdirSync(project);
+    for (let remaining = 100; ; remaining--) {
+      try {
+        captureLiveArtifacts(project);
+        break;
+      } catch (error) {
+        const missing = error as NodeJS.ErrnoException;
+        if (
+          remaining === 0 ||
+          missing.code !== 'ENOENT' ||
+          !missing.path?.startsWith(project + sep)
+        )
+          throw error;
+        if (basename(missing.path) === 'dist') {
+          mkdirSync(missing.path, { recursive: true });
+          writeFileSync(join(missing.path, 'fixture.js'), 'synthetic');
+        } else {
+          mkdirSync(dirname(missing.path), { recursive: true });
+          writeFileSync(missing.path, 'synthetic');
+        }
+      }
+    }
+    writeFileSync(join(project, 'package.json'), '{"type":"module"}\n');
+    const fixtureRuntime = join(project, '.runtime');
+    mkdirSync(fixtureRuntime);
+    writeFileSync(join(project, '.gitignore'), '.work/\n.runtime/\ndist/\n');
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: project, encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init', '-q');
+    git('add', '-A');
+    git(
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+      'commit',
+      '-qm',
+      'fixture',
+    );
+    const commit = git('rev-parse', 'HEAD');
+    const taskId = 'dev-safe-events';
+    const taskDirectory = join(project, '.work', 'tasks', taskId);
+    mkdirSync(taskDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(taskDirectory, 'state.json'),
+      JSON.stringify({
+        workspace: project,
+        plan: { id: taskId },
+        stage: 'C1_EVIDENCE_PENDING',
+        contractRevision: 0,
+        checkpoint: { candidate: { commit, contractRevision: 0 } },
+      }),
+      { mode: 0o600 },
+    );
+    const setupUrl = pathToFileURL(resolve('tests/support/local-dev-live.ts')).href;
+    const preflightUrl = pathToFileURL(resolve('scripts/service/generation-cutover.ts')).href;
+    for (const invalid of [false, true]) {
+      const observations = join(
+        fixtureRuntime,
+        invalid ? 'invalid-observations.jsonl' : 'valid-observations.jsonl',
+      );
+      const setupPath = join(fixtureRuntime, 'setup.mjs');
+      const preflightPath = join(fixtureRuntime, 'preflight.mjs');
+      const preload = join(fixtureRuntime, 'preload.mjs');
+      const record = `import { appendFileSync } from 'node:fs';
+const record = (event, data = {}) => appendFileSync(${JSON.stringify(observations)}, JSON.stringify({event, ...data}) + '\\n', {mode: 0o600});`;
+      writeFileSync(
+        setupPath,
+        `${record}
+export async function preparePersistentDevEnvironment(domains) {
+  record('fixture-setup', {domains});
+  return ${JSON.stringify({
+    origin: 'http://127.0.0.1:1',
+    values: { MIO_LOCAL_COMPUTE_DIRECTORY: join(fixtureRuntime, 'compute') },
+    runtimeEnv: {
+      MIO_ASSETS_DATABASE_URL: 'postgresql://fixture.invalid/media',
+      MIO_GENERATIONS_DATA_DIR: join(fixtureRuntime, 'generations'),
+      DSH_HOME: join(fixtureRuntime, 'dsh'),
+    },
+  })};
+}
+export async function authenticateOrCreateRetainedDevOwner() { throw new Error('UNEXPECTED_AUTH'); }
+export async function parseLiveAuthInput() { throw new Error('UNEXPECTED_AUTH'); }
+`,
+        { mode: 0o600 },
+      );
+      writeFileSync(
+        preflightPath,
+        `${record}
+export async function inspectGenerationCutover(pool, options) {
+  record('fixture-preflight', {probeCos: options.probeCos});
+  throw new Error(${JSON.stringify(invalid ? 'private-sensitive-tail\nLIVE_CUTOVER_PREFLIGHT' : 'LIVE_CUTOVER_PREFLIGHT\nprivate-sensitive-tail')});
+}
+`,
+        { mode: 0o600 },
+      );
+      writeFileSync(
+        preload,
+        `${record}
+import { registerHooks, syncBuiltinESMExports } from 'node:module';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import pg from 'pg';
+const blocked = () => { record('unexpected-external-operation'); throw new Error('EXTERNAL_OPERATION_BLOCKED'); };
+globalThis.fetch = blocked;
+net.Socket.prototype.connect = blocked;
+pg.Pool.prototype.query = blocked;
+pg.Pool.prototype.connect = blocked;
+const end = pg.Pool.prototype.end;
+pg.Pool.prototype.end = function (...args) { record('pool-ended'); return end.apply(this, args); };
+const spawnSync = childProcess.spawnSync;
+childProcess.spawnSync = function (command, args, options) {
+  if (command !== 'git' || !['rev-parse', 'status'].includes(args[0])) return blocked();
+  record('candidate-git-check', {command: args[0]});
+  return spawnSync(command, args, options);
+};
+for (const name of ['spawn', 'exec', 'execFile', 'fork', 'execSync', 'execFileSync']) childProcess[name] = blocked;
+syncBuiltinESMExports();
+registerHooks({ resolve(specifier, context, nextResolve) {
+  const resolved = nextResolve(specifier, context);
+  if (resolved.url === ${JSON.stringify(setupUrl)}) return {url: ${JSON.stringify(pathToFileURL(setupPath).href)}, shortCircuit: true};
+  if (resolved.url === ${JSON.stringify(preflightUrl)}) return {url: ${JSON.stringify(pathToFileURL(preflightPath).href)}, shortCircuit: true};
+  return resolved;
+}});
+`,
+        { mode: 0o600 },
+      );
+      const run = join(fixtureRuntime, invalid ? 'invalid-run' : 'valid-run');
+      const child = spawn(
+        process.execPath,
+        [resolve('tests/compute/live-image-loop.ts'), 'dev', run, '/unused-auth', taskId],
+        {
+          cwd: project,
+          env: {
+            PATH: process.env.PATH,
+            MIO_RUN_LIVE_IMAGE: 'yes',
+            NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      const [code] = await once(child, 'close');
+      const expected = invalid ? 'LIVE_UNEXPECTED_FAILURE' : 'LIVE_CUTOVER_PREFLIGHT';
+      expect(code).toBe(1);
+      expect(output.trim()).toBe(expected);
+      const events = readFileSync(join(run, 'events.jsonl'), 'utf8');
+      expect(output + events).not.toContain('private-sensitive-tail');
+      expect(
+        events
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line)),
+      ).toEqual([{ at: expect.any(String), event: 'failed-or-unknown', code: expected }]);
+      const activity = readFileSync(observations, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      expect(activity).toEqual([
+        { event: 'candidate-git-check', command: 'rev-parse' },
+        { event: 'candidate-git-check', command: 'status' },
+        { event: 'fixture-setup', domains: ['auth', 'assets', 'generations', 'providers'] },
+        { event: 'fixture-preflight', probeCos: true },
+        { event: 'pool-ended' },
+      ]);
     }
   } finally {
     rmSync(directory, { recursive: true });

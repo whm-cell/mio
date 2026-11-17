@@ -1,6 +1,6 @@
 # Mio 插件服务底座
 
-本仓库是独立的后端 TypeScript 插件服务，由官方 DeepSeek Harness Profile 启动，不包含前端 UI。提供基础 HTTP、账号认证及全部拒绝的工具策略；[本地对话服务](docs/conversations.md)包括用户归属、BYOK 文本、多轮、原生内容持久化、历史、SSE 与取消。实际接受范围与限制见[成果入口](docs/tasks/conversation-service/complete/report.md)，开发安排见[对话 PRD](docs/tasks/conversation-service/prd.md)。项目/媒体生成尚未实现。认证边界见[认证底座](docs/auth.md)，内核边界见 [DSH 契约](docs/integrations/dsh.md)。
+本仓库是独立的后端 TypeScript 插件服务，由官方 DeepSeek Harness Profile 启动，不包含前端 UI。提供基础 HTTP、账号认证及全部拒绝的工具策略；[本地对话服务](docs/conversations.md)包括用户归属、BYOK 文本、多轮、原生内容持久化、历史、SSE 与取消。实际接受范围与限制见[成果入口](docs/tasks/conversation-service/complete/report.md)，开发安排见[对话 PRD](docs/tasks/conversation-service/prd.md)。项目和画布工作流尚未实现；图片生成与恢复由 A 独立承接，范围与真实接受见[图片需求与成果](docs/tasks/onelink-image-generation/prd.md)及下文配置。认证边界见[认证底座](docs/auth.md)，内核边界见 [DSH 契约](docs/integrations/dsh.md)。
 
 用户资产入口按[资产 API](docs/apis/assets.md)和[私有 COS 契约](docs/integrations/cos.md)配置独立媒体数据库与桶；显式执行 `pnpm assets:migrate --apply` 后启用。当前开发与真实云验收状态以[任务资料](docs/tasks/compute-service/prd.md)及实际证据为准，不能据此推断转码链路已完成。
 

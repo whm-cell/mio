@@ -122,7 +122,12 @@ export function parseLiveInvocation(
 }
 
 export function assertLivePhase(phase: string) {
-  if (phase !== 'dev') throw new Error('LIVE_LEGACY_PHASE_RETIRED: use dev for A generation');
+  if (phase !== 'dev') throw new Error('LIVE_LEGACY_PHASE_RETIRED');
+}
+
+function failureCode(error: unknown): string {
+  const first = error instanceof Error ? error.message.split('\n', 1)[0] : undefined;
+  return first && /^[A-Z0-9_]+$/.test(first) ? first : 'LIVE_UNEXPECTED_FAILURE';
 }
 type Environment = Record<string, string>;
 type State = { origin: string; a: Environment };
@@ -971,13 +976,9 @@ async function runPersistentDev(invocation: ReturnType<typeof parseLiveInvocatio
       imageMq: false,
     });
   } catch (error) {
-    record('failed-or-unknown', {
-      code:
-        error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
-          ? error.message
-          : 'LIVE_IMAGE_FAILURE',
-    });
-    throw error;
+    const code = failureCode(error);
+    record('failed-or-unknown', { code });
+    throw new Error(code);
   } finally {
     await stop();
     await pool.end();
@@ -985,10 +986,15 @@ async function runPersistentDev(invocation: ReturnType<typeof parseLiveInvocatio
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const invocation = parseLiveInvocation(
-    process.argv.slice(2),
-    process.env.MIO_RUN_LIVE_IMAGE,
-    process.env.MIO_LIVE_IMAGE_SCENARIO,
-  );
-  await runPersistentDev(invocation);
+  try {
+    const invocation = parseLiveInvocation(
+      process.argv.slice(2),
+      process.env.MIO_RUN_LIVE_IMAGE,
+      process.env.MIO_LIVE_IMAGE_SCENARIO,
+    );
+    await runPersistentDev(invocation);
+  } catch (error) {
+    console.error(failureCode(error));
+    process.exitCode = 1;
+  }
 }

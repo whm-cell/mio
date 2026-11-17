@@ -184,7 +184,7 @@ globalThis.fetch = (input, init) => {
   const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
   const target = new URL(url);
   if (
-    target.origin !== 'https://api.onelinkai.cloud' ||
+    (target.origin !== 'https://api.onelinkai.cloud' && method !== 'POST') ||
     (method === 'GET' && target.pathname === '/v1/models' && !target.search && !target.hash)
   )
     return originalFetch(input, init);

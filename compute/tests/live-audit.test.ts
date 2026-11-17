@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import {
@@ -11,12 +11,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { expect, it, vi } from 'vitest';
 import { Journal } from '../src/adapters/journal.ts';
-import { captureLiveArtifacts } from '../../tests/compute/live-image-loop.ts';
 
 it('records the first real-provider attempt and blocks a second without forwarding credentials', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
@@ -34,6 +33,27 @@ it('records the first real-provider attempt and blocks a second without forwardi
     const allowed = readFileSync(join(directory, 'supplier-post-allowed.json'), 'utf8');
     const blocked = readFileSync(join(directory, 'supplier-post-repeat-blocked.json'), 'utf8');
     expect(first + allowed + blocked).not.toContain('synthetic-secret');
+  } finally {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    rmSync(directory, { recursive: true });
+  }
+});
+
+it('allows A model discovery and non-provider reads/PUTs without spending the supplier POST lock', async () => {
+  vi.resetModules();
+  const directory = mkdtempSync(join(tmpdir(), 'mio-live-audit-'));
+  const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('ok'));
+  vi.stubEnv('MIO_LIVE_IMAGE_AUDIT_DIRECTORY', directory);
+  vi.stubGlobal('fetch', transport);
+  try {
+    await import('../../tests/compute/live-image-audit.ts');
+    await fetch('https://api.onelinkai.cloud/v1/models');
+    await fetch('https://bucket.cos.example/mio/raw/image');
+    await fetch('https://bucket.cos.example/mio/staging/image', { method: 'PUT', body: 'fixture' });
+    expect(transport).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(directory, 'supplier-post-started.json'))).toBe(false);
+    expect(existsSync(join(directory, 'supplier-post-allowed.json'))).toBe(false);
   } finally {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -135,127 +155,40 @@ it('reads the journal only after the worker releases its exclusive lock', () => 
   }
 });
 
-it('keeps only a valid failure code when an assertion includes sensitive trailing details', async () => {
+it('prints only a valid failure code when the current CLI rejects sensitive trailing details', async () => {
   const runtime = resolve('.runtime');
   mkdirSync(runtime, { recursive: true });
   const directory = realpathSync(mkdtempSync(join(realpathSync(runtime), 'mio-live-safe-code-')));
   try {
-    const projectPath = join(directory, 'project');
-    mkdirSync(projectPath);
-    const project = realpathSync(projectPath);
-    // Build a private synthetic artifact tree; pnpm check runs tests before app/worker build.
-    for (let remaining = 100; ; remaining--) {
-      try {
-        captureLiveArtifacts(project);
-        break;
-      } catch (error) {
-        const missing = error as NodeJS.ErrnoException;
-        if (
-          remaining === 0 ||
-          missing.code !== 'ENOENT' ||
-          !missing.path?.startsWith(`${project}${sep}`)
-        )
-          throw error;
-        if (basename(missing.path) === 'dist') {
-          mkdirSync(missing.path, { recursive: true });
-          writeFileSync(join(missing.path, 'fixture.js'), 'synthetic');
-        } else {
-          mkdirSync(dirname(missing.path), { recursive: true });
-          writeFileSync(missing.path, 'synthetic');
-        }
-      }
-    }
-    const fixtureRuntime = join(project, '.runtime');
-    mkdirSync(fixtureRuntime);
-    writeFileSync(join(project, '.gitignore'), '.work/\n.runtime/\ndist/\n');
-    const git = (...args: string[]) => {
-      const result = spawnSync('git', args, { cwd: project, encoding: 'utf8' });
-      expect(result.status, result.stderr).toBe(0);
-      return result.stdout.trim();
-    };
-    git('init', '-q');
-    git('add', '-A');
-    git(
-      '-c',
-      'user.name=Fixture',
-      '-c',
-      'user.email=fixture@example.test',
-      '-c',
-      'commit.gpgsign=false',
-      '-c',
-      'core.hooksPath=/dev/null',
-      'commit',
-      '-qm',
-      'fixture',
-    );
-    const commit = git('rev-parse', 'HEAD');
-    const taskId = 'live-safe-code';
-    const taskDirectory = join(project, '.work', 'tasks', taskId);
-    mkdirSync(taskDirectory, { recursive: true, mode: 0o700 });
-    writeFileSync(
-      join(taskDirectory, 'state.json'),
-      JSON.stringify({
-        workspace: project,
-        plan: { id: taskId },
-        stage: 'C1_EVIDENCE_PENDING',
-        contractRevision: 0,
-        checkpoint: { candidate: { commit, contractRevision: 0 } },
-      }),
-      { mode: 0o600 },
-    );
-    const infrastructure = join(directory, 'infra');
-    mkdirSync(infrastructure, { mode: 0o700 });
-    const write = (name: string, content: string) =>
-      writeFileSync(join(infrastructure, name), content, { mode: 0o600 });
-    write(
-      'manifest.json',
-      JSON.stringify({
-        runDirectory: infrastructure,
-        project: 'miow3safe',
-        postgresDatabase: 'mio_w3_safe',
-        rabbitVhost: 'mio-w3-safe',
-        ports: { postgres: 12345, amqp: 12346, management: 12347 },
-      }),
-    );
-    write('postgres.env', 'MIO_TEST_DATABASE_URL=postgres://a:b@127.0.0.1:12345/mio_w3_safe\n');
-    write(
-      'rabbit-a.env',
-      'MIO_COMPUTE_BROKER_USER=a\nMIO_COMPUTE_EXPECTED_RESULT_USER=b\nRABBITMQ_URL=amqp://a:b@127.0.0.1:12346/mio-w3-safe\n',
-    );
-    write(
-      'rabbit-b.env',
-      'MIO_COMPUTE_BROKER_USER=b\nMIO_COMPUTE_EXPECTED_COMMAND_USER=a\nRABBITMQ_URL=amqp://b:b@127.0.0.1:12346/mio-w3-safe\n',
-    );
     const preload = join(directory, 'preload.mjs');
     writeFileSync(
       preload,
-      `import assert from 'node:assert/strict';
-import pg from 'pg';
-pg.Pool.prototype.query = async () => ({ rows: [{ count: '0' }] });
-pg.Pool.prototype.end = async () => {};
-const equal = assert.equal;
-assert.equal = (...args) => {
-  if (args[2] === 'LIVE_DATABASE_NOT_EMPTY') throw new Error(process.env.MIO_TEST_INVALID_CODE
-    ? 'private-sensitive-tail\\nLIVE_DATABASE_NOT_EMPTY'
-    : 'LIVE_DATABASE_NOT_EMPTY\\nprivate-sensitive-tail');
-  return equal(...args);
+      `
+const OriginalError = globalThis.Error;
+globalThis.Error = class extends OriginalError {
+  constructor(message, options) {
+    super(typeof message === 'string' && message.startsWith('LIVE_LEGACY_PHASE_RETIRED')
+      ? (process.env.MIO_TEST_INVALID_CODE
+        ? 'private-sensitive-tail\\nLIVE_DATABASE_NOT_EMPTY'
+        : 'LIVE_DATABASE_NOT_EMPTY\\nprivate-sensitive-tail')
+      : message, options);
+  }
 };`,
       { mode: 0o600 },
     );
     for (const invalid of [false, true]) {
-      const run = join(fixtureRuntime, invalid ? 'invalid' : 'valid');
+      const run = join(directory, invalid ? 'invalid' : 'valid');
       const child = spawn(
         process.execPath,
         [
           resolve('tests/compute/live-image-loop.ts'),
           'prepare',
           run,
-          infrastructure,
-          '/unused',
-          taskId,
+          '/unused-infra',
+          '/unused-key',
+          'live-safe-code',
         ],
         {
-          cwd: project,
           env: {
             ...process.env,
             MIO_RUN_LIVE_IMAGE: 'yes',
@@ -270,11 +203,9 @@ assert.equal = (...args) => {
       child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
       const [code] = await once(child, 'close');
       expect(code).toBe(1);
-      expect(output).toContain(invalid ? 'LIVE_UNEXPECTED_FAILURE' : 'LIVE_DATABASE_NOT_EMPTY');
+      expect(output.trim()).toBe(invalid ? 'LIVE_UNEXPECTED_FAILURE' : 'LIVE_DATABASE_NOT_EMPTY');
       expect(output).not.toContain('private-sensitive-tail');
-      expect(readFileSync(join(run, 'events.jsonl'), 'utf8')).not.toContain(
-        'private-sensitive-tail',
-      );
+      expect(existsSync(run)).toBe(false);
     }
   } finally {
     rmSync(directory, { recursive: true });

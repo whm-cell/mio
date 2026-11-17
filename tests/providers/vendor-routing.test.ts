@@ -979,14 +979,18 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
               });
               expect(postRes.status, await postRes.clone().text()).toBe(202);
               const { jobId } = (await postRes.json()) as { jobId: string };
-              await vi.waitFor(async () => {
-                const getRes = await fetch(`${httpOrigin}/api/v1/compute/images/${jobId}`, {
-                  headers: { origin: httpOrigin },
-                });
-                const view = (await getRes.json()) as { status: string; assetIds: string[] };
-                expect(view.status).toBe('completed');
-                expect(view.assetIds).toHaveLength(1);
-              });
+              // The outbox polls every second, before worker execution and result persistence.
+              await vi.waitFor(
+                async () => {
+                  const getRes = await fetch(`${httpOrigin}/api/v1/compute/images/${jobId}`, {
+                    headers: { origin: httpOrigin },
+                  });
+                  const view = (await getRes.json()) as { status: string; assetIds: string[] };
+                  expect(view.status).toBe('completed');
+                  expect(view.assetIds).toHaveLength(1);
+                },
+                { timeout: 5_000 },
+              );
             }
             expect(outboundBodies[0]).toMatchObject({
               model: 'custom-gpt-sync',

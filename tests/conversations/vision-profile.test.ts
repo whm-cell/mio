@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
 import sharp from 'sharp';
-import { imageOutputKey } from '@mio/compute-contracts';
+import { imageOutputKey } from '../../src/generations/contracts.ts';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import {
   makeChatRouteFixture,

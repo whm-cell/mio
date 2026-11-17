@@ -33,6 +33,11 @@ import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
+import { readGenerationConfig } from './generations/config.ts';
+import { createGenerationStore } from './generations/store.ts';
+import { createGenerationService } from './generations/service.ts';
+import type { GenerationService } from './generations/service.ts';
+import { createGenerationHandler } from './generations/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
@@ -56,13 +61,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const assetConfig = readAssetConfig();
   const computeConfig = readComputeConfig();
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
-  const imageEnabled = Boolean(process.env.MIO_IMAGE_PUBLIC_KEY && process.env.MIO_IMAGE_KEY_ID);
-  if (Boolean(process.env.MIO_IMAGE_PUBLIC_KEY) !== Boolean(process.env.MIO_IMAGE_KEY_ID))
-    throw new Error('IMAGE_CONFIG: public key and key ID are required together');
-  if (imageEnabled && !/^[A-Za-z0-9_-]{1,64}$/.test(process.env.MIO_IMAGE_KEY_ID!))
-    throw new Error('IMAGE_CONFIG: invalid key ID');
-  if (imageEnabled && (!computeConfig || !providerConfig))
-    throw new Error('IMAGE_CONFIG: compute and providers are required');
+  const generationConfig = readGenerationConfig();
+  const imageEnabled = Boolean(generationConfig);
+  if (generationConfig && (!authConfig || !assetConfig || !providerConfig))
+    throw new Error('GENERATION_CONFIG: authentication, assets and providers are required');
   const handler = createHandler({
     token: process.env[config.tokenEnv] ?? '',
     allowedOrigins: config.allowedOrigins,
@@ -106,6 +108,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }),
     );
     let conversations: ConversationService | undefined;
+    let generations: GenerationService | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
@@ -142,26 +145,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
-    let compute: ReturnType<typeof createComputeService> | undefined;
     if (computeConfig && assetConfig) {
-      const store = await createComputeStore(assetConfig.databaseURL, imageEnabled);
+      const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
       try {
-        const acquired =
-          (compute =
-          ownedCompute =
-            createComputeService(
-              store,
-              createCosStorage(assetConfig),
-              computeConfig,
-              imageEnabled
-                ? {
-                    provider: () => providers,
-                    publicKey: process.env.MIO_IMAGE_PUBLIC_KEY!,
-                    keyId: process.env.MIO_IMAGE_KEY_ID!,
-                  }
-                : undefined,
-            ));
+        const acquired = (ownedCompute = createComputeService(
+          store,
+          createCosStorage(assetConfig),
+          computeConfig,
+        ));
         ctx.effect(() => async () => {
           // Parent/child effects may unload concurrently: drain conversations before closing compute.
           const failures: unknown[] = [];
@@ -203,6 +195,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             failures.push(error);
           }
           try {
+            await generations?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
             await ownedProviders.close();
           } catch (error) {
             failures.push(error);
@@ -218,6 +215,45 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       } catch (error) {
         await ownedProviders.close();
+        throw error;
+      }
+    }
+    if (generationConfig && assetConfig) {
+      const store = await createGenerationStore(assetConfig.databaseURL);
+      let ownedGenerations: GenerationService | undefined;
+      try {
+        const acquired =
+          (generations =
+          ownedGenerations =
+            await createGenerationService(
+              store,
+              createCosStorage(assetConfig),
+              generationConfig,
+              () => providers,
+            ));
+        ctx.effect(() => async () => {
+          const failures: unknown[] = [];
+          try {
+            await conversations?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await acquired.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
+        });
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/images',
+            handler: createGenerationHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await (ownedGenerations ? ownedGenerations.close() : store.close());
         throw error;
       }
     }
@@ -266,7 +302,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           const store = await createConversationStore(conversationConfig.databaseURL);
           try {
             const imageTools =
-              imageEnabled && compute && providers
+              imageEnabled && generations && providers
                 ? {
                     listModels: (actor: { userId: string }) => providers.listImageModels(actor),
                     inspectRoute: (actor: { userId: string }, modelRef: string) =>
@@ -275,10 +311,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                       actor: { userId: string },
                       requestId: string,
                       modelRef: string,
-                      parameters: Parameters<typeof compute.createImage>[3],
-                    ) => compute.createImage(actor, requestId, modelRef, parameters),
+                      parameters: Parameters<GenerationService['createImage']>[3],
+                    ) => generations.createImage(actor, requestId, modelRef, parameters),
                     getImage: (actor: { userId: string }, jobId: string) =>
-                      compute.getImage(actor, jobId),
+                      generations.getImage(actor, jobId),
                   }
                 : undefined;
             const ownedConversations =

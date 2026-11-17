@@ -57,7 +57,7 @@ it('reports an uncertain write without retrying or exposing credentials', async 
   expect(methods.filter((method) => method !== 'GET')).toEqual(['PUT']);
 });
 
-it('idempotently upgrades exact legacy v1 B permissions and provisions image queues without touching existing data', async () => {
+it('preserves retired image resources and only prepares the heavy-media topology', async () => {
   vi.spyOn(ComputeBroker, 'connect').mockResolvedValue({
     close: async () => {},
   } as unknown as ComputeBroker);
@@ -71,15 +71,10 @@ it('idempotently upgrades exact legacy v1 B permissions and provisions image que
     'apply-to': 'queues',
   });
   for (const item of computeTopology('mio-test')) {
-    if (
-      item.path.includes('mio.compute.image.commands') ||
-      (item.body as { routing_key?: string }).routing_key === 'image.v1' ||
-      (item.body as { routing_key?: string }).routing_key === 'image.dead.v1'
-    ) {
-      continue;
-    }
     state.set(item.path, item.method === 'POST' ? [item.body] : item.body);
   }
+  const legacyImageQueue = { messages: 3, durable: true, arguments: { 'x-queue-type': 'quorum' } };
+  state.set('queues/mio-test/mio.compute.image.commands.v1', legacyImageQueue);
   state.set('users/mio-test-a', {
     name: 'mio-test-a',
     has_password: true,
@@ -136,33 +131,9 @@ it('idempotently upgrades exact legacy v1 B permissions and provisions image que
   };
 
   await prepareLocalBroker('test', env);
-  expect(mutations.map((item) => `${item.method} ${item.path}`)).toEqual([
-    'PUT exchanges/mio-test/mio.compute.image.commands.dlx.v1',
-    'PUT queues/mio-test/mio.compute.image.commands.v1',
-    'PUT queues/mio-test/mio.compute.image.commands.dlq.v1',
-    'POST bindings/mio-test/e/mio.compute.commands.v1/q/mio.compute.image.commands.v1',
-    'POST bindings/mio-test/e/mio.compute.image.commands.dlx.v1/q/mio.compute.image.commands.dlq.v1',
-    'PUT permissions/mio-test/mio-test-b',
-  ]);
-  expect(
-    mutations.find((item) => item.path === 'queues/mio-test/mio.compute.image.commands.v1')?.body,
-  ).toEqual({
-    durable: true,
-    auto_delete: false,
-    arguments: {
-      'x-queue-type': 'quorum',
-      'x-delivery-limit': -1,
-      'x-overflow': 'reject-publish',
-      'x-dead-letter-exchange': 'mio.compute.image.commands.dlx.v1',
-      'x-dead-letter-routing-key': 'image.dead.v1',
-      'x-dead-letter-strategy': 'at-least-once',
-    },
-  });
-  expect(mutations.find((item) => item.path === 'permissions/mio-test/mio-test-b')?.body).toEqual({
-    configure: '^$',
-    write: '^mio\\.compute\\.results\\.v1$',
-    read: '^(?:mio\\.compute\\.commands\\.v1|mio\\.compute\\.image\\.commands\\.v1)$',
-  });
+  expect(mutations).toEqual([]);
+  expect(state.get('queues/mio-test/mio.compute.image.commands.v1')).toBe(legacyImageQueue);
+  expect(computeTopology('mio-test').some((entry) => entry.path.includes('image'))).toBe(false);
 
   mutations.length = 0;
   await prepareLocalBroker('test', env);

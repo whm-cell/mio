@@ -8,10 +8,12 @@
 
 已有 schema 3 的 journal 会在实例身份及完整性核对后，在 SQLite 事务内升级到 schema 4；升级中断时继续保留原卷并重新启动，不另建空库。终态结果已持久化且发布确认、未被退回后，本地文件可幂等清理；重投仍从 journal 应答，不重新计算。journal 的 `ack_dispatched` 只表示本地 ACK 调用返回，AMQP 没有该 ACK 的服务端回执；`cleaned` 记录本地文件清理，二者不能证明 broker 已收到 ACK。未知状态继续保留文件。
 
-图片计算与单轨原厂路由已进入 schema 6，B 须单独注入 `MIO_IMAGE_KEY_ID` 和 `MIO_IMAGE_PRIVATE_KEY`，A 只接收同 ID 的公钥；缺 B 密钥时新图片命令明确拒绝，已有已保存结果仍可恢复。视频转码继续在 `mio.compute.commands.v1` 上单并发（`prefetch=1`）串行消费并保留旧队列遗留图片消息兼容；新图片请求、异步查询与物化恢复通过独立消费通道（`prefetch=4`）从 `mio.compute.image.commands.v1` 并发消费，不受视频转码繁忙或定时 `Maintenance` 窗口暂停阻塞，并在处理入口按 `jobId` 做进程内串行互斥（跨 `jobId` 并发 I/O、同 `jobId` 串行访问 SQLite `Journal`）；非法/非图片消息及 `IMAGE_COMMAND_CONFLICT` / `IMAGE_QUERY_UNKNOWN` 冲突毒消息直接死信，单条图片可重试异常仅隔离关闭并有界重开图片通道重排（不中断在途视频转码或其他并发健康图片），唯 `Journal` 故障或连接断开触发全局恢复。提交意图先于唯一一次供应商 POST 持久化，结果未知不重提。物化自动尝试最多三次；耗尽后报告失败并确认原消息，owner 可按[图片恢复入口](../docs/apis/compute.md#post-apiv1computeimagesjobidrecover)在容量允许时恢复原结果，每个恢复 ID 最多尝试一次，不持有供应商 Key 或重新生成。关停或重连前先同步关闭图片消费闸门使晚到消息重回队列，等待全部已接纳在途图片 I/O 与结果发布确认完成后再关闭通道、连接与 journal；无法确认的结果保留 unknown。
+Worker B 仅执行本地重媒体转码，命令通道保持单并发（`prefetch=1`）。云端图片生成、查询及物化恢复已迁至 A 的独立生成服务，不需要向 B 注入 OneLink 凭据或图片 RSA 私钥，也不消费图片专用队列。旧图片消息不能交给新 B 重跑；切换前应按[图片迁移要求](../docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md)排空并对账旧任务、outbox、消息、journal 和部分产物。
+
+既有 journal 的图片历史表和卷保留供只读对账；运行时不再写入或接管这些图片记录。视频的恢复、独占目录和实例身份规则继续生效。
 
 进程启动意图已提交而 PID 尚未持久化时，Worker 会发送 `PROCESS_UNKNOWN` 并停止新计算；重启不能证明旧进程结束。人工应先停止 Worker，核对同一宿主、启动周期和进程命名空间，并通过覆盖该运行环境的进程/隔离运行时记录，确认对应 FFmpeg 及其子进程均已终止。无法确认就保持 HOLD。**只有人工实际完成确认后**，以同一目录及实例身份运行 `node compute/dist/main.js resolve-no-pid <attempt-id> --confirmed-process-terminated '<确认依据>'`；它只接受无 PID 的 unknown 记录，保存依据并持久创建 interrupted 事件。再次启动后有界对账会发布该事件。该操作不会重新执行原 attempt。
 
-上传结果未知时保留原输出、attempted fileId 和 journal；每次图片物化重试使用新的 `index-fileId` 对象键，成功 winner 的键稳定用于下载，未知对象只保留身份供后续只读对账，不能复用或覆盖。视频上传仍按固定 attempt 键和其对账规则处理。连接或读写无进度的 60 秒超时与总预算不同；本地超时不证明远端 PUT 已取消。未知对象内容不符或本地输出缺失时保持待对账，不删除 COS 资产。
+视频上传结果未知时保留原输出和 journal，继续按固定 attempt 键对账。连接或读写无进度的 60 秒超时与总预算不同；本地超时不证明远端 PUT 已取消。视频未知上传恢复通过 GET 流式校验完整内容，未知对象内容不符或本地输出缺失时保持待对账，不删除 COS 资产。
 
-图片成功物化使用本地内容校验和 COS Content-MD5 提交校验，并核对 PUT 与 HEAD 的 ETag、大小及 SHA-256 元数据；HEAD 不重算对象 SHA-256。视频未知上传恢复仍通过 GET 流式校验内容。
+图片产物与恢复目录归属 A，见[图片接口与恢复约定](../docs/apis/compute.md)。

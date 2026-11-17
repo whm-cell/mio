@@ -1,8 +1,8 @@
 import { ApplicationError } from '@mio/foundation/errors';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { IMAGE_DRIVERS, IMAGE_OPERATIONS } from '@mio/compute-contracts';
-import type { ImageOperation, ImageRequestParameters } from '@mio/compute-contracts';
+import { IMAGE_DRIVERS, IMAGE_OPERATIONS } from '../generations/contracts.ts';
+import type { ImageOperation, ImageRequestParameters } from '../generations/contracts.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
 import { defineTool, isPlainJsonRecord, ToolArgsError } from '@deepseek-ai/dsh-tools';

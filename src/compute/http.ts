@@ -1,12 +1,10 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { IMAGE_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import type { AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeError } from './errors.ts';
-import { ProviderError } from '../providers/contracts.ts';
 import type { createComputeService } from './service.ts';
 
 type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;
@@ -33,13 +31,11 @@ export function createComputeHandler(
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       if (url.search) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       const parts = url.pathname.split('/').slice(4);
-      const image = parts[0] === 'images';
-      const create = parts.length === 1 && (parts[0] === 'jobs' || image);
+      const create = parts.length === 1 && parts[0] === 'jobs';
       const id = parts[1];
-      const get = parts.length === 2 && (parts[0] === 'jobs' || image) && id && isUuidV4(id);
-      const recover = parts.length === 3 && image && id && isUuidV4(id) && parts[2] === 'recover';
-      if (!create && !get && !recover) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      const write = create || recover;
+      const get = parts.length === 2 && parts[0] === 'jobs' && id && isUuidV4(id);
+      if (!create && !get) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      const write = create;
       const method = write ? 'POST' : 'GET';
       if (request.method === 'OPTIONS') {
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
@@ -63,39 +59,9 @@ export function createComputeHandler(
       let actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       if (write) {
-        const value = await readJsonBody(request, image ? IMAGE_MAX_MESSAGE_BYTES : 8192);
+        const value = await readJsonBody(request, 8192);
         actor = await identity(headers);
         if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
-        if (recover) {
-          if (Object.keys(value).length)
-            return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-          const result = await service.recoverImage(actor, id!);
-          response
-            .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
-            .end(JSON.stringify(result));
-          return;
-        }
-        if (image) {
-          if (
-            Object.keys(value).length !== 3 ||
-            typeof value.requestId !== 'string' ||
-            typeof value.modelRef !== 'string' ||
-            !value.parameters ||
-            typeof value.parameters !== 'object' ||
-            Array.isArray(value.parameters)
-          )
-            return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-          const result = await service.createImage(
-            actor,
-            value.requestId,
-            value.modelRef,
-            value.parameters as { prompt: string },
-          );
-          response
-            .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
-            .end(JSON.stringify(result));
-          return;
-        }
         if (
           Object.keys(value).length !== 2 ||
           typeof value.requestId !== 'string' ||
@@ -109,17 +75,13 @@ export function createComputeHandler(
           })
           .end(JSON.stringify(result.job));
       } else {
-        const result = image ? await service.getImage(actor, id!) : await service.get(actor, id!);
+        const result = await service.get(actor, id!);
         response
           .writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' })
           .end(JSON.stringify(result));
       }
     } catch (error) {
-      if (
-        error instanceof ComputeError ||
-        error instanceof RequestBodyError ||
-        error instanceof ProviderError
-      )
+      if (error instanceof ComputeError || error instanceof RequestBodyError)
         return fail(error.status, error.code);
       return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_UNAVAILABLE');
     }

@@ -1,6 +1,19 @@
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 
+export const localComputeKeys = [
+  'MIO_LOCAL_RABBITMQ_PORT',
+  'MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT',
+  'MIO_LOCAL_RABBITMQ_PASSWORD',
+  'MIO_LOCAL_RABBITMQ_A_PASSWORD',
+  'MIO_LOCAL_RABBITMQ_B_PASSWORD',
+  'RABBITMQ_URL',
+  'MIO_COMPUTE_BROKER_USER',
+  'MIO_COMPUTE_EXPECTED_RESULT_USER',
+  'MIO_LOCAL_COMPUTE_DIRECTORY',
+  'MIO_LOCAL_COMPUTE_INSTANCE_ID',
+] as const;
+
 export function localComputeSettings(name: 'dev' | 'test') {
   const secret = () => randomBytes(32).toString('hex');
   const port = name === 'dev' ? '56720' : '56721';
@@ -59,6 +72,7 @@ export function localWorkerEnvironment(
   host: NodeJS.ProcessEnv,
   root = resolve('.'),
 ): NodeJS.ProcessEnv {
+  validateLocalComputeSettings(name, values, root);
   if (
     values.MIO_LOCAL_COMPUTE_COS_SECRET_ID &&
     values.MIO_LOCAL_COMPUTE_COS_SECRET_ID === values.MIO_COS_SECRET_ID
@@ -73,7 +87,7 @@ export function localWorkerEnvironment(
     MIO_COMPUTE_DIRECTORY: resolve(root, values.MIO_LOCAL_COMPUTE_DIRECTORY!),
     MIO_COMPUTE_INSTANCE_ID: values.MIO_LOCAL_COMPUTE_INSTANCE_ID,
     ...Object.fromEntries(
-      ['MIO_COS_BUCKET', 'MIO_COS_REGION', 'MIO_IMAGE_KEY_ID', 'MIO_IMAGE_PRIVATE_KEY']
+      ['MIO_COS_BUCKET', 'MIO_COS_REGION']
         .filter((key) => values[key])
         .map((key) => [key, values[key]]),
     ),

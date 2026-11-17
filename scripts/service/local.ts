@@ -103,15 +103,24 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, ['scripts/service/start.ts'], runtime);
     return;
   }
+  if (action === 'generations-preflight' && args.every((arg) => arg === '--probe-cos')) {
+    await run(process.execPath, ['scripts/service/generation-cutover.ts', ...args], {
+      ...values,
+      ...runtime,
+    });
+    return;
+  }
   if (action === 'migrate') {
     const domain = args[0] && args[0] !== '--apply' ? args.shift()! : 'auth';
     if (
-      !['auth', 'conversations', 'providers', 'assets', 'compute'].includes(domain) ||
+      !['auth', 'conversations', 'providers', 'assets', 'compute', 'generations'].includes(
+        domain,
+      ) ||
       args.some((arg) => !['--apply', '--with-conversations'].includes(arg)) ||
       (domain !== 'providers' && args.includes('--with-conversations'))
     )
       throw new Error(
-        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute] [--apply]',
+        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations] [--apply]',
       );
     console.log(`${name}: ${domain} migration ${args.includes('--apply') ? 'apply' : 'preview'}`);
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);
@@ -139,7 +148,7 @@ async function main(name: 'dev' | 'test') {
     return;
   }
   throw new Error(
-    'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, compute init|start, start, migrate, route or check',
+    'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, compute init|start, generations-preflight, start, migrate, route or check',
   );
 }
 

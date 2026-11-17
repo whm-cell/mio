@@ -2,7 +2,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { createHash } from 'node:crypto';
-import { isValidImageAssetObjectKey } from '@mio/compute-contracts';
+import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
 import { AssetError, MAX_ASSET_BYTES, MAX_VISION_SOURCE_BYTES } from './contracts.ts';
 import type { AssetObjectStore, AssetPrincipal, VisionSource } from './contracts.ts';
 import type { AssetRow, AssetStore } from './store.ts';

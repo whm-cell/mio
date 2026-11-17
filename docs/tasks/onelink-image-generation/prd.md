@@ -29,6 +29,8 @@ C0 收口本图片切片的实施范围与调用授权（O1）、以系统 `user
 
 ## 3. C1 实施顺序
 
+当前架构迁移单元按[变更索引](changes/index.md)中的 [A 承接图片生成与持久恢复](changes/image-generation-in-a/change.md)推进：保留已支持的同步、异步、参考图、编辑与受控 Agent 图片工具契约，把图片执行和恢复完整迁到单实例 A；B 专注本地重媒体。下述内容保留既有切片边界，旧接受不代表本次迁移或切换已经完成。
+
 沿[统一生命周期](../../coordination.md#当前任务的生命周期)，本期先落一个可闭环的 GPT `image.edit` 切片：调用方提交本人 `imageAssetId` 和可选 `maskAssetId`，A 按 `user_id` 核对 ready/original 资产并 HEAD 冻结 raw ETag/长度，B 从私有 COS 读取后向 `/v1/images/edits` 发一次 multipart 请求，继续复用现有 journal、unknown、逐输出物化和结果 Asset 绑定。无 mask 的单图 edit 可承接单参考图场景；mask 只接受 PNG。Seedream edit、多参考数组、真正带画布几何的 outpaint、Gemini/Kling/Vidu 异步操作留作后续独立切片。
 
 E2（`reference-outpaint-slice`）落地 owner 资产数组、多参考 multipart 和显式 `metadata.image.geometry` capability gate（上游 `geometry` 未验证前保持关闭，`DESIGN-OVER-001`）；E3（`async-image-slice`）落地显式 async capability 下的协议中立 submit/query/recovery、持久 upstream task ID、有界 query 及 `image-vidu-q2` 真实闭环；`seedream-sync-slice` 覆盖 `doubao-seedream-4.0` 真实同步 OneLink + 私有 COS 闭环与场景化 live 核验入口；`kling-async-image-slice` 覆盖 `kling-image-v1`（精确对应目录成员 `image-kling-v3`，排除 `image-kling-v3-omni`）异步提交/查询/恢复、`kling-async` live 核验与真实 OneLink + 私有 COS 闭环。各切片的已接受状态与范围以[本能力成果](complete/report.md)和对应任务证据为准；目录发现、协议适配和真实验证分别记录。每片仍以当前 Key 显式刷新得到的动态目录和显式 capability 声明为准。

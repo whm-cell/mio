@@ -2,9 +2,9 @@ import {
   IMAGE_OPERATIONS,
   validateImageInputByRoute,
   validateImageRouteConfig,
-} from '@mio/compute-contracts';
-import type { ImageInput, ImageOperation, ImageRouteConfig } from '@mio/compute-contracts';
-import { withPublicHttps } from '../../adapters/public-https.ts';
+} from '../../generations/contracts.ts';
+import type { ImageInput, ImageOperation, ImageRouteConfig } from '../../generations/contracts.ts';
+import { withPublicHttps } from './public-https.ts';
 import { createRoutedKlingImageProtocol } from './kling/index.ts';
 import { submitOpenAiImage } from './openai/index.ts';
 import { ASYNC_TASK_ID, sanitizeAsyncObservation, validBase64 } from './shared/index.ts';
@@ -195,3 +195,15 @@ export function createRoutedImageProtocol(
     },
   };
 }
+
+export type {
+  AsyncImageErrorCategory,
+  AsyncImageObservation,
+  AsyncImageObservationPath,
+  AsyncImageQuery,
+  AsyncImageSubmission,
+  AsyncImageTransport,
+  ImageObservation,
+  ImageSubmission,
+  ReadImage,
+} from './shared/index.ts';

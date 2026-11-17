@@ -1,6 +1,9 @@
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Context } from '@deepseek-ai/cordis';
 import WebServer from '@deepseek-ai/dsh-host-webserver';
@@ -26,6 +29,9 @@ vi.mock('../../src/integrations/cos.ts', () => ({
         etag: `${key.startsWith('mio/raw/') ? 'raw' : 'staging'}-${hash}`,
       };
     },
+    async putImage() {
+      throw new Error('unexpected generation');
+    },
     async copy(source: string, target: string, etag: string) {
       const bytes = cloud.bytes.get(source);
       if (!bytes || `staging-${createHash('sha256').update(bytes).digest('hex')}` !== etag)
@@ -38,6 +44,7 @@ vi.mock('../../src/integrations/cos.ts', () => ({
   }),
 }));
 
+let generationDirectory: string;
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let observer: Pool;
 let ctx: Context;
@@ -103,19 +110,14 @@ beforeAll(async () => {
   vi.stubEnv('MIO_PROVIDERS_DATABASE_URL', database.url);
   vi.stubEnv('MIO_PROVIDERS_MASTER_KEY', randomBytes(32).toString('base64'));
   vi.stubEnv('MIO_PROVIDERS_MASTER_KEY_ID', 'image-plugin-test');
-  vi.stubEnv('MIO_IMAGE_KEY_ID', 'image-plugin-test');
-  vi.stubEnv(
-    'MIO_IMAGE_PUBLIC_KEY',
-    generateKeyPairSync('rsa', {
-      modulusLength: 2048,
-      publicKeyEncoding: { type: 'spki', format: 'pem' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    }).publicKey,
-  );
+  generationDirectory = await mkdtemp(join(tmpdir(), 'mio-plugin-generations-'));
+  vi.stubEnv('MIO_GENERATIONS_ENABLED', 'true');
+  vi.stubEnv('MIO_GENERATIONS_DATA_DIR', generationDirectory);
   for (const file of [
     'scripts/service/migrate-auth.ts',
     'scripts/service/migrate-assets.ts',
     'scripts/service/migrate-compute.ts',
+    'scripts/service/migrate-generations.ts',
     'scripts/service/migrate-providers.ts',
   ]) {
     const result = spawnSync(process.execPath, [file, '--apply'], {
@@ -158,6 +160,7 @@ afterAll(async () => {
     vi.unstubAllEnvs();
     if (observer) await observer.end();
     if (database) await database.close();
+    if (generationDirectory) await rm(generationDirectory, { recursive: true, force: true });
     if (objectServer) await new Promise<void>((resolve) => objectServer.close(() => resolve()));
   }
 }, 30000);
@@ -192,7 +195,7 @@ it('wires image admission to the real provider service without creating a job fo
     expect(await response.json()).toMatchObject({ error: { code: 'PROVIDER_NOT_CONFIGURED' } });
     const counts = await observer.query<{ jobs: number; outbox: number }>(`
       SELECT (SELECT count(*)::int FROM mio_image_jobs) AS jobs,
-             (SELECT count(*)::int FROM mio_image_outbox) AS outbox`);
+             (SELECT count(*)::int FROM mio_image_executions) AS outbox`);
     expect(counts.rows[0]).toEqual({ jobs: 0, outbox: 0 });
     expect(fetchSpy).toHaveBeenCalledTimes(4);
   } finally {

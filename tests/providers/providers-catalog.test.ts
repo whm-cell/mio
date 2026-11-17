@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { expect, it } from 'vitest';
-import { IMAGE_DRIVERS } from '@mio/compute-contracts';
+import { IMAGE_DRIVERS } from '../../src/generations/contracts.ts';
 import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
 import {
   deriveImageCapabilityMetadata,

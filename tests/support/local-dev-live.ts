@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readLocalEnvironment } from '../../scripts/service/local-environment.ts';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
 
-type DevDomain = 'auth' | 'providers' | 'conversations' | 'assets' | 'compute';
+type DevDomain = 'auth' | 'providers' | 'conversations' | 'assets' | 'compute' | 'generations';
 
 type ParsedLiveAuthInput =
   | { kind: 'login'; email: string; password: string; apiKey?: string }
@@ -114,14 +114,28 @@ export async function preparePersistentDevEnvironment(domains: readonly DevDomai
   if (domains.includes('conversations')) {
     runtimeEnv.MIO_CONVERSATIONS_DATABASE_URL ??= authDb;
   }
-  if (domains.includes('assets') || domains.includes('compute')) {
+  if (
+    domains.includes('assets') ||
+    domains.includes('compute') ||
+    domains.includes('generations')
+  ) {
     runtimeEnv.MIO_ASSETS_DATABASE_URL ??= authDb;
   }
   if (domains.includes('compute')) {
     runtimeEnv.MIO_COMPUTE_ENABLED = 'true';
   }
 
-  const ordered: DevDomain[] = ['auth', 'assets', 'compute', 'providers', 'conversations'];
+  if (domains.includes('generations')) {
+    runtimeEnv.MIO_GENERATIONS_DATA_DIR ??= resolve('.runtime/dev/generations');
+  }
+  const ordered: DevDomain[] = [
+    'auth',
+    'assets',
+    'compute',
+    'generations',
+    'providers',
+    'conversations',
+  ];
   for (const domain of ordered) {
     if (!domains.includes(domain)) continue;
     const migration = spawnSync(

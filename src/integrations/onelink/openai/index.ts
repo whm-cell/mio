@@ -1,4 +1,4 @@
-import type { ImageInput, ImageRouteConfig } from '@mio/compute-contracts';
+import type { ImageInput, ImageRouteConfig } from '../../../generations/contracts.ts';
 import {
   extractRequestId,
   extractUsage,

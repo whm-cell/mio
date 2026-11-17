@@ -1,18 +1,21 @@
-import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { createImageDecoder } from '../../src/generations/decode.ts';
+import { registerVendorRoutingCases } from './protocol-fixture.ts';
 import { describe, expect, it, vi } from 'vitest';
 import {
   IMAGE_DRIVERS,
-  parseImageQuery,
-  parseImageResult,
+  isValidImageAssetObjectKey,
   validateImageInputByRoute,
   validateImageRouteConfig,
   type ImageDriver,
   type ImageRouteConfig,
-} from '@mio/compute-contracts';
-import { createRoutedImageProtocol, type ReadImage } from '../src/images.ts';
-import type { withPublicHttps } from '../src/adapters/public-https.ts';
-import { createRoutedKlingImageProtocol } from '../src/providers/onelink/kling/index.ts';
-import { createRoutedViduImageProtocol } from '../src/providers/onelink/vidu/index.ts';
+} from '../../src/generations/contracts.ts';
+import {
+  createRoutedImageProtocol,
+  type ReadImage,
+} from '../../src/integrations/onelink/router.ts';
+import { createRoutedKlingImageProtocol } from '../../src/integrations/onelink/kling/index.ts';
+import { createRoutedViduImageProtocol } from '../../src/integrations/onelink/vidu/index.ts';
 
 type ImageDownload = typeof withPublicHttps;
 
@@ -176,32 +179,6 @@ function testKling(transport: typeof fetch) {
     async (url, signal, consume) =>
       consume(await transport(url, { method: 'GET', redirect: 'error', signal })),
   );
-}
-
-function queryCommand() {
-  return {
-    version: 1 as const,
-    type: 'image.query' as const,
-    messageId: randomUUID(),
-    commandId: randomUUID(),
-    jobId: randomUUID(),
-    ownerId: 'owner',
-    expiresAt: Date.now() + 60_000,
-    profile: 'openai-images' as const,
-    route: GPT_ROUTE,
-    operation: 'generate' as const,
-    input: { ...input, async: true },
-    upstreamTaskId: 'task-1',
-    queryAttempt: 1,
-    credential: {
-      version: 1 as const,
-      keyId: 'key',
-      wrappedKey: 'wrapped',
-      nonce: 'nonce',
-      ciphertext: 'ciphertext',
-      tag: 'tag',
-    },
-  };
 }
 
 describe('Routed vendor image protocols', () => {
@@ -680,47 +657,6 @@ describe('Routed vendor image protocols', () => {
       ),
     ).resolves.toEqual({ state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' });
     expect(cancel).toHaveBeenCalledOnce();
-  });
-
-  it('keeps query credential failures parseable and rejects inconsistent query envelopes', () => {
-    const query = queryCommand();
-    expect(parseImageQuery(query)).toEqual(query);
-    expect(parseImageQuery({ ...query, queryCredential: query.credential })).toEqual({
-      ...query,
-      queryCredential: query.credential,
-    });
-    expect(
-      parseImageResult({
-        version: 1,
-        type: 'image.result',
-        messageId: randomUUID(),
-        commandId: query.commandId,
-        jobId: query.jobId,
-        state: 'failed',
-        outputs: [],
-        errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE',
-        upstreamTaskId: query.upstreamTaskId,
-        queryAttempt: query.queryAttempt,
-      }),
-    ).toMatchObject({ state: 'failed', errorCode: 'IMAGE_CREDENTIAL_UNAVAILABLE' });
-    expect(() =>
-      parseImageQuery({
-        ...query,
-        operation: 'edit',
-      }),
-    ).toThrow('IMAGE_MESSAGE_INVALID');
-    expect(() =>
-      parseImageQuery({
-        ...query,
-        credential: { ...query.credential, keyId: 'x'.repeat(8193) },
-      }),
-    ).toThrow('IMAGE_MESSAGE_INVALID');
-    expect(() =>
-      parseImageQuery({
-        ...query,
-        queryCredential: { ...query.credential, keyId: 'x'.repeat(8193) },
-      }),
-    ).toThrow('IMAGE_MESSAGE_INVALID');
   });
 
   it('dispatches only explicit implemented routes and operations', () => {
@@ -1447,5 +1383,391 @@ describe('Routed vendor image protocols', () => {
       expect(outcome).toEqual(expected);
       expect(transport).toHaveBeenCalledOnce();
     }
+  });
+});
+
+import { isIP } from 'node:net';
+import type { LookupFunction } from 'node:net';
+import {
+  brotliCompressSync,
+  deflateRawSync,
+  deflateSync,
+  gzipSync,
+  zstdCompressSync,
+} from 'node:zlib';
+import { Agent, MockAgent, Response as UndiciResponse } from 'undici';
+import { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
+
+type Dependencies = NonNullable<Parameters<typeof withPublicHttps>[3]>;
+
+function downloadFixture(addresses: { address: string; family: number }[], all = true) {
+  const connected: string[] = [];
+  const resolveAll: NonNullable<Dependencies['resolveAll']> = vi.fn((_host, done) =>
+    done(null, addresses),
+  );
+  const agent = new Agent();
+  let lookup: LookupFunction;
+  const createAgent: NonNullable<Dependencies['createAgent']> = vi.fn((value) => {
+    lookup = value;
+    return agent;
+  });
+  const fetch: NonNullable<Dependencies['fetch']> = vi.fn(async (input, options) => {
+    const host = new URL(String(input)).hostname.replace(/^\[|\]$/g, '');
+    if (isIP(host)) connected.push(host);
+    else
+      await new Promise<void>((resolve, reject) => {
+        lookup(host, { all }, (error, value) => {
+          if (error) return reject(error);
+          connected.push(...(Array.isArray(value) ? value.map((item) => item.address) : [value]));
+          resolve();
+        });
+      });
+    expect(options?.method).toBe('GET');
+    expect(options?.redirect).toBe('error');
+    expect(options?.headers).toBeUndefined();
+    return new UndiciResponse('image');
+  }) as NonNullable<Dependencies['fetch']>;
+  return { resolveAll, createAgent, fetch, agent, connected };
+}
+
+async function downloadBytes(response: Response) {
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      chunks.push(part.value);
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    reader.releaseLock();
+  }
+}
+const downloadText = async (response: Response) => (await downloadBytes(response)).toString();
+
+it('accepts arbitrary public hosts and binds the connection lookup to public addresses only', async () => {
+  const f = downloadFixture([
+    { address: '10.0.0.7', family: 4 },
+    { address: '8.8.8.8', family: 4 },
+    { address: '2606:4700:4700::1111', family: 6 },
+    { address: '::ffff:127.0.0.1', family: 6 },
+  ]);
+  const close = vi.spyOn(f.agent, 'close');
+  expect(
+    await withPublicHttps(
+      new URL('https://new-cdn.example/image'),
+      AbortSignal.timeout(2000),
+      downloadText,
+      f,
+    ),
+  ).toBe('image');
+  expect(f.resolveAll).toHaveBeenCalledOnce();
+  expect(f.connected).toEqual(['8.8.8.8', '2606:4700:4700::1111']);
+  expect(new URL(String(vi.mocked(f.fetch).mock.calls[0]![0])).hostname).toBe('new-cdn.example');
+  expect(close).toHaveBeenCalled();
+  expect(f.agent.closed).toBe(true);
+});
+
+it.each([
+  '127.0.0.1',
+  '10.0.0.1',
+  '100.64.0.1',
+  '169.254.169.254',
+  '192.0.2.1',
+  '::1',
+  '::2',
+  'fc00::1',
+  'fe80::1',
+  '2001:db8::1',
+  '::ffff:127.0.0.1',
+  '64:ff9b::a00:1',
+])('rejects a non-public literal %s before creating a dispatcher', async (address) => {
+  const f = downloadFixture([]);
+  const host = isIP(address) === 6 ? `[${address}]` : address;
+  await expect(
+    withPublicHttps(new URL(`https://${host}/`), AbortSignal.timeout(1000), downloadText, f),
+  ).rejects.toThrow();
+  expect(f.createAgent).not.toHaveBeenCalled();
+  expect(f.fetch).not.toHaveBeenCalled();
+  await f.agent.close();
+});
+
+it('blocks a private DNS answer in a real undici Agent lookup before a connection', async () => {
+  const resolveAll = vi.fn<NonNullable<Dependencies['resolveAll']>>((_host, done) =>
+    done(null, [{ address: '127.0.0.1', family: 4 }]),
+  );
+  await expect(
+    withPublicHttps(new URL('https://rebind.example/'), AbortSignal.timeout(2000), downloadText, {
+      resolveAll,
+    }),
+  ).rejects.toMatchObject({ cause: { code: 'ENOTFOUND' } });
+  expect(resolveAll).toHaveBeenCalledOnce();
+});
+
+it('uses the vetted lookup result instead of resolving a rebinding hostname twice', async () => {
+  const f = downloadFixture([], false);
+  const resolveAll: NonNullable<Dependencies['resolveAll']> = vi
+    .fn()
+    .mockImplementationOnce((_host, done) => done(null, [{ address: '8.8.8.8', family: 4 }]))
+    .mockImplementationOnce((_host, done) => done(null, [{ address: '127.0.0.1', family: 4 }]));
+  expect(
+    await withPublicHttps(
+      new URL('https://rebinding.example/'),
+      AbortSignal.timeout(1000),
+      downloadText,
+      {
+        ...f,
+        resolveAll,
+      },
+    ),
+  ).toBe('image');
+  expect(resolveAll).toHaveBeenCalledOnce();
+  expect(f.connected).toEqual(['8.8.8.8']);
+});
+
+it.each(['8.8.8.8', '::ffff:8.8.8.8', '64:ff9b::808:808'])(
+  'allows a public literal %s without DNS',
+  async (address) => {
+    const f = downloadFixture([]);
+    const host = isIP(address) === 6 ? `[${address}]` : address;
+    expect(
+      await withPublicHttps(
+        new URL(`https://${host}/`),
+        AbortSignal.timeout(1000),
+        downloadText,
+        f,
+      ),
+    ).toBe('image');
+    expect(f.resolveAll).not.toHaveBeenCalled();
+  },
+);
+
+it('rejects redirects without requesting the destination and destroys its agent', async () => {
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  const source = vi.fn(() => ({
+    statusCode: 302,
+    data: '',
+    responseOptions: { headers: { location: 'https://destination.example/' } },
+  }));
+  const destination = vi.fn(() => ({ statusCode: 200, data: 'unexpected' }));
+  agent.get('https://source.example').intercept({ path: '/', method: 'GET' }).reply(source);
+  agent
+    .get('https://destination.example')
+    .intercept({ path: '/', method: 'GET' })
+    .reply(destination);
+  const destroy = vi.spyOn(agent, 'destroy').mockImplementation(() => agent.close());
+  await expect(
+    withPublicHttps(new URL('https://source.example/'), AbortSignal.timeout(1000), downloadText, {
+      createAgent: () => agent,
+    }),
+  ).rejects.toThrow();
+  expect(source).toHaveBeenCalledOnce();
+  expect(destination).not.toHaveBeenCalled();
+  expect(destroy).toHaveBeenCalled();
+});
+
+it('cancels unread response bodies, closes the agent, and destroys it on consumer failure', async () => {
+  const cancel = vi.fn();
+  const response = new UndiciResponse(new ReadableStream<Uint8Array>({ cancel }));
+  const f = downloadFixture([{ address: '8.8.8.8', family: 4 }]);
+  const close = vi.spyOn(f.agent, 'close');
+  const fetch = vi.fn(async () => response) as NonNullable<Dependencies['fetch']>;
+  expect(
+    await withPublicHttps(
+      new URL('https://new-cdn.example/'),
+      AbortSignal.timeout(1000),
+      async () => 42,
+      { ...f, fetch },
+    ),
+  ).toBe(42);
+  expect(cancel).toHaveBeenCalledOnce();
+  expect(close).toHaveBeenCalled();
+  expect(f.agent.closed).toBe(true);
+  const failed = downloadFixture([]);
+  const destroy = vi.spyOn(failed.agent, 'destroy');
+  const failedFetch = vi.fn(async () => new UndiciResponse('image')) as NonNullable<
+    Dependencies['fetch']
+  >;
+  await expect(
+    withPublicHttps(
+      new URL('https://new-cdn.example/'),
+      AbortSignal.timeout(1000),
+      async () => {
+        throw new Error('consumer failed');
+      },
+      { ...failed, fetch: failedFetch },
+    ),
+  ).rejects.toThrow('consumer failed');
+  expect(destroy).toHaveBeenCalled();
+});
+
+it('aborts a real undici request while its DNS lookup is pending', async () => {
+  const controller = new AbortController();
+  let finish: Parameters<NonNullable<Dependencies['resolveAll']>>[1] | undefined;
+  const pending = withPublicHttps(
+    new URL('https://dns-pending.example/'),
+    controller.signal,
+    downloadText,
+    {
+      resolveAll: (_host, done) => {
+        finish = done;
+      },
+    },
+  );
+  await vi.waitFor(() => expect(finish).toBeDefined());
+  controller.abort();
+  finish!(null, [{ address: '127.0.0.1', family: 4 }]);
+  await expect(pending).rejects.toThrow();
+});
+
+it('settles an aborted request even when DNS never calls back', async () => {
+  const pending = withPublicHttps(
+    new URL('https://dns-never.example/'),
+    AbortSignal.timeout(50),
+    downloadText,
+    {
+      resolveAll: () => {},
+    },
+  );
+  const outcome = await Promise.race([
+    pending.then(
+      () => 'unexpected',
+      () => 'aborted',
+    ),
+    new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+  ]);
+  expect(outcome).toBe('aborted');
+});
+
+it.each([
+  ['gzip', gzipSync],
+  ['deflate', deflateSync],
+  ['deflate', deflateRawSync],
+  ['br', brotliCompressSync],
+  ['zstd', zstdCompressSync],
+  ['gzip, br', (value: Buffer) => brotliCompressSync(gzipSync(value))],
+] as const)('retains fetch decoding for %s responses', async (name, compress) => {
+  const original = Buffer.from('image-data'.repeat(10_000));
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  agent
+    .get('https://cdn.example')
+    .intercept({ path: '/', method: 'GET' })
+    .reply(200, compress(original), { headers: { 'content-encoding': name } });
+  const result = await withPublicHttps(
+    new URL('https://cdn.example/'),
+    AbortSignal.timeout(3000),
+    downloadBytes,
+    { createAgent: () => agent },
+  );
+  expect(result).toEqual(original);
+});
+
+describe('owner-scoped image object identities', () => {
+  const jobId = '11111111-1111-4111-8111-111111111111';
+  const attemptId = '22222222-2222-4222-8222-222222222222';
+  const assetId = '33333333-3333-4333-8333-333333333333';
+  const rawId = '44444444-4444-4444-8444-444444444444';
+  it('accepts owner raw and image derived object keys and rejects video derived or mismatched keys', () => {
+    const fileId = '77777777-7777-4777-8777-777777777777';
+    expect(isValidImageAssetObjectKey(assetId, `mio/raw/${assetId}/${rawId}`, 'image/png')).toBe(
+      true,
+    );
+    expect(
+      isValidImageAssetObjectKey(
+        assetId,
+        `mio/derived/${jobId}/images/0-${fileId}.png`,
+        'image/png',
+      ),
+    ).toBe(true);
+    expect(
+      isValidImageAssetObjectKey(
+        assetId,
+        `mio/derived/${jobId}/images/15-${fileId}.jpeg`,
+        'image/jpeg',
+      ),
+    ).toBe(true);
+
+    // Reject video derived key, extension/contentType mismatch, out-of-range index (>15), and wrong raw owner assetId
+    expect(
+      isValidImageAssetObjectKey(
+        assetId,
+        `mio/derived/${jobId}/${attemptId}/result.mp4`,
+        'image/png',
+      ),
+    ).toBe(false);
+    expect(
+      isValidImageAssetObjectKey(
+        assetId,
+        `mio/derived/${jobId}/images/0-${fileId}.png`,
+        'image/jpeg',
+      ),
+    ).toBe(false);
+    expect(
+      isValidImageAssetObjectKey(
+        assetId,
+        `mio/derived/${jobId}/images/16-${fileId}.png`,
+        'image/png',
+      ),
+    ).toBe(false);
+    expect(isValidImageAssetObjectKey(assetId, `mio/raw/${jobId}/${rawId}`, 'image/png')).toBe(
+      false,
+    );
+  });
+});
+
+registerVendorRoutingCases();
+
+function encodedContentImage(format: string, size = '16x16'): Buffer {
+  const encoded = spawnSync(
+    'ffmpeg',
+    [
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      `color=c=blue:s=${size}`,
+      '-frames:v',
+      '1',
+      '-c:v',
+      format,
+      '-f',
+      'image2pipe',
+      'pipe:1',
+    ],
+    { timeout: 10_000, maxBuffer: 1024 * 1024 },
+  );
+  if (encoded.status !== 0) throw new Error(encoded.stderr.toString());
+  return encoded.stdout;
+}
+
+describe('generation image content validation using complete async decoding', () => {
+  const decode = createImageDecoder();
+  it.each([
+    ['png', 'png'],
+    ['mjpeg', 'jpeg'],
+    ['libwebp', 'webp'],
+  ])('accepts decodable %s and rejects a mismatched declared format', async (codec, format) => {
+    const bytes = encodedContentImage(codec);
+    await expect(decode(bytes, format)).resolves.toBeUndefined();
+    await expect(decode(bytes, format === 'png' ? 'jpeg' : 'png')).rejects.toThrow(
+      'IMAGE_OUTPUT_INVALID',
+    );
+  });
+  it('rejects missing image data while preserving the existing image dimension policy', async () => {
+    await expect(decode(Buffer.from('89504e470d0a1a0a', 'hex'), 'png')).rejects.toThrow(
+      'IMAGE_OUTPUT_INVALID',
+    );
+    await expect(decode(encodedContentImage('png', '4096x16'), 'png')).resolves.toBeUndefined();
+  });
+  it('rejects truncated pixels even when the header retains dimensions', async () => {
+    const bytes = encodedContentImage('png', '256x256');
+    await expect(decode(bytes.subarray(0, Math.floor(bytes.length / 2)), 'png')).rejects.toThrow(
+      'IMAGE_OUTPUT_INVALID',
+    );
   });
 });

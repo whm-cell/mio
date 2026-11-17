@@ -101,6 +101,9 @@ importers:
       cos-nodejs-sdk-v5:
         specifier: 3.0.0
         version: 3.0.0
+      ipaddr.js:
+        specifier: 2.5.0
+        version: 2.5.0
       pg:
         specifier: 8.23.1
         version: 8.23.1
@@ -110,6 +113,9 @@ importers:
       tencentcloud-sdk-nodejs-sms:
         specifier: 4.1.306
         version: 4.1.306
+      undici:
+        specifier: 8.11.2
+        version: 8.11.2
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: 4.1.0
@@ -162,12 +168,6 @@ importers:
       cos-nodejs-sdk-v5:
         specifier: 3.0.0
         version: 3.0.0
-      ipaddr.js:
-        specifier: 2.5.0
-        version: 2.5.0
-      undici:
-        specifier: 8.11.2
-        version: 8.11.2
 
   contracts/compute: {}
 

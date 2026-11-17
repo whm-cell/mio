@@ -1,5 +1,5 @@
-import type { ImageInput, ImageRouteConfig } from '@mio/compute-contracts';
-import { withPublicHttps } from '../../../adapters/public-https.ts';
+import type { ImageInput, ImageRouteConfig } from '../../../generations/contracts.ts';
+import { withPublicHttps } from '../public-https.ts';
 import {
   dataUrlFromBytes,
   downloadResultImage,

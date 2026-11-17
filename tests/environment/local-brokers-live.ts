@@ -13,8 +13,6 @@ import {
   COMMAND_EXCHANGE,
   COMMAND_QUEUE,
   COMMAND_ROUTING_KEY,
-  IMAGE_COMMAND_QUEUE,
-  IMAGE_COMMAND_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_QUEUE,
   RESULT_ROUTING_KEY,
@@ -38,13 +36,6 @@ const directions = [
     exchange: COMMAND_EXCHANGE,
     queue: COMMAND_QUEUE,
     routing: COMMAND_ROUTING_KEY,
-  },
-  {
-    sender: 'a',
-    receiver: 'b',
-    exchange: COMMAND_EXCHANGE,
-    queue: IMAGE_COMMAND_QUEUE,
-    routing: IMAGE_COMMAND_ROUTING_KEY,
   },
   {
     sender: 'b',
@@ -101,10 +92,8 @@ async function inspect(env: Environment) {
   });
   for (const queue of [
     COMMAND_QUEUE,
-    IMAGE_COMMAND_QUEUE,
     RESULT_QUEUE,
     'mio.compute.commands.dlq.v1',
-    'mio.compute.image.commands.dlq.v1',
     'mio.compute.results.dlq.v1',
   ]) {
     const state = await read(`queues/mio-${env.name}/${queue}`);
@@ -113,7 +102,7 @@ async function inspect(env: Environment) {
     const args = state.arguments as Record<string, unknown>;
     assert.equal(args['x-delivery-limit'], -1);
     assert.equal(args['x-overflow'], 'reject-publish');
-    if (queue === COMMAND_QUEUE || queue === IMAGE_COMMAND_QUEUE || queue === RESULT_QUEUE)
+    if (queue === COMMAND_QUEUE || queue === RESULT_QUEUE)
       assert.equal(args['x-dead-letter-strategy'], 'at-least-once');
   }
 }
@@ -194,10 +183,8 @@ async function empty(env: Environment) {
   await channel(env, 'admin', async (ch) => {
     for (const queue of [
       COMMAND_QUEUE,
-      IMAGE_COMMAND_QUEUE,
       RESULT_QUEUE,
       'mio.compute.commands.dlq.v1',
-      'mio.compute.image.commands.dlq.v1',
       'mio.compute.results.dlq.v1',
     ]) {
       const state = await ch.checkQueue(queue);
@@ -267,7 +254,7 @@ async function permissions(env: Environment, other: Environment) {
       );
     });
     await channel(env, role, async (ch) => {
-      const wrongDirection = directions[role === 'a' ? 2 : 0];
+      const wrongDirection = directions[role === 'a' ? 1 : 0];
       ch.publish(wrongDirection.exchange, wrongDirection.routing, Buffer.from(runId), {
         persistent: true,
       });

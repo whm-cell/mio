@@ -130,11 +130,11 @@ it('gives B only its own environment identity and rejects a swapped broker or jo
   expect(worker.MIO_COMPUTE_EXPECTED_COMMAND_USER).toBe('mio-test-a');
   expect(worker.MIO_COMPUTE_DIRECTORY).toBe(join(root, '.runtime/test/compute'));
   expect(worker.RABBITMQ_URL).toContain(`mio-test-b:${test.values.MIO_LOCAL_RABBITMQ_B_PASSWORD}@`);
-  expect(test.runtime.MIO_IMAGE_KEY_ID).toBe('test-key');
-  expect(test.runtime.MIO_IMAGE_PUBLIC_KEY).toBe('public-test');
+  expect(test.runtime.MIO_IMAGE_KEY_ID).toBeUndefined();
+  expect(test.runtime.MIO_IMAGE_PUBLIC_KEY).toBeUndefined();
   expect(test.runtime.MIO_IMAGE_PRIVATE_KEY).toBeUndefined();
-  expect(worker.MIO_IMAGE_KEY_ID).toBe('test-key');
-  expect(worker.MIO_IMAGE_PRIVATE_KEY).toBe('private-test');
+  expect(worker.MIO_IMAGE_KEY_ID).toBeUndefined();
+  expect(worker.MIO_IMAGE_PRIVATE_KEY).toBeUndefined();
   expect(worker.MIO_IMAGE_PUBLIC_KEY).toBeUndefined();
   expect(test.runtime.MIO_COS_SECRET_ID).toBe('app-id');
   expect(test.runtime.MIO_COS_SECRET_KEY).toBe('app-key');
@@ -397,3 +397,28 @@ it('requires a scope before reading the test environment and preserves isolated 
     await new Promise<void>((ok) => listener.close(() => ok()));
   }
 }, 30000);
+
+it('runs a generation-only environment without B or RabbitMQ and preserves the recovery directory', async () => {
+  const root = await fixture();
+  const file = join(root, '.env');
+  const current = await readFile(file, 'utf8');
+  const independent = current
+    .split('\n')
+    .filter((line) => !/^(RABBITMQ_|MIO_(LOCAL_RABBITMQ|LOCAL_COMPUTE|COMPUTE)_)/.test(line))
+    .join('\n');
+  await writeFile(
+    file,
+    `${independent}\nMIO_GENERATIONS_ENABLED=true\nMIO_PROVIDERS_MASTER_KEY=provider-master\n`,
+  );
+  const config = await readLocalEnvironment('dev', root, {});
+  expect(config.runtime.MIO_GENERATIONS_ENABLED).toBe('true');
+  expect(config.runtime.MIO_GENERATIONS_DATA_DIR).toBe(join(root, '.runtime/dev/generations'));
+  expect(config.runtime.MIO_PROVIDERS_MASTER_KEY).toBe('provider-master');
+  expect(config.runtime.RABBITMQ_URL).toBeUndefined();
+  expect(config.runtime.MIO_COMPUTE_ENABLED).toBeUndefined();
+  expect(() => localWorkerEnvironment('dev', config.values, config.host, root)).toThrow(
+    'LOCAL_BROKER_SECRET',
+  );
+  await writeFile(file, `${independent}\nMIO_COMPUTE_ENABLED=true\n`);
+  await expect(readLocalEnvironment('dev', root, {})).rejects.toThrow('LOCAL_BROKER_SECRET');
+});

@@ -1,12 +1,12 @@
-import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import COS from 'cos-nodejs-sdk-v5';
-import { ObjectStore } from '../../compute/src/adapters/cos.ts';
+import { createCosStorage } from '../../src/integrations/cos.ts';
+import sharp from 'sharp';
 
-// Explicitly run only with an authorized target bucket and a separate B identity.
+// Explicitly run only with an authorized target bucket and the A generation identity.
 if (process.env.MIO_RUN_IMAGE_UPLOAD_COS_PROBE !== 'yes')
   throw new Error('IMAGE_UPLOAD_COS_PROBE_OPT_IN_REQUIRED');
 const bucket = process.env.MIO_COS_BUCKET;
@@ -53,27 +53,11 @@ const save = () =>
   writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
 
 async function main() {
-  const fixture = spawnSync(
-    'ffmpeg',
-    [
-      '-v',
-      'error',
-      '-f',
-      'lavfi',
-      '-i',
-      'color=c=blue:s=16x16',
-      '-frames:v',
-      '1',
-      '-c:v',
-      'png',
-      '-f',
-      'image2pipe',
-      'pipe:1',
-    ],
-    { timeout: 10000, maxBuffer: 1024 * 1024 },
-  );
-  if (fixture.status !== 0 || !fixture.stdout.length) throw new Error('IMAGE_PROBE_FIXTURE_FAILED');
-  const bytes = fixture.stdout;
+  const bytes = await sharp({
+    create: { width: 16, height: 16, channels: 3, background: '#2477ee' },
+  })
+    .png()
+    .toBuffer();
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   manifest.size = bytes.length;
   manifest.sha256 = sha256;
@@ -83,7 +67,7 @@ async function main() {
     mode: 0o600,
   });
   console.log('IMAGE_UPLOAD_COS_PROBE_MANIFEST=' + manifestPath);
-  const store = new ObjectStore(config);
+  const store = createCosStorage({ ...config, databaseURL: 'postgresql://unused/probe' });
   const cos = new COS({
     SecretId: config.secretId,
     SecretKey: config.secretKey,
@@ -94,7 +78,7 @@ async function main() {
   });
   manifest.goodPut = 'started';
   await save();
-  const result = await store.image(jobId, 0, bytes.toString('base64'), 'png', fileId);
+  const result = await store.putImage!(goodKey, bytes, 'png', sha256, AbortSignal.timeout(60_000));
   if (result.key !== goodKey || result.sizeBytes !== bytes.length || result.sha256 !== sha256)
     throw new Error('IMAGE_PROBE_OUTPUT_MISMATCH');
   manifest.goodPut = 'pass';

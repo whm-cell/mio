@@ -1,65 +1,11 @@
-export {
-  parseImageCommand,
-  parseImageRecovery,
-  parseImageQuery,
-  parseImageResult,
-  imageOutputKey,
-  imageOutputIndex,
-  imageCommandCredentialBinding,
-  imageQueryCredentialBinding,
-  IMAGE_OPERATIONS,
-  IMAGE_GEOMETRY_EDGES,
-  canonicalImageInput,
-} from './images.ts';
-export {
-  IMAGE_DRIVERS,
-  IMAGE_DRIVER_PATH_PREFIX,
-  isImageDriver,
-  isSafeRouteIdentifier,
-  isValidImageAssetObjectKey,
-  isValidImageRoutePath,
-  validateImageRouteConfig,
-  validateImageInputByRoute,
-  canonicalImageRouteConfig,
-} from './image-routes.ts';
-export type {
-  ImageAssetRef,
-  ImageInput,
-  ImageOperation,
-  ImageGeometryEdge,
-  ImageGeometry,
-  ImageRequestParameters,
-  ImageEnvelope,
-  ImageCommandV1,
-  ImageRecoveryCommandV1,
-  ImageQueryCommandV1,
-  ImageResultV1,
-  ImageOutput,
-  ImageErrorCode,
-} from './images.ts';
-export type {
-  ImageDriver,
-  KlingReferenceFormat,
-  ImageRouteAsyncSpec,
-  ImageRouteParamSpec,
-  ImageRouteRequestDefaults,
-  ImageRouteOutputSpec,
-  ImageRouteConfig,
-} from './image-routes.ts';
 /** Shared message v1. The transport authenticates publishers separately from these values. */
 export const COMPUTE_VERSION = 1 as const;
 export const COMPUTE_PROFILE = 'mp4-h264-aac-720p24-v1' as const;
 export const COMPUTE_MAX_MESSAGE_BYTES = 8192;
-export const IMAGE_MAX_MESSAGE_BYTES = 160_000;
 export const COMPUTE_MAX_MEDIA_BYTES = 1024 ** 3;
 export const COMMAND_EXCHANGE = 'mio.compute.commands.v1';
 export const COMMAND_QUEUE = 'mio.compute.commands.v1';
 export const COMMAND_ROUTING_KEY = 'transcode.v1';
-export const IMAGE_COMMAND_QUEUE = 'mio.compute.image.commands.v1';
-export const IMAGE_COMMAND_ROUTING_KEY = 'image.v1';
-export const IMAGE_WORKER_PREFETCH = 4;
-export const IMAGE_USER_QUOTA = 32;
-export const IMAGE_GLOBAL_QUOTA = 1000;
 export const RESULT_EXCHANGE = 'mio.compute.results.v1';
 export const RESULT_QUEUE = 'mio.compute.results.v1';
 export const RESULT_ROUTING_KEY = 'transcode.result.v1';

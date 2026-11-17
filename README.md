@@ -56,7 +56,7 @@ pnpm test tests/integrations/redis.test.ts
 
 ## 本地运行
 
-开发与人工测试使用两套常驻持久化 Docker PostgreSQL 18.6 / Redis 8.2.11 / RabbitMQ 4.4.0。私有 `.env`、`.env.test` 由初始化命令分别生成，已有秘密保留；数据、密钥、Profile、会话和 Worker 目录按环境隔离。完整配置、恢复及自动化回归隔离见[常驻环境](docs/local-environments.md)。
+开发与人工测试使用两套常驻持久化 Docker PostgreSQL 18.6 / Redis 8.2.11 / RabbitMQ 4.4.0。私有 `.env`、`.env.test` 由初始化命令分别生成，已有秘密保留；数据、密钥、Profile、会话、A 图片恢复目录和 Worker 目录按环境隔离。完整配置、恢复及自动化回归隔离见[常驻环境](docs/local-environments.md)。
 
 ```sh
 pnpm env:init
@@ -100,3 +100,5 @@ curl http://127.0.0.1:4311/readyz
 公共协议、需求、源码、测试和检查配置入库；每人的 `.work/` 内容、运行资料 `.runtime/`、凭证 `.env*`、依赖与构建产物忽略。本地开发遵守统一记录协议；公共检查不要求任何成员的私人记录存在。忽略规则不提供备份或清除已跟踪内容，跨人交接需要单独提供代码与必要证据。
 
 升级 DSH 时修改固定版本、审阅公开接口与 Profile 组成差异，再运行完整检查和产物装载。远端 CI/分支保护须在实际接入后单独验证。
+
+图片生成由 A 独立执行：配置 `MIO_GENERATIONS_ENABLED=true` 和 `MIO_GENERATIONS_DATA_DIR`，先迁移 assets，再运行 `pnpm migrate:dev generations --apply`；仍需要 provider master key 与 A 的 COS 读写权限，允许不启用 B 或 RabbitMQ。已有 A/B 图片环境必须先按[图片切换步骤](docs/local-environments.md#图片生成迁移与切换)对账排空，初始化不会自动启用或切换。

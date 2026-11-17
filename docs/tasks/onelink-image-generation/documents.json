@@ -10,6 +10,11 @@
       "identity": "docs/tasks/onelink-image-generation/design.md",
       "kind": "design",
       "path": "docs/tasks/onelink-image-generation/design.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md",
+      "kind": "change",
+      "path": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md"
     }
   ]
 }

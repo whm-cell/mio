@@ -19,6 +19,7 @@
 - **供应商与 OneLink**：`tests/providers/*.test.ts`、`tests/onelink/*.test.ts`；共享模型绑定追查对话消费者，领域要求见[供应商规范](../providers.md)／[OneLink 集成](../integrations/onelink.md)。
 - **对话**：`tests/conversations/*.test.ts`；沿[对话规范](../conversations.md)追查 HTTP、执行引擎、Profile、持久化与恢复。
 - **私有素材与 COS**：`tests/assets/*.test.ts`；资源归属、存储和计算输入的消费者见[素材 API](../apis/assets.md)／[COS 集成](../integrations/cos.md)。
+- **A 图片生成与恢复**：`tests/generations/*.test.ts`、`tests/compute/images*.test.ts`、`tests/compute/image-concurrency.test.ts` 以及对话图片工具回归；供应商协议、独立执行、持久检查点、原始字节、查询边界与无重复生成沿[OneLink 集成](../integrations/onelink.md)／[图片 API](../apis/compute.md)核对。
 - **计算协议、A 服务与 B Worker**：`tests/compute/*.test.ts`、`tests/integrations/rabbitmq-lifecycle.test.ts`、`compute/tests/*.test.ts`；共享协议追查两端，队列、journal、COS 与真实 FFmpeg 条件见[计算协议](../tasks/compute-service/protocol.md)／[Worker 入口](../../compute/README.md)。
 - **本地环境与部署工具**：`tests/environment/*.test.ts`；配置、拓扑、启动和迁移沿[常驻环境](../local-environments.md)核对。
 
@@ -26,18 +27,18 @@
 
 共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。获授权的本地真实业务与模型验收（含 `providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及下述图片 `dev` 模式）默认直接读写[常驻 mio_dev 环境](../local-environments.md#自动化回归与人工数据)并保留数据；发现入口不等于授权执行。
 
-已授权的图片真实闭环默认使用 `dev` 模式直接增量迁移并读写常驻开发环境（认证与供应商使用配置的 `mio_dev`，媒体任务和资产使用实际 `MIO_ASSETS_DATABASE_URL`，可为独立分域库；保留生成的资产、任务与路由）；仅演练强杀在途 Worker 与交换机重复消息重投时才使用 `prepare`/`execute` 隔离空库模式：
+已授权的图片真实闭环使用 `dev` 模式，直接增量迁移并读写常驻开发环境（认证与供应商使用配置的 `mio_dev`，媒体任务和资产使用实际 `MIO_ASSETS_DATABASE_URL`，可为独立分域库），保留生成的资产、任务与路由：
 
 ```sh
 MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] dev <.runtime/run-dir> <login-or-key-file> <task-id>
-MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] prepare <.runtime/run-dir> <infrastructure-dir> <provider-key-file> <task-id>
-MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] execute <.runtime/run-dir> <service-cos-env> <worker-cos-env> <task-id>
 ```
 
-任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`，prepare／execute 核对同一 task ID、`{commit, contractRevision}` 和运行产物摘要；旧私人运行历史只读，不自动恢复。实际执行仍须核对场景、环境、凭据和费用授权。
+入口只启动 A，显式启用图片生成并指定本环境的专属持久目录，不配置 RabbitMQ 或启动 B。旧 `prepare`／`execute` 阶段已退役，调用会拒绝；已有私人原件保持历史身份，不自动恢复或冒充 A 的当前证据。提交意图、落盘与 PG 检查点、COS 故障等恢复边界由 `tests/generations/` 在隔离回归通道注入故障验证。
 
-`dev` 使用已有登录 JSON（`email`、`password`，可选 `apiKey`）可复用账号；若输入原始 Key，则创建保留的专用账号并在本次私有运行目录的 `owner-login.json`（仅文件所有者可读写）保存登录信息，不保存 Key。登录文件包含 `apiKey` 时入口会保存并轮换该账号的供应商凭据；导入与现有声明不同的全局模型路由也会影响其他用户。执行前须核对账号、凭据及现有全局路由，确认这些写入符合本次授权。运行目录和登录文件不得提交或输出。执行者须在整个运行窗口停用其他 A/B 和任务提交者：入口检查六个计算队列、连接、未完成任务、outbox 和 Worker journal，运行中继续检查额外连接和其他在途任务，发现占用即停止，不清队列。检查是快照，不能替代保持独占窗口。
+任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`。入口核对同一 task ID、`{commit, contractRevision}`、干净工作区与实际运行产物摘要；实际执行仍须核对场景、环境、凭据和费用授权。
 
-异步场景只放行与本次实际提交后持久化的上游任务一致的查询，最多八次，查询期限仍以持久化的 600 秒契约和命令期限为准；观察可等待已发起操作的下载与 COS 物化结束，不延长上游查询期限。观察上界按现有查询／下载、逐输出最多三轮图片校验与 COS 超时加 30 秒余量计算；超过上界保留现场并记为未验证，不承诺覆盖任意故障。`dev` 停止 Worker 后重启 A 并检查同一 requestId 的 HTTP 幂等及短暂观察窗口，不代表 MQ 重放；强杀和重复消息重放仍由隔离的 `prepare`／`execute` 验证。未知结果保留原任务身份核对，不自动以新 requestId 重提。
+`dev` 使用已有登录 JSON（`email`、`password`，可选 `apiKey`）可复用账号；若输入原始 Key，则创建保留的专用账号并在本次私有运行目录的 `owner-login.json`（仅文件所有者可读写）保存登录信息，不保存 Key。登录文件包含 `apiKey` 时入口会保存并轮换该账号的供应商凭据；导入与现有声明不同的全局模型路由也会影响其他用户。执行前须核对账号、凭据及现有全局路由，确认这些写入符合本次授权。运行目录和登录文件不得提交或输出。旧链路切换前的任务、消息、journal 与上传身份盘点沿[迁移与切换](../local-environments.md#图片生成迁移与切换)执行；该 live 入口不代替切换预检或旧执行器停机确认。
+
+A 进程内的单次生成 POST 审计保留跨重启标记，不以重新运行或新 requestId 重发未知任务。异步查询只放行与本次提交后 PG 持久化的上游任务身份一致的请求，最多八次，受持久化的 600 秒绝对期限和命令期限约束；观察可等待已发起操作的下载与 COS 物化结束，不延长上游查询期限。超过观察上界保留现场并记为未验证，不承诺覆盖任意故障。完成后重启 A，检查相同 requestId 的 HTTP 幂等、历史与资产下载；这不代表已完成真实强杀、旧 MQ 重放、B 并行资源或生产验收。
 
 在已有任务记录简记目标、差异、所选入口与理由、复用原件及覆盖缺口。区分文件发现、正文展开、实际执行和证据覆盖：局部成功不自动产生完整通过，同候选的简短结论不能替代原件，失败仍保留。复用方法沿[证据协议](../work-records.md#增量验证与同输入复用)，完整验证条件沿[验证协议](../coordination.md#验证与接受)；导航不改变 `pnpm check`、CI 或人工接受。

@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import COS from 'cos-nodejs-sdk-v5';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { AssetError } from '../assets/contracts.ts';
 import type { AssetConfig } from '../assets/config.ts';
@@ -121,6 +122,46 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         signal.removeEventListener('abort', abort);
         stream.destroy();
       }
+    },
+    async putImage(Key, bytes, format, sha256, signal) {
+      signal.throwIfAborted();
+      const body = Buffer.from(bytes);
+      if (
+        !['png', 'jpeg', 'webp'].includes(format) ||
+        createHash('sha256').update(body).digest('hex') !== sha256
+      )
+        throw new Error('IMAGE_OUTPUT_INVALID');
+      const uploaded = await cos.putObject({
+        Bucket,
+        Region,
+        Key,
+        // The SDK cannot retry a consumed stream; reconcile this key before any new PUT.
+        Body: Readable.from(body),
+        ContentLength: body.length,
+        ContentType: 'image/' + format,
+        'x-cos-meta-sha256': sha256,
+        Headers: {
+          'x-cos-forbid-overwrite': 'true',
+          'Content-MD5': createHash('md5').update(body).digest('base64'),
+        },
+      });
+      signal.throwIfAborted();
+      const checked = await cos.headObject({ Bucket, Region, Key });
+      if (
+        !uploaded.ETag ||
+        checked.ETag !== uploaded.ETag ||
+        Number(checked.headers?.['content-length']) !== body.length ||
+        checked.headers?.['x-cos-meta-sha256'] !== sha256
+      )
+        throw new Error('IMAGE_OUTPUT_MISMATCH');
+      signal.throwIfAborted();
+      return {
+        key: Key,
+        sizeBytes: body.length,
+        sha256,
+        etag: uploaded.ETag,
+        contentType: 'image/' + format,
+      };
     },
     async copy(source, target, etag) {
       await cos.putObjectCopy({

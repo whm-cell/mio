@@ -436,13 +436,15 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/assets/schema.ts',
         'src/compute/store.ts',
         'src/compute/schema.ts',
+        'src/generations/store.ts',
+        'src/generations/schema.ts',
       ].includes(file);
       if (
         ((authPackage || specifier.startsWith('@better-auth/')) && !beneath(file, 'src/auth')) ||
         (databasePackage && !beneath(file, 'src/auth') && !businessDatabase)
       )
         errors.push(
-          `AUTH_ADAPTER ${file}: authentication belongs in src/auth; PostgreSQL also permits reviewed conversation/provider/asset store/schema`,
+          `AUTH_ADAPTER ${file}: authentication belongs in src/auth; PostgreSQL also permits reviewed business store/schema adapters`,
         );
       if (file !== 'src/plugin.ts' && !beneath(file, 'src/dsh')) {
         if (

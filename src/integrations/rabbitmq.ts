@@ -4,20 +4,10 @@ import {
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
   COMPUTE_MAX_MESSAGE_BYTES,
-  IMAGE_COMMAND_ROUTING_KEY,
-  IMAGE_WORKER_PREFETCH,
   RESULT_QUEUE,
   parseComputeResultV1,
-  parseImageResult,
 } from '@mio/compute-contracts';
-import type {
-  ComputeCommandV1,
-  ComputeResultV1,
-  ImageCommandV1,
-  ImageQueryCommandV1,
-  ImageRecoveryCommandV1,
-  ImageResultV1,
-} from '@mio/compute-contracts';
+import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 
 async function closeConnection(
   connection: ChannelModel,
@@ -126,7 +116,7 @@ export class ComputeBroker {
         const consumer = await consumerConnection.createChannel();
         consumer.on('error', () => {});
         consumer.once('close', closed);
-        await consumer.prefetch(IMAGE_WORKER_PREFETCH);
+        await consumer.prefetch(4);
         const publisher = await publisherConnection.createConfirmChannel();
         publisher.on('error', () => {});
         publisher.once('close', closed);
@@ -153,9 +143,7 @@ export class ComputeBroker {
     }
   }
 
-  async publish(
-    message: ComputeCommandV1 | ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1,
-  ): Promise<void> {
+  async publish(message: ComputeCommandV1): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
@@ -165,8 +153,7 @@ export class ComputeBroker {
     let onDrain: (() => void) | undefined;
     try {
       let drain: Promise<void> = Promise.resolve();
-      const routingKey =
-        message.type === 'transcode.request' ? COMMAND_ROUTING_KEY : IMAGE_COMMAND_ROUTING_KEY;
+      const routingKey = COMMAND_ROUTING_KEY;
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.publisher.publish(
           COMMAND_EXCHANGE,
@@ -202,7 +189,6 @@ export class ComputeBroker {
   async consume(
     handle: (result: ComputeResultV1) => Promise<void>,
     failed: () => void,
-    imageHandle?: (result: ImageResultV1) => Promise<void>,
   ): Promise<void> {
     await this.consumer.consume(
       RESULT_QUEUE,
@@ -212,7 +198,7 @@ export class ComputeBroker {
           failed();
           return;
         }
-        let result: ComputeResultV1 | ImageResultV1;
+        let result: ComputeResultV1;
         try {
           if (
             message.properties.userId !== this.expectedUserId ||
@@ -223,10 +209,7 @@ export class ComputeBroker {
           const value: unknown = JSON.parse(
             new TextDecoder('utf-8', { fatal: true }).decode(message.content),
           );
-          result =
-            value && typeof value === 'object' && 'type' in value && value.type === 'image.result'
-              ? parseImageResult(value)
-              : parseComputeResultV1(value);
+          result = parseComputeResultV1(value);
           if (message.properties.messageId !== result.messageId)
             throw new Error('RESULT_ID_MISMATCH');
         } catch {
@@ -240,12 +223,7 @@ export class ComputeBroker {
         let shouldFail = false;
         const task = (async () => {
           try {
-            if (result.type === 'image.result') {
-              if (!imageHandle) throw new Error('IMAGE_HANDLER_UNAVAILABLE');
-              await imageHandle(result);
-            } else {
-              await handle(result);
-            }
+            await handle(result);
           } catch (error) {
             if (!this.lifecycle.closed) {
               if ((error as { permanent?: boolean })?.permanent) {

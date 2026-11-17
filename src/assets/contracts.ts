@@ -13,6 +13,13 @@ export interface AssetObjectStore {
   downloadUrl(key: string): string;
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  putImage?(
+    key: string,
+    bytes: Uint8Array,
+    format: string,
+    sha256: string,
+    signal: AbortSignal,
+  ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
   copy(source: string, target: string, etag: string): Promise<void>;
   delete(key: string): Promise<void>;
 }

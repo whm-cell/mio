@@ -1,41 +1,22 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  COMMAND_EXCHANGE,
-  IMAGE_COMMAND_QUEUE,
-  IMAGE_COMMAND_ROUTING_KEY,
-} from '@mio/compute-contracts';
 import { validateModelRouteEntry } from '../../src/providers/onelink/router.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { findFixtureImageRouteConfig } from '../providers/fixtures/onelink-routes-fixture.ts';
-import { createRoutedImageProtocol, defaultRouteAsyncTransport } from '../../compute/src/images.ts';
+import {
+  createRoutedImageProtocol,
+  defaultRouteAsyncTransport,
+} from '../../src/integrations/onelink/router.ts';
 
-const mocks = vi.hoisted(() => ({
-  validateImage: vi.fn(),
-  publish: vi.fn(),
-  confirms: vi.fn(async () => {}),
-  close: vi.fn(async () => {}),
-}));
-vi.mock('../../compute/src/adapters/media.ts', () => ({ validateImage: mocks.validateImage }));
-vi.mock('amqplib', () => ({
-  connect: vi.fn(async () => ({
-    createConfirmChannel: async () => ({ publish: mocks.publish, waitForConfirms: mocks.confirms }),
-    close: mocks.close,
-  })),
+const mocks = vi.hoisted(() => ({ validateImage: vi.fn(async () => {}) }));
+vi.mock('../../src/generations/decode.ts', () => ({
+  createImageDecoder: () => mocks.validateImage,
 }));
 import {
   assetBytes,
@@ -47,7 +28,7 @@ import {
   liveRouteDeclaration,
   matchCompletedOutputs,
   parseLiveInvocation,
-  replay,
+  assertLivePhase,
   selectLiveModel,
   verifyReplayResult,
 } from './live-image-loop.ts';
@@ -166,69 +147,10 @@ describe('offline live scenario preparation', () => {
     expect(existsSync('.runtime/fixture-not-created')).toBe(false);
   });
 
-  it('rejects another task before execute even when both tasks have the same Git candidate', () => {
-    const workspace = realpathSync(auditDirectory());
-    const git = (...args: string[]) => {
-      const result = spawnSync('git', args, { cwd: workspace, encoding: 'utf8' });
-      expect(result.status, result.stderr).toBe(0);
-      return result.stdout.trim();
-    };
-    writeFileSync(join(workspace, '.gitignore'), '.work/\n.runtime/\n');
-    git('init', '-q');
-    git('add', '.gitignore');
-    git(
-      '-c',
-      'user.name=Fixture',
-      '-c',
-      'user.email=fixture@example.test',
-      '-c',
-      'commit.gpgsign=false',
-      '-c',
-      'core.hooksPath=/dev/null',
-      'commit',
-      '-qm',
-      'fixture',
-    );
-    const candidate = { commit: git('rev-parse', 'HEAD'), contractRevision: 0 };
-    for (const taskId of ['first-task', 'second-task']) {
-      const path = join(workspace, '.work', 'tasks', taskId);
-      mkdirSync(path, { recursive: true });
-      writeFileSync(
-        join(path, 'state.json'),
-        JSON.stringify({
-          workspace,
-          plan: { id: taskId },
-          stage: 'C1_EVIDENCE_PENDING',
-          contractRevision: 0,
-          checkpoint: { candidate },
-        }),
-      );
-    }
-    const run = join(workspace, '.runtime', 'fixture');
-    mkdirSync(run, { recursive: true });
-    writeFileSync(join(run, 'state.json'), JSON.stringify({ taskId: 'first-task', candidate }));
-    expect(git('status', '--porcelain')).toBe('');
-    const result = spawnSync(
-      process.execPath,
-      [
-        resolve('tests/compute/live-image-loop.ts'),
-        'execute',
-        run,
-        'unused-a',
-        'unused-b',
-        'second-task',
-      ],
-      {
-        cwd: workspace,
-        encoding: 'utf8',
-        timeout: 10_000,
-        env: { ...process.env, MIO_RUN_LIVE_IMAGE: 'yes' },
-      },
-    );
-    expect(result.status).toBe(1);
-    expect(`${result.stdout}\n${result.stderr}`).toContain('LIVE_TASK_CHANGED');
-    expect(existsSync(join(run, 'execute-started.json'))).toBe(false);
-    expect(existsSync(join(run, 'runtime-config.json'))).toBe(false);
+  it('retires B execution phases before starting any operation', () => {
+    expect(() => assertLivePhase('execute')).toThrow('LIVE_LEGACY_PHASE_RETIRED');
+    expect(() => assertLivePhase('prepare')).toThrow('LIVE_LEGACY_PHASE_RETIRED');
+    expect(() => assertLivePhase('dev')).not.toThrow();
   });
 
   const scenarios = [
@@ -514,25 +436,6 @@ describe('offline live scenario preparation', () => {
     });
     expect(transport).toHaveBeenCalledOnce();
   });
-
-  it('replays on the shared image command routing key', async () => {
-    const command = { messageId: randomUUID(), jobId: randomUUID() } as Parameters<
-      typeof replay
-    >[1];
-    await replay(
-      { a: { RABBITMQ_URL: 'amqp://isolated.invalid', MIO_COMPUTE_BROKER_USER: 'fixture' } },
-      command,
-    );
-    expect(IMAGE_COMMAND_QUEUE).toBe('mio.compute.image.commands.v1');
-    expect(mocks.publish).toHaveBeenCalledWith(
-      COMMAND_EXCHANGE,
-      IMAGE_COMMAND_ROUTING_KEY,
-      expect.any(Buffer),
-      expect.objectContaining({ mandatory: true, persistent: true, messageId: command.messageId }),
-    );
-    expect(IMAGE_COMMAND_ROUTING_KEY).toBe('image.v1');
-    expect(mocks.confirms).toHaveBeenCalledOnce();
-  });
 });
 
 describe('multi-output and owned asset validation', () => {
@@ -792,6 +695,18 @@ describe('multi-output and owned asset validation', () => {
 });
 
 describe('offline network audit interlock', () => {
+  it('does not consume the generation POST budget for A model discovery or local service calls', async () => {
+    const directory = auditDirectory();
+    const transport = vi.fn(async () => Response.json({ data: [] }));
+    await installAudit('gpt-sync', directory, transport as typeof fetch);
+    await fetch('https://api.onelinkai.cloud/v1/models');
+    await fetch('http://127.0.0.1:4310/readyz');
+    expect(existsSync(join(directory, 'supplier-post-started.json'))).toBe(false);
+    await fetch('https://api.onelinkai.cloud/v1/images/generations', { method: 'POST' });
+    expect(transport).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(directory, 'supplier-post-started.json'))).toBe(true);
+  });
+
   const endpoints = [
     ['vidu-async', '/vidu/ent/v2/reference2image'],
     ['kling-async', '/kling/v1/images/generations'],

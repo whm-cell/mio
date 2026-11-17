@@ -1,6 +1,6 @@
-import { isValidImageRoutePath } from '@mio/compute-contracts';
-import type { ImageAssetRef, ImageDriver, ImageInput } from '@mio/compute-contracts';
-import type { withPublicHttps } from '../../../adapters/public-https.ts';
+import { isValidImageRoutePath } from '../../../generations/contracts.ts';
+import type { ImageAssetRef, ImageDriver, ImageInput } from '../../../generations/contracts.ts';
+import type { withPublicHttps } from '../public-https.ts';
 
 const ONELINK_ORIGIN = 'https://api.onelinkai.cloud';
 export const ASYNC_TASK_ID = /^[A-Za-z0-9._:-]{1,256}$/;

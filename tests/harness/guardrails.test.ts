@@ -142,6 +142,10 @@ it.each([
   ['src/compute/schema.ts', 0],
   ['src/compute/service.ts', 1],
   ['src/compute-extra/store.ts', 1],
+  ['src/generations/store.ts', 0],
+  ['src/generations/schema.ts', 0],
+  ['src/generations/service.ts', 1],
+  ['src/generations-extra/store.ts', 1],
 ] as const)(
   'limits business PostgreSQL imports to reviewed conversation/provider adapters: %s',
   async (file, status) => {
@@ -165,6 +169,10 @@ it.each([
   ['src/compute/store.ts', 'database-alias', 'pg', 0],
   ['src/compute/store.ts', 'pg', 'better-auth', 1],
   ['src/compute/service.ts', 'database-alias', 'pg', 1],
+  ['src/generations/store.ts', 'database-alias', 'pg', 0],
+  ['src/generations/schema.ts', 'database-alias', 'pg', 0],
+  ['src/generations/service.ts', 'database-alias', 'pg', 1],
+  ['src/generations/store.ts', 'pg', 'better-auth', 1],
 ] as const)(
   'keeps package identity checks behind database aliases: %s, %s -> %s',
   async (file, alias, target, status) => {
@@ -209,6 +217,30 @@ function check(root: string) {
   );
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
 }
+
+it.each([
+  ['src/generations/files.ts', "export { readFile } from 'fs';", 0],
+  ['src/generations/files.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
+  [
+    'src/generations/files.ts',
+    "export const fs = globalThis['process']['getBuiltinModule']('node:fs');",
+    0,
+  ],
+  ['src/generations/files-extra.ts', "export { readFile } from 'fs/promises';", 1],
+  ['src/generations-extra/files.ts', "export { readFile } from 'node:fs';", 1],
+  ['src/generations/service.ts', "export const fs = process.getBuiltinModule('fs');", 1],
+  ['src/generations/files.ts', "export { spawn } from 'node:child_process';", 1],
+  ['src/generations/files.ts', "export { DatabaseSync } from 'node:sqlite';", 1],
+] as const)(
+  'confines A durable filesystem access to the exact adapter: %s %s',
+  async (file, code, status) => {
+    const root = await fixture({ [file]: code });
+    const result = check(root);
+    expect(result.status, result.output).toBe(status);
+    if (status) expect(result.output).toContain(`RUNTIME_CAPABILITY ${file}`);
+  },
+);
 
 it('builds a self-contained legacy fixture independent of the host project declarations', async () => {
   const root = await fixture({});

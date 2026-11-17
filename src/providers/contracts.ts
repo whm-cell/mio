@@ -4,7 +4,7 @@ import type {
   ImageGeometryEdge,
   ImageOperation,
   ImageRouteConfig,
-} from '@mio/compute-contracts';
+} from '../generations/contracts.ts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
@@ -217,4 +217,15 @@ export interface ImageRuntimeSnapshot {
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
   readonly apiKey: string;
+}
+
+/** Durable admission keeps encrypted provider bytes; only an outbound action opens them. */
+export interface ImageAdmissionSnapshot extends Omit<ImageRuntimeSnapshot, 'apiKey'> {
+  readonly credential: {
+    readonly cipherFormat: number;
+    readonly masterKeyId: string;
+    readonly nonce: string;
+    readonly ciphertext: string;
+    readonly authTag: string;
+  };
 }

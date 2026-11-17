@@ -174,56 +174,13 @@ export class Journal {
           throw error;
         }
       }
+      // The retired image table remains intact for offline cutover reconciliation.
       db.prepare('SELECT job_id, identity, phase, payload FROM image_attempts LIMIT 0').all();
       this.#db = db;
     } catch (error) {
       db.close();
       throw error;
     }
-  }
-
-  image(jobId: string): { identity: string; phase: string; payload: string | null } | null {
-    const row = this.#db
-      .prepare('SELECT identity, phase, payload FROM image_attempts WHERE job_id = ?')
-      .get(jobId);
-    return row
-      ? {
-          identity: String(row.identity),
-          phase: String(row.phase),
-          payload: row.payload === null ? null : String(row.payload),
-        }
-      : null;
-  }
-
-  beginImage(jobId: string, identity: string): boolean {
-    const existing = this.image(jobId);
-    if (existing) {
-      if (existing.identity !== identity) throw new Error('IMAGE_COMMAND_CONFLICT');
-      return false;
-    }
-    this.#db
-      .prepare("INSERT INTO image_attempts VALUES (?, ?, 'submitting', NULL)")
-      .run(jobId, identity);
-    return true;
-  }
-
-  imagePhase(
-    jobId: string,
-    phase:
-      | 'unknown'
-      | 'submitted'
-      | 'processing'
-      | 'returned'
-      | 'materializing'
-      | 'completed'
-      | 'failed'
-      | 'rejected',
-    payload: string | null,
-  ): void {
-    const changed = this.#db
-      .prepare('UPDATE image_attempts SET phase = ?, payload = ? WHERE job_id = ?')
-      .run(phase, payload, jobId);
-    if (changed.changes !== 1) throw new Error('IMAGE_ATTEMPT_MISSING');
   }
 
   close(): void {

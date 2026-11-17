@@ -1,5 +1,7 @@
 # 计算任务协议 v1 与 Worker 恢复边界
 
+本协议当前仅约束 A/B 本地重媒体通信。云端图片执行已迁入 A 的[生成模块](../../../src/generations/service.ts)，其 HTTP、持久恢复与切换沿[图片 HTTP 契约](../../apis/compute.md#post-apiv1computeimages)和[迁移变更](../onelink-image-generation/changes/image-generation-in-a/change.md)。旧图片消息、journal 和密钥仅用于切换前对账，不属于新跨进程协议；历史表和恢复原件不会随代码退役自动清空。
+
 本页是经本期协调审阅的 P3/P4 v1 实施边界；双方以它对齐，改变消息、身份、数据或副作用边界须重新核对。协议冻结不表示源码、云权限、消息或结果已经交付。需求和资源限制见[本期 PRD](prd.md)，服务边界见[设计](design.md)。共享包为 `@mio/compute-contracts`，源码入口为 `contracts/compute/src/index.ts`，构建生成 `dist/index.js` 与 `dist/index.d.ts`；A/B 不导入对方内部模块。
 
 ## 消息与身份
@@ -35,12 +37,9 @@ A 从登录会话取得 owner，按 owner 查询已登记资产；HEAD 该 raw �
 
 succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio/derived/<jobId>/<attemptId>/result.mp4`，`sizeBytes` 为 1 至 1073741824，SHA-256 是小写 64 位十六进制。B 对输出及未知上传恢复的 GET 流式执行同一上限，再持久记录最终文件大小与 SHA-256；PUT 传内容校验及 SHA-256 元数据，完成后 HEAD 获取 derived 对象的实际 ETag。A 在登记前 HEAD 该对象，核对 key、实际长度、ETag 与 SHA-256 元数据，并从本地 job 事实取得 owner。HEAD 核对元数据不等同重新读取并计算全部对象字节。A 不以消息内的 owner 或 URL 决定资源归属。结果资产与 job 终态在同一 PG 事务发布；由既有媒体域作增量迁移，保留原数据。
 
-图片命令使用同一消息边界但采用 `type: "image.request"`；当前首片只实现 GPT `image.edit`，生成仍使用既有 `image.generate` 输入。编辑输入只携带 A 按当前系统 `user_id` 核对并经 COS HEAD 冻结的原始 Asset 快照，不携带字节、公开 URL 或供应商凭据：
-
 ```json
 {
   "version": 1,
-  "type": "image.request",
   "messageId": "<command-id>",
   "jobId": "<job-id>",
   "ownerId": "<system-user-id>",
@@ -62,10 +61,6 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 }
 ```
 
-`image` 或有序 `images[]` 必须是 owner 的 `ready` 图片资产（`original` `mio/raw/<asset-id>/<uuid>` 或已落库图片输出 `derived` `mio/derived/<jobId>/images/<index>-<fileId>.<format>`），`mask` 省略或为同类 owner 资产且为 PNG；outpaint 还携带受 capability gate 约束的像素 geometry。`input.async:true` 只在当前 profile 的显式 async capability 下受理；初次 `image.request` 最多一次，随后由持久化 `image.query` 以 upstream task ID、queryAttempt 和截止时间推进，unknown/failed 不自动重提，HTTP 只返回 submitted/processing/failed 状态。A 只接受本人 `mio/raw/<asset-id>/<uuid>` 或图片 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，并把每个对象实际 ETag/长度写入命令。B 通过私有 COS `If-Match` 读取并按实际文件签名核对，COS 读取失败发生在 journal 提交前时安全重试；读取成功后才进入一次供应商提交。B 将这些引用转成 multipart 的重复 `image` 文件字段和 geometry 字段，绝不把 Asset ID、COS key 或 ETag 透传给供应商。`image.result`、逐输出 COS 物化、unknown 不重发和恢复仍沿本页图片结果规则；本期不新增图片容量策略，但实际处理仍受运行时、存储和传输条件限制。Seedream edit 和真实上游 geometry 验证仍待各自证据；Vidu 与 Kling（`kling-image-v1`）异步适配已实现，真实供应商/COS 和远端 CI 状态以所属成果与任务证据为准。生产性能基准、容量和压测不是本 E3 目标。
-
-`image.query` 的原 `credential` 信封只用于核对提交时 journal 身份；A 首次发布某次 query 前按任务的可信 owner 取得当前 Key，另封装 `queryCredential` 并持久冻结供 B 查询使用；同一消息重投复用该信封，不同 attempt 重新取当前 Key。`queryDeadline` 取 PG 异步截止与原命令有效期较早者；query 信封绑定任务、owner、profile、输入、原命令、上游 task ID、attempt、消息 ID 和截止时间。首次封装与并发轮换并非原子。旧消息允许解析但缺少 `queryCredential` 或 `queryDeadline` 时不访问供应商，返回可对账的 credential unavailable；迟到消息不执行 GET。同一已知任务以更高 queryAttempt 恢复，重复或更旧 attempt 不重复 GET。不能取得当前 Key 或消息超限时保留任务与上游 ID，不重发提交。首次查询尽快执行，处理中的后续查询按有效截止与剩余次数分配，过期后不再派发。
-
 图片结果使用 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，其中 `index` 是原始输出序号、`fileId` 是小写 UUID v4。B 在每次实际 PUT 前把该 fileId 追加到 journal；PUT、超时或进程异常后均不得复用同一对象键，下一次物化必须生成新的 fileId。B 本地校验图片并计算 SHA-256 和 Content-MD5，PUT 以流发送并携带禁止覆盖头；COS 按 Content-MD5 校验提交内容。PUT 必须成功并返回 ETag，随后 HEAD 的长度、SHA-256 元数据及 ETag 须与本次 PUT 一致，成功路径不再 GET 全量内容。HEAD 只核对对象关联和元数据，不代表服务端重新计算 SHA-256；ETag 是对象标识，不当作 MD5。结果携带完整唯一键，A 严格解析 jobId、index、fileId、扩展名和 MIME，并在 PG 中把首个有效键绑定为该输出序号的 owner 资产；旧键保留为可对账孤儿，不覆盖已登记 winner。视频结果仍遵守上一段固定 attempt 键及其禁止覆盖前提；这两类约束不得混用。
 
 ## 路由、回执与状态
@@ -86,7 +81,7 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 
 每个 attempt 在启动 FFmpeg 前持久写 launch intent，并且同一 attempt 最多 spawn 一次。A 最多创建三个 attempt；保守记账可能在 intent 已写但尚未证明 spawn 时消耗一次，不承诺恰好执行三次。`PROCESS_UNKNOWN` 时停止所有新计算 admission，包括新命令和重投，直到确认旧 FFmpeg 已终止，维持单实例并发 1。若 journal 已持久记录 PID，须核对同一宿主、boot 和进程命名空间，并确认该 PID 不存在；PID 仍存在或身份无法核对则继续 HOLD。若崩溃发生在 PID 落盘前，只能由可证明覆盖该进程的隔离运行时记录或人工核实；worker 或容器重启自身不能当作进程已结束的证明。确认后才能报告 interrupted，由 A 决定是否创建下一个 attempt。
 
-每个视频 attempt 使用上述固定 derived 键。B 先持久化输出文件、长度和 SHA-256，再发带禁止覆盖头的 PUT；成功或结果未知后均 HEAD 同一键。上传结果未知且对象存在时 GET 同一键、流式重算 SHA-256 和长度再认领；不存在时仅用已持久输出重传同一键。同一进程中若 SDK PUT 因本地等待超时而仍未结束，对账须等待该请求真正结束，不能同时再次查询或写同一键；进程崩溃后只能按同键和摘要重新核验，不能声称旧请求已取消。对象内容不匹配、旧进程仍可能写入或本地输出丢失时保持 unknown，不无条件重新计算或更换键。unknown 事件持久并确认发布后可以 ACK 命令，但 journal 和必要本地文件必须保留；B 启动及有界定时对账可继续同一 attempt，解决后发布新的稳定事件，不能依赖已 ACK 消息再次投递。对账与命令重投共用 journal 排他控制，每次最多处理一个 attempt，定时扫描和失败退避须有界，不能并发对同一键恢复。图片物化沿上一段唯一 fileId 规则执行；未确定写入的 attempted fileId 留在 journal 供只读 HEAD/GET 对账，重试仅创建新键。
+每个视频 attempt 使用上述固定 derived 键。B 先持久化输出文件、长度和 SHA-256，再发带禁止覆盖头的 PUT；成功或结果未知后均 HEAD 同一键。上传结果未知且对象存在时 GET 同一键、流式重算 SHA-256 和长度再认领；不存在时仅用已持久输出重传同一键。同一进程中若 SDK PUT 因本地等待超时而仍未结束，对账须等待该请求真正结束，不能同时再次查询或写同一键；进程崩溃后只能按同键和摘要重新核验，不能声称旧请求已取消。对象内容不匹配、旧进程仍可能写入或本地输出丢失时保持 unknown，不无条件重新计算或更换键。unknown 事件持久并确认发布后可以 ACK 命令，但 journal 和必要本地文件必须保留；B 启动及有界定时对账可继续同一 attempt，解决后发布新的稳定事件，不能依赖已 ACK 消息再次投递。对账与命令重投共用 journal 排他控制，每次最多处理一个 attempt，定时扫描和失败退避须有界，不能并发对同一键恢复。
 
 定期对账可持续较长时间，因此 B 开始对账前同步关闭新命令入场、排空已接纳的 handler，再关闭该次 consumer channel；不能让已投递的新命令在对账锁后等待而消耗其 ACK 期限。关门后迟到的投递不进入 Worker、不创建 attempt 或启动计算，也不 ACK；关闭该旧 channel 后由 broker 重排。旧 channel 的迟到回调不得在新 channel 上应答或误触发重连。publisher 使用独立连接及 channel；对账结束且进场条件满足后新建 consumer channel 并重新订阅。存在 `PROCESS_UNKNOWN` 或磁盘背压时继续暂停订阅，直到相应条件恢复。
 

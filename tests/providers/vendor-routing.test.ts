@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -7,28 +7,15 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Pool } from 'pg';
+import sharp from 'sharp';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type {
-  ImageCommandV1,
-  ImageQueryCommandV1,
-  ImageRecoveryCommandV1,
-  ImageResultV1,
-} from '@mio/compute-contracts';
-import {
-  imageCommandCredentialBinding,
-  imageOutputKey,
-  parseImageCommand,
-  parseImageQuery,
-  parseImageRecovery,
-  parseImageResult,
-  validateImageRouteConfig,
-} from '@mio/compute-contracts';
+import { validateImageRouteConfig } from '../../src/generations/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
-import { createComputeHandler } from '../../src/compute/http.ts';
-import { sealImageKey } from '../../src/compute/image-credentials.ts';
-import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
-import { createComputeService } from '../../src/compute/service.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
+import { createGenerationHandler } from '../../src/generations/http.ts';
+import { checkGenerationSchema, generationSchemaSQL } from '../../src/generations/schema.ts';
+import { createGenerationService } from '../../src/generations/service.ts';
+import { createGenerationStore, GenerationStore } from '../../src/generations/store.ts';
+import type { GenerationObjects } from '../../src/generations/execution.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { createConversationService } from '../../src/conversations/service.ts';
 import { createConversationStore } from '../../src/conversations/store.ts';
@@ -38,8 +25,6 @@ import type { ModelRouteInput, ProviderPrincipal } from '../../src/providers/con
 import { checkProviderSchema, providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
-import { Journal } from '../../compute/src/adapters/journal.ts';
-import { createImageWorker } from '../../compute/src/image-worker.ts';
 import { protocolResponse } from '../onelink/fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
@@ -49,34 +34,6 @@ import {
   importRoutesViaCli,
   ONELINK_FIXTURE_ROUTES,
 } from './fixtures/onelink-routes-fixture.ts';
-
-const bus = vi.hoisted(() => ({
-  receive: undefined as undefined | ((r: ImageResultV1) => Promise<void>),
-  execute: undefined as
-    | undefined
-    | ((c: ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1) => Promise<void>),
-}));
-vi.mock('../../src/integrations/rabbitmq.ts', () => ({
-  ComputeBroker: {
-    connect: async () => ({
-      onClose() {},
-      async close() {},
-      async consume(_handle: unknown, _failed: unknown, images: typeof bus.receive) {
-        bus.receive = images;
-      },
-      async publish(command: ImageCommandV1 | ImageQueryCommandV1 | ImageRecoveryCommandV1) {
-        const cloned = JSON.parse(JSON.stringify(command));
-        await bus.execute!(
-          command.type === 'image.recover'
-            ? parseImageRecovery(cloned)
-            : command.type === 'image.query'
-              ? parseImageQuery(cloned)
-              : parseImageCommand(cloned),
-        );
-      },
-    }),
-  },
-}));
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -105,6 +62,44 @@ function encodeSampleJpeg(): Uint8Array {
 }
 
 const JPEG_BYTES = encodeSampleJpeg();
+const PNG_BYTES = await sharp(JPEG_BYTES).png().toBuffer();
+
+function generationObjects(
+  objects: Map<string, { size: number; etag: string; sha256: string }>,
+): GenerationObjects {
+  return {
+    uploadUrl: () => '',
+    downloadUrl: () => '',
+    copy: async () => {},
+    delete: async () => {},
+    head: async (key) => {
+      const value = objects.get(key);
+      if (!value) throw Object.assign(new Error('OBJECT_NOT_FOUND'), { statusCode: 404 });
+      return value;
+    },
+    readImage: async (key, etag, size) => {
+      const value = objects.get(key);
+      if (!value || value.etag !== etag || value.size !== size)
+        throw new Error('REFERENCE_MISMATCH');
+      return JPEG_BYTES;
+    },
+    putImage: async (key, bytes, format, sha256) => {
+      const digest = createHash('sha256').update(bytes).digest('hex');
+      expect(sha256).toBe(digest);
+      expect(Buffer.from(bytes)).toEqual(Buffer.from(format === 'png' ? PNG_BYTES : JPEG_BYTES));
+      if (objects.has(key)) throw new Error('OBJECT_OVERWRITE');
+      const meta = { size: bytes.byteLength, etag: 'etag-derived', sha256: digest };
+      objects.set(key, meta);
+      return {
+        key,
+        sizeBytes: meta.size,
+        etag: meta.etag,
+        sha256: digest,
+        contentType: 'image/' + format,
+      };
+    },
+  };
+}
 
 function providerEnv(databaseURL: string, masterKey: Buffer) {
   return {
@@ -425,11 +420,10 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
 
         await pool.query(conversationSchemaSQL);
         await pool.query(assetSchemaSQL);
-        await pool.query(computeSchemaSQL);
+        await pool.query(generationSchemaSQL);
 
         const dshRoot = await mkdtemp(join(tmpdir(), 'mio-vr-dsh-'));
-        const journalDir = mkdtempSync(join(tmpdir(), 'mio-vr-journal-'));
-        const journal = new Journal(journalDir, randomUUID(), true);
+        const generationDir = mkdtempSync(join(tmpdir(), 'mio-vr-generations-'));
         const ctx = await kernelRuntime(dshRoot, new ScriptedModel([]));
         const store = await createProviderStore(config);
         const providerService = createProviderService(store, config, async () =>
@@ -443,11 +437,6 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
 
         const chatOutbound: Record<string, unknown>[] = [];
 
-        const rsa = generateKeyPairSync('rsa', {
-          modulusLength: 2048,
-          publicKeyEncoding: { type: 'spki', format: 'pem' },
-          privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-        });
         const objects = new Map<string, { size: number; etag: string; sha256: string }>();
         const imageOutbound: Record<string, unknown>[] = [];
         const imageTransport = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
@@ -455,66 +444,20 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           const b64 = Buffer.from(JPEG_BYTES).toString('base64');
           return Response.json({ data: [{ b64_json: b64 }, { b64_json: b64 }] });
         });
-        const worker = createImageWorker(
-          journal,
-          'k1',
-          rsa.privateKey,
-          async (job, index, base64, format, fileId) => {
-            const bytes = Buffer.from(base64, 'base64');
-            const key = imageOutputKey(job, index, fileId, format as 'jpeg');
-            const meta = {
-              size: bytes.byteLength,
-              etag: 'etag-derived',
-              sha256: createHash('sha256').update(bytes).digest('hex'),
-            };
-            objects.set(key, meta);
-            return {
-              key,
-              sizeBytes: meta.size,
-              etag: meta.etag,
-              sha256: meta.sha256,
-              contentType: `image/${format}`,
-            };
-          },
-          imageTransport,
-        );
-        bus.execute = async (command) => {
-          if (command.type === 'image.recover') return;
-          let outcome = await worker(command);
-          while (outcome.state === 'materializing') outcome = await worker(command);
-          await bus.receive!(
-            parseImageResult({
-              version: 1,
-              type: 'image.result',
-              messageId: randomUUID(),
-              commandId: command.type === 'image.query' ? command.commandId : command.messageId,
-              jobId: command.jobId,
-              state: outcome.state,
-              outputs: 'outputs' in outcome ? outcome.outputs : [],
-              ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
-            }),
-          );
-        };
-        const computePool = new Pool({ connectionString: databaseURL });
-        const computeStore = new ComputeStore(computePool, true);
-        const computeService = createComputeService(
-          computeStore,
-          {
-            head: async (key: string) => objects.get(key)!,
-            uploadUrl: () => '',
-            downloadUrl: () => '',
-            copy: async () => {},
-            delete: async () => {},
-          },
-          { brokerURL: 'amqp://localhost', brokerUser: 'a', expectedResultUser: 'b' },
-          { keyId: 'k1', publicKey: rsa.publicKey, provider: () => providerService },
+        const generationStore = await createGenerationStore(databaseURL);
+        const generationService = await createGenerationService(
+          generationStore,
+          generationObjects(objects),
+          { dataDirectory: generationDir },
+          () => providerService,
+          { transport: imageTransport },
         );
         const actor: ProviderPrincipal = { userId: 'user-zero-ts', sessionId: 'sess-zero-ts' };
         let httpOrigin = '';
         const server = createServer(
           (req, res) =>
-            void createComputeHandler(
-              computeService,
+            void createGenerationHandler(
+              generationService,
               async () => ({ userId: actor.userId, sessionId: actor.sessionId }),
               [httpOrigin],
             )(req, res),
@@ -536,7 +479,6 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         });
 
         try {
-          await vi.waitFor(() => expect(bus.receive).toBeDefined());
           await providerService.save(actor, 0, 'sk-zero-ts-key-12345');
           const afterSave = (await providerService.get(actor))!;
           await providerService.settings(actor, afterSave.revision, {
@@ -603,29 +545,23 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           ).toBe('verified');
         } finally {
           server.close();
-          await computeService.close();
+          await generationService.close();
           await convService.close();
           await engine.close();
           await convStore.close();
           await providerService.close();
           await store.close();
           await ctx.fiber.dispose();
-          journal.close();
-          rmSync(journalDir, { recursive: true });
+          rmSync(generationDir, { recursive: true });
           await rm(dshRoot, { recursive: true, force: true });
         }
       }),
     45_000,
   );
 
-  it('Scenario 5: upgrades legacy provider adaptations non-destructively and fails closed when async jobs lack a valid route_snapshot', async () => {
+  it('Scenario 5: upgrades provider adaptations and image schema without taking over legacy image jobs', async () => {
     const database = await authDatabase();
     const pool = new Pool({ connectionString: database.url });
-    const rsa = generateKeyPairSync('rsa', {
-      modulusLength: 2048,
-      publicKeyEncoding: { type: 'spki', format: 'pem' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    });
     try {
       await pool.query(providerSchemaSQL);
       // Simulate pre-existing legacy mio_provider_model_adaptations + adaptation_origin column
@@ -675,7 +611,10 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
       );
 
       await pool.query(assetSchemaSQL);
-      await pool.query(computeSchemaSQL);
+      await pool.query(generationSchemaSQL);
+      await pool.query(`CREATE TABLE mio_image_outbox (
+        job_id uuid PRIMARY KEY REFERENCES mio_image_jobs(id), sent_at timestamptz
+      )`);
       await pool.query('ALTER TABLE mio_image_jobs DROP COLUMN route_snapshot');
 
       const klingRoute = findFixtureImageRouteConfig('image-kling-v3');
@@ -691,18 +630,20 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         route: klingRoute,
         input: { model: 'image-kling-v3', prompt: 'missing snapshot test', async: true },
       };
-      const cmd: ImageCommandV1 = {
+      const cmd = {
         ...commandBase,
-        credential: sealImageKey(
-          'legacy-sk-123',
-          imageCommandCredentialBinding(commandBase),
-          'k1',
-          rsa.publicKey,
-        ),
+        credential: {
+          version: 1,
+          keyId: 'legacy',
+          wrappedKey: 'retained-encrypted-key',
+          nonce: 'retained-nonce',
+          ciphertext: 'retained-ciphertext',
+          tag: 'retained-tag',
+        },
       };
       await pool.query(
         `INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,admitted,state,query_attempt,async_max_queries,async_deadline)
-           VALUES($1,$2,$3,'legacy-hash',$4::jsonb,'{}'::jsonb,'accepted',0,6,now() + interval '5 minutes')`,
+           VALUES($1,$2,$3,'legacy-hash',$4::jsonb,'{}'::jsonb,'processing',0,6,now() + interval '5 minutes')`,
         [jobId, ownerId, randomUUID(), JSON.stringify(cmd)],
       );
       await pool.query(`INSERT INTO mio_image_outbox(job_id,sent_at) VALUES($1,now())`, [jobId]);
@@ -730,9 +671,9 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
 
       // Run incremental schema migrations on top of legacy state
       await pool.query(providerSchemaSQL);
-      await pool.query(computeSchemaSQL);
+      await pool.query(generationSchemaSQL);
       await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
-      await expect(checkComputeSchema(pool, true)).resolves.toBeUndefined();
+      await expect(checkGenerationSchema(pool)).resolves.toBeUndefined();
 
       // Legacy table is preserved non-destructively; matching chat row migrated; unmapped legacy profile skipped
       expect(
@@ -753,42 +694,35 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         },
       ]);
 
-      // Unsent legacy image.request and in-flight image.query with NULL route_snapshot both fail closed cleanly
-      const computePool = new Pool({ connectionString: database.url });
-      const computeStore = new ComputeStore(computePool, true);
+      // These rows predate A executions. A must preserve their state, encrypted
+      // command and outbox for operator reconciliation, with no new provider call.
+      const legacyCommands = await pool.query(
+        'SELECT id,state,command FROM mio_image_jobs ORDER BY id',
+      );
+      const generationStore = new GenerationStore(new Pool({ connectionString: database.url }));
       try {
-        // First drain the unsent legacy image.request -> rejected / IMAGE_HANDLER_UNAVAILABLE, credential stripped, outbox marked sent
-        expect(await computeStore.imagePending()).toBeUndefined();
-        const rejectedJob = await computeStore.imageGet(ownerId, unsentLegacyJobId);
-        expect(rejectedJob.status).toBe('rejected');
-        expect(rejectedJob.errorCode).toBe('IMAGE_HANDLER_UNAVAILABLE');
-        const strippedCmd = (
-          await pool.query<{ has_cred: boolean; sent_at: string | null }>(
-            "SELECT (j.command ? 'credential') AS has_cred, o.sent_at FROM mio_image_jobs j JOIN mio_image_outbox o ON o.job_id=j.id WHERE j.id=$1",
-            [unsentLegacyJobId],
-          )
-        ).rows[0]!;
-        expect(strippedCmd.has_cred).toBe(false);
-        expect(strippedCmd.sent_at).not.toBeNull();
-
-        await computeStore.imageAccept({
-          version: 1,
-          type: 'image.result',
-          messageId: randomUUID(),
-          commandId: cmd.messageId,
-          jobId,
-          state: 'submitted',
-          upstreamTaskId: 'task_null_snap',
-          queryAttempt: 0,
-          outputs: [],
-        });
-        const pending = await computeStore.imagePending();
-        expect(pending).toBeUndefined();
-        const failedJob = await computeStore.imageGet(ownerId, jobId);
-        expect(failedJob.status).toBe('failed');
-        expect(failedJob.errorCode).toBe('IMAGE_QUERY_FAILED');
+        await generationStore.startExecutor(() => {});
+        expect(await generationStore.claim()).toBeUndefined();
+        expect((await generationStore.imageGet(ownerId, unsentLegacyJobId)).status).toBe(
+          'accepted',
+        );
+        expect((await generationStore.imageGet(ownerId, jobId)).status).toBe('processing');
+        expect(
+          (await pool.query('SELECT id,state,command FROM mio_image_jobs ORDER BY id')).rows,
+        ).toEqual(legacyCommands.rows);
+        expect(
+          (await pool.query('SELECT count(*)::int AS count FROM mio_image_executions')).rows[0]
+            .count,
+        ).toBe(0);
+        expect(
+          (
+            await pool.query('SELECT sent_at FROM mio_image_outbox WHERE job_id=$1', [
+              unsentLegacyJobId,
+            ])
+          ).rows[0].sent_at,
+        ).toBeNull();
       } finally {
-        await computeStore.close();
+        await generationStore.close();
       }
     } finally {
       await pool.end();
@@ -797,19 +731,13 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
   }, 45_000);
 
   it(
-    'admits explicit DB routes across openai-images (minimal generate-only) and volcengine-ark-images (references, omitted defaultSize) end-to-end through ComputeService',
+    'admits explicit DB routes across openai-images (minimal generate-only) and volcengine-ark-images (references, omitted defaultSize) end-to-end through GenerationService',
     async () =>
       withProviderDb(async ({ pool, config, databaseURL }) => {
         await pool.query(assetSchemaSQL);
-        await pool.query(computeSchemaSQL);
+        await pool.query(generationSchemaSQL);
 
-        const journalDir = mkdtempSync(join(tmpdir(), 'mio-routed-multi-'));
-        const journal = new Journal(journalDir, randomUUID(), true);
-        const rsa = generateKeyPairSync('rsa', {
-          modulusLength: 2048,
-          publicKeyEncoding: { type: 'spki', format: 'pem' },
-          privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-        });
+        const generationDir = mkdtempSync(join(tmpdir(), 'mio-routed-multi-'));
         const store = await createProviderStore(config, true);
         const providerService = createProviderService(store, config, async () =>
           Response.json({
@@ -818,57 +746,15 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         );
         const objects = new Map<string, { size: number; etag: string; sha256: string }>();
         const outboundBodies: Record<string, unknown>[] = [];
-        const worker = createImageWorker(
-          journal,
-          'k1',
-          rsa.privateKey,
-          async (job, index, base64, format, fileId) => {
-            const bytes = Buffer.from(base64, 'base64');
-            const key = imageOutputKey(job, index, fileId, format as 'jpeg');
-            const meta = {
-              size: bytes.byteLength,
-              etag: 'etag-out',
-              sha256: createHash('sha256').update(bytes).digest('hex'),
-            };
-            objects.set(key, meta);
-            return {
-              key,
-              sizeBytes: meta.size,
-              etag: meta.etag,
-              sha256: meta.sha256,
-              contentType: `image/${format}`,
-            };
-          },
-          async (_url, init) => {
-            outboundBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-            return Response.json({
-              data: [{ b64_json: Buffer.from(JPEG_BYTES).toString('base64') }],
-            });
-          },
-          async () => JPEG_BYTES,
-        );
-
-        let computeService: ReturnType<typeof createComputeService> | undefined;
-        bus.receive = undefined;
-        bus.execute = async (command) => {
-          if (command.type === 'image.recover') return;
-          let outcome = await worker(command);
-          while (outcome.state === 'materializing') outcome = await worker(command);
-          await bus.receive!(
-            parseImageResult({
-              version: 1,
-              type: 'image.result',
-              messageId: randomUUID(),
-              commandId: command.type === 'image.query' ? command.commandId : command.messageId,
-              jobId: command.jobId,
-              state: outcome.state,
-              outputs: 'outputs' in outcome ? outcome.outputs : [],
-              ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
-            }),
-          );
+        const imageTransport: typeof fetch = async (url, init) => {
+          outboundBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          const bytes = String(url).includes('/v1/images/generations') ? PNG_BYTES : JPEG_BYTES;
+          return Response.json({
+            data: [{ b64_json: Buffer.from(bytes).toString('base64') }],
+          });
         };
-        const computePool = new Pool({ connectionString: databaseURL });
-        const computeStore = new ComputeStore(computePool, true);
+        let generationService: Awaited<ReturnType<typeof createGenerationService>> | undefined;
+        const generationStore = await createGenerationStore(databaseURL);
 
         try {
           const actor: ProviderPrincipal = { userId: 'owner-routed-1', sessionId: 'sess-routed-1' };
@@ -911,19 +797,13 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             },
           ]);
 
-          computeService = createComputeService(
-            computeStore,
-            {
-              head: async (key: string) => objects.get(key)!,
-              uploadUrl: () => '',
-              downloadUrl: () => '',
-              copy: async () => {},
-              delete: async () => {},
-            },
-            { brokerURL: 'amqp://localhost', brokerUser: 'a', expectedResultUser: 'b' },
-            { keyId: 'k1', publicKey: rsa.publicKey, provider: () => providerService },
+          generationService = await createGenerationService(
+            generationStore,
+            generationObjects(objects),
+            { dataDirectory: generationDir },
+            () => providerService,
+            { transport: imageTransport },
           );
-          await vi.waitFor(() => expect(bus.receive).toBeDefined());
 
           await providerService.save(actor, 0, 'sk-owner-routed-key');
           await providerService.discover(actor);
@@ -944,8 +824,8 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           let httpOrigin = '';
           const server = createServer(
             (req, res) =>
-              void createComputeHandler(
-                computeService!,
+              void createGenerationHandler(
+                generationService!,
                 async () => ({ userId: actor.userId, sessionId: actor.sessionId }),
                 [httpOrigin],
               )(req, res),
@@ -979,7 +859,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
               });
               expect(postRes.status, await postRes.clone().text()).toBe(202);
               const { jobId } = (await postRes.json()) as { jobId: string };
-              // The outbox polls every second, before worker execution and result persistence.
+              // The A executor runs after admission and commits owner-scoped assets.
               await vi.waitFor(
                 async () => {
                   const getRes = await fetch(`${httpOrigin}/api/v1/compute/images/${jobId}`, {
@@ -1006,12 +886,11 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             server.close();
           }
         } finally {
-          if (computeService) await computeService.close();
-          else await computeStore.close();
+          if (generationService) await generationService.close();
+          else await generationStore.close();
           await providerService.close();
           await store.close();
-          journal.close();
-          rmSync(journalDir, { recursive: true });
+          rmSync(generationDir, { recursive: true });
         }
       }),
     45_000,

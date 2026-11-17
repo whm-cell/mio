@@ -79,7 +79,9 @@
     "check:local": "node scripts/harness/validation-entry.ts local",
     "check:static:base": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard",
     "check:static": "pnpm check:static:base && pnpm build",
-    "check": "node scripts/harness/validation-entry.ts check && pnpm check:static:base && pnpm test && pnpm build && pnpm test:smoke"
+    "check": "node scripts/harness/validation-entry.ts check && pnpm check:static:base && pnpm test && pnpm build && pnpm test:smoke",
+    "generations:migrate": "node scripts/service/migrate-generations.ts",
+    "generations:preflight": "node scripts/service/generation-cutover.ts"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0"
@@ -115,9 +117,11 @@
     "amqplib": "2.2.1",
     "better-auth": "1.7.18",
     "cos-nodejs-sdk-v5": "3.0.0",
+    "ipaddr.js": "2.5.0",
     "pg": "8.23.1",
     "sharp": "0.35.5",
-    "tencentcloud-sdk-nodejs-sms": "4.1.306"
+    "tencentcloud-sdk-nodejs-sms": "4.1.306",
+    "undici": "8.11.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",

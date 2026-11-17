@@ -85,15 +85,6 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
       expected.has_password = true;
       delete expected.password;
     }
-    if (
-      resource.path === `permissions/${vhost}/mio-${name}-b` &&
-      actual.configure === '^$' &&
-      actual.write === '^mio\\.compute\\.results\\.v1$' &&
-      actual.read === '^mio\\.compute\\.commands\\.v1$'
-    ) {
-      missing.push(resource);
-      continue;
-    }
     if (!Object.entries(expected).every(([key, value]) => isDeepStrictEqual(actual[key], value)))
       throw new Error(
         `LOCAL_BROKER_CONFLICT: ${resource.path}; preserve data and inspect configuration drift`,

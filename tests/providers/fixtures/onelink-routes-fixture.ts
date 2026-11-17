@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { ImageRouteConfig } from '@mio/compute-contracts';
+import type { ImageRouteConfig } from '../../../src/generations/contracts.ts';
 import type { ModelRouteInput } from '../../../src/providers/contracts.ts';
 import {
   resolveImageRoute,

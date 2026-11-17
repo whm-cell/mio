@@ -11,7 +11,7 @@ export interface ImageGeometry {
   bottom: number;
 }
 
-/** Immutable owner-scoped input snapshot carried to the isolated worker. */
+/** Immutable owner-scoped input snapshot retained by the generation task. */
 export interface ImageAssetRef {
   assetId: string;
   key: string;

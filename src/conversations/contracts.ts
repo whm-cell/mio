@@ -4,7 +4,7 @@ import type {
   ImageOperation,
   ImageRequestParameters,
   ImageRouteConfig,
-} from '@mio/compute-contracts';
+} from '../generations/contracts.ts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {

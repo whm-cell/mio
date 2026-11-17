@@ -1,488 +1,230 @@
-import { randomUUID, generateKeyPairSync } from 'node:crypto';
-import { Pool } from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
-import type { ImageCommandV1, ImageResultV1 } from '@mio/compute-contracts';
-import {
-  imageCommandCredentialBinding,
-  parseImageCommand,
-  parseImageResult,
-} from '@mio/compute-contracts';
-import { assetSchemaSQL } from '../../src/assets/schema.ts';
+import { createHash, randomUUID } from 'node:crypto';
+import { expect, it, vi } from 'vitest';
+import { checkGenerationSchema, generationSchemaSQL } from '../../src/generations/schema.ts';
 import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
-import { sealImageKey } from '../../src/compute/image-credentials.ts';
-import { authDatabase } from '../support/auth-database.ts';
-import { findFixtureImageRouteConfig } from '../providers/fixtures/onelink-routes-fixture.ts';
+import { createGenerationAdmission } from '../../src/generations/admission.ts';
+import { imageOutputKey } from '../../src/generations/contracts.ts';
+import { generationFixture } from '../generations/fixture.ts';
 
-let database: Awaited<ReturnType<typeof authDatabase>>;
-let pool: Pool;
-let store: ComputeStore;
-const keys = generateKeyPairSync('rsa', {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: 'spki', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-});
-const GPT_ROUTE = findFixtureImageRouteConfig('gpt-image-2');
-
-function imageKey(jobId: string, index: number, format = 'png') {
-  const fileId = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
-  return `mio/derived/${jobId}/images/${index}-${fileId}.${format}`;
-}
-beforeAll(async () => {
-  database = await authDatabase();
-  pool = new Pool({ connectionString: database.url });
-  await pool.query(assetSchemaSQL);
-  await pool.query(computeSchemaSQL);
-  await pool.query(computeSchemaSQL);
-  store = new ComputeStore(pool, true);
-}, 45000);
-afterAll(async () => {
-  await store?.close();
-  await database?.close();
-});
-beforeEach(async () => {
-  await pool.query(
-    'TRUNCATE mio_image_outputs,mio_image_outbox,mio_image_jobs,mio_compute_inbox,mio_compute_outbox,mio_compute_jobs,mio_assets CASCADE',
-  );
-});
-
-it('requires image tables and current columns only when images are enabled', async () => {
-  const isolated = await authDatabase();
-  const db = new Pool({ connectionString: isolated.url });
+it('migrates existing media tables incrementally and reads historical B jobs without claiming them', async () => {
+  const f = await generationFixture();
   try {
-    await db.query(assetSchemaSQL);
-    await db.query(computeSchemaSQL);
-    await db.query('DROP TABLE mio_image_outputs,mio_image_outbox,mio_image_jobs');
-    await expect(checkComputeSchema(db)).resolves.toBeUndefined();
-    await expect(checkComputeSchema(db, true)).rejects.toThrow();
-    await db.query(computeSchemaSQL);
-    await expect(checkComputeSchema(db, true)).resolves.toBeUndefined();
+    await f.pool.query(computeSchemaSQL);
+    const job = await f.admit();
+    const before = await f.store.imageGet(f.actor.userId, job.jobId);
+    await f.pool.query('DELETE FROM mio_image_executions WHERE job_id=$1', [job.jobId]);
+    await f.pool.query(generationSchemaSQL);
+    await expect(checkGenerationSchema(f.pool)).resolves.toBeUndefined();
+    await expect(checkComputeSchema(f.pool)).resolves.toBeUndefined();
+    expect(await f.store.imageGet(f.actor.userId, job.jobId)).toEqual(before);
+    expect(await f.store.claim()).toBeUndefined();
+    await f.start();
+    expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('accepted');
+    expect(f.transport).not.toHaveBeenCalled();
+    await expect(f.service.recoverImage(f.actor, job.jobId)).rejects.toMatchObject({
+      code: 'RESULT_CONFLICT',
+    });
   } finally {
-    await db.end();
-    await isolated.close();
+    await f.close();
   }
-}, 45000);
-
-it('reserves shared capacity for owner recovery, ignores stale results and removes the credential at terminal state', async () => {
-  const owner = randomUUID();
-  const jobId = randomUUID();
-  const command: ImageCommandV1 = {
-    version: 1,
-    type: 'image.request',
-    profile: 'openai-images',
-    route: GPT_ROUTE,
-    messageId: randomUUID(),
-    jobId,
-    ownerId: owner,
-    expiresAt: Date.now() + 60000,
-    input: { model: 'gpt-image-2', prompt: 'square', n: 2 },
-    credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
-  };
-  await store.imageCreate(owner, randomUUID(), 'recovery', command);
-  const output = (index: number) => ({
-    key: imageKey(jobId, index),
-    sizeBytes: 3,
-    sha256: String(index).repeat(64),
-    etag: 'etag',
-    contentType: 'image/png',
-  });
-  const failure: ImageResultV1 = {
-    version: 1,
-    type: 'image.result',
-    messageId: randomUUID(),
-    commandId: command.messageId,
-    jobId,
-    state: 'materialization_failed',
-    outputs: [output(0)],
-  };
-  await store.imageAccept(failure);
-  expect(
-    (
-      await pool.query('SELECT command ? $2 AS retained FROM mio_image_jobs WHERE id=$1', [
-        jobId,
-        'credential',
-      ])
-    ).rows[0].retained,
-  ).toBe(false);
-  await expect(store.imageRecover('other', jobId)).rejects.toMatchObject({ code: 'JOB_NOT_FOUND' });
-  await Promise.all([store.imageRecover(owner, jobId), store.imageRecover(owner, jobId)]);
-  const recovery = await store.imagePending();
-  expect(recovery).toMatchObject({
-    type: 'image.recover',
-    commandId: command.messageId,
-    jobId,
-    sequence: 1,
-  });
-  await store.imageSent(jobId, command.messageId);
-  expect(await store.imagePending()).toEqual(recovery);
-  await store.imageAccept({ ...failure, messageId: randomUUID() });
-  expect((await store.imageGet(owner, jobId)).status).toBe('materializing');
-  await store.imageAccept({ ...failure, messageId: randomUUID(), recoveryId: recovery!.messageId });
-  expect((await store.imageGet(owner, jobId)).status).toBe('materialization_failed');
-  await store.imageRecover(owner, jobId);
-  const next = await store.imagePending();
-  expect(next).toMatchObject({ type: 'image.recover', sequence: 2 });
-  await store.imageAccept({
-    ...failure,
-    messageId: randomUUID(),
-    recoveryId: recovery!.messageId,
-    state: 'completed',
-    outputs: [output(0), output(1)],
-  });
-  expect((await store.imageGet(owner, jobId)).status).toBe('materializing');
-  await store.imageAccept({
-    ...failure,
-    messageId: randomUUID(),
-    recoveryId: next!.messageId,
-    state: 'completed',
-    outputs: [output(0), output(1)],
-  });
-  expect((await store.imageGet(owner, jobId)).status).toBe('completed');
-  expect((await store.imageGet(owner, jobId)).assetIds).toHaveLength(2);
-  expect(await store.imagePending()).toBeUndefined();
 });
 
-it('decouples image active quota (32 per owner) from video admission and rechecks capacity before explicit recovery', async () => {
-  const owner = randomUUID();
-  const make = (): ImageCommandV1 => ({
-    version: 1,
-    type: 'image.request',
-    profile: 'openai-images',
-    route: GPT_ROUTE,
-    messageId: randomUUID(),
-    jobId: randomUUID(),
-    ownerId: owner,
-    expiresAt: Date.now() + 60000,
-    input: { model: 'gpt-image-2', prompt: 'square' },
-    credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
-  });
-  const assetId = randomUUID(),
-    key = `mio/raw/${assetId}/${randomUUID()}`;
-  await pool.query(
-    "INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at) VALUES($1,$2,'x.mp4','video/mp4',3,$3,$4,'ready',now())",
-    [assetId, owner, `mio/staging/${assetId}`, key],
-  );
-  for (let i = 0; i < 10; i++) {
-    await store.create(owner, randomUUID(), assetId, key, 3, 'etag');
-  }
-  await expect(store.create(owner, randomUUID(), assetId, key, 3, 'etag')).rejects.toMatchObject({
-    code: 'COMPUTE_QUOTA_EXCEEDED',
-  });
-
-  const images = Array.from({ length: 32 }, make);
-  for (const image of images) await store.imageCreate(owner, randomUUID(), image.jobId, image);
-  const overQuotaImage = make();
-  await expect(
-    store.imageCreate(owner, randomUUID(), 'over', overQuotaImage),
-  ).rejects.toMatchObject({
-    code: 'COMPUTE_QUOTA_EXCEEDED',
-  });
-  const failed: ImageResultV1 = {
-    version: 1,
-    type: 'image.result',
-    messageId: randomUUID(),
-    commandId: images[0]!.messageId,
-    jobId: images[0]!.jobId,
-    state: 'materialization_failed',
-    outputs: [],
-  };
-  await store.imageAccept(failed);
-  await store.imageCreate(owner, randomUUID(), 'replacement', overQuotaImage);
-  await expect(store.imageRecover(owner, failed.jobId)).rejects.toMatchObject({
-    code: 'COMPUTE_QUOTA_EXCEEDED',
-  });
-  await store.imageAccept({
-    ...failed,
-    messageId: randomUUID(),
-    commandId: images[1]!.messageId,
-    jobId: images[1]!.jobId,
-    state: 'rejected',
-    errorCode: 'IMAGE_LIMITED',
-  });
-  await store.imageRecover(owner, failed.jobId);
-  expect((await store.imageGet(owner, failed.jobId)).status).toBe('materializing');
-});
-
-it.each([
-  { existingImages: 999, existingVideos: 500, owners: 'distinct' },
-  { existingImages: 31, existingVideos: 10, owners: 'same' },
-] as const)(
-  'serializes concurrent image admissions at the $owners image capacity boundary without video interference',
-  async ({ existingImages, existingVideos, owners }) => {
-    const owner = `race-${randomUUID()}`;
-    const assetId = randomUUID(),
-      key = `mio/raw/${assetId}/${randomUUID()}`;
-    await pool.query(
-      "INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at) VALUES($1,$2,'x.mp4','video/mp4',3,$3,$4,'ready',now())",
-      [assetId, owner, `mio/staging/${assetId}`, key],
-    );
-    const makeImage = (): ImageCommandV1 => ({
-      version: 1,
-      type: 'image.request',
-      profile: 'openai-images',
-      route: GPT_ROUTE,
-      messageId: randomUUID(),
-      jobId: randomUUID(),
-      ownerId: owner,
-      expiresAt: Date.now() + 60000,
-      input: { model: 'gpt-image-2', prompt: 'square' },
-      credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
+it('upgrades a retained legacy state constraint before running async tasks without resubmitting history', async () => {
+  const f = await generationFixture();
+  try {
+    const historical = await f.admit();
+    await f.pool.query('DELETE FROM mio_image_executions WHERE job_id=$1', [historical.jobId]);
+    const before = (
+      await f.pool.query('SELECT * FROM mio_image_jobs WHERE id=$1', [historical.jobId])
+    ).rows[0];
+    await f.pool.query(`ALTER TABLE mio_image_jobs DROP CONSTRAINT mio_image_jobs_state_check;
+      ALTER TABLE mio_image_jobs ADD CONSTRAINT mio_image_jobs_state_check
+      CHECK(state IN ('accepted','materializing','completed','partial','materialization_failed','unknown','rejected'))`);
+    await expect(checkGenerationSchema(f.pool)).rejects.toThrow('GENERATION_IMAGE_SCHEMA_OUTDATED');
+    await f.pool.query(generationSchemaSQL);
+    await f.pool.query(generationSchemaSQL);
+    await expect(checkGenerationSchema(f.pool)).resolves.toBeUndefined();
+    expect(
+      (await f.pool.query('SELECT * FROM mio_image_jobs WHERE id=$1', [historical.jobId])).rows[0],
+    ).toEqual(before);
+    f.asyncTransport.query.mockResolvedValueOnce({
+      state: 'processing',
+      upstreamTaskId: 'original-upstream-task',
     });
-    const seed = makeImage();
-    await pool.query(
+    await f.start();
+    const job = await f.service.createImage(f.actor, randomUUID(), f.asyncModelRef, {
+      prompt: 'after legacy state upgrade',
+      async: true,
+    });
+    await vi.waitFor(
+      async () => expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('processing'),
+      { timeout: 6000 },
+    );
+    expect(
+      (
+        await f.pool.query(
+          'SELECT upstream_task_id,query_attempt FROM mio_image_jobs WHERE id=$1',
+          [job.jobId],
+        )
+      ).rows[0],
+    ).toEqual({
+      upstream_task_id: 'original-upstream-task',
+      query_attempt: 1,
+    });
+    await f.pool.query('UPDATE mio_image_jobs SET next_query_at=now() WHERE id=$1', [job.jobId]);
+    await vi.waitFor(
+      async () => expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('completed'),
+      { timeout: 6000 },
+    );
+    expect(f.asyncTransport.submit).toHaveBeenCalledTimes(1);
+    expect(f.asyncTransport.query).toHaveBeenCalledTimes(2);
+    expect(f.transport).not.toHaveBeenCalled();
+    expect(
+      (await f.pool.query('SELECT * FROM mio_image_jobs WHERE id=$1', [historical.jobId])).rows[0],
+    ).toEqual(before);
+  } finally {
+    await f.close();
+  }
+});
+
+it('deduplicates concurrent requests before provider availability and rolls back execution insertion failures', async () => {
+  const f = await generationFixture();
+  try {
+    const requestId = randomUUID();
+    const jobs = await Promise.all(Array.from({ length: 12 }, () => f.admit(requestId)));
+    expect(new Set(jobs.map((job) => job.jobId)).size).toBe(1);
+    const withoutProvider = createGenerationAdmission(
+      f.store,
+      f.files,
+      f.objects.head,
+      () => undefined,
+    );
+    expect(
+      (await withoutProvider(f.actor, requestId, f.modelRef, { prompt: 'fixture' })).jobId,
+    ).toBe(jobs[0]!.jobId);
+    await expect(
+      withoutProvider(f.actor, requestId, f.modelRef, { prompt: 'different' }),
+    ).rejects.toMatchObject({ code: 'REQUEST_CONFLICT' });
+    await f.pool.query(
+      "CREATE FUNCTION reject_execution() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture write failure'; END $$",
+    );
+    await f.pool.query(
+      'CREATE TRIGGER reject_execution BEFORE INSERT ON mio_image_executions FOR EACH ROW EXECUTE FUNCTION reject_execution()',
+    );
+    const failed = randomUUID();
+    await expect(f.admit(failed)).rejects.toThrow('fixture write failure');
+    expect(await f.store.imageRequest(f.actor.userId, failed)).toBeUndefined();
+    expect((await f.pool.query('SELECT count(*) FROM mio_image_jobs')).rows[0].count).toBe('1');
+  } finally {
+    await f.close();
+  }
+});
+
+it('enforces 32 active jobs per owner and 1000 globally while preserving historical idempotency', async () => {
+  const f = await generationFixture();
+  try {
+    const results = await Promise.allSettled(Array.from({ length: 36 }, () => f.admit()));
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(32);
+    expect(
+      results
+        .filter((r) => r.status === 'rejected')
+        .every((r) => r.status === 'rejected' && r.reason.code === 'COMPUTE_QUOTA_EXCEEDED'),
+    ).toBe(true);
+    const row = (await f.pool.query('SELECT * FROM mio_image_jobs LIMIT 1')).rows[0];
+    await f.pool.query(
       `INSERT INTO mio_image_jobs(id,owner_id,request_id,input_hash,command,state)
-    SELECT gen_random_uuid(),CASE WHEN $2='same' THEN $3 ELSE 'image-'||n END,gen_random_uuid(),n::text,$4::jsonb,'accepted' FROM generate_series(1,$1) n`,
-      [existingImages, owners, owner, JSON.stringify(seed)],
+      SELECT gen_random_uuid(),'other-'||i,gen_random_uuid(),'fixture',$1,'accepted' FROM generate_series(1,968) i`,
+      [row.command],
     );
-    await pool.query(
-      `INSERT INTO mio_compute_jobs(id,owner_id,request_id,input_asset_id,input_key,input_size,input_etag,state,attempt,attempt_id,command_id)
-    SELECT gen_random_uuid(),CASE WHEN $2='same' THEN $3 ELSE 'video-'||n END,gen_random_uuid(),$4,$5,3,'etag','queued',1,gen_random_uuid(),gen_random_uuid() FROM generate_series(1,$1) n`,
-      [existingVideos, owners, owner, assetId, key],
-    );
-    const results = await Promise.allSettled([
-      store.imageCreate(owner, randomUUID(), 'race-1', makeImage()),
-      store.imageCreate(owner, randomUUID(), 'race-2', makeImage()),
-    ]);
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-    const rejected = results.find((result) => result.status === 'rejected');
-    expect(rejected).toMatchObject({
-      status: 'rejected',
-      reason: { code: 'COMPUTE_QUOTA_EXCEEDED' },
-    });
-  },
-);
-
-it('atomically deduplicates admission, persists encrypted outbox and registers owned assets once', async () => {
-  const jobId = randomUUID();
-  const requestId = randomUUID();
-  const input = { model: 'gpt-image-2', prompt: 'square' };
-  const expiresAt = Date.now() + 60000;
-  const commandBase = {
-    version: 1 as const,
-    type: 'image.request' as const,
-    profile: 'openai-images' as const,
-    route: GPT_ROUTE,
-    messageId: randomUUID(),
-    jobId,
-    ownerId: 'owner',
-    expiresAt,
-    input,
-  };
-  const credential = sealImageKey(
-    'private-key',
-    imageCommandCredentialBinding(commandBase),
-    'b1',
-    keys.publicKey,
-  );
-  const command: ImageCommandV1 = {
-    ...commandBase,
-    credential,
-  };
-  expect(parseImageCommand(command)).toEqual(command);
-  expect(() => parseImageCommand({ ...command, profile: 'unimplemented-profile' })).toThrow(
-    'IMAGE_MESSAGE_INVALID',
-  );
-  expect(() => parseImageCommand({ ...command, profile: 'gpt-images-v1' })).toThrow(
-    'IMAGE_MESSAGE_INVALID',
-  );
-  const { route: _missingRoute, ...missingRoute } = command;
-  void _missingRoute;
-  expect(() => parseImageCommand(missingRoute)).toThrow('IMAGE_MESSAGE_INVALID');
-  const { profile: _missingProfile, ...missingProfile } = command;
-  void _missingProfile;
-  expect(() => parseImageCommand(missingProfile)).toThrow('IMAGE_MESSAGE_INVALID');
-  expect(JSON.stringify(command)).not.toContain('private-key');
-  const ids = await Promise.all(
-    Array.from({ length: 4 }, (_, index) =>
-      store.imageCreate('owner', requestId, 'hash', {
-        ...command,
-        jobId: index === 0 ? jobId : randomUUID(),
-        messageId: randomUUID(),
-      }),
-    ),
-  );
-  expect(new Set(ids).size).toBe(1);
-  const acceptedId = ids[0]!;
-  const accepted = (await store.imagePending())!;
-  expect(accepted.jobId).toBe(acceptedId);
-  await expect(
-    store.imageCreate('owner', requestId, 'different', {
-      ...command,
+    const admission = createGenerationAdmission(f.store, f.files, f.objects.head, () => f.provider);
+    const snapshot = await f.provider.snapshotImage(f.actor, f.modelRef);
+    const next = {
+      ...row.command,
       jobId: randomUUID(),
       messageId: randomUUID(),
-    }),
-  ).rejects.toMatchObject({
-    code: 'REQUEST_CONFLICT',
-  });
-  expect(await store.imagePending()).toEqual(accepted);
-  await store.imageSent(acceptedId, accepted.messageId);
-  expect(await store.imagePending()).toBeUndefined();
-  await expect(store.imageGet('other', acceptedId)).rejects.toMatchObject({
-    code: 'JOB_NOT_FOUND',
-  });
-  const result: ImageResultV1 = {
-    version: 1,
-    type: 'image.result',
-    messageId: randomUUID(),
-    commandId: accepted.messageId,
-    jobId: acceptedId,
-    state: 'completed',
-    outputs: [
-      {
-        key: imageKey(acceptedId, 0),
-        sizeBytes: 3,
-        sha256: 'a'.repeat(64),
-        etag: 'etag',
-        contentType: 'image/png',
-      },
-    ],
-  };
-  expect(parseImageResult(result)).toEqual(result);
-  await store.imageAccept(result);
-  await store.imageAccept({ ...result, messageId: randomUUID() });
-  const view = await store.imageGet('owner', acceptedId);
-  expect(view.status).toBe('completed');
-  expect(view.assetIds).toHaveLength(1);
-  const asset = (
-    await pool.query('SELECT owner_id,raw_key FROM mio_assets WHERE id=$1', [view.assetIds[0]])
-  ).rows[0];
-  expect(asset).toEqual({ owner_id: 'owner', raw_key: result.outputs[0]!.key });
-  expect(() =>
-    parseImageResult({ ...result, outputs: [{ ...result.outputs[0], key: 'mio/raw/another' }] }),
-  ).toThrow('IMAGE_MESSAGE_INVALID');
+      ownerId: 'new-owner',
+    };
+    await expect(
+      f.store.imageCreate('new-owner', randomUUID(), 'other', next, row.admitted, snapshot),
+    ).rejects.toMatchObject({ code: 'COMPUTE_QUOTA_EXCEEDED' });
+    expect(
+      (await admission(f.actor, row.request_id, f.modelRef, { prompt: 'fixture' })).jobId,
+    ).toBe(row.id);
+  } finally {
+    await f.close();
+  }
 });
 
-it('requires a UUID file ID in every derived image key', () => {
-  const jobId = randomUUID();
-  const base = {
-    version: 1 as const,
-    type: 'image.result' as const,
-    messageId: randomUUID(),
-    commandId: randomUUID(),
-    jobId,
-    state: 'completed' as const,
-    outputs: [
-      {
-        key: imageKey(jobId, 0),
-        sizeBytes: 3,
-        sha256: 'a'.repeat(64),
-        etag: 'etag',
-        contentType: 'image/png',
-      },
-    ],
-  };
-  expect(parseImageResult(base)).toEqual(base);
-  expect(() =>
-    parseImageResult({
-      ...base,
-      outputs: [{ ...base.outputs[0]!, key: `mio/derived/${jobId}/images/0.png` }],
-    }),
-  ).toThrow('IMAGE_MESSAGE_INVALID');
+it('claims one execution atomically and ignores stale output commits without duplicating assets', async () => {
+  const f = await generationFixture();
+  try {
+    const job = await f.admit();
+    const claims = await Promise.all(Array.from({ length: 8 }, () => f.store.claim()));
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const row = claims.find(Boolean)!;
+    const receipt = await f.files.receive(
+      row.id,
+      row.command.messageId,
+      1,
+      [{ base64: f.bytes.toString('base64') }],
+      'png',
+    );
+    const output = {
+      key: imageOutputKey(row.id, 0, randomUUID(), 'png'),
+      sizeBytes: f.bytes.length,
+      sha256: createHash('sha256').update(f.bytes).digest('hex'),
+      etag: 'etag',
+      contentType: 'image/png',
+    };
+    expect(
+      await f.store.acceptOutputs(
+        { ...row, claim_id: randomUUID() },
+        [output],
+        'completed',
+        receipt.ref,
+      ),
+    ).toBe(false);
+    expect(await f.store.acceptOutputs(row, [output], 'completed', receipt.ref)).toBe(true);
+    expect(await f.store.acceptOutputs(row, [output], 'completed', receipt.ref)).toBe(false);
+    expect((await f.store.imageGet(f.actor.userId, job.jobId)).assetIds).toHaveLength(1);
+    expect(
+      (await f.pool.query('SELECT snapshot FROM mio_image_executions WHERE job_id=$1', [job.jobId]))
+        .rows[0].snapshot,
+    ).toBeNull();
+    await expect(f.store.imageGet('other-owner', job.jobId)).rejects.toMatchObject({
+      code: 'JOB_NOT_FOUND',
+    });
+  } finally {
+    await f.close();
+  }
 });
 
-it('registers durable partial outputs and resumes the remainder without duplicate assets', async () => {
-  const jobId = randomUUID();
-  const command: ImageCommandV1 = {
-    version: 1,
-    type: 'image.request',
-    profile: 'openai-images',
-    route: GPT_ROUTE,
-    messageId: randomUUID(),
-    jobId,
-    ownerId: 'owner',
-    expiresAt: Date.now() + 60000,
-    input: { model: 'gpt-image-2', prompt: 'square', n: 2 },
-    credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
-  };
-  await store.imageCreate('owner', randomUUID(), 'hash-partial', command);
-  const output = (index: number) => ({
-    key: imageKey(jobId, index),
-    sizeBytes: 3,
-    sha256: String(index).repeat(64),
-    etag: 'etag',
-    contentType: 'image/png',
-  });
-  const result: ImageResultV1 = {
-    version: 1,
-    type: 'image.result',
-    messageId: randomUUID(),
-    commandId: command.messageId,
-    jobId,
-    state: 'materializing',
-    outputs: [output(0)],
-  };
-  expect(parseImageResult(result)).toEqual(result);
-  await store.imageAccept(result);
-  await store.imageAccept({ ...result, messageId: randomUUID() });
-  const partial = await store.imageGet('owner', jobId);
-  expect(partial.status).toBe('materializing');
-  expect(partial.assetIds).toHaveLength(1);
-  await expect(
-    store.imageAccept({ ...result, outputs: [{ ...output(0), sizeBytes: 99 }] }),
-  ).rejects.toMatchObject({ code: 'RESULT_CONFLICT' });
-  await store.imageAccept({
-    ...result,
-    messageId: randomUUID(),
-    state: 'completed',
-    outputs: [output(0), output(1)],
-  });
-  const completed = await store.imageGet('owner', jobId);
-  expect(completed.status).toBe('completed');
-  expect(completed.assetIds).toHaveLength(2);
-  expect(completed.assetIds[0]).toBe(partial.assetIds[0]);
-});
-
-it('registers a later output by its stable index when the earlier output is missing', async () => {
-  const jobId = randomUUID();
-  const command: ImageCommandV1 = {
-    version: 1,
-    type: 'image.request',
-    profile: 'openai-images',
-    route: GPT_ROUTE,
-    messageId: randomUUID(),
-    jobId,
-    ownerId: 'owner',
-    expiresAt: Date.now() + 60000,
-    input: { model: 'gpt-image-2', prompt: 'square', n: 2 },
-    credential: sealImageKey('k', 'binding', 'b1', keys.publicKey),
-  };
-  await store.imageCreate('owner', randomUUID(), 'sparse', command);
-  const output = (index: number) => ({
-    key: imageKey(jobId, index),
-    sizeBytes: 3,
-    sha256: String(index).repeat(64),
-    etag: 'etag',
-    contentType: 'image/png',
-  });
-  const result: ImageResultV1 = {
-    version: 1,
-    type: 'image.result',
-    messageId: randomUUID(),
-    commandId: command.messageId,
-    jobId,
-    state: 'materializing',
-    outputs: [output(1)],
-  };
-  expect(parseImageResult(result)).toEqual(result);
-  await store.imageAccept(result);
-  const first = await store.imageGet('owner', jobId);
-  expect(first.assetIds).toHaveLength(1);
-  expect(first.outputs).toEqual([{ index: 1, assetId: first.assetIds[0] }]);
-  await store.imageAccept({
-    ...result,
-    messageId: randomUUID(),
-    state: 'completed',
-    outputs: [output(0), output(1)],
-  });
-  const complete = await store.imageGet('owner', jobId);
-  expect(complete.assetIds).toHaveLength(2);
-  expect(complete.assetIds[1]).toBe(first.assetIds[0]);
-  expect(
-    (
-      await pool.query(
-        'SELECT output_index FROM mio_image_outputs WHERE job_id=$1 ORDER BY output_index',
-        [jobId],
-      )
-    ).rows.map((row) => row.output_index),
-  ).toEqual([0, 1]);
+it('keeps a later valid output at its original index and never labels partial results complete', async () => {
+  const f = await generationFixture();
+  try {
+    f.transport.mockResolvedValue(
+      Response.json({ data: [{ b64_json: 'YmFk' }, { b64_json: f.bytes.toString('base64') }] }),
+    );
+    await f.start();
+    const job = await f.service.createImage(f.actor, randomUUID(), f.modelRef, {
+      prompt: 'partial',
+      n: 2,
+    });
+    await vi.waitFor(
+      async () => expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('partial'),
+      { timeout: 6000 },
+    );
+    const result = await f.service.getImage(f.actor, job.jobId);
+    expect(result.outputs.map((output) => output.index)).toEqual([1]);
+    expect(result.assetIds).toHaveLength(1);
+    await expect(f.service.recoverImage(f.actor, job.jobId)).rejects.toMatchObject({
+      code: 'RESULT_CONFLICT',
+    });
+    await f.stop();
+    await f.start();
+    expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('partial');
+    expect(f.transport).toHaveBeenCalledTimes(1);
+  } finally {
+    await f.close();
+  }
 });

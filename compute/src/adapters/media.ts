@@ -24,61 +24,6 @@ import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
 
-export function validateImage(bytes: Buffer, format: string): void {
-  const probe = spawnSync(
-    'ffprobe',
-    [
-      '-v',
-      'error',
-      '-protocol_whitelist',
-      'pipe',
-      '-i',
-      'pipe:0',
-      '-select_streams',
-      'v:0',
-      '-show_entries',
-      'stream=width,height,codec_name',
-      '-of',
-      'json',
-    ],
-    { input: bytes, timeout: 10_000, maxBuffer: 64 * 1024 },
-  );
-  // A process failure is not proof that the supplied image is irrecoverably invalid.
-  if (probe.status !== 0) throw new Error('IMAGE_VALIDATION_INCOMPLETE');
-  const stream = JSON.parse(probe.stdout.toString()).streams?.[0];
-  if (
-    !stream ||
-    stream.codec_name !==
-      ({ png: 'png', jpeg: 'mjpeg', webp: 'webp' } as Record<string, string>)[format] ||
-    !Number.isInteger(stream.width) ||
-    !Number.isInteger(stream.height) ||
-    stream.width < 1 ||
-    stream.height < 1
-  )
-    throw new Error('IMAGE_OUTPUT_INVALID');
-  const decode = spawnSync(
-    'ffmpeg',
-    [
-      '-v',
-      'error',
-      '-xerror',
-      '-threads',
-      '1',
-      '-protocol_whitelist',
-      'pipe',
-      '-i',
-      'pipe:0',
-      '-frames:v',
-      '1',
-      '-f',
-      'null',
-      '-',
-    ],
-    { input: bytes, timeout: 15_000, maxBuffer: 64 * 1024 },
-  );
-  if (decode.status !== 0) throw new Error('IMAGE_VALIDATION_INCOMPLETE');
-}
-
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
 

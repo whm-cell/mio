@@ -6,13 +6,13 @@ import {
   isSafeRouteIdentifier,
   isValidImageRoutePath,
   validateImageRouteConfig,
-} from '@mio/compute-contracts';
+} from '../../generations/contracts.ts';
 import type {
   ImageDriver,
   ImageOperation,
   ImageRouteConfig,
   ImageRouteParamSpec,
-} from '@mio/compute-contracts';
+} from '../../generations/contracts.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,

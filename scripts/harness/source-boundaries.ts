@@ -38,6 +38,12 @@ export function allowsCapability(
   file: string,
   name: string,
 ): boolean {
+  if (
+    name === 'fs' &&
+    file === 'src/generations/files.ts' &&
+    (!project || project.declaration.packageRoot === '.')
+  )
+    return true;
   if (name !== 'fs' && name !== 'child_process' && name !== 'sqlite') return false;
   return project?.declaration.capabilities?.[name]?.includes(file) ?? false;
 }

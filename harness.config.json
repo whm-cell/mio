@@ -19,12 +19,14 @@
       "src/assets/config.ts",
       "src/assets/schema.ts",
       "src/compute/schema.ts",
+      "src/generations/schema.ts",
       "src/integrations/rabbitmq.ts",
       "contracts/compute/dist/index.d.ts",
       "src/providers/config.ts",
       "src/providers/schema.ts",
       "src/providers/store.ts",
-      "src/providers/contracts.ts"
+      "src/providers/contracts.ts",
+      "src/integrations/cos.ts"
     ]
   },
   "documentRoots": [
@@ -83,12 +85,30 @@
       "typecheck": "packages/foundation/tsconfig.json",
       "build": "packages/foundation/tsconfig.build.json",
       "publicEntries": [
-        { "source": "packages/foundation/src/logging.ts", "export": "./logging" },
-        { "source": "packages/foundation/src/errors.ts", "export": "./errors" },
-        { "source": "packages/foundation/src/http-status.ts", "export": "./http-status" },
-        { "source": "packages/foundation/src/time.ts", "export": "./time" },
-        { "source": "packages/foundation/src/identifiers.ts", "export": "./identifiers" },
-        { "source": "packages/foundation/src/hash.ts", "export": "./hash" }
+        {
+          "source": "packages/foundation/src/logging.ts",
+          "export": "./logging"
+        },
+        {
+          "source": "packages/foundation/src/errors.ts",
+          "export": "./errors"
+        },
+        {
+          "source": "packages/foundation/src/http-status.ts",
+          "export": "./http-status"
+        },
+        {
+          "source": "packages/foundation/src/time.ts",
+          "export": "./time"
+        },
+        {
+          "source": "packages/foundation/src/identifiers.ts",
+          "export": "./identifiers"
+        },
+        {
+          "source": "packages/foundation/src/hash.ts",
+          "export": "./hash"
+        }
       ]
     },
     "protocol": {
@@ -97,7 +117,12 @@
       "sources": ["contracts/compute/src"],
       "typecheck": "contracts/compute/tsconfig.json",
       "build": "contracts/compute/tsconfig.build.json",
-      "publicEntries": [{ "source": "contracts/compute/src/index.ts", "export": "." }]
+      "publicEntries": [
+        {
+          "source": "contracts/compute/src/index.ts",
+          "export": "."
+        }
+      ]
     }
   },
   "configurationFiles": [

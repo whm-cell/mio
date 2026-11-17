@@ -55,12 +55,23 @@ try {
   );
   console.log('PORTABLE_COMPUTE_MIGRATION_EXISTING_ASSET_OK');
 
-  for (const name of ['auth', 'assets', 'compute']) migrate(name);
+  for (const name of ['auth', 'assets', 'compute', 'generations']) migrate(name);
   assert.deepEqual((await readOriginal()).rows, expected, 'repeated migration changed the asset');
   await pool.query('SELECT id FROM mio_compute_jobs LIMIT 0');
   await pool.query('SELECT id FROM mio_compute_outbox LIMIT 0');
   await pool.query('SELECT id FROM mio_compute_inbox LIMIT 0');
+  await pool.query('SELECT id FROM mio_image_jobs LIMIT 0');
+  await pool.query(
+    'SELECT job_id,phase,claim_id,snapshot,checkpoint FROM mio_image_executions LIMIT 0',
+  );
+  migrate('generations');
+  assert.deepEqual(
+    (await readOriginal()).rows,
+    expected,
+    'generation migration changed the existing asset',
+  );
   console.log('PORTABLE_AUTH_ASSET_COMPUTE_MIGRATIONS_OK');
+  console.log('PORTABLE_GENERATIONS_MIGRATION_EXISTING_ASSET_OK');
 } finally {
   await pool.end();
   await database.close();

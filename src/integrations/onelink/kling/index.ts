@@ -1,6 +1,6 @@
-import { validateImageInputByRoute } from '@mio/compute-contracts';
-import type { ImageRouteConfig } from '@mio/compute-contracts';
-import { withPublicHttps } from '../../../adapters/public-https.ts';
+import { validateImageInputByRoute } from '../../../generations/contracts.ts';
+import type { ImageRouteConfig } from '../../../generations/contracts.ts';
+import { withPublicHttps } from '../public-https.ts';
 import {
   ASYNC_TASK_ID,
   asyncResponseObservation,

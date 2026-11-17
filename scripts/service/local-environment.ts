@@ -2,7 +2,11 @@ import { randomBytes } from 'node:crypto';
 import { lstat, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
-import { localComputeSettings, validateLocalComputeSettings } from './local-compute-environment.ts';
+import {
+  localComputeKeys,
+  localComputeSettings,
+  validateLocalComputeSettings,
+} from './local-compute-environment.ts';
 
 export type LocalEnvironment = 'dev' | 'test';
 
@@ -78,6 +82,7 @@ export async function createLocalEnvironment(name: LocalEnvironment, root = reso
     MIO_REDIS_URL: `redis://mio:${redisPassword}@127.0.0.1:${redisPort}`,
     MIO_REDIS_NAMESPACE: name,
     DSH_HOME: `.runtime/${name}/dsh`,
+    MIO_GENERATIONS_DATA_DIR: `.runtime/${name}/generations`,
     MIO_LOCAL_POSTGRES_PORT: postgresPort,
     MIO_LOCAL_REDIS_PORT: redisPort,
     MIO_LOCAL_POSTGRES_PASSWORD: secret(),
@@ -106,6 +111,10 @@ export async function createLocalEnvironment(name: LocalEnvironment, root = reso
     const existing = parseEnv(contents);
     if (existing.MIO_ENVIRONMENT !== name) throw new Error('LOCAL_ENV_IDENTITY');
     const chunks: string[] = [];
+    if (existing.MIO_GENERATIONS_DATA_DIR === undefined)
+      chunks.push(
+        `\n# A image recovery directory; enable explicitly after cutover checks.\nMIO_GENERATIONS_DATA_DIR=.runtime/${name}/generations\n`,
+      );
     const computeAdditions = localComputeSettings(name);
     const computeKeys = Object.keys(computeAdditions);
     const computePresent = computeKeys.filter((key) => existing[key] !== undefined);
@@ -195,14 +204,18 @@ export async function readLocalEnvironment(
       `redis://mio:${values.MIO_LOCAL_REDIS_PASSWORD}@127.0.0.1:${values.MIO_LOCAL_REDIS_PORT}`
   )
     throw new Error('LOCAL_ENV_TARGET: application URLs must match this environment middleware');
-  validateLocalComputeSettings(name, values, root);
+  const hasComputeSettings = localComputeKeys.some((key) => values[key] !== undefined);
+  if (hasComputeSettings || values.MIO_COMPUTE_ENABLED === 'true')
+    validateLocalComputeSettings(name, values, root);
   const ports = [
     'MIO_PORT',
     'MIO_LOCAL_POSTGRES_PORT',
     'MIO_LOCAL_REDIS_PORT',
     'MIO_LOCAL_RABBITMQ_PORT',
     'MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT',
-  ].map((key) => Number(values[key]));
+  ]
+    .filter((key) => values[key] !== undefined)
+    .map((key) => Number(values[key]));
   if (new Set(ports).size !== ports.length)
     throw new Error('LOCAL_ENV_PORT: service ports must differ');
   const host = Object.fromEntries(
@@ -222,11 +235,16 @@ export async function readLocalEnvironment(
               'MIO_COMPUTE_INSTANCE_ID',
               'MIO_COMPUTE_EXPECTED_COMMAND_USER',
               'MIO_IMAGE_PRIVATE_KEY',
+              'MIO_IMAGE_PUBLIC_KEY',
+              'MIO_IMAGE_KEY_ID',
             ].includes(key)) ||
           key === 'NODE_ENV' ||
           key === 'RABBITMQ_URL',
       ),
     ),
+    ...(values.MIO_GENERATIONS_DATA_DIR
+      ? { MIO_GENERATIONS_DATA_DIR: resolve(root, values.MIO_GENERATIONS_DATA_DIR) }
+      : {}),
     DSH_HOME: resolve(root, values.DSH_HOME),
     DSH_AGENTS_HOME: resolve(root, values.DSH_HOME, 'agents'),
     DSH_TELEMETRY_DISABLED: '1',

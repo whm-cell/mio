@@ -1,7 +1,9 @@
+import { createImageDecoder } from '../../src/generations/decode.ts';
+import { generationSchemaSQL } from '../../src/generations/schema.ts';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { cp, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -9,34 +11,15 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-  imageOutputIndex,
-  imageOutputKey,
-  imageQueryCredentialBinding,
-  parseImageResult,
-} from '@mio/compute-contracts';
-import type { ImageAssetRef } from '@mio/compute-contracts';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Journal } from '../../compute/src/adapters/journal.ts';
-import { validateImage } from '../../compute/src/adapters/media.ts';
-import { Broker } from '../../compute/src/adapters/rabbitmq.ts';
-import { createImageWorker, recoverImageMaterialization } from '../../compute/src/image-worker.ts';
-import { Maintenance } from '../../compute/src/maintenance.ts';
-import { Worker } from '../../compute/src/worker.ts';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
-import { sealImageKey } from '../../src/compute/image-credentials.ts';
-import { createComputeStore } from '../../src/compute/store.ts';
-import { readProviderConfig } from '../../src/providers/config.ts';
-import { createProviderService } from '../../src/providers/service.ts';
-import { createProviderStore } from '../../src/providers/store.ts';
 import {
   ONELINK_FIXTURE_ROUTES,
   findFixtureRoute,
   importRoutesViaCli,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
-import { provisionLocalTestBroker } from '../support/local-broker-fixture.ts';
 
 interface CosEntry {
   bytes: Buffer;
@@ -71,7 +54,7 @@ interface SseFrame {
   data: Record<string, unknown>;
 }
 
-function generateValidImage(format: 'png' | 'jpeg', color: string): Buffer {
+async function generateValidImage(format: 'png' | 'jpeg', color: string): Promise<Buffer> {
   const codec = format === 'png' ? 'png' : 'mjpeg';
   const result = spawnSync(
     'ffmpeg',
@@ -94,7 +77,7 @@ function generateValidImage(format: 'png' | 'jpeg', color: string): Buffer {
   );
   assert.equal(result.status, 0, result.stderr?.toString('utf8'));
   const bytes = Buffer.from(result.stdout);
-  validateImage(bytes, format);
+  await createImageDecoder()(bytes, format);
   return bytes;
 }
 
@@ -282,8 +265,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
   let chatRequests: RecordedChatRequest[];
   let imageUpstreamRequests: RecordedImageUpstream[];
   let pauseSignal: { paused: boolean; release: (() => void) | null };
-  let stopWorkerRuntime: (() => Promise<void>) | undefined;
-  let cleanupBrokerResources: (() => Promise<void>) | undefined;
   let profileControl: {
     origin: string;
     apiToken: string;
@@ -291,7 +272,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     stop: () => Promise<void>;
     close: () => Promise<void>;
   };
-  let brokerMode: 'rabbitmq' | 'pg-outbox-ci' = 'rabbitmq';
 
   const cookies: string[] = [];
   const owners: string[] = [];
@@ -366,13 +346,13 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
       .poll(
         async () => {
           const res = await call(`/api/v1/compute/images/${jobId}`, 'GET', undefined, owner);
-          if (res.status !== 200) return false;
+          if (res.status !== 200) return { status: 'http-' + res.status };
           latest = (await res.json()) as typeof latest;
-          return latest.status === 'completed';
+          return latest;
         },
         { timeout, interval: 100 },
       )
-      .toBe(true);
+      .toMatchObject({ status: 'completed', errorCode: null });
     return latest;
   }
 
@@ -397,8 +377,8 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
   }
 
   beforeAll(async () => {
-    pngSample = generateValidImage('png', 'navy');
-    jpegSample = generateValidImage('jpeg', 'coral');
+    pngSample = await generateValidImage('png', 'navy');
+    jpegSample = await generateValidImage('jpeg', 'coral');
     cosObjects = new Map();
     chatRequests = [];
     imageUpstreamRequests = [];
@@ -435,7 +415,16 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
       if (parsed.pathname.startsWith('/object/')) {
         const key = decodeURIComponent(parsed.pathname.slice('/object/'.length));
         if (req.method === 'PUT') {
+          if (req.headers['x-cos-forbid-overwrite'] === 'true' && cosObjects.has(key)) {
+            res.writeHead(409).end();
+            return;
+          }
           const bytes = await readBodyBuffer(req);
+          const md5 = req.headers['content-md5'];
+          if (md5 && md5 !== createHash('md5').update(bytes).digest('base64')) {
+            res.writeHead(400).end();
+            return;
+          }
           const sha256 = createHash('sha256').update(bytes).digest('hex');
           const etag = `"stg-${sha256.slice(0, 24)}"`;
           cosObjects.set(key, {
@@ -450,6 +439,10 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
         const found = cosObjects.get(key);
         if (!found) {
           res.writeHead(404).end();
+          return;
+        }
+        if (req.headers['if-match'] && req.headers['if-match'] !== found.etag) {
+          res.writeHead(412).end();
           return;
         }
         if (req.method === 'DELETE') {
@@ -897,7 +890,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
         return;
       }
 
-      // Image upstream endpoints invoked by Worker B
+      // Image upstream endpoints invoked by A's generation executor
       const contentType = req.headers['content-type'] ?? null;
       if (req.method === 'POST') {
         const raw = await readBodyBuffer(req);
@@ -1051,13 +1044,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     observer = new Pool({ connectionString: database.observerURL });
     const masterKey = randomBytes(32).toString('base64');
     const masterKeyId = 'conv-img-master-1';
-    const imageKeyId = 'conv-img-rsa-1';
-    const rsaKeys = generateKeyPairSync('rsa', {
-      modulusLength: 2048,
-      publicKeyEncoding: { type: 'spki', format: 'pem' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    });
-
     const migrateEnv: NodeJS.ProcessEnv = {
       PATH: process.env.PATH ?? '',
       MIO_AUTH_DATABASE_URL: database.url,
@@ -1092,266 +1078,8 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     };
     await importRoutesViaCli(migrateEnv, [...ONELINK_FIXTURE_ROUTES, disabledRoute]);
 
-    // Worker B setup (real Journal + real createImageWorker + real RabbitMQ when .env.test exists)
-    const workerDir = await mkdtemp(join(tmpdir(), 'mio-conv-img-worker-'));
-    const journal = new Journal(workerDir, randomUUID(), true);
-    const readImageFromCos = async (ref: ImageAssetRef): Promise<Uint8Array> => {
-      const found = cosObjects.get(ref.key);
-      if (!found || found.etag !== ref.etag || found.bytes.length !== ref.sizeBytes) {
-        throw new Error('IMAGE_INPUT_MISMATCH');
-      }
-      return Uint8Array.from(found.bytes);
-    };
-    const materializeToCos = async (
-      jobId: string,
-      index: number,
-      base64: string,
-      format: string,
-      fileId: string,
-    ) => {
-      const bytes = Buffer.from(base64, 'base64');
-      validateImage(bytes, format);
-      const key = imageOutputKey(jobId, index, fileId, format);
-      if (imageOutputIndex(jobId, key, `image/${format}`) !== index) {
-        throw new Error('IMAGE_OUTPUT_INVALID');
-      }
-      const sha256 = createHash('sha256').update(bytes).digest('hex');
-      const etag = `"drv-${sha256.slice(0, 24)}"`;
-      cosObjects.set(key, {
-        bytes,
-        contentType: `image/${format}`,
-        etag,
-        sha256,
-      });
-      return {
-        key,
-        sizeBytes: bytes.length,
-        sha256,
-        etag,
-        contentType: `image/${format}`,
-      };
-    };
-    const workerFetch: typeof fetch = async (input, init) => {
-      const req = new Request(input, init);
-      const parsed = new URL(req.url);
-      if (parsed.origin === 'https://api.onelinkai.cloud') {
-        const body =
-          req.method === 'GET' || req.method === 'HEAD'
-            ? undefined
-            : new Uint8Array(await req.arrayBuffer());
-        return fetch(`${onelinkServer.origin}${parsed.pathname}${parsed.search}`, {
-          method: req.method,
-          headers: req.headers,
-          ...(body !== undefined ? { body } : {}),
-          signal: req.signal,
-        });
-      }
-      throw new Error(`WORKER_EXTERNAL_FORBIDDEN:${parsed.origin}`);
-    };
-    const controlledPublicHttps: NonNullable<Parameters<typeof createImageWorker>[7]> = async (
-      url,
-      _signal,
-      consume,
-    ) => {
-      if (url.origin !== 'https://cdn.onelink-fixture.invalid') {
-        throw new Error(`UNEXPECTED_CDN_ORIGIN:${url.origin}`);
-      }
-      return consume(
-        new Response(new Uint8Array(pngSample), {
-          status: 200,
-          headers: {
-            'content-type': 'image/png',
-            'content-length': String(pngSample.length),
-          },
-        }),
-      );
-    };
-
-    const imageWorker = createImageWorker(
-      journal,
-      imageKeyId,
-      rsaKeys.privateKey,
-      materializeToCos,
-      workerFetch,
-      readImageFromCos,
-      undefined,
-      controlledPublicHttps,
-    );
-
-    let appBrokerUrl = 'amqp://unused-a:unused@127.0.0.1:1/unused';
-    let appBrokerUser = 'unused-a';
-    let expectedResultUser = 'unused-b';
-
-    const localBroker = await provisionLocalTestBroker('mio-conv-img');
-    if (localBroker) {
-      brokerMode = 'rabbitmq';
-      cleanupBrokerResources = () => localBroker.close();
-      appBrokerUrl = localBroker.appBrokerUrl;
-      appBrokerUser = localBroker.userA;
-      expectedResultUser = localBroker.userB;
-      const workerBrokerUrl = localBroker.workerBrokerUrl;
-
-      const workerBroker = await Broker.connect(
-        workerBrokerUrl,
-        localBroker.userB,
-        localBroker.userA,
-      );
-      const dummyVideoStore = {
-        async download() {},
-        async head() {
-          return null;
-        },
-        async verify() {
-          return false;
-        },
-        async upload() {
-          throw new Error('VIDEO_NOT_USED');
-        },
-      };
-      const workerInstance = new Worker(journal, dummyVideoStore, workerBroker, workerDir);
-      const imageStop = new AbortController();
-      const maintenance = new Maintenance(
-        workerBroker,
-        workerInstance,
-        () => {},
-        async (command, ack) => {
-          const outcome =
-            command.type === 'image.recover'
-              ? (
-                  await recoverImageMaterialization(
-                    journal,
-                    command.jobId,
-                    command.commandId,
-                    command.sequence,
-                    materializeToCos,
-                    imageStop.signal,
-                  )
-                ).outcome
-              : await imageWorker(command, imageStop.signal);
-          await workerBroker.publishImage({
-            version: 1,
-            type: 'image.result',
-            messageId: randomUUID(),
-            commandId:
-              command.type === 'image.recover' || command.type === 'image.query'
-                ? command.commandId
-                : command.messageId,
-            jobId: command.jobId,
-            state: outcome.state,
-            outputs: 'outputs' in outcome ? outcome.outputs : [],
-            ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
-            ...('upstreamTaskId' in outcome ? { upstreamTaskId: outcome.upstreamTaskId } : {}),
-            ...('queryAttempt' in outcome ? { queryAttempt: outcome.queryAttempt } : {}),
-            ...(command.type === 'image.recover' ? { recoveryId: command.messageId } : {}),
-          });
-          if (outcome.state === 'materializing') throw new Error('IMAGE_MATERIALIZATION_PENDING');
-          ack();
-        },
-      );
-      await maintenance.tick();
-      stopWorkerRuntime = async () => {
-        maintenance.stop();
-        workerInstance.stop();
-        imageStop.abort();
-        await workerBroker.close();
-        await maintenance.wait().catch(() => {});
-        await workerInstance.waitIdle();
-        journal.close();
-        await rm(workerDir, { recursive: true, force: true });
-      };
-    } else {
-      assert.equal(
-        process.env.GITHUB_ACTIONS,
-        'true',
-        'Local runs require a running local RabbitMQ container (mio-dev or mio-test)',
-      );
-      brokerMode = 'pg-outbox-ci';
-      const relayComputeStore = await createComputeStore(database.url, true);
-      const relayProviderCfg = readProviderConfig({
-        MIO_PROVIDERS_DATABASE_URL: database.url,
-        MIO_PROVIDERS_MASTER_KEY: masterKey,
-        MIO_PROVIDERS_MASTER_KEY_ID: masterKeyId,
-      })!;
-      const relayProviderStore = await createProviderStore(relayProviderCfg, true);
-      const relayProviders = createProviderService(relayProviderStore, relayProviderCfg);
-      let relayStopping = false;
-      const relayLoop = (async () => {
-        while (!relayStopping) {
-          const pending = await relayComputeStore.imagePending();
-          if (!pending) {
-            await delay(80);
-            continue;
-          }
-          let command = pending;
-          if (command.type === 'image.query' && !command.queryCredential && command.queryDeadline) {
-            const apiKey = await relayProviders.resolveImageTaskCredential(command.ownerId);
-            const queryCredential = sealImageKey(
-              apiKey,
-              imageQueryCredentialBinding(command),
-              imageKeyId,
-              rsaKeys.publicKey,
-            );
-            const prepared = await relayComputeStore.imagePrepareQuery(
-              command.jobId,
-              command.messageId,
-              command.queryDeadline,
-              queryCredential,
-            );
-            if (!prepared) continue;
-            command = prepared;
-          }
-          await relayComputeStore.imageSent(pending.jobId, pending.messageId);
-          if (command.type === 'image.recover') continue;
-          const outcome = await imageWorker(command);
-          const result = parseImageResult({
-            version: 1,
-            type: 'image.result',
-            messageId: randomUUID(),
-            commandId: command.type === 'image.query' ? command.commandId : command.messageId,
-            jobId: command.jobId,
-            state: outcome.state,
-            outputs: 'outputs' in outcome ? outcome.outputs : [],
-            ...('errorCode' in outcome ? { errorCode: outcome.errorCode } : {}),
-            ...('upstreamTaskId' in outcome ? { upstreamTaskId: outcome.upstreamTaskId } : {}),
-            ...('queryAttempt' in outcome ? { queryAttempt: outcome.queryAttempt } : {}),
-          });
-          const accepted = await relayComputeStore.imageAccept(result);
-          if (accepted && result.state === 'completed') {
-            const { admitted } = accepted;
-            if (
-              typeof admitted.providerConfigId === 'string' &&
-              typeof admitted.modelKey === 'string' &&
-              typeof admitted.credentialVersion === 'number' &&
-              typeof admitted.catalogVersion === 'number' &&
-              typeof admitted.adaptationVersion === 'number' &&
-              typeof admitted.profile === 'string'
-            ) {
-              await relayProviders.recordVerification(
-                { userId: accepted.ownerId },
-                {
-                  providerConfigId: admitted.providerConfigId,
-                  modelKey: admitted.modelKey,
-                  credentialVersion: admitted.credentialVersion,
-                  catalogVersion: admitted.catalogVersion,
-                  adaptationVersion: admitted.adaptationVersion,
-                  operation: 'image.generate',
-                  profile: admitted.profile,
-                },
-                `image:${result.jobId}`,
-              );
-            }
-          }
-        }
-      })();
-      stopWorkerRuntime = async () => {
-        relayStopping = true;
-        await relayLoop.catch(() => {});
-        await relayProviders.close();
-        await relayComputeStore.close();
-        journal.close();
-        await rm(workerDir, { recursive: true, force: true });
-      };
-    }
+    // The actual A executor runs inside the packed Profile; B and MQ stay unconfigured.
+    await observer.query(generationSchemaSQL);
 
     // Build and pack official Profile with temporary child-Profile overlay
     const profileDir = await mkdtemp(join(tmpdir(), 'mio-conv-img-profile-'));
@@ -1384,7 +1112,87 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     await mkdir(overlayDir);
     await cp(
       resolve('tests/conversations/conversation-image-overlay.ts'),
+      join(overlayDir, 'base.ts'),
+    );
+    await writeFile(
       join(overlayDir, 'index.ts'),
+      `
+import type { Context } from '@deepseek-ai/cordis';
+import COS from 'cos-nodejs-sdk-v5';
+import { PassThrough } from 'node:stream';
+import { Agent, MockAgent } from 'undici';
+import { apply as baseApply } from './base.ts';
+
+export function apply(ctx: Context) {
+  baseApply(ctx);
+  const realFetch = globalThis.fetch;
+  const cosOrigin = process.env.MIO_TEST_COS_ORIGIN!;
+  const originalPut = COS.prototype.putObject;
+  const originalGet = COS.prototype.getObject;
+  const originalDispatch = Agent.prototype.dispatch;
+  const fixtureAgent = new Agent();
+  fixtureAgent.dispatch = originalDispatch.bind(fixtureAgent);
+  const cdn = new MockAgent({ agent: fixtureAgent });
+  cdn.disableNetConnect();
+  cdn.get('https://cdn.onelink-fixture.invalid')
+    .intercept({ method: 'GET', path: /.*/ })
+    .reply(200, Buffer.from(process.env.MIO_TEST_RESULT_BASE64!, 'base64'), {
+      headers: { 'content-type': 'image/png' },
+    }).persist();
+
+  ctx.effect(() => {
+    Agent.prototype.dispatch = function (options, handler) {
+      if (String(options.origin) === 'https://cdn.onelink-fixture.invalid') {
+        return cdn.dispatch(options, handler);
+      }
+      throw new Error('UNEXPECTED_IMAGE_DOWNLOAD');
+    };
+    COS.prototype.putObject = (async function (params) {
+      const chunks: Buffer[] = [];
+      const body = Buffer.isBuffer(params.Body) ? [params.Body] : params.Body;
+      for await (const chunk of body) chunks.push(Buffer.from(chunk));
+      const response = await realFetch(cosOrigin + '/object/' + encodeURIComponent(params.Key), {
+        method: 'PUT',
+        headers: {
+          'content-type': params.ContentType,
+          'content-md5': params.Headers?.['Content-MD5'] ?? '',
+          'x-cos-forbid-overwrite': params.Headers?.['x-cos-forbid-overwrite'] ?? '',
+        },
+        body: Buffer.concat(chunks),
+      });
+      if (!response.ok) throw Object.assign(new Error('COS_PUT_FAILED'), { statusCode: response.status });
+      return { statusCode: 200, ETag: response.headers.get('etag'), headers: {} };
+    }) as typeof COS.prototype.putObject;
+    COS.prototype.getObject = (function (params, callback) {
+      const sender = new PassThrough();
+      sender.on('error', () => {});
+      sender.pipe(params.Output);
+      void realFetch(cosOrigin + '/object/' + encodeURIComponent(params.Key), {
+        headers: { 'if-match': params.IfMatch ?? '' },
+      }).then(async response => {
+        sender.emit('response', { statusCode: response.status });
+        if (!response.ok || !response.body) {
+          callback({ statusCode: response.status }, undefined);
+          sender.end();
+          return;
+        }
+        for await (const chunk of response.body) sender.write(Buffer.from(chunk));
+        sender.end();
+        callback(null, { statusCode: 200, headers: {} });
+      }).catch(error => {
+        sender.destroy(error);
+        callback(error, undefined);
+      });
+    }) as typeof COS.prototype.getObject;
+    return async () => {
+      COS.prototype.putObject = originalPut;
+      COS.prototype.getObject = originalGet;
+      Agent.prototype.dispatch = originalDispatch;
+      await cdn.close();
+    };
+  });
+}
+`,
     );
     await writeFile(
       join(overlayDir, 'package.json'),
@@ -1450,12 +1258,9 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             MIO_COS_REGION: 'ap-shanghai',
             MIO_COS_SECRET_ID: 'synthetic-cos-id',
             MIO_COS_SECRET_KEY: 'synthetic-cos-secret',
-            MIO_COMPUTE_ENABLED: 'true',
-            RABBITMQ_URL: appBrokerUrl,
-            MIO_COMPUTE_BROKER_USER: appBrokerUser,
-            MIO_COMPUTE_EXPECTED_RESULT_USER: expectedResultUser,
-            MIO_IMAGE_KEY_ID: imageKeyId,
-            MIO_IMAGE_PUBLIC_KEY: rsaKeys.publicKey,
+            MIO_GENERATIONS_ENABLED: 'true',
+            MIO_GENERATIONS_DATA_DIR: join(profileDir, 'generations'),
+            MIO_TEST_RESULT_BASE64: pngSample.toString('base64'),
             MIO_PROVIDERS_DATABASE_URL: database.url,
             MIO_PROVIDERS_MASTER_KEY: masterKey,
             MIO_PROVIDERS_MASTER_KEY_ID: masterKeyId,
@@ -1499,9 +1304,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     };
 
     await profileControl.start('database');
-    if (process.env.GITHUB_ACTIONS !== 'true') {
-      expect(brokerMode).toBe('rabbitmq');
-    }
 
     for (const [idx, label] of ['owner-zero', 'owner-one'].entries()) {
       const signup = await call(
@@ -1558,8 +1360,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     try {
       await profileControl?.close();
     } finally {
-      await stopWorkerRuntime?.().catch(() => {});
-      await cleanupBrokerResources?.().catch(() => {});
       await onelinkServer?.close().catch(() => {});
       await cosServer?.close().catch(() => {});
       await observer?.end().catch(() => {});
@@ -1708,7 +1508,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     turn1SeedJobId = String((turn1ToolFrames[0]!.data.job as { jobId: string }).jobId);
     turn1KlingJobId = String((turn1ToolFrames[1]!.data.job as { jobId: string }).jobId);
 
-    // Wait for Worker B to finish both jobs (sync Seedream + omitted-async Kling)
+    // Wait for A to finish both jobs (sync Seedream + omitted-async Kling)
     const [seedCompleted, klingCompleted] = await Promise.all([
       waitImageJobCompleted(turn1SeedJobId, 0),
       waitImageJobCompleted(turn1KlingJobId, 0),

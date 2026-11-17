@@ -28,7 +28,6 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { createComputeHandler } from '../../src/compute/http.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
-import { createComputeService } from '../../src/compute/service.ts';
 import { ComputeStore } from '../../src/compute/store.ts';
 import { Journal } from '../../compute/src/adapters/journal.ts';
 import { createImageWorker, recoverImageMaterialization } from '../../compute/src/image-worker.ts';
@@ -295,9 +294,8 @@ it('processes 15 concurrent image jobs without head-of-line blocking or quota st
     }
 
     const { Broker } = await import('../../compute/src/adapters/rabbitmq.ts');
-    const { createComputeService: createDynamicComputeService } = existsSync(resolve('.env.test'))
-      ? { createComputeService }
-      : await import('../../src/compute/service.ts');
+    const { createComputeService: createDynamicComputeService } =
+      await import('../../src/compute/service.ts');
 
     const ownerId = `owner-${randomUUID()}`;
     const videoAssetId = randomUUID();

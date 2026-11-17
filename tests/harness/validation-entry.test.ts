@@ -165,37 +165,89 @@ it('returns failure when interrupted and cleans its fixture group', async () => 
   }
 }, 30000);
 
-it('allows the unchanged full command sequence only in the Actions fixture', async () => {
+it('allows an unscoped test run only in Actions while still enforcing explicit scopes there', async () => {
   const root = await fixture();
   const full = await finish(start(root, ['test'], { GITHUB_ACTIONS: 'true' }));
   expect(full.code, full.output).toBe(0);
   expect(await marker(root)).toEqual(['extra', 'main', 'prefix', 'worker']);
   await rm(join(root, 'marker'));
+  const scoped = await finish(
+    start(root, ['test', 'tests/auth/main.test.ts'], { GITHUB_ACTIONS: 'true' }),
+  );
+  expect(scoped.code, scoped.output).toBe(0);
+  expect(await marker(root)).toEqual(['main']);
+  await rm(join(root, 'marker'));
+  const invalid = await finish(start(root, ['test', 'tests'], { GITHUB_ACTIONS: 'true' }));
+  expect(invalid.code, invalid.output).not.toBe(0);
+  expect(await marker(root)).toEqual([]);
+});
+
+it('runs the static sequence locally and gates the full sequence to Actions', async () => {
+  const root = await fixture();
   const pkg = JSON.parse(await readFile(resolve('package.json'), 'utf8')) as {
-    scripts: { check: string };
+    scripts: { check: string; 'check:static': string };
   };
   await writeFile(
     join(root, 'pnpm'),
-    `#!${process.execPath}\nrequire('node:fs').appendFileSync(process.env.MARKER, process.argv[2] + '\\n');\n`,
+    `#!${process.execPath}
+const step = process.argv[2];
+require('node:fs').appendFileSync(process.env.MARKER, step + '\\n');
+if (process.env.FAIL_AT === step) process.exit(9);
+if (step === 'check:static') {
+  const result = require('node:child_process').spawnSync(
+    '/bin/sh', ['-c', ${JSON.stringify(pkg.scripts['check:static'])}],
+    { stdio: 'inherit', env: process.env },
+  );
+  process.exit(result.status ?? 1);
+}
+`,
     { mode: 0o700 },
   );
-  const command = (env: NodeJS.ProcessEnv) =>
-    spawn('/bin/sh', ['-c', pkg.scripts.check], {
+  const command = (script: string, env: NodeJS.ProcessEnv) =>
+    spawn('/bin/sh', ['-c', script], {
       cwd: root,
       env: {
         ...process.env,
         MARKER: join(root, 'marker'),
         PATH: `${root}:${process.env.PATH}`,
+        GITHUB_ACTIONS: '',
+        FAIL_AT: '',
         ...env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-  const local = await finish(command({ GITHUB_ACTIONS: '', CI: 'true' }));
+  const staticLocal = await finish(command(pkg.scripts['check:static'], {}));
+  expect(staticLocal.code, staticLocal.output).toBe(0);
+  expect(await readFile(join(root, 'marker'), 'utf8')).toBe(
+    'format:check\ntypecheck\nlint\nguard\nbuild\n',
+  );
+  await rm(join(root, 'marker'));
+  const staticFailure = await finish(command(pkg.scripts['check:static'], { FAIL_AT: 'lint' }));
+  expect(staticFailure.code, staticFailure.output).not.toBe(0);
+  expect(await readFile(join(root, 'marker'), 'utf8')).toBe('format:check\ntypecheck\nlint\n');
+  await rm(join(root, 'marker'));
+  const local = await finish(command(pkg.scripts.check, { CI: 'true' }));
   expect(local.code, local.output).not.toBe(0);
   expect(await marker(root)).toEqual([]);
-  const actions = await finish(command({ GITHUB_ACTIONS: 'true' }));
+  const actions = await finish(command(pkg.scripts.check, { GITHUB_ACTIONS: 'true' }));
   expect(actions.code, actions.output).toBe(0);
   expect(await readFile(join(root, 'marker'), 'utf8')).toBe(
-    'format:check\ntypecheck\nlint\nguard\ntest\nbuild\ntest:smoke\n',
+    'check:static\nformat:check\ntypecheck\nlint\nguard\nbuild\ntest\ntest:smoke\n',
+  );
+  await rm(join(root, 'marker'));
+  const fullStaticFailure = await finish(
+    command(pkg.scripts.check, { GITHUB_ACTIONS: 'true', FAIL_AT: 'guard' }),
+  );
+  expect(fullStaticFailure.code, fullStaticFailure.output).not.toBe(0);
+  expect(await readFile(join(root, 'marker'), 'utf8')).toBe(
+    'check:static\nformat:check\ntypecheck\nlint\nguard\n',
+  );
+  await rm(join(root, 'marker'));
+  const testFailure = await finish(
+    command(pkg.scripts.check, { GITHUB_ACTIONS: 'true', FAIL_AT: 'test' }),
+  );
+  expect(testFailure.code, testFailure.output).not.toBe(0);
+  expect(await readFile(join(root, 'marker'), 'utf8')).toBe(
+    'check:static\nformat:check\ntypecheck\nlint\nguard\nbuild\ntest\n',
   );
 }, 20000);

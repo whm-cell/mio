@@ -69,7 +69,8 @@
     "start:dev": "node scripts/service/local.ts dev start",
     "start:test": "node scripts/service/local.ts test start",
     "check:local": "node scripts/harness/validation-entry.ts local",
-    "check": "node scripts/harness/validation-entry.ts check && pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm test && pnpm build && pnpm test:smoke"
+    "check:static": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm guard && pnpm build",
+    "check": "node scripts/harness/validation-entry.ts check && pnpm check:static && pnpm test && pnpm test:smoke"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0"

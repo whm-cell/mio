@@ -103,7 +103,7 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, ['scripts/service/start.ts'], runtime);
     return;
   }
-  if (action === 'generations-preflight' && args.every((arg) => arg === '--probe-cos')) {
+  if (action === 'generations-preflight') {
     await run(process.execPath, ['scripts/service/generation-cutover.ts', ...args], {
       ...values,
       ...runtime,

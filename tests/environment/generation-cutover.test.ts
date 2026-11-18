@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -49,13 +49,13 @@ async function fixture() {
   return { pool, directory };
 }
 
-function healthyPreflight(dataDirectory: string) {
+function healthyPreflight(dataDirectory: string, environment: 'dev' | 'test' = 'test') {
   vi.stubGlobal('fetch', async (input: string, init?: RequestInit) => {
     if (input === probeUrl && init?.method === 'PUT' && Buffer.isBuffer(init.body)) {
       probeBytes = Buffer.from(init.body);
       return new Response(null, { headers: { etag: probeEtag } });
     }
-    if (input.startsWith('http://127.0.0.1:15672/api/queues/mio-test/'))
+    if (input.startsWith(`http://127.0.0.1:15672/api/queues/mio-${environment}/`))
       return Response.json({ messages: 0, consumers: 0 });
     throw new Error('Unexpected preflight request');
   });
@@ -68,7 +68,7 @@ function healthyPreflight(dataDirectory: string) {
       MIO_COS_REGION: 'ap-beijing',
       MIO_COS_SECRET_ID: 'fixture-id',
       MIO_COS_SECRET_KEY: 'fixture-key',
-      MIO_ENVIRONMENT: 'test',
+      MIO_ENVIRONMENT: environment,
       MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT: '15672',
       MIO_LOCAL_RABBITMQ_PASSWORD: 'fixture-broker',
     },
@@ -247,6 +247,26 @@ it('reconciles a historical partial against the exact surviving original output 
       )
     ).rows,
   ).toEqual([{ output_index: 0 }, { output_index: 2 }]);
+
+  const invalidKey = last.output.key.replace(last.fileId, 'not-a-file-id');
+  await pool.query('UPDATE mio_assets SET raw_key=$1 WHERE raw_key=$2', [
+    invalidKey,
+    last.output.key,
+  ]);
+  const malformed = writeJournal(join(directory, 'noncanonical-key.sqlite3'), [
+    {
+      jobId,
+      payload: {
+        ...payload,
+        outputs: [first.output, { ...last.output, key: invalidKey }],
+        attemptedFileIds: { 0: [first.fileId], 2: ['not-a-file-id'] },
+      },
+    },
+  ]);
+  expect(await inspectGenerationCutover(pool, { ...options, journal: malformed })).toMatchObject({
+    blockers: ['LEGACY_IMAGE_PARTIALS_UNRECONCILED'],
+    readyForCutover: false,
+  });
 });
 
 it('distinguishes a proven empty terminal result from one with an unconfirmed upload', async () => {
@@ -299,6 +319,162 @@ it('reads legacy plain-text rejections in the same journal as a proven partial',
   expect(await inspectGenerationCutover(pool, { ...options, journal: damaged })).toMatchObject({
     journal: 'unreadable',
     blockers: ['LEGACY_IMAGE_JOURNAL_UNREADABLE'],
+    readyForCutover: false,
+  });
+});
+
+it('recognizes an explicit disposition of exactly one legacy upload in local dev', async () => {
+  const { pool, directory } = await fixture();
+  const { jobId, commandId } = await addSettledJob(pool, 'partial');
+  const fileId = randomUUID();
+  const payload = JSON.stringify({
+    commandId,
+    expectedCount: 1,
+    outputs: [],
+    attemptedFileIds: { 0: [fileId] },
+  });
+  const journal = writeJournal(join(directory, 'disposition-journal.sqlite3'), [
+    { jobId, payload },
+  ]);
+  const options = { ...healthyPreflight(directory, 'dev'), journal };
+  const disposition = {
+    decision: 'abandon-unconfirmed-upload',
+    jobId,
+    commandId,
+    index: 0,
+    fileId,
+    journalPayloadSha256: createHash('sha256').update(payload).digest('hex'),
+    acceptedAt: '2026-11-18T02:00:00Z',
+    acceptedBy: 'test operator',
+    reason: 'Source bytes unavailable after checking the known object identity and backups.',
+  };
+  const legacyPartialDispositionFile = join(directory, 'disposition.json');
+  await writeFile(legacyPartialDispositionFile, JSON.stringify(disposition), { mode: 0o600 });
+  expect(await inspectGenerationCutover(pool, options)).toMatchObject({
+    acceptedLegacyUpload: null,
+    blockers: ['LEGACY_IMAGE_UPLOADS_REQUIRE_RECONCILIATION'],
+    readyForCutover: false,
+  });
+  expect(
+    await inspectGenerationCutover(pool, { ...options, legacyPartialDispositionFile }),
+  ).toMatchObject({
+    acceptedLegacyUpload: disposition,
+    blockers: [],
+    readyForCutover: true,
+  });
+  expect((await pool.query('SELECT state FROM mio_image_jobs WHERE id=$1', [jobId])).rows).toEqual([
+    { state: 'partial' },
+  ]);
+  const readonlyJournal = new DatabaseSync(journal, { readOnly: true });
+  try {
+    expect(
+      readonlyJournal.prepare('SELECT payload FROM image_attempts WHERE job_id=?').get(jobId)
+        ?.payload,
+    ).toBe(payload);
+  } finally {
+    readonlyJournal.close();
+  }
+
+  const wrongFile = join(directory, 'wrong-attempt.json');
+  await writeFile(wrongFile, JSON.stringify({ ...disposition, fileId: randomUUID() }), {
+    mode: 0o600,
+  });
+  const stale = writeJournal(join(directory, 'stale-journal.sqlite3'), [
+    { jobId, payload: `${payload}\n` },
+  ]);
+  for (const [name, override] of Object.entries({
+    wrongAttempt: { legacyPartialDispositionFile: wrongFile },
+    stale: { journal: stale },
+  })) {
+    expect(
+      await inspectGenerationCutover(pool, {
+        ...options,
+        legacyPartialDispositionFile,
+        ...override,
+      }),
+      name,
+    ).toMatchObject({
+      acceptedLegacyUpload: null,
+      blockers: [
+        'LEGACY_IMAGE_UPLOADS_REQUIRE_RECONCILIATION',
+        'LEGACY_IMAGE_PARTIAL_DISPOSITION_UNMATCHED',
+      ],
+      readyForCutover: false,
+    });
+  }
+  const { journal: oldJournal, ...withoutJournal } = options;
+  expect(oldJournal).toBe(journal);
+  expect(
+    await inspectGenerationCutover(pool, { ...withoutJournal, legacyPartialDispositionFile }),
+  ).toMatchObject({
+    acceptedLegacyUpload: null,
+    blockers: ['LEGACY_IMAGE_PARTIALS_UNRECONCILED', 'LEGACY_IMAGE_PARTIAL_DISPOSITION_UNMATCHED'],
+    readyForCutover: false,
+  });
+  expect(
+    await inspectGenerationCutover(pool, {
+      ...healthyPreflight(directory),
+      journal,
+      legacyPartialDispositionFile,
+    }),
+  ).toMatchObject({
+    acceptedLegacyUpload: null,
+    blockers: [
+      'LEGACY_IMAGE_PARTIAL_DISPOSITION_DEV_ONLY',
+      'LEGACY_IMAGE_UPLOADS_REQUIRE_RECONCILIATION',
+    ],
+    readyForCutover: false,
+  });
+});
+
+it('keeps unrelated unknown uploads blocked when one legacy upload is disposed', async () => {
+  const { pool, directory } = await fixture();
+  const { jobId, commandId } = await addSettledJob(pool, 'partial');
+  const other = await addSettledJob(pool, 'partial');
+  const fileId = randomUUID();
+  const payload = JSON.stringify({
+    commandId,
+    expectedCount: 1,
+    outputs: [],
+    attemptedFileIds: { 0: [fileId] },
+  });
+  const journal = writeJournal(join(directory, 'other-unknown.sqlite3'), [
+    { jobId, payload },
+    {
+      jobId: other.jobId,
+      payload: {
+        commandId: other.commandId,
+        expectedCount: 1,
+        outputs: [],
+        attemptedFileIds: { 0: [randomUUID()] },
+      },
+    },
+  ]);
+  const legacyPartialDispositionFile = join(directory, 'disposition.json');
+  await writeFile(
+    legacyPartialDispositionFile,
+    JSON.stringify({
+      decision: 'abandon-unconfirmed-upload',
+      jobId,
+      commandId,
+      index: 0,
+      fileId,
+      journalPayloadSha256: createHash('sha256').update(payload).digest('hex'),
+      acceptedAt: '2026-11-18T02:00:00Z',
+      acceptedBy: 'test operator',
+      reason: 'Source unavailable.',
+    }),
+    { mode: 0o600 },
+  );
+  expect(
+    await inspectGenerationCutover(pool, {
+      ...healthyPreflight(directory, 'dev'),
+      journal,
+      legacyPartialDispositionFile,
+    }),
+  ).toMatchObject({
+    acceptedLegacyUpload: { jobId, fileId },
+    blockers: ['LEGACY_IMAGE_UPLOADS_REQUIRE_RECONCILIATION'],
     readyForCutover: false,
   });
 });

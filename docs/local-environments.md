@@ -148,6 +148,8 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 
 旧 B 的 `partial` 要与 journal 完成记录中的任务、命令和请求数量对账，并逐项核对 PG 已登记产物的原序号、对象键、类型和大小。早期数组载荷需要至少一项能与 PG 核对的实际产物，且所有产物都要一致。journal 缺失、缺少对应终态记录或证据不符时，预检报告 `LEGACY_IMAGE_PARTIALS_UNRECONCILED` 并停止切换。已对账的旧部分结果保留 `partial` 状态，未确认上传仍单独阻断。仅有已确认的完整旧历史或 A 自有任务时，继续核对其余门禁。
 
+本地 dev 的项目负责人明确决定放弃某笔旧 `partial` 的未确认上传后，可用 `node scripts/service/local.ts dev generations-preflight --legacy-partial-disposition <file>` 提交单笔决定。把来源核对和人类决定保存在私有证据中，并将决定存为权限 `0600` 的 JSON 对象。字段包括 `decision` 固定为 `abandon-unconfirmed-upload`，任务、旧命令和上传标识 `jobId`、`commandId`、`index`、`fileId`，旧 SQLite `image_attempts.payload` UTF-8 文本的 `journalPayloadSha256`，以及确认人 `acceptedBy`、时间 `acceptedAt` 和依据 `reason`。预检只为与原 PG `partial` 和旧 journal 完成记录一致的单个未确认上传报告 `acceptedLegacyUpload`。原状态、任务、上传记录和旧 journal 继续保留，其他切换条件照常核对。后续独立业务请求的结果另行关联原决定。
+
 `generations-preflight --probe-cos` 显式在 A 现有 COS 身份范围内写入一个唯一小 PNG，再 HEAD/条件读取并核对原始字节。探针对象保留在报告的唯一键供对账，不自动删除；此选项验证实际写读权限。没有 COS 探针证据的只读预检保持不就绪。旧 unknown、未确认上传/消息、缺失恢复文件或权限不足均阻止切换，不能把失败标为已排空。
 
 预检不停止进程、不消费/清空队列、不接受或重跑任务。操作者逐项处理阻断并确认旧进程已不再发送生成 POST 后，才启动 A 图片执行器。新链路及历史读取验证后恢复接单，再退役图片专用队列和 RSA 密钥；视频队列、B 重媒体 journal、历史任务表及旧恢复原件保留。A 尚无新任务时可回旧版本；存在 A 新任务时先对账，不把任务交旧 B 重跑。

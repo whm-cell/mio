@@ -1,11 +1,13 @@
 import { constants } from 'node:fs';
-import { access, lstat } from 'node:fs/promises';
+import { access, lstat, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
+import { isUuidV4 } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import { readAssetConfig, readAssetDatabaseURL } from '../../src/assets/config.ts';
+import { imageOutputIndex } from '../../src/generations/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 
 const legacyPlainRejections = new Set([
@@ -31,6 +33,45 @@ type LegacyPartial = {
   expectedCount: number | null;
   outputs: (Omit<LegacyOutput, 'key'> & { index: number; key: string | null })[];
 };
+type LegacyPartialDisposition = {
+  decision: 'abandon-unconfirmed-upload';
+  jobId: string;
+  commandId: string;
+  index: number;
+  fileId: string;
+  journalPayloadSha256: string;
+  acceptedBy: string;
+  acceptedAt: string;
+  reason: string;
+};
+
+async function readLegacyPartialDisposition(file: string): Promise<LegacyPartialDisposition> {
+  const stat = await lstat(file);
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > 8192)
+    throw new Error('LEGACY_IMAGE_PARTIAL_DISPOSITION_INVALID');
+  const value = JSON.parse(await readFile(file, 'utf8')) as LegacyPartialDisposition;
+  if (
+    !value ||
+    Object.keys(value).length !== 9 ||
+    value.decision !== 'abandon-unconfirmed-upload' ||
+    !isUuidV4(value.jobId) ||
+    !isUuidV4(value.commandId) ||
+    !isUuidV4(value.fileId) ||
+    !Number.isInteger(value.index) ||
+    value.index < 0 ||
+    value.index > 15 ||
+    typeof value.journalPayloadSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.journalPayloadSha256) ||
+    typeof value.acceptedBy !== 'string' ||
+    !value.acceptedBy.trim() ||
+    typeof value.acceptedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.acceptedAt)) ||
+    typeof value.reason !== 'string' ||
+    !value.reason.trim()
+  )
+    throw new Error('LEGACY_IMAGE_PARTIAL_DISPOSITION_INVALID');
+  return value;
+}
 
 function matchesLegacyPartial(
   partial: LegacyPartial,
@@ -62,7 +103,8 @@ function matchesLegacyPartial(
     return (
       index >= 0 &&
       index < expectedCount &&
-      key?.startsWith(`mio/derived/${partial.id}/images/${index}-`) &&
+      key !== null &&
+      imageOutputIndex(partial.id, key, contentType) === index &&
       recorded?.key === key &&
       recorded.sizeBytes === sizeBytes &&
       recorded.contentType === contentType
@@ -72,9 +114,28 @@ function matchesLegacyPartial(
 
 export async function inspectGenerationCutover(
   pool: Pool,
-  options: { dataDirectory: string; journal?: string; env: NodeJS.ProcessEnv; probeCos?: boolean },
+  options: {
+    dataDirectory: string;
+    journal?: string;
+    env: NodeJS.ProcessEnv;
+    probeCos?: boolean;
+    legacyPartialDispositionFile?: string;
+  },
 ) {
   const blockers: string[] = [];
+  let disposition: LegacyPartialDisposition | undefined;
+  let acceptedLegacyUpload: LegacyPartialDisposition | null = null;
+  if (options.legacyPartialDispositionFile) {
+    if (options.env.MIO_ENVIRONMENT !== 'dev')
+      blockers.push('LEGACY_IMAGE_PARTIAL_DISPOSITION_DEV_ONLY');
+    else {
+      try {
+        disposition = await readLegacyPartialDisposition(options.legacyPartialDispositionFile);
+      } catch {
+        blockers.push('LEGACY_IMAGE_PARTIAL_DISPOSITION_INVALID');
+      }
+    }
+  }
   const counts = (
     await pool.query<{
       legacy: number;
@@ -151,15 +212,26 @@ export async function inspectGenerationCutover(
           const saved = JSON.parse(row.payload) as LegacyJournalPayload | LegacyOutput[];
           const jobId = String(row.job_id);
           const partial = unmatchedPartials.get(jobId);
-          if (partial && row.phase === 'completed' && matchesLegacyPartial(partial, saved))
-            unmatchedPartials.delete(jobId);
+          const matched =
+            partial && row.phase === 'completed' && matchesLegacyPartial(partial, saved);
+          if (matched) unmatchedPartials.delete(jobId);
           if (Array.isArray(saved)) continue;
           for (const [index, attempts] of Object.entries(saved.attemptedFileIds ?? {})) {
             if (saved.invalidIndices?.includes(Number(index))) continue;
             for (const id of attempts) {
               const prefix = `mio/derived/${jobId}/images/${index}-${id}.`;
-              if (!saved.outputs?.some((output) => output.key.startsWith(prefix)))
-                uncertainUploads++;
+              if (saved.outputs?.some((output) => output.key.startsWith(prefix))) continue;
+              if (
+                matched &&
+                disposition?.jobId === jobId &&
+                disposition.commandId === saved.commandId &&
+                String(disposition.index) === index &&
+                disposition.fileId === id &&
+                disposition.journalPayloadSha256 ===
+                  createHash('sha256').update(row.payload).digest('hex')
+              )
+                acceptedLegacyUpload = disposition;
+              else uncertainUploads++;
             }
           }
         }
@@ -179,6 +251,8 @@ export async function inspectGenerationCutover(
   if (journal === 'absent' && counts.legacyUnfinished > 0)
     blockers.push('LEGACY_IMAGE_RECOVERY_DATA_MISSING');
   if (unmatchedPartials.size > 0) blockers.push('LEGACY_IMAGE_PARTIALS_UNRECONCILED');
+  if (disposition && !acceptedLegacyUpload)
+    blockers.push('LEGACY_IMAGE_PARTIAL_DISPOSITION_UNMATCHED');
   const queues: { name: string; messages: number; consumers: number }[] = [];
   const managementPort = options.env.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT;
   if (managementPort && options.env.MIO_LOCAL_RABBITMQ_PASSWORD && options.env.MIO_ENVIRONMENT) {
@@ -272,6 +346,7 @@ export async function inspectGenerationCutover(
     counts,
     outbox,
     journal,
+    acceptedLegacyUpload,
     queues,
     directory,
     cos,
@@ -284,11 +359,27 @@ export async function inspectGenerationCutover(
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const args = process.argv.slice(2);
-  if (args.some((arg) => arg !== '--probe-cos'))
-    throw new Error('Usage: generations:preflight [--probe-cos]');
+  const usage = 'Usage: generations:preflight [--probe-cos] [--legacy-partial-disposition <file>]';
+  let probeCos = false;
+  let legacyPartialDispositionFile: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--probe-cos') probeCos = true;
+    else if (arg === '--legacy-partial-disposition' && !legacyPartialDispositionFile) {
+      const file = args[++index];
+      if (!file || file.startsWith('--')) throw new Error(usage);
+      legacyPartialDispositionFile = resolve(file);
+    } else throw new Error(usage);
+  }
   const databaseURL = readAssetDatabaseURL();
   const dataDirectory = process.env.MIO_GENERATIONS_DATA_DIR;
   if (!databaseURL || !dataDirectory) throw new Error('GENERATION_PREFLIGHT_CONFIG_REQUIRED');
+  if (
+    legacyPartialDispositionFile &&
+    (process.env.MIO_ENVIRONMENT !== 'dev' ||
+      !['127.0.0.1', 'localhost', '[::1]'].includes(new URL(databaseURL).hostname))
+  )
+    throw new Error('LEGACY_IMAGE_PARTIAL_DISPOSITION_DEV_ONLY');
   const pool = new Pool({ connectionString: databaseURL, connectionTimeoutMillis: 5000 });
   try {
     const workerDirectory =
@@ -296,8 +387,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const report = await inspectGenerationCutover(pool, {
       dataDirectory: resolve(dataDirectory),
       env: process.env,
-      probeCos: args.includes('--probe-cos'),
+      probeCos,
       ...(workerDirectory ? { journal: resolve(workerDirectory, 'journal.sqlite3') } : {}),
+      ...(legacyPartialDispositionFile ? { legacyPartialDispositionFile } : {}),
     });
     console.log(JSON.stringify(report, null, 2));
     process.exitCode = report.readyForCutover ? 0 : 1;

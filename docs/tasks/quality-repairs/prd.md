@@ -20,9 +20,9 @@
 
 ### Q02 OpenAI 同步图片出站字段
 
-- **C0** 核对原厂路径、冻结路由和生成／编辑字段。OpenAI Images 的 JSON 生成只接收文本输入，编辑使用 multipart；参考图生成交给承担该能力的驱动。[OneLink 集成](../../integrations/onelink.md) · [供应商路由 PRD](../onelink-vendor-routing/prd.md)
-- **C1** 按操作白名单构造字段；拒绝 OpenAI 生成请求的参考图组合。覆盖已持久路由和任务中的纯文本生成及 multipart 编辑。
-- **接受** 捕获普通生成、有参考图的编辑及受支持驱动的参考图生成请求，核对路径、允许字段、图片字节与顺序。出站媒体字段仅含原厂协议允许的数据，OpenAI 生成带参考图时为 0 次上游 POST。
+- **C0** 核对冻结路由和出站协议。OpenAI Images 的 JSON 生成只接收模型、提示词及支持的标量选项；兼容网关的 `aspect_ratio` 取冻结动态路由显式允许的值。编辑使用 multipart，参考图生成交给承担该能力的驱动。[图片 API](../../apis/compute.md#post-apiv1computeimages) · [OneLink 集成](../../integrations/onelink.md) · [供应商路由 PRD](../onelink-vendor-routing/prd.md)
+- **C1** 按操作白名单构造出站字段；拒绝 OpenAI 生成请求的参考图组合。覆盖已持久路由和任务中的纯文本生成及 multipart 编辑。
+- **接受** 在受控传输中核对普通生成、参考图编辑和受支持驱动的参考图生成请求，验证路径、允许的标量字段、显式许可的 `aspect_ratio`、图片字节与顺序。内部媒体元数据无出站，OpenAI 生成带参考图时模拟上游 POST 计数为零。
 
 ### Q03 参考图与遮罩签名先于 submitting
 

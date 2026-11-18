@@ -1,5 +1,5 @@
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import {
   readLocalEnvironment,
 } from '../../scripts/service/local-environment.ts';
 import { localWorkerEnvironment } from '../../scripts/service/local-compute-environment.ts';
+import { readAssetConfig } from '../../src/assets/config.ts';
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -216,6 +217,62 @@ it('shares local COS settings while keeping B broker, journal and other credenti
     await expect(readLocalEnvironment('test', root, {})).rejects.toThrow('LOCAL_COMPUTE_IDENTITY');
   }
 });
+
+it.each(['empty', 'omitted'] as const)(
+  'honors an %s COS session token in A and B',
+  async (mode) => {
+    const root = await fixture();
+    const file = join(root, '.env.test');
+    const hasEmptyToken = mode === 'empty';
+    await writeFile(
+      file,
+      [
+        await readFile(file, 'utf8'),
+        'MIO_ASSETS_DATABASE_URL=postgresql://local/assets',
+        'MIO_COS_BUCKET=test-bucket-1234',
+        'MIO_COS_REGION=ap-beijing',
+        'MIO_COS_SECRET_ID=fixture-id',
+        'MIO_COS_SECRET_KEY=fixture-key',
+        ...(hasEmptyToken ? ['MIO_COS_SESSION_TOKEN='] : []),
+        '',
+      ].join('\n'),
+    );
+    const environment = await readLocalEnvironment('test', root, { PATH: process.env.PATH });
+    if (hasEmptyToken) expect(() => readAssetConfig(environment.runtime)).toThrow('ASSET_CONFIG');
+    else expect(readAssetConfig(environment.runtime)).toMatchObject({ secretId: 'fixture-id' });
+
+    // Stop at the actual Worker storage constructor before opening its journal or RabbitMQ.
+    const storage = `export default class {
+  constructor(options) {
+    process.stdout.write(Object.hasOwn(options, 'SecurityToken') ? 'COS_WITH_TOKEN' : 'COS_WITHOUT_TOKEN');
+    throw new Error('fixture: stop before networking');
+  }
+}`;
+    const trap = `import { registerHooks } from 'node:module';
+registerHooks({
+  resolve(specifier, context, next) {
+    if (specifier === 'cos-nodejs-sdk-v5')
+      return { url: 'data:text/javascript;base64,${Buffer.from(storage).toString('base64')}', shortCircuit: true };
+    return next(specifier, context);
+  }
+});`;
+    const worker = localWorkerEnvironment('test', environment.values, environment.host, root);
+    const child = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        `data:text/javascript;base64,${Buffer.from(trap).toString('base64')}`,
+        'compute/src/main.ts',
+        'start',
+      ],
+      { env: worker, encoding: 'utf8', timeout: 5000 },
+    );
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(1);
+    expect(child.stdout).toBe(hasEmptyToken ? '' : 'COS_WITHOUT_TOKEN');
+    expect(worker.MIO_COS_SESSION_TOKEN).toBe(hasEmptyToken ? '' : undefined);
+  },
+);
 
 it('rejects a swapped file or cross-environment connection before starting a service or migration', async () => {
   const root = await fixture();

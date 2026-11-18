@@ -89,7 +89,7 @@ export function localWorkerEnvironment(
         'MIO_COS_SECRET_KEY',
         'MIO_COS_SESSION_TOKEN',
       ]
-        .filter((key) => values[key])
+        .filter((key) => values[key] !== undefined)
         .map((key) => [key, values[key]]),
     ),
   };

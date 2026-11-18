@@ -8,6 +8,68 @@ import { Pool } from 'pg';
 import { readAssetConfig, readAssetDatabaseURL } from '../../src/assets/config.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 
+const legacyPlainRejections = new Set([
+  'IMAGE_INPUT_INVALID',
+  'IMAGE_AUTH',
+  'IMAGE_LIMITED',
+  'IMAGE_REJECTED',
+  'IMAGE_HANDLER_UNAVAILABLE',
+  'IMAGE_CREDENTIAL_UNAVAILABLE',
+]);
+
+type LegacyOutput = { key: string; sizeBytes: number; contentType: string };
+type LegacyJournalPayload = {
+  commandId?: string;
+  expectedCount?: number;
+  attemptedFileIds?: Record<string, string[]>;
+  invalidIndices?: number[];
+  outputs?: LegacyOutput[];
+};
+type LegacyPartial = {
+  id: string;
+  commandId: string | null;
+  expectedCount: number | null;
+  outputs: (Omit<LegacyOutput, 'key'> & { index: number; key: string | null })[];
+};
+
+function matchesLegacyPartial(
+  partial: LegacyPartial,
+  saved: LegacyJournalPayload | LegacyOutput[],
+) {
+  const { expectedCount } = partial;
+  if (expectedCount === null || !Number.isSafeInteger(expectedCount)) return false;
+  const outputs = Array.isArray(saved) ? saved : saved.outputs;
+  if (
+    !Array.isArray(outputs) ||
+    outputs.length !== partial.outputs.length ||
+    outputs.length >= expectedCount
+  )
+    return false;
+  if (Array.isArray(saved)) {
+    // The oldest completed payload was just an array; only its actual object keys bind it to PG.
+    if (outputs.length === 0) return false;
+  } else if (
+    typeof partial.commandId !== 'string' ||
+    !partial.commandId ||
+    saved.commandId !== partial.commandId ||
+    saved.expectedCount !== expectedCount
+  )
+    return false;
+
+  // B recorded terminal outputs in source index order, including gaps in a partial result.
+  return partial.outputs.every(({ index, key, sizeBytes, contentType }, position) => {
+    const recorded = outputs[position];
+    return (
+      index >= 0 &&
+      index < expectedCount &&
+      key?.startsWith(`mio/derived/${partial.id}/images/${index}-`) &&
+      recorded?.key === key &&
+      recorded.sizeBytes === sizeBytes &&
+      recorded.contentType === contentType
+    );
+  });
+}
+
 export async function inspectGenerationCutover(
   pool: Pool,
   options: { dataDirectory: string; journal?: string; env: NodeJS.ProcessEnv; probeCos?: boolean },
@@ -31,6 +93,21 @@ export async function inspectGenerationCutover(
   ).rows[0]!;
   if (counts.legacyUnfinished > 0) blockers.push('LEGACY_IMAGE_TASKS_UNRECONCILED');
   if (counts.aUnfinished > 0) blockers.push('A_GENERATION_TASKS_UNRECONCILED');
+  const { rows: legacyPartials } = await pool.query<LegacyPartial>(`SELECT
+    j.id, j.command->'messageId' AS "commandId",
+    CASE WHEN jsonb_typeof(j.command->'input')='object'
+      THEN COALESCE(j.command#>'{input,n}', '1'::jsonb) END AS "expectedCount",
+    COALESCE(jsonb_agg(jsonb_build_object(
+      'index', o.output_index,
+      'key', CASE WHEN a.owner_id=j.owner_id AND a.state='ready' THEN a.raw_key END,
+      'sizeBytes', a.size_bytes, 'contentType', a.content_type
+    ) ORDER BY o.output_index) FILTER (WHERE o.job_id IS NOT NULL), '[]'::jsonb) AS outputs
+    FROM mio_image_jobs j
+    LEFT JOIN mio_image_outputs o ON o.job_id=j.id
+    LEFT JOIN mio_assets a ON a.id=o.asset_id
+    WHERE j.state='partial' AND NOT EXISTS (SELECT 1 FROM mio_image_executions e WHERE e.job_id=j.id)
+    GROUP BY j.id`);
+  const unmatchedPartials = new Map(legacyPartials.map((partial) => [partial.id, partial]));
   const oldOutbox = (
     await pool.query<{ present: string | null }>(
       "SELECT to_regclass('mio_image_outbox')::text AS present",
@@ -65,17 +142,22 @@ export async function inspectGenerationCutover(
         : 0;
       let uncertainUploads = 0;
       if (table) {
-        for (const row of database.prepare('SELECT job_id,payload FROM image_attempts').iterate()) {
+        for (const row of database
+          .prepare('SELECT job_id,phase,payload FROM image_attempts')
+          .iterate()) {
           if (typeof row.payload !== 'string') continue;
-          const saved = JSON.parse(row.payload) as {
-            attemptedFileIds?: Record<string, string[]>;
-            invalidIndices?: number[];
-            outputs?: { key: string }[];
-          };
+          // B could persist these pre-materialization rejections without a JSON envelope.
+          if (row.phase === 'rejected' && legacyPlainRejections.has(row.payload)) continue;
+          const saved = JSON.parse(row.payload) as LegacyJournalPayload | LegacyOutput[];
+          const jobId = String(row.job_id);
+          const partial = unmatchedPartials.get(jobId);
+          if (partial && row.phase === 'completed' && matchesLegacyPartial(partial, saved))
+            unmatchedPartials.delete(jobId);
+          if (Array.isArray(saved)) continue;
           for (const [index, attempts] of Object.entries(saved.attemptedFileIds ?? {})) {
             if (saved.invalidIndices?.includes(Number(index))) continue;
             for (const id of attempts) {
-              const prefix = `mio/derived/${String(row.job_id)}/images/${index}-${id}.`;
+              const prefix = `mio/derived/${jobId}/images/${index}-${id}.`;
               if (!saved.outputs?.some((output) => output.key.startsWith(prefix)))
                 uncertainUploads++;
             }
@@ -96,6 +178,7 @@ export async function inspectGenerationCutover(
   }
   if (journal === 'absent' && counts.legacyUnfinished > 0)
     blockers.push('LEGACY_IMAGE_RECOVERY_DATA_MISSING');
+  if (unmatchedPartials.size > 0) blockers.push('LEGACY_IMAGE_PARTIALS_UNRECONCILED');
   const queues: { name: string; messages: number; consumers: number }[] = [];
   const managementPort = options.env.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT;
   if (managementPort && options.env.MIO_LOCAL_RABBITMQ_PASSWORD && options.env.MIO_ENVIRONMENT) {

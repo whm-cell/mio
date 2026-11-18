@@ -128,11 +128,13 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 两套常驻 PostgreSQL 实例均在同一容器内另建权限隔离的 `mio_regression_test` 与专属账号 `mio_regression`（首次空卷由初始化脚本建立，既有数据卷通过 `pnpm env:init && pnpm regression:init:dev` 或 `regression:init:test` 无损幂等补建，不重置已有密码、不清业务表）。`mio_regression` 无权连接 `mio_dev` 或 `mio_test`；集成测试仅在 `mio_regression_test` 内创建并删除本轮随机 schema。
 
-准备隔离 Redis 二进制（自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`）后，本地运行 `pnpm test <测试范围>` 或 `pnpm check:local <测试范围>` 会自动检测并统一复用本机已启动容器（优先 `mio-dev`）的三类隔离通道：PostgreSQL 复用同实例内权限隔离的 `mio_regression_test` 随机 schema，Redis 常规限流回归复用同实例内仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号并在结束后清理临时键，RabbitMQ 集成测试在同实例内动态创建并清理独立临时 vhost 与临时账号；测试进程不加载 `.env`／`.env.test` 中的业务开关、万联 Key 或 COS 凭据，日常开发只需保持一套 `mio-dev` 运行即可。仅修改全局 `maxmemory=1`（OOM）或停进程的 Redis 故障用例自动调用本地临时进程，本地容器均未启动时 PG 退回 `initdb`。
+本地测试分别探测 PostgreSQL 和 Redis 的专用回归通道，每项优先选 `mio-dev`，其次 `mio-test`。缺少对应通道的配置或找不到可达端口时，由用例为该服务启动独立临时进程。选定通道后发生的登录、初始化或权限错误按实际失败报告。测试进程只从 `.env`／`.env.test` 提取专用回归通道配置。入口与显式环境选择见[测试导航](engineering/testing.md#按变更定位测试)。
+
+Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号，并在结束后清理本轮键。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。RabbitMQ 集成测试动态创建并清理独立临时 vhost 与账号。
 
 区分**破坏性自动化回归**与**获授权的本地真实业务／模型验收**：
 
-- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，运行在常驻 `mio-dev` 容器的隔离通道（`mio_regression_test` 随机 schema、`~mio:regtest-*:*` 前缀、临时 vhost）及全局 OOM 临时夹具中，严禁读写 `mio_dev` 业务表、`mio:dev:*` 键或 `mio-dev` 业务队列。
+- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，使用常驻服务的隔离通道（`mio_regression_test` 随机 schema、`~mio:regtest-*:*` 前缀、临时 vhost）或独立临时夹具，严禁读写 `mio_dev` 业务表、`mio:dev:*` 键或 `mio-dev` 业务队列。
 - **获授权的本地真实业务／模型验收（含 `*-live.ts` 验收脚本）**：统一直接读写常驻 `mio_dev`（`.env` + `mio_dev` + `mio-dev` Redis/MQ + `.runtime/dev/{dsh,compute}`）并保留测试数据——`providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及 `live-image-loop.ts dev` 模式均先对 `mio_dev` 执行增量迁移，再复用既有账号／凭据或保留的测试账号完成真实业务验证，不再新建即用即删的隔离库，使生成的路由、会话、资产与验证记录直接留在 `mio_dev` 中可查可用。
 - **破坏性中间件／重放故障演练**：如强杀在途执行器与故障重放（使用隔离 generation 场景；旧 `live-image-loop.ts prepare/execute` 已退役）、容器停启探针（`local-environments-live.ts`、`local-brokers-live.ts`）或队列容量告警探针（`live-compute-queue-probe.ts`），因会中断在途进程或触发容器级告警，仍按场景使用显式隔离现场。
 

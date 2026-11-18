@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { Pool } from 'pg';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -477,6 +478,45 @@ it('keeps unrelated unknown uploads blocked when one legacy upload is disposed',
     blockers: ['LEGACY_IMAGE_UPLOADS_REQUIRE_RECONCILIATION'],
     readyForCutover: false,
   });
+});
+
+it('checks the effective pg host before a local disposition can connect', () => {
+  const trap = `import { createRequire } from 'node:module';
+const { Client } = createRequire(process.cwd() + '/package.json')('pg');
+Client.prototype.connect = (callback) => {
+  process.stderr.write('PG_CONNECT_TRAPPED\\n');
+  queueMicrotask(() => callback(new Error('fixture: actual connections are disabled')));
+};`;
+  const invoke = (databaseURL: string, ...flags: string[]) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--import',
+        `data:text/javascript;base64,${Buffer.from(trap).toString('base64')}`,
+        'scripts/service/generation-cutover.ts',
+        ...flags,
+      ],
+      {
+        env: {
+          MIO_ENVIRONMENT: 'dev',
+          MIO_ASSETS_DATABASE_URL: databaseURL,
+          MIO_GENERATIONS_DATA_DIR: '/unused-generation-directory',
+        },
+        encoding: 'utf8',
+        timeout: 5000,
+      },
+    );
+  const receipt = ['--legacy-partial-disposition', '/unused-single-receipt.json'];
+  const overridden = 'postgresql://127.0.0.1/dev?host=nonlocal.invalid';
+  const rejected = invoke(overridden, ...receipt);
+  expect(rejected.status).toBe(1);
+  expect(rejected.stderr).toContain('LEGACY_IMAGE_PARTIAL_DISPOSITION_DEV_ONLY');
+  expect(rejected.stderr).not.toContain('PG_CONNECT_TRAPPED');
+  expect(invoke(overridden).stderr).toContain('PG_CONNECT_TRAPPED');
+  expect(
+    invoke('postgresql://127.0.0.1/dev?options=-cdefault_transaction_read_only%3Don', ...receipt)
+      .stderr,
+  ).toContain('PG_CONNECT_TRAPPED');
 });
 
 it('does not require a legacy journal for a fresh A site, complete history, or A-owned partials', async () => {

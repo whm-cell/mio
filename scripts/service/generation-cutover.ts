@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { readAssetConfig, readAssetDatabaseURL } from '../../src/assets/config.ts';
 import { imageOutputIndex } from '../../src/generations/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
@@ -374,13 +374,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const databaseURL = readAssetDatabaseURL();
   const dataDirectory = process.env.MIO_GENERATIONS_DATA_DIR;
   if (!databaseURL || !dataDirectory) throw new Error('GENERATION_PREFLIGHT_CONFIG_REQUIRED');
+  const database = { connectionString: databaseURL, connectionTimeoutMillis: 5000 };
   if (
     legacyPartialDispositionFile &&
     (process.env.MIO_ENVIRONMENT !== 'dev' ||
-      !['127.0.0.1', 'localhost', '[::1]'].includes(new URL(databaseURL).hostname))
+      !['127.0.0.1', 'localhost', '::1'].includes(new Client(database).host))
   )
     throw new Error('LEGACY_IMAGE_PARTIAL_DISPOSITION_DEV_ONLY');
-  const pool = new Pool({ connectionString: databaseURL, connectionTimeoutMillis: 5000 });
+  const pool = new Pool(database);
   try {
     const workerDirectory =
       process.env.MIO_LOCAL_COMPUTE_DIRECTORY ?? process.env.MIO_COMPUTE_DIRECTORY;

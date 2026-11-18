@@ -50,7 +50,7 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 本地配置中的 `MIO_GENERATIONS_DATA_DIR=.runtime/dev/generations`（test 对应 test）由启动器解析为绝对路径；目录需持久保留，与媒体 PG 和 provider master key 一起备份。图片不再根据 RSA 字段推导启用，旧 `MIO_IMAGE_PUBLIC_KEY`、`MIO_IMAGE_PRIVATE_KEY`、`MIO_IMAGE_KEY_ID` 不注入 A/B。旧恢复数据未对账前仍保留私有备份。生成停止会停止认领新任务，后续从 PG 与文件检查点恢复，不重放对话工具。已有旧 B 任务无 A 执行行时保持历史只读，不被 A 接管重生成。
 
-本地 A 使用原 `MIO_COS_SECRET_ID/KEY`；本地 B 必须在同一私有环境文件另设受限的 `MIO_LOCAL_COMPUTE_COS_SECRET_ID/KEY`，缺失不回退 A，ID 与 A 相同时拒绝启动。升级已有本地 COS 配置时先补 B 独立身份，再启动 Worker；桶与地域继续共用。长期受限 Key 可直接使用；若选定临时凭据，A 使用 `MIO_COS_SESSION_TOKEN`、B 使用 `MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN`，B 字段不会注入 A。两进程由同一本地用户管理，该约定不隔离同用户对环境文件的读取权限。不得使用 Root 凭据；临时凭据失效后操作会失败，签名下载 URL 也不会超出其实际有效期，此时更换同一权限边界的凭据并重新启动对应进程即可。本配置不自动续期。
+本地 `dev` 和 `test` 各自在同一私有环境文件设置一次 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID` 和 `MIO_COS_SECRET_KEY`，临时凭据同时设置 `MIO_COS_SESSION_TOKEN`。同环境的 A 和 B 使用这套受限身份，其权限覆盖两项服务实际需要的 COS 操作。旧环境文件中的 `MIO_LOCAL_COMPUTE_COS_*` 可保留，由启动器忽略。`compute:start:dev/test` 仍使用本环境的 B 专用 RabbitMQ 身份和独占持久目录。独立部署的 B 进程自行注入自己的环境，见 [Worker 入口](../compute/README.md)。服务使用非 Root 凭据。临时凭据到期后，更换凭据并重启对应进程，签名 URL 受凭据有效期约束。
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 、`compute` 或 `generations`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算或生成迁移，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。未启用域不自动迁移。
 

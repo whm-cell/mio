@@ -116,15 +116,36 @@ it('upgrades pre-MQ files without changing old secrets, and rejects partial iden
   await expect(createLocalEnvironment('dev', root)).rejects.toThrow('LOCAL_REGRESSION_PARTIAL');
 });
 
-it('gives B only its own environment identity and rejects a swapped broker or journal', async () => {
+it('shares local COS settings while keeping B broker, journal and other credentials scoped', async () => {
   const root = await fixture();
   const file = join(root, '.env.test');
   await writeFile(
     file,
-    `${await readFile(file, 'utf8')}\nMIO_IMAGE_KEY_ID=test-key\nMIO_IMAGE_PUBLIC_KEY=public-test\nMIO_IMAGE_PRIVATE_KEY=private-test\nMIO_COS_SECRET_ID=app-id\nMIO_COS_SECRET_KEY=app-key\nMIO_COS_SESSION_TOKEN=app-token\nMIO_LOCAL_COMPUTE_COS_SECRET_ID=worker-id\nMIO_LOCAL_COMPUTE_COS_SECRET_KEY=worker-key\nMIO_LOCAL_COMPUTE_COS_SESSION_TOKEN=worker-token\n`,
+    [
+      await readFile(file, 'utf8'),
+      'MIO_IMAGE_KEY_ID=test-key',
+      'MIO_IMAGE_PUBLIC_KEY=public-test',
+      'MIO_IMAGE_PRIVATE_KEY=private-test',
+      'MIO_COS_BUCKET=test-bucket-1234',
+      'MIO_COS_REGION=ap-beijing',
+      'MIO_COS_SECRET_ID=shared-id',
+      'MIO_COS_SECRET_KEY=shared-key',
+      'MIO_COS_SESSION_TOKEN=shared-token',
+      'MIO_LOCAL_COMPUTE_COS_SECRET_ID=legacy-worker-id',
+      'MIO_LOCAL_COMPUTE_COS_SECRET_KEY=legacy-worker-key',
+      'MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN=legacy-worker-token',
+      'MIO_PROVIDER_MASTER_KEY=private-to-a',
+      'MIO_PROVIDERS_DATABASE_URL=postgresql://local/providers',
+      'MIO_ASSETS_DATABASE_URL=postgresql://local/assets',
+      '',
+    ].join('\n'),
   );
   const dev = await readLocalEnvironment('dev', root, {});
-  const test = await readLocalEnvironment('test', root, {});
+  const test = await readLocalEnvironment('test', root, {
+    MIO_COS_SECRET_ID: 'inherited-id',
+    MIO_COS_SECRET_KEY: 'inherited-key',
+    MIO_COS_SESSION_TOKEN: 'inherited-token',
+  });
   const worker = localWorkerEnvironment('test', test.values, test.host, root);
   expect(worker.MIO_COMPUTE_BROKER_USER).toBe('mio-test-b');
   expect(worker.MIO_COMPUTE_EXPECTED_COMMAND_USER).toBe('mio-test-a');
@@ -136,39 +157,40 @@ it('gives B only its own environment identity and rejects a swapped broker or jo
   expect(worker.MIO_IMAGE_KEY_ID).toBeUndefined();
   expect(worker.MIO_IMAGE_PRIVATE_KEY).toBeUndefined();
   expect(worker.MIO_IMAGE_PUBLIC_KEY).toBeUndefined();
-  expect(test.runtime.MIO_COS_SECRET_ID).toBe('app-id');
-  expect(test.runtime.MIO_COS_SECRET_KEY).toBe('app-key');
-  expect(test.runtime.MIO_COS_SESSION_TOKEN).toBe('app-token');
-  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SECRET_ID).toBeUndefined();
-  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SECRET_KEY).toBeUndefined();
-  expect(test.runtime.MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN).toBeUndefined();
-  expect(worker.MIO_COS_SECRET_ID).toBe('worker-id');
-  expect(worker.MIO_COS_SECRET_KEY).toBe('worker-key');
-  expect(worker.MIO_COS_SESSION_TOKEN).toBe('worker-token');
-  expect(
-    localWorkerEnvironment(
-      'test',
-      {
-        ...test.values,
-        MIO_LOCAL_COMPUTE_COS_SECRET_ID: undefined,
-        MIO_LOCAL_COMPUTE_COS_SECRET_KEY: undefined,
-        MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN: undefined,
-      },
-      test.host,
-      root,
-    ).MIO_COS_SECRET_ID,
-  ).toBeUndefined();
-  expect(() =>
-    localWorkerEnvironment(
-      'test',
-      { ...test.values, MIO_LOCAL_COMPUTE_COS_SECRET_ID: 'app-id' },
-      test.host,
-      root,
-    ),
-  ).toThrow('LOCAL_WORKER_COS_IDENTITY');
+  const shared = {
+    MIO_COS_BUCKET: 'test-bucket-1234',
+    MIO_COS_REGION: 'ap-beijing',
+    MIO_COS_SECRET_ID: 'shared-id',
+    MIO_COS_SECRET_KEY: 'shared-key',
+    MIO_COS_SESSION_TOKEN: 'shared-token',
+  };
+  expect(test.runtime).toMatchObject(shared);
+  expect(worker).toMatchObject(shared);
+  for (const part of ['SECRET_ID', 'SECRET_KEY', 'SESSION_TOKEN']) {
+    expect(test.runtime[`MIO_LOCAL_COMPUTE_COS_${part}`]).toBeUndefined();
+    expect(worker[`MIO_LOCAL_COMPUTE_COS_${part}`]).toBeUndefined();
+  }
+  const missing = localWorkerEnvironment(
+    'test',
+    {
+      ...test.values,
+      MIO_COS_SECRET_ID: undefined,
+      MIO_COS_SECRET_KEY: undefined,
+      MIO_COS_SESSION_TOKEN: undefined,
+      MIO_LOCAL_COMPUTE_COS_SECRET_ID: 'shared-id',
+    },
+    test.host,
+    root,
+  );
+  expect(missing.MIO_COS_SECRET_ID).toBeUndefined();
+  expect(missing.MIO_COS_SECRET_KEY).toBeUndefined();
+  expect(missing.MIO_COS_SESSION_TOKEN).toBeUndefined();
   for (const key of [
     'MIO_AUTH_SECRET',
     'MIO_AUTH_DATABASE_URL',
+    'MIO_ASSETS_DATABASE_URL',
+    'MIO_PROVIDERS_DATABASE_URL',
+    'MIO_PROVIDER_MASTER_KEY',
     'MIO_REDIS_URL',
     'MIO_LOCAL_RABBITMQ_PASSWORD',
     'MIO_LOCAL_RABBITMQ_A_PASSWORD',

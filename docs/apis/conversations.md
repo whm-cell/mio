@@ -86,11 +86,11 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 ## GET /api/v1/conversations/:id/events
 
-身份：当前登录用户与对话 owner；每秒复核同一登录会话，失效/鉴权错误关流。
+身份：当前登录用户与对话 owner。每秒调度原登录会话复核，每次最多等 5 秒。身份或会话变化、会话失效及读取失败或超时时关流。
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。先完成归属检查，再安装 listener 后重读基线；交接期间事件有界缓冲，基线可承接已结束请求的终态。事件按 requestId 关联，终态回执优先于较早中间状态；重连查持久历史/回执，不承诺早先瞬态 chunk 重放。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
 错误：响应前遵循本域错误体；建流后只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
 

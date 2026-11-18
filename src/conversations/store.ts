@@ -6,6 +6,7 @@ import { checkConversationSchema } from './schema.ts';
 import { ConversationError } from './contracts.ts';
 import type {
   Conversation,
+  ConversationSnapshot,
   Principal,
   Receipt,
   RequestStatus,
@@ -32,7 +33,8 @@ interface RequestRow {
   status: RequestStatus;
   error_code: string | null;
 }
-const receipt = (row: RequestRow): Receipt => ({
+type ReceiptRow = Omit<RequestRow, 'digest'>;
+const receipt = (row: ReceiptRow): Receipt => ({
   conversationId: row.conversation_id,
   requestId: row.request_id,
   status: row.status,
@@ -179,15 +181,27 @@ export class ConversationStore {
       throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
     return receipt(old);
   }
-  async latest(actor: Principal, id: string): Promise<Receipt | null> {
-    await this.owned(actor, id);
+  async snapshot(actor: Principal, id: string): Promise<ConversationSnapshot> {
+    this.assertActive();
     const row = (
-      await this.pool.query<RequestRow>(
-        'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 ORDER BY created_at DESC,request_id DESC LIMIT 1',
-        [id],
+      await this.pool.query<{ active_request: string | null; latest: ReceiptRow | null }>(
+        `SELECT c.active_request, row_to_json(r) AS latest
+         FROM mio_conversations c
+         LEFT JOIN LATERAL (
+           SELECT conversation_id, request_id, status, error_code
+           FROM mio_conversation_requests WHERE conversation_id=c.id
+           ORDER BY created_at DESC, request_id DESC LIMIT 1
+         ) r ON true
+         WHERE c.id=$1 AND c.owner_id=$2`,
+        [id, actor.userId],
       )
     ).rows[0];
-    return row ? receipt(row) : null;
+    if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'CONVERSATION_NOT_FOUND');
+    return {
+      conversationId: id,
+      activeRequestId: row.active_request,
+      receipt: row.latest && receipt(row.latest),
+    };
   }
   async receive(
     actor: Principal,

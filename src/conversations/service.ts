@@ -312,28 +312,22 @@ export function createConversationService(
     },
     async subscribe(actor: Principal, id: string, listener: (event: ConversationEvent) => void) {
       check();
-      const row = await store.owned(actor, id);
+      await store.owned(actor, id);
       let group = listeners.get(id);
       if (!group) listeners.set(id, (group = new Set()));
       group.add(listener);
-      let latest;
-      try {
-        const current = await store.owned(actor, id);
-        latest = await store.latest(actor, id);
-        check();
-        row.active_request = current.active_request;
-      } catch (error) {
+      const close = () => {
         group.delete(listener);
         if (!group.size) listeners.delete(id);
+      };
+      try {
+        const snapshot = await store.snapshot(actor, id);
+        check();
+        return { snapshot, close };
+      } catch (error) {
+        close();
         throw error;
       }
-      return {
-        snapshot: { conversationId: id, activeRequestId: row.active_request, receipt: latest },
-        close: () => {
-          group.delete(listener);
-          if (!group.size) listeners.delete(id);
-        },
-      };
     },
     close(): Promise<void> {
       return (closing ??= (async () => {

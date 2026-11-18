@@ -643,6 +643,98 @@ it('keeps the final snapshot when completion occurs during the first subscriptio
   }
 });
 
+it.each(['input-persisted', 'completed'] as const)(
+  'opens with a consistent %s receipt and keeps buffered events newer than that receipt',
+  async (baselineStatus) => {
+    const id = await create();
+    const gate = controlled('snapshot text');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const query = Pool.prototype.query;
+    const spy = vi.spyOn(Pool.prototype, 'query').mockImplementation(function (
+      this: Pool,
+      ...args: Parameters<Pool['query']>
+    ) {
+      const [sql, values] = args;
+      if (
+        typeof sql === 'string' &&
+        /ORDER BY created_at DESC,\s*request_id DESC/.test(sql) &&
+        Array.isArray(values) &&
+        values[0] === id
+      ) {
+        entered.resolve();
+        return release.promise.then(() => Reflect.apply(query, this, args));
+      }
+      return Reflect.apply(query, this, args);
+    });
+    const opening = events(id);
+    try {
+      await entered.promise;
+      script.push(textResponse('earlier turn text'), gate.response);
+      expect((await send(id, 'earlier-turn', 'first')).status).toBe(202);
+      expect((await terminal(id, 'earlier-turn')).status).toBe('completed');
+      expect((await send(id, 'snapshot-active', 'second')).status).toBe(202);
+      await gate.entered;
+      await vi.waitFor(async () => {
+        const response = await call(path(id, 'requests/snapshot-active'));
+        expect((await response.json()) as Receipt).toMatchObject({ status: 'input-persisted' });
+      });
+      if (baselineStatus === 'completed') {
+        gate.release();
+        expect((await terminal(id, 'snapshot-active')).status).toBe('completed');
+      }
+      release.resolve();
+      const stream = await opening;
+      try {
+        await stream.wait(
+          (event) => event.type === 'text' && event.requestId === 'snapshot-active',
+        );
+        expect(stream.received[0]).toMatchObject({
+          type: 'snapshot',
+          conversationId: id,
+          activeRequestId: baselineStatus === 'completed' ? null : 'snapshot-active',
+          receipt: { requestId: 'snapshot-active', status: baselineStatus },
+        });
+        gate.release();
+        expect((await terminal(id, 'snapshot-active')).status).toBe('completed');
+        script.push(textResponse('after the snapshot'));
+        expect((await send(id, 'following-turn', 'third')).status).toBe(202);
+        const states = () =>
+          stream.received
+            .filter((event) => event.type === 'state')
+            .map((event) => event.receipt as Receipt);
+        await stream.wait(
+          (event) =>
+            event.type === 'state' &&
+            (event.receipt as Receipt).requestId === 'following-turn' &&
+            (event.receipt as Receipt).status === 'completed',
+        );
+        expect(states().filter((receipt) => receipt.requestId === 'snapshot-active')).toEqual(
+          baselineStatus === 'completed'
+            ? []
+            : [{ conversationId: id, requestId: 'snapshot-active', status: 'completed' }],
+        );
+        expect(states().filter((receipt) => receipt.requestId === 'earlier-turn')).toEqual([
+          { conversationId: id, requestId: 'earlier-turn', status: 'accepted' },
+          { conversationId: id, requestId: 'earlier-turn', status: 'input-persisted' },
+          { conversationId: id, requestId: 'earlier-turn', status: 'completed' },
+        ]);
+        expect(stream.received).toContainEqual({
+          type: 'text',
+          requestId: 'earlier-turn',
+          text: 'earlier turn text',
+        });
+      } finally {
+        await stream.close();
+      }
+    } finally {
+      release.resolve();
+      gate.release();
+      spy.mockRestore();
+    }
+  },
+);
+
 it('does not execute when PostgreSQL reception fails and never resends a failed durability receipt', async () => {
   const id = await create();
   const initial = model.requests.length;

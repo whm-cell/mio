@@ -4,13 +4,25 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { ConversationError } from './contracts.ts';
-import type { Principal, ConversationEvent } from './contracts.ts';
+import type { Principal, ConversationEvent, ConversationSnapshot, Receipt } from './contracts.ts';
 import type { ConversationService } from './service.ts';
 
 const MAX_BODY = 16 * 1024;
 const MAX_STREAM_BUFFER = 64 * 1024;
+const STREAM_AUTH_BUDGET_MS = 5_000;
 const requestIdPattern = /^[A-Za-z0-9_-]{1,80}$/;
 type Identity = (headers: Headers) => Promise<Principal | null>;
+
+function coveredBySnapshot(baseline: Receipt | null, receipt: Receipt): boolean {
+  if (baseline?.requestId !== receipt.requestId) return false;
+  if (baseline.status === receipt.status) {
+    return receipt.error === undefined || baseline.error !== undefined;
+  }
+  return (
+    receipt.status === 'accepted' ||
+    (receipt.status === 'input-persisted' && baseline.status !== 'accepted')
+  );
+}
 
 function integer(raw: string | null, fallback: number, min: number, max: number): number {
   if (raw === null) return fallback;
@@ -192,49 +204,51 @@ export function createConversationHandler(
       // Subscribe before sending the baseline. Events arriving while authorization/storage await
       // are buffered within the same bound as the socket and never reinterpreted as durable replay.
       let started = false;
-      let queued: string[] = [];
+      let baseline: Receipt | null = null;
+      const queued: { data: string; receipt?: Receipt }[] = [];
       let queuedBytes = 0;
-      let checking = false;
       let errored = false;
       const resources: {
         subscription?: Awaited<ReturnType<ConversationService['subscribe']>>;
         interval?: ReturnType<typeof setInterval>;
+        authDeadline?: ReturnType<typeof setTimeout>;
       } = {};
       let closed = false;
       const close = () => {
         if (closed) return;
         closed = true;
         if (resources.interval) clearInterval(resources.interval);
+        if (resources.authDeadline) clearTimeout(resources.authDeadline);
         resources.subscription?.close();
+        queued.length = 0;
         streams.delete(close);
-        if (!response.writableEnded) response.end();
+        response.removeListener('close', close);
+        if (!response.destroyed && !response.writableEnded) response.end();
       };
-      const write = (
-        event:
-          | ConversationEvent
-          | { type: 'snapshot'; conversationId: string; activeRequestId: string | null },
-      ) => {
-        if (event.type === 'error') errored = true;
-        const data = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
-        if (response.destroyed || response.writableEnded) return close();
-        if (Buffer.byteLength(data) > MAX_STREAM_BUFFER) {
-          response.destroy();
-          close();
-          return;
-        }
-        if (!started) {
-          queuedBytes += Buffer.byteLength(data);
-          if (queuedBytes > MAX_STREAM_BUFFER) {
-            response.destroy();
-            close();
-          } else queued.push(data);
-          return;
-        }
+      const overflow = () => {
+        response.destroy();
+        close();
+      };
+      const sendFrame = (data: string) => {
+        if (closed || response.destroyed || response.writableEnded) return close();
         response.write(data);
-        if (response.writableLength > MAX_STREAM_BUFFER) {
-          response.destroy();
-          close();
-        } else if (event.type === 'error') close();
+        if (response.writableLength > MAX_STREAM_BUFFER) overflow();
+      };
+      const write = (event: ConversationEvent | ({ type: 'snapshot' } & ConversationSnapshot)) => {
+        if (closed || response.destroyed || response.writableEnded) return close();
+        if (event.type === 'state' && coveredBySnapshot(baseline, event.receipt)) return;
+        const data = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+        const bytes = Buffer.byteLength(data);
+        if (bytes > MAX_STREAM_BUFFER) return overflow();
+        if (!started) {
+          queuedBytes += bytes;
+          if (queuedBytes > MAX_STREAM_BUFFER) return overflow();
+          queued.push(event.type === 'state' ? { data, receipt: event.receipt } : { data });
+          if (event.type === 'error') errored = true;
+          return;
+        }
+        sendFrame(data);
+        if (event.type === 'error') close();
       };
       const subscription = await service.subscribe(actor, id!, write);
       resources.subscription = subscription;
@@ -248,43 +262,34 @@ export function createConversationHandler(
       });
       response.flushHeaders();
       started = true;
+      baseline = subscription.snapshot.receipt;
       write({ type: 'snapshot', ...subscription.snapshot });
-      for (const data of queued) {
-        response.write(data);
-        if (response.writableLength > MAX_STREAM_BUFFER) {
-          response.destroy();
-          close();
-          break;
-        }
+      for (const { data, receipt } of queued) {
+        if (!receipt || !coveredBySnapshot(baseline, receipt)) sendFrame(data);
       }
-      queued = [];
-      queuedBytes = 0;
+      queued.length = 0;
       if (response.destroyed || response.writableEnded || closed || errored) {
         close();
         return;
       }
       streams.add(close);
       response.once('close', close);
-      const sessionId = actor.sessionId;
+      const { userId, sessionId } = actor;
+      const authUnavailable = () => write({ type: 'error', code: 'AUTH_UNAVAILABLE' });
       const interval = setInterval(() => {
-        if (checking) return;
-        checking = true;
-        void identity(headers)
-          .then(
-            (current) => {
-              if (!current || current.sessionId !== sessionId) {
-                write({ type: 'error', code: 'UNAUTHORIZED' });
-                close();
-              }
-            },
-            () => {
-              write({ type: 'error', code: 'AUTH_UNAVAILABLE' });
-              close();
-            },
-          )
-          .finally(() => {
-            checking = false;
-          });
+        if (closed || resources.authDeadline) return;
+        const deadline = setTimeout(authUnavailable, STREAM_AUTH_BUDGET_MS);
+        resources.authDeadline = deadline;
+        deadline.unref();
+        void Promise.resolve()
+          .then(() => identity(headers))
+          .then((current) => {
+            if (closed) return;
+            clearTimeout(deadline);
+            delete resources.authDeadline;
+            if (current?.sessionId !== sessionId || current.userId !== userId)
+              write({ type: 'error', code: 'UNAUTHORIZED' });
+          }, authUnavailable);
       }, 1000);
       resources.interval = interval;
       interval.unref();

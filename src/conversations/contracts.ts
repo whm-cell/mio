@@ -42,6 +42,11 @@ export interface Receipt {
   status: RequestStatus;
   error?: string;
 }
+export interface ConversationSnapshot {
+  conversationId: string;
+  activeRequestId: string | null;
+  receipt: Receipt | null;
+}
 /** Serializable image identity; binary content and private object keys stay outside history. */
 export interface ConversationImageReference {
   readonly attachmentId: string;

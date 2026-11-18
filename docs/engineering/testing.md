@@ -6,7 +6,9 @@
 
 直接浏览源码时从 [tests 目录索引](../../tests/README.md)进入；目录按稳定能力归属，不随 PRD 拆分或完成迁移。
 
-本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。常驻 `mio-dev`（或 `mio-test`）启动后，`pnpm test <范围>` 与 `pnpm check:local <范围>` 统一自动复用同容器内的隔离通道：PostgreSQL 复用 `mio_regression_test` 随机 schema（既有卷首次执行 `pnpm env:init && pnpm regression:init:dev`），Redis 常规限流回归复用 `~mio:regtest-*:*` 前缀账号并自动清理（全局 OOM／停机故障用例自动识别 `.runtime/redis-build` 临时进程），RabbitMQ 集成测试自动创建并清理临时 vhost；仅本地容器均未启动时才退回临时进程。完整 `pnpm check` 由 GitHub Actions 执行。
+本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。`pnpm test <范围>` 与 `pnpm check:local <范围>` 分别探测 PostgreSQL 和 Redis 的隔离通道，每项优先复用 `mio-dev`，其次 `mio-test`。没有针对该服务的配置或端口不可达时，由用例启动隔离临时进程。显式运行 `node scripts/service/local.ts <dev|test> check <范围>` 时只探测选定环境，已有配置不合规时会报错。
+
+PostgreSQL 复用 `mio_regression_test` 随机 schema（既有卷首次执行 `pnpm env:init && pnpm regression:init:dev`）。Redis 常规限流回归复用 `~mio:regtest-*:*` 前缀账号并自动清理，全局 OOM／停机故障用例自动识别 `.runtime/redis-build` 临时进程。RabbitMQ 集成测试自动创建并清理临时 vhost。完整 `pnpm check` 由 GitHub Actions 执行。
 
 本地可运行 `pnpm check:static:base`，依次执行格式、类型、lint 和护栏；`pnpm check:static` 运行这四项后再构建，均不运行测试或插件装载 smoke。完整 `pnpm check` 先验证 GitHub Actions 环境，再依次运行相同的四项静态检查、全部测试、完整构建和 `test:smoke`，使最终 smoke 使用测试后的构建产物；静态通过不能替代测试、完整覆盖或业务验收结论。
 

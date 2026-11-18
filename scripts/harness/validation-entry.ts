@@ -55,9 +55,7 @@ function within(path: string, root: string) {
 }
 
 type LocalRegressionCandidate = {
-  name: 'dev' | 'test';
   file: string;
-  exists: boolean;
   hasRegressionKeys: boolean;
   validUrl: string | null;
   port: number | null;
@@ -65,38 +63,23 @@ type LocalRegressionCandidate = {
   redisPort: number | null;
 };
 
-async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegressionCandidate> {
+async function inspectLocalRegression(
+  name: 'dev' | 'test',
+  strictConfig: boolean,
+): Promise<LocalRegressionCandidate | undefined> {
   const file = name === 'dev' ? '.env' : '.env.test';
   const path = resolve(file);
   let info;
   try {
     info = await lstat(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return {
-        name,
-        file,
-        exists: false,
-        hasRegressionKeys: false,
-        validUrl: null,
-        port: null,
-        redisUrl: null,
-        redisPort: null,
-      };
-    }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
-    return {
-      name,
-      file,
-      exists: true,
-      hasRegressionKeys: false,
-      validUrl: null,
-      port: null,
-      redisUrl: null,
-      redisPort: null,
-    };
+    if (strictConfig)
+      throw new Error(`LOCAL_ENV_FILE: ${file} must be a private regular file (chmod 600)`);
+    return;
   }
   const values = parseEnv(await readFile(path, 'utf8'));
   const port = Number(values.MIO_LOCAL_POSTGRES_PORT);
@@ -109,6 +92,13 @@ async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegres
   const hasRegressionKeys =
     values.MIO_LOCAL_REGRESSION_PASSWORD !== undefined ||
     values.MIO_TEST_DATABASE_URL !== undefined;
+  if (
+    strictConfig &&
+    hasRegressionKeys &&
+    values.MIO_LOCAL_REDIS_PORT !== undefined &&
+    validRedisPort === null
+  )
+    throw new Error(`LOCAL_REGRESSION_TARGET: invalid regression Redis port in ${file}`);
   const password = values.MIO_LOCAL_REGRESSION_PASSWORD;
   const validPassword = values.MIO_ENVIRONMENT === name && /^[a-f0-9]{64}$/.test(password ?? '');
   const expected =
@@ -121,9 +111,7 @@ async function inspectLocalRegression(name: 'dev' | 'test'): Promise<LocalRegres
       ? `redis://mio_regression:${password}@127.0.0.1:${validRedisPort}`
       : null;
   return {
-    name,
     file,
-    exists: true,
     hasRegressionKeys,
     validUrl,
     port: validPort,
@@ -148,28 +136,18 @@ function canConnectLoopback(port: number): Promise<boolean> {
   });
 }
 
-async function selectLocalCheckEnvironment(): Promise<'dev' | 'test'> {
-  const [dev, test] = await Promise.all([
-    inspectLocalRegression('dev'),
-    inspectLocalRegression('test'),
-  ]);
-  if (!dev.exists && test.exists) return 'test';
-  if (dev.exists && !test.exists) return 'dev';
-  if (dev.hasRegressionKeys && !dev.validUrl) return 'dev';
-  if (dev.validUrl && dev.port !== null && (await canConnectLoopback(dev.port))) return 'dev';
-  if (test.exists && test.port !== null && (await canConnectLoopback(test.port))) return 'test';
-  return dev.validUrl ? 'dev' : 'test';
-}
-
-async function resolveAutoRegressionTargets(): Promise<{
+async function resolveAutoRegressionTargets(
+  names: readonly ('dev' | 'test')[],
+  strictConfig: boolean,
+): Promise<{
   databaseUrl: string | null;
   redisUrl: string | null;
 }> {
   let databaseUrl: string | null = null;
   let redisUrl: string | null = null;
-  for (const name of ['dev', 'test'] as const) {
-    const candidate = await inspectLocalRegression(name);
-    if (!candidate.exists) continue;
+  for (const name of names) {
+    const candidate = await inspectLocalRegression(name, strictConfig);
+    if (!candidate) continue;
     if (candidate.hasRegressionKeys && !candidate.validUrl) {
       throw new Error(
         `LOCAL_REGRESSION_TARGET: invalid regression database setting in ${candidate.file}`,
@@ -219,8 +197,7 @@ async function main() {
     throw new Error('TEST_OPTION: option changes discovery or is not supported by this entry');
 
   if (action === 'local') {
-    const targetEnv = await selectLocalCheckEnvironment();
-    await run(process.execPath, ['scripts/service/local.ts', targetEnv, 'check', ...args]);
+    await run(process.execPath, ['scripts/service/local.ts', 'auto', 'check', ...args]);
     return;
   }
 
@@ -242,11 +219,26 @@ async function main() {
   );
   if (!process.env.MIO_TEST_DATABASE_URL) delete process.env.MIO_TEST_DATABASE_URL;
   if (!process.env.MIO_TEST_REDIS_URL) delete process.env.MIO_TEST_REDIS_URL;
+  // The local wrapper strips inherited service settings and passes an environment selection.
+  const localEnvironment = process.env.MIO_TEST_LOCAL_ENVIRONMENT;
+  delete process.env.MIO_TEST_LOCAL_ENVIRONMENT;
   if (
-    process.env.GITHUB_ACTIONS !== 'true' &&
+    localEnvironment !== undefined &&
+    localEnvironment !== 'dev' &&
+    localEnvironment !== 'test' &&
+    localEnvironment !== 'auto'
+  )
+    throw new Error('LOCAL_REGRESSION_TARGET: invalid local environment selection');
+  if (
+    (localEnvironment !== undefined || process.env.GITHUB_ACTIONS !== 'true') &&
     (!process.env.MIO_TEST_DATABASE_URL || !process.env.MIO_TEST_REDIS_URL)
   ) {
-    const detected = await resolveAutoRegressionTargets();
+    const detected = await resolveAutoRegressionTargets(
+      localEnvironment === 'dev' || localEnvironment === 'test'
+        ? [localEnvironment]
+        : ['dev', 'test'],
+      localEnvironment !== undefined,
+    );
     if (!process.env.MIO_TEST_DATABASE_URL && detected.databaseUrl)
       process.env.MIO_TEST_DATABASE_URL = detected.databaseUrl;
     if (!process.env.MIO_TEST_REDIS_URL && detected.redisUrl)

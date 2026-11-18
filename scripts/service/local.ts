@@ -2,15 +2,13 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import {
   createLocalEnvironment,
-  expectedRegressionDatabaseUrl,
-  expectedRegressionRedisUrl,
+  localHostEnvironment,
   readLocalEnvironment,
 } from './local-environment.ts';
 import { prepareProfile } from './profile.ts';
 import { localWorkerEnvironment } from './local-compute-environment.ts';
 
 const [name, action, ...args] = process.argv.slice(2);
-if (name !== 'dev' && name !== 'test') throw new Error('Usage: local <dev|test> <action>');
 
 async function run(binary: string, argv: string[], env: NodeJS.ProcessEnv): Promise<void> {
   const child = spawn(binary, argv, { env, stdio: 'inherit' });
@@ -39,13 +37,29 @@ async function run(binary: string, argv: string[], env: NodeJS.ProcessEnv): Prom
   }
 }
 
+async function checkLocal(name: 'dev' | 'test' | 'auto') {
+  if (!args.length) throw new Error('LOCAL_CHECK_SCOPE: provide a test file or directory');
+  if (name !== 'auto') {
+    try {
+      await readLocalEnvironment(name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  await run('pnpm', ['test', ...args], {
+    ...localHostEnvironment(),
+    MIO_TEST_LOCAL_ENVIRONMENT: name,
+    ...(process.env.MIO_TEST_REDIS_SERVER
+      ? { MIO_TEST_REDIS_SERVER: process.env.MIO_TEST_REDIS_SERVER }
+      : {}),
+  });
+}
+
 async function main(name: 'dev' | 'test') {
   if (action === 'init' && args.length === 0) {
     console.log(`${name}: private configuration ${await createLocalEnvironment(name)}`);
     return;
   }
-  if (action === 'check' && args.length === 0)
-    throw new Error('LOCAL_CHECK_SCOPE: provide a test file or directory');
   const environment = await readLocalEnvironment(name);
   const { runtime, values, host, file } = environment;
   if (action === 'regression-init' && args.length === 0) {
@@ -134,22 +148,15 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, ['scripts/service/import-provider-route.ts', args[0]!], runtime);
     return;
   }
-  if (action === 'check') {
-    const expected = expectedRegressionDatabaseUrl(values);
-    const expectedRedis = expectedRegressionRedisUrl(values);
-    await run('pnpm', ['test', ...args], {
-      ...host,
-      MIO_TEST_DATABASE_URL: expected,
-      MIO_TEST_REDIS_URL: expectedRedis,
-      ...(process.env.MIO_TEST_REDIS_SERVER
-        ? { MIO_TEST_REDIS_SERVER: process.env.MIO_TEST_REDIS_SERVER }
-        : {}),
-    });
-    return;
-  }
   throw new Error(
     'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, compute init|start, generations-preflight, start, migrate, route or check',
   );
 }
 
-await main(name);
+if (action === 'check' && (name === 'dev' || name === 'test' || name === 'auto')) {
+  await checkLocal(name);
+} else if (name === 'dev' || name === 'test') {
+  await main(name);
+} else {
+  throw new Error('Usage: local <dev|test> <action>');
+}

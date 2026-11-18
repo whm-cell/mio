@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
@@ -367,6 +367,8 @@ it('requires a scope before reading the test environment and preserves isolated 
     TARGET: join(root, 'captured.json'),
     MIO_AUTH_DATABASE_URL: 'postgresql://inherited/development',
     MIO_TEST_DATABASE_URL: 'postgresql://inherited/development',
+    MIO_TEST_REDIS_URL: 'redis://inherited/development',
+    MIO_TEST_LOCAL_ENVIRONMENT: 'test',
     MIO_TEST_REDIS_SERVER: '/isolated/redis-server',
     NODE_ENV: 'development',
   };
@@ -390,18 +392,16 @@ it('requires a scope before reading the test environment and preserves isolated 
     expect(result.output).toContain('SCOPE');
     expect(result.output).not.toContain('ENOENT');
   }
-  await createLocalEnvironment('test', root);
   await mkdir(join(root, 'scripts/service'), { recursive: true });
   await symlink(local, join(root, 'scripts/service/local.ts'));
-  const capture = `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.TARGET, JSON.stringify({ args: process.argv.slice(2), db: process.env.MIO_TEST_DATABASE_URL, redis: process.env.MIO_TEST_REDIS_SERVER, auth: process.env.MIO_AUTH_DATABASE_URL, nodeEnv: process.env.NODE_ENV }));\n`;
+  const capture = `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.TARGET, JSON.stringify({ args: process.argv.slice(2), environment: process.env.MIO_TEST_LOCAL_ENVIRONMENT, db: process.env.MIO_TEST_DATABASE_URL, redisUrl: process.env.MIO_TEST_REDIS_URL, redis: process.env.MIO_TEST_REDIS_SERVER, auth: process.env.MIO_AUTH_DATABASE_URL, nodeEnv: process.env.NODE_ENV }));\n`;
   await writeFile(join(root, 'pnpm'), capture, { mode: 0o700 });
   const result = await command(entry, ['local', 'tests/auth', '--reporter', 'dot']);
   expect(result.code, result.output).toBe(0);
   const captured = JSON.parse(await readFile(env.TARGET, 'utf8'));
-  const values = (await readLocalEnvironment('test', root, {})).values;
   expect(captured).toEqual({
     args: ['test', 'tests/auth', '--reporter', 'dot'],
-    db: values.MIO_TEST_DATABASE_URL,
+    environment: 'auto',
     redis: '/isolated/redis-server',
   });
   await rm(env.TARGET);
@@ -444,42 +444,162 @@ it('requires a scope before reading the test environment and preserves isolated 
     }
   }
   await writeFile(join(root, 'pnpm'), capture);
+  await createLocalEnvironment('test', root);
   const path = join(root, '.env.test');
   const contents = await readFile(path, 'utf8');
   await writeFile(
     path,
-    contents.replace(/^MIO_TEST_DATABASE_URL=.*$/m, 'MIO_TEST_DATABASE_URL=wrong'),
+    contents.replace(/^(MIO_TEST_DATABASE_URL=.*\/)mio_regression_test$/m, '$1mio_dev'),
   );
-  const rejected = await command(entry, ['local', 'tests/auth']);
+  const rejected = await command(local, ['test', 'check', 'tests/auth']);
   expect(rejected.code).not.toBe(0);
   expect(rejected.output).toContain('LOCAL_REGRESSION_TARGET');
   await expect(readFile(env.TARGET)).rejects.toThrow();
 
   await writeFile(path, contents);
-  await createLocalEnvironment('dev', root);
-  const listener = createServer();
-  await new Promise<void>((ok, fail) => {
-    listener.once('error', fail);
-    listener.listen(0, '127.0.0.1', ok);
+  const explicit = await command(local, ['test', 'check', 'tests/auth']);
+  expect(explicit.code, explicit.output).toBe(0);
+  expect(JSON.parse(await readFile(env.TARGET, 'utf8'))).toEqual({
+    args: ['test', 'tests/auth'],
+    environment: 'test',
+    redis: '/isolated/redis-server',
   });
+}, 30000);
+
+it('uses reachable PostgreSQL and Redis channels independently in the local validation entry', async () => {
+  const root = await fixture();
+  const entry = 'scripts/harness/validation-entry.ts';
+  const local = 'scripts/service/local.ts';
+  const scope = 'tests/probe/environment.test.ts';
+  const marker = join(root, 'target.json');
+  for (const directory of ['scripts/harness', 'scripts/service', 'tests/probe', 'compute/tests'])
+    await mkdir(join(root, directory), { recursive: true });
+  for (const file of [entry, local, 'node_modules']) await symlink(resolve(file), join(root, file));
+  await writeFile(
+    join(root, 'pnpm'),
+    `#!${process.execPath}\nconst { spawnSync } = require('node:child_process');\nconst result = spawnSync(process.execPath, [${JSON.stringify(entry)}, ...process.argv.slice(2)], { stdio: 'inherit' });\nprocess.exitCode = result.status ?? 1;\n`,
+    { mode: 0o700 },
+  );
+  await writeFile(
+    join(root, scope),
+    `import { writeFileSync } from 'node:fs';\nimport { it } from 'vitest';\nit('records test targets', () => writeFileSync(process.env.MARKER, JSON.stringify({ pg: process.env.MIO_TEST_DATABASE_URL ?? null, redis: process.env.MIO_TEST_REDIS_URL ?? null, auth: process.env.MIO_AUTH_DATABASE_URL, selection: process.env.MIO_TEST_LOCAL_ENVIRONMENT, nodeEnv: process.env.NODE_ENV })));\n`,
+  );
+  const listeners = Array.from({ length: 4 }, () => createServer());
+  const close = (server: (typeof listeners)[number]) =>
+    new Promise<void>((done) => server.close(() => done()));
+  const base = {
+    ...process.env,
+    PATH: `${root}:${process.env.PATH}`,
+    GITHUB_ACTIONS: '',
+    MARKER: marker,
+  };
+  const inherited = {
+    ...base,
+    MIO_TEST_DATABASE_URL: 'postgresql://inherited.example.invalid/mio_dev',
+    MIO_TEST_REDIS_URL: 'redis://inherited.example.invalid',
+    MIO_AUTH_DATABASE_URL: 'postgresql://inherited.example.invalid/mio_dev',
+    MIO_TEST_LOCAL_ENVIRONMENT: 'test',
+    NODE_ENV: 'development',
+  };
+  async function runProbe(script: string, args: string[], env: NodeJS.ProcessEnv = inherited) {
+    await rm(marker, { force: true });
+    const child = spawn(process.execPath, [script, ...args, scope], {
+      cwd: root,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+    child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+    return { code: (await once(child, 'close'))[0], output };
+  }
+  async function probe(script: string, args: string[], env?: NodeJS.ProcessEnv) {
+    const result = await runProbe(script, args, env);
+    expect(result.code, result.output).toBe(0);
+    return JSON.parse(await readFile(marker, 'utf8'));
+  }
   try {
-    const bound = listener.address();
-    if (!bound || typeof bound === 'string') throw new Error('missing port');
-    const devPath = join(root, '.env');
-    const devContents = await readFile(devPath, 'utf8');
-    await writeFile(
-      devPath,
-      devContents
-        .replace(/^MIO_LOCAL_POSTGRES_PORT=55432$/m, `MIO_LOCAL_POSTGRES_PORT=${bound.port}`)
-        .replaceAll('@127.0.0.1:55432/', `@127.0.0.1:${bound.port}/`),
+    const ports = await Promise.all(
+      listeners.map(async (listener) => {
+        listener.listen(0, '127.0.0.1');
+        await once(listener, 'listening');
+        const address = listener.address();
+        if (!address || typeof address === 'string') throw new Error('missing fixture port');
+        return address.port;
+      }),
     );
-    const devValues = (await readLocalEnvironment('dev', root, {})).values;
-    const viaDev = await command(entry, ['local', 'tests/auth']);
-    expect(viaDev.code, viaDev.output).toBe(0);
-    const capturedDev = JSON.parse(await readFile(env.TARGET, 'utf8'));
-    expect(capturedDev.db).toBe(devValues.MIO_TEST_DATABASE_URL);
+    for (const [file, pg, redis, oldPg, oldRedis] of [
+      ['.env', ports[0]!, ports[1]!, 55432, 56379],
+      ['.env.test', ports[2]!, ports[3]!, 55433, 56380],
+    ] as const) {
+      const path = join(root, file);
+      const contents = await readFile(path, 'utf8');
+      await writeFile(
+        path,
+        contents
+          .replace(`MIO_LOCAL_POSTGRES_PORT=${oldPg}\n`, `MIO_LOCAL_POSTGRES_PORT=${pg}\n`)
+          .replaceAll(`@127.0.0.1:${oldPg}/`, `@127.0.0.1:${pg}/`)
+          .replace(`MIO_LOCAL_REDIS_PORT=${oldRedis}\n`, `MIO_LOCAL_REDIS_PORT=${redis}\n`)
+          .replaceAll(`@127.0.0.1:${oldRedis}\n`, `@127.0.0.1:${redis}\n`),
+      );
+    }
+    const dev = (await readLocalEnvironment('dev', root, {})).values;
+    const test = (await readLocalEnvironment('test', root, {})).values;
+    const devRedis = `redis://mio_regression:${dev.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:${ports[1]}`;
+    const testRedis = `redis://mio_regression:${test.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:${ports[3]}`;
+    const available = { pg: dev.MIO_TEST_DATABASE_URL, redis: devRedis, nodeEnv: 'test' };
+    expect(await probe(entry, ['local'])).toEqual(available);
+
+    await close(listeners[1]!);
+    await close(listeners[2]!);
+    const mixed = { ...available, redis: testRedis };
+    expect(await probe(entry, ['local'])).toEqual(mixed);
+    expect(
+      await probe(entry, ['test'], {
+        ...base,
+        MIO_TEST_DATABASE_URL: '',
+        MIO_TEST_REDIS_URL: '',
+        MIO_TEST_LOCAL_ENVIRONMENT: undefined,
+        MIO_AUTH_DATABASE_URL: undefined,
+        NODE_ENV: 'test',
+      }),
+    ).toMatchObject(mixed);
+    expect(await probe(local, ['dev', 'check'])).toEqual({ ...mixed, redis: null });
+    expect(await probe(local, ['test', 'check'])).toEqual({ ...mixed, pg: null });
+
+    const testFile = join(root, '.env.test');
+    const configuration = await readFile(testFile, 'utf8');
+    await writeFile(
+      testFile,
+      configuration.replace(/^MIO_AUTH_DATABASE_URL=.*$/m, 'MIO_AUTH_DATABASE_URL=invalid'),
+    );
+    expect(await probe(entry, ['local'])).toEqual(mixed);
+    const badApplicationConfig = await runProbe(local, ['test', 'check']);
+    expect(badApplicationConfig.code).not.toBe(0);
+    expect(badApplicationConfig.output).toContain('LOCAL_ENV_TARGET');
+
+    await close(listeners[0]!);
+    expect(await probe(entry, ['local'])).toEqual({ ...mixed, pg: null });
+    await close(listeners[3]!);
+    expect(await probe(entry, ['local'])).toEqual({ ...mixed, pg: null, redis: null });
+
+    await writeFile(
+      testFile,
+      configuration.replace(/^(MIO_TEST_DATABASE_URL=.*\/)mio_regression_test$/m, '$1mio_dev'),
+    );
+    const badRegressionTarget = await runProbe(entry, ['local']);
+    expect(badRegressionTarget.code).not.toBe(0);
+    expect(badRegressionTarget.output).toContain('LOCAL_REGRESSION_TARGET');
+    await expect(readFile(marker)).rejects.toThrow();
+
+    await writeFile(testFile, configuration);
+    await chmod(testFile, 0o644);
+    const publicConfig = await runProbe(entry, ['local']);
+    expect(publicConfig.code).not.toBe(0);
+    expect(publicConfig.output).toContain('LOCAL_ENV_FILE');
+    await expect(readFile(marker)).rejects.toThrow();
   } finally {
-    await new Promise<void>((ok) => listener.close(() => ok()));
+    await Promise.all(listeners.map(close));
   }
 }, 30000);
 

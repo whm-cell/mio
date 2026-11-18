@@ -42,19 +42,12 @@ export function expectedRegressionDatabaseUrl(values: NodeJS.ProcessEnv): string
   return expected;
 }
 
-export function expectedRegressionRedisUrl(values: NodeJS.ProcessEnv): string {
-  const password = values.MIO_LOCAL_REGRESSION_PASSWORD;
-  const port = Number(values.MIO_LOCAL_REDIS_PORT);
-  if (
-    !/^[a-f0-9]{64}$/.test(password ?? '') ||
-    !Number.isInteger(port) ||
-    port < 1024 ||
-    port > 65535
-  )
-    throw new Error(
-      'LOCAL_REGRESSION_TARGET: run pnpm env:init to configure the isolated regression settings',
-    );
-  return `redis://mio_regression:${password}@127.0.0.1:${port}`;
+export function localHostEnvironment(inherited: NodeJS.ProcessEnv = process.env) {
+  return Object.fromEntries(
+    Object.entries(inherited).filter(
+      ([key]) => !/^(MIO_|DSH_|RABBITMQ_|POSTGRES_|REDIS|PG|COMPOSE_|NODE_ENV$)/.test(key),
+    ),
+  );
 }
 
 /** One-time creation only: existing database passwords and signing secrets must survive. */
@@ -218,11 +211,7 @@ export async function readLocalEnvironment(
     .map((key) => Number(values[key]));
   if (new Set(ports).size !== ports.length)
     throw new Error('LOCAL_ENV_PORT: service ports must differ');
-  const host = Object.fromEntries(
-    Object.entries(inherited).filter(
-      ([key]) => !/^(MIO_|DSH_|RABBITMQ_|POSTGRES_|REDIS|PG|COMPOSE_|NODE_ENV$)/.test(key),
-    ),
-  );
+  const host = localHostEnvironment(inherited);
   const runtime: NodeJS.ProcessEnv & { DSH_HOME: string; DSH_AGENTS_HOME: string } = {
     ...host,
     ...Object.fromEntries(

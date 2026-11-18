@@ -119,6 +119,7 @@ it('upgrades pre-MQ files without changing old secrets, and rejects partial iden
 it('shares local COS settings while keeping B broker, journal and other credentials scoped', async () => {
   const root = await fixture();
   const file = join(root, '.env.test');
+  const providerMasterKey = Buffer.alloc(32, 7).toString('base64');
   await writeFile(
     file,
     [
@@ -134,7 +135,8 @@ it('shares local COS settings while keeping B broker, journal and other credenti
       'MIO_LOCAL_COMPUTE_COS_SECRET_ID=legacy-worker-id',
       'MIO_LOCAL_COMPUTE_COS_SECRET_KEY=legacy-worker-key',
       'MIO_LOCAL_COMPUTE_COS_SESSION_TOKEN=legacy-worker-token',
-      'MIO_PROVIDER_MASTER_KEY=private-to-a',
+      `MIO_PROVIDERS_MASTER_KEY=${providerMasterKey}`,
+      'MIO_PROVIDERS_MASTER_KEY_ID=fixture-key',
       'MIO_PROVIDERS_DATABASE_URL=postgresql://local/providers',
       'MIO_ASSETS_DATABASE_URL=postgresql://local/assets',
       '',
@@ -166,6 +168,9 @@ it('shares local COS settings while keeping B broker, journal and other credenti
   };
   expect(test.runtime).toMatchObject(shared);
   expect(worker).toMatchObject(shared);
+  expect(test.runtime.MIO_PROVIDERS_MASTER_KEY).toBe(providerMasterKey);
+  expect(test.runtime.MIO_PROVIDERS_MASTER_KEY_ID).toBe('fixture-key');
+  expect(test.runtime.MIO_PROVIDERS_DATABASE_URL).toBe('postgresql://local/providers');
   for (const part of ['SECRET_ID', 'SECRET_KEY', 'SESSION_TOKEN']) {
     expect(test.runtime[`MIO_LOCAL_COMPUTE_COS_${part}`]).toBeUndefined();
     expect(worker[`MIO_LOCAL_COMPUTE_COS_${part}`]).toBeUndefined();
@@ -190,7 +195,8 @@ it('shares local COS settings while keeping B broker, journal and other credenti
     'MIO_AUTH_DATABASE_URL',
     'MIO_ASSETS_DATABASE_URL',
     'MIO_PROVIDERS_DATABASE_URL',
-    'MIO_PROVIDER_MASTER_KEY',
+    'MIO_PROVIDERS_MASTER_KEY',
+    'MIO_PROVIDERS_MASTER_KEY_ID',
     'MIO_REDIS_URL',
     'MIO_LOCAL_RABBITMQ_PASSWORD',
     'MIO_LOCAL_RABBITMQ_A_PASSWORD',

@@ -11,6 +11,8 @@ import { ComputeError } from './errors.ts';
 import type { ComputeStore, JobRow } from './store.ts';
 const log = createLogger('app', 'compute');
 const VIDEO_OUTBOX_BATCH = 10;
+const BROKER_RETRY_INITIAL_MS = 1000;
+const BROKER_RETRY_MAX_MS = 30_000;
 
 function view(job: JobRow) {
   return {
@@ -38,7 +40,7 @@ export function createComputeService(
   let polling: Promise<void> | undefined;
   let pollRequested = false;
   let retryAt = 0;
-  let retryDelay = 1000;
+  let retryDelay = BROKER_RETRY_INITIAL_MS;
   const active = new Set<Promise<unknown>>();
   const disconnecting = new Set<Promise<void>>();
   const stop = new AbortController();
@@ -109,8 +111,17 @@ export function createComputeService(
         throw error;
       }
     });
+  const scheduleRetry = () => {
+    pollRequested = false;
+    if (stopping) return;
+    log.error('COMPUTE_BROKER_RETRY');
+    retryAt = epochMs() + retryDelay;
+    retryDelay = Math.min(retryDelay * 2, BROKER_RETRY_MAX_MS);
+  };
   const disconnect = (instance: ComputeBroker) => {
-    if (broker === instance) broker = undefined;
+    if (broker !== instance) return;
+    broker = undefined;
+    scheduleRetry();
     const task = instance.close().catch(() => {});
     disconnecting.add(task);
     void task.finally(() => disconnecting.delete(task));
@@ -128,8 +139,9 @@ export function createComputeService(
       pollRequested = false;
       return;
     }
+    let instance = broker;
     polling = admit(async () => {
-      if (!broker) {
+      if (!instance) {
         const acquired = await ComputeBroker.connect(
           config.brokerURL,
           config.brokerUser,
@@ -140,8 +152,9 @@ export function createComputeService(
           return;
         }
         broker = acquired;
-        retryDelay = 1000;
+        instance = acquired;
         acquired.onClose(() => disconnect(acquired));
+        if (broker !== acquired) return;
         try {
           await acquired.consume(receive, () => disconnect(acquired));
         } catch (error) {
@@ -149,28 +162,29 @@ export function createComputeService(
           throw error;
         }
       }
-      const instance = broker;
-      if (!instance || stopping) return;
-      for (let count = 0; count < VIDEO_OUTBOX_BATCH && !stopping; count++) {
+      for (let count = 0; count < VIDEO_OUTBOX_BATCH && !stopping && broker === instance; count++) {
         const item = await store.claim();
         if (!item) break;
         try {
+          if (broker !== instance) throw new Error('COMPUTE_BROKER_CLOSED');
           await instance.publish(item.command);
           await store.sent(item.command, item.lease);
         } catch (error) {
-          await store.release(item.command.messageId, item.lease);
-          disconnect(instance);
+          try {
+            await store.release(item.command.messageId, item.lease);
+          } finally {
+            disconnect(instance);
+          }
           throw error;
         }
       }
+      if (!stopping && broker === instance) {
+        retryAt = 0;
+        retryDelay = BROKER_RETRY_INITIAL_MS;
+      }
     })
       .catch(() => {
-        pollRequested = false;
-        if (!stopping) {
-          log.error('COMPUTE_BROKER_RETRY');
-          retryAt = epochMs() + retryDelay;
-          retryDelay = Math.min(retryDelay * 2, 30_000);
-        }
+        if (broker === instance) scheduleRetry();
       })
       .finally(() => {
         polling = undefined;

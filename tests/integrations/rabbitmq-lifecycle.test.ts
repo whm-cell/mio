@@ -202,6 +202,129 @@ it.each(['channel-close', 'consumer-cancel'] as const)(
   },
 );
 
+it.each(['handshake', 'immediate-close', 'consume', 'publish-and-close'] as const)(
+  'backs off repeated %s failures through the cap and resets after a recovered outbox flush',
+  async (failure) => {
+    const retryDelays = [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000];
+    const attemptSize = failure === 'handshake' ? 1 : 2;
+    for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+      if (failure === 'handshake') {
+        vi.mocked(connect).mockRejectedValueOnce(new Error('handshake failed'));
+        continue;
+      }
+      const pair = connections();
+      if (failure === 'immediate-close')
+        pair.consumer.channel.consume.mockImplementationOnce(async () => {
+          pair.consumer.channel.emit('close');
+          return { consumerTag: 'closed' };
+        });
+      else if (failure === 'consume')
+        pair.consumer.channel.consume.mockRejectedValueOnce(new Error('registration failed'));
+      else
+        pair.publisher.channel.publish.mockImplementationOnce(
+          (_exchange, _key, _body, _options, confirm) => {
+            queueMicrotask(() => {
+              pair.consumer.channel.emit('close');
+              confirm(new Error('publish failed'));
+            });
+            return true;
+          },
+        );
+    }
+    const healthy = connections();
+    healthy.publisher.channel.publish.mockImplementationOnce(
+      (_exchange, _key, _body, _options, confirm) => {
+        queueMicrotask(() => confirm(null));
+        return true;
+      },
+    );
+    vi.mocked(connect).mockRejectedValueOnce(new Error('unavailable after recovery'));
+    const assetId = randomUUID();
+    const command: ComputeCommandV1 = {
+      version: 1,
+      type: 'transcode.request',
+      messageId: randomUUID(),
+      jobId: randomUUID(),
+      attemptId: randomUUID(),
+      attempt: 1,
+      profile: 'mp4-h264-aac-720p24-v1',
+      input: { assetId, key: `mio/raw/${assetId}/${randomUUID()}`, sizeBytes: 1, etag: 'etag' },
+    };
+    let pending = true;
+    const store = {
+      claim: vi.fn(async () => (pending ? { command, lease: 'lease' } : undefined)),
+      sent: vi.fn(async () => {
+        pending = false;
+      }),
+      release: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
+    } as unknown as ComputeStore;
+    vi.useFakeTimers();
+    const service = createComputeService(store, {} as AssetObjectStore, {
+      brokerURL: 'amqp://a:secret@127.0.0.1/test',
+      brokerUser: 'a',
+      expectedResultUser: 'b',
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      for (const [attempt, backoff] of retryDelays.entries()) {
+        await vi.advanceTimersByTimeAsync(backoff - 1);
+        expect(connect).toHaveBeenCalledTimes((attempt + 1) * attemptSize);
+        expect(store.sent).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(connect).toHaveBeenCalledTimes(retryDelays.length * attemptSize + 2);
+      expect(healthy.consumer.channel.consume).toHaveBeenCalledOnce();
+      expect(store.sent).toHaveBeenCalledExactlyOnceWith(command, 'lease');
+      expect(store.release).toHaveBeenCalledTimes(
+        failure === 'publish-and-close' ? retryDelays.length : 0,
+      );
+      healthy.consumer.channel.emit('close');
+      await vi.advanceTimersByTimeAsync(999);
+      expect(connect).toHaveBeenCalledTimes(retryDelays.length * attemptSize + 2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connect).toHaveBeenCalledTimes(retryDelays.length * attemptSize + 3);
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+it('ignores a delayed close from a broker already replaced after a registration failure', async () => {
+  const stale = connections();
+  stale.consumer.channel.consume.mockRejectedValueOnce(new Error('registration failed'));
+  stale.consumer.close.mockImplementationOnce(() => new Promise(() => {}));
+  stale.publisher.close.mockImplementationOnce(() => new Promise(() => {}));
+  const healthy = connections();
+  const store = {
+    claim: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  } as unknown as ComputeStore;
+  vi.useFakeTimers();
+  const service = createComputeService(store, {} as AssetObjectStore, {
+    brokerURL: 'amqp://a:secret@127.0.0.1/test',
+    brokerUser: 'a',
+    expectedResultUser: 'b',
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(healthy.consumer.channel.consume).toHaveBeenCalledOnce();
+    expect(store.claim).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(500);
+    stale.consumer.emit('close');
+    stale.publisher.emit('close');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(store.claim).toHaveBeenCalledTimes(2);
+    expect(connect).toHaveBeenCalledTimes(4);
+  } finally {
+    stale.consumer.emit('close');
+    stale.publisher.emit('close');
+    await service.close();
+    vi.useRealTimers();
+  }
+});
+
 it('treats a synchronous result-handler failure as recoverable and never acknowledges it', async () => {
   const pair = connections();
   const broker = await open();

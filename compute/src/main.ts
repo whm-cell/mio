@@ -1,4 +1,5 @@
 import { createLogger } from '@mio/foundation/logging';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isJournalFailure, Journal } from './adapters/journal.ts';
 import { ObjectStore } from './adapters/cos.ts';
 import { processIdentity } from './adapters/media.ts';
@@ -60,26 +61,25 @@ async function start(): Promise<void> {
       : {}),
   });
   const journal = new Journal(directory, instance);
-  let stopping = false;
+  const stopping = new AbortController();
   let worker: Worker | null = null;
-  let notifyStop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => {
-    notifyStop = resolve;
+    stopping.signal.addEventListener('abort', () => resolve(), { once: true });
   });
   const stop = () => {
-    stopping = true;
     worker?.stop();
-    notifyStop();
+    stopping.abort(new Error('WORKER_STOPPED'));
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {
-    while (!stopping) {
+    while (!stopping.signal.aborted) {
       let broker: Broker | undefined;
       let interval: ReturnType<typeof setInterval> | undefined;
       let maintenance: Maintenance | undefined;
       try {
-        broker = await Broker.connect(url, username, expectedUser);
+        broker = await Broker.connect(url, username, expectedUser, stopping.signal);
+        stopping.signal.throwIfAborted();
         worker = new Worker(journal, store, broker, directory);
         const current = worker;
         let fail: (error: unknown) => void = () => {};
@@ -103,19 +103,20 @@ async function start(): Promise<void> {
         await Promise.race([closed, failed, stopped]);
       } catch (error) {
         if (isJournalFailure(error)) {
-          stopping = true;
+          stop();
           log.error('JOURNAL_CONSUMPTION_STOPPED');
-        } else if (!stopping) log.error('BROKER_CONNECTION_ERROR');
+        } else if (!stopping.signal.aborted) log.error('BROKER_CONNECTION_ERROR');
       } finally {
         maintenance?.stop();
         if (interval) clearInterval(interval);
         worker?.stop();
+        if (worker) await worker.waitIdle();
         if (broker) await broker.close();
         if (maintenance) await maintenance.wait().catch(() => {});
-        if (worker) await worker.waitIdle();
         worker = null;
       }
-      if (!stopping) await new Promise<void>((resolve) => setTimeout(resolve, 5000));
+      if (!stopping.signal.aborted)
+        await delay(5000, undefined, { signal: stopping.signal }).catch(() => {});
     }
   } finally {
     process.off('SIGINT', stop);

@@ -1,7 +1,14 @@
 import { connect } from 'amqplib';
 import { createId } from '@mio/foundation/identifiers';
 import { EventEmitter } from 'node:events';
-import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, Message } from 'amqplib';
+import type {
+  Channel,
+  ChannelModel,
+  ConfirmChannel,
+  ConsumeMessage,
+  Message,
+  SocketOptions,
+} from 'amqplib';
 import {
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
@@ -10,6 +17,9 @@ import {
   parseComputeCommandV1,
 } from '@mio/compute-contracts';
 import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+
+const BROKER_STARTUP_TIMEOUT_MS = 5000;
+const BROKER_CLOSE_TIMEOUT_MS = 5000;
 
 interface BrokerState {
   closed: boolean;
@@ -85,6 +95,7 @@ export class Broker {
   readonly #expectedUserId: string;
   readonly #state: BrokerState;
   readonly #closedConnections: WeakSet<ChannelModel>;
+  readonly #transport: AbortController;
   #gate: ConsumerGate | null = null;
   #handling: Promise<void> | null = null;
   #pause: Promise<void> | null = null;
@@ -99,6 +110,7 @@ export class Broker {
     expectedUserId: string,
     state: BrokerState,
     closedConnections: WeakSet<ChannelModel>,
+    transport: AbortController,
   ) {
     this.#consumerConnection = consumerConnection;
     this.#publisherConnection = publisherConnection;
@@ -108,9 +120,15 @@ export class Broker {
     this.#expectedUserId = expectedUserId;
     this.#state = state;
     this.#closedConnections = closedConnections;
+    this.#transport = transport;
   }
 
-  static async connect(url: string, userId: string, expectedUserId: string): Promise<Broker> {
+  static async connect(
+    url: string,
+    userId: string,
+    expectedUserId: string,
+    stop?: AbortSignal,
+  ): Promise<Broker> {
     const parsed = new URL(url);
     if (
       parsed.protocol !== 'amqps:' &&
@@ -120,6 +138,7 @@ export class Broker {
     ) {
       throw new Error('BROKER_TLS_REQUIRED');
     }
+    stop?.throwIfAborted();
     const state: BrokerState = { closed: false, events: new EventEmitter(), markClosed: () => {} };
     const markClosed = () => {
       if (!state.closed) {
@@ -133,41 +152,74 @@ export class Broker {
       surface.once('close', markClosed);
     };
     const closedConnections = new WeakSet<ChannelModel>();
-    const watchConnection = (surface: ChannelModel) => {
-      surface.once('close', () => closedConnections.add(surface));
-      watch(surface);
+    const transport = new AbortController();
+    // amqplib passes these options through to Node's TCP and TLS sockets.
+    const socketOptions: SocketOptions & { signal: AbortSignal } = {
+      timeout: BROKER_STARTUP_TIMEOUT_MS,
+      signal: transport.signal,
     };
-    const consumerConnection = await connect(url);
-    watchConnection(consumerConnection);
-    try {
-      const publisherConnection = await connect(url);
-      watchConnection(publisherConnection);
-      try {
-        const consumer = await consumerConnection.createChannel();
-        const slot = watchConsumer(consumer, state);
-        const publisher = await publisherConnection.createConfirmChannel();
-        watch(publisher);
-        if (state.closed) throw new Error('BROKER_CLOSED');
-        await consumer.prefetch(1);
-        await publisher.prefetch(1);
-        if (state.closed) throw new Error('BROKER_CLOSED');
-        return new Broker(
-          consumerConnection,
-          publisherConnection,
-          slot,
-          publisher,
-          userId,
-          expectedUserId,
-          state,
-          closedConnections,
-        );
-      } catch (error) {
-        await closeConnection(publisherConnection, closedConnections);
-        throw error;
+    const connections: ChannelModel[] = [];
+    const openConnection = async () => {
+      transport.signal.throwIfAborted();
+      const connection = await connect(url, socketOptions);
+      connection.once('close', () => closedConnections.add(connection));
+      watch(connection);
+      if (transport.signal.aborted) {
+        await closeConnection(connection, closedConnections);
+        transport.signal.throwIfAborted();
       }
+      connections.push(connection);
+      return connection;
+    };
+    const initialize = async () => {
+      const consumerConnection = await openConnection();
+      const publisherConnection = await openConnection();
+      transport.signal.throwIfAborted();
+      const consumer = await consumerConnection.createChannel();
+      const slot = watchConsumer(consumer, state);
+      transport.signal.throwIfAborted();
+      const publisher = await publisherConnection.createConfirmChannel();
+      watch(publisher);
+      transport.signal.throwIfAborted();
+      if (state.closed) throw new Error('BROKER_CLOSED');
+      await Promise.all([consumer.prefetch(1), publisher.prefetch(1)]);
+      if (state.closed) throw new Error('BROKER_CLOSED');
+      return new Broker(
+        consumerConnection,
+        publisherConnection,
+        slot,
+        publisher,
+        userId,
+        expectedUserId,
+        state,
+        closedConnections,
+        transport,
+      );
+    };
+    const { promise: cancelled, reject } = Promise.withResolvers<never>();
+    const onAbort = () => reject(transport.signal.reason);
+    transport.signal.addEventListener('abort', onAbort, { once: true });
+    const onStop = () => transport.abort(stop?.reason);
+    stop?.addEventListener('abort', onStop, { once: true });
+    const deadline = setTimeout(
+      () => transport.abort(new Error('BROKER_STARTUP_TIMEOUT')),
+      BROKER_STARTUP_TIMEOUT_MS,
+    );
+    try {
+      const broker = await Promise.race([initialize(), cancelled]);
+      transport.signal.throwIfAborted();
+      return broker;
     } catch (error) {
-      await closeConnection(consumerConnection, closedConnections);
+      transport.abort();
+      await Promise.all(
+        connections.map((connection) => closeConnection(connection, closedConnections)),
+      );
       throw error;
+    } finally {
+      // The live broker owns its sockets through the drain and connection close handshake.
+      clearTimeout(deadline);
+      stop?.removeEventListener('abort', onStop);
+      transport.signal.removeEventListener('abort', onAbort);
     }
   }
 
@@ -359,9 +411,15 @@ export class Broker {
     // Preserve journal ownership until admitted transcodes finish.
     if (this.#handling) await this.#handling;
     this.#state.markClosed();
-    await Promise.all([
-      closeConnection(this.#consumerConnection, this.#closedConnections),
-      closeConnection(this.#publisherConnection, this.#closedConnections),
-    ]);
+    const deadline = setTimeout(() => this.#transport.abort(), BROKER_CLOSE_TIMEOUT_MS);
+    try {
+      await Promise.all([
+        closeConnection(this.#consumerConnection, this.#closedConnections),
+        closeConnection(this.#publisherConnection, this.#closedConnections),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+      this.#transport.abort();
+    }
   }
 }

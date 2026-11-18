@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, expect, it, vi } from 'vitest';
 import { COMPUTE_PROFILE, parseComputeCommandV1 } from '@mio/compute-contracts';
 import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
@@ -91,6 +94,7 @@ async function fixture(closeDuringPrefetch = false, publisherAlreadyClosed = fal
   const { Broker } = await import('../src/adapters/rabbitmq.ts');
   return {
     Broker,
+    connect,
     consumer,
     nextConsumer,
     thirdConsumer,
@@ -123,6 +127,114 @@ afterEach(() => {
   vi.doUnmock('amqplib');
   vi.resetModules();
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+it.each(['amqp', 'amqps'])(
+  'destroys a real %s handshake socket when Worker startup stops',
+  async (protocol) => {
+    const accepted = Promise.withResolvers<Socket>();
+    const server = createServer(accepted.resolve);
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const { Broker } = await import('../src/adapters/rabbitmq.ts');
+    const stop = new AbortController();
+    const failure = new Error('test shutdown');
+    const connection = Broker.connect(
+      `${protocol}://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      'worker-b',
+      'app-a',
+      stop.signal,
+    ).catch((error: unknown) => error);
+    const socket = await accepted.promise;
+    try {
+      await once(socket, 'data');
+      const closed = once(socket, 'close');
+      stop.abort(failure);
+      expect(await Promise.race([connection, delay(750, 'handshake still pending')])).toBe(failure);
+      expect(await Promise.race([closed.then(() => 'closed'), delay(750, 'socket open')])).toBe(
+        'closed',
+      );
+    } finally {
+      socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await connection;
+    }
+  },
+);
+
+it('enforces one startup deadline through channel setup and releases both connections', async () => {
+  const { Broker, consumerConnection, publisherConnection } = await fixture();
+  publisherConnection.createConfirmChannel.mockImplementationOnce(() => new Promise(() => {}));
+  vi.useFakeTimers();
+  try {
+    const connection = Broker.connect('amqp://localhost', 'worker-b', 'app-a').catch(
+      (error: unknown) => error,
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(consumerConnection.close).toHaveBeenCalledOnce();
+    expect(publisherConnection.close).toHaveBeenCalledOnce();
+    await expect(connection).resolves.toEqual(new Error('BROKER_STARTUP_TIMEOUT'));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('releases the first connection on stop and closes a second connection that opens late', async () => {
+  const { Broker, connect, consumerConnection, publisherConnection } = await fixture();
+  const late = Promise.withResolvers<typeof publisherConnection>();
+  connect.mockReset().mockResolvedValueOnce(consumerConnection).mockReturnValueOnce(late.promise);
+  const stop = new AbortController();
+  const failure = new Error('test shutdown');
+  const connection = Broker.connect('amqp://localhost', 'worker-b', 'app-a', stop.signal).catch(
+    (error: unknown) => error,
+  );
+  try {
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    stop.abort(failure);
+    expect(await Promise.race([connection, delay(750, 'startup still pending')])).toBe(failure);
+    expect(consumerConnection.close).toHaveBeenCalledOnce();
+  } finally {
+    late.resolve(publisherConnection);
+  }
+  await vi.waitFor(() => expect(publisherConnection.close).toHaveBeenCalledOnce());
+  expect(publisherConnection.createConfirmChannel).not.toHaveBeenCalled();
+});
+
+it('keeps the startup signal and deadline from interrupting an established publisher', async () => {
+  const { Broker, connect, publisher } = await fixture();
+  const stop = new AbortController();
+  vi.useFakeTimers();
+  try {
+    const broker = await Broker.connect('amqp://localhost', 'worker-b', 'app-a', stop.signal);
+    const transports = connect.mock.calls.map(
+      ([, options]) => (options as { signal: AbortSignal } | undefined)?.signal,
+    );
+    expect(transports).toHaveLength(2);
+    stop.abort();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(transports.every((signal) => signal?.aborted === false)).toBe(true);
+    publisher.publish.mockImplementationOnce((...args) => {
+      const confirm = args.at(-1) as (error: null) => void;
+      confirm(null);
+      return true;
+    });
+    const { messageId, jobId, attemptId } = parseComputeCommandV1(
+      JSON.parse(delivery().content.toString()),
+    );
+    await broker.publish({
+      version: 1,
+      type: 'transcode.result',
+      state: 'running',
+      messageId: randomUUID(),
+      commandId: messageId,
+      jobId,
+      attemptId,
+      attempt: 1,
+    });
+    await broker.close();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it('observes a consumer-only channel close while both connections remain open', async () => {

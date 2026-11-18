@@ -5,12 +5,16 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { parseEnv } from 'node:util';
 import { afterEach, expect, it } from 'vitest';
 import {
   createLocalEnvironment,
   readLocalEnvironment,
 } from '../../scripts/service/local-environment.ts';
-import { localWorkerEnvironment } from '../../scripts/service/local-compute-environment.ts';
+import {
+  localComputeKeys,
+  localWorkerEnvironment,
+} from '../../scripts/service/local-compute-environment.ts';
 import { readAssetConfig } from '../../src/assets/config.ts';
 
 const directories: string[] = [];
@@ -76,45 +80,96 @@ it('does not inherit another environment or expose middleware administrator cred
   expect(env.runtime.NODE_ENV).toBe('production');
 });
 
-it('upgrades pre-MQ files without changing old secrets, and rejects partial identities', async () => {
+it('only appends missing groups or the generation directory and preserves partial files', async () => {
   const root = await fixture();
   const file = join(root, '.env');
   const current = await readFile(file, 'utf8');
-  const legacy = current
-    .split('\n')
-    .filter((line) => !/^(RABBITMQ_|MIO_(LOCAL_RABBITMQ|LOCAL_COMPUTE|COMPUTE)_)/.test(line))
-    .join('\n');
+  const generationDirectory = 'MIO_GENERATIONS_DATA_DIR';
+  const regressionKeys = ['MIO_LOCAL_REGRESSION_PASSWORD', 'MIO_TEST_DATABASE_URL'];
+  const omitKeys = (contents: string, keys: readonly string[]) =>
+    contents
+      .split('\n')
+      .filter((line) => !keys.includes(line.split('=', 1)[0]!))
+      .join('\n');
+
+  async function checkUpgrade(before: Buffer, keys: readonly string[]) {
+    expect(await createLocalEnvironment('dev', root)).toBe('upgraded');
+    const after = await readFile(file);
+    expect(after.subarray(0, before.length).equals(before), 'original bytes').toBe(true);
+    expect(Object.keys(parseEnv(after.subarray(before.length).toString('utf8'))).sort()).toEqual(
+      [...keys].sort(),
+    );
+    expect(await createLocalEnvironment('dev', root)).toBe('preserved');
+    expect((await readFile(file)).equals(after), 'bytes after repeated init').toBe(true);
+    return after.toString('utf8');
+  }
+
+  async function checkPartial(contents: string, error: string) {
+    const before = Buffer.from(contents);
+    await writeFile(file, before);
+    await expect(createLocalEnvironment('dev', root)).rejects.toThrow(error);
+    expect((await readFile(file)).equals(before), 'bytes after rejected init').toBe(true);
+  }
+
+  const retainedDirectory = '.runtime/dev/custom-generations';
+  const legacy = Buffer.from(
+    [
+      omitKeys(current, localComputeKeys)
+        .replace(
+          /^MIO_AUTH_SECRET=.*$/m,
+          'MIO_AUTH_SECRET="fixture-legacy-signing-secret-kept-on-upgrade"',
+        )
+        .replace(/^MIO_GENERATIONS_DATA_DIR=.*$/m, `${generationDirectory}=${retainedDirectory}`),
+      '# Keep this custom value and its formatting',
+      'MIO_CUSTOM_NOTE = "first line\nsecond line with café # inside the value"',
+    ].join('\n'),
+  );
   await writeFile(file, legacy);
-  expect(await createLocalEnvironment('dev', root)).toBe('upgraded');
-  const upgraded = await readFile(file, 'utf8');
-  expect(upgraded.startsWith(legacy)).toBe(true);
+  const withCompute = await checkUpgrade(legacy, localComputeKeys);
   const config = await readLocalEnvironment('dev', root, {});
-  expect(await createLocalEnvironment('dev', root)).toBe('preserved');
-  expect(await readFile(file, 'utf8')).toBe(upgraded);
-  await writeFile(file, upgraded.replace(/^MIO_LOCAL_RABBITMQ_B_PASSWORD=.*\n/m, ''));
-  await expect(createLocalEnvironment('dev', root)).rejects.toThrow('LOCAL_COMPUTE_PARTIAL');
   expect(
-    (await readFile(file, 'utf8')).includes(config.values.MIO_LOCAL_RABBITMQ_A_PASSWORD!),
+    config.runtime.MIO_GENERATIONS_DATA_DIR === join(root, retainedDirectory),
+    generationDirectory,
   ).toBe(true);
 
-  const preRegression = upgraded
-    .split('\n')
-    .filter((line) => !/^(MIO_LOCAL_REGRESSION_PASSWORD|MIO_TEST_DATABASE_URL)=/.test(line))
-    .join('\n');
+  const missingDirectory = Buffer.from(omitKeys(withCompute, [generationDirectory]));
+  await writeFile(file, missingDirectory);
+  const withDirectory = await checkUpgrade(missingDirectory, [generationDirectory]);
+  const directoryConfig = await readLocalEnvironment('dev', root, {});
+  expect(
+    directoryConfig.runtime.MIO_GENERATIONS_DATA_DIR === join(root, '.runtime/dev/generations'),
+    generationDirectory,
+  ).toBe(true);
+  expect(
+    directoryConfig.runtime.MIO_GENERATIONS_ENABLED === undefined,
+    'MIO_GENERATIONS_ENABLED',
+  ).toBe(true);
+  expect(directoryConfig.runtime.MIO_COMPUTE_ENABLED === undefined, 'MIO_COMPUTE_ENABLED').toBe(
+    true,
+  );
+
+  await checkPartial(
+    omitKeys(withDirectory, ['MIO_LOCAL_RABBITMQ_B_PASSWORD', generationDirectory]),
+    'LOCAL_COMPUTE_PARTIAL',
+  );
+
+  const preRegression = Buffer.from(omitKeys(withDirectory, regressionKeys));
   await writeFile(file, preRegression);
   const preConfig = await readLocalEnvironment('dev', root, {});
   expect(preConfig.values.MIO_TEST_DATABASE_URL).toBeUndefined();
-  expect(await createLocalEnvironment('dev', root)).toBe('upgraded');
-  const regUpgraded = await readFile(file, 'utf8');
-  expect(regUpgraded.startsWith(preRegression)).toBe(true);
+  const regUpgraded = await checkUpgrade(preRegression, regressionKeys);
   const afterReg = await readLocalEnvironment('dev', root, {});
-  expect(afterReg.values.MIO_TEST_DATABASE_URL).toBe(
-    `postgresql://mio_regression:${afterReg.values.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:55432/mio_regression_test`,
-  );
+  expect(
+    afterReg.values.MIO_TEST_DATABASE_URL ===
+      `postgresql://mio_regression:${afterReg.values.MIO_LOCAL_REGRESSION_PASSWORD}@127.0.0.1:55432/mio_regression_test`,
+    'MIO_TEST_DATABASE_URL',
+  ).toBe(true);
   expect(afterReg.runtime.MIO_TEST_DATABASE_URL).toBeUndefined();
   expect(afterReg.runtime.MIO_LOCAL_REGRESSION_PASSWORD).toBeUndefined();
-  await writeFile(file, regUpgraded.replace(/^MIO_TEST_DATABASE_URL=.*\n/m, ''));
-  await expect(createLocalEnvironment('dev', root)).rejects.toThrow('LOCAL_REGRESSION_PARTIAL');
+  await checkPartial(
+    omitKeys(regUpgraded, ['MIO_TEST_DATABASE_URL', ...localComputeKeys, generationDirectory]),
+    'LOCAL_REGRESSION_PARTIAL',
+  );
 });
 
 it('shares local COS settings while keeping B broker, journal and other credentials scoped', async () => {

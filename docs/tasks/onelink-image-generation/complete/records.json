@@ -45,6 +45,43 @@
       }
     },
     {
+      "key": "image-generation-in-a",
+      "title": "将图片生成与恢复迁入 A",
+      "locations": [
+        {
+          "path": "src/generations/service.ts",
+          "purpose": "A 的图片任务准入与独立执行队列"
+        },
+        {
+          "path": "src/generations/runner.ts",
+          "purpose": "供应商提交、查询、恢复与结果状态收束"
+        },
+        {
+          "path": "scripts/service/generation-cutover.ts",
+          "purpose": "旧任务与恢复日志对账、新对象存储探针和回退门禁"
+        },
+        {
+          "path": "scripts/service/local-compute-environment.ts",
+          "purpose": "向本地 B 投影共享对象存储配置"
+        },
+        {
+          "path": "docs/local-environments.md",
+          "purpose": "本地服务配置、切换与回退操作"
+        }
+      ],
+      "outcomes": "A 独立执行同步与异步图片生成和恢复，保留 API、Agent 工具、历史查询与资产归属。图片网络并发上限为四，异步完整解码一次处理一张并保留原件字节。B 继续处理重媒体，本地 A/B 共用一套受限 COS 服务身份。原开发库十项可读存量资产和三条冻结引用对账通过。经批准单笔旧 partial 保留原状，原需求已在 A 和新桶用新任务重放并下载验证。预检保持旧任务、outbox、队列、日志、新 COS 和回退的独立门禁。",
+      "verification": "当前候选八项证据通过，包括独立审查、规范与代码质量核对、有效全量基线和定向检查。实测无 B 的 A 同步与异步生成、真实多轮工具与原件归属、七处故障恢复、无重复供应商提交。原开发环境在共享受限凭据下正式预检通过。隔离演练验证旧 HTTP 与 Agent 停止准入、旧 B 退出、新 A 历史与资产读取及回退对账。两轮 B 真云转码完成；一次真实对话在 B 真云转码期间首段 9.954 秒、完成 10.041 秒。另一个真实生图请求在采用环回存储的实际 B/FFmpeg 负载中 1.497 秒获 202，22.713 秒完成。各原件保留实际运行版本，覆盖判断记录其适用性。",
+      "limitations": "常驻开发与生产执行器保持原部署。原本地长期环境仍配置 Root 管理身份，本轮服务只注入短期受限共享会话，会话已随验收退出；常驻启用需要可持续的受限共享身份。若在 A 受理图片后执行回退，须先完成 A 侧任务与资产对账。负载场景未取得同请求空载对照，真实 B 真云写入和 A 生图分轮观察。当前候选没有重跑远端完整 CI。",
+      "acceptance": {
+        "candidate": {
+          "commit": "cc0e1e60dff322e4247ad58d0506904c6f289102",
+          "contractRevision": 10
+        },
+        "statement": "这个版本我验收通过，把 cc0e1e6 对应的任务推进到 complete。",
+        "reference": "2026-11-18 当前 Codex 会话中，用户针对候选 cc0e1e6 的明确验收消息。"
+      }
+    },
+    {
       "key": "kling-async-image-slice",
       "title": "OneLink Kling 异步文生图（kling-image-v1）提交、有界查询与重启恢复",
       "locations": [

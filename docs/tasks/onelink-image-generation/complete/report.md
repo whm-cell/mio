@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/compute/service.ts](../../../../src/compute/service.ts) · [src/compute/store.ts](../../../../src/compute/store.ts) · [src/providers/catalog.ts](../../../../src/providers/catalog.ts) · [tests/compute/live-image-loop.ts](../../../../tests/compute/live-image-loop.ts) · [docs/tasks/compute-service/protocol.md](../../compute-service/protocol.md) · [docs/apis/compute.md](../../../apis/compute.md) · [docs/integrations/onelink.md](../../../integrations/onelink.md)
 
+## image-generation-in-a
+
+**将图片生成与恢复迁入 A**
+
+[src/generations/service.ts](../../../../src/generations/service.ts) · [src/generations/runner.ts](../../../../src/generations/runner.ts) · [scripts/service/generation-cutover.ts](../../../../scripts/service/generation-cutover.ts) · [scripts/service/local-compute-environment.ts](../../../../scripts/service/local-compute-environment.ts) · [docs/local-environments.md](../../../local-environments.md)
+
 ## kling-async-image-slice
 
 **OneLink Kling 异步文生图（kling-image-v1）提交、有界查询与重启恢复**

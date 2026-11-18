@@ -680,7 +680,11 @@ async function runPersistentDev(invocation: ReturnType<typeof parseLiveInvocatio
     for (let i = 0; i < 120; i++) {
       assert(app.exitCode === null && app.signalCode === null, 'LIVE_APP_EARLY_EXIT');
       try {
-        if ((await request(dev.origin, '/readyz')).status === 200) return;
+        const ready = await fetch(`${dev.origin}/readyz`, {
+          redirect: 'error',
+          signal: AbortSignal.timeout(1500),
+        });
+        if (ready.status === 200) return;
       } catch {}
       await delay(250);
     }
@@ -759,7 +763,7 @@ async function runPersistentDev(invocation: ReturnType<typeof parseLiveInvocatio
       {
         env,
         encoding: 'utf8',
-        input: JSON.stringify({ version: 1, entries: [route] }),
+        input: JSON.stringify({ routes: [route] }),
       },
     );
     assert.equal(imported.status, 0, 'LIVE_ROUTE_IMPORT');

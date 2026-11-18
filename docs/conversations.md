@@ -39,7 +39,7 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 当 BYOK、`assets` 与显式启用的 A `generations` 同时就绪时，插件向对话引擎注入窄桥接 `ConversationImageTools`（对话契约层不导入 DSH 或生成模块内部实现），仅在活动轮次的 `agentCtx.tools` 开放三个受控意图级生图工具：只读不解密的 `list_image_models`、异步/同步非阻塞受理的 `submit_image_job`（自动为 `requiresAsync: true` 路由补齐 `async: true`，按路由 `supportedOperations` 与 `allowGenerateReferences` 归一化参考图操作模式，并以 `sha256Utf8("mio:conv-image:v1:${userId}:${conversationId}:${turnRequestId}:${clientOperationKey ?? exec.callId}")` 派生确定性 UUID v4 `requestId` 交 `GenerationService.createImage` 幂等去重）以及先经 `isUuidV4` 校验的 `get_image_job`。工具严禁接收 `apiKey`、`userId`、裸 URL、Base64、COS 键或未知字段，单轮受 12 次总调用、4 次图片提交与 8 步硬熔断（`TURN_STEP_BUDGET_EXCEEDED`）约束；轮次结束或卸载立即撤销工具授权。历史与 SSE 仅对非错误且通过严格结构校验的 `mio.image-job` 卡片做白名单投影。
 
-图片工具提交会先按用户和派生的请求 ID 查已有任务。重试时按任务冻结的路由补齐 `async` 和参考图操作后比对请求摘要。同一意图在供应商停用或路由默认值变化时仍返回原任务。相同请求 ID 的不同内容会得到 `REQUEST_CONFLICT`，新提交按当前路由受理。
+图片工具提交会先按用户和派生的请求 ID 查已有任务。重试时按任务冻结的路由补齐 `async` 和参考图操作后比对请求摘要。同一意图在供应商停用或路由默认值变化时仍返回原任务。相同请求 ID 归一后的参数不同会返回 `REQUEST_CONFLICT`。新提交按当前路由受理。
 
 同对话只接受一个活动请求。事务锁住归属行，先查原 request ID：同内容返回原回执，异内容冲突，早于当前目录、默认、认证阻断和解密；不同 ID 遇忙拒绝。输入摘要不含可变版本，不因刷新/轮换重发。目录移除或默认失效后旧回执/历史仍可读，fresh 输入无资格时不新增收费接收。进程内保存同一用户在途接收 Promise，持久去重仍由 PostgreSQL 唯一键负责。
 

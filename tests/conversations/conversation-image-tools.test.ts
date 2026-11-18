@@ -1797,6 +1797,7 @@ export function apply(ctx: Context) {
         .count,
     );
     const chatBeforeIdem = chatRequests.length;
+    const upstreamBeforeIdem = imageUpstreamRequests.length;
     try {
       expect(
         (
@@ -1827,6 +1828,12 @@ export function apply(ctx: Context) {
     expect(idemFinalOutputs[2]!.text).toContain('REQUEST_CONFLICT');
     expect(idemFinalOutputs[3]!.text).toContain('PROVIDER_DISABLED');
     await waitImageJobCompleted(firstIdemJob.jobId, 0);
+    expect(
+      imageUpstreamRequests
+        .slice(upstreamBeforeIdem)
+        .filter((request) => request.method === 'POST')
+        .map((request) => request.json?.prompt),
+    ).toEqual(['idempotent castle']);
 
     // 2. maxImageSubmitsPerTurn = 4 blocks the 5th submit_image_job with 0 5th job created
     const jobsBeforeSubmitBudget = Number(

@@ -1,11 +1,13 @@
 import { epochMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
 import type { ProviderService } from '../providers/service.ts';
+import { validateImageInputByRoute } from './contracts.ts';
 import type { ImageAssetRef } from './contracts.ts';
 import {
   createRoutedImageProtocol,
   defaultRouteAsyncTransport,
 } from '../integrations/onelink/router.ts';
+import { matchesImageSignature } from '../integrations/onelink/shared/index.ts';
 import type { AsyncImageTransport, ReadImage } from '../integrations/onelink/shared/index.ts';
 import { withPublicHttps } from '../integrations/onelink/public-https.ts';
 import { createImageDecoder } from './decode.ts';
@@ -131,11 +133,20 @@ export function createGenerationRunner(
       return;
     }
     const input = row.command.input;
+    if (!validateImageInputByRoute(input, row.command.route)) {
+      await store.terminal(row, 'rejected', 'IMAGE_INPUT_INVALID');
+      return;
+    }
     const reader = read();
     const bounded = AbortSignal.any([stop, AbortSignal.timeout(180_000)]);
     const refs = input.images ?? (input.image ? [input.image] : []);
-    for (const ref of refs) await reader(ref, bounded);
-    if (input.mask) await reader(input.mask, bounded);
+    const sources = input.mask ? [...refs, input.mask] : refs;
+    for (const ref of sources) {
+      if (!matchesImageSignature(await reader(ref, bounded), ref.contentType)) {
+        await store.terminal(row, 'rejected', 'IMAGE_INPUT_INVALID');
+        return;
+      }
+    }
     if (row.command.expiresAt <= epochMs() || stop.aborted) {
       await store.terminal(row, 'rejected', 'IMAGE_CREDENTIAL_UNAVAILABLE');
       return;

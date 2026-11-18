@@ -16,7 +16,7 @@ import { createGenerationAdmission } from '../../src/generations/admission.ts';
 import { createGenerationService } from '../../src/generations/service.ts';
 import type { GenerationService } from '../../src/generations/service.ts';
 import type { GenerationObjects } from '../../src/generations/execution.ts';
-import type { ImageRequestParameters } from '../../src/generations/contracts.ts';
+import type { ImageAssetRef, ImageRequestParameters } from '../../src/generations/contracts.ts';
 import type { AsyncImageTransport } from '../../src/integrations/onelink/shared/index.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';
@@ -160,6 +160,22 @@ export async function generationFixture() {
     },
     setOffline(value: boolean) {
       offline = value;
+    },
+    async addImageSource(input = bytes, contentType: ImageAssetRef['contentType'] = 'image/png') {
+      const assetId = randomUUID();
+      const key = `mio/raw/${assetId}/${randomUUID()}`;
+      const etag = 'etag-' + assetId;
+      await pool.query(
+        `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,raw_key,state,expires_at)
+         VALUES($1,$2,'source',$3,$4,$5,'ready',now())`,
+        [assetId, actor.userId, contentType, input.length, key],
+      );
+      stored.set(key, {
+        bytes: input,
+        etag,
+        sha256: createHash('sha256').update(input).digest('hex'),
+      });
+      return { assetId, key, etag, sizeBytes: input.length, contentType };
     },
     async admit(
       requestId = randomUUID(),

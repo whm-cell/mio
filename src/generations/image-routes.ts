@@ -519,7 +519,7 @@ export function validateImageInputByRoute(input: ImageInput, route: ImageRouteCo
     (input.image !== undefined ||
       input.mask !== undefined ||
       input.geometry !== undefined ||
-      (!spec.allowGenerateReferences && refs.length > 0))
+      (refs.length > 0 && (route.driver === 'openai-images' || !spec.allowGenerateReferences)))
   )
     return false;
   if ((operation === 'edit' || operation === 'outpaint') && refs.length < 1) return false;

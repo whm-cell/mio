@@ -9,6 +9,7 @@ vi.mock('node:fs/promises', async (original) => ({
 }));
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
+import sharp from 'sharp';
 import { createGenerationHandler } from '../../src/generations/http.ts';
 import { generationFixture } from './fixture.ts';
 
@@ -84,6 +85,99 @@ it('keeps image HTTP ownership, idempotency, output order and derived-image edit
   }
 }, 15000);
 
+it('keeps legacy OpenAI jobs for generate and edit while rejecting generate with references', async () => {
+  const f = await generationFixture();
+  const submitting = vi.spyOn(f.store, 'submitting');
+  try {
+    const secondBytes = await sharp(f.bytes).negate().png().toBuffer();
+    const sources = await Promise.all([f.addImageSource(), f.addImageSource(secondBytes)]);
+    const imageAssetIds = sources.map((source) => source.assetId);
+    await f.pool.query(
+      `UPDATE mio_provider_model_routes SET param_spec=param_spec ||
+       '{"allowGenerateReferences":true,"allowedAspectRatios":["16:9"]}'::jsonb
+       WHERE raw_model_id='gpt-image-2' AND operation='image.generate'`,
+    );
+    const generate = await f.admit(randomUUID(), 'plain legacy generate', {
+      operation: 'generate',
+      n: 1,
+      aspect_ratio: '16:9',
+    });
+    const edit = await f.admit(randomUUID(), 'ordered legacy edit', {
+      operation: 'edit',
+      imageAssetIds,
+    });
+    const blocked = await f.admit(randomUUID(), 'legacy generate with references');
+    await f.pool.query(
+      `UPDATE mio_image_jobs SET
+       command=jsonb_set(command,'{route,paramSpec,allowGenerateReferences}','true'),
+       route_snapshot=jsonb_set(route_snapshot,'{paramSpec,allowGenerateReferences}','true')
+       WHERE id=ANY($1::uuid[])`,
+      [[generate.jobId, edit.jobId, blocked.jobId]],
+    );
+    await f.pool.query(
+      "UPDATE mio_image_jobs SET command=jsonb_set(command,'{input,images}',$2) WHERE id=$1",
+      [blocked.jobId, JSON.stringify(sources)],
+    );
+
+    const service = await f.start();
+    await vi.waitFor(
+      async () => {
+        const result = await service.getImage(f.actor, blocked.jobId);
+        expect(result.status).not.toBe('accepted');
+      },
+      { timeout: 6000 },
+    );
+    expect(await service.getImage(f.actor, blocked.jobId)).toMatchObject({
+      status: 'rejected',
+      errorCode: 'IMAGE_INPUT_INVALID',
+    });
+    expect(submitting.mock.calls.map(([row]) => row.id)).not.toContain(blocked.jobId);
+    await vi.waitFor(
+      async () => {
+        expect((await service.getImage(f.actor, generate.jobId)).status).toBe('completed');
+        expect((await service.getImage(f.actor, edit.jobId)).status).toBe('completed');
+      },
+      { timeout: 6000 },
+    );
+    expect(f.transport).toHaveBeenCalledTimes(2);
+    const [generateCall] = f.transport.mock.calls.filter(([url]) =>
+      String(url).endsWith('/generations'),
+    );
+    expect(JSON.parse(String(generateCall?.[1]?.body))).toEqual({
+      model: 'gpt-image-2',
+      prompt: 'plain legacy generate',
+      n: 1,
+      aspect_ratio: '16:9',
+    });
+    const [editCall] = f.transport.mock.calls.filter(([url]) => String(url).endsWith('/edits'));
+    const form = editCall?.[1]?.body as FormData;
+    expect([...form.keys()]).toEqual(['model', 'prompt', 'response_format', 'image', 'image']);
+    const images = form.getAll('image') as File[];
+    expect(
+      await Promise.all(images.map(async (image) => Buffer.from(await image.arrayBuffer()))),
+    ).toEqual([f.bytes, secondBytes]);
+    const model = (await f.provider.listImageModels(f.actor)).find(
+      (item) => item.modelRef === f.modelRef,
+    );
+    expect(model).toMatchObject({
+      supportedOperations: ['generate', 'edit'],
+      allowGenerateReferences: false,
+      allowedAspectRatios: ['16:9'],
+    });
+    await expect(
+      service.createImage(f.actor, randomUUID(), f.modelRef, {
+        prompt: 'new generate with references',
+        operation: 'generate',
+        imageAssetIds,
+      }),
+    ).rejects.toMatchObject({ code: 'IMAGE_OPERATION_UNSUPPORTED' });
+    expect(f.transport).toHaveBeenCalledTimes(2);
+  } finally {
+    submitting.mockRestore();
+    await f.close();
+  }
+}, 15000);
+
 it('freezes the first encrypted credential but queries an admitted async task with the current Key', async () => {
   const f = await generationFixture();
   try {
@@ -116,6 +210,93 @@ it('freezes the first encrypted credential but queries an admitted async task wi
     ).rows[0];
     expect(JSON.stringify(metadata)).not.toContain('image-key');
   } finally {
+    await f.close();
+  }
+}, 15000);
+
+it.each(['later reference', 'mask'] as const)(
+  'rejects a %s with a mismatched signature before writing a submission intent',
+  async (fault) => {
+    const f = await generationFixture();
+    const submitting = vi.spyOn(f.store, 'submitting');
+    try {
+      const source = await f.addImageSource();
+      const jpeg = await sharp(f.bytes).jpeg().toBuffer();
+      const mislabeled = await f.addImageSource(jpeg, 'image/png');
+      const service = await f.start();
+      const job = await service.createImage(
+        f.actor,
+        randomUUID(),
+        fault === 'mask' ? f.modelRef : f.asyncModelRef,
+        {
+          prompt: 'signature preflight',
+          ...(fault === 'mask'
+            ? { operation: 'edit', imageAssetId: source.assetId, maskAssetId: mislabeled.assetId }
+            : {
+                operation: 'generate',
+                async: true,
+                imageAssetIds: [source.assetId, mislabeled.assetId],
+              }),
+        },
+      );
+      await vi.waitFor(
+        async () =>
+          expect((await service.getImage(f.actor, job.jobId)).status).not.toBe('accepted'),
+        { timeout: 6000 },
+      );
+      expect(submitting.mock.calls.length).toBe(0);
+      expect(await service.getImage(f.actor, job.jobId)).toMatchObject({
+        status: 'rejected',
+        errorCode: 'IMAGE_INPUT_INVALID',
+      });
+      const reads = vi.mocked(f.objects.readImage!).mock.calls.map(([key]) => key);
+      expect(reads).toEqual([source.key, mislabeled.key]);
+      expect(f.transport).not.toHaveBeenCalled();
+      expect(f.asyncTransport.submit).not.toHaveBeenCalled();
+    } finally {
+      submitting.mockRestore();
+      await f.close();
+    }
+  },
+  15000,
+);
+
+it('retries a failed conditional read before submitting verified image and mask bytes once', async () => {
+  const f = await generationFixture();
+  const release = vi.spyOn(f.store, 'release');
+  const submitting = vi.spyOn(f.store, 'submitting');
+  const read = vi.mocked(f.objects.readImage!);
+  try {
+    const source = await f.addImageSource();
+    const mask = await f.addImageSource();
+    read.mockRejectedValueOnce(
+      Object.assign(new Error('ASSET_OBJECT_RESPONSE'), { statusCode: 412 }),
+    );
+    const service = await f.start();
+    const job = await service.createImage(f.actor, randomUUID(), f.modelRef, {
+      prompt: 'retry storage read',
+      operation: 'edit',
+      imageAssetId: source.assetId,
+      maskAssetId: mask.assetId,
+    });
+    await vi.waitFor(
+      async () => expect((await service.getImage(f.actor, job.jobId)).status).toBe('completed'),
+      { timeout: 6000 },
+    );
+    expect(release).toHaveBeenCalledOnce();
+    expect(submitting).toHaveBeenCalledOnce();
+    expect(release.mock.invocationCallOrder[0]).toBeLessThan(
+      submitting.mock.invocationCallOrder[0]!,
+    );
+    expect(read.mock.calls.map(([key, etag, size]) => [key, etag, size])).toEqual([
+      [source.key, source.etag, source.sizeBytes],
+      [source.key, source.etag, source.sizeBytes],
+      [mask.key, mask.etag, mask.sizeBytes],
+    ]);
+    expect(f.transport).toHaveBeenCalledOnce();
+  } finally {
+    release.mockRestore();
+    submitting.mockRestore();
     await f.close();
   }
 }, 15000);

@@ -146,6 +146,24 @@ async function withProviderDb(
 }
 
 describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () => {
+  it('rejects an imported OpenAI image route for reference-driven JSON generation', async () =>
+    withProviderDb(async ({ pool, env }) => {
+      const route = findFixtureRoute('gpt-image-2', 'image.generate');
+      const rejected = runRouteCli(
+        env,
+        '--stdin',
+        JSON.stringify({
+          ...route,
+          paramSpec: { ...route.paramSpec, allowGenerateReferences: true },
+        }),
+      );
+      expect(rejected.status).toBe(1);
+      expect(rejected.stderr.trim()).toBe('ROUTE_INVALID');
+      expect((await pool.query('SELECT raw_model_id FROM mio_provider_model_routes')).rows).toEqual(
+        [],
+      );
+    }));
+
   it('Scenario 1: imports JSON routes idempotently via CLI, rejects --seed and >65536B inputs, and makes discovered models runnable across users', async () =>
     withProviderDb(async ({ config, env }) => {
       const rejectedSeed = runRouteCli(env, '--seed');

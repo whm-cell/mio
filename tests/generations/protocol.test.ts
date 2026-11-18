@@ -758,19 +758,39 @@ describe('Routed vendor image protocols', () => {
       .mockResolvedValue(
         Response.json({ data: [{ b64_json: 'YWJj', revised_prompt: key }], secret: key }),
       );
+    const options = {
+      n: 1,
+      background: 'opaque',
+      moderation: 'low',
+      quality: 'high',
+      size: '1024x1024',
+      aspect_ratio: '16:9',
+      output_format: 'jpeg',
+      output_compression: 0,
+      user: 'fixture-user',
+    } as const;
+    const protocol = createRoutedImageProtocol(
+      {
+        ...GPT_ROUTE,
+        paramSpec: { ...GPT_ROUTE.paramSpec, allowedAspectRatios: ['16:9'] },
+        requestDefaults: {},
+      },
+      'generate',
+      transport,
+    );
     expect(
-      await createRoutedImageProtocol(
-        { ...GPT_ROUTE, requestDefaults: {} },
-        'generate',
-        transport,
-      ).submit(input, key),
+      await protocol.submit({ ...input, ...options, operation: 'generate', async: false }, key),
     ).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
+    await expect(protocol.submit({ ...input, aspect_ratio: '9:16' }, key)).resolves.toEqual({
+      state: 'rejected',
+      code: 'IMAGE_INPUT_INVALID',
+    });
     expect(transport).toHaveBeenCalledOnce();
-    const [url, options] = transport.mock.calls[0]!;
+    const [url, request] = transport.mock.calls[0]!;
     expect(url).toBe('https://api.onelinkai.cloud/v1/images/generations');
-    expect(options?.redirect).toBe('error');
-    expect(JSON.parse(options?.body as string)).toEqual(input);
-    expect(options?.headers).toEqual({
+    expect(request?.redirect).toBe('error');
+    expect(JSON.parse(request?.body as string)).toEqual({ ...input, ...options });
+    expect(request?.headers).toEqual({
       Authorization: `Bearer ${key}`,
       'Content-Type': 'application/json',
     });

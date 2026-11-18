@@ -287,6 +287,8 @@ export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
     outputSpec,
   };
   if (!validateImageRouteConfig(candidateRoute)) invalidRoute();
+  if (candidateRoute.driver === 'openai-images' && candidateRoute.paramSpec.allowGenerateReferences)
+    invalidRoute();
   if (
     candidateRoute.paramSpec.async !== null &&
     !isValidImageRoutePath(queryPathTemplate, value.driver, true)
@@ -502,9 +504,17 @@ export function resolveImageRoute(row: PlatformRouteRecord): ResolvedImageRoute 
     !isValidImageRoutePath(candidate.queryPathTemplate, row.driver, true)
   )
     return undefined;
-  const route = canonicalImageRouteConfig(candidate);
-  const imageCapability =
-    row.capability_metadata?.image ?? deriveImageCapabilityMetadata(route.paramSpec);
+  const legacyGenerateReferences =
+    candidate.driver === 'openai-images' && candidate.paramSpec.allowGenerateReferences;
+  const route = canonicalImageRouteConfig(
+    legacyGenerateReferences
+      ? { ...candidate, paramSpec: { ...candidate.paramSpec, allowGenerateReferences: false } }
+      : candidate,
+  );
+  const storedImageCapability = legacyGenerateReferences
+    ? undefined
+    : row.capability_metadata?.image;
+  const imageCapability = storedImageCapability ?? deriveImageCapabilityMetadata(route.paramSpec);
   const asyncReady =
     !route.requiresAsync || Boolean(imageCapability.async?.operations.includes('generate'));
   return {

@@ -12,6 +12,18 @@ import {
 } from '../shared/index.ts';
 import type { ImageObservation, ImageSubmission, ReadImage } from '../shared/index.ts';
 
+const OPENAI_IMAGE_OPTIONAL_FIELDS = [
+  'n',
+  'background',
+  'moderation',
+  'quality',
+  'size',
+  'output_format',
+  'output_compression',
+  'user',
+] as const;
+const OPENAI_IMAGE_GENERATE_FIELDS = [...OPENAI_IMAGE_OPTIONAL_FIELDS, 'aspect_ratio'] as const;
+
 async function buildOpenAiEditFormData(
   input: ImageInput,
   operation: string,
@@ -46,17 +58,7 @@ async function buildOpenAiEditFormData(
       'mask.png',
     );
   }
-  const optional = [
-    'n',
-    'background',
-    'moderation',
-    'quality',
-    'size',
-    'output_format',
-    'output_compression',
-    'user',
-  ] as const;
-  for (const key of optional) {
+  for (const key of OPENAI_IMAGE_OPTIONAL_FIELDS) {
     const value = input[key];
     if (value !== undefined) form.set(key, String(value));
   }
@@ -89,7 +91,12 @@ export async function submitOpenAiImage(
       endpoint = joinOneLinkPath(route.submitPath, 'openai-images');
       if (!endpoint) return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
       headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-      body = JSON.stringify(input);
+      const payload: Record<string, string | number> = { model: input.model, prompt: input.prompt };
+      for (const key of OPENAI_IMAGE_GENERATE_FIELDS) {
+        const value = input[key];
+        if (value !== undefined) payload[key] = value;
+      }
+      body = JSON.stringify(payload);
     }
   } catch {
     return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };

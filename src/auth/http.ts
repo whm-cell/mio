@@ -5,6 +5,7 @@ import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { AUTH_BASE_PATH } from './config.ts';
 import type { AuthConfig } from './config.ts';
 import type { Authentication } from './service.ts';
+import { wechatCallbackURL } from './wechat-input.ts';
 
 const AUTH_BODY_LIMIT_BYTES = 16 * 1024;
 
@@ -18,6 +19,7 @@ const routes = new Map([
   ['/sign-in/social', 'POST'],
   ['/link-social', 'POST'],
   ['/callback/wechat', 'GET'],
+  ['/wechat/qr-session', 'POST'],
   ['/sign-out', 'POST'],
   ['/get-session', 'GET'],
   ['/change-password', 'POST'],
@@ -37,20 +39,12 @@ function wechatStartBody(raw: string, origin: string) {
       Object.keys(body).some((key) => !['provider', 'callbackURL'].includes(key))
     )
       return;
-    const callback = body.callbackURL ?? '/';
-    if (
-      typeof callback !== 'string' ||
-      !callback.startsWith('/') ||
-      callback.startsWith('//') ||
-      /[\u0000-\u001f\u007f\\]/.test(callback)
-    )
-      return;
-    const url = new URL(callback, origin);
-    if (url.origin !== origin) return;
+    const callbackURL = wechatCallbackURL(body.callbackURL, origin, '/');
+    if (!callbackURL) return;
     return JSON.stringify({
       provider: 'wechat',
-      callbackURL: url.href,
-      errorCallbackURL: url.href,
+      callbackURL,
+      errorCallbackURL: callbackURL,
       disableRedirect: true,
     });
   } catch {
@@ -75,13 +69,20 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       response.setHeader('vary', 'Origin');
     }
     const pathname = (request.url ?? '').split('?')[0]!;
-    const wechatRoute = [
-      `${AUTH_BASE_PATH}/sign-in/social`,
-      `${AUTH_BASE_PATH}/link-social`,
-      `${AUTH_BASE_PATH}/callback/wechat`,
-    ].includes(pathname);
+    const qrCreate = pathname === `${AUTH_BASE_PATH}/wechat/qr-session`;
+    const qrPoll = /^\/api\/auth\/wechat\/qr-session\/[0-9a-f-]{36}\/poll$/.test(pathname);
+    const wechatRoute =
+      [
+        `${AUTH_BASE_PATH}/sign-in/social`,
+        `${AUTH_BASE_PATH}/link-social`,
+        `${AUTH_BASE_PATH}/callback/wechat`,
+      ].includes(pathname) ||
+      qrCreate ||
+      qrPoll;
     const method =
-      pathname === '/api/v1/me' ? 'GET' : routes.get(pathname.slice(AUTH_BASE_PATH.length));
+      pathname === '/api/v1/me' || qrPoll
+        ? 'GET'
+        : routes.get(pathname.slice(AUTH_BASE_PATH.length));
     if (!method) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
     if (request.method === 'OPTIONS') {
       if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
@@ -122,7 +123,7 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
         method === 'POST'
           ? (await readBody(request, AUTH_BODY_LIMIT_BYTES)).toString('utf8')
           : undefined;
-      if (wechatRoute && method === 'POST') {
+      if (wechatRoute && !qrCreate && method === 'POST') {
         body = wechatStartBody(body!, config.baseURL);
         if (!body) return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
       }

@@ -10,6 +10,8 @@ import {
 } from 'better-auth/api';
 import { createWechatClient, wechatAccountId } from '../integrations/wechat.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
+import type { Pool } from 'pg';
+import { admitWechatQR, finishWechatQR } from './wechat-qr-store.ts';
 
 const MAX_BINDING_AGE = 10 * 60_000;
 const STATE_RESERVATION_AGE = 15 * 60_000;
@@ -18,8 +20,21 @@ function reject(code: string): never {
   throw new APIError('BAD_REQUEST', { code, message: 'WeChat authentication failed' });
 }
 
+/** QR persistence failures do not disclose database or provider details. */
+export function wechatUnavailable(): never {
+  throw new APIError('SERVICE_UNAVAILABLE', {
+    code: 'AUTH_UNAVAILABLE',
+    message: 'Authentication unavailable',
+  });
+}
+
 /** Preserve the initial session in library-owned state and consume each browser-bound state once. */
-export function wechatPlugin(config: WechatConfig | undefined, domain: string): BetterAuthPlugin {
+export function wechatPlugin(
+  config: WechatConfig | undefined,
+  domain: string,
+  pool: Pool,
+): BetterAuthPlugin {
+  const qrCallbacks = new WeakMap<Request, string>();
   return {
     id: 'mio-wechat',
     schema: {
@@ -92,6 +107,26 @@ export function wechatPlugin(config: WechatConfig | undefined, domain: string): 
               expiresAt: new Date(epochMs() + STATE_RESERVATION_AGE),
             });
             if (!reserved) return reject('STATE_REPLAY');
+            const qr = await admitWechatQR(pool, digest).catch(wechatUnavailable);
+            if (qr && 'error' in qr) return reject(qr.error);
+            if (qr && ctx.query?.error) {
+              ctx.query.error = 'WECHAT_AUTH_FAILED';
+              ctx.query.error_description = '';
+            }
+            if (qr && ctx.request) qrCallbacks.set(ctx.request, qr.id);
+          }),
+        },
+      ],
+      after: [
+        {
+          matcher: (ctx) => ctx.path === '/callback/:id' && ctx.params?.id === 'wechat',
+          handler: createAuthMiddleware(async (ctx) => {
+            const id = ctx.request && qrCallbacks.get(ctx.request);
+            if (!id) return;
+            qrCallbacks.delete(ctx.request!);
+            await finishWechatQR(pool, id, ctx.context.newSession?.user.id).catch(
+              wechatUnavailable,
+            );
           }),
         },
       ],

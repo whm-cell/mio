@@ -37,6 +37,8 @@ pnpm start:dev
 
 本次认证 schema 包括可空且唯一的手机号、验证码挑战、短信预算及账号复合唯一索引；无论是否启用对应供应商，运行与显式迁移检查同一结构。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更。启用供应商但配置不全会拒绝装载；未启用时相应入口返回不可用，不影响邮箱入口。
 
+微信 QR polling 使用同一认证库中的 `mioWechatQR` 模型，包含不透明 ID、唯一且可空的 OAuth state 摘要、QR Cookie 摘要、带索引的状态与过期时间，以及可空的确认用户、确认时间和失败原因码。模型通过 `authOptions` 的插件 schema 进入现有显式迁移与启动检查；即使微信关闭，升级后也须先显式迁移 QR 结构才能启用认证。QR 表不保存 state、Cookie、Session secret 或供应商 token 明文；Better Auth 自身的数据库 OAuth state 仍沿用原策略，不受这条 QR 表存储规则替代。
+
 认证与 `MIO_API_TOKEN` 分离，后者仍只保护 foundation 能力查询，不能作为 userId。认证启用失败时插件不注册 readyz 或业务路由；成功后 readyz 只表明本次装载就绪，不持续查询数据库健康。
 
 ## HTTP 入口
@@ -68,6 +70,10 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 ### 微信登录与绑定
 
 微信可独立登录或注册，手机号绑定可选；已有用户必须从本人会话主动绑定，不能凭相同邮箱自动合并或转移另一个账号的微信。身份键、授权回调、state 防重放、供应商请求和 AppID 变更前置条件见[微信契约](integrations/wechat.md)。仅开放指定微信 provider 和 GET 回调，不支持换绑、解绑、账号合并或旧账号迁移。微信生成的占位邮箱保持 `emailVerified=false`；微信授权本身不验证邮箱。
+
+匿名 QR 登录在原微信流程外增加短期会话与轮询，不提供微信绑定入口。Mio 主页面保持打开，同一浏览器的授权窗口完成微信 callback 并接收原 Session Cookie；主页面凭单个 QR 的 Cookie 轮询，确认后调用现有 `/api/v1/me`。QR 有效期为 5 分钟，Cookie 保留 15 分钟以便观察过期；创建时最多删除 100 条已过期至少 10 分钟的记录，不另启清理 Worker。清理后该 ID 按未知处理，不能永久查询历史状态。
+
+QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
 
 ## 职责与限制
 

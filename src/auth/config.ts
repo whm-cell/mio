@@ -6,6 +6,7 @@ import type { WechatConfig } from '../integrations/wechat.ts';
 import { phonePlugin } from './phone.ts';
 import type { PhoneLimits } from './phone-store.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
+import { wechatQRPlugin } from './wechat-qr.ts';
 
 export const AUTH_BASE_PATH = '/api/auth';
 export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
@@ -152,7 +153,8 @@ export function authOptions(config: AuthConfig, pool: Pool, sender?: SmsSender):
         sender ?? (config.sms ? createTencentSmsSender(config.sms) : undefined),
         AUTH_PLACEHOLDER_EMAIL_DOMAIN,
       ),
-      wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN),
+      wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
+      wechatQRPlugin(config.baseURL, pool),
     ],
     user: {
       async validateUserInfo(data, context) {
@@ -207,6 +209,8 @@ export function authOptions(config: AuthConfig, pool: Pool, sender?: SmsSender):
         '/phone-binding/confirm': { window: 60, max: 10 },
         '/sign-in/social': { window: 60, max: 10 },
         '/link-social': { window: 60, max: 10 },
+        '/wechat/qr-session': { window: 60, max: 20 },
+        '/wechat/qr-session/*/poll': { window: 60, max: 300 },
       },
     },
     advanced: {

@@ -20,6 +20,11 @@
       "identity": "docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md",
       "kind": "change",
       "path": "docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md"
+    },
+    {
+      "identity": "docs/tasks/ai-drama-foundation/changes/wechat-qr-polling/change.md",
+      "kind": "change",
+      "path": "docs/tasks/ai-drama-foundation/changes/wechat-qr-polling/change.md"
     }
   ]
 }

@@ -21,7 +21,7 @@ import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 import type { GenerationRequest } from './execution.ts';
-import type { GenerationStore } from './store.ts';
+import type { GenerationStore, ImageRequestRecord } from './store.ts';
 import type { GenerationFiles } from './files.ts';
 import { GenerationError } from './errors.ts';
 
@@ -59,6 +59,31 @@ function validateRequest(requestId: string, modelRef: string, parameters: ImageR
     (parameters.async !== undefined && typeof parameters.async !== 'boolean')
   )
     inputError();
+}
+
+function requestHash(modelRef: string, parameters: ImageRequestParameters): string {
+  const normalized = Object.fromEntries(
+    Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
+  );
+  return sha256Utf8(JSON.stringify([modelRef, normalized]));
+}
+
+function toolParameters(
+  parameters: ImageRequestParameters,
+  defaults: Pick<ImageRequestRecord, 'requiresAsync' | 'supportsEdit' | 'allowGenerateReferences'>,
+): ImageRequestParameters {
+  const async = parameters.async ?? (defaults.requiresAsync ? true : undefined);
+  let operation = parameters.operation;
+  if (operation === undefined) {
+    if (parameters.maskAssetId !== undefined) operation = 'edit';
+    else if (parameters.imageAssetIds?.length)
+      operation = defaults.supportsEdit || !defaults.allowGenerateReferences ? 'edit' : 'generate';
+  }
+  return {
+    ...parameters,
+    ...(async !== undefined ? { async } : {}),
+    ...(operation !== undefined ? { operation } : {}),
+  };
 }
 
 function references(parameters: ImageRequestParameters) {
@@ -189,98 +214,142 @@ export function createGenerationAdmission(
     actor: { readonly userId: string; readonly sessionId?: string },
     requestId: string,
     modelRef: string,
-    parameters: ImageRequestParameters,
+    intent: ImageRequestParameters,
+    tool?: { signal: AbortSignal },
   ) => {
-    validateRequest(requestId, modelRef, parameters);
-    const normalized = Object.fromEntries(
-      Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
-    );
-    const hash = sha256Utf8(JSON.stringify([modelRef, normalized]));
-    const previous = await store.imageRequest(actor.userId, requestId);
-    if (previous) {
-      if (previous.input_hash !== hash)
+    validateRequest(requestId, modelRef, intent);
+    tool?.signal.throwIfAborted();
+    const httpHash = tool ? undefined : requestHash(modelRef, intent);
+    // Tool retries use the winning job's defaults, including jobs admitted before this lookup.
+    const matchesTool = tool
+      ? (record: ImageRequestRecord) =>
+          record.input_hash === requestHash(modelRef, toolParameters(intent, record))
+      : undefined;
+    const replay = async () => {
+      const previous = await store.imageRequest(actor.userId, requestId, Boolean(matchesTool));
+      tool?.signal.throwIfAborted();
+      if (!previous) return;
+      if (matchesTool ? !matchesTool(previous) : previous.input_hash !== httpHash)
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
       return store.imageGet(actor.userId, previous.id);
+    };
+    const previous = await replay();
+    if (previous) return previous;
+    try {
+      if (await store.storageBlocked())
+        throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
+      await files.admit();
+      const providers = provider();
+      if (!providers)
+        throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
+      const httpReferences = tool ? undefined : references(intent);
+      tool?.signal.throwIfAborted();
+      const snapshot = await providers.snapshotImage(actor, modelRef);
+      tool?.signal.throwIfAborted();
+      const parameters = tool
+        ? toolParameters(intent, {
+            requiresAsync: snapshot.route.requiresAsync,
+            supportsEdit: snapshot.route.paramSpec.supportedOperations.includes('edit'),
+            allowGenerateReferences: snapshot.route.paramSpec.allowGenerateReferences,
+          })
+        : intent;
+      const { operation, ids } = httpReferences ?? references(parameters);
+      const route = capability(snapshot, parameters, operation, ids.length);
+      const images = await Promise.all(ids.map((id) => inputAsset(store, head, actor.userId, id)));
+      const mask =
+        parameters.maskAssetId !== undefined
+          ? await inputAsset(store, head, actor.userId, parameters.maskAssetId, true)
+          : undefined;
+      const {
+        imageAssetId,
+        imageAssetIds: _imageAssetIds,
+        maskAssetId: _maskAssetId,
+        geometry,
+        ...rest
+      } = parameters;
+      void _imageAssetIds;
+      void _maskAssetId;
+      const input: ImageInput = {
+        ...rest,
+        model: snapshot.modelId,
+        ...(operation === 'edit' || operation === 'outpaint'
+          ? {
+              operation,
+              ...(imageAssetId !== undefined && images.length === 1
+                ? { image: images[0]! }
+                : { images }),
+              ...(mask ? { mask } : {}),
+              ...(operation === 'outpaint' ? { geometry } : {}),
+            }
+          : images.length
+            ? { images }
+            : {}),
+      };
+      if (!validateImageInputByRoute(input, route)) inputError();
+      const async = snapshot.capabilityMetadata.image?.async;
+      const command: GenerationRequest = {
+        version: 1,
+        type: 'image.request',
+        messageId: createId(),
+        jobId: createId(),
+        ownerId: actor.userId,
+        profile: snapshot.profile,
+        route,
+        input,
+        expiresAt:
+          epochMs() +
+          (parameters.async === true
+            ? Math.min(
+                86_400_000,
+                (route.paramSpec.async?.maxAgeSeconds ?? async?.maxAgeSeconds ?? 600) * 1000,
+              )
+            : 10 * 60_000),
+      };
+      if (Buffer.byteLength(JSON.stringify(command), 'utf8') > IMAGE_MAX_MESSAGE_BYTES)
+        inputError();
+      const admitted = {
+        providerConfigId: snapshot.providerConfigId,
+        providerRevision: snapshot.providerRevision,
+        credentialVersion: snapshot.credentialVersion,
+        catalogVersion: snapshot.catalogVersion,
+        adaptationVersion: snapshot.adaptationVersion,
+        vendor: snapshot.vendor,
+        modelKey: snapshot.modelKey,
+        ...(parameters.async === true && async ? { async } : {}),
+        modelRef,
+        modelId: snapshot.modelId,
+        profile: snapshot.profile,
+        operation:
+          input.operation === 'outpaint'
+            ? 'image.outpaint'
+            : input.operation === 'edit'
+              ? 'image.edit'
+              : 'image.generate',
+      };
+      tool?.signal.throwIfAborted();
+      const hash = httpHash ?? requestHash(modelRef, parameters);
+      const id = await store.imageCreate(
+        actor.userId,
+        requestId,
+        hash,
+        command,
+        admitted,
+        snapshot,
+        matchesTool,
+      );
+      return store.imageGet(actor.userId, id);
+    } catch (error) {
+      // Another submit can commit between the first lookup and a failing fresh preflight.
+      if (
+        tool &&
+        !tool.signal.aborted &&
+        (error instanceof ProviderError ||
+          (error instanceof GenerationError && error.code !== 'REQUEST_CONFLICT'))
+      ) {
+        const concurrent = await replay();
+        if (concurrent) return concurrent;
+      }
+      throw error;
     }
-    if (await store.storageBlocked())
-      throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
-    await files.admit();
-    const providers = provider();
-    if (!providers) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
-    const { operation, ids } = references(parameters);
-    const snapshot = await providers.snapshotImage(actor, modelRef);
-    const route = capability(snapshot, parameters, operation, ids.length);
-    const images = await Promise.all(ids.map((id) => inputAsset(store, head, actor.userId, id)));
-    const mask =
-      parameters.maskAssetId !== undefined
-        ? await inputAsset(store, head, actor.userId, parameters.maskAssetId, true)
-        : undefined;
-    const {
-      imageAssetId,
-      imageAssetIds: _imageAssetIds,
-      maskAssetId: _maskAssetId,
-      geometry,
-      ...rest
-    } = parameters;
-    void _imageAssetIds;
-    void _maskAssetId;
-    const input: ImageInput = {
-      ...rest,
-      model: snapshot.modelId,
-      ...(operation === 'edit' || operation === 'outpaint'
-        ? {
-            operation,
-            ...(imageAssetId !== undefined && images.length === 1
-              ? { image: images[0]! }
-              : { images }),
-            ...(mask ? { mask } : {}),
-            ...(operation === 'outpaint' ? { geometry } : {}),
-          }
-        : images.length
-          ? { images }
-          : {}),
-    };
-    if (!validateImageInputByRoute(input, route)) inputError();
-    const async = snapshot.capabilityMetadata.image?.async;
-    const command: GenerationRequest = {
-      version: 1,
-      type: 'image.request',
-      messageId: createId(),
-      jobId: createId(),
-      ownerId: actor.userId,
-      profile: snapshot.profile,
-      route,
-      input,
-      expiresAt:
-        epochMs() +
-        (parameters.async === true
-          ? Math.min(
-              86_400_000,
-              (route.paramSpec.async?.maxAgeSeconds ?? async?.maxAgeSeconds ?? 600) * 1000,
-            )
-          : 10 * 60_000),
-    };
-    if (Buffer.byteLength(JSON.stringify(command), 'utf8') > IMAGE_MAX_MESSAGE_BYTES) inputError();
-    const admitted = {
-      providerConfigId: snapshot.providerConfigId,
-      providerRevision: snapshot.providerRevision,
-      credentialVersion: snapshot.credentialVersion,
-      catalogVersion: snapshot.catalogVersion,
-      adaptationVersion: snapshot.adaptationVersion,
-      vendor: snapshot.vendor,
-      modelKey: snapshot.modelKey,
-      ...(parameters.async === true && async ? { async } : {}),
-      modelRef,
-      modelId: snapshot.modelId,
-      profile: snapshot.profile,
-      operation:
-        input.operation === 'outpaint'
-          ? 'image.outpaint'
-          : input.operation === 'edit'
-            ? 'image.edit'
-            : 'image.generate',
-    };
-    const id = await store.imageCreate(actor.userId, requestId, hash, command, admitted, snapshot);
-    return store.imageGet(actor.userId, id);
   };
 }

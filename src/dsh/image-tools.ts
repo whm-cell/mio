@@ -2,7 +2,7 @@ import { ApplicationError } from '@mio/foundation/errors';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { IMAGE_DRIVERS, IMAGE_OPERATIONS } from '../generations/contracts.ts';
-import type { ImageOperation, ImageRequestParameters } from '../generations/contracts.ts';
+import type { ImageRequestParameters } from '../generations/contracts.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
 import { defineTool, isPlainJsonRecord, ToolArgsError } from '@deepseek-ai/dsh-tools';
@@ -409,26 +409,10 @@ export function registerConversationImageTools(
           }
           exec.signal.throwIfAborted();
           try {
-            const route = await bridge.inspectRoute(actor, args.modelRef);
-            exec.signal.throwIfAborted();
-            const hasRefs = (args.imageAssetIds?.length ?? 0) > 0;
-            const resolvedOperation: ImageOperation | undefined =
-              args.operation ??
-              (args.maskAssetId !== undefined
-                ? 'edit'
-                : hasRefs
-                  ? route.paramSpec.supportedOperations.includes('edit')
-                    ? 'edit'
-                    : route.paramSpec.allowGenerateReferences
-                      ? 'generate'
-                      : 'edit'
-                  : undefined);
-            const resolvedAsync =
-              args.async !== undefined ? args.async : route.requiresAsync ? true : undefined;
             const parameters: ImageRequestParameters = {
               prompt: args.prompt,
-              ...(resolvedAsync !== undefined ? { async: resolvedAsync } : {}),
-              ...(resolvedOperation !== undefined ? { operation: resolvedOperation } : {}),
+              ...(args.async !== undefined ? { async: args.async } : {}),
+              ...(args.operation !== undefined ? { operation: args.operation } : {}),
               ...(args.imageAssetIds !== undefined
                 ? { imageAssetIds: [...args.imageAssetIds] }
                 : {}),
@@ -450,7 +434,13 @@ export function registerConversationImageTools(
               run.requestId,
               args.clientOperationKey ?? exec.callId,
             );
-            const job = await bridge.createImage(actor, requestId, args.modelRef, parameters);
+            const job = await bridge.createImage(
+              actor,
+              requestId,
+              args.modelRef,
+              parameters,
+              exec.signal,
+            );
             return sanitizeJobView(job);
           } catch (error) {
             return toSanitizedToolError(error);

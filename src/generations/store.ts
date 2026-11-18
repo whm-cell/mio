@@ -24,6 +24,36 @@ const log = createLogger('app', 'generation-store');
 const QUOTA_LOCK = 672049924;
 const EXECUTOR_LOCK = 672049925;
 
+export interface ImageRequestRecord {
+  id: string;
+  input_hash: string;
+  requiresAsync: boolean | null;
+  supportsEdit: boolean | null;
+  allowGenerateReferences: boolean | null;
+}
+
+async function findImageRequest(
+  db: Pool | PoolClient,
+  owner: string,
+  requestId: string,
+  includeToolDefaults: boolean,
+): Promise<ImageRequestRecord | undefined> {
+  return (
+    await db.query<ImageRequestRecord>(
+      `SELECT id,input_hash,
+        route->'requiresAsync' AS "requiresAsync",
+        (route#>'{paramSpec,supportedOperations}') ? 'edit' AS "supportsEdit",
+        route#>'{paramSpec,allowGenerateReferences}' AS "allowGenerateReferences"
+       FROM mio_image_jobs
+       CROSS JOIN LATERAL (
+         SELECT CASE WHEN $3::boolean THEN COALESCE(route_snapshot,command->'route') END AS route
+       ) frozen
+       WHERE owner_id=$1 AND request_id=$2`,
+      [owner, requestId, includeToolDefaults],
+    )
+  ).rows[0];
+}
+
 async function transaction<T>(pool: Pool, run: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
@@ -103,13 +133,8 @@ export class GenerationStore {
     );
   }
 
-  async imageRequest(owner: string, requestId: string) {
-    return (
-      await this.pool.query<{ id: string; input_hash: string }>(
-        'SELECT id,input_hash FROM mio_image_jobs WHERE owner_id=$1 AND request_id=$2',
-        [owner, requestId],
-      )
-    ).rows[0];
+  imageRequest(owner: string, requestId: string, includeToolDefaults = false) {
+    return findImageRequest(this.pool, owner, requestId, includeToolDefaults);
   }
 
   async imageCreate(
@@ -119,6 +144,7 @@ export class GenerationStore {
     command: GenerationRequest,
     admitted: Record<string, unknown>,
     snapshot: ImageAdmissionSnapshot,
+    matchesTool?: (previous: ImageRequestRecord) => boolean,
   ): Promise<string> {
     if (
       command.ownerId !== owner ||
@@ -128,14 +154,9 @@ export class GenerationStore {
       throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
     return transaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock($1)', [QUOTA_LOCK]);
-      const existing = (
-        await client.query<{ id: string; input_hash: string }>(
-          'SELECT id,input_hash FROM mio_image_jobs WHERE owner_id=$1 AND request_id=$2',
-          [owner, requestId],
-        )
-      ).rows[0];
+      const existing = await findImageRequest(client, owner, requestId, Boolean(matchesTool));
       if (existing) {
-        if (existing.input_hash !== hash)
+        if (matchesTool ? !matchesTool(existing) : existing.input_hash !== hash)
           throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return existing.id;
       }

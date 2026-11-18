@@ -3,7 +3,6 @@ import type {
   ImageDriver,
   ImageOperation,
   ImageRequestParameters,
-  ImageRouteConfig,
 } from '../generations/contracts.ts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
@@ -128,12 +127,12 @@ export interface ConversationImageModelSummary {
 }
 export interface ConversationImageTools {
   listModels(actor: { userId: string }): Promise<ConversationImageModelSummary[]>;
-  inspectRoute(actor: { userId: string }, modelRef: string): Promise<ImageRouteConfig>;
   createImage(
     actor: { userId: string },
     requestId: string,
     modelRef: string,
     parameters: ImageRequestParameters,
+    signal: AbortSignal,
   ): Promise<ConversationImageJobView>;
   getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
 }

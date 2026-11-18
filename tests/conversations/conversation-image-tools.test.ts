@@ -294,6 +294,14 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     return ((await res.json()) as { revision: number }).revision;
   }
 
+  async function setProviderEnabled(enabled: boolean) {
+    const response = await call('/api/v1/providers/onelink', 'PATCH', {
+      enabled,
+      expectedRevision: await providerRevision(),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+  }
+
   async function createConversation(owner = 0, modelRef?: string): Promise<string> {
     const res = await call('/api/v1/conversations', 'POST', modelRef ? { modelRef } : {}, owner);
     expect(res.status, await res.clone().text()).toBe(201);
@@ -755,6 +763,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             return;
           }
           if (toolOutputs.length === 1) {
+            await setProviderEnabled(false);
             streamOpenAiToolCalls(
               res,
               [
@@ -774,6 +783,15 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
                     modelRef: 'onelink:image:doubao-seedream-4.0',
                     prompt: 'mutated castle prompt',
                     clientOperationKey: 'idem-op-01',
+                  },
+                },
+                {
+                  id: 'idem_fresh',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:doubao-seedream-4.0',
+                    prompt: 'new castle prompt',
+                    clientOperationKey: 'new-op-01',
                   },
                 },
               ],
@@ -1779,17 +1797,21 @@ export function apply(ctx: Context) {
         .count,
     );
     const chatBeforeIdem = chatRequests.length;
-    expect(
-      (
-        await call(
-          `/api/v1/conversations/${budgetConv}/messages`,
-          'POST',
-          { requestId: 'idem-turn', text: 'IDEMPOTENT_RETRY_TURN' },
-          0,
-        )
-      ).status,
-    ).toBe(202);
-    expect((await waitReceiptStatus(budgetConv, 'idem-turn', 0)).status).toBe('completed');
+    try {
+      expect(
+        (
+          await call(
+            `/api/v1/conversations/${budgetConv}/messages`,
+            'POST',
+            { requestId: 'idem-turn', text: 'IDEMPOTENT_RETRY_TURN' },
+            0,
+          )
+        ).status,
+      ).toBe(202);
+      expect((await waitReceiptStatus(budgetConv, 'idem-turn', 0)).status).toBe('completed');
+    } finally {
+      await setProviderEnabled(true);
+    }
 
     const jobsAfterIdem = Number(
       (await observer.query<{ count: string }>('SELECT count(*) FROM mio_image_jobs')).rows[0]!
@@ -1797,10 +1819,13 @@ export function apply(ctx: Context) {
     );
     expect(jobsAfterIdem).toBe(jobsBeforeIdem + 1);
     const idemFinalOutputs = currentTurnToolOutputs(chatRequests[chatBeforeIdem + 2]!.messages);
+    expect(idemFinalOutputs).toHaveLength(4);
     const firstIdemJob = JSON.parse(idemFinalOutputs[0]!.text) as { jobId: string };
+    expect(idemFinalOutputs[1]!.text).not.toContain('PROVIDER_DISABLED');
     const secondIdemJob = JSON.parse(idemFinalOutputs[1]!.text) as { jobId: string };
     expect(secondIdemJob.jobId).toBe(firstIdemJob.jobId);
     expect(idemFinalOutputs[2]!.text).toContain('REQUEST_CONFLICT');
+    expect(idemFinalOutputs[3]!.text).toContain('PROVIDER_DISABLED');
     await waitImageJobCompleted(firstIdemJob.jobId, 0);
 
     // 2. maxImageSubmitsPerTurn = 4 blocks the 5th submit_image_job with 0 5th job created

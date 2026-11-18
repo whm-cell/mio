@@ -231,9 +231,6 @@ export function createProviderService(
       }
       return models;
     },
-    async inspectImageRoute(actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) {
-      return (await imageState(actor, modelRef)).adaptation.route;
-    },
     async resolveImage(
       actor: { readonly userId: string; readonly sessionId?: string },
       modelRef: string,

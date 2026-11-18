@@ -119,9 +119,10 @@ export async function createGenerationService(
       requestId: string,
       modelRef: string,
       parameters: ImageRequestParameters,
+      tool?: { signal: AbortSignal },
     ) {
       return admit(async () => {
-        const job = await create(actor, requestId, modelRef, parameters);
+        const job = await create(actor, requestId, modelRef, parameters, tool);
         setImmediate(pump);
         return job;
       });

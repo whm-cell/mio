@@ -15,6 +15,7 @@ import { readConversationConfig } from './conversations/config.ts';
 import { createConversationStore } from './conversations/store.ts';
 import { createConversationService } from './conversations/service.ts';
 import type { ConversationService } from './conversations/service.ts';
+import type { ConversationImageTools } from './conversations/contracts.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
 import { createConversationVision } from './dsh/vision.ts';
@@ -301,20 +302,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           await offload;
           const store = await createConversationStore(conversationConfig.databaseURL);
           try {
-            const imageTools =
+            const imageTools: ConversationImageTools | undefined =
               imageEnabled && generations && providers
                 ? {
-                    listModels: (actor: { userId: string }) => providers.listImageModels(actor),
-                    inspectRoute: (actor: { userId: string }, modelRef: string) =>
-                      providers.inspectImageRoute(actor, modelRef),
-                    createImage: (
-                      actor: { userId: string },
-                      requestId: string,
-                      modelRef: string,
-                      parameters: Parameters<GenerationService['createImage']>[3],
-                    ) => generations.createImage(actor, requestId, modelRef, parameters),
-                    getImage: (actor: { userId: string }, jobId: string) =>
-                      generations.getImage(actor, jobId),
+                    listModels: (actor) => providers.listImageModels(actor),
+                    createImage: (actor, requestId, modelRef, parameters, signal) =>
+                      generations.createImage(actor, requestId, modelRef, parameters, { signal }),
+                    getImage: (actor, jobId) => generations.getImage(actor, jobId),
                   }
                 : undefined;
             const ownedConversations =

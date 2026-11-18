@@ -11,10 +11,11 @@ const actor = { userId: 'stream-owner', sessionId: 'initial-session' };
 async function openStream(recheck: () => Promise<Principal | null>) {
   const id = randomUUID();
   const unsubscribe = vi.fn();
-  const subscribe: ConversationService['subscribe'] = async () => ({
+  const subscribed = vi.fn<ConversationService['subscribe']>().mockResolvedValue({
     snapshot: { conversationId: id, activeRequestId: null, receipt: null },
     close: unsubscribe,
   });
+  const subscribe: ConversationService['subscribe'] = subscribed;
   const service = { subscribe } as ConversationService;
   const identity = vi.fn(recheck).mockResolvedValueOnce(actor);
   const endpoint = createConversationHandler(service, identity, []);
@@ -26,11 +27,35 @@ async function openStream(recheck: () => Promise<Principal | null>) {
   await endpoint.handler(request, response);
   expect(response.statusCode).toBe(200);
   expect(write.mock.calls[0]?.[0]).toContain('event: snapshot');
-  return { identity, unsubscribe, response, write, close: endpoint.close };
+  return {
+    identity,
+    unsubscribe,
+    response,
+    write,
+    publish: subscribed.mock.calls[0]![2],
+    close: endpoint.close,
+  };
 }
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
+
+it('continues streaming after successful verification and releases the interval on disconnect', async () => {
+  const stream = await openStream(async () => actor);
+  try {
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(stream.identity).toHaveBeenCalledTimes(3);
+    expect(stream.response.writableEnded).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+    stream.publish({ type: 'text', requestId: 'live-turn', text: 'after verification' });
+    expect(stream.write.mock.calls[1]?.[0]).toContain('"text":"after verification"');
+    stream.response.emit('close');
+    expect(stream.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    stream.close();
+  }
+});
 
 it.each(['resolve', 'reject'] as const)(
   'ends the stream after the authentication budget and ignores a late %s',

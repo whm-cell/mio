@@ -1,6 +1,6 @@
 # 计算任务协议 v1 与 Worker 恢复边界
 
-本协议当前仅约束 A/B 本地重媒体通信。云端图片执行已迁入 A 的[生成模块](../../../src/generations/service.ts)，其 HTTP、持久恢复与切换沿[图片 HTTP 契约](../../apis/compute.md#post-apiv1computeimages)和[迁移变更](../onelink-image-generation/changes/image-generation-in-a/change.md)。旧图片消息、journal 和密钥仅用于切换前对账，不属于新跨进程协议；历史表和恢复原件不会随代码退役自动清空。
+本协议约束 A/B 之间经 RabbitMQ 传输的视频转码命令和结果。云端图片生成、查询和物化恢复已迁入 A，由 PostgreSQL 持久任务和 A 的专用恢复目录承接。[图片 HTTP 契约](../../apis/compute.md#post-apiv1computeimages) · [图片迁移变更](../onelink-image-generation/changes/image-generation-in-a/change.md)
 
 本页是经本期协调审阅的 P3/P4 v1 实施边界；双方以它对齐，改变消息、身份、数据或副作用边界须重新核对。协议冻结不表示源码、云权限、消息或结果已经交付。需求和资源限制见[本期 PRD](prd.md)，服务边界见[设计](design.md)。共享包为 `@mio/compute-contracts`，源码入口为 `contracts/compute/src/index.ts`，构建生成 `dist/index.js` 与 `dist/index.d.ts`；A/B 不导入对方内部模块。
 
@@ -37,47 +37,36 @@ A 从登录会话取得 owner，按 owner 查询已登记资产；HEAD 该 raw �
 
 succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio/derived/<jobId>/<attemptId>/result.mp4`，`sizeBytes` 为 1 至 1073741824，SHA-256 是小写 64 位十六进制。B 对输出及未知上传恢复的 GET 流式执行同一上限，再持久记录最终文件大小与 SHA-256；PUT 传内容校验及 SHA-256 元数据，完成后 HEAD 获取 derived 对象的实际 ETag。A 在登记前 HEAD 该对象，核对 key、实际长度、ETag 与 SHA-256 元数据，并从本地 job 事实取得 owner。HEAD 核对元数据不等同重新读取并计算全部对象字节。A 不以消息内的 owner 或 URL 决定资源归属。结果资产与 job 终态在同一 PG 事务发布；由既有媒体域作增量迁移，保留原数据。
 
-```json
-{
-  "version": 1,
-  "messageId": "<command-id>",
-  "jobId": "<job-id>",
-  "ownerId": "<system-user-id>",
-  "expiresAt": 0,
-  "profile": "gpt-images-v1",
-  "input": {
-    "model": "<directory-model-id>",
-    "prompt": "<edit-prompt>",
-    "operation": "edit",
-    "image": {
-      "assetId": "<asset-id>",
-      "key": "mio/raw/<asset-id>/<raw-id>",
-      "sizeBytes": 123,
-      "etag": "<raw-cos-etag>",
-      "contentType": "image/png"
-    },
-    "mask": null
-  }
-}
-```
-
-图片结果使用 `mio/derived/<jobId>/images/<index>-<fileId>.<format>`，其中 `index` 是原始输出序号、`fileId` 是小写 UUID v4。B 在每次实际 PUT 前把该 fileId 追加到 journal；PUT、超时或进程异常后均不得复用同一对象键，下一次物化必须生成新的 fileId。B 本地校验图片并计算 SHA-256 和 Content-MD5，PUT 以流发送并携带禁止覆盖头；COS 按 Content-MD5 校验提交内容。PUT 必须成功并返回 ETag，随后 HEAD 的长度、SHA-256 元数据及 ETag 须与本次 PUT 一致，成功路径不再 GET 全量内容。HEAD 只核对对象关联和元数据，不代表服务端重新计算 SHA-256；ETag 是对象标识，不当作 MD5。结果携带完整唯一键，A 严格解析 jobId、index、fileId、扩展名和 MIME，并在 PG 中把首个有效键绑定为该输出序号的 owner 资产；旧键保留为可对账孤儿，不覆盖已登记 winner。视频结果仍遵守上一段固定 attempt 键及其禁止覆盖前提；这两类约束不得混用。
-
 ## 路由、回执与状态
 
-使用隔离 vhost 与持久 direct exchange `mio.compute.commands.v1`：视频命令以 routing key `transcode.v1` 路由至 quorum queue `mio.compute.commands.v1`（B 视频通道 `prefetch=1`，死信交换机 `mio.compute.commands.dlx.v1` / 死信队列 `mio.compute.commands.dlq.v1` / `transcode.dead.v1`）；图片命令（`image.request`、`image.query`、`image.recover`）以 routing key `image.v1` 路由至独立 quorum queue `mio.compute.image.commands.v1`（B 独立图片通道 `prefetch=4`，死信交换机 `mio.compute.image.commands.dlx.v1` / 死信队列 `mio.compute.image.commands.dlq.v1` / `image.dead.v1`），同时视频通道保留对旧队列遗留图片消息的兼容回调，而图片队列遇到非图片/非法消息及 `IMAGE_COMMAND_CONFLICT`、`IMAGE_QUERY_UNKNOWN` 冲突毒消息直接 `reject(message, false)` 进入死信，遇到可重试图片级异常（如 `IMAGE_MATERIALIZATION_PENDING`、`IMAGE_INPUT_UNAVAILABLE`）仅在排空同通道其余在途图片后隔离关闭并有界重开图片通道重排，不中断在途视频转码或整连接。结果采用独立持久 direct exchange `mio.compute.results.v1`、quorum queue `mio.compute.results.v1`，routing key 为 `transcode.result.v1`（A 结果消费 `prefetch=4`，关闭前排空所有在途结果处理及 COS HEAD 核验）。消息 persistent、JSON content type，两侧发布和消费使用分开的连接。各命令与结果队列均配置持久 quorum 死信队列（`dead-letter-strategy=at-least-once`、`overflow=reject-publish`、`delivery-limit=-1`），不依赖默认丢弃。
+所有路由在隔离 vhost 内建立，共使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
 
-A 在一个 PG 事务写 job（或图片任务）与待发布 outbox，并在落库后立即触发 `wakePoll()`（并发触发合并续跑，遇 Broker 故障遵守指数退避，`stopping` 时立即停止），单轮有界批量排空最多 32 条到期图片命令和 10 条视频命令；同 owner/requestId 和同输入返回原 job，输入不同时 409。publisher confirm、mandatory return、断线未知和本地缓冲背压分别处理：确认不等于业务成功；未确认或退回的 outbox 不得标为已送达。B 在图片入口按 `jobId` 串行互斥（跨 `jobId` 最多 4 路并发 I/O，同 `jobId` 串行访问 SQLite `Journal`），关闭前先同步关闭消费闸门再排空在途图片执行与 `publishImage`；在 journal 事务记录事件后发布结果，只有确认且未退回才 ACK 对应命令。A 在验证结果并提交 inbox 去重、资产及状态后 ACK 结果；连接中断后重投按稳定 messageId 幂等。
+| 路由     | 交换机                        | Routing key                | 队列                          |
+| -------- | ----------------------------- | -------------------------- | ----------------------------- |
+| A 发命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`     |
+| 命令死信 | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1` |
+| B 发结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`      |
+| 结果死信 | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`  |
 
-视频任务状态为 accepted、queued、running、succeeded、failed。A 对 jobId、commandId、当前 attemptId 与 attempt 序号做一致核对，以数据库条件更新；running 不能覆盖终态，旧 attempt 的 running、failed 或 succeeded 均不回退或重试当前任务。unknown 不伪装失败或成功，保留待对账且不自动增加 attempt。终态后重复同事件无副作用。视频活动任务独立限制每用户最多 10、全局最多 500（`mio_compute_jobs` 的 `accepted`/`queued`/`running`）；图片活动任务使用独立事务锁限制每用户最多 32、全局最多 1000（`mio_image_jobs` 的 `accepted`/`materializing`），两类配额互不挤占且均在并发受理下事务性维持。
+两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。B 的命令消费使用 `prefetch=1`。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
+
+A 在一个 PostgreSQL 事务写入视频 job 与 outbox，落库后触发 `wakePoll()`，合并并发唤醒，每轮认领并发布最多 10 条命令。Broker 故障后的重试从 1 秒起指数退避，最多 30 秒。结果消费者成功注册且同一 Broker 完成当轮 outbox 检查和发布后恢复初始退避。相同 owner/requestId 和输入返回原 job，输入冲突返回 409。收到发布确认且消息未退回时才将 outbox 标为已送达。B 在 journal 中持久化结果事件后发布，并在完成对应结果的确认后 ACK 命令。A 验证结果并提交 inbox 去重、资产及状态后 ACK 结果。连接中断后按稳定 messageId 幂等重投。
+
+视频任务状态为 accepted、queued、running、succeeded、failed。A 对 jobId、commandId、当前 attemptId 与 attempt 序号做一致核对，以数据库条件更新；running 不能覆盖终态，旧 attempt 的 running、failed 或 succeeded 均不回退或重试当前任务。unknown 不伪装失败或成功，保留待对账且不自动增加 attempt。终态后重复同事件无副作用。视频活动任务限制每用户最多 10、全局最多 500（`mio_compute_jobs` 的 `accepted`/`queued`/`running`），并发受理时以事务维持。
 
 消息由独立 broker 身份隔离：A 可发布命令和消费结果，B 可消费命令和发布结果；限制 exchange/queue/vhost 权限，远程链路使用 TLS。发布者必须设置 AMQP `userId` 为自己的专用身份，消费者要求该属性存在且等于预期，禁止授予 `impersonator`；RabbitMQ 只在该属性存在时验证它与连接身份一致。消费者还须核验本地 attempt，不能信任正文的 worker 名；凭据泄露后的伪造不由字段格式单独解决。
 
 quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式配置 `dead-letter-strategy=at-least-once`、`overflow=reject-publish`、目标 DLX 和必要 feature flag，验证目标不可用时源队列保留待转发消息。把策略降为 at-most-once 或 drop-head 可能删除尚未确认的死信，恢复和运维不得静默降级。
 
+## 历史图片链路
+
+迁移前，A 经 outbox 将 `image.request`、`image.query`、`image.recover` 以 `image.v1` 路由到 `mio.compute.image.commands.v1`，B 独立消费并以 SQLite journal 记录执行和物化。旧图片队列、DLX/DLQ 与 B 额外的图片读取权限需要在切换时对账和显式退役。切换先暂停新提交并盘点旧 PG/outbox、队列消息、消费者、B journal 与尚未确认的图片上传，再按证据处理未排空的记录。历史任务数据与恢复原件继续保留。[图片生成切换步骤](../../local-environments.md#图片生成迁移与切换) · [历史验收记录](complete/report.md#image-io-concurrency)
+
 ## B 的持久 journal 与未知结果
 
 首期单实例 B 将 SQLite journal 保存在独占持久卷 `/var/lib/mio-compute/journal.sqlite3`，使用 WAL 和 FULL 同步；该卷同时持有尚需恢复的输入、输出文件。启动须核对实例身份和现有 journal，缺失或损坏时停止消费并对账，不能自动当成新 worker。保留卷与数据库、WAL/SHM 的一致性；本地临时路径不得来自消息。SQLite 同步写的延迟、锁及损坏恢复须在目标环境验证。
+
+B 每轮在 5 秒内建立消费和发布两条 AMQP 连接、通道及预取设置。收到停止信号时终止尚未完成的建立和重连等待。连接可用后，停机先停止接纳新命令，等待已接纳的 handler 和正在运行的 journal 对账完成。随后关闭 AMQP 连接，等待关闭回执最多 5 秒。
 
 每个 attempt 在启动 FFmpeg 前持久写 launch intent，并且同一 attempt 最多 spawn 一次。A 最多创建三个 attempt；保守记账可能在 intent 已写但尚未证明 spawn 时消耗一次，不承诺恰好执行三次。`PROCESS_UNKNOWN` 时停止所有新计算 admission，包括新命令和重投，直到确认旧 FFmpeg 已终止，维持单实例并发 1。若 journal 已持久记录 PID，须核对同一宿主、boot 和进程命名空间，并确认该 PID 不存在；PID 仍存在或身份无法核对则继续 HOLD。若崩溃发生在 PID 落盘前，只能由可证明覆盖该进程的隔离运行时记录或人工核实；worker 或容器重启自身不能当作进程已结束的证明。确认后才能报告 interrupted，由 A 决定是否创建下一个 attempt。
 

@@ -24,7 +24,7 @@
 
 现行代码在 `contracts/compute/src/images.ts`、`compute/src/images.ts`、`src/providers/schema.ts`、`src/providers/catalog.ts` 和 `src/dsh/onelink.ts` 中将协议选择、完整 URL、输出张数与参数白名单硬编码在 4 个图片 profile 与固定 `1024` token 常量上，导致同原厂新模型被自身代码锁死：
 
-- **火山 Seedream 同步生图分化**：现行 `seedream-4-images-v1` 将火山协议锁死为仅 `1024x1024`、`n === 1`、固定 `jpeg`、强制 `watermark: true` 且禁止参考图；而现网同端点（`/volc/api/v3/images/generations`）的 `doubao-seedream-4.5` 与 `` `doubao-seedream-5.0*` ``（`5.0-lite`、`5-0-pro-260628`）支持 `2K`/`3K`/`4K`、最多 14 张参考图、`sequential_image_generation` 最多 **15 张输出**、`png`/`jpeg` 及用户水印开关覆盖。
+- **火山 Seedream 同步生图分化**：现行 `seedream-4-images-v1` 将火山协议锁死为仅 `1024x1024`、`n === 1`、固定 `jpeg`、强制 `watermark: true` 且禁止参考图；而现网同端点（`/volc/api/v3/images/generations`）的 `doubao-seedream-4.5` 与 `` `doubao-seedream-5.0*` ``（`5.0-lite`、`5-0-pro-260628`）支持高分辨率（`4.5` 为 `1024x1024`/`2K`/`4K`，`5.0*` 为 `1024x1024`/`2K`/`3K`/`4K`）、最多 14 张参考图、`sequential_image_generation` 最多 **15 张输出**及用户水印开关覆盖；其中 `doubao-seedream-4.5` 仍固定输出 `jpeg`（不支持 `output_format`），而 `` `doubao-seedream-5.0*` ``（`5.0-lite`、`5-0-pro-260628`）支持 `png`/`jpeg`。
 - **可灵异步生图双端点分化**：现网 `image-kling-v3` 走 `/kling/v1/images/generations`（0–4 张参考图、1–4 张输出），而同厂 `image-kling-v3-omni` 走独立 `/kling/v1/images/omni-image`（`maxReferenceImages: 1`、`maxN: 1`、`auto` 比例），且现行 `src/providers/catalog.ts` 将 `references.maxImages` 硬编码为 `2..16`，直接拒绝单参考图声明。
 - **OpenAI 生图分化**：`` `gpt-image-2*` `` 支持 `/v1/images/generations` 与 multipart `/v1/images/edits`（最多 10 张、含 `'auto'` 尺寸），而 `sp-gpt-image-2` 走 JSON 兼容路径且最多 1 张、无 `'auto'` 尺寸。
 

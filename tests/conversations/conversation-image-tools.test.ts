@@ -265,6 +265,8 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
   let chatRequests: RecordedChatRequest[];
   let imageUpstreamRequests: RecordedImageUpstream[];
   let pauseSignal: { paused: boolean; release: (() => void) | null };
+  let heldKlingTaskIds: Set<string>;
+  let heldKlingWaiters: (() => void)[];
   let profileControl: {
     origin: string;
     apiToken: string;
@@ -391,6 +393,8 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
     chatRequests = [];
     imageUpstreamRequests = [];
     pauseSignal = { paused: false, release: null };
+    heldKlingTaskIds = new Set();
+    heldKlingWaiters = [];
 
     cosServer = await listenLoopback(async (req, res) => {
       const parsed = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -610,7 +614,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
                     modelRef: 'onelink:image:doubao-seedream-4.5',
                     prompt: 'stylize dual references',
                     imageAssetIds: [seedAssetId, klingAssetId],
-                    output_format: 'png',
                     clientOperationKey: 'turn2-seed45-ref',
                   },
                 },
@@ -740,6 +743,110 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             return;
           }
           streamOpenAiText(res, 'All unauthorized and injected calls were rejected.', reqSeq);
+          return;
+        }
+
+        if (prompt === 'SEED45_INVALID_FORMAT_TURN') {
+          if (toolOutputs.length === 0) {
+            streamOpenAiToolCalls(
+              res,
+              [
+                {
+                  id: 'neg_seed45_output_format',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:doubao-seedream-4.5',
+                    prompt: 'unsupported output format',
+                    output_format: 'png',
+                  },
+                },
+              ],
+              reqSeq,
+            );
+            return;
+          }
+          streamOpenAiText(res, 'Seedream 4.5 rejected output_format=png at admission.', reqSeq);
+          return;
+        }
+
+        if (prompt === 'SAME_TURN_POLL_GUARD_TURN') {
+          if (toolOutputs.length === 0) {
+            streamOpenAiToolCalls(
+              res,
+              [
+                {
+                  id: 'poll_guard_submit_1',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:image-kling-v3',
+                    prompt: 'pending-kling-poll-guard',
+                    clientOperationKey: 'poll-guard-1',
+                  },
+                },
+              ],
+              reqSeq,
+            );
+            return;
+          }
+          if (toolOutputs.length === 1) {
+            const submitted = JSON.parse(toolOutputs[0]!.text) as { jobId: string };
+            streamOpenAiToolCalls(
+              res,
+              [
+                {
+                  id: 'poll_guard_immediate_get',
+                  name: 'get_image_job',
+                  args: { jobId: submitted.jobId },
+                },
+              ],
+              reqSeq,
+            );
+            return;
+          }
+          streamOpenAiText(res, 'Submitted image job and deferred same-turn polling.', reqSeq);
+          return;
+        }
+
+        if (prompt.startsWith('CROSS_TURN_REPEAT_POLL_TURN:')) {
+          const [, pendingJobId] = prompt.split(':');
+          if (toolOutputs.length === 0) {
+            streamOpenAiToolCalls(
+              res,
+              [{ id: 'cross_get_1', name: 'get_image_job', args: { jobId: pendingJobId } }],
+              reqSeq,
+            );
+            return;
+          }
+          if (toolOutputs.length === 1) {
+            streamOpenAiToolCalls(
+              res,
+              [{ id: 'cross_get_2', name: 'get_image_job', args: { jobId: pendingJobId } }],
+              reqSeq,
+            );
+            return;
+          }
+          streamOpenAiText(
+            res,
+            'Job is still in progress; stopped repeated polling for this turn.',
+            reqSeq,
+          );
+          return;
+        }
+
+        if (prompt.startsWith('PARALLEL_POLL_GUARD_TURN:')) {
+          const [, pendingJobId] = prompt.split(':');
+          if (toolOutputs.length === 0) {
+            streamOpenAiToolCalls(
+              res,
+              [
+                { id: 'par_get_1', name: 'get_image_job', args: { jobId: pendingJobId } },
+                { id: 'par_get_2', name: 'get_image_job', args: { jobId: pendingJobId } },
+              ],
+              reqSeq,
+            );
+            return;
+          }
+          streamOpenAiText(res, 'Parallel duplicate poll blocked.', reqSeq);
           return;
         }
 
@@ -974,6 +1081,10 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
           parsed.pathname === '/kling/v1/images/omni-image'
         ) {
           const taskId = `kling_task_${++asyncTaskSeq}`;
+          const lastReq = imageUpstreamRequests.at(-1)?.json;
+          if (lastReq?.prompt === 'pending-kling-poll-guard') {
+            heldKlingTaskIds.add(taskId);
+          }
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(
             JSON.stringify({
@@ -1022,6 +1133,15 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
           parsed.pathname.startsWith('/kling/v1/images/omni-image/')
         ) {
           const taskId = parsed.pathname.split('/').at(-1)!;
+          if (heldKlingTaskIds.has(taskId)) {
+            await new Promise<void>((resolveHold) => {
+              heldKlingWaiters.push(resolveHold);
+              req.on('close', releaseHoldOnce);
+              function releaseHoldOnce() {
+                resolveHold();
+              }
+            });
+          }
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(
             JSON.stringify({
@@ -1375,6 +1495,10 @@ export function apply(ctx: Context) {
   }, 90_000);
 
   afterAll(async () => {
+    heldKlingTaskIds?.clear();
+    while (heldKlingWaiters?.length) {
+      heldKlingWaiters.shift()?.();
+    }
     try {
       await profileControl?.close();
     } finally {
@@ -1515,6 +1639,8 @@ export function apply(ctx: Context) {
       ].sort(),
     );
     expect(klingSummary.requiresAsync).toBe(true);
+    const seed45Summary = listOutput.models.find((item) => item.modelId === 'doubao-seedream-4.5')!;
+    expect(seed45Summary.allowedOutputFormats).toEqual([]);
 
     // Live SSE whitelist: only submit_image_job cards projected, zero list_image_models or raw tool/call
     const turn1ToolFrames = turn1Frames.filter((frame) => frame.event === 'tool');
@@ -1633,6 +1759,7 @@ export function apply(ctx: Context) {
       (r) =>
         r.path === '/volc/api/v3/images/generations' && r.json?.model === 'doubao-seedream-4.5',
     );
+    expect(seed45Req?.json?.output_format).toBeUndefined();
     expect(Array.isArray(seed45Req?.json?.image)).toBe(true);
     expect((seed45Req?.json?.image as string[])[0]).toMatch(/^data:image\/jpeg;base64,/);
     expect((seed45Req?.json?.image as string[])[1]).toMatch(/^data:image\/png;base64,/);
@@ -1725,6 +1852,7 @@ export function apply(ctx: Context) {
         .count,
     );
     const chatBefore = chatRequests.length;
+    const upstreamBeforeNeg = imageUpstreamRequests.length;
 
     const sseRes = await fetch(
       `${profileControl.origin}/api/v1/conversations/${owner1Conv}/events`,
@@ -1786,6 +1914,37 @@ export function apply(ctx: Context) {
       await call(`/api/v1/conversations/${owner1Conv}/history`, 'GET', undefined, 1)
     ).json()) as { items: { role: string }[] };
     expect(history.items.map((item) => item.role)).toEqual(['user', 'assistant', 'status']);
+
+    // Passing output_format: 'png' to doubao-seedream-4.5 fails local admission with IMAGE_INPUT_INVALID and 0 upstream POSTs.
+    const chatBeforeSeed45Neg = chatRequests.length;
+    const upstreamBeforeSeed45Neg = imageUpstreamRequests.length;
+    expect(
+      (
+        await call(
+          `/api/v1/conversations/${owner1Conv}/messages`,
+          'POST',
+          { requestId: 'neg-seed45-format', text: 'SEED45_INVALID_FORMAT_TURN' },
+          1,
+        )
+      ).status,
+    ).toBe(202);
+    expect((await waitReceiptStatus(owner1Conv, 'neg-seed45-format', 1)).status).toBe('completed');
+    const seed45NegOutputs = currentTurnToolOutputs(
+      chatRequests[chatBeforeSeed45Neg + 1]!.messages,
+    );
+    expect(seed45NegOutputs).toHaveLength(1);
+    expect(seed45NegOutputs[0]!.text).toContain('IMAGE_INPUT_INVALID');
+    expect(
+      imageUpstreamRequests.slice(upstreamBeforeSeed45Neg).filter((r) => r.method === 'POST'),
+    ).toHaveLength(0);
+    const jobsAfterSeed45Neg = Number(
+      (await observer.query<{ count: string }>('SELECT count(*) FROM mio_image_jobs')).rows[0]!
+        .count,
+    );
+    expect(jobsAfterSeed45Neg).toBe(jobsBefore);
+    expect(
+      imageUpstreamRequests.slice(upstreamBeforeNeg).filter((r) => r.method === 'POST'),
+    ).toHaveLength(0);
   }, 30_000);
 
   it('enforces clientOperationKey idempotency, per-turn submit/call budgets, 8-step circuit breaker, cancel, and cold restart history', async () => {
@@ -1975,4 +2134,151 @@ export function apply(ctx: Context) {
     const seqs = coldHistory.items.map((item) => item.seq);
     expect(seqs.every((seq, idx) => idx === 0 || seq > seqs[idx - 1]!)).toBe(true);
   }, 60_000);
+
+  it('defers same-turn get_image_job polling after submit and repeated non-terminal polls without exceeding step budget', async () => {
+    const pollGuardConv = await createConversation(0);
+    const chatBeforeTurnA = chatRequests.length;
+
+    const sseTurnARes = await fetch(
+      `${profileControl.origin}/api/v1/conversations/${pollGuardConv}/events`,
+      { headers: { origin: profileControl.origin, cookie: cookies[0]! } },
+    );
+    const sseTurnAPromise = collectSseFrames(sseTurnARes, 'poll-guard-turn-a');
+
+    expect(
+      (
+        await call(
+          `/api/v1/conversations/${pollGuardConv}/messages`,
+          'POST',
+          { requestId: 'poll-guard-turn-a', text: 'SAME_TURN_POLL_GUARD_TURN' },
+          0,
+        )
+      ).status,
+    ).toBe(202);
+
+    const [turnAFrames, turnAReceipt] = await Promise.all([
+      sseTurnAPromise,
+      waitReceiptStatus(pollGuardConv, 'poll-guard-turn-a', 0),
+    ]);
+    expect(turnAReceipt.status).toBe('completed');
+    expect(chatRequests.length - chatBeforeTurnA).toBe(3);
+
+    const turnAToolOutputs = currentTurnToolOutputs(chatRequests[chatBeforeTurnA + 2]!.messages);
+    expect(turnAToolOutputs).toHaveLength(2);
+    const submittedJob = JSON.parse(turnAToolOutputs[0]!.text) as {
+      jobId: string;
+      status: string;
+    };
+    const pendingJobId = submittedJob.jobId;
+    expect(turnAToolOutputs[1]!.text).toContain('IMAGE_JOB_POLL_DEFERRED');
+
+    const turnAToolFrames = turnAFrames.filter((frame) => frame.event === 'tool');
+    expect(turnAToolFrames).toHaveLength(1);
+    expect(turnAToolFrames[0]!.data.tool).toBe('submit_image_job');
+
+    const historyAfterTurnA = (await (
+      await call(`/api/v1/conversations/${pollGuardConv}/history`, 'GET', undefined, 0)
+    ).json()) as {
+      items: { seq: number; role: string; tool?: string; job?: { jobId: string } }[];
+    };
+    const toolItemsAfterTurnA = historyAfterTurnA.items.filter((item) => item.role === 'tool');
+    expect(toolItemsAfterTurnA).toHaveLength(1);
+    expect(toolItemsAfterTurnA[0]!.tool).toBe('submit_image_job');
+
+    // Cross-turn first query succeeds for the still-non-terminal job; 2nd poll in the same turn is deferred.
+    const chatBeforeTurnB = chatRequests.length;
+    const sseTurnBRes = await fetch(
+      `${profileControl.origin}/api/v1/conversations/${pollGuardConv}/events`,
+      { headers: { origin: profileControl.origin, cookie: cookies[0]! } },
+    );
+    const sseTurnBPromise = collectSseFrames(sseTurnBRes, 'poll-guard-turn-b');
+
+    expect(
+      (
+        await call(
+          `/api/v1/conversations/${pollGuardConv}/messages`,
+          'POST',
+          {
+            requestId: 'poll-guard-turn-b',
+            text: `CROSS_TURN_REPEAT_POLL_TURN:${pendingJobId}`,
+          },
+          0,
+        )
+      ).status,
+    ).toBe(202);
+
+    const [turnBFrames, turnBReceipt] = await Promise.all([
+      sseTurnBPromise,
+      waitReceiptStatus(pollGuardConv, 'poll-guard-turn-b', 0),
+    ]);
+    expect(turnBReceipt.status).toBe('completed');
+    expect(chatRequests.length - chatBeforeTurnB).toBe(3);
+
+    const turnBToolOutputs = currentTurnToolOutputs(chatRequests[chatBeforeTurnB + 2]!.messages);
+    expect(turnBToolOutputs).toHaveLength(2);
+    const firstCrossPoll = JSON.parse(turnBToolOutputs[0]!.text) as {
+      jobId: string;
+      status: string;
+    };
+    expect(firstCrossPoll.jobId).toBe(pendingJobId);
+    expect(['accepted', 'submitted', 'processing', 'materializing']).toContain(
+      firstCrossPoll.status,
+    );
+    expect(turnBToolOutputs[1]!.text).toContain('IMAGE_JOB_POLL_DEFERRED');
+
+    const turnBToolFrames = turnBFrames.filter((frame) => frame.event === 'tool');
+    expect(turnBToolFrames).toHaveLength(1);
+    expect(turnBToolFrames[0]!.data.tool).toBe('get_image_job');
+
+    // Same-step parallel duplicate get_image_job for the same non-terminal jobId emits 1 card and defers the duplicate.
+    const chatBeforeTurnC = chatRequests.length;
+    const sseTurnCRes = await fetch(
+      `${profileControl.origin}/api/v1/conversations/${pollGuardConv}/events`,
+      { headers: { origin: profileControl.origin, cookie: cookies[0]! } },
+    );
+    const sseTurnCPromise = collectSseFrames(sseTurnCRes, 'poll-guard-turn-c');
+
+    expect(
+      (
+        await call(
+          `/api/v1/conversations/${pollGuardConv}/messages`,
+          'POST',
+          {
+            requestId: 'poll-guard-turn-c',
+            text: `PARALLEL_POLL_GUARD_TURN:${pendingJobId}`,
+          },
+          0,
+        )
+      ).status,
+    ).toBe(202);
+
+    const [turnCFrames, turnCReceipt] = await Promise.all([
+      sseTurnCPromise,
+      waitReceiptStatus(pollGuardConv, 'poll-guard-turn-c', 0),
+    ]);
+    expect(turnCReceipt.status).toBe('completed');
+    const turnCToolOutputs = currentTurnToolOutputs(chatRequests[chatBeforeTurnC + 1]!.messages);
+    expect(turnCToolOutputs).toHaveLength(2);
+    expect(JSON.parse(turnCToolOutputs[0]!.text)).toMatchObject({ jobId: pendingJobId });
+    expect(turnCToolOutputs[1]!.text).toContain('IMAGE_JOB_POLL_DEFERRED');
+    expect(turnCFrames.filter((frame) => frame.event === 'tool')).toHaveLength(1);
+
+    const historyAfterTurnC = (await (
+      await call(`/api/v1/conversations/${pollGuardConv}/history`, 'GET', undefined, 0)
+    ).json()) as {
+      items: { seq: number; role: string; tool?: string; job?: { jobId: string } }[];
+    };
+    const toolItemsAfterTurnC = historyAfterTurnC.items.filter((item) => item.role === 'tool');
+    expect(toolItemsAfterTurnC.map((item) => item.tool)).toEqual([
+      'submit_image_job',
+      'get_image_job',
+      'get_image_job',
+    ]);
+
+    heldKlingTaskIds.clear();
+    while (heldKlingWaiters.length) {
+      heldKlingWaiters.shift()?.();
+    }
+    await waitImageJobCompleted(pendingJobId, 0);
+  }, 45_000);
 });

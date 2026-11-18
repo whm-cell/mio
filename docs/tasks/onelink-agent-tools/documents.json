@@ -5,6 +5,11 @@
       "identity": "docs/tasks/onelink-agent-tools/prd.md",
       "kind": "prd",
       "path": "docs/tasks/onelink-agent-tools/prd.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-agent-tools/changes/image-tool-poll-and-seedream45/change.md",
+      "kind": "change",
+      "path": "docs/tasks/onelink-agent-tools/changes/image-tool-poll-and-seedream45/change.md"
     }
   ]
 }

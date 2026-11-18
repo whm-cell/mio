@@ -29,6 +29,12 @@ const IMAGE_JOB_STATES = new Set([
   'failed',
   'unknown',
 ]);
+const NON_TERMINAL_IMAGE_JOB_STATES = new Set([
+  'accepted',
+  'submitted',
+  'processing',
+  'materializing',
+]);
 
 const LIST_MODELS_KEYS = new Set<string>();
 const GET_JOB_KEYS = new Set(['jobId']);
@@ -255,6 +261,10 @@ export function registerConversationImageTools(
   bridge: ConversationImageTools,
 ): void {
   const actor = Object.freeze({ userId: run.userId });
+  const submittedPendingJobIds = new Set<string>();
+  const polledPendingJobIds = new Set<string>();
+  // get_image_job allows parallel calls across distinct jobIds, so serialize same-jobId checks within a step.
+  const inFlightPollByJobId = new Map<string, Promise<void>>();
 
   agentCtx.tools.register(
     closedParametersTool(
@@ -298,7 +308,7 @@ export function registerConversationImageTools(
       defineTool({
         name: 'submit_image_job',
         description:
-          'Submit an intent-level image generation or reference-image edit job for the current user and immediately return its Mio job handle.',
+          'Submit an intent-level image generation or reference-image edit job for the current user. The job runs asynchronously in the background and returns a Mio job handle immediately; once you receive the jobId, report the jobId and current status to the user and finish this turn immediately. NEVER call get_image_job to poll or wait for completion in the same turn.',
         parameters: {
           modelRef: {
             type: 'string',
@@ -441,6 +451,11 @@ export function registerConversationImageTools(
               parameters,
               exec.signal,
             );
+            if (NON_TERMINAL_IMAGE_JOB_STATES.has(job.status)) {
+              submittedPendingJobIds.add(job.jobId);
+            } else {
+              submittedPendingJobIds.delete(job.jobId);
+            }
             return sanitizeJobView(job);
           } catch (error) {
             return toSanitizedToolError(error);
@@ -455,7 +470,7 @@ export function registerConversationImageTools(
       defineTool({
         name: 'get_image_job',
         description:
-          'Query the current status and completed output asset IDs of an owner-scoped Mio image job.',
+          'Query the current status and completed output asset IDs of an owner-scoped Mio image job created in a previous turn. NEVER busy-poll in the same turn: if it returns a non-terminal status (accepted, submitted, processing, materializing), tell the user the job is still generating and finish this turn immediately without calling get_image_job again.',
         parameters: {
           jobId: {
             type: 'string',
@@ -483,11 +498,32 @@ export function registerConversationImageTools(
             );
           }
           exec.signal.throwIfAborted();
+          while (inFlightPollByJobId.has(args.jobId)) {
+            await inFlightPollByJobId.get(args.jobId);
+            exec.signal.throwIfAborted();
+          }
+          if (submittedPendingJobIds.has(args.jobId) || polledPendingJobIds.has(args.jobId)) {
+            throw new HarnessError(
+              'MIO_IMAGE_TOOL_ERROR: IMAGE_JOB_POLL_DEFERRED: image job runs asynchronously in the background; do not poll get_image_job in the same turn. Report the jobId to the user and finish this turn.',
+              'IMAGE_JOB_POLL_DEFERRED',
+            );
+          }
+          let releaseInFlight!: () => void;
+          const inFlight = new Promise<void>((resolve) => {
+            releaseInFlight = resolve;
+          });
+          inFlightPollByJobId.set(args.jobId, inFlight);
           try {
             const job = await bridge.getImage(actor, args.jobId);
+            if (NON_TERMINAL_IMAGE_JOB_STATES.has(job.status)) {
+              polledPendingJobIds.add(job.jobId);
+            }
             return sanitizeJobView(job);
           } catch (error) {
             return toSanitizedToolError(error);
+          } finally {
+            inFlightPollByJobId.delete(args.jobId);
+            releaseInFlight();
           }
         },
       }),

@@ -70,7 +70,9 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
     }
     const pathname = (request.url ?? '').split('?')[0]!;
     const qrCreate = pathname === `${AUTH_BASE_PATH}/wechat/qr-session`;
-    const qrPoll = /^\/api\/auth\/wechat\/qr-session\/[0-9a-f-]{36}\/poll$/.test(pathname);
+    const qrPoll =
+      pathname.startsWith(`${AUTH_BASE_PATH}/`) &&
+      /^\/wechat\/qr-session\/[0-9a-f-]{36}\/poll$/.test(pathname.slice(AUTH_BASE_PATH.length));
     const wechatRoute =
       [
         `${AUTH_BASE_PATH}/sign-in/social`,

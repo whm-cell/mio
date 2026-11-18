@@ -54,21 +54,18 @@ async function materializeImage(
   image: SavedImage,
   decode: (bytes: Uint8Array, format: string) => Promise<void>,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<GeneratedObject> {
   const saved = checkpoint.outputs[image.index];
   if (saved) {
     if (!matches(await objects.head(saved.key), image, saved.etag))
       throw new Error('IMAGE_OUTPUT_MISMATCH');
-    return;
+    return saved;
   }
   const bytes = await files.read(checkpoint.jobId, image);
   await decode(bytes, image.format);
   signal.throwIfAborted();
   const existing = await findAttempt(objects, checkpoint, image);
-  if (existing) {
-    checkpoint.outputs[image.index] = existing;
-    return;
-  }
+  if (existing) return existing;
   if (!objects.putImage) throw new Error('IMAGE_STORAGE_UNAVAILABLE');
   const key = imageOutputKey(checkpoint.jobId, image.index, createId(), image.format);
   (checkpoint.attemptedKeys[image.index] ??= []).push(key);
@@ -83,7 +80,7 @@ async function materializeImage(
     !matches(await objects.head(key), image, uploaded.etag)
   )
     throw new Error('IMAGE_OUTPUT_MISMATCH');
-  checkpoint.outputs[image.index] = uploaded;
+  return uploaded;
 }
 
 export async function materializeGeneration(
@@ -102,6 +99,7 @@ export async function materializeGeneration(
   const permitted = checkpoint.attempts < 3;
   if (permitted) checkpoint.attempts++;
   await files.save(checkpoint);
+  const verifiedOutputs: [index: number, output: GeneratedObject][] = [];
   let failed = !checkpoint.receivedAll;
   for (const image of checkpoint.images) {
     if (checkpoint.invalidIndices.includes(image.index)) continue;
@@ -110,7 +108,9 @@ export async function materializeGeneration(
       continue;
     }
     try {
-      await materializeImage(objects, files, checkpoint, image, decode, signal);
+      const output = await materializeImage(objects, files, checkpoint, image, decode, signal);
+      checkpoint.outputs[image.index] = output;
+      verifiedOutputs.push([image.index, output]);
     } catch (error) {
       if (error instanceof Error && error.message === 'IMAGE_OUTPUT_INVALID')
         checkpoint.invalidIndices.push(image.index);
@@ -118,9 +118,7 @@ export async function materializeGeneration(
     }
     await files.save(checkpoint);
   }
-  const outputs = Object.entries(checkpoint.outputs)
-    .sort(([a], [b]) => Number(a) - Number(b))
-    .map(([, output]) => output);
+  const outputs = verifiedOutputs.sort(([a], [b]) => a - b).map(([, output]) => output);
   const state = failed
     ? checkpoint.attempts >= 3
       ? 'materialization_failed'

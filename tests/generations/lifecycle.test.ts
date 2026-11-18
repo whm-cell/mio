@@ -175,6 +175,80 @@ it('recovers a durable receipt ahead of PG and never submits a persisted intent 
   }
 });
 
+it.each(['404', 'sha256', 'etag'] as const)(
+  'keeps a recovered receipt with a %s HEAD failure out of ready assets',
+  async (fault) => {
+    const f = await generationFixture();
+    const release = Promise.withResolvers<void>();
+    const accept = vi.spyOn(f.store, 'acceptOutputs').mockImplementation(async () => {
+      await release.promise;
+      throw new Error('PG unavailable after durable object receipt');
+    });
+    const ready = () =>
+      f.pool.query("SELECT id,raw_key FROM mio_assets WHERE owner_id=$1 AND state='ready'", [
+        f.actor.userId,
+      ]);
+    try {
+      const initial = await f.start();
+      const job = await initial.createImage(f.actor, randomUUID(), f.modelRef, {
+        prompt: 'object receipt before PG outputs',
+      });
+      await vi.waitFor(() => expect(accept).toHaveBeenCalledTimes(1), { timeout: 6000 });
+      const stopping = f.stop();
+      release.resolve();
+      await stopping;
+
+      const [{ command }] = accept.mock.calls[0]!;
+      const persisted = (
+        await f.pool.query('SELECT checkpoint FROM mio_image_executions WHERE job_id=$1', [
+          job.jobId,
+        ])
+      ).rows[0].checkpoint;
+      const saved = (await f.files.load(job.jobId, command.messageId, 1, persisted))!;
+      expect(saved.ref.revision).toBeGreaterThan(persisted.revision);
+      expect((await ready()).rows).toEqual([]);
+      const output = saved.checkpoint.outputs[0]!;
+      const original = f.stored.get(output.key)!;
+      if (fault === '404') f.stored.delete(output.key);
+      if (fault === 'sha256') f.stored.set(output.key, { ...original, sha256: '0'.repeat(64) });
+      if (fault === 'etag') f.stored.set(output.key, { ...original, etag: 'different-etag' });
+
+      const restarted = await f.start();
+      await vi.waitFor(
+        async () =>
+          expect((await restarted.getImage(f.actor, job.jobId)).status).toBe(
+            'materialization_failed',
+          ),
+        { timeout: 6000 },
+      );
+      expect((await ready()).rows).toEqual([]);
+      expect((await restarted.getImage(f.actor, job.jobId)).outputs).toEqual([]);
+      const exhausted = (await f.files.load(job.jobId, command.messageId, 1))!.checkpoint;
+      expect(exhausted.attempts).toBe(3);
+      expect(exhausted.outputs[0]).toEqual(output);
+      expect(exhausted.attemptedKeys[0]).toEqual([output.key]);
+      expect(await f.files.read(job.jobId, exhausted.images[0]!)).toEqual(f.bytes);
+
+      f.stored.set(output.key, original);
+      await restarted.recoverImage(f.actor, job.jobId);
+      await vi.waitFor(
+        async () => expect((await restarted.getImage(f.actor, job.jobId)).status).toBe('completed'),
+        { timeout: 6000 },
+      );
+      const recovered = await restarted.getImage(f.actor, job.jobId);
+      expect(recovered.outputs.map((item) => item.index)).toEqual([0]);
+      expect((await ready()).rows).toEqual([{ id: recovered.assetIds[0], raw_key: output.key }]);
+      expect(f.objects.putImage).toHaveBeenCalledTimes(1);
+      expect(f.transport).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      accept.mockRestore();
+      await f.close();
+    }
+  },
+  15000,
+);
+
 it('retains durable original bytes after COS failure and recovers assets without another generation', async () => {
   const f = await generationFixture();
   try {
@@ -378,9 +452,11 @@ it('persists the admission block when the result directory cannot be created', a
   }
 });
 
-it('retains committed partial assets while retrying only missing output materialization', async () => {
+it('retains a committed output while a recovered second output fails HEAD', async () => {
   const f = await generationFixture();
   const put = f.objects.putImage!;
+  const accept = vi.spyOn(f.store, 'acceptOutputs');
+  const release = Promise.withResolvers<void>();
   let rejectSecond = true;
   f.objects.putImage = vi.fn<typeof put>(async (...args) => {
     if (rejectSecond && args[0].includes('/images/1-'))
@@ -402,7 +478,45 @@ it('retains committed partial assets while retrying only missing output material
     );
     const partial = await f.service.getImage(f.actor, job.jobId);
     expect(partial.outputs.map((output) => output.index)).toEqual([0]);
+    accept.mockClear().mockImplementationOnce(async () => {
+      await release.promise;
+      throw new Error('PG unavailable after second object receipt');
+    });
     rejectSecond = false;
+    await f.service.recoverImage(f.actor, job.jobId);
+    await vi.waitFor(() => expect(accept).toHaveBeenCalledTimes(1), { timeout: 6000 });
+    const stopping = f.stop();
+    release.resolve();
+    await stopping;
+
+    const [, outputs] = accept.mock.calls[0]!;
+    const first = outputs[0]!;
+    const second = outputs[1]!;
+    const original = f.stored.get(second.key)!;
+    expect(f.stored.delete(second.key)).toBe(true);
+    const putCount = vi.mocked(f.objects.putImage).mock.calls.length;
+    vi.mocked(f.objects.head).mockClear();
+    await f.start();
+    await vi.waitFor(
+      async () =>
+        expect((await f.service.getImage(f.actor, job.jobId)).status).toBe(
+          'materialization_failed',
+        ),
+      { timeout: 6000 },
+    );
+    expect(f.objects.head).toHaveBeenCalledWith(first.key);
+    expect(f.objects.head).toHaveBeenCalledWith(second.key);
+    expect((await f.service.getImage(f.actor, job.jobId)).outputs).toEqual(partial.outputs);
+    expect(
+      (
+        await f.pool.query(
+          "SELECT id,raw_key FROM mio_assets WHERE owner_id=$1 AND state='ready'",
+          [f.actor.userId],
+        )
+      ).rows,
+    ).toEqual([{ id: partial.assetIds[0], raw_key: first.key }]);
+
+    f.stored.set(second.key, original);
     await f.service.recoverImage(f.actor, job.jobId);
     await vi.waitFor(
       async () => expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('completed'),
@@ -411,6 +525,7 @@ it('retains committed partial assets while retrying only missing output material
     const result = await f.service.getImage(f.actor, job.jobId);
     expect(result.outputs.map((output) => output.index)).toEqual([0, 1]);
     expect(result.assetIds[0]).toBe(partial.assetIds[0]);
+    expect(f.objects.putImage).toHaveBeenCalledTimes(putCount);
     expect(f.transport).toHaveBeenCalledTimes(1);
     expect(f.stored.size).toBe(2);
     expect(
@@ -418,9 +533,11 @@ it('retains committed partial assets while retrying only missing output material
         .rows[0].count,
     ).toBe('2');
   } finally {
+    release.resolve();
+    accept.mockRestore();
     await f.close();
   }
-});
+}, 15000);
 
 it('reconciles an ambiguous successful COS write by its saved physical identity', async () => {
   const f = await generationFixture();

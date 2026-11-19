@@ -20,6 +20,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/auth/phone.ts](../../../../src/auth/phone.ts) · [src/auth/phone-store.ts](../../../../src/auth/phone-store.ts) · [src/auth/wechat.ts](../../../../src/auth/wechat.ts) · [src/integrations/tencent-sms.ts](../../../../src/integrations/tencent-sms.ts) · [src/integrations/wechat.ts](../../../../src/integrations/wechat.ts) · [docs/apis/auth.md](../../../apis/auth.md) · [docs/tasks/ai-drama-foundation/changes/phone-wechat-auth/change.md](../changes/phone-wechat-auth/change.md) · [docs/tasks/ai-drama-foundation/pending/auth-extension.md](../pending/auth-extension.md)
 
+## wechat-qr-polling
+
+**匿名微信 QR polling 登录与内嵌 WxLogin 同源回调跳板**
+
+[src/auth/wechat-qr.ts](../../../../src/auth/wechat-qr.ts) · [src/auth/wechat-qr-store.ts](../../../../src/auth/wechat-qr-store.ts) · [src/auth/wechat.ts](../../../../src/auth/wechat.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [src/auth/wechat-input.ts](../../../../src/auth/wechat-input.ts) · [src/auth/config.ts](../../../../src/auth/config.ts) · [docs/apis/auth.md](../../../apis/auth.md) · [docs/auth.md](../../../auth.md) · [docs/integrations/wechat.md](../../../integrations/wechat.md) · [docs/tasks/ai-drama-foundation/changes/wechat-qr-polling/change.md](../changes/wechat-qr-polling/change.md) · [tests/auth/wechat.test.ts](../../../../tests/auth/wechat.test.ts)
+
 ```mio-prd-results
 {
   "version": 5,

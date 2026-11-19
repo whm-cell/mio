@@ -37,6 +37,59 @@
       }
     },
     {
+      "key": "conversation-platform-prompt",
+      "title": "对话平台人设与受控系统提示词（miioo AI 漫剧助手）",
+      "locations": [
+        {
+          "path": "src/conversations/prompt.ts",
+          "purpose": "纯业务对话系统提示词模块：miioo AI 漫剧助手身份、适度宽松漫剧创作话题政策、防泄露与按能力组合确定性文本"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "mio-conversations 子插件显式声明 systemPrompt 注入与类型增强"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "会话级 PERSONA_PREFIX_SECTION（order: 0, interpolate: false, 非 complete）在 legacy 与 BYOK 轮次统一注入"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "同步对话系统提示词产品规则、能力声明与验证说明"
+        },
+        {
+          "path": "docs/integrations/dsh.md",
+          "purpose": "同步 DSH Profile includeHarnessIdentity: false 与会话级系统提示词接入约束"
+        },
+        {
+          "path": "docs/tasks/conversation-service/changes/conversation-platform-prompt/change.md",
+          "purpose": "本轻量变更需求边界、C0/C1 安排与验收记录"
+        },
+        {
+          "path": "tests/conversations/prompt.test.ts",
+          "purpose": "提示词身份、适度宽松政策、防泄露、4 种工具能力组合与确定性单元测试"
+        },
+        {
+          "path": "tests/conversations/conversations-engine.test.ts",
+          "purpose": "legacy/BYOK 引擎注入、多轮前缀稳定、字面量 {{...}} 安全与非 complete 协作测试"
+        },
+        {
+          "path": "tests/conversations/conversations-profile.test.ts",
+          "purpose": "正式打包 Profile 验证入模含 miioo AI 漫剧助手、不含 DeepSeek Harness 且公开历史不外泄系统提示"
+        }
+      ],
+      "outcomes": "在正式 Profile（cordis.patch.yml）为 @deepseek-ai/dsh-system-prompt 配置 includeHarnessIdentity: false 移除上游 DeepSeek Harness 默认系统提示词开场白，并通过纯业务模块 src/conversations/prompt.ts 与会话级 DSH 注入（PERSONA_PREFIX_SECTION, order: 0, interpolate: false, 非 complete）为 legacy 与 BYOK 全部对话轮次提供受控的 miioo AI 漫剧助手系统提示词：覆盖 AI 漫剧核心创作、适度宽松的背景考据/审美支持与明显无关话题礼貌婉拒、防指令复述/覆盖、按本轮实际工具授权（imageGeneration / imageInspection）准确声明能力以及按能力组合完全确定的 KV-cache 前缀稳定性；保持既有公开历史白名单投影、工具单调守卫与 DSH 边界不变，不引入数据库配置表或过度抽象。",
+      "verification": "干净候选 a7e37f3304429851f5f67ffc402cd1ebbe6df439（contractRevision=1）全部 7/7 验收通过：pnpm work documents 零问题；pnpm check:static（format:check、typecheck、lint、AST guard、完整 build）通过；pnpm test:smoke 正式打包产物与 Profile 启动/鉴权/关闭通过；pnpm check:local tests/conversations tests/onelink tests/foundation 主回归 23 文件 164 测试全通过，另在当前候选上记录绑定补测 tests/providers/vendor-routing.test.ts（7/7 通过）与 tests/providers/providers-profile.test.ts（1/1 通过），合计 25 文件 172 项本地隔离测试通过；并基于直接父提交 main 85cc0c9a15823bc2085105ef4dbac62c9d0d5ff0 通过的 GitHub Actions run 44469628859 与消费者影响边界审计形成完整 pnpm check 覆盖判断（full-check-coverage-a7e37f3-v2.md，本机全量执行 0 次），完成源码 quality-review 与三方 norms-review 原件登记。",
+      "limitations": "仅完成本地隔离自动化验证与作者自审；独立只读审阅待 verifier 复核，人类真实接受尚未取得（未执行 deliver complete）；未触发收费真实大模型线上调用以主观评测提示词遵循效果；未推送远端分支、未开 PR、未取得当前分支的远端 CI 运行。",
+      "acceptance": {
+        "candidate": {
+          "commit": "a7e37f3304429851f5f67ffc402cd1ebbe6df439",
+          "contractRevision": 1
+        },
+        "statement": "这项结果接受并完成交付",
+        "reference": "2026-11-19 当前对话用户在审阅已交回的 conversation-platform-prompt 候选 a7e37f3304429851f5f67ffc402cd1ebbe6df439（contractRevision=1，draftId=9c1a55c3-f7e4-4b29-b666-2dd469c9878b）及独立审阅与限制后，明确答复“这项结果接受并完成交付”并授权完成交付（board #11）。"
+      }
+    },
+    {
       "key": "conversation-service",
       "title": "用户归属的本地对话 API 与真实默认文本闭环",
       "locations": [

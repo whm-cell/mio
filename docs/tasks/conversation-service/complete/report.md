@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/dsh/kernel.ts](../../../../src/dsh/kernel.ts) · [src/dsh/policy.ts](../../../../src/dsh/policy.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [tests/foundation/kernel.test.ts](../../../../tests/foundation/kernel.test.ts)
 
+## conversation-platform-prompt
+
+**对话平台人设与受控系统提示词（miioo AI 漫剧助手）**
+
+[src/conversations/prompt.ts](../../../../src/conversations/prompt.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [docs/conversations.md](../../../conversations.md) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [docs/tasks/conversation-service/changes/conversation-platform-prompt/change.md](../changes/conversation-platform-prompt/change.md) · [tests/conversations/prompt.test.ts](../../../../tests/conversations/prompt.test.ts) · [tests/conversations/conversations-engine.test.ts](../../../../tests/conversations/conversations-engine.test.ts) · [tests/conversations/conversations-profile.test.ts](../../../../tests/conversations/conversations-profile.test.ts)
+
 ## conversation-service
 
 **用户归属的本地对话 API 与真实默认文本闭环**

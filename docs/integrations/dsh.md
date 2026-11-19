@@ -4,7 +4,7 @@
 
 Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session、Session Projection、JSONL Persistence、Session Query 冷读接口，以及既有 System Prompt、Tools 和 Native Executor。[内核入口](../../src/dsh/kernel.ts)只管理公开 AgentHandle 和生命周期；模型请求、inbox、上下文与结算仍由官方 loop 负责。
 
-[正式 Profile](../../cordis.patch.yml)逐项装配必要服务，不加载 SDK/Web 默认 Bundle、Shell、文件工具、MCP、自动重试或模拟模型。未启用 provider 域时保留显式 legacy deepseek-official；启用后由 Mio 注册固定 OneLink 文本路由，缺本人配置不回退。配置见[对话规范](../conversations.md)，无对话数据库保留 foundation 路径；sessions 只反映对话入口是否装配。
+[正式 Profile](../../cordis.patch.yml)逐项装配必要服务，不加载 SDK/Web 默认 Bundle、Shell、文件工具、MCP、自动重试或模拟模型，并在 `@deepseek-ai/dsh-system-prompt` 显式配置 `includeHarnessIdentity: false` 以移除上游 `DeepSeek Harness` 默认开场白。未启用 provider 域时保留显式 legacy deepseek-official；启用后由 Mio 注册固定 OneLink 文本路由，缺本人配置不回退。配置见[对话规范](../conversations.md)，无对话数据库保留 foundation 路径；sessions 只反映对话入口是否装配。
 
 正式 Profile 使用 `@mio/plugin/profile` 薄入口以模块级依赖等待 `mioKernel`；独立 `@mio/plugin` 不新增该依赖。活动对话与冷读排空之前保留官方 `@deepseek-ai/dsh-compaction-image-offload` 投影及其恢复监听器，显式串行释放，不依赖同级 fiber 的卸载顺序。
 
@@ -20,6 +20,7 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 - 原生持久根是独立 `DSH_HOME` 的 `sessions`；不得借用账号登录 Session、认证表、`.work`、其他运行实例或共享业务数据。
 - `@deepseek-ai/dsh-tools` 的 `checkGuards(exec)` 依次检查根级 `guards.global` 与 `guards.chainLayers(exec.agent)`。插件入口、内核和 `create`/`resume` 的 `setup` 在 Agent 发布前均注册[单调拒绝守卫](../../src/dsh/policy.ts)，无 Agent 的直接调用、未授权 Agent 及白名单外工具一律返回 `MIO_TOOL_DENIED`，后注册 `tools/pre-execute` allow 无法覆盖单调守卫。仅当 BYOK 与图片计算桥接均就绪时，活动对话轮次在模块私有 `WeakMap<Agent, ...>` 中临时登记该 `Agent`、仅向会话 `agentCtx.tools`（绝不向全局 `ctx.tools`）注册[三个意图级生图工具](../../src/dsh/image-tools.ts)（`list_image_models`、`submit_image_job`、`get_image_job`），并在 `agentCtx` 守卫执行单轮预算（`maxToolCallsPerTurn = 12`、`maxImageSubmitsPerTurn = 4`，超限返回 `MIO_TOOL_BUDGET_EXCEEDED` 且函数 0 次执行），配合 `agent/pre-step` 的单轮硬步数上限 `MAX_TURN_STEPS = 8`（超限抛 `LlmError(..., 'TURN_STEP_BUDGET_EXCEEDED')`）；同时单轮工具闭包对未完成（`accepted`/`submitted`/`processing`/`materializing`）的同轮新建任务或本轮已查非终态任务的重复 `get_image_job` 轮询以 `IMAGE_JOB_POLL_DEFERRED` 拦截（失败不产出 `mio.image-job` 卡片），跨轮对前序 `jobId` 的首次查询仍正常放行；轮次结束 `finally` 与 `agentCtx` fiber dispose 立即撤销授权。测试模型、计数工具只在 `tests/`，不得进入生产包或 Profile。
 - 显式视觉路由和资产桥就绪时，本轮另登记只读 `inspect_image_asset`；它从可信轮次取 owner，复用同一总工具调用和步骤预算，独立于计算桥。图片仅以绑定资产与源摘要的 opaque ID 持久化，实际预览在内存编码；读取和发送均重新校验源身份。视觉能力撤回时先检查待处理输入和会话 surface，不让文本适配自动抹去图片。
+- 对话子插件 `mio-conversations` 显式注入 `systemPrompt`；[对话引擎](../../src/dsh/conversations.ts)在每次活动轮次 `resume` 的 `setup` 中统一（覆盖 legacy 与 BYOK）按本轮实际工具授权结果注册会话级 `agentCtx.systemPrompt.section({ name: PERSONA_PREFIX_SECTION, order: 0, interpolate: false, text })`（不设 `complete: true`）。文本由纯业务模块[对话系统提示词](../../src/conversations/prompt.ts)生成（固定对外身份 `miioo AI 漫剧助手`，不含时间戳/UUID/用户 ID 等动态字段以维持 DSH `SystemPromptProjection` KV-cache 前缀稳定）；`interpolate: false` 防止字面量 `{{...}}` 被模板插值误解析，且系统消息受公开历史与流式白名单投影隔离，绝不外泄给客户端。
 - 预检先按 occurrence 检查张数，再逐个取得实际预览长度，以 Base64 总字节数判断是否需要旧图卸载；仅本轮开始前的 occurrence 可卸载。公开 `projectOffloadedImages` 在请求副本中生成含 assetId 和 `inspect_image_asset` 的占位，原日志和冻结输入不被改写。PiAi 发送前重新读取并核对摘要、尺寸、MIME 与预览指纹；有界并发和取消负责释放在途图片资源。
 - 普通输入使用 followup，steer 不自动成为公共入口。Handle 持有者负责释放，完成释放后可在同一内核恢复，释放中重开明确拒绝；DSH ID 不等于登录会话 ID，使用者须先完成可信身份与资源归属检查。
 - assistant-stream chunk 是瞬态展示；assistant/message 或 assistant/attempt 是结算记录，也仍不等于已落盘。whenIdle 只证明排空，需检查真实 turn/end.reason 才判断 completed、aborted、error 或 interrupted。

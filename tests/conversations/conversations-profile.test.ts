@@ -90,10 +90,13 @@ it('runs packed public multi-round requests and preserves settled content across
   };
   expect(observed.count).toBe(2);
   expect(JSON.stringify(observed.messages)).toContain('remember packed context');
+  expect(JSON.stringify(observed.messages)).toContain('miioo AI 漫剧助手');
+  expect(JSON.stringify(observed.messages)).not.toContain('DeepSeek Harness');
   await runtime.stop();
   await runtime.start('database');
   const history = await (await call(`/api/v1/conversations/${id}/history`)).json();
   expect(JSON.stringify(history)).toContain('reply 2');
+  expect(JSON.stringify(history)).not.toContain('miioo AI 漫剧助手');
   expect((await message(id, 'two', 'use prior context')).status).toBe(202);
   const fresh = (await (await fetch(`${runtime.origin}/__test/model`)).json()) as { count: number };
   expect(fresh.count).toBe(0);

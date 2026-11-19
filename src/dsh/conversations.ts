@@ -3,6 +3,7 @@ import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
 import type { TurnEndReason } from '@deepseek-ai/dsh-session';
+import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
 import type { ConversationConfig } from '../conversations/config.ts';
 import type {
   ConversationEngine,
@@ -10,6 +11,7 @@ import type {
   ConversationVision,
   HistoryItem,
 } from '../conversations/contracts.ts';
+import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
@@ -183,10 +185,21 @@ export function createDshConversationEngine(
           const inspection = Boolean(
             vision && observedBinding?.snapshot.inputModalities?.includes('image'),
           );
+          const hasGenerationTools = Boolean(observedBinding && onelink && imageTools);
+          const hasInspectionTool = Boolean(observedBinding && onelink && inspection);
+          agentCtx.systemPrompt.section({
+            name: PERSONA_PREFIX_SECTION,
+            order: 0,
+            interpolate: false,
+            text: buildConversationSystemPrompt({
+              imageGeneration: hasGenerationTools,
+              imageInspection: hasInspectionTool,
+            }),
+          });
           if (observedBinding && onelink && (imageTools || inspection)) {
             revokeImageTools = authorizeConversationImageTools(agentCtx, agent, {
-              generation: Boolean(imageTools),
-              inspection,
+              generation: hasGenerationTools,
+              inspection: hasInspectionTool,
             });
             if (imageTools) registerConversationImageTools(agentCtx, observedBinding, imageTools);
             if (inspection) registerVisionTool(agentCtx, observedBinding, vision!);

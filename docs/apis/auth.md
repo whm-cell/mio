@@ -29,7 +29,7 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | `/change-password`                                                                                             | 10 秒 / 3 次         |
 | `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次  |
 
-错误凭据也占一次放行额度；适配器提前拒绝的 Origin、路径、方法、正文错误和 OPTIONS 不消费。窗口从最近放行计算，放行更新该时间，拒绝不更新；额度耗尽保留库 429 原始消息与 `X-Retry-After`（向上取整的剩余秒数）。代理后的客户端共享代理地址限额，正式部署需要在可信边缘配置限流；当前未验证任意代理链或多实例容量。库自身 CSRF 和适配器 Origin 检查均保留。
+错误凭据也占一次放行额度；适配器提前拒绝的 Origin、路径、方法、正文错误、OPTIONS 以及 `/callback/wechat` 的单跳 iframe 桥接响应不消费。窗口从最近放行计算，放行更新该时间，拒绝不更新；额度耗尽保留库 429 原始消息与 `X-Retry-After`（向上取整的剩余秒数）。代理后的客户端共享代理地址限额，正式部署需要在可信边缘配置限流；当前未验证任意代理链或多实例容量。库自身 CSRF 和适配器 Origin 检查均保留。
 
 计数默认在 DB，显式 Redis 选择与恢复按[认证配置](../auth.md#限流存储与恢复)，资源边界见[Redis 契约](../integrations/redis.md)。Redis 失败返回包装 `503 AUTH_UNAVAILABLE`，不是超额 429；没有静默 DB 回退。未知状态后受限入口持续 503，直至操作者排清、等待并重启；已装载且 DB 正常时 `/api/v1/me` 仍查询 DB。PG 账号/会话、cookie 和原迁移模型不因 Redis 计数改变；整进程维护期间入口可能不可达。
 
@@ -43,7 +43,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：201 和 `{qrcode_id,authorization_url,expire_seconds:300}`。QR ID 为不透明 UUID v4；同时转发 Better Auth 的 OAuth state Cookie 并设置 `mio.wechat_qr` Cookie（HTTPS 名称带 `__Secure-` 前缀）。QR Cookie 为 HttpOnly、SameSite=Lax，HTTPS 带 Secure，路径精确到本 ID 的 poll 入口，Max-Age 为 900 秒；QR 本身仍只在 300 秒内有效，较长 Cookie 只用于观察过期。响应保持 `Cache-Control: no-store`。
 
-`authorization_url` 必须由同一浏览器的授权窗口承载微信授权页面，不是可直接作为二维码图片加载的地址。授权窗口的 callback 设置 Session Cookie；主页面与该窗口须满足共同的同站点／同源 Cookie 部署条件。返回 URL 不表示已经授权或登录，本仓库不实现完成页。
+`authorization_url` 必须由微信官方授权页面或同源页面内嵌的微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）承载，不是可直接作为二维码图片加载的地址；不提供无同浏览器 Session Cookie 的跨设备凭据交接。同源内嵌容器（须满足 `SAMEORIGIN` / `frame-ancestors 'self'`）或同一浏览器的授权窗口在 callback 处设置 Session Cookie；主页面须与服务满足共同的同站点／同源 Cookie 部署条件。返回 URL 不表示已经授权或登录，本仓库不实现完成页。
 
 错误：无效输入为 400 `INVALID_INPUT`，未启用微信为 503 `WECHAT_UNAVAILABLE`，数据库或授权地址创建失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文和 429 沿共同约定。
 
@@ -99,13 +99,13 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 身份：微信授权返回的 code、state 和发起浏览器的 state Cookie；绑定在回调执行权威会话核验时，还要求发起会话有效且当前浏览器使用同一 userId 和 sessionId。核验已通过的在途绑定不会因并发退出或撤销自动取消，可能在撤销成功后完成；后续请求仍受撤销约束。
 
-输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。
+输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。同源 iframe 桥接第二跳可附带内部参数 `mio_bridge`，适配器在转交认证库前将其移除。
 
-成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。
+成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。当请求携带 `Sec-Fetch-Dest: iframe`、未携带 `mio_bridge`、缺少对应协议的 state Cookie（HTTPS 为 `__Secure-mio.state`，回环 HTTP 为 `mio.state`）且 `state` 为非空且不超过 512 字符的字符串时，适配器在完成 Origin、方法与微信启用检查后不进入认证库，直接返回 200 `text/html; charset=utf-8` 固定同源桥接页（无动态插值，内联脚本仅为当前 URL 添加 `mio_bridge=1` 并执行 `location.replace`），保留 `X-Request-Id`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`，并设置 `X-Frame-Options: SAMEORIGIN`、`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; frame-ancestors 'self'` 与 `Referrer-Policy: no-referrer`；浏览器在同源 iframe 内发起第二跳并附带 state Cookie 后，适配器移除 `mio_bridge` 并交由认证库完成校验与 302 重定向。
 
-错误：缺少或错误 state Cookie、重复 state 为 400；库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
+错误：缺少或错误 state Cookie、重复 state 为 400；已携带 `mio_bridge` 的第二跳若仍缺少或错配 state Cookie，直接交由认证库返回 400 `STATE_MISMATCH` 且不再返回桥接页（零循环）。非 iframe 请求、缺少或超长 `state` 不触发桥接；微信未启用时即使携带 `Sec-Fetch-Dest: iframe` 仍返回 503 `WECHAT_UNAVAILABLE`。库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
 
-副作用：进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
+副作用：第一跳 iframe 桥接不调用认证库，不消费 `/callback/wechat` 限流额度，也不触碰数据库或微信接口。进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
 
 当 state 对应 QR 会话时，在原签名 Cookie 和单次保留检查后关联 QR；过期 QR 在供应商兑换前以 400 拒绝。只有本次 callback 的新 Session 用户能将 pending QR 标记为 confirmed，已有登录 Cookie 不会让失败回调变成成功；其余已进入的失败回调把对应 pending QR 标记为 failed。重复／并发 callback 不替换已经确认或消费的结果。QR 用户拒绝参数脱敏为 `WECHAT_AUTH_FAILED` 后回到批准的完成路径，普通 OAuth 重定向行为保持原契约。缺失或错误发起 Cookie 的请求在关联 QR 前拒绝，不将该 QR 标记失败。
 

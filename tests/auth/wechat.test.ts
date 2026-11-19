@@ -8,6 +8,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
+import type { Authentication } from '../../src/auth/service.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
@@ -34,7 +35,13 @@ const cookies = (response: Response) =>
 
 function call(
   path: string,
-  options: { body?: unknown; cookie?: string; instance?: number; origin?: boolean } = {},
+  options: {
+    body?: unknown;
+    cookie?: string;
+    headers?: Record<string, string>;
+    instance?: number;
+    origin?: boolean;
+  } = {},
 ) {
   return originalFetch(`${origins[options.instance ?? 0]}${path}`, {
     method: options.body === undefined ? 'GET' : 'POST',
@@ -43,6 +50,7 @@ function call(
       ...(options.origin === false ? {} : { origin: origins[0]! }),
       ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
       ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...options.headers,
     },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
   });
@@ -831,6 +839,271 @@ it('uses Secure QR cookies under HTTPS and rejects both QR routes while WeChat i
         expect(
           (await originalFetch(`${origin}/api/auth/wechat/qr-session/${randomUUID()}/poll`)).status,
         ).toBe(503);
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await auth.close();
+    }
+  }
+});
+
+it('bridges cross-site embedded WxLogin iframe callbacks into a same-origin hop and completes QR polling', async () => {
+  const qr = await startQR();
+  fixtures.set('iframe-qr', { openid: 'iframe-qr-user' });
+  const query = new URLSearchParams({ state: qr.state, code: 'iframe-qr' });
+  const hop1 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+  });
+  expect(hop1.status).toBe(200);
+  expect(hop1.headers.get('content-type')).toBe('text/html; charset=utf-8');
+  expect(hop1.headers.get('cache-control')).toBe('no-store');
+  expect(hop1.headers.get('x-content-type-options')).toBe('nosniff');
+  expect(hop1.headers.get('x-request-id')).toMatch(/^[0-9a-f-]{36}$/);
+  expect(hop1.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+  expect(hop1.headers.get('referrer-policy')).toBe('no-referrer');
+  const html = await hop1.text();
+  const match = /^<!doctype html><meta charset="utf-8"><script>([^<]+)<\/script>$/.exec(html);
+  expect(match).not.toBeNull();
+  const expectedHash = createHash('sha256').update(match![1]!).digest('base64');
+  expect(hop1.headers.get('content-security-policy')).toBe(
+    `default-src 'none'; script-src 'sha256-${expectedHash}'; frame-ancestors 'self'`,
+  );
+  expect(html).not.toContain(qr.state);
+  expect(html).not.toContain('iframe-qr');
+  expect(exchanges).toBe(0);
+  expect(
+    (await pool.query('SELECT key FROM "rateLimit" WHERE key LIKE $1', ['%/callback/wechat%']))
+      .rowCount,
+  ).toBe(0);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  query.set('mio_bridge', '1');
+  const hop2 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    cookie: qr.cookie,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+  });
+  expect(hop2.status).toBe(302);
+  expect(hop2.headers.get('location')).toBe(`${origins[0]}/auth/wechat/qr-complete`);
+  expect(exchanges).toBe(1);
+  const session = cookies(hop2);
+  expect(session).toContain('mio.session_token=');
+  const user = await identity(session);
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'confirmed' });
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'consumed' });
+  expect((await identity(session)).userId).toBe(user.userId);
+});
+
+it('bridges iframe authorization refusal and redacts QR error without code exchange', async () => {
+  const qr = await startQR();
+  const query = new URLSearchParams({
+    state: qr.state,
+    error: 'access_denied',
+    error_description: 'private-iframe-refusal',
+  });
+  const hop1 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+  });
+  expect(hop1.status).toBe(200);
+  expect(hop1.headers.get('content-type')).toContain('text/html');
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  query.set('mio_bridge', '1');
+  const hop2 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    cookie: qr.cookie,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+  });
+  expect(hop2.status).toBe(302);
+  expect(hop2.headers.get('location')).toBe(
+    `${origins[0]}/auth/wechat/qr-complete?error=WECHAT_AUTH_FAILED`,
+  );
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'failed' });
+  expect(exchanges).toBe(0);
+});
+
+it('prevents iframe bridge loops, enforces non-iframe and cookie guards, and strips mio_bridge', async () => {
+  const qr = await startQR();
+  const other = await startQR();
+  fixtures.set('guard-ok', { openid: 'guard-ok-user' });
+  const hop2NoCookie = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok', mio_bridge: '1' })}`,
+    {
+      origin: false,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(hop2NoCookie.status).toBe(400);
+  expect(await hop2NoCookie.text()).toContain('STATE_MISMATCH');
+  const hop2WrongCookie = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok', mio_bridge: '1' })}`,
+    {
+      origin: false,
+      cookie: other.cookie,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(hop2WrongCookie.status).toBe(400);
+  expect(await hop2WrongCookie.text()).toContain('STATE_MISMATCH');
+  const nonIframe = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+    { origin: false },
+  );
+  expect(nonIframe.status).toBe(400);
+  expect(await nonIframe.text()).toContain('STATE_MISMATCH');
+  for (const query of ['', 'state=', `state=${'a'.repeat(513)}`]) {
+    const invalidState = await call(`/api/auth/callback/wechat${query ? `?${query}` : ''}`, {
+      origin: false,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+    });
+    expect(invalidState.status).toBe(400);
+  }
+  for (const cookie of ['mio.state=', '__Secure-mio.state=wrong-scheme']) {
+    const bridged = await call(
+      `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+      {
+        origin: false,
+        cookie,
+        headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+      },
+    );
+    expect(bridged.status).toBe(200);
+    expect(bridged.headers.get('content-type')).toContain('text/html');
+  }
+  expect(exchanges).toBe(0);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  const direct = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+    {
+      origin: false,
+      cookie: qr.cookie,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(direct.status).toBe(302);
+  expect(direct.headers.get('location')).toBe(`${origins[0]}/auth/wechat/qr-complete`);
+  expect(exchanges).toBe(1);
+  expect(await (await pollQR(qr, cookies(direct))).json()).toEqual({ status: 'confirmed' });
+  const seenUrls: string[] = [];
+  const spyHandler = vi.fn(async (input: Request) => {
+    seenUrls.push(input.url);
+    return new Response(null, { status: 204 });
+  });
+  const spyServer = createServer(
+    createAuthHandler(
+      {
+        baseURL: 'http://localhost',
+        secret,
+        databaseURL: database.url,
+        origins: ['http://localhost'],
+        smsLimits: { phoneHour: 5, phoneDay: 10, ipHour: 20, ipDay: 100, globalDay: 1000 },
+        wechat: { appId, appSecret: 'fixture-secret' },
+      },
+      { handler: spyHandler } as unknown as Authentication,
+    ),
+  );
+  try {
+    spyServer.listen(0, '127.0.0.1');
+    await once(spyServer, 'listening');
+    const address = spyServer.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    const spyOrigin = `http://127.0.0.1:${address.port}`;
+    const spyHop1 = await originalFetch(
+      `${spyOrigin}/api/auth/callback/wechat?state=xyz&code=abc`,
+      { headers: { 'sec-fetch-dest': 'iframe' } },
+    );
+    expect(spyHop1.status).toBe(200);
+    expect(spyHandler).toHaveBeenCalledTimes(0);
+    const spyHop2 = await originalFetch(
+      `${spyOrigin}/api/auth/callback/wechat?state=xyz&code=abc&mio_bridge=1`,
+      { headers: { 'sec-fetch-dest': 'iframe' } },
+    );
+    expect(spyHop2.status).toBe(204);
+    expect(spyHandler).toHaveBeenCalledTimes(1);
+    const forwarded = new URL(seenUrls[0]!);
+    expect(forwarded.pathname).toBe('/api/auth/callback/wechat');
+    expect(forwarded.searchParams.get('state')).toBe('xyz');
+    expect(forwarded.searchParams.get('code')).toBe('abc');
+    expect(forwarded.searchParams.has('mio_bridge')).toBe(false);
+  } finally {
+    await new Promise<void>((resolve) => spyServer.close(() => resolve()));
+  }
+});
+
+it('distinguishes __Secure-mio.state under HTTPS iframe bridge and rejects disabled WeChat with 503', async () => {
+  for (const enabled of [true, false]) {
+    const config = readAuthConfig({
+      MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: database.url,
+      ...(enabled
+        ? {
+            MIO_AUTH_WECHAT_ENABLED: 'true',
+            MIO_AUTH_WECHAT_APP_ID: appId,
+            MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
+          }
+        : {}),
+    })!;
+    const auth = await createAuthentication(config);
+    const server = createServer(createAuthHandler(config, auth));
+    try {
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('missing address');
+      const origin = `http://127.0.0.1:${address.port}`;
+      if (enabled) {
+        const created = await originalFetch(`${origin}/api/auth/wechat/qr-session`, {
+          method: 'POST',
+          headers: { origin: config.baseURL, 'content-type': 'application/json' },
+          body: '{}',
+        });
+        expect(created.status).toBe(201);
+        const httpsCookies = cookies(created);
+        expect(httpsCookies).toContain('__Secure-mio.state=');
+        const body = (await created.json()) as { authorization_url: string };
+        const state = new URL(body.authorization_url).searchParams.get('state')!;
+        const wrongCookieName = await originalFetch(
+          `${origin}/api/auth/callback/wechat?${new URLSearchParams({ state, code: 'https-iframe' })}`,
+          {
+            redirect: 'manual',
+            headers: {
+              'sec-fetch-dest': 'iframe',
+              'sec-fetch-site': 'cross-site',
+              cookie: 'mio.state=wrong-prefix',
+            },
+          },
+        );
+        expect(wrongCookieName.status).toBe(200);
+        expect(wrongCookieName.headers.get('content-type')).toContain('text/html');
+        expect(exchanges).toBe(0);
+        fixtures.set('https-iframe', { openid: 'https-iframe-user' });
+        const direct = await originalFetch(
+          `${origin}/api/auth/callback/wechat?${new URLSearchParams({ state, code: 'https-iframe' })}`,
+          {
+            redirect: 'manual',
+            headers: {
+              'sec-fetch-dest': 'iframe',
+              'sec-fetch-site': 'same-origin',
+              cookie: httpsCookies,
+            },
+          },
+        );
+        expect(direct.status).toBe(302);
+        expect(direct.headers.get('location')).toBe(
+          'https://mio-qr.example.test/auth/wechat/qr-complete',
+        );
+        expect(exchanges).toBe(1);
+      } else {
+        const disabled = await originalFetch(
+          `${origin}/api/auth/callback/wechat?state=disabled-state&code=disabled-code`,
+          {
+            redirect: 'manual',
+            headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+          },
+        );
+        expect(disabled.status).toBe(503);
+        expect(await disabled.text()).toContain('WECHAT_UNAVAILABLE');
       }
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

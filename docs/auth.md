@@ -71,9 +71,9 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 
 微信可独立登录或注册，手机号绑定可选；已有用户必须从本人会话主动绑定，不能凭相同邮箱自动合并或转移另一个账号的微信。身份键、授权回调、state 防重放、供应商请求和 AppID 变更前置条件见[微信契约](integrations/wechat.md)。仅开放指定微信 provider 和 GET 回调，不支持换绑、解绑、账号合并或旧账号迁移。微信生成的占位邮箱保持 `emailVerified=false`；微信授权本身不验证邮箱。
 
-匿名 QR 登录在原微信流程外增加短期会话与轮询，不提供微信绑定入口。Mio 主页面保持打开，同一浏览器的授权窗口完成微信 callback 并接收原 Session Cookie；主页面凭单个 QR 的 Cookie 轮询，确认后调用现有 `/api/v1/me`。QR 有效期为 5 分钟，Cookie 保留 15 分钟以便观察过期；创建时最多删除 100 条已过期至少 10 分钟的记录，不另启清理 Worker。清理后该 ID 按未知处理，不能永久查询历史状态。
+匿名 QR 登录在原微信流程外增加短期会话与轮询，不提供微信绑定入口。Mio 主页面保持打开，支持同源内嵌微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）或同一浏览器的授权窗口完成微信 callback 并接收原 Session Cookie；主页面凭单个 QR 的 Cookie 轮询，确认后调用现有 `/api/v1/me`。`authorization_url` 须由微信官方页面或 `WxLogin` 渲染，不提供独立二维码图片 URL，也不提供无同浏览器 Session Cookie 的跨设备凭据交接。QR 有效期为 5 分钟，Cookie 保留 15 分钟以便观察过期；创建时最多删除 100 条已过期至少 10 分钟的记录，不另启清理 Worker。清理后该 ID 按未知处理，不能永久查询历史状态。
 
-QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
+针对跨站 `WxLogin` iframe 回调省略 `SameSite=Lax` state Cookie 的场景，认证 HTTP 适配器在 `/api/auth/callback/wechat` 提供单跳同源 HTML 桥接（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'` CSP、`Referrer-Policy: no-referrer`、`Cache-Control: no-store` 与 `mio_bridge` 防循环），使第二跳同源携带 state Cookie 进入认证库；QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
 
 ## 职责与限制
 

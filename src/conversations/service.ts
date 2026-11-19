@@ -310,18 +310,32 @@ export function createConversationService(
       }
       return { requested: row.active_request !== null, requestId: row.active_request };
     },
-    async subscribe(actor: Principal, id: string, listener: (event: ConversationEvent) => void) {
+    async subscribe(
+      actor: Principal,
+      id: string,
+      listener: (event: ConversationEvent) => void,
+      signal?: AbortSignal,
+    ) {
       check();
+      signal?.throwIfAborted();
       await store.owned(actor, id);
+      signal?.throwIfAborted();
+      check();
       let group = listeners.get(id);
       if (!group) listeners.set(id, (group = new Set()));
       group.add(listener);
+      let closed = false;
       const close = () => {
+        if (closed) return;
+        closed = true;
         group.delete(listener);
         if (!group.size) listeners.delete(id);
+        signal?.removeEventListener('abort', close);
       };
+      signal?.addEventListener('abort', close, { once: true });
       try {
         const snapshot = await store.snapshot(actor, id);
+        signal?.throwIfAborted();
         check();
         return { snapshot, close };
       } catch (error) {

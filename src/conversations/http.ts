@@ -6,10 +6,10 @@ import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { ConversationError } from './contracts.ts';
 import type { Principal, ConversationEvent, ConversationSnapshot, Receipt } from './contracts.ts';
 import type { ConversationService } from './service.ts';
+import { createSseRegistry } from './sse-registry.ts';
 
 const MAX_BODY = 16 * 1024;
 const MAX_STREAM_BUFFER = 64 * 1024;
-const STREAM_AUTH_BUDGET_MS = 5_000;
 const requestIdPattern = /^[A-Za-z0-9_-]{1,80}$/;
 type Identity = (headers: Headers) => Promise<Principal | null>;
 
@@ -36,6 +36,128 @@ function integer(raw: string | null, fallback: number, min: number, max: number)
   return Number(raw);
 }
 
+/** Install cleanup before authentication or storage can suspend a stream open. */
+async function streamConversation({
+  service,
+  registry,
+  streams,
+  request,
+  response,
+  id,
+  headers,
+  fail,
+}: {
+  service: ConversationService;
+  registry: ReturnType<typeof createSseRegistry>;
+  streams: Set<() => void>;
+  request: IncomingMessage;
+  response: ServerResponse;
+  id: string;
+  headers: Headers;
+  fail: (status: number, code: string) => void;
+}) {
+  const stop = new AbortController();
+  let reservation: ReturnType<typeof registry.reserve> | undefined;
+  let subscription: Awaited<ReturnType<ConversationService['subscribe']>> | undefined;
+  let closed = false;
+  let started = false;
+  let errored = false;
+  let baseline: Receipt | null = null;
+  const queued: { data: string; receipt?: Receipt }[] = [];
+  let queuedBytes = 0;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    stop.abort();
+    subscription?.close();
+    reservation?.release();
+    queued.length = 0;
+    streams.delete(close);
+    response.removeListener('close', close);
+    request.removeListener('aborted', close);
+    if (!response.destroyed && !response.writableEnded) response.end();
+  };
+  const overflow = () => {
+    response.destroy();
+    close();
+  };
+  const sendFrame = (data: string) => {
+    if (closed || response.destroyed || response.writableEnded) return close();
+    response.write(data);
+    if (response.writableLength > MAX_STREAM_BUFFER) overflow();
+  };
+  const write = (event: ConversationEvent | ({ type: 'snapshot' } & ConversationSnapshot)) => {
+    if (closed || response.destroyed || response.writableEnded) return close();
+    if (event.type === 'state' && coveredBySnapshot(baseline, event.receipt)) return;
+    const data = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+    const bytes = Buffer.byteLength(data);
+    if (bytes > MAX_STREAM_BUFFER) return overflow();
+    if (!started) {
+      queuedBytes += bytes;
+      if (queuedBytes > MAX_STREAM_BUFFER) return overflow();
+      queued.push(event.type === 'state' ? { data, receipt: event.receipt } : { data });
+      if (event.type === 'error') errored = true;
+      return;
+    }
+    sendFrame(data);
+    if (event.type === 'error') close();
+  };
+  const authFailure = (code: 'UNAUTHORIZED' | 'AUTH_UNAVAILABLE') => {
+    if (closed) return;
+    try {
+      if (response.headersSent) write({ type: 'error', code });
+      else
+        fail(
+          code === 'UNAUTHORIZED' ? HTTP_STATUS.UNAUTHORIZED : HTTP_STATUS.SERVICE_UNAVAILABLE,
+          code,
+        );
+    } finally {
+      close();
+    }
+  };
+  try {
+    reservation = registry.reserve(headers, authFailure);
+    streams.add(close);
+    response.once('close', close);
+    request.once('aborted', close);
+    if (response.destroyed || request.aborted) return close();
+    const actor = await reservation.identify(stop.signal);
+    if (closed) return;
+    if (!actor) throw new ConversationError(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+    reservation.bind(actor);
+    // Events during snapshot/ownership awaits retain the existing bounded snapshot buffer.
+    const installed = await service.subscribe(actor, id, write, stop.signal);
+    subscription = installed;
+    if (closed || response.destroyed) {
+      installed.close();
+      close();
+      return;
+    }
+    response.writeHead(HTTP_STATUS.OK, {
+      'content-type': 'text/event-stream',
+      'x-accel-buffering': 'no',
+    });
+    response.flushHeaders();
+    started = true;
+    baseline = installed.snapshot.receipt;
+    write({ type: 'snapshot', ...installed.snapshot });
+    for (const { data, receipt } of queued) {
+      if (!receipt || !coveredBySnapshot(baseline, receipt)) sendFrame(data);
+    }
+    queued.length = 0;
+    if (response.destroyed || response.writableEnded || closed || errored) close();
+  } catch (error) {
+    if (!closed && !response.destroyed && !response.writableEnded && !response.headersSent) {
+      const known = error instanceof ConversationError;
+      fail(
+        known ? error.status : HTTP_STATUS.SERVICE_UNAVAILABLE,
+        known ? error.code : 'CONVERSATION_UNAVAILABLE',
+      );
+    }
+    close();
+  }
+}
+
 /** HTTP owns identity rechecks, browser policy and bounded transient stream resources. */
 export function createConversationHandler(
   service: ConversationService,
@@ -44,6 +166,8 @@ export function createConversationHandler(
 ) {
   const allowed = new Set(origins);
   const streams = new Set<() => void>();
+  const registry = createSseRegistry(identity);
+  let stopping = false;
   const handler = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const transportRequestId = startHttpResponse(response);
     const fail = (status: number, code: string) =>
@@ -116,6 +240,19 @@ export function createConversationHandler(
         return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
       const headers = new Headers();
       if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
+      if (action === 'events') {
+        if (stopping) return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNAVAILABLE');
+        return streamConversation({
+          service,
+          registry,
+          streams,
+          request,
+          response,
+          id: id!,
+          headers,
+          fail,
+        });
+      }
       let actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       const value = method !== 'GET' ? await readJsonBody(request, MAX_BODY) : {};
@@ -201,98 +338,6 @@ export function createConversationHandler(
         );
       }
       if (action === 'cancel') return send(HTTP_STATUS.ACCEPTED, await service.cancel(actor, id!));
-      // Subscribe before sending the baseline. Events arriving while authorization/storage await
-      // are buffered within the same bound as the socket and never reinterpreted as durable replay.
-      let started = false;
-      let baseline: Receipt | null = null;
-      const queued: { data: string; receipt?: Receipt }[] = [];
-      let queuedBytes = 0;
-      let errored = false;
-      const resources: {
-        subscription?: Awaited<ReturnType<ConversationService['subscribe']>>;
-        interval?: ReturnType<typeof setInterval>;
-        authDeadline?: ReturnType<typeof setTimeout>;
-      } = {};
-      let closed = false;
-      const close = () => {
-        if (closed) return;
-        closed = true;
-        if (resources.interval) clearInterval(resources.interval);
-        if (resources.authDeadline) clearTimeout(resources.authDeadline);
-        resources.subscription?.close();
-        queued.length = 0;
-        streams.delete(close);
-        response.removeListener('close', close);
-        if (!response.destroyed && !response.writableEnded) response.end();
-      };
-      const overflow = () => {
-        response.destroy();
-        close();
-      };
-      const sendFrame = (data: string) => {
-        if (closed || response.destroyed || response.writableEnded) return close();
-        response.write(data);
-        if (response.writableLength > MAX_STREAM_BUFFER) overflow();
-      };
-      const write = (event: ConversationEvent | ({ type: 'snapshot' } & ConversationSnapshot)) => {
-        if (closed || response.destroyed || response.writableEnded) return close();
-        if (event.type === 'state' && coveredBySnapshot(baseline, event.receipt)) return;
-        const data = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
-        const bytes = Buffer.byteLength(data);
-        if (bytes > MAX_STREAM_BUFFER) return overflow();
-        if (!started) {
-          queuedBytes += bytes;
-          if (queuedBytes > MAX_STREAM_BUFFER) return overflow();
-          queued.push(event.type === 'state' ? { data, receipt: event.receipt } : { data });
-          if (event.type === 'error') errored = true;
-          return;
-        }
-        sendFrame(data);
-        if (event.type === 'error') close();
-      };
-      const subscription = await service.subscribe(actor, id!, write);
-      resources.subscription = subscription;
-      if (response.destroyed) {
-        subscription.close();
-        return;
-      }
-      response.writeHead(HTTP_STATUS.OK, {
-        'content-type': 'text/event-stream',
-        'x-accel-buffering': 'no',
-      });
-      response.flushHeaders();
-      started = true;
-      baseline = subscription.snapshot.receipt;
-      write({ type: 'snapshot', ...subscription.snapshot });
-      for (const { data, receipt } of queued) {
-        if (!receipt || !coveredBySnapshot(baseline, receipt)) sendFrame(data);
-      }
-      queued.length = 0;
-      if (response.destroyed || response.writableEnded || closed || errored) {
-        close();
-        return;
-      }
-      streams.add(close);
-      response.once('close', close);
-      const { userId, sessionId } = actor;
-      const authUnavailable = () => write({ type: 'error', code: 'AUTH_UNAVAILABLE' });
-      const interval = setInterval(() => {
-        if (closed || resources.authDeadline) return;
-        const deadline = setTimeout(authUnavailable, STREAM_AUTH_BUDGET_MS);
-        resources.authDeadline = deadline;
-        deadline.unref();
-        void Promise.resolve()
-          .then(() => identity(headers))
-          .then((current) => {
-            if (closed) return;
-            clearTimeout(deadline);
-            delete resources.authDeadline;
-            if (current?.sessionId !== sessionId || current.userId !== userId)
-              write({ type: 'error', code: 'UNAUTHORIZED' });
-          }, authUnavailable);
-      }, 1000);
-      resources.interval = interval;
-      interval.unref();
     } catch (error) {
       if (response.writableEnded || response.destroyed) return;
       if (response.headersSent) {
@@ -309,6 +354,7 @@ export function createConversationHandler(
   return {
     handler,
     close: () => {
+      stopping = true;
       for (const close of streams) close();
     },
   };

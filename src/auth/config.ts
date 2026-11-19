@@ -7,6 +7,7 @@ import { phonePlugin } from './phone.ts';
 import type { PhoneLimits } from './phone-store.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
+import { AuthPostgresDialect } from './database.ts';
 
 export const AUTH_BASE_PATH = '/api/auth';
 export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
@@ -144,7 +145,7 @@ export function authOptions(config: AuthConfig, pool: Pool, sender?: SmsSender):
     baseURL: config.baseURL,
     basePath: AUTH_BASE_PATH,
     secret: config.secret,
-    database: pool,
+    database: { dialect: new AuthPostgresDialect({ pool }), type: 'postgres', transaction: true },
     trustedOrigins: [...config.origins],
     plugins: [
       phonePlugin(

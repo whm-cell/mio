@@ -7,6 +7,7 @@ import {
   canonicalImageRouteConfig,
   isImageDriver,
   isValidImageAssetObjectKey,
+  imageReferencesWithinBudget,
   validateImageInputByRoute,
   validateImageRouteConfig,
 } from './contracts.ts';
@@ -286,6 +287,8 @@ export function createGenerationAdmission(
             : {}),
       };
       if (!validateImageInputByRoute(input, route)) inputError();
+      if (!imageReferencesWithinBudget(input))
+        throw new GenerationError(HTTP_STATUS.PAYLOAD_TOO_LARGE, 'IMAGE_REFERENCE_LIMIT');
       const async = snapshot.capabilityMetadata.image?.async;
       const command: GenerationRequest = {
         version: 1,

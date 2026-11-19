@@ -35,6 +35,10 @@ pnpm start:dev
 
 第一条只输出迁移计划，第二条才执行。发现库无法自动修复的结构问题（例如额外必填列）时，两种模式均报错，须先审阅并修复目标结构。迁移和运行时复用 `src/auth/config.ts`，普通插件启动只检查结构和连接，不自动建表。目标库需单独备份；升级时的删除、改名、回填应单独审阅，不能假定自动回滚。通用 guard 不连接或修改业务库。
 
+认证配置通过 [AuthPostgresDialect](../src/auth/database.ts) 的公开 `createIntrospector` 扩展提供元数据，直接依赖固定的 Kysely 0.29.8。启动 `getMigrations`、显式迁移和首次运行时 adapter 结构校验共用该入口。表、列和 schema 在 SQL 内限定为连接 `current_schemas(false)` 的有效 search_path，并保留系统 schema 排除；迁移仍以第一个目标 schema 为准，运行时可沿有效路径找到后续 schema 的实际表。序列与列按 OID 依赖关系关联，覆盖 serial／identity，不对无关 schema 执行按名称解析的权限或序列函数，避免其他隔离 schema 并发删除引起探测失败。
+
+探测返回真实列顺序、类型、nullable、default、注释和序列归属，并保留内部迁移表选项、Better Auth 表／列差异、额外无默认必填列检查及启动／迁移的必需索引检查。运行时结构检查不代表持续索引巡检。配置显式保留 `transaction:true`；注册事务、认证池所有者及关闭责任不变，不自动修改目标结构。
+
 本次认证 schema 包括可空且唯一的手机号、验证码挑战、短信预算及账号复合唯一索引；无论是否启用对应供应商，运行与显式迁移检查同一结构。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更。启用供应商但配置不全会拒绝装载；未启用时相应入口返回不可用，不影响邮箱入口。
 
 微信 QR polling 使用同一认证库中的 `mioWechatQR` 模型，包含不透明 ID、唯一且可空的 OAuth state 摘要、QR Cookie 摘要、带索引的状态与过期时间，以及可空的确认用户、确认时间和失败原因码。模型通过 `authOptions` 的插件 schema 进入现有显式迁移与启动检查；即使微信关闭，升级后也须先显式迁移 QR 结构才能启用认证。QR 表不保存 state、Cookie、Session secret 或供应商 token 明文；Better Auth 自身的数据库 OAuth state 仍沿用原策略，不受这条 QR 表存储规则替代。
@@ -86,7 +90,7 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 
 `pnpm test` 包含真实 PostgreSQL 集成，数据库环境选择、隔离和清理要求统一见 [PostgreSQL 验证入口](integrations/postgres.md#验证入口与变更影响)。
 
-`tests/auth/auth.test.ts` 经真实 DSH HTTP 覆盖注册、重复邮箱、错误密码、会话失效/撤销与续期、密码更新、跨账号隔离、重载持久化、HTTPS cookie、来源/请求体/限流、迁移幂等与结构异常、注册事务回滚/并发唯一性、启动失败和启动中卸载；还构建并装载正式打包产物验证认证。原有工具拒绝、HTTP 错误与端口释放测试保留。
+`tests/auth/auth.test.ts` 经真实 DSH HTTP 覆盖注册、重复邮箱、错误密码、会话失效/撤销与续期、密码更新、跨账号隔离、重载持久化、HTTPS cookie、来源/请求体/限流、迁移幂等与结构异常、注册事务回滚/并发唯一性、启动失败和启动中卸载；还构建并装载正式打包产物验证认证。原有工具拒绝、HTTP 错误与端口释放测试保留。`tests/auth/schema-isolation.test.ts` 通过真实隔离 PostgreSQL 覆盖启动与首次运行时元数据 SQL、无关 serial schema 并发建删、多项 search_path、元数据保持、目标表／列／必需索引／额外必填列负例；缺索引检查属于启动与迁移。
 
 测试不等于邮箱所有权、真实浏览器、生产容量或项目业务验收。指定候选的原接受结果见 [所属 PRD 成果入口](tasks/ai-drama-foundation/complete/report.md#auth-registration-foundation)，验证摘要与限制可经[成果读取入口](work-records.md#核对与同步)展开。公共成果不保存详细原件或可恢复代码；资料整理没有重验历史认证专项，也不宣告后续项目或生成能力完成。复用取舍和读取器尚缺的直接验证见[设计](tasks/ai-drama-foundation/design.md#auth-http-reuse)，当前验证方法沿 [验收入口](acceptance.md) 查询。
 

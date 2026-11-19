@@ -86,15 +86,15 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 ## GET /api/v1/conversations/:id/events
 
-身份：当前登录用户与对话 owner。每秒调度原登录会话复核，每次最多等 5 秒。身份或会话变化、会话失效及读取失败或超时时关流。
+身份：当前登录用户与对话 owner。首次鉴权最多等 5 秒；已验证的同一 userId/sessionId 共享每秒调度的 fresh 数据库身份复核，每次最多等 5 秒，不缓存成功身份。身份或会话变化、会话失效会关闭该组全部订阅；错误或超时同样整组关流，不同用户和会话分别复核。
 
-输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。
+输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
 成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
-错误：响应前遵循本域错误体；建流后只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
+错误：响应前遵循本域错误体，限额为 429 `SSE_LIMITED`，初次鉴权错误或超时为 503 `AUTH_UNAVAILABLE`。建流后会话失效或身份变化发 `UNAUTHORIZED`，鉴权错误或超时发 `AUTH_UNAVAILABLE`，随后关闭；其他错误只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
 
-副作用：持有临时 listener 和登录复核 timer；断开清理它们，不隐式取消已受理执行，建流本身不授予模型工具权限。
+副作用：持有有界连接名额、临时 listener 和同会话共享的复核 timer；首次鉴权、归属或快照等待期间断开也立即释放名额及已安装 listener，最后订阅退出清理组 timer 和复核期限，迟到结果不重开流。断开不隐式取消已受理执行，建流本身不授予模型工具权限。
 
 ## POST /api/v1/conversations/:id/cancel
 

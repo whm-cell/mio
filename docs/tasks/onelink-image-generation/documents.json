@@ -15,6 +15,11 @@
       "identity": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md",
       "kind": "change",
       "path": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-image-generation/changes/image-reference-byte-budget/change.md",
+      "kind": "change",
+      "path": "docs/tasks/onelink-image-generation/changes/image-reference-byte-budget/change.md"
     }
   ]
 }

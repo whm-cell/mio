@@ -1,7 +1,7 @@
 import { epochMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
 import type { ProviderService } from '../providers/service.ts';
-import { validateImageInputByRoute } from './contracts.ts';
+import { imageReferencesWithinBudget, validateImageInputByRoute } from './contracts.ts';
 import type { ImageAssetRef } from './contracts.ts';
 import {
   createRoutedImageProtocol,
@@ -127,14 +127,18 @@ export function createGenerationRunner(
     };
   };
   const submit = async (row: GenerationExecution) => {
-    const providers = provider();
-    if (!row.snapshot || !providers || row.command.expiresAt <= epochMs()) {
-      await store.terminal(row, 'rejected', 'IMAGE_CREDENTIAL_UNAVAILABLE');
-      return;
-    }
     const input = row.command.input;
     if (!validateImageInputByRoute(input, row.command.route)) {
       await store.terminal(row, 'rejected', 'IMAGE_INPUT_INVALID');
+      return;
+    }
+    if (!imageReferencesWithinBudget(input)) {
+      await store.terminal(row, 'rejected', 'IMAGE_REFERENCE_LIMIT');
+      return;
+    }
+    const providers = provider();
+    if (!row.snapshot || !providers || row.command.expiresAt <= epochMs()) {
+      await store.terminal(row, 'rejected', 'IMAGE_CREDENTIAL_UNAVAILABLE');
       return;
     }
     const reader = read();

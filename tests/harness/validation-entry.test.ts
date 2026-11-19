@@ -362,3 +362,77 @@ test('captures env', () => {
   expect(tampered.code).not.toBe(0);
   expect(tampered.output).toContain('LOCAL_REGRESSION_TARGET');
 }, 30000);
+
+it('rejects ci-group outside Actions and on missing, unknown or extra arguments', async () => {
+  const root = await fixture();
+  const nonActions = await finish(start(root, ['ci-group', 'harness'], { CI: 'true' }));
+  expect(nonActions.code, nonActions.output).not.toBe(0);
+  expect(nonActions.output).toContain('CHECK_CI_ONLY');
+  expect(await marker(root)).toEqual([]);
+
+  for (const args of [
+    [],
+    ['unknown'],
+    ['harness', 'extra'],
+    ['service', '--include', 'tests/**'],
+    ['--config', 'vitest.config.ts'],
+  ]) {
+    const result = await finish(start(root, ['ci-group', ...args], { GITHUB_ACTIONS: 'true' }));
+    expect(result.code, `${args.join(' ')}: ${result.output}`).not.toBe(0);
+    expect(result.output).toContain('CI_GROUP');
+    expect(await marker(root)).toEqual([]);
+  }
+}, 20000);
+
+it('partitions all discovered tests disjointly and completely across ci-group harness and service', async () => {
+  const root = await fixture();
+  const body = (name: string) =>
+    `import { appendFileSync } from 'node:fs';\nimport { test } from 'vitest';\ntest('${name}', () => appendFileSync(process.env.MARKER, '${name}\\n'));\n`;
+  await Promise.all(
+    ['tests/harness', 'tests/environment', 'tests/new-domain'].map((dir) =>
+      mkdir(join(root, dir), { recursive: true }),
+    ),
+  );
+  await Promise.all(
+    [
+      ['tests/harness/guard.test.ts', body('harness-guard')],
+      ['tests/environment/env.test.ts', body('env-check')],
+      ['tests/new-domain/future.test.ts', body('new-domain')],
+    ].map(([path, content]) => writeFile(join(root, path!), content!)),
+  );
+
+  const harnessRun = await finish(start(root, ['ci-group', 'harness'], { GITHUB_ACTIONS: 'true' }));
+  expect(harnessRun.code, harnessRun.output).toBe(0);
+  const harnessMarkers = await marker(root);
+  expect(harnessMarkers).toEqual(['env-check', 'harness-guard']);
+  expect(harnessRun.output).toContain('{"group":"harness","selected":2,"complement":5,"total":7}');
+  await rm(join(root, 'marker'));
+
+  const serviceRun = await finish(start(root, ['ci-group', 'service'], { GITHUB_ACTIONS: 'true' }));
+  expect(serviceRun.code, serviceRun.output).toBe(0);
+  const serviceMarkers = await marker(root);
+  expect(serviceMarkers).toEqual(['extra', 'main', 'new-domain', 'prefix', 'worker']);
+  expect(serviceRun.output).toContain('{"group":"service","selected":5,"complement":2,"total":7}');
+
+  // Disjoint union equals exact complete cover of every discovered test across tests/ and compute/tests/.
+  const overlap = harnessMarkers.filter((name) => serviceMarkers.includes(name));
+  expect(overlap).toEqual([]);
+  expect([...harnessMarkers, ...serviceMarkers].sort()).toEqual([
+    'env-check',
+    'extra',
+    'harness-guard',
+    'main',
+    'new-domain',
+    'prefix',
+    'worker',
+  ]);
+  await rm(join(root, 'marker'));
+
+  // A failing test in the selected group propagates a non-zero exit code.
+  await writeFile(
+    join(root, 'tests/new-domain/failing.test.ts'),
+    "import { expect, test } from 'vitest'; test('fails', () => expect(1).toBe(2));\n",
+  );
+  const failed = await finish(start(root, ['ci-group', 'service'], { GITHUB_ACTIONS: 'true' }));
+  expect(failed.code, failed.output).not.toBe(0);
+}, 30000);

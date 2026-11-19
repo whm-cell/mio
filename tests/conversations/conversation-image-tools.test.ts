@@ -5,7 +5,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { cp, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,7 @@ import {
   importRoutesViaCli,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { unpackPluginPackage } from '../support/auth-runtime.ts';
 
 interface CosEntry {
   bytes: Buffer;
@@ -1221,28 +1222,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
 
     // Build and pack official Profile with temporary child-Profile overlay
     const profileDir = await mkdtemp(join(tmpdir(), 'mio-conv-img-profile-'));
-    const stageDir = join(profileDir, 'stage');
-    await mkdir(stageDir);
-    for (const item of ['package.json', 'cordis.patch.yml', 'README.md', 'AGENTS.md', 'docs']) {
-      await cp(resolve(item), join(stageDir, item), { recursive: true });
-    }
-    const execChecked = (bin: string, args: string[]) => {
-      const res = spawnSync(bin, args, { encoding: 'utf8', timeout: 60_000 });
-      assert.equal(res.status, 0, `${res.stdout}${res.stderr}`);
-    };
-    execChecked(process.execPath, [
-      'node_modules/typescript/bin/tsc',
-      '-p',
-      'tsconfig.build.json',
-      '--outDir',
-      join(stageDir, 'dist'),
-    ]);
-    execChecked('npm', ['pack', stageDir, '--ignore-scripts', '--pack-destination', profileDir]);
-    const [tgz] = (await readdir(profileDir)).filter((name) => name.endsWith('.tgz'));
-    assert(tgz);
-    execChecked('tar', ['-xzf', join(profileDir, tgz), '-C', profileDir]);
-    const packedDir = join(profileDir, 'package');
-    await symlink(resolve('node_modules'), join(packedDir, 'node_modules'), 'dir');
+    const packedDir = await unpackPluginPackage(profileDir);
     const dshHome = join(profileDir, 'home');
     await prepareProfile(dshHome, packedDir);
 

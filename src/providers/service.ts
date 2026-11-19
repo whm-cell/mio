@@ -42,7 +42,7 @@ export function createProviderService(
   };
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
-    const row = await store.state(actor.userId);
+    const row = await store.state(actor.userId, false);
     assertOpen();
     if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const preference = row.preferences.find((pref) => pref.usage === 'chat' && pref.is_default);
@@ -110,7 +110,7 @@ export function createProviderService(
   };
   const imageState = async (actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) => {
     assertOpen();
-    const row = await store.state(actor.userId);
+    const row = await store.state(actor.userId, false);
     assertOpen();
     if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const model = findModel(row.models, modelRef);

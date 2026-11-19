@@ -494,6 +494,7 @@ export class GenerationStore {
   }
 
   async close(): Promise<void> {
+    const errors: unknown[] = [];
     if (this.executor) {
       if (this.executorFailure) this.executor.off('error', this.executorFailure);
       const client = this.executor;
@@ -502,11 +503,22 @@ export class GenerationStore {
         await client.query('SELECT pg_advisory_unlock(hashtext(current_schema()),$1)', [
           EXECUTOR_LOCK,
         ]);
-      } finally {
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
         client.release();
+      } catch (error) {
+        errors.push(error);
       }
     }
-    await this.pool.end();
+    try {
+      await this.pool.end();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, 'GENERATION_CLOSE_FAILED');
   }
 }
 

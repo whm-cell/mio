@@ -16,6 +16,8 @@ import {
 } from '../../src/integrations/onelink/router.ts';
 import { createRoutedKlingImageProtocol } from '../../src/integrations/onelink/kling/index.ts';
 import { createRoutedViduImageProtocol } from '../../src/integrations/onelink/vidu/index.ts';
+import { validateModelRouteEntry } from '../../src/providers/onelink/router.ts';
+import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';
 
 type ImageDownload = typeof withPublicHttps;
 
@@ -182,6 +184,82 @@ function testKling(transport: typeof fetch) {
 }
 
 describe('Routed vendor image protocols', () => {
+  it('rejects excess Vidu creations before downloading and preserves all requested results and task identity', async () => {
+    const route = {
+      ...VIDU_ROUTE,
+      paramSpec: { ...VIDU_ROUTE.paramSpec, maxN: 2, allowExplicitN: true },
+    };
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        id: 'original-task',
+        state: 'success',
+        creations: [
+          { url: 'https://image01.vidu.zone/first.jpg' },
+          { url: 'https://image01.vidu.zone/second.jpg' },
+        ],
+      }),
+    );
+    const downloads: string[] = [];
+    const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
+    const download: ImageDownload = async (url, _signal, consume) => {
+      downloads.push(String(url));
+      return consume(new Response(bytes));
+    };
+    const driver = createRoutedViduImageProtocol(route, transport, undefined, download);
+    const protocol = createRoutedImageProtocol(route, 'generate', transport, undefined, driver);
+    const request = { model: 'image-vidu-q2', prompt: 'two images', async: true, n: 1 };
+    expect(await protocol.queryAsync(request, key, 'original-task', 1)).toEqual({
+      state: 'unknown',
+      code: 'IMAGE_QUERY_UNKNOWN',
+    });
+    expect(downloads).toEqual([]);
+    transport.mockResolvedValueOnce(
+      Response.json({
+        id: 'original-task',
+        state: 'success',
+        creations: [
+          { url: 'https://image01.vidu.zone/first.jpg' },
+          { url: 'https://image01.vidu.zone/second.jpg' },
+        ],
+      }),
+    );
+    expect(await protocol.queryAsync({ ...request, n: 2 }, key, 'original-task', 2)).toEqual({
+      state: 'returned',
+      upstreamTaskId: 'original-task',
+      images: Array.from({ length: 2 }, () => ({
+        base64: Buffer.from(bytes).toString('base64'),
+        format: 'jpeg',
+      })),
+    });
+    expect(downloads).toEqual([
+      'https://image01.vidu.zone/first.jpg',
+      'https://image01.vidu.zone/second.jpg',
+    ]);
+    expect(transport.mock.calls.map(([url]) => String(url))).toEqual(
+      Array(2).fill('https://api.onelinkai.cloud/vidu/ent/v2/tasks/original-task/creations'),
+    );
+  });
+
+  it.each([
+    [VIDU_ROUTE, 'image-vidu-q2'],
+    [KLING_MINIMAL_ROUTE, 'image-kling-v3'],
+  ] as const)('rejects unusable %s task templates before import or submission', (route, model) => {
+    const transport = vi.fn<typeof fetch>();
+    const queryPathTemplate = route.queryPathTemplate + '/{task_id}';
+    const invalid = { ...route, queryPathTemplate };
+    expect(validateImageRouteConfig(invalid)).toBe(false);
+    expect(() =>
+      validateModelRouteEntry({
+        ...findFixtureRoute(model, 'image.generate'),
+        queryPathTemplate,
+      }),
+    ).toThrow();
+    expect(() => createRoutedImageProtocol(invalid, 'generate', transport)).toThrow(
+      'IMAGE_PROTOCOL_UNSUPPORTED',
+    );
+    expect(transport).not.toHaveBeenCalled();
+  });
+
   it('builds the documented Vidu async request and preserves downloaded output format', async () => {
     const bytes = Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]);
     const ref = {

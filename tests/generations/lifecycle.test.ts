@@ -301,6 +301,54 @@ it('retries a failed conditional read before submitting verified image and mask 
   }
 }, 15000);
 
+it('retains an old submitted task identity and unusable frozen template without regenerating across restart', async () => {
+  const f = await generationFixture();
+  try {
+    const job = await f.admit(randomUUID(), 'previously submitted', { async: true }, true);
+    const row = (await f.store.claim())!;
+    expect(await f.store.submitting(row)).toBe(true);
+    await f.store.submitted(row, 'original-upstream-task');
+    const template = row.command.route.queryPathTemplate + '/{task_id}';
+    await f.pool.query(
+      `UPDATE mio_image_jobs SET
+      command=jsonb_set(command,'{route,queryPathTemplate}',to_jsonb($2::text)),
+      route_snapshot=jsonb_set(route_snapshot,'{queryPathTemplate}',to_jsonb($2::text)),
+      async_max_queries=2,next_query_at=now() WHERE id=$1`,
+      [job.jobId, template],
+    );
+    await f.start();
+    await vi.waitFor(
+      async () =>
+        expect((await f.service.getImage(f.actor, job.jobId)).errorCode).toBe('IMAGE_QUERY_LIMIT'),
+      { timeout: 6000 },
+    );
+    await f.stop();
+    await f.start();
+    expect(f.transport).not.toHaveBeenCalled();
+    expect(f.asyncTransport.submit).not.toHaveBeenCalled();
+    expect(f.asyncTransport.query).not.toHaveBeenCalled();
+    expect(
+      (
+        await f.pool.query(
+          `SELECT upstream_task_id,
+      command#>>'{route,queryPathTemplate}' AS command_template,
+      route_snapshot->>'queryPathTemplate' AS snapshot_template
+      FROM mio_image_jobs WHERE id=$1`,
+          [job.jobId],
+        )
+      ).rows,
+    ).toEqual([
+      {
+        upstream_task_id: 'original-upstream-task',
+        command_template: template,
+        snapshot_template: template,
+      },
+    ]);
+  } finally {
+    await f.close();
+  }
+}, 15000);
+
 it('keeps an uncertain submission unknown across restarts and refuses a generation replay', async () => {
   const f = await generationFixture();
   try {

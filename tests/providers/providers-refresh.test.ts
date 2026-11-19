@@ -73,6 +73,53 @@ async function fixture(transport: ModelTransport) {
   return { config, store, service, actor, declare, choose };
 }
 
+it('omits verification aggregation only for fresh runtime snapshots and retains catalog observations', async () => {
+  const f = await fixture(async () => metadata(['runtime-chat', 'image-vidu-q2']));
+  await f.service.discover(f.actor);
+  const catalog = (await f.service.catalog(f.actor)).items;
+  const chatRef = catalog.find((item) => item.modelId === 'runtime-chat')!.modelRef;
+  const imageRef = catalog.find((item) => item.modelId === 'image-vidu-q2')!.modelRef;
+  await f.declare(chatRef);
+  await f.store.importRoutes([findFixtureRoute('image-vidu-q2', 'image.generate')]);
+  const states = vi.spyOn(f.store, 'state');
+  const queries = vi.spyOn(Pool.prototype, 'query');
+  try {
+    const selected = await f.service.selectChat(f.actor, chatRef);
+    const chat = await f.service.resolveChat(f.actor, selected);
+    expect((await f.service.resolveImage(f.actor, imageRef)).modelId).toBe('image-vidu-q2');
+    expect(states.mock.calls).toEqual(Array.from({ length: 3 }, () => [f.actor.userId, false]));
+    for (const result of states.mock.results)
+      expect(await result.value).not.toHaveProperty('verifications');
+    expect(queries).toHaveBeenCalledTimes(3);
+    for (const [sql, args] of queries.mock.calls) {
+      expect(sql).toContain('c.owner_id=$1');
+      expect(sql).not.toContain('mio_provider_model_verifications');
+      expect(args).toEqual([f.actor.userId]);
+    }
+    await f.store.recordVerification(f.actor.userId, chat, 'fixture:runtime-projection');
+    expect(
+      (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === chatRef)!
+        .adaptation!.verification.status,
+    ).toBe('verified');
+    expect(await states.mock.results.at(-1)!.value).toHaveProperty(
+      'verifications',
+      expect.any(Array),
+    );
+    await f.service.save(f.actor, (await f.service.get(f.actor))!.revision, 'rotated-runtime-key');
+    await expect(f.service.resolveChat(f.actor, selected)).rejects.toThrow(
+      'MODEL_CATALOG_NOT_DISCOVERED',
+    );
+    await f.service.discover(f.actor);
+    expect(await f.service.resolveChat(f.actor, selected)).toMatchObject({
+      credentialVersion: 2,
+      apiKey: 'rotated-runtime-key',
+    });
+  } finally {
+    queries.mockRestore();
+    states.mockRestore();
+  }
+});
+
 it('discovers new exact identities without a release, keeps unknown metadata pending and freezes current versions', async () => {
   let ids = ['Future-Q', 'future-Q', 'claude-does-not-prove-protocol', 'vendor:route-K'];
   const f = await fixture(async () => metadata(ids));

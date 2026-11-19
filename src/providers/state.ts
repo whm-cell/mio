@@ -35,7 +35,7 @@ export interface ProviderState extends ProviderRow {
   routes?: PlatformRouteRecord[];
   verifications?: VerificationRecord[];
 }
-export const providerStateSQL = `SELECT c.*,
+export const providerStateSQL = (includeVerifications = true) => `SELECT c.*,
   COALESCE((SELECT jsonb_agg(m ORDER BY m.raw_model_id COLLATE "C",m.model_key)
     FROM mio_provider_models m WHERE m.provider_id=c.id),'[]') AS models,
   COALESCE((SELECT jsonb_agg(p) FROM mio_provider_model_preferences p WHERE p.provider_id=c.id),'[]') AS preferences,
@@ -45,8 +45,12 @@ export const providerStateSQL = `SELECT c.*,
       AND EXISTS (
         SELECT 1 FROM mio_provider_models m
         WHERE m.provider_id=c.id AND m.raw_model_id=r.raw_model_id COLLATE "C"
-      )),'[]') AS routes,
-  COALESCE((SELECT jsonb_agg(v) FROM mio_provider_model_verifications v WHERE v.provider_id=c.id),'[]') AS verifications
+      )),'[]') AS routes${
+        includeVerifications
+          ? `,
+  COALESCE((SELECT jsonb_agg(v) FROM mio_provider_model_verifications v WHERE v.provider_id=c.id),'[]') AS verifications`
+          : ''
+      }
   FROM mio_provider_configs c WHERE c.owner_id=$1`;
 
 export function providerView(row: ProviderRow): ProviderView {

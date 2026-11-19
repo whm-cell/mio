@@ -87,6 +87,7 @@ export async function checkSource(root: string, files: readonly string[], harnes
   }
   const membership = new Map<ts.ParsedCommandLine, Set<string>>();
   const targetOwners = new Map<string, ReturnType<typeof projectForTarget>>();
+  const packageOwners = new Map<string, ReturnType<typeof owningPackageName>>();
   const includes = (config: ts.ParsedCommandLine, file: string) => {
     let set = membership.get(config);
     if (!set) {
@@ -289,7 +290,12 @@ export async function checkSource(root: string, files: readonly string[], harnes
       ) {
         errors.push(`PUBLIC_IMPORT ${file}: ${specifier}`);
       }
-      const packageName = resolved && (await owningPackageName(resolved.resolvedFileName));
+      let packageOwner = resolved && packageOwners.get(resolved.resolvedFileName);
+      if (resolved && !packageOwner) {
+        packageOwner = owningPackageName(resolved.resolvedFileName);
+        packageOwners.set(resolved.resolvedFileName, packageOwner);
+      }
+      const packageName = await packageOwner;
       const ownerKey =
         resolved &&
         JSON.stringify([resolved.resolvedFileName, resolved.packageId?.name, packageName]);

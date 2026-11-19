@@ -10,6 +10,17 @@
 
 PostgreSQL 复用 `mio_regression_test` 随机 schema（既有卷首次执行 `pnpm env:init && pnpm regression:init:dev`）。Redis 常规限流回归复用 `~mio:regtest-*:*` 前缀账号并自动清理，全局 OOM／停机故障用例自动识别 `.runtime/redis-build` 临时进程。RabbitMQ 集成测试自动创建并清理临时 vhost。完整 `pnpm check` 由 GitHub Actions 执行。
 
+本地连续验证多个打包 Profile 时，可沿现有 `MIO_TEST_PACKED_ARCHIVE` 约定对当前候选只构建、打包一次，再为本批显式选定的测试提供绝对路径：
+
+```sh
+pnpm build
+mkdir -p .work/packed-test
+npm pack --ignore-scripts --pack-destination .work/packed-test
+MIO_TEST_PACKED_ARCHIVE="$PWD/.work/packed-test/mio-plugin-0.1.0.tgz" pnpm test tests/auth tests/providers
+```
+
+源码或构建输入改变后重新生成本批 archive；不把旧包当缓存。每次 Profile 仍独立解压，使用各自 HOME、schema 和端口；显式 archive 不可读、损坏或缺插件产物时失败，不退回重建。auth smoke 将同一 archive 显式传给 `smoke.ts --archive <path>` 并保留认证断言。未提供 archive 的独立测试继续使用原有按次构建 fallback；默认 `pnpm test:smoke` 始终打包当前根构建，保留 CI 最后的干净构建与 smoke。
+
 本地可运行 `pnpm check:static:base`，依次执行格式、类型、lint 和护栏；`pnpm check:static` 运行这四项后再构建，均不运行测试或插件装载 smoke。完整 `pnpm check` 先验证 GitHub Actions 环境，再依次运行相同的四项静态检查、全部测试、完整构建和 `test:smoke`，使最终 smoke 使用测试后的构建产物；静态通过不能替代测试、完整覆盖或业务验收结论。
 
 现有 [CI 工作流](../../.github/workflows/check.yml)在 `main` 分支 `push` 与 `pull_request` 时自动触发，并保留 `workflow_dispatch` 手动全量运行；同一 PR 的并发组仅取消被新提交取代的在途 `pull_request` 运行。所有 Job 均固定在 `ubuntu-24.04`（不使用 `ubuntu-latest`，不运行 `apt-get`），按 `scope` → 并行 `harness`／`service`（`VITEST_MAX_WORKERS=4`）→ `check` 聚合门禁执行，并保持对外必需状态名 `check` 不变。选择器 `ci-scope.ts` 在 `scope`（5 分钟超时）中保留通用的 `push`／`pull_request` 判定逻辑，比较本次 push 的 before→SHA，或本次 PR 合并候选的第一父节点→合并结果，保留重命名两端；缺失或不匹配的比较信息退回全量。工作流仅在全部差异属于 `scripts/harness/**/*.ts`、`tests/harness/**/*.ts` 或 `docs/coordination.md`、`docs/work-records.md`、本页时输出 `mode=harness` 并跳过 `service`；测试入口 `validation-entry.ts`、CI 选择脚本自身、业务／共享代码、依赖、配置、混合或未知改动以及 `main`／默认分支和手动运行始终全量运行 `harness` 与 `service`。

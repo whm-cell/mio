@@ -96,9 +96,12 @@ export class ProviderStore {
     const row = await this.current(owner);
     return row ? providerView(row) : null;
   }
-  /** One MVCC statement: credentials, membership, routes, verifications and preferences agree. */
-  async state(owner: string): Promise<ProviderState | null> {
-    return (await this.pool.query<ProviderState>(providerStateSQL, [owner])).rows[0] ?? null;
+  /** One MVCC statement; runtime consumers omit only catalog verification observations. */
+  async state(owner: string, includeVerifications = true): Promise<ProviderState | null> {
+    return (
+      (await this.pool.query<ProviderState>(providerStateSQL(includeVerifications), [owner]))
+        .rows[0] ?? null
+    );
   }
   async save(owner: string, expected: number, apiKey: string): Promise<ProviderView> {
     return this.transaction(async (client) => {
@@ -183,7 +186,7 @@ export class ProviderStore {
   ): Promise<ProviderView> {
     return this.transaction(async (client) => {
       const row = await this.locked(client, owner, expected);
-      const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0]!;
+      const state = (await client.query<ProviderState>(providerStateSQL(), [owner])).rows[0]!;
       const model = findModel(state.models, modelRef);
       if ('enabled' in patch || 'isDefault' in patch) {
         const reason = membershipError(row, model);
@@ -409,7 +412,7 @@ export class ProviderStore {
         row.catalog_version === snapshot.catalogVersion;
       // Late completion remains in its request observation and cannot overwrite a newer tuple's verification.
       if (!current) return;
-      const state = (await client.query<ProviderState>(providerStateSQL, [owner])).rows[0];
+      const state = (await client.query<ProviderState>(providerStateSQL(), [owner])).rows[0];
       const model = state?.models.find((item) => item.model_key === snapshot.modelKey);
       if (!state || !model) return;
       const effective =

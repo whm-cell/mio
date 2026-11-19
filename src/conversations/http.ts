@@ -292,7 +292,8 @@ export function createConversationHandler(
       }
       if (base) {
         const after = url.searchParams.get('after') ?? undefined;
-        if (after && !isUuidV4(after)) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
+        if (after !== undefined && !isUuidV4(after))
+          return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
         return send(
           HTTP_STATUS.OK,
           await service.list(actor, after, integer(url.searchParams.get('limit'), 20, 1, 100)),

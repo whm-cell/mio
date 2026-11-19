@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { access, mkdir, mkdtemp, readdir, rm, symlink } from 'node:fs/promises';
@@ -11,10 +11,36 @@ import { launcher, prepareProfile } from './profile.ts';
 
 const project = resolve('.');
 const scratch = await mkdtemp(join(tmpdir(), 'mio-packed-'));
+const stop = new AbortController();
+const interrupt = () => stop.abort(new Error('SMOKE_CANCELLED: SIGINT'));
+const terminate = () => stop.abort(new Error('SMOKE_CANCELLED: SIGTERM'));
+process.on('SIGINT', interrupt);
+process.on('SIGTERM', terminate);
+const deadline = setTimeout(() => stop.abort(new Error('SMOKE_TIMEOUT')), 20_000);
+deadline.unref();
 
-function command(bin: string, args: string[]): void {
-  const result = spawnSync(bin, args, { cwd: project, encoding: 'utf8', timeout: 60000 });
-  assert.equal(result.status, 0, `${bin}: ${result.stderr}\n${result.stdout}`);
+async function command(bin: string, args: string[]): Promise<void> {
+  stop.signal.throwIfAborted();
+  const child = spawn(bin, args, {
+    cwd: project,
+    signal: stop.signal,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk: Buffer) => {
+    output = (output + chunk).slice(-12000);
+  });
+  child.stderr.on('data', (chunk: Buffer) => {
+    output = (output + chunk).slice(-12000);
+  });
+  let failure: Error | undefined;
+  child.once('error', (error) => {
+    failure = error;
+  });
+  const code = await new Promise<number | null>((resolve) => child.once('close', resolve));
+  stop.signal.throwIfAborted();
+  if (failure) throw failure;
+  assert.equal(code, 0, `${bin}: ${output}`);
 }
 
 async function freePort(): Promise<number> {
@@ -31,11 +57,21 @@ async function freePort(): Promise<number> {
 }
 
 try {
-  command('npm', ['pack', '--ignore-scripts', '--pack-destination', scratch]);
-  const archives = (await readdir(scratch)).filter((name) => name.endsWith('.tgz'));
-  assert.equal(archives.length, 1);
-  command('tar', ['-xzf', join(scratch, archives[0]!), '-C', scratch]);
+  const args = process.argv.slice(2);
+  assert(
+    args.length === 0 || (args.length === 2 && args[0] === '--archive' && args[1]),
+    'SMOKE_ARGUMENTS',
+  );
+  let archive = args[1] && resolve(args[1]);
+  if (!archive) {
+    await command('npm', ['pack', '--ignore-scripts', '--pack-destination', scratch]);
+    const archives = (await readdir(scratch)).filter((name) => name.endsWith('.tgz'));
+    assert.equal(archives.length, 1);
+    archive = join(scratch, archives[0]!);
+  }
+  await command('tar', ['-xzf', archive, '-C', scratch]);
   const packed = join(scratch, 'package');
+  await access(join(packed, 'dist/plugin.js'));
   await assert.rejects(access(join(packed, 'src')));
   await assert.rejects(access(join(packed, '.work')));
   await assert.rejects(access(join(packed, 'tests')));
@@ -66,6 +102,7 @@ try {
         }
       : {}),
   };
+  stop.signal.throwIfAborted();
   const child = spawn(process.execPath, [launcher(), '--profile', 'mio'], {
     cwd: runDir,
     env: environment,
@@ -85,7 +122,9 @@ try {
       if (child.exitCode !== null || child.signalCode !== null)
         throw new Error(`DSH exited early: ${output}`);
       try {
-        const response = await fetch(`${origin}/readyz`, { signal: AbortSignal.timeout(500) });
+        const response = await fetch(`${origin}/readyz`, {
+          signal: AbortSignal.any([stop.signal, AbortSignal.timeout(500)]),
+        });
         if (response.ok) {
           ready = true;
           break;
@@ -93,10 +132,15 @@ try {
       } catch {
         /* The listener may still be starting. */
       }
-      await delay(100);
+      await delay(100, undefined, { signal: stop.signal });
     }
     assert(ready, `Plugin did not become ready: ${output}`);
-    const response = await fetch(`${origin}/api/v1/capabilities`, {
+    const request = (path: string, init?: RequestInit) =>
+      fetch(`${origin}${path}`, {
+        ...init,
+        signal: AbortSignal.any([stop.signal, AbortSignal.timeout(3000)]),
+      });
+    const response = await request('/api/v1/capabilities', {
       headers: { authorization: `Bearer ${token}` },
     });
     assert.equal(response.status, 200);
@@ -106,9 +150,9 @@ try {
       tools: [],
       sessions: false,
     });
-    assert.equal((await fetch(`${origin}/api/v1/capabilities`)).status, 401);
+    assert.equal((await request('/api/v1/capabilities')).status, 401);
     if (process.env.MIO_SMOKE_AUTH_DATABASE_URL) {
-      const signup = await fetch(`${origin}/api/auth/sign-up/email`, {
+      const signup = await request('/api/auth/sign-up/email', {
         method: 'POST',
         headers: { origin, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -122,22 +166,20 @@ try {
         .getSetCookie()
         .map((value) => value.split(';')[0])
         .join('; ');
-      const me = await fetch(`${origin}/api/v1/me`, { headers: { origin, cookie } });
+      const me = await request('/api/v1/me', { headers: { origin, cookie } });
       assert.equal(me.status, 200);
-      const signout = await fetch(`${origin}/api/auth/sign-out`, {
+      const signout = await request('/api/auth/sign-out', {
         method: 'POST',
         headers: { origin, cookie, 'content-type': 'application/json' },
         body: '{}',
       });
       assert.equal(signout.status, 200);
-      assert.equal(
-        (await fetch(`${origin}/api/v1/me`, { headers: { origin, cookie } })).status,
-        401,
-      );
+      assert.equal((await request('/api/v1/me', { headers: { origin, cookie } })).status, 401);
       console.log('PASS: authentication registration, identity and logout from packed plugin.');
     }
     child.kill('SIGTERM');
-    const stopped = await Promise.race([exit.then(() => true), delay(5000).then(() => false)]);
+    const stopped = await Promise.race([exit.then(() => true), delay(5000, false, { ref: false })]);
+    stop.signal.throwIfAborted();
     assert(stopped, `DSH did not stop gracefully: ${output}`);
     const probe = createServer();
     probe.listen(port, '127.0.0.1');
@@ -153,10 +195,18 @@ try {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGKILL');
+      child.kill('SIGTERM');
+      const stopped = await Promise.race([
+        exit.then(() => true),
+        delay(5000, false, { ref: false }),
+      ]);
+      if (!stopped) child.kill('SIGKILL');
       await exit;
     }
   }
 } finally {
+  clearTimeout(deadline);
+  process.off('SIGINT', interrupt);
+  process.off('SIGTERM', terminate);
   await rm(scratch, { recursive: true, force: true });
 }

@@ -146,15 +146,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         },
       });
       signal.throwIfAborted();
-      const checked = await cos.headObject({ Bucket, Region, Key });
-      if (
-        !uploaded.ETag ||
-        checked.ETag !== uploaded.ETag ||
-        Number(checked.headers?.['content-length']) !== body.length ||
-        checked.headers?.['x-cos-meta-sha256'] !== sha256
-      )
-        throw new Error('IMAGE_OUTPUT_MISMATCH');
-      signal.throwIfAborted();
+      if (!uploaded.ETag) throw new Error('IMAGE_OUTPUT_MISMATCH');
       return {
         key: Key,
         sizeBytes: body.length,

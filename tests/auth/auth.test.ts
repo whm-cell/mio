@@ -477,17 +477,24 @@ it('preserves another account session on revocation and issues Secure cookies fo
 });
 
 it('loads the packed authentication plugin through an official isolated Profile', () => {
-  const build = spawnSync(
+  const archive = process.env.MIO_TEST_PACKED_ARCHIVE?.trim();
+  if (!archive) {
+    const build = spawnSync(
+      process.execPath,
+      ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.build.json'],
+      { encoding: 'utf8', timeout: 30000 },
+    );
+    expect(build.status, build.stderr).toBe(0);
+  }
+  const smoke = spawnSync(
     process.execPath,
-    ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.build.json'],
-    { encoding: 'utf8', timeout: 30000 },
+    ['scripts/service/smoke.ts', ...(archive ? ['--archive', archive] : [])],
+    {
+      env: { ...process.env, MIO_SMOKE_AUTH_DATABASE_URL: database.url },
+      encoding: 'utf8',
+      timeout: 30000,
+    },
   );
-  expect(build.status, build.stderr).toBe(0);
-  const smoke = spawnSync(process.execPath, ['scripts/service/smoke.ts'], {
-    env: { ...process.env, MIO_SMOKE_AUTH_DATABASE_URL: database.url },
-    encoding: 'utf8',
-    timeout: 30000,
-  });
   expect(smoke.status, smoke.stdout + smoke.stderr).toBe(0);
   expect(smoke.stdout).toContain('authentication registration, identity and logout');
 }, 45000);

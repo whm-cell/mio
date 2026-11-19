@@ -226,7 +226,7 @@ export function isValidImageRoutePath(
   if (!routePathPattern.test(path) || path.includes('..') || path.includes('//')) return false;
   if (!path.startsWith(IMAGE_DRIVER_PATH_PREFIX[driver])) return false;
   if (!template) return !path.includes('{') && !path.includes('}');
-  if (!path.includes('{task_id}')) return false;
+  if (path.split('{task_id}').length !== 2) return false;
   const stripped = path.replaceAll('{task_id}', 'task');
   return !stripped.includes('{') && !stripped.includes('}');
 }

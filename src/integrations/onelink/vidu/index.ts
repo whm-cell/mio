@@ -85,7 +85,7 @@ export function createRoutedViduImageProtocol(
         };
       }
     },
-    async query(_input, apiKey, upstreamTaskId, _queryAttempt, signal) {
+    async query(input, apiKey, upstreamTaskId, _queryAttempt, signal) {
       const endpoint = substituteTaskId(route.queryPathTemplate, upstreamTaskId, 'vidu-images');
       if (!endpoint) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
       try {
@@ -115,7 +115,8 @@ export function createRoutedViduImageProtocol(
           parsed.malformed ||
           state !== 'success' ||
           !Array.isArray(payload?.creations) ||
-          !payload.creations.length
+          !payload.creations.length ||
+          payload.creations.length > (input.n ?? 1)
         )
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
         const images: { base64: string; format: 'png' | 'jpeg' | 'webp' }[] = [];

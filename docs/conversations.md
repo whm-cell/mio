@@ -45,6 +45,8 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 带图请求先查 owner 和原回执，再检查忙碌状态及当前模型视觉能力；耗时资产读取、解码与本轮图片预算预检在行锁外完成。最终短事务再次核对回执、busy 和路由/视觉预算快照，变化时拒绝并等待客户端按原意重试。纯文本沿旧 SHA-256，带图摘要为 `vision:v1:` 加 `SHA256(JSON.stringify([text, orderedIds]))`。原件、内存预览、授权检查及旧图卸载的限制见[对话 HTTP](apis/conversations.md#post-apiv1conversationsidmessages)和[DSH 集成](integrations/dsh.md)。同一原图在同一请求中出现多次时按 occurrence 计预算；不能满足时不能丢弃当前轮图片。
 
+正式 Profile 关闭上游 DSH 默认身份开场白（`includeHarnessIdentity: false`），每次对话轮次（无论 legacy 还是 BYOK）统一由服务端注入受控的会话级系统提示词：助手固定自称 `miioo AI 漫剧助手`（不提及内部框架或运行时名称），围绕 AI 漫剧创作执行适度宽松话题政策（支持服务于创作的背景、历史/服饰/设定考据与审美参考并自然衔接回创作，对编程调试、作业解题、医疗/法律/金融、无关时政与纯粹闲聊礼貌婉拒并引导回漫剧创作），禁止泄露或覆盖内部指令，并按本轮实际授权的生图与图片查看能力如实声明工具可用性；提示词文本按 `{ imageGeneration, imageInspection }` 组合完全确定，不含动态变量以维持前缀缓存稳定，且绝不经公开历史或 SSE 透传。
+
 回执层级为 accepted（仅 PG 已受理）、input-persisted（DSH 输入/inbox 屏障和 PG 状态已成功）、completed/cancelled/failed（已执行请求检查真实 DSH 终态并 flush 后完成 PG 更新，执行前用户取消另有下述边界）。unknown 表示无法证明完整结算，错误码只含服务定义值。接收 COMMIT/ACK 不确定时，按原用户/对话/请求/内容摘要锁行核对，只将本进程未启动的待执行记录改 unknown 并释放 busy；不重发模型。结算 ACK 丢失时先读原回执，保留已提交的终态。无法完成对账时停止该实例后续操作，查询返回脱敏 503，操作者须停止并重启原实例核对，不能换 ID 重发未知输入。
 
 取消绑定本次 active request ID；包括 PG 已受理但 adapter 尚未登记的窗口。取消回执只是 requested，实际 cancelled/其他结算通过原请求查询；延迟取消不能取消下一条请求。
@@ -63,7 +65,7 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 ## 验证及限制
 
-`tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/conversations-engine.test.ts` 验证多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile、多轮、正常重启及 SIGKILL；`tests/conversations/conversation-image-tools.test.ts` 经 A 内的 generations、隔离 PG、受控上游与 COS 替身、官方 loop、真实 JSONL 与正式打包 Profile，在不启动 B 和图片 MQ 的条件下验证多轮生图/改图工具闭环、权限隔离、注入拦截、预算/步数熔断、幂等去重、取消与重启恢复。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
+`tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/prompt.test.ts` 与 `tests/conversations/conversations-engine.test.ts` 验证平台系统提示词规则、四种工具能力组合、确定性输出、legacy/BYOK 会话注入、多轮前缀稳定与字面量 `{{...}}` 安全，以及多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile（含移除上游 `DeepSeek Harness` 开场白、注入 `miioo AI 漫剧助手` 且公开历史不外泄系统提示）、多轮、正常重启及 SIGKILL；`tests/conversations/conversation-image-tools.test.ts` 经 A 内的 generations、隔离 PG、受控上游与 COS 替身、官方 loop、真实 JSONL 与正式打包 Profile，在不启动 B 和图片 MQ 的条件下验证多轮生图/改图工具闭环、权限隔离、注入拦截、预算/步数熔断、幂等去重、取消与重启恢复。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
 
 `tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
 

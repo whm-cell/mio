@@ -10,6 +10,11 @@
       "identity": "docs/tasks/conversation-service/changes/conversation-vision-input/change.md",
       "kind": "change",
       "path": "docs/tasks/conversation-service/changes/conversation-vision-input/change.md"
+    },
+    {
+      "identity": "docs/tasks/conversation-service/changes/conversation-platform-prompt/change.md",
+      "kind": "change",
+      "path": "docs/tasks/conversation-service/changes/conversation-platform-prompt/change.md"
     }
   ]
 }

@@ -2,6 +2,7 @@ import { monotonicMs } from '@mio/foundation/time';
 import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
+import type {} from '@deepseek-ai/dsh-system-prompt';
 import type {} from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { createHandler } from './http.ts';
@@ -262,7 +263,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (!ctx.get('mioKernel')) throw new Error('CONVERSATION_CONFIG: DSH kernel required');
       await ctx.plugin({
         name: 'mio-conversations',
-        inject: ['mioKernel', 'llm', 'webServer', 'agents', 'sessions'],
+        inject: ['mioKernel', 'llm', 'webServer', 'agents', 'sessions', 'systemPrompt'],
         async apply(conversationCtx: Context) {
           let acquired: ConversationService | undefined;
           let http: ReturnType<typeof createConversationHandler> | undefined;

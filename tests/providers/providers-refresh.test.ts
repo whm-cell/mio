@@ -123,6 +123,114 @@ it('discovers new exact identities without a release, keeps unknown metadata pen
   expect(snapshot.profile).toBe('openai-chat');
 });
 
+it('updates retained members once per refresh and removes only missing members without touching other owners', async () => {
+  const originalIds = Array.from({ length: 100 }, (_, index) => `refresh-write-${index}`);
+  let ids = originalIds;
+  const f = await fixture(async () => metadata(ids));
+  const other = await fixture(async () => metadata(originalIds));
+  await f.service.discover(f.actor);
+  await other.service.discover(other.actor);
+  const original = await f.service.catalog(f.actor);
+  const otherOriginal = await other.service.catalog(other.actor);
+  const providerId = original.provider!.id;
+  await pool.query(`
+    CREATE TABLE mio_provider_refresh_writes (
+      provider_id uuid NOT NULL, raw_model_id text NOT NULL,
+      old_state text NOT NULL, new_state text NOT NULL
+    );
+    CREATE FUNCTION record_provider_refresh_write() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO mio_provider_refresh_writes VALUES
+        (NEW.provider_id, NEW.raw_model_id, OLD.membership_state, NEW.membership_state);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER provider_refresh_write AFTER UPDATE ON mio_provider_models
+      FOR EACH ROW EXECUTE FUNCTION record_provider_refresh_write();
+  `);
+  try {
+    await f.service.discover(f.actor);
+    expect(
+      (
+        await pool.query(`SELECT provider_id, old_state, new_state, count(*)::int AS writes
+        FROM mio_provider_refresh_writes GROUP BY provider_id, old_state, new_state`)
+      ).rows,
+    ).toEqual([
+      { provider_id: providerId, old_state: 'current', new_state: 'current', writes: 100 },
+    ]);
+    const refreshed = await f.service.catalog(f.actor);
+    expect(refreshed.provider!.catalog.version).toBe(2);
+    expect(refreshed.provider!.discovery!.ids).toEqual(originalIds);
+    expect(refreshed.items).toHaveLength(100);
+    for (const model of refreshed.items) {
+      const previous = original.items.find((item) => item.modelId === model.modelId)!;
+      expect(model).toMatchObject({
+        modelKey: previous.modelKey,
+        modelRef: previous.modelRef,
+        firstSeenAt: previous.firstSeenAt,
+        membership: 'current',
+        credentialVersion: 1,
+        catalogVersion: 2,
+        discovered: true,
+      });
+      expect(Date.parse(model.lastSeenAt!)).toBeGreaterThanOrEqual(
+        Date.parse(previous.lastSeenAt!),
+      );
+    }
+
+    await pool.query('TRUNCATE mio_provider_refresh_writes');
+    ids = originalIds.slice(1);
+    await f.service.discover(f.actor);
+    expect(
+      (
+        await pool.query(`SELECT old_state, new_state, count(*)::int AS writes
+        FROM mio_provider_refresh_writes GROUP BY old_state, new_state ORDER BY new_state`)
+      ).rows,
+    ).toEqual([
+      { old_state: 'current', new_state: 'current', writes: 99 },
+      { old_state: 'current', new_state: 'removed', writes: 1 },
+    ]);
+    const removed = (await f.service.catalog(f.actor)).items.find(
+      (item) => item.modelId === originalIds[0],
+    )!;
+    expect(removed).toMatchObject({ membership: 'removed', discovered: false, catalogVersion: 2 });
+
+    await pool.query('TRUNCATE mio_provider_refresh_writes');
+    ids = originalIds;
+    await f.service.discover(f.actor);
+    expect(
+      (
+        await pool.query(`SELECT old_state, new_state, count(*)::int AS writes
+        FROM mio_provider_refresh_writes GROUP BY old_state, new_state ORDER BY old_state`)
+      ).rows,
+    ).toEqual([
+      { old_state: 'current', new_state: 'current', writes: 99 },
+      { old_state: 'removed', new_state: 'current', writes: 1 },
+    ]);
+    const restored = (await f.service.catalog(f.actor)).items.find(
+      (item) => item.modelId === originalIds[0],
+    )!;
+    expect(restored).toMatchObject({
+      modelKey: removed.modelKey,
+      modelRef: removed.modelRef,
+      firstSeenAt: removed.firstSeenAt,
+      membership: 'current',
+      catalogVersion: 4,
+      discovered: true,
+    });
+    expect(await f.service.catalog(other.actor)).toEqual(otherOriginal);
+    expect(
+      (await pool.query('SELECT DISTINCT provider_id FROM mio_provider_refresh_writes')).rows,
+    ).toEqual([{ provider_id: providerId }]);
+  } finally {
+    await pool.query(`
+      DROP TRIGGER IF EXISTS provider_refresh_write ON mio_provider_models;
+      DROP FUNCTION IF EXISTS record_provider_refresh_write();
+      DROP TABLE IF EXISTS mio_provider_refresh_writes;
+    `);
+  }
+});
+
 it("resolves an existing task owner's current key independently of admission and discovery", async () => {
   const transport = vi.fn(async () => metadata(['model']));
   const f = await fixture(transport);

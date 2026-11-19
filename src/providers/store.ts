@@ -353,8 +353,13 @@ export class ProviderStore {
       if (discovery.status === 'connected') {
         const version = (row.catalog_version ?? 0) + 1;
         await client.query(
-          "UPDATE mio_provider_models SET membership_state='removed' WHERE provider_id=$1 AND membership_state='current'",
-          [row.id],
+          `UPDATE mio_provider_models SET membership_state='removed'
+            WHERE provider_id=$1 AND membership_state='current'
+              AND NOT EXISTS (
+                SELECT 1 FROM unnest($2::text[]) AS incoming(id)
+                WHERE incoming.id COLLATE "C" = mio_provider_models.raw_model_id
+              )`,
+          [row.id, models.map((model) => model.id)],
         );
         await client.query(
           `INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata,metadata_source,

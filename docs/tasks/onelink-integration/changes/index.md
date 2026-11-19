@@ -1,5 +1,6 @@
 # 轻量变更索引
 
-| ID                       | 类型    | 标题                           | 父 PRD 章节                    | 详情                                         |
-| ------------------------ | ------- | ------------------------------ | ------------------------------ | -------------------------------------------- |
-| onelink-model-management | feature | OneLink 模型展示信息与常驻使用 | W1：用户万联配置与模型能力目录 | [详情](./onelink-model-management/change.md) |
+| ID                                          | 类型    | 标题                           | 父 PRD 章节                    | 详情                                                            |
+| ------------------------------------------- | ------- | ------------------------------ | ------------------------------ | --------------------------------------------------------------- |
+| onelink-model-management                    | feature | OneLink 模型展示信息与常驻使用 | W1：用户万联配置与模型能力目录 | [详情](./onelink-model-management/change.md)                    |
+| onelink-provider-catalog-write-optimization | fix     | OneLink 模型目录刷新写入优化   | W1：用户万联配置与模型能力目录 | [详情](./onelink-provider-catalog-write-optimization/change.md) |

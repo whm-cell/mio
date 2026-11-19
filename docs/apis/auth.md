@@ -16,20 +16,60 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 
 限流采用直接连接地址，覆盖客户端传来的 IP 头；库按规范化 IP 和路径计数，查询参数不另开额度。当前完整规则如下，均在 `/api/auth` 下：
 
-| 路径                                                                                                           | 窗口/额度           |
-| -------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `/sign-in/email`                                                                                               | 60 秒 / 10 次       |
-| `/sign-up/email`                                                                                               | 60 秒 / 5 次        |
-| `/phone-number/send-otp`、`/phone-binding/send-otp`                                                            | 各自 60 秒 / 100 次 |
-| `/phone-number/verify`、`/phone-binding/confirm`                                                               | 各自 60 秒 / 10 次  |
-| `/sign-in/social`、`/link-social`                                                                              | 各自 60 秒 / 10 次  |
-| `/callback/wechat`                                                                                             | 60 秒 / 100 次      |
-| `/change-password`                                                                                             | 10 秒 / 3 次        |
-| `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次 |
+| 路径                                                                                                           | 窗口/额度            |
+| -------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `/sign-in/email`                                                                                               | 60 秒 / 10 次        |
+| `/sign-up/email`                                                                                               | 60 秒 / 5 次         |
+| `/phone-number/send-otp`、`/phone-binding/send-otp`                                                            | 各自 60 秒 / 100 次  |
+| `/phone-number/verify`、`/phone-binding/confirm`                                                               | 各自 60 秒 / 10 次   |
+| `/sign-in/social`、`/link-social`                                                                              | 各自 60 秒 / 10 次   |
+| `/wechat/qr-session`                                                                                           | 60 秒 / 20 次        |
+| `/wechat/qr-session/{qrcode_id}/poll`                                                                          | 各 ID 60 秒 / 300 次 |
+| `/callback/wechat`                                                                                             | 60 秒 / 100 次       |
+| `/change-password`                                                                                             | 10 秒 / 3 次         |
+| `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次  |
 
-错误凭据也占一次放行额度；适配器提前拒绝的 Origin、路径、方法、正文错误和 OPTIONS 不消费。窗口从最近放行计算，放行更新该时间，拒绝不更新；额度耗尽保留库 429 原始消息与 `X-Retry-After`（向上取整的剩余秒数）。代理后的客户端共享代理地址限额，正式部署需要在可信边缘配置限流；当前未验证任意代理链或多实例容量。库自身 CSRF 和适配器 Origin 检查均保留。
+错误凭据也占一次放行额度；适配器提前拒绝的 Origin、路径、方法、正文错误、OPTIONS 以及 `/callback/wechat` 的单跳 iframe 桥接响应不消费。窗口从最近放行计算，放行更新该时间，拒绝不更新；额度耗尽保留库 429 原始消息与 `X-Retry-After`（向上取整的剩余秒数）。代理后的客户端共享代理地址限额，正式部署需要在可信边缘配置限流；当前未验证任意代理链或多实例容量。库自身 CSRF 和适配器 Origin 检查均保留。
 
 计数默认在 DB，显式 Redis 选择与恢复按[认证配置](../auth.md#限流存储与恢复)，资源边界见[Redis 契约](../integrations/redis.md)。Redis 失败返回包装 `503 AUTH_UNAVAILABLE`，不是超额 429；没有静默 DB 回退。未知状态后受限入口持续 503，直至操作者排清、等待并重启；已装载且 DB 正常时 `/api/v1/me` 仍查询 DB。PG 账号/会话、cookie 和原迁移模型不因 Redis 计数改变；整进程维护期间入口可能不可达。
+
+QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 `/sign-in/social` 额度。QR poll 按该 IP 与具体 ID 路径分别计数；查询参数不产生新额度。客户端建议每秒轮询一次，并在过期或终态后停止。其他限流、Origin 拒绝顺序和基础设施错误仍沿本域共同约定。
+
+## POST /api/auth/wechat/qr-session
+
+身份：允许匿名发起微信网站注册或登录；本入口不绑定当前用户的微信。
+
+输入：JSON 对象，可选 `callbackURL`，不接受其他字段。该值仅接受以单个 `/` 开始且位于固定 `MIO_AUTH_BASE_URL` 下的相对路径，拒绝反斜线和控制字符，缺省 `/auth/wechat/qr-complete`。Origin、正文类型、16 KiB 与读取期限沿共同约定。
+
+成功：201 和 `{qrcode_id,authorization_url,expire_seconds:300}`。QR ID 为不透明 UUID v4；同时转发 Better Auth 的 OAuth state Cookie 并设置 `mio.wechat_qr` Cookie（HTTPS 名称带 `__Secure-` 前缀）。QR Cookie 为 HttpOnly、SameSite=Lax，HTTPS 带 Secure，路径精确到本 ID 的 poll 入口，Max-Age 为 900 秒；QR 本身仍只在 300 秒内有效，较长 Cookie 只用于观察过期。响应保持 `Cache-Control: no-store`。
+
+`authorization_url` 必须由微信官方授权页面或同源页面内嵌的微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）承载，不是可直接作为二维码图片加载的地址；不提供无同浏览器 Session Cookie 的跨设备凭据交接。同源内嵌容器（须满足 `SAMEORIGIN` / `frame-ancestors 'self'`）或同一浏览器的授权窗口在 callback 处设置 Session Cookie；主页面须与服务满足共同的同站点／同源 Cookie 部署条件。返回 URL 不表示已经授权或登录，本仓库不实现完成页。
+
+错误：无效输入为 400 `INVALID_INPUT`，未启用微信为 503 `WECHAT_UNAVAILABLE`，数据库或授权地址创建失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文和 429 沿共同约定。
+
+副作用：先建立 QR 持久状态，再复用 Better Auth 生成授权 URL 并关联 OAuth state 摘要；QR 表只存独立 Cookie 和 state 的摘要，不存 Session secret。创建时最多清理 100 条已过期至少 10 分钟的记录。创建中途失败不等于已经取得登录身份，失败遗留的短期记录由同一有界清理收敛。
+
+## GET /api/auth/wechat/qr-session/{qrcode_id}/poll
+
+身份：本 ID 对应的 QR state Cookie；返回 confirmed 还要求有效的 Mio Session Cookie，且数据库确认的用户与 QR 会话确认用户一致。服务 token 不能替代任一 Cookie。
+
+输入：路径 ID 为 UUID v4，无正文。Origin 可省略；提供时必须在允许列表内。除精确 QR poll 路径外，不开放其他动态认证路径或隐式 Better Auth 插件入口。
+
+成功：200 和以下一个状态；不返回用户资料、Session token 或供应商凭据。
+
+| status    | 含义                                                                                                                   |
+| --------- | ---------------------------------------------------------------------------------------------------------------------- |
+| pending   | 尚未由本次微信 callback 完成授权。                                                                                     |
+| confirmed | 本次 callback 已产生 Session，当前浏览器 Session 有效且属于该确认用户；这一响应同时在数据库行锁内将记录转为 consumed。 |
+| failed    | 对应 callback 授权失败；不返回供应商原始错误或内部失败原因码。                                                         |
+| expired   | 已超过 5 分钟；即使此前 confirmed、failed 或 consumed，过期检查也优先返回此状态。                                      |
+| consumed  | 有效期内的成功结果已经被首次 confirmed 轮询消费，不能再次取得确认结果。                                                |
+
+不提供无法可靠观察的 scanned。并发轮询至多一个返回 confirmed；其他请求读取 consumed。若记录已被后续创建清理，则返回未知 ID 的 404，不承诺永久保留 expired 状态。
+
+错误：未知或无效 ID 为 404 `NOT_FOUND`，此判断不要求 Cookie；已知 ID 缺少或错配 QR Cookie 为 400 `STATE_MISMATCH`。confirmed 状态下 Session 缺失、过期、撤销或用户不符为 401 `UNAUTHORIZED`，且不消费记录。微信关闭为 503 `WECHAT_UNAVAILABLE`，数据库或会话查询失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法和限流沿共同约定。
+
+副作用：读取并按有效期更新 QR 状态；首次合格确认在同一事务中消费成功结果。poll 不新建、不续期也不发放 Session Cookie；前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
 
 ## POST /api/auth/sign-in/social
 
@@ -59,13 +99,15 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 
 身份：微信授权返回的 code、state 和发起浏览器的 state Cookie；绑定在回调执行权威会话核验时，还要求发起会话有效且当前浏览器使用同一 userId 和 sessionId。核验已通过的在途绑定不会因并发退出或撤销自动取消，可能在撤销成功后完成；后续请求仍受撤销约束。
 
-输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。
+输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。同源 iframe 桥接第二跳可附带内部参数 `mio_bridge`，适配器在转交认证库前将其移除。
 
-成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。
+成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。当请求携带 `Sec-Fetch-Dest: iframe`、未携带 `mio_bridge`、缺少对应协议的 state Cookie（HTTPS 为 `__Secure-mio.state`，回环 HTTP 为 `mio.state`）且 `state` 为非空且不超过 512 字符的字符串时，适配器在完成 Origin、方法与微信启用检查后不进入认证库，直接返回 200 `text/html; charset=utf-8` 固定同源桥接页（无动态插值，内联脚本仅为当前 URL 添加 `mio_bridge=1` 并执行 `location.replace`），保留 `X-Request-Id`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`，并设置 `X-Frame-Options: SAMEORIGIN`、`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; frame-ancestors 'self'` 与 `Referrer-Policy: no-referrer`；浏览器在同源 iframe 内发起第二跳并附带 state Cookie 后，适配器移除 `mio_bridge` 并交由认证库完成校验与 302 重定向。
 
-错误：缺少或错误 state Cookie、重复 state 为 400；库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
+错误：缺少或错误 state Cookie、重复 state 为 400；已携带 `mio_bridge` 的第二跳若仍缺少或错配 state Cookie，直接交由认证库返回 400 `STATE_MISMATCH` 且不再返回桥接页（零循环）。非 iframe 请求、缺少或超长 `state` 不触发桥接；微信未启用时即使携带 `Sec-Fetch-Dest: iframe` 仍返回 503 `WECHAT_UNAVAILABLE`。库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
 
-副作用：进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
+副作用：第一跳 iframe 桥接不调用认证库，不消费 `/callback/wechat` 限流额度，也不触碰数据库或微信接口。进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
+
+当 state 对应 QR 会话时，在原签名 Cookie 和单次保留检查后关联 QR；过期 QR 在供应商兑换前以 400 拒绝。只有本次 callback 的新 Session 用户能将 pending QR 标记为 confirmed，已有登录 Cookie 不会让失败回调变成成功；其余已进入的失败回调把对应 pending QR 标记为 failed。重复／并发 callback 不替换已经确认或消费的结果。QR 用户拒绝参数脱敏为 `WECHAT_AUTH_FAILED` 后回到批准的完成路径，普通 OAuth 重定向行为保持原契约。缺失或错误发起 Cookie 的请求在关联 QR 前拒绝，不将该 QR 标记失败。
 
 ## POST /api/auth/phone-number/send-otp
 

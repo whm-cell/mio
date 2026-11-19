@@ -8,6 +8,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
+import type { Authentication } from '../../src/auth/service.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
@@ -34,7 +35,13 @@ const cookies = (response: Response) =>
 
 function call(
   path: string,
-  options: { body?: unknown; cookie?: string; instance?: number; origin?: boolean } = {},
+  options: {
+    body?: unknown;
+    cookie?: string;
+    headers?: Record<string, string>;
+    instance?: number;
+    origin?: boolean;
+  } = {},
 ) {
   return originalFetch(`${origins[options.instance ?? 0]}${path}`, {
     method: options.body === undefined ? 'GET' : 'POST',
@@ -43,6 +50,7 @@ function call(
       ...(options.origin === false ? {} : { origin: origins[0]! }),
       ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
       ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...options.headers,
     },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
   });
@@ -152,7 +160,9 @@ beforeEach(async () => {
   exchanges = 0;
   holdExchange = undefined;
   exchangeStarted = undefined;
-  await pool.query('TRUNCATE "account", "session", "user", "verification", "rateLimit" CASCADE');
+  await pool.query(
+    'TRUNCATE "account", "session", "user", "verification", "rateLimit", "mioWechatQR" CASCADE',
+  );
 });
 
 afterAll(async () => {
@@ -461,5 +471,643 @@ it('adds both unique indexes idempotently and refuses existing conflicting accou
   } finally {
     await oldPool.end();
     await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+  }
+});
+
+async function startQR(cookie?: string) {
+  const response = await call('/api/auth/wechat/qr-session', {
+    body: {},
+    ...(cookie ? { cookie } : {}),
+  });
+  expect(response.status, await response.clone().text()).toBe(201);
+  const body = (await response.json()) as {
+    qrcode_id: string;
+    authorization_url: string;
+    expire_seconds: number;
+  };
+  expect(body.expire_seconds).toBe(300);
+  const authorization = new URL(body.authorization_url);
+  expect(authorization.origin).toBe('https://open.weixin.qq.com');
+  expect(response.headers.get('cache-control')).toBe('no-store');
+  const qrCookie = response.headers.getSetCookie().find((value) => value.includes('wechat_qr='));
+  expect(qrCookie).toContain('HttpOnly');
+  expect(qrCookie).toMatch(/SameSite=Lax/i);
+  expect(qrCookie).toContain(`/api/auth/wechat/qr-session/${body.qrcode_id}/poll`);
+  expect(cookies(response)).not.toContain('session_token=');
+  return {
+    id: body.qrcode_id,
+    state: authorization.searchParams.get('state')!,
+    cookie: cookies(response),
+  };
+}
+
+function pollQR(flow: { id: string; cookie: string }, session?: string, instance = 0) {
+  return call(`/api/auth/wechat/qr-session/${flow.id}/poll`, {
+    cookie: [flow.cookie, session].filter(Boolean).join('; '),
+    instance,
+  });
+}
+
+it('completes QR registration through the OAuth session and consumes the result once across instances', async () => {
+  const qr = await startQR();
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  fixtures.set('qr-new', { openid: 'qr-user' });
+  const completed = await callback(qr, 'qr-new');
+  expect(completed.status).toBe(302);
+  expect(completed.headers.get('location')).toBe(`${origins[0]}/auth/wechat/qr-complete`);
+  const session = cookies(completed);
+  const user = await identity(session);
+  const stored = (await pool.query('SELECT * FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0];
+  expect(stored.status).toBe('confirmed');
+  expect(stored.userId).toBe(user.userId);
+  expect(stored.stateHash).not.toBe(qr.state);
+  expect(stored.cookieHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.stringify(stored)).not.toContain('session_token');
+  const claims = await Promise.all([pollQR(qr, session), pollQR(qr, session, 1)]);
+  expect(
+    (await Promise.all(claims.map((response) => response.json()))).sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    ),
+  ).toEqual([{ status: 'confirmed' }, { status: 'consumed' }]);
+  for (const response of claims) {
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  }
+  expect((await identity(session)).userId).toBe(user.userId);
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'consumed' });
+});
+
+it('requires the confirmed user session and does not consume QR for another or revoked session', async () => {
+  const other = await emailUser();
+  const qr = await startQR();
+  fixtures.set('qr-owner', { openid: 'qr-owner' });
+  const completed = await callback(qr, 'qr-owner');
+  const owner = cookies(completed);
+  expect((await pollQR(qr)).status).toBe(401);
+  expect((await pollQR(qr, other)).status).toBe(401);
+  expect(
+    (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0].status,
+  ).toBe('confirmed');
+  expect((await call('/api/auth/sign-out', { body: {}, cookie: owner })).status).toBe(200);
+  expect((await pollQR(qr, owner)).status).toBe(401);
+  expect(
+    (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0].status,
+  ).toBe('confirmed');
+});
+
+it('does not mistake an old session or failed callback for a successful QR login', async () => {
+  const oldSession = await emailUser();
+  const qr = await startQR(oldSession);
+  const response = await callback(qr, 'invalid-provider-code', oldSession);
+  expect(response.headers.get('location')).toContain('invalid_code');
+  expect(await (await pollQR(qr, oldSession)).json()).toEqual({ status: 'failed' });
+  const row = (await pool.query('SELECT * FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0];
+  expect(row.userId).toBeNull();
+  expect(row.failureCode).toBe('OAUTH_FAILED');
+  expect(JSON.stringify(row)).not.toContain('private fixture details');
+  expect((await pool.query('SELECT id FROM "session"')).rowCount).toBe(1);
+});
+
+it('rejects a forged callback without burning QR and rejects missing or cross-browser QR cookies', async () => {
+  const qr = await startQR();
+  const another = await startQR();
+  const forged = await call(`/api/auth/callback/wechat?state=${qr.state}&code=forged`, {
+    origin: false,
+    cookie: another.cookie,
+  });
+  expect(forged.status).toBe(400);
+  expect(exchanges).toBe(0);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  expect((await call(`/api/auth/wechat/qr-session/${qr.id}/poll`)).status).toBe(400);
+  expect((await pollQR({ id: qr.id, cookie: another.cookie })).status).toBe(400);
+  expect((await pollQR({ id: randomUUID(), cookie: qr.cookie })).status).toBe(404);
+  expect((await call(`/api/auth/wechat/qr-session/${randomUUID()}/poll`)).status).toBe(404);
+  fixtures.set('valid-after-forgery', { openid: 'forgery-survivor' });
+  const success = await callback(qr, 'valid-after-forgery');
+  expect(await (await pollQR(qr, cookies(success))).json()).toEqual({ status: 'confirmed' });
+});
+
+it('serializes QR callback replay without replacing the confirmed or consumed result', async () => {
+  const qr = await startQR();
+  fixtures.set('qr-once', { openid: 'once-qr-user' });
+  let release!: () => void;
+  holdExchange = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    exchangeStarted = resolve;
+  });
+  const first = callback(qr, 'qr-once');
+  await started;
+  let replay: Response;
+  try {
+    replay = await callback(qr, 'qr-once', undefined, 1);
+    expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  } finally {
+    release();
+  }
+  expect(replay!.status).toBe(400);
+  const finished = await first;
+  const session = cookies(finished);
+  expect(finished.status).toBe(302);
+  expect(exchanges).toBe(1);
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'confirmed' });
+  expect((await callback(qr, 'qr-once')).status).toBe(400);
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'consumed' });
+  expect((await pool.query('SELECT id FROM "session"')).rowCount).toBe(1);
+});
+
+it('expires QR before code exchange and preserves an observable expiry grace before bounded cleanup', async () => {
+  const qr = await startQR();
+  await pool.query(
+    'UPDATE "mioWechatQR" SET "expiresAt"=clock_timestamp()-interval \'1 second\' WHERE id=$1',
+    [qr.id],
+  );
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'expired' });
+  const expired = await callback(qr, 'too-late');
+  expect(expired.status).toBe(400);
+  expect(exchanges).toBe(0);
+  expect((await pool.query('SELECT id FROM "session"')).rowCount).toBe(0);
+  await pool.query(`INSERT INTO "mioWechatQR" (id, "cookieHash", status, "expiresAt")
+    SELECT gen_random_uuid()::text, 'fixture-digest', 'pending', clock_timestamp()-interval '11 minutes'
+    FROM generate_series(1,101)`);
+  await startQR();
+  const count = (
+    await pool.query(`SELECT count(*)::int AS count FROM "mioWechatQR"
+    WHERE "expiresAt" <= clock_timestamp()-interval '10 minutes'`)
+  ).rows[0].count;
+  expect(count).toBe(1);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'expired' });
+});
+
+it('enforces QR creation 20/60s and concrete QR polling 300/60s without the ordinary login limit', async () => {
+  const first = await startQR();
+  const second = await startQR();
+  for (let index = 2; index < 20; index++) await startQR();
+  expect((await call('/api/auth/wechat/qr-session', { body: {} })).status).toBe(429);
+  expect((await pool.query('SELECT id FROM "mioWechatQR"')).rowCount).toBe(20);
+  for (let index = 0; index < 300; index++) expect((await pollQR(first)).status).toBe(200);
+  expect((await pollQR(first)).status).toBe(429);
+  expect((await pollQR(second)).status).toBe(200);
+}, 30000);
+
+it('keeps the QR HTTP boundary precise and validates input before creating OAuth state', async () => {
+  for (const body of [
+    [],
+    null,
+    { provider: 'wechat' },
+    { callbackURL: null },
+    { callbackURL: 'https://evil.test/' },
+    { callbackURL: '//evil.test/' },
+    { callbackURL: '/\\evil.test/' },
+    { callbackURL: '/bad\npath' },
+  ])
+    expect((await call('/api/auth/wechat/qr-session', { body })).status).toBe(400);
+  expect((await pool.query('SELECT id FROM "mioWechatQR"')).rowCount).toBe(0);
+  expect((await call('/api/auth/wechat/qr-session', { body: {}, origin: false })).status).toBe(403);
+  expect((await call('/api/auth/wechat/qr-session')).status).toBe(405);
+  expect((await call('/api/auth/wechat/qr-session/not-an-id/poll')).status).toBe(404);
+  expect((await call('/api/auth/wechat/qr-session/extra/path/poll')).status).toBe(404);
+  const qr = await startQR();
+  expect((await call(`/api/auth/wechat/qr-session/${qr.id}/poll`, { body: {} })).status).toBe(405);
+  const denied = await originalFetch(`${origins[0]}/api/auth/wechat/qr-session`, {
+    method: 'POST',
+    headers: { origin: 'https://evil.test', 'content-type': 'application/json' },
+    body: '{}',
+  });
+  expect(denied.status).toBe(403);
+  const nonJSON = await originalFetch(`${origins[0]}/api/auth/wechat/qr-session`, {
+    method: 'POST',
+    headers: { origin: origins[0]! },
+    body: '{}',
+  });
+  expect(nonJSON.status).toBe(415);
+  expect((await call('/api/auth/wechat/qr-session', { body: 'x'.repeat(16384) })).status).toBe(413);
+});
+
+it('requires explicit QR schema migration and includes its indexes idempotently', async () => {
+  const schema = `mio_qr_old_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE SCHEMA "${schema}"`);
+  const scoped = new URL(database.url);
+  scoped.searchParams.set('options', `-csearch_path=${schema}`);
+  const oldPool = new Pool({ connectionString: scoped.toString() });
+  try {
+    const config = readAuthConfig({
+      MIO_AUTH_BASE_URL: origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: scoped.toString(),
+    })!;
+    const old = authOptions(config, oldPool);
+    old.plugins = old.plugins?.filter((plugin) => plugin.id !== 'mio-wechat-qr');
+    await (await getMigrations(old)).runMigrations();
+    await expect(createAuthentication(config)).rejects.toThrow('AUTH_SCHEMA');
+    const pending = await getMigrations(authOptions(config, oldPool));
+    expect(pending.toBeCreated.some((entry) => entry.table === 'mioWechatQR')).toBe(true);
+    await pending.runMigrations();
+    const current = await getMigrations(authOptions(config, oldPool));
+    expect(current.toBeCreated).toHaveLength(0);
+    expect(current.toBeAddedIndexes).toHaveLength(0);
+    const enabled = await createAuthentication(config);
+    await enabled.close();
+    const indexes = await oldPool.query(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename='mioWechatQR'`,
+      [schema],
+    );
+    expect(
+      indexes.rows.some(
+        (row) => row.indexdef.includes('stateHash') && row.indexdef.includes('UNIQUE'),
+      ),
+    ).toBe(true);
+    expect(indexes.rows.some((row) => row.indexdef.includes('expiresAt'))).toBe(true);
+    expect(indexes.rows.some((row) => row.indexdef.includes('status'))).toBe(true);
+  } finally {
+    await oldPool.end();
+    await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+  }
+});
+
+it('signs in an existing WeChat user through QR without changing identity or merging a matching email', async () => {
+  fixtures.set('first-qr-account', { openid: 'existing-qr-openid' });
+  const first = await callback(await start('/sign-in/social'), 'first-qr-account');
+  const ownerId = (await identity(cookies(first))).userId;
+  const qr = await startQR();
+  fixtures.set('same-qr-account', { openid: 'existing-qr-openid', unionid: 'later-unionid' });
+  const second = await callback(qr, 'same-qr-account');
+  expect((await identity(cookies(second))).userId).toBe(ownerId);
+  expect(await (await pollQR(qr, cookies(second))).json()).toEqual({ status: 'confirmed' });
+  expect((await pool.query('SELECT id FROM "user"')).rowCount).toBe(1);
+  const emailOwner = await emailUser();
+  const emailOwnerId = (await identity(emailOwner)).userId;
+  const digest = createHash('sha256')
+    .update(JSON.stringify([appId, 'qr-email-collision']))
+    .digest('hex')
+    .slice(0, 56);
+  await pool.query('UPDATE "user" SET email=$1, "emailVerified"=true WHERE id=$2', [
+    `wechat-${digest}@auth.mio.invalid`,
+    emailOwnerId,
+  ]);
+  fixtures.set('qr-collision', { openid: 'qr-email-collision' });
+  const collision = await startQR();
+  const rejected = await callback(collision, 'qr-collision');
+  expect(rejected.headers.get('location')).toContain('account_not_linked');
+  expect(await (await pollQR(collision, emailOwner)).json()).toEqual({ status: 'failed' });
+  expect(
+    (await pool.query('SELECT id FROM "account" WHERE "providerId"=\'wechat\'')).rowCount,
+  ).toBe(1);
+});
+
+it('redacts QR authorization refusal while leaving ordinary OAuth redirects unchanged', async () => {
+  const qr = await startQR();
+  const rejected = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({
+      state: qr.state,
+      error: 'untrusted-provider-detail',
+      error_description: 'private-fixture-message',
+    })}`,
+    { cookie: qr.cookie, origin: false },
+  );
+  expect(rejected.headers.get('location')).toBe(
+    `${origins[0]}/auth/wechat/qr-complete?error=WECHAT_AUTH_FAILED`,
+  );
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'failed' });
+  expect(exchanges).toBe(0);
+});
+
+it('rolls back an unsuccessful QR claim and permits the first successful claim after DB recovery', async () => {
+  const qr = await startQR();
+  fixtures.set('qr-rollback', { openid: 'qr-rollback-owner' });
+  const completed = await callback(qr, 'qr-rollback');
+  const session = cookies(completed);
+  await pool.query(`CREATE FUNCTION reject_qr_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.status='consumed' THEN RAISE EXCEPTION 'private-fixture-database-detail'; END IF; RETURN NEW; END $$`);
+  await pool.query(`CREATE TRIGGER reject_qr_claim BEFORE UPDATE ON "mioWechatQR"
+    FOR EACH ROW EXECUTE FUNCTION reject_qr_claim()`);
+  try {
+    const failed = await pollQR(qr, session);
+    expect(failed.status).toBe(503);
+    const error = await failed.text();
+    expect(error).toContain('AUTH_UNAVAILABLE');
+    expect(error).not.toContain('private-fixture-database-detail');
+    expect(
+      (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0].status,
+    ).toBe('confirmed');
+  } finally {
+    await pool.query('DROP TRIGGER reject_qr_claim ON "mioWechatQR"');
+    await pool.query('DROP FUNCTION reject_qr_claim()');
+  }
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'confirmed' });
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'consumed' });
+});
+
+it('uses Secure QR cookies under HTTPS and rejects both QR routes while WeChat is disabled', async () => {
+  for (const enabled of [true, false]) {
+    const config = readAuthConfig({
+      MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: database.url,
+      ...(enabled
+        ? {
+            MIO_AUTH_WECHAT_ENABLED: 'true',
+            MIO_AUTH_WECHAT_APP_ID: appId,
+            MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
+          }
+        : {}),
+    })!;
+    const auth = await createAuthentication(config);
+    const server = createServer(createAuthHandler(config, auth));
+    try {
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('missing address');
+      const origin = `http://127.0.0.1:${address.port}`;
+      const response = await originalFetch(`${origin}/api/auth/wechat/qr-session`, {
+        method: 'POST',
+        headers: { origin: config.baseURL, 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(response.status, await response.clone().text()).toBe(enabled ? 201 : 503);
+      if (enabled) {
+        const cookie = response.headers
+          .getSetCookie()
+          .find((value) => value.includes('wechat_qr='));
+        expect(cookie).toMatch(/^__Secure-mio\.wechat_qr=/);
+        expect(cookie).toContain('; Secure');
+        expect(cookie).toContain('HttpOnly');
+        expect(cookie).toMatch(/SameSite=Lax/i);
+      } else {
+        expect(
+          (await originalFetch(`${origin}/api/auth/wechat/qr-session/${randomUUID()}/poll`)).status,
+        ).toBe(503);
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await auth.close();
+    }
+  }
+});
+
+it('bridges cross-site embedded WxLogin iframe callbacks into a same-origin hop and completes QR polling', async () => {
+  const qr = await startQR();
+  fixtures.set('iframe-qr', { openid: 'iframe-qr-user' });
+  const query = new URLSearchParams({ state: qr.state, code: 'iframe-qr' });
+  const hop1 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+  });
+  expect(hop1.status).toBe(200);
+  expect(hop1.headers.get('content-type')).toBe('text/html; charset=utf-8');
+  expect(hop1.headers.get('cache-control')).toBe('no-store');
+  expect(hop1.headers.get('x-content-type-options')).toBe('nosniff');
+  expect(hop1.headers.get('x-request-id')).toMatch(/^[0-9a-f-]{36}$/);
+  expect(hop1.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+  expect(hop1.headers.get('referrer-policy')).toBe('no-referrer');
+  const html = await hop1.text();
+  const match = /^<!doctype html><meta charset="utf-8"><script>([^<]+)<\/script>$/.exec(html);
+  expect(match).not.toBeNull();
+  const expectedHash = createHash('sha256').update(match![1]!).digest('base64');
+  expect(hop1.headers.get('content-security-policy')).toBe(
+    `default-src 'none'; script-src 'sha256-${expectedHash}'; frame-ancestors 'self'`,
+  );
+  expect(html).not.toContain(qr.state);
+  expect(html).not.toContain('iframe-qr');
+  expect(exchanges).toBe(0);
+  expect(
+    (await pool.query('SELECT key FROM "rateLimit" WHERE key LIKE $1', ['%/callback/wechat%']))
+      .rowCount,
+  ).toBe(0);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  query.set('mio_bridge', '1');
+  const hop2 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    cookie: qr.cookie,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+  });
+  expect(hop2.status).toBe(302);
+  expect(hop2.headers.get('location')).toBe(`${origins[0]}/auth/wechat/qr-complete`);
+  expect(exchanges).toBe(1);
+  const session = cookies(hop2);
+  expect(session).toContain('mio.session_token=');
+  const user = await identity(session);
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'confirmed' });
+  expect(await (await pollQR(qr, session)).json()).toEqual({ status: 'consumed' });
+  expect((await identity(session)).userId).toBe(user.userId);
+});
+
+it('bridges iframe authorization refusal and redacts QR error without code exchange', async () => {
+  const qr = await startQR();
+  const query = new URLSearchParams({
+    state: qr.state,
+    error: 'access_denied',
+    error_description: 'private-iframe-refusal',
+  });
+  const hop1 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+  });
+  expect(hop1.status).toBe(200);
+  expect(hop1.headers.get('content-type')).toContain('text/html');
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  query.set('mio_bridge', '1');
+  const hop2 = await call(`/api/auth/callback/wechat?${query}`, {
+    origin: false,
+    cookie: qr.cookie,
+    headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+  });
+  expect(hop2.status).toBe(302);
+  expect(hop2.headers.get('location')).toBe(
+    `${origins[0]}/auth/wechat/qr-complete?error=WECHAT_AUTH_FAILED`,
+  );
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'failed' });
+  expect(exchanges).toBe(0);
+});
+
+it('prevents iframe bridge loops, enforces non-iframe and cookie guards, and strips mio_bridge', async () => {
+  const qr = await startQR();
+  const other = await startQR();
+  fixtures.set('guard-ok', { openid: 'guard-ok-user' });
+  const hop2NoCookie = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok', mio_bridge: '1' })}`,
+    {
+      origin: false,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(hop2NoCookie.status).toBe(400);
+  expect(await hop2NoCookie.text()).toContain('STATE_MISMATCH');
+  const hop2WrongCookie = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok', mio_bridge: '1' })}`,
+    {
+      origin: false,
+      cookie: other.cookie,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(hop2WrongCookie.status).toBe(400);
+  expect(await hop2WrongCookie.text()).toContain('STATE_MISMATCH');
+  const nonIframe = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+    { origin: false },
+  );
+  expect(nonIframe.status).toBe(400);
+  expect(await nonIframe.text()).toContain('STATE_MISMATCH');
+  for (const query of ['', 'state=', `state=${'a'.repeat(513)}`]) {
+    const invalidState = await call(`/api/auth/callback/wechat${query ? `?${query}` : ''}`, {
+      origin: false,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+    });
+    expect(invalidState.status).toBe(400);
+  }
+  for (const cookie of ['mio.state=', '__Secure-mio.state=wrong-scheme']) {
+    const bridged = await call(
+      `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+      {
+        origin: false,
+        cookie,
+        headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+      },
+    );
+    expect(bridged.status).toBe(200);
+    expect(bridged.headers.get('content-type')).toContain('text/html');
+  }
+  expect(exchanges).toBe(0);
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
+  const direct = await call(
+    `/api/auth/callback/wechat?${new URLSearchParams({ state: qr.state, code: 'guard-ok' })}`,
+    {
+      origin: false,
+      cookie: qr.cookie,
+      headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' },
+    },
+  );
+  expect(direct.status).toBe(302);
+  expect(direct.headers.get('location')).toBe(`${origins[0]}/auth/wechat/qr-complete`);
+  expect(exchanges).toBe(1);
+  expect(await (await pollQR(qr, cookies(direct))).json()).toEqual({ status: 'confirmed' });
+  const seenUrls: string[] = [];
+  const spyHandler = vi.fn(async (input: Request) => {
+    seenUrls.push(input.url);
+    return new Response(null, { status: 204 });
+  });
+  const spyServer = createServer(
+    createAuthHandler(
+      {
+        baseURL: 'http://localhost',
+        secret,
+        databaseURL: database.url,
+        origins: ['http://localhost'],
+        smsLimits: { phoneHour: 5, phoneDay: 10, ipHour: 20, ipDay: 100, globalDay: 1000 },
+        wechat: { appId, appSecret: 'fixture-secret' },
+      },
+      { handler: spyHandler } as unknown as Authentication,
+    ),
+  );
+  try {
+    spyServer.listen(0, '127.0.0.1');
+    await once(spyServer, 'listening');
+    const address = spyServer.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    const spyOrigin = `http://127.0.0.1:${address.port}`;
+    const spyHop1 = await originalFetch(
+      `${spyOrigin}/api/auth/callback/wechat?state=xyz&code=abc`,
+      { headers: { 'sec-fetch-dest': 'iframe' } },
+    );
+    expect(spyHop1.status).toBe(200);
+    expect(spyHandler).toHaveBeenCalledTimes(0);
+    const spyHop2 = await originalFetch(
+      `${spyOrigin}/api/auth/callback/wechat?state=xyz&code=abc&mio_bridge=1`,
+      { headers: { 'sec-fetch-dest': 'iframe' } },
+    );
+    expect(spyHop2.status).toBe(204);
+    expect(spyHandler).toHaveBeenCalledTimes(1);
+    const forwarded = new URL(seenUrls[0]!);
+    expect(forwarded.pathname).toBe('/api/auth/callback/wechat');
+    expect(forwarded.searchParams.get('state')).toBe('xyz');
+    expect(forwarded.searchParams.get('code')).toBe('abc');
+    expect(forwarded.searchParams.has('mio_bridge')).toBe(false);
+  } finally {
+    await new Promise<void>((resolve) => spyServer.close(() => resolve()));
+  }
+});
+
+it('distinguishes __Secure-mio.state under HTTPS iframe bridge and rejects disabled WeChat with 503', async () => {
+  for (const enabled of [true, false]) {
+    const config = readAuthConfig({
+      MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: database.url,
+      ...(enabled
+        ? {
+            MIO_AUTH_WECHAT_ENABLED: 'true',
+            MIO_AUTH_WECHAT_APP_ID: appId,
+            MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
+          }
+        : {}),
+    })!;
+    const auth = await createAuthentication(config);
+    const server = createServer(createAuthHandler(config, auth));
+    try {
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('missing address');
+      const origin = `http://127.0.0.1:${address.port}`;
+      if (enabled) {
+        const created = await originalFetch(`${origin}/api/auth/wechat/qr-session`, {
+          method: 'POST',
+          headers: { origin: config.baseURL, 'content-type': 'application/json' },
+          body: '{}',
+        });
+        expect(created.status).toBe(201);
+        const httpsCookies = cookies(created);
+        expect(httpsCookies).toContain('__Secure-mio.state=');
+        const body = (await created.json()) as { authorization_url: string };
+        const state = new URL(body.authorization_url).searchParams.get('state')!;
+        const wrongCookieName = await originalFetch(
+          `${origin}/api/auth/callback/wechat?${new URLSearchParams({ state, code: 'https-iframe' })}`,
+          {
+            redirect: 'manual',
+            headers: {
+              'sec-fetch-dest': 'iframe',
+              'sec-fetch-site': 'cross-site',
+              cookie: 'mio.state=wrong-prefix',
+            },
+          },
+        );
+        expect(wrongCookieName.status).toBe(200);
+        expect(wrongCookieName.headers.get('content-type')).toContain('text/html');
+        expect(exchanges).toBe(0);
+        fixtures.set('https-iframe', { openid: 'https-iframe-user' });
+        const direct = await originalFetch(
+          `${origin}/api/auth/callback/wechat?${new URLSearchParams({ state, code: 'https-iframe' })}`,
+          {
+            redirect: 'manual',
+            headers: {
+              'sec-fetch-dest': 'iframe',
+              'sec-fetch-site': 'same-origin',
+              cookie: httpsCookies,
+            },
+          },
+        );
+        expect(direct.status).toBe(302);
+        expect(direct.headers.get('location')).toBe(
+          'https://mio-qr.example.test/auth/wechat/qr-complete',
+        );
+        expect(exchanges).toBe(1);
+      } else {
+        const disabled = await originalFetch(
+          `${origin}/api/auth/callback/wechat?state=disabled-state&code=disabled-code`,
+          {
+            redirect: 'manual',
+            headers: { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'cross-site' },
+          },
+        );
+        expect(disabled.status).toBe(503);
+        expect(await disabled.text()).toContain('WECHAT_UNAVAILABLE');
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await auth.close();
+    }
   }
 });

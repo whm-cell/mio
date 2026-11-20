@@ -395,19 +395,16 @@ export function createMaterialService(
         const inputHash = hash({ id, revision, scope });
         const old = await store.previous(owner, opKind, requestId, inputHash);
         if (old) return operationResult(owner, old);
-        const group = kind === 'group' ? await store.ownedGroup(owner, id) : undefined;
+        const upstreamGroupId =
+          kind === 'group' ? await store.precheckGroupDelete(owner, id, revision) : undefined;
         if (kind === 'material') await store.ownedMaterial(owner, id);
         const snapshot = await credentials.snapshotAccount(owner);
-        if (group) {
-          if (group.revision !== revision)
-            throw new MaterialError(HTTP_STATUS.CONFLICT, 'REVISION_CONFLICT');
-          if (group.state !== 'ready' || !group.upstream_group_id)
-            throw new MaterialError(HTTP_STATUS.CONFLICT, 'MATERIAL_GROUP_NOT_READY');
+        if (upstreamGroupId) {
           stop.signal.throwIfAborted();
           const key = credentials.openAccountSnapshot(owner, snapshot);
           let absent = false;
           try {
-            await upstream.getGroup(key, group.upstream_group_id, stop.signal);
+            await upstream.getGroup(key, upstreamGroupId, stop.signal);
           } catch (error) {
             if (
               !(error instanceof MaterialUpstreamError) ||

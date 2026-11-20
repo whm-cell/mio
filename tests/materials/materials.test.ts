@@ -392,6 +392,142 @@ it('keeps local deletion offline and rejects nonempty group deletion without imp
   expect(f.groups.size).toBe(1);
 });
 
+it.each(['sync lease', 'unsettled operation'] as const)(
+  'rejects remote group deletion with an active %s before credentials or upstream access',
+  async (scenario) => {
+    const f = await fixture();
+    const group = await f.create();
+    if (scenario === 'sync lease') {
+      await f.store.claimGroup(f.actor.userId, group.groupId, undefined, null);
+    } else {
+      f.add(group.upstreamId);
+      await f.service.sync(f.actor, group.groupId);
+      const material = (await f.store.materials(f.actor.userId, group.groupId, 20))[0]!;
+      await f.store.beginDelete(
+        f.actor.userId,
+        randomUUID(),
+        sha256Utf8(
+          JSON.stringify({ id: material.id, revision: material.revision, scope: 'upstream' }),
+        ),
+        'material',
+        material.id,
+        material.revision,
+        await f.provider.snapshotAccount(f.actor.userId),
+      );
+    }
+
+    const snapshot = vi.spyOn(f.provider, 'snapshotAccount');
+    const decrypt = vi.spyOn(f.provider, 'openAccountSnapshot');
+    const before = f.transport.mock.calls.length;
+    await expect(
+      f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'upstream'),
+    ).rejects.toMatchObject({ status: 409, code: 'MATERIAL_BUSY' });
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(decrypt).not.toHaveBeenCalled();
+    expect(f.transport).toHaveBeenCalledTimes(before);
+    expect(await f.service.group(f.actor, group.groupId)).toMatchObject({
+      state: 'ready',
+      revision: group.revision,
+    });
+    expect(
+      (
+        await f.pool.query(
+          "SELECT id FROM mio_material_operations WHERE owner_id=$1 AND kind='delete_group_upstream'",
+          [f.actor.userId],
+        )
+      ).rowCount,
+    ).toBe(0);
+  },
+);
+
+it.each([403, 503] as const)(
+  'keeps a nonempty local group rejection ahead of a preset upstream %i response',
+  async (status) => {
+    const f = await fixture();
+    const group = await f.create();
+    f.add(group.upstreamId);
+    await f.service.sync(f.actor, group.groupId);
+    f.override(async (action) =>
+      action === 'GetAssetGroup'
+        ? envelope(action, {}, status, status === 403 ? 'Forbidden' : 'ServiceUnavailable')
+        : undefined,
+    );
+
+    const snapshot = vi.spyOn(f.provider, 'snapshotAccount');
+    const decrypt = vi.spyOn(f.provider, 'openAccountSnapshot');
+    const before = f.transport.mock.calls.length;
+    await expect(
+      f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'upstream'),
+    ).rejects.toMatchObject({ status: 409, code: 'RESOURCE_IN_USE' });
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(decrypt).not.toHaveBeenCalled();
+    expect(f.transport).toHaveBeenCalledTimes(before);
+    expect(await f.service.group(f.actor, group.groupId)).toMatchObject({
+      state: 'ready',
+      revision: group.revision,
+    });
+    expect(
+      f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+    ).toHaveLength(0);
+  },
+);
+
+it.each(['sync lease', 'nonempty material', 'group revision'] as const)(
+  'rechecks %s changes after the remote group 404 before deleting locally',
+  async (scenario) => {
+    const f = await fixture();
+    const group = await f.create();
+    f.override(async (action) => {
+      if (action !== 'GetAssetGroup') return;
+      if (scenario === 'sync lease')
+        await f.pool.query(
+          "UPDATE mio_material_groups SET sync_lease_id=$2,sync_lease_until=clock_timestamp()+interval '60 seconds' WHERE id=$1",
+          [group.groupId, randomUUID()],
+        );
+      else if (scenario === 'nonempty material')
+        await f.pool.query(
+          `INSERT INTO mio_materials(id,owner_id,provider_type,group_id,upstream_asset_id,asset_type,name,state,registration_credential_version)
+           VALUES($1,$2,'onelink',$3,'asset-20261120009999-abcde','image','Concurrent','active',1)`,
+          [randomUUID(), f.actor.userId, group.groupId],
+        );
+      else
+        await f.pool.query('UPDATE mio_material_groups SET revision=revision+1 WHERE id=$1', [
+          group.groupId,
+        ]);
+      return envelope(action, {}, 404, 'ResourceNotFound');
+    });
+
+    await expect(
+      f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'upstream'),
+    ).rejects.toMatchObject(
+      scenario === 'group revision'
+        ? { status: 409, code: 'REVISION_CONFLICT' }
+        : {
+            status: 409,
+            code: scenario === 'sync lease' ? 'MATERIAL_BUSY' : 'RESOURCE_IN_USE',
+          },
+    );
+    expect(
+      f.transport.mock.calls.filter(([url]) => String(url).includes('Action=GetAssetGroup')),
+    ).toHaveLength(1);
+    expect(
+      f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+    ).toHaveLength(0);
+    expect(
+      (await f.pool.query('SELECT state FROM mio_material_groups WHERE id=$1', [group.groupId]))
+        .rows[0].state,
+    ).toBe('ready');
+    expect(
+      (
+        await f.pool.query(
+          "SELECT id FROM mio_material_operations WHERE owner_id=$1 AND kind='delete_group_upstream'",
+          [f.actor.userId],
+        )
+      ).rowCount,
+    ).toBe(0);
+  },
+);
+
 it.each(['local tombstone', 'unsynchronized material', 'external insertion'] as const)(
   'rejects remote group deletion with %s before creating a deletion operation',
   async (scenario) => {
@@ -519,6 +655,58 @@ it('keeps historical unknown group deletion idempotent and holds recovery to one
   expect(
     f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
   ).toHaveLength(0);
+});
+
+it('recovers a historical unknown group deletion by original identity on exact 404', async () => {
+  const f = await fixture();
+  const group = await f.create();
+  const requestId = randomUUID();
+  const { operation } = await f.store.beginDelete(
+    f.actor.userId,
+    requestId,
+    sha256Utf8(JSON.stringify({ id: group.groupId, revision: group.revision, scope: 'upstream' })),
+    'group',
+    group.groupId,
+    group.revision,
+    await f.provider.snapshotAccount(f.actor.userId),
+  );
+  await f.store.failOperation(f.actor.userId, operation, true, 'UPSTREAM_RESULT_UNKNOWN');
+  f.override(async (action) =>
+    action === 'GetAssetGroup' ? envelope(action, {}, 404, 'ResourceNotFound') : undefined,
+  );
+
+  expect(await f.service.operation(f.actor, operation.id)).toMatchObject({
+    operationId: operation.id,
+    state: 'succeeded',
+    resultLocalId: group.groupId,
+  });
+  const gets = f.transport.mock.calls.filter(([url]) =>
+    String(url).includes('Action=GetAssetGroup'),
+  );
+  expect(gets).toHaveLength(1);
+  expect(JSON.parse(String(gets[0]![1]?.body))).toMatchObject({ Id: group.upstreamId });
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+  ).toHaveLength(0);
+  expect(
+    (
+      await f.pool.query(
+        'SELECT id,request_id,kind,state,result_local_id,protocol_snapshot FROM mio_material_operations WHERE id=$1',
+        [operation.id],
+      )
+    ).rows[0],
+  ).toMatchObject({
+    id: operation.id,
+    request_id: requestId,
+    kind: 'delete_group_upstream',
+    state: 'succeeded',
+    result_local_id: group.groupId,
+    protocol_snapshot: { version: 1, upstreamId: group.upstreamId },
+  });
+  expect(
+    (await f.pool.query('SELECT state FROM mio_material_groups WHERE id=$1', [group.groupId]))
+      .rows[0].state,
+  ).toBe('deleted');
 });
 
 it('records deterministic pre-send decryption failure as failed with no upstream call, leaving deletion resource usable', async () => {

@@ -634,6 +634,16 @@ export class MaterialStore {
       throw conflict('RESOURCE_IN_USE');
   }
 
+  async precheckGroupDelete(owner: string, id: string, revision: number): Promise<string> {
+    return this.transaction(async (client) => {
+      const group = await this.group(client, owner, id, true);
+      this.assertMutable(group, revision);
+      await this.assertIdle(client, owner, group);
+      await this.assertEmpty(client, owner, id);
+      return group.upstream_group_id!;
+    });
+  }
+
   async beginDelete(
     owner: string,
     requestId: string,

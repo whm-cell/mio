@@ -394,7 +394,8 @@ export async function createConversationStore(databaseURL: string): Promise<Conv
       `UPDATE mio_conversation_requests SET status='unknown',error_code='PROCESS_INTERRUPTED',updated_at=now() WHERE status IN ('accepted','input-persisted')`,
     );
     await lease.query(
-      `UPDATE mio_conversations SET active_request=NULL,state=CASE WHEN state='creating' THEN 'unknown' ELSE state END`,
+      `UPDATE mio_conversations SET active_request=NULL,state=CASE WHEN state='creating' THEN 'unknown' ELSE state END
+       WHERE active_request IS NOT NULL OR state='creating'`,
     );
     return new ConversationStore(pool, lease);
   } catch (error) {

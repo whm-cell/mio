@@ -552,6 +552,8 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             sequential_image_generation_options: { max_images: 2 },
           });
 
+          // Completion is committed before verification; drain the active execution first.
+          await generationService.close();
           const refreshedCatalog = await providerService.catalog(actor);
           expect(
             refreshedCatalog.items.find((i) => i.modelId === 's-chat-custom-2048')?.adaptation

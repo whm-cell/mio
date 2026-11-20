@@ -1,0 +1,43 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-material-library/prd.md",
+  "results": [
+    {
+      "key": "material-library-unit3",
+      "title": "Unit 3 手机扫码真人认证与会话恢复",
+      "locations": [
+        {
+          "path": "docs/apis/materials.md",
+          "purpose": "公开手机回跳、本人会话管理、认证结果及撤销说明的现行契约"
+        },
+        {
+          "path": "src/materials/auth-http.ts",
+          "purpose": "精确手机 GET 分流、供应商附加字段处理及固定脱敏响应"
+        },
+        {
+          "path": "src/materials/auth-service.ts",
+          "purpose": "原会话摘要核对、owner 复核、上游授权确认及审计过滤"
+        },
+        {
+          "path": "src/materials/auth-store.ts",
+          "purpose": "会话事务、归属关联及完成与到期密文回收"
+        },
+        {
+          "path": "docs/integrations/postgres.md",
+          "purpose": "会话表、审计增量迁移与清理的存储契约"
+        }
+      ],
+      "outcomes": "已支持本人从桌面会话扫码，手机公开回跳经严格双字段和原摘要验证后，由服务端核对上游组并同事务完成、清密文及绑定本人 verified 真人组。支持本人显式恢复原会话、已完成回放、20 分钟到期回收与有界上游审计。撤下公开认证入口时，健康运行的素材服务仍清理到期会话。",
+      "verification": "本人真机在本地 Dev + 临时 HTTPS 验收。launch 302、附带 6 个供应商字段的 complete 200，创建/查结果/验组各 1 次。原会话已完成、密文归零，桌面自动出现归属本人且 verified 的真人组。隔离 PG 与协议替身验证刷新、重开服务与重放。定向 378 项、静态构建、打包和装载检查通过，独立质量与规范审查通过。GitHub Actions 44705557870 完整模式 1291 项及最终 smoke、gate 通过。",
+      "limitations": "真机现场覆盖本地 Dev、临时 HTTPS 和验收 Demo。真实桌面自动出现已由本人观察，主动刷新和后端重启由隔离回归验证。旧新供应商组 ID 未直接比对。第三方授权撤销经平台实际渠道办理。整个素材服务停机或数据库不可用时，后台物理清理顺延。生产验收和正式前端属独立交付。",
+      "acceptance": {
+        "candidate": {
+          "commit": "84a26e3bfed7a02a79b58d2d207dd5db95c15575",
+          "contractRevision": 2
+        },
+        "statement": "接受 Unit 3，完成交付",
+        "reference": "2026-11-20 Codex 素材库 Unit 3 验收聊天。用户在明确展示候选 84a26e3（契约修订 2）的交付草案后回复。"
+      }
+    }
+  ]
+}

@@ -45,6 +45,10 @@ it.each(['before-delete', 'after-first-delete'] as const)(
         (await readdir(join(f.directory, job.jobId))).some((file) => file.endsWith('.png')),
       ).toBe(true);
       await f.stop();
+      expect(clean).toHaveBeenCalled();
+      expect(
+        (await readdir(join(f.directory, job.jobId))).filter((file) => file.endsWith('.png')),
+      ).toHaveLength(failure === 'before-delete' ? 2 : 1);
       clean.mockRestore();
       await f.start();
       await vi.waitFor(

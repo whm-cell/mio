@@ -54,6 +54,72 @@ function within(path: string, root: string) {
   return path === root || path.startsWith(`${root}${sep}`);
 }
 
+async function existingCanonicalPath(path: string): Promise<string | null> {
+  try {
+    return await realpath(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function runCiGroup(groupArgs: string[]) {
+  if (process.env.GITHUB_ACTIONS !== 'true')
+    throw new Error('CHECK_CI_ONLY: ci-group runs in GitHub Actions');
+  const [group, ...extra] = groupArgs;
+  if (extra.length > 0 || (group !== 'harness' && group !== 'service'))
+    throw new Error('CI_GROUP: expected exactly one group: harness or service');
+  if (!process.env.MIO_TEST_DATABASE_URL) delete process.env.MIO_TEST_DATABASE_URL;
+  if (!process.env.MIO_TEST_REDIS_URL) delete process.env.MIO_TEST_REDIS_URL;
+  process.env.TEST = 'true';
+  process.env.VITEST = 'true';
+  process.env.NODE_ENV ??= 'test';
+  const { createVitest } = await import('vitest/node');
+  const vitest = await createVitest('test', { watch: false });
+  try {
+    const specifications = await vitest.globTestSpecifications();
+    const harnessRoots = (
+      await Promise.all(
+        ['tests/harness', 'tests/environment'].map((dir) => existingCanonicalPath(resolve(dir))),
+      )
+    ).filter((dir): dir is string => dir !== null);
+    const entries = await Promise.all(
+      specifications.map(async (specification) => ({
+        specification,
+        canonical: await realpath(specification.moduleId),
+      })),
+    );
+    entries.sort((left, right) => left.canonical.localeCompare(right.canonical));
+    const seen = new Set<string>();
+    const harness: typeof specifications = [];
+    const service: typeof specifications = [];
+    for (const { specification, canonical } of entries) {
+      const key = `${specification.project.name}:${canonical}`;
+      if (seen.has(key)) throw new Error(`CI_GROUP: duplicate test specification: ${canonical}`);
+      seen.add(key);
+      if (harnessRoots.some((root) => within(canonical, root))) harness.push(specification);
+      else service.push(specification);
+    }
+    if (harness.length + service.length !== specifications.length)
+      throw new Error('CI_GROUP: partition size mismatch');
+    const selected = group === 'harness' ? harness : service;
+    const complement = group === 'harness' ? service : harness;
+    if (!selected.length) throw new Error(`CI_GROUP: no tests found for group ${group}`);
+    console.log(
+      JSON.stringify({
+        group,
+        selected: selected.length,
+        complement: complement.length,
+        total: specifications.length,
+      }),
+    );
+    await vitest.standalone();
+    await vitest.runTestSpecifications(selected);
+  } finally {
+    await vitest.close();
+  }
+}
+
 type LocalRegressionCandidate = {
   file: string;
   hasRegressionKeys: boolean;
@@ -177,6 +243,10 @@ async function main() {
   if (action === 'check') {
     if (process.env.GITHUB_ACTIONS !== 'true')
       throw new Error('CHECK_CI_ONLY: full pnpm check runs in GitHub Actions');
+    return;
+  }
+  if (action === 'ci-group') {
+    await runCiGroup(args);
     return;
   }
   if (action !== 'test' && action !== 'local') throw new Error('VALIDATION_ACTION');

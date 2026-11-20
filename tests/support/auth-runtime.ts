@@ -3,12 +3,63 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import {
+  access,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
+
+function runCheckedCommand(bin: string, args: string[]): void {
+  const result = spawnSync(bin, args, { encoding: 'utf8', timeout: 60000 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+}
+
+/**
+ * Unpack the built plugin package into an isolated per-call temp directory.
+ * Reuses a verified read-only archive when MIO_TEST_PACKED_ARCHIVE is set;
+ * otherwise builds and packs an isolated stage without touching repo dist/.
+ */
+export async function unpackPluginPackage(directory: string): Promise<string> {
+  const prepacked = process.env.MIO_TEST_PACKED_ARCHIVE?.trim();
+  if (prepacked) {
+    const archivePath = resolve(prepacked);
+    await access(archivePath, constants.R_OK);
+    runCheckedCommand('tar', ['-xzf', archivePath, '-C', directory]);
+  } else {
+    const stage = join(directory, 'stage');
+    await mkdir(stage);
+    for (const path of ['package.json', 'cordis.patch.yml', 'README.md', 'AGENTS.md', 'docs'])
+      await cp(resolve(path), join(stage, path), { recursive: true });
+    // Existing auth tests build their own project dist. This fixture never writes or packs it.
+    runCheckedCommand(process.execPath, [
+      'node_modules/typescript/bin/tsc',
+      '-p',
+      'tsconfig.build.json',
+      '--outDir',
+      join(stage, 'dist'),
+    ]);
+    runCheckedCommand('npm', ['pack', stage, '--ignore-scripts', '--pack-destination', directory]);
+    const [archive] = (await readdir(directory)).filter((file) => file.endsWith('.tgz'));
+    assert(archive);
+    runCheckedCommand('tar', ['-xzf', join(directory, archive), '-C', directory]);
+  }
+  const packed = join(directory, 'package');
+  await access(join(packed, 'dist/plugin.js'), constants.R_OK);
+  await symlink(resolve('node_modules'), join(packed, 'node_modules'), 'dir');
+  return packed;
+}
 
 /** Real official Profile, packed dist only, fixed port/secret/DB across controlled stops. */
 export async function packedAuthRuntime(
@@ -25,28 +76,13 @@ export async function packedAuthRuntime(
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'mio-redis-profile-'));
-  const command = (bin: string, args: string[]) => {
-    const result = spawnSync(bin, args, { encoding: 'utf8', timeout: 60000 });
-    assert.equal(result.status, 0, result.stdout + result.stderr);
-  };
-  const stage = join(directory, 'stage');
-  await mkdir(stage);
-  for (const path of ['package.json', 'cordis.patch.yml', 'README.md', 'AGENTS.md', 'docs'])
-    await cp(resolve(path), join(stage, path), { recursive: true });
-  // Existing auth tests build their own project dist. This fixture never writes or packs it.
-  command(process.execPath, [
-    'node_modules/typescript/bin/tsc',
-    '-p',
-    'tsconfig.build.json',
-    '--outDir',
-    join(stage, 'dist'),
-  ]);
-  command('npm', ['pack', stage, '--ignore-scripts', '--pack-destination', directory]);
-  const [archive] = (await readdir(directory)).filter((file) => file.endsWith('.tgz'));
-  assert(archive);
-  command('tar', ['-xzf', join(directory, archive), '-C', directory]);
-  const packed = join(directory, 'package');
-  await symlink(resolve('node_modules'), join(packed, 'node_modules'), 'dir');
+  let packed: string;
+  try {
+    packed = await unpackPluginPackage(directory);
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
   const home = join(directory, 'home');
   await prepareProfile(home, packed);
   const observationsPath = join(directory, 'model-fixture/requests.jsonl');

@@ -12,7 +12,8 @@ permissions:
   contents: read
 jobs:
   scope:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       mode: ${{ steps.select.outputs.mode }}
     steps:
@@ -24,11 +25,11 @@ jobs:
           node-version: 24.22.2
       - id: select
         run: node scripts/harness/ci-scope.ts
-  check:
+  harness:
     needs: scope
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
@@ -39,9 +40,8 @@ jobs:
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      MIO_CI_SCOPE: ${{ needs.scope.result == 'success' && needs.scope.outputs.mode || 'full' }}
       MIO_TEST_DATABASE_URL: postgresql://mio_test:mio_fixture_only@127.0.0.1:5432/mio_auth_test
-      VITEST_MAX_WORKERS: '2'
+      VITEST_MAX_WORKERS: '4'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -52,29 +52,149 @@ jobs:
           node-version: 24.22.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Install FFmpeg for media tests
-        if: env.MIO_CI_SCOPE != 'harness'
+      - name: Run static checks
+        run: pnpm check:static:base
+      - name: Run harness and environment tests
+        run: node scripts/harness/validation-entry.ts ci-group harness
+  service:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.mode != 'harness') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+        env:
+          POSTGRES_USER: mio_test
+          POSTGRES_PASSWORD: mio_fixture_only
+          POSTGRES_DB: mio_auth_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIO_TEST_DATABASE_URL: postgresql://mio_test:mio_fixture_only@127.0.0.1:5432/mio_auth_test
+      VITEST_MAX_WORKERS: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.6.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Cache static FFmpeg 8.0.1
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mio-ci/ffmpeg-8.0.1
+          key: mio-ffmpeg-8.0.1-${{ runner.os }}-${{ runner.arch }}-252705ff
+      - name: Extract digest-pinned static FFmpeg 8.0.1
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends -o Acquire::Retries=3 ffmpeg
+          set -euo pipefail
+          FFMPEG_DIR="$HOME/.cache/mio-ci/ffmpeg-8.0.1"
+          mkdir -p "$FFMPEG_DIR"
+          trap 'docker rm -f mio-ffmpeg >/dev/null 2>&1 || true' EXIT
+          docker rm -f mio-ffmpeg >/dev/null 2>&1 || true
+          docker create --name mio-ffmpeg mwader/static-ffmpeg:8.0.1@sha256:252705ff88532fa338e7065c21792756552f8fe7c212f84bc503d3c340689594
+          docker cp mio-ffmpeg:/ffmpeg "$FFMPEG_DIR/ffmpeg"
+          docker cp mio-ffmpeg:/ffprobe "$FFMPEG_DIR/ffprobe"
+          chmod +x "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
+      - name: Configure and verify FFmpeg 8.0.1
+        run: |
+          set -euo pipefail
+          FFMPEG_DIR="$HOME/.cache/mio-ci/ffmpeg-8.0.1"
+          echo "$FFMPEG_DIR" >> "$GITHUB_PATH"
+          export PATH="$FFMPEG_DIR:$PATH"
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version
+          ffprobe -version
+          ENCODERS="$(ffmpeg -hide_banner -encoders)"
+          grep -Eq '(^|[[:space:]])libx264([[:space:]]|$)' <<<"$ENCODERS"
+          grep -Eq '(^|[[:space:]])aac([[:space:]]|$)' <<<"$ENCODERS"
+      - name: Cache Redis 8.2.11 test binary
+        id: redis-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mio-ci/redis-8.2.11
+          key: mio-redis-8.2.11-${{ runner.os }}-${{ runner.arch }}-fba14b77
       - name: Build isolated Redis 8.2.11 test binary
-        if: env.MIO_CI_SCOPE != 'harness'
+        if: steps.redis-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
+          REDIS_DIR="$HOME/.cache/mio-ci/redis-8.2.11"
+          mkdir -p "$REDIS_DIR"
           curl --fail --location https://download.redis.io/releases/redis-8.2.11.tar.gz -o "$RUNNER_TEMP/redis-8.2.11.tar.gz"
           echo "fba14b77c4bdcb2d5418b6741fc0cdaac4b78bc73eab9b2e5f3c255d597f16fa  $RUNNER_TEMP/redis-8.2.11.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/redis-8.2.11.tar.gz" -C "$RUNNER_TEMP"
-          make -C "$RUNNER_TEMP/redis-8.2.11" -j2 MALLOC=libc
-          echo "MIO_TEST_REDIS_SERVER=$RUNNER_TEMP/redis-8.2.11/src/redis-server" >> "$GITHUB_ENV"
-      - name: Run harness and consumer checks
-        if: env.MIO_CI_SCOPE == 'harness'
+          make -C "$RUNNER_TEMP/redis-8.2.11" -j"$(nproc)" MALLOC=libc
+          cp "$RUNNER_TEMP/redis-8.2.11/src/redis-server" "$REDIS_DIR/redis-server"
+          chmod +x "$REDIS_DIR/redis-server"
+      - name: Configure and verify Redis 8.2.11 test binary
         run: |
-          pnpm format:check
-          pnpm typecheck
-          pnpm lint
-          pnpm guard
-          pnpm exec vitest run tests/harness/ tests/environment/
-      - name: Run full checks
-        if: env.MIO_CI_SCOPE != 'harness'
+          set -euo pipefail
+          REDIS_BIN="$HOME/.cache/mio-ci/redis-8.2.11/redis-server"
+          VERSION="$("$REDIS_BIN" --version)"
+          echo "$VERSION"
+          grep -Fq 'v=8.2.11' <<<"$VERSION"
+          echo "MIO_TEST_REDIS_SERVER=$REDIS_BIN" >> "$GITHUB_ENV"
+      - name: Build and pre-pack plugin archive for profile fixtures
+        run: |
+          set -euo pipefail
+          pnpm build
+          PACK_DIR="$RUNNER_TEMP/mio-packed"
+          rm -rf "$PACK_DIR"
+          mkdir -p "$PACK_DIR"
+          npm pack --ignore-scripts --pack-destination "$PACK_DIR"
+          shopt -s nullglob
+          ARCHIVES=("$PACK_DIR"/*.tgz)
+          if [ "${#ARCHIVES[@]}" -ne 1 ]; then
+            echo "Expected exactly 1 packed archive in $PACK_DIR, found ${#ARCHIVES[@]}" >&2
+            exit 1
+          fi
+          echo "MIO_TEST_PACKED_ARCHIVE=${ARCHIVES[0]}" >> "$GITHUB_ENV"
+      - name: Run service and worker tests
         run: |
           node -e 'console.log({node: process.version, availableParallelism: require("node:os").availableParallelism(), vitestMaxWorkers: process.env.VITEST_MAX_WORKERS})'
-          pnpm check
+          node scripts/harness/validation-entry.ts ci-group service
+      - name: Build and run packed profile smoke test
+        run: |
+          pnpm build
+          pnpm test:smoke
+  check:
+    needs: [scope, harness, service]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SCOPE_RESULT: ${{ needs.scope.result }}
+      SCOPE_MODE: ${{ needs.scope.outputs.mode }}
+      HARNESS_RESULT: ${{ needs.harness.result }}
+      SERVICE_RESULT: ${{ needs.service.result }}
+    steps:
+      - name: Enforce Foundation checks gate
+        run: |
+          set -euo pipefail
+          echo "Foundation checks summary: scope=${SCOPE_RESULT} mode=${SCOPE_MODE:-<unset>} harness=${HARNESS_RESULT} service=${SERVICE_RESULT}"
+          if [ "${SCOPE_RESULT}" != "success" ]; then
+            echo "Gate failed: scope job result is '${SCOPE_RESULT}'" >&2
+            exit 1
+          fi
+          if [ "${HARNESS_RESULT}" != "success" ]; then
+            echo "Gate failed: harness job result is '${HARNESS_RESULT}'" >&2
+            exit 1
+          fi
+          if [ "${SCOPE_MODE}" = "harness" ]; then
+            if [ "${SERVICE_RESULT}" != "skipped" ]; then
+              echo "Gate failed: expected service job to be 'skipped' for harness-only scope, got '${SERVICE_RESULT}'" >&2
+              exit 1
+            fi
+          else
+            if [ "${SERVICE_RESULT}" != "success" ]; then
+              echo "Gate failed: service job result is '${SERVICE_RESULT}' for mode '${SCOPE_MODE:-<unset>}'" >&2
+              exit 1
+            fi
+          fi
+          echo "Foundation checks gate passed."

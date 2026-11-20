@@ -24,7 +24,7 @@ let ownerId = '';
 const objects = new Map<string, { data: Buffer; etag: string }>();
 const gets = new Map<string, number>();
 const driftAfter = new Map<string, number>();
-const reassignOnSecondRead = new Map<string, string>();
+const reassignDuringRead = new Map<string, string>();
 const call = (path: string, method = 'GET', value?: unknown) =>
   fetch(`${runtime.origin}${path}`, {
     method,
@@ -45,8 +45,8 @@ beforeAll(async () => {
       const count = (gets.get(key) ?? 0) + 1;
       gets.set(key, count);
       if (count > (driftAfter.get(key) ?? Infinity)) return void response.writeHead(412).end();
-      const reassign = reassignOnSecondRead.get(key);
-      if (count === 2 && reassign) {
+      const reassign = reassignDuringRead.get(key);
+      if (count === 1 && reassign) {
         void observer
           .query('UPDATE mio_assets SET owner_id=$2 WHERE id=$1', [reassign, 'other-owner'])
           .then(() =>
@@ -239,19 +239,34 @@ it('accepts owned original and derived sources and rejects unauthorized, unready
     expect(await response.json()).toMatchObject({ error: { code } });
   }
   const changing = await asset({});
-  driftAfter.set(changing.key, 1);
+  driftAfter.set(changing.key, 0);
   const { response } = await send(changing.id);
   expect(response.status, await response.clone().text()).toBe(409);
   expect(await response.json()).toMatchObject({ error: { code: 'ASSET_SOURCE_CHANGED' } });
   const reassigned = await asset({});
-  reassignOnSecondRead.set(reassigned.key, reassigned.id);
+  reassignDuringRead.set(reassigned.key, reassigned.id);
   const noLongerOwned = await send(reassigned.id);
   expect(noLongerOwned.response.status).toBe(404);
   expect(await noLongerOwned.response.json()).toMatchObject({ error: { code: 'ASSET_NOT_FOUND' } });
+  const lateChanging = await asset({});
+  driftAfter.set(lateChanging.key, 1);
+  const late = await send(lateChanging.id);
+  expect(late.response.status, await late.response.clone().text()).toBe(202);
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await call(`/api/v1/conversations/${late.id}/requests/source`)).json()) as {
+            status: string;
+          }
+        ).status,
+    )
+    .toBe('failed');
+  expect(gets.get(lateChanging.key)).toBe(2);
   expect((await runtime.onelinkRequests()).length).toBe(baseline);
 }, 30000);
 
-it('drains an offloaded active turn and a blocked cold history before projection teardown', async () => {
+it('drains an offloaded turn, cancels blocked cold history on shutdown and reads it after restart', async () => {
   const ids = [...objects.keys()].map((key) => key.split('/')[2]!);
   const baseline = (await runtime.onelinkRequests()).length;
   const created = await call('/api/v1/conversations', 'POST', {});
@@ -324,14 +339,15 @@ it('drains an offloaded active turn and a blocked cold history before projection
       state: await runtime.visionHistoryState(),
       logs: runtime.logs(),
     }),
-  ).toBe(200);
-  const cold = await response.json();
-  expect(JSON.stringify(cold)).toContain(ids[0]);
-  expect(JSON.stringify(cold)).toContain(ids[1]);
+  ).toBe(503);
+  expect(await response.json()).toMatchObject({ error: { code: 'CONVERSATION_UNAVAILABLE' } });
   await stopping;
-  expect(await runtime.visionHistoryMarker('completed')).toBe(true);
+  expect(await runtime.visionHistoryMarker('completed')).toBe(false);
+  expect(await runtime.visionHistoryError()).toContain('AbortError');
   await runtime.start('database');
   const replay = await call(`/api/v1/conversations/${id}/history?limit=100`);
   expect(replay.status).toBe(200);
-  expect(JSON.stringify(await replay.json())).toContain(ids[0]);
+  const replayed = JSON.stringify(await replay.json());
+  expect(replayed).toContain(ids[0]);
+  expect(replayed).toContain(ids[1]);
 }, 30000);

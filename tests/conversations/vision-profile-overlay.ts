@@ -89,7 +89,7 @@ export function apply(ctx: Context) {
   ctx.inject(['mioKernel'], (subCtx) => {
     const kernel = subCtx.mioKernel;
     const original = kernel.history;
-    kernel.history = async function (id: string) {
+    kernel.history = async function (id: string, signal?: AbortSignal) {
       const blocked = await readFile(new URL('./block-history', import.meta.url)).then(
         () => true,
         () => false,
@@ -123,7 +123,7 @@ export function apply(ctx: Context) {
         await writeFile(new URL('./history-state', import.meta.url), JSON.stringify(state()));
       }
       try {
-        const result = await original.call(this, id);
+        const result = await original.call(this, id, signal);
         if (blocked) await writeFile(new URL('./history-completed', import.meta.url), 'completed');
         return result;
       } catch (error) {

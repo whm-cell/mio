@@ -19,6 +19,8 @@
 - [开发入口](AGENTS.md)
 - [团队任务协调](docs/coordination.md)
 
+素材库管理通过[素材 HTTP](docs/apis/materials.md)消费：配置 `MIO_MATERIALS_ENABLED=true`，先 assets 迁移，再 `pnpm migrate:dev materials --apply`，启动只读检查；已提供本地组/素材查询、AIGC 建组、同步远端改名、组内单页同步、状态复核与显式本地/远端删除。图片登记、真人认证及视频消费仍按[素材 PRD](docs/tasks/onelink-material-library/prd.md)分期，候选实现与真实业务接受分别报告。
+
 ## 安装与检查
 
 使用 Node 24.22.2（DSH 最低要求 24.9）及 pnpm 11.6.0。版本固定在 package.json 和锁文件；公共安装、构建和 CI 不需要相邻源码仓库、全局 Skills 或成员的个人记录。

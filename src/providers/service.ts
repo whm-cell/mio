@@ -10,6 +10,7 @@ import type {
   ImageRuntimeSnapshot,
   ImageAdmissionSnapshot,
   VerificationSnapshot,
+  AccountCredentialSnapshot,
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
@@ -170,6 +171,42 @@ export function createProviderService(
       config,
     );
   return {
+    async snapshotAccount(ownerId: string): Promise<AccountCredentialSnapshot> {
+      assertOpen();
+      const row = await store.current(ownerId);
+      assertOpen();
+      if (!row || !row.enabled || row.credential_auth_state === 'rejected')
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_UNAVAILABLE');
+      return {
+        providerConfigId: row.id,
+        credentialVersion: row.credential_version,
+        credential: {
+          cipherFormat: row.cipher_format,
+          masterKeyId: row.master_key_id,
+          nonce: row.nonce.toString('base64'),
+          ciphertext: row.ciphertext.toString('base64'),
+          authTag: row.auth_tag.toString('base64'),
+        },
+      };
+    },
+    openAccountSnapshot(ownerId: string, snapshot: AccountCredentialSnapshot): string {
+      assertOpen();
+      return decryptCredential(
+        {
+          cipher_format: snapshot.credential.cipherFormat,
+          master_key_id: snapshot.credential.masterKeyId,
+          nonce: Buffer.from(snapshot.credential.nonce, 'base64'),
+          ciphertext: Buffer.from(snapshot.credential.ciphertext, 'base64'),
+          auth_tag: Buffer.from(snapshot.credential.authTag, 'base64'),
+        },
+        {
+          ownerId,
+          providerId: snapshot.providerConfigId,
+          credentialVersion: snapshot.credentialVersion,
+        },
+        config,
+      );
+    },
     snapshotImage,
     openImageSnapshot(ownerId: string, snapshot: ImageAdmissionSnapshot) {
       assertOpen();

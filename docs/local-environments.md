@@ -52,7 +52,9 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 本地 `dev` 和 `test` 各自在同一私有环境文件设置一次 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID` 和 `MIO_COS_SECRET_KEY`，临时凭据同时设置 `MIO_COS_SESSION_TOKEN`。同环境的 A 和 B 使用这套受限身份，其权限覆盖两项服务实际需要的 COS 操作。旧环境文件中的 `MIO_LOCAL_COMPUTE_COS_*` 可保留，由启动器忽略。`compute:start:dev/test` 仍使用本环境的 B 专用 RabbitMQ 身份和独占持久目录。独立部署的 B 进程自行注入自己的环境，见 [Worker 入口](../compute/README.md)。服务使用非 Root 凭据。临时凭据到期后，更换凭据并重启对应进程，签名 URL 受凭据有效期约束。
 
-`pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 、`compute` 或 `generations`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算或生成迁移，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。未启用域不自动迁移。
+`pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets` 、`compute`、`generations` 或 `materials`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算、生成或素材迁移，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。未启用域不自动迁移。
+
+素材管理显式设置 `MIO_MATERIALS_ENABLED=true` 后启用，沿现有认证、供应商与媒体数据库配置；先 `pnpm migrate:dev assets --apply`，再 `pnpm migrate:dev materials --apply`（test 对应 test）。新增三表保留既有资产，启动仅检查，不自动迁移、枚举上游组或重发 unknown 创建。配置和 HTTP 见[素材契约](apis/materials.md)。Unit 1 不需要模型/default/目录资格，图片登记、真人认证及视频引用随后续单元接入。
 
 ## 常驻 dev 的 OneLink 与对话
 

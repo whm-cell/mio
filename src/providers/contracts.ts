@@ -229,3 +229,10 @@ export interface ImageAdmissionSnapshot extends Omit<ImageRuntimeSnapshot, 'apiK
     readonly authTag: string;
   };
 }
+
+/** Account resources have no model/catalog dependency. Open only for one controlled outbound request. */
+export interface AccountCredentialSnapshot {
+  readonly providerConfigId: string;
+  readonly credentialVersion: number;
+  readonly credential: ImageAdmissionSnapshot['credential'];
+}

@@ -32,6 +32,12 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 [存储](../src/providers/store.ts)自持最多 5 个连接、连接/查询等待各 5 秒。所有用户配置变更在配置行锁下串行；初建 owner 唯一约束及客户端 expectedRevision 防并发覆盖。刷新开始和完成、配置/展示覆盖及偏好更新递增 revision；平台路由实质更新独立递增 `mio_provider_model_routes.declaration_version`。关闭取消并等待发现，先收敛对话运行再关闭本域池；即使对话清理失败也释放本域并保留错误。共同资源约束沿[PostgreSQL](integrations/postgres.md)。
 
+## 无模型账号资源凭据
+
+[供应商服务](../src/providers/service.ts)的 `snapshotAccount(ownerId)` 只核验本人 onelink 配置存在、enabled 且 credential_auth_state 不是 rejected，返回配置身份、credentialVersion 与受控密文快照；不读取模型、默认项、路由或目录资格。`openAccountSnapshot(ownerId,snapshot)` 复用 AES-256-GCM/AAD 解密，仅供一次受控出站请求内存使用；错误 owner 或密钥篡改拒绝。快照与明文不进入 HTTP、日志或持久素材记录。
+
+[素材域](apis/materials.md)是当前消费者。本地列表与详情不依赖当前 Key、不解密或联网；新出站使用当前账号快照，轮换不重绑资源 owner 或改写历史。对已有资源仅通过单资源 Get 核验访问，素材 403 只阻塞该资源出站，不把整个 provider 标 rejected，不删除本地映射；精确 404/ResourceNotFound 与 403 分开处理。素材操作成功不赋予模型 verified，模型目录发现也不授予素材资源权限。关闭先收敛素材消费者，即使消费者清理失败仍关闭供应商池并聚合错误。
+
 ## 目录、刷新与资格
 
 当前 Key 的完整成功 GET /v1/models 是唯一成员权威，raw ID 的大小写、标点和线路后缀不归一。新 ID 无需修改生产名单或发布即进入目录。稳定 `onelink:model:<UUID>` 不含分类/协议；同 ID 移除后再次发现仍复用身份。旧 `onelink:<category>:<rawId>` 无损解析 raw ID，分类不参与新身份，也不重写旧回执。

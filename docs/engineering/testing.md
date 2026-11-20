@@ -34,6 +34,7 @@ MIO_TEST_PACKED_ARCHIVE="$PWD/.work/packed-test/mio-plugin-0.1.0.tgz" pnpm test 
 - **供应商与 OneLink**：`tests/providers/*.test.ts`、`tests/onelink/*.test.ts`；共享模型绑定追查对话消费者，领域要求见[供应商规范](../providers.md)／[OneLink 集成](../integrations/onelink.md)。
 - **对话**：`tests/conversations/*.test.ts`；沿[对话规范](../conversations.md)追查 HTTP、执行引擎、Profile、持久化与恢复。
 - **私有素材与 COS**：`tests/assets/*.test.ts`；资源归属、存储和计算输入的消费者见[素材 API](../apis/assets.md)／[COS 集成](../integrations/cos.md)。
+- **素材库**：`tests/materials/*.test.ts` 覆盖账号级凭据、三表迁移、共享池隔离、组内有界同步、墓碑、租约、明确删除与未知结果恢复，协议替身保持离线；现行行为见[素材 HTTP](../apis/materials.md)。
 - **A 图片生成与恢复**：`tests/generations/*.test.ts`、`tests/compute/images*.test.ts`、`tests/compute/image-concurrency.test.ts` 以及对话图片工具回归；供应商协议、独立执行、持久检查点、原始字节、查询边界与无重复生成沿[OneLink 集成](../integrations/onelink.md)／[图片 API](../apis/compute.md)核对。
 - **计算协议、A 服务与 B Worker**：`tests/compute/*.test.ts`、`tests/integrations/rabbitmq-lifecycle.test.ts`、`compute/tests/*.test.ts`；共享协议追查两端，队列、journal、COS 与真实 FFmpeg 条件见[计算协议](../tasks/compute-service/protocol.md)／[Worker 入口](../../compute/README.md)。
 - **本地环境与部署工具**：`tests/environment/*.test.ts`；配置、拓扑、启动和迁移沿[常驻环境](../local-environments.md)核对。

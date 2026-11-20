@@ -438,6 +438,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/conversations/schema.ts',
         'src/providers/store.ts',
         'src/providers/schema.ts',
+        'src/materials/store.ts',
+        'src/materials/schema.ts',
         'src/assets/store.ts',
         'src/assets/schema.ts',
         'src/compute/store.ts',
@@ -490,7 +492,9 @@ export async function checkSource(root: string, files: readonly string[], harnes
         else {
           edges.push(localTarget);
           if (
-            (beneath(file, 'src/providers') || beneath(file, 'src/conversations')) &&
+            (beneath(file, 'src/providers') ||
+              beneath(file, 'src/conversations') ||
+              beneath(file, 'src/materials')) &&
             beneath(localTarget, 'src/dsh')
           )
             errors.push(`DSH_BOUNDARY ${file}: business modules must not import src/dsh`);

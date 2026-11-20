@@ -127,14 +127,20 @@ async function main(name: 'dev' | 'test') {
   if (action === 'migrate') {
     const domain = args[0] && args[0] !== '--apply' ? args.shift()! : 'auth';
     if (
-      !['auth', 'conversations', 'providers', 'assets', 'compute', 'generations'].includes(
-        domain,
-      ) ||
+      ![
+        'auth',
+        'conversations',
+        'providers',
+        'assets',
+        'compute',
+        'generations',
+        'materials',
+      ].includes(domain) ||
       args.some((arg) => !['--apply', '--with-conversations'].includes(arg)) ||
       (domain !== 'providers' && args.includes('--with-conversations'))
     )
       throw new Error(
-        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations] [--apply]',
+        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials] [--apply]',
       );
     console.log(`${name}: ${domain} migration ${args.includes('--apply') ? 'apply' : 'preview'}`);
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);

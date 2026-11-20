@@ -10,6 +10,7 @@
 | [providers/](providers/)         | 供应商配置、目录、刷新、迁移；领域参考数据在 `providers/fixtures/`            |
 | [onelink/](onelink/)             | OneLink 适配、传输、生命周期及专用模型夹具                                    |
 | [conversations/](conversations/) | 对话 HTTP、执行引擎、Profile 与模型夹具                                       |
+| [materials/](materials/)         | 素材组/素材、账号级凭据、同步隔离、迁移、HTTP 与操作恢复                      |
 | [assets/](assets/)               | 素材归属、HTTP 与 COS                                                         |
 | [compute/](compute/)             | A 服务与共享计算协议；B Worker 测试保留在 [compute/tests/](../compute/tests/) |
 | [integrations/](integrations/)   | Redis 公共资源与 RabbitMQ 生命周期                                            |

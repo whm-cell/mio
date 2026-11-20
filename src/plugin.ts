@@ -35,6 +35,12 @@ import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
+import { readMaterialConfig } from './materials/config.ts';
+import { createMaterialStore } from './materials/store.ts';
+import { createMaterialService } from './materials/service.ts';
+import type { MaterialService } from './materials/service.ts';
+import { createMaterialHandler } from './materials/http.ts';
+import { createMaterialUpstream } from './integrations/onelink/materials.ts';
 import { readGenerationConfig } from './generations/config.ts';
 import { createGenerationStore } from './generations/store.ts';
 import { createGenerationService } from './generations/service.ts';
@@ -60,11 +66,29 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   denyModelTools(ctx);
   const authConfig = readAuthConfig();
   const providerConfig = readProviderConfig();
-  const assetConfig = readAssetConfig();
+  const materialConfig = readMaterialConfig();
+  // A materials-only installation shares the media URL but does not opt into COS/assets.
+  // Any partial COS configuration still reaches the existing strict asset validation.
+  const materialDatabaseOnly =
+    materialConfig &&
+    process.env.MIO_COMPUTE_ENABLED === undefined &&
+    process.env.MIO_GENERATIONS_ENABLED === undefined &&
+    [
+      'MIO_COS_BUCKET',
+      'MIO_COS_REGION',
+      'MIO_COS_SECRET_ID',
+      'MIO_COS_SECRET_KEY',
+      'MIO_COS_SESSION_TOKEN',
+    ].every((key) => process.env[key] === undefined);
+  const assetConfig = readAssetConfig(
+    materialDatabaseOnly ? { ...process.env, MIO_ASSETS_DATABASE_URL: undefined } : process.env,
+  );
   const computeConfig = readComputeConfig();
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
   const generationConfig = readGenerationConfig();
   const imageEnabled = Boolean(generationConfig);
+  if (materialConfig && (!authConfig || !providerConfig))
+    throw new Error('MATERIAL_CONFIG: authentication and providers required');
   if (generationConfig && (!authConfig || !assetConfig || !providerConfig))
     throw new Error('GENERATION_CONFIG: authentication, assets and providers are required');
   const handler = createHandler({
@@ -111,6 +135,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     );
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
+    let materials: MaterialService | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
@@ -202,6 +227,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             failures.push(error);
           }
           try {
+            await materials?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
             await ownedProviders.close();
           } catch (error) {
             failures.push(error);
@@ -217,6 +247,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       } catch (error) {
         await ownedProviders.close();
+        throw error;
+      }
+    }
+    if (materialConfig && providers) {
+      const store = await createMaterialStore(materialConfig.databaseURL);
+      let acquired: MaterialService | undefined;
+      try {
+        materials = acquired = createMaterialService(store, providers, createMaterialUpstream());
+        const owned = acquired;
+        ctx.effect(() => async () => {
+          await owned.close();
+        });
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/materials',
+            handler: createMaterialHandler(owned, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await (acquired ? acquired.close() : store.close());
         throw error;
       }
     }

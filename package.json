@@ -50,6 +50,7 @@
     "profile:prepare": "node scripts/service/prepare-profile.ts",
     "auth:migrate": "node scripts/service/migrate-auth.ts",
     "conversations:migrate": "node scripts/service/migrate-conversations.ts",
+    "materials:migrate": "node scripts/service/migrate-materials.ts",
     "assets:migrate": "node scripts/service/migrate-assets.ts",
     "compute:migrate": "node scripts/service/migrate-compute.ts",
     "providers:migrate": "node scripts/service/migrate-providers.ts",

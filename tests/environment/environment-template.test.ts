@@ -12,6 +12,7 @@ import { readAssetConfig } from '../../src/assets/config.ts';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { readComputeConfig } from '../../src/compute/config.ts';
 import { readConversationConfig } from '../../src/conversations/config.ts';
+import { readMaterialConfig } from '../../src/materials/config.ts';
 import { readGenerationConfig } from '../../src/generations/config.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
 
@@ -58,6 +59,7 @@ const enableSwitches = {
   MIO_AUTH_WECHAT_ENABLED: 'true',
   MIO_COMPUTE_ENABLED: 'true',
   MIO_GENERATIONS_ENABLED: 'true',
+  MIO_MATERIALS_ENABLED: 'true',
 };
 
 async function temporaryDirectory() {
@@ -139,6 +141,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   );
   expect(readComputeConfig(configured) !== undefined, 'MIO_COMPUTE_ENABLED').toBe(true);
   expect(readGenerationConfig(configured) !== undefined, 'MIO_GENERATIONS_ENABLED').toBe(true);
+  expect(readMaterialConfig(configured) !== undefined, 'MIO_MATERIALS_ENABLED').toBe(true);
 });
 
 it('keeps optional domains off after initialization and preserves switch semantics', async () => {

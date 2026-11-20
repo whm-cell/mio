@@ -73,6 +73,16 @@ it('recognizes a pi-ai type alias and rejects business imports of the local DSH 
   await writeFile(join(root, 'src/dsh/pi.ts'), 'export interface Value { id: string }');
   expect(check(root).output).toContain('DSH_BOUNDARY');
 });
+it.each(['src/materials/service.ts', 'src/materials/http.ts'])(
+  'keeps materials outside framework adapters: %s',
+  async (file) => {
+    const root = await fixture({
+      'src/dsh/vision.ts': 'export const value=1;',
+      [file]: "export {value} from '../dsh/vision.ts';",
+    });
+    expect(check(root).output).toContain('DSH_BOUNDARY');
+  },
+);
 afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
@@ -103,6 +113,9 @@ it('rejects the COS package under a business import alias', async () => {
 
 it.each([
   ['scripts/service/import-provider-route.ts', 'src/providers/store.ts', 0],
+  ['scripts/service/migrate-materials.ts', 'src/materials/config.ts', 0],
+  ['scripts/service/migrate-materials.ts', 'src/materials/schema.ts', 0],
+  ['scripts/service/migrate-materials.ts', 'src/materials/service.ts', 1],
   ['scripts/service/import-provider-route.ts', 'src/providers/catalog.ts', 1],
   ['scripts/service/import-provider-route.ts', 'src/providers/contracts.ts', 0],
   ['scripts/service/import-provider-route.ts', 'src/providers/service.ts', 1],
@@ -132,6 +145,10 @@ it.each([
   ['src/conversations-extra/store.ts', 1],
   ['src/providers/store.ts', 0],
   ['src/providers/schema.ts', 0],
+  ['src/materials/store.ts', 0],
+  ['src/materials/schema.ts', 0],
+  ['src/materials/service.ts', 1],
+  ['src/materials-extra/store.ts', 1],
   ['src/providers/service.ts', 1],
   ['src/providers-extra/store.ts', 1],
   ['src/assets/store.ts', 0],

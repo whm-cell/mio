@@ -18,6 +18,8 @@ export function legacyHarness(): HarnessConfig {
         'src/conversations/schema.ts',
         'src/assets/config.ts',
         'src/assets/schema.ts',
+        'src/materials/config.ts',
+        'src/materials/schema.ts',
         'src/providers/config.ts',
         'src/providers/schema.ts',
         'src/providers/store.ts',

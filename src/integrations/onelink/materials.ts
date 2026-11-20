@@ -1,0 +1,198 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { MaterialError } from '../../materials/contracts.ts';
+import type { MaterialUpstream, UpstreamMaterial } from '../../materials/contracts.ts';
+import { ONELINK_ORIGIN } from './models.ts';
+import type { ModelTransport } from './models.ts';
+
+/** An uncertain mutation must never be automatically submitted again. */
+export class MaterialUpstreamError extends MaterialError {
+  readonly uncertain: boolean;
+  constructor(status: number, code: string, uncertain = false) {
+    super(status, code);
+    this.uncertain = uncertain;
+  }
+}
+const groupId = /^group-[0-9]{14}-[a-zA-Z0-9]{5}$/;
+const assetId = /^asset-[0-9]{14}-[a-zA-Z0-9]{5}$/;
+const record = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === 'object' && !Array.isArray(value));
+function invalid(): never {
+  throw new MaterialUpstreamError(
+    HTTP_STATUS.SERVICE_UNAVAILABLE,
+    'UPSTREAM_RESPONSE_INVALID',
+    true,
+  );
+}
+function item(value: unknown, expectedGroup: string): UpstreamMaterial {
+  if (
+    !record(value) ||
+    typeof value.Id !== 'string' ||
+    !assetId.test(value.Id) ||
+    value.GroupId !== expectedGroup ||
+    value.AssetType !== 'Image' ||
+    typeof value.Status !== 'string' ||
+    value.Status.length > 100 ||
+    typeof value.Name !== 'string' ||
+    !value.Name.isWellFormed() ||
+    value.Name.includes('\0') ||
+    Array.from(value.Name).length > 100
+  )
+    return invalid();
+  return { id: value.Id, groupId: expectedGroup, name: value.Name, status: value.Status };
+}
+
+// A transport or response stream that ignores abort must still release the request waiter.
+function bounded<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new MaterialUpstreamError(503, 'UPSTREAM_RESULT_UNKNOWN', true));
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve()
+      .then(() => {
+        signal.throwIfAborted();
+        return work();
+      })
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+/** Fixed OpenAPI actions only: a shared supplier pool must never be enumerated. */
+export function createMaterialUpstream(transport: ModelTransport = fetch): MaterialUpstream {
+  const call = async (
+    action: string,
+    key: string,
+    input: Record<string, unknown>,
+    cancellation: AbortSignal,
+  ) => {
+    const signal = AbortSignal.any([cancellation, AbortSignal.timeout(20_000)]);
+    try {
+      signal.throwIfAborted();
+      const response = await bounded(
+        () =>
+          transport(`${ONELINK_ORIGIN}/volc/openapi?Action=${action}&Version=2024-01-01`, {
+            method: 'POST',
+            redirect: 'error',
+            signal,
+            headers: {
+              authorization: `Bearer ${key}`,
+              'content-type': 'application/json',
+              accept: 'application/json',
+            },
+            body: JSON.stringify(input),
+          }),
+        signal,
+      );
+      const reader = response.body?.getReader();
+      if (!reader) return invalid();
+      const parts: Uint8Array[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          signal.throwIfAborted();
+          const part = await bounded(() => reader.read(), signal);
+          if (part.done) break;
+          size += part.value.byteLength;
+          if (size > 2 * 1024 * 1024) return invalid();
+          parts.push(part.value);
+        }
+      } finally {
+        void reader.cancel().catch(() => {});
+      }
+      signal.throwIfAborted();
+      const raw = Buffer.concat(parts).toString('utf8');
+      if (raw.includes(key)) return invalid();
+      const body: unknown = JSON.parse(raw);
+      if (!record(body) || !record(body.ResponseMetadata)) return invalid();
+      const metadata = body.ResponseMetadata;
+      if (
+        metadata.Action !== action ||
+        metadata.Version !== '2024-01-01' ||
+        metadata.Service !== 'ark'
+      )
+        return invalid();
+      if (!response.ok || metadata.Error) {
+        const error = record(metadata.Error) ? metadata.Error : undefined;
+        if (response.status === 403)
+          throw new MaterialUpstreamError(HTTP_STATUS.FORBIDDEN, 'PROVIDER_RESOURCE_FORBIDDEN');
+        if (response.status === 404 && error?.Code === 'ResourceNotFound')
+          throw new MaterialUpstreamError(HTTP_STATUS.NOT_FOUND, 'UPSTREAM_RESOURCE_NOT_FOUND');
+        throw new MaterialUpstreamError(
+          HTTP_STATUS.SERVICE_UNAVAILABLE,
+          response.status === 429
+            ? 'UPSTREAM_RATE_LIMITED'
+            : response.status === 401
+              ? 'PROVIDER_UNAVAILABLE'
+              : 'UPSTREAM_REJECTED',
+          response.status >= 500,
+        );
+      }
+      if (!record(body.Result)) return invalid();
+      const requestId =
+        typeof metadata.RequestId === 'string' &&
+        metadata.RequestId.length <= 256 &&
+        !/[\x00-\x1f\x7f]/.test(metadata.RequestId)
+          ? metadata.RequestId
+          : null;
+      return { result: body.Result, requestId };
+    } catch (error) {
+      if (error instanceof MaterialUpstreamError) throw error;
+      throw new MaterialUpstreamError(
+        HTTP_STATUS.SERVICE_UNAVAILABLE,
+        cancellation.aborted ? 'UPSTREAM_CANCELLED' : 'UPSTREAM_RESULT_UNKNOWN',
+        true,
+      );
+    }
+  };
+  return {
+    async createGroup(key, name, signal) {
+      const value = await call('CreateAssetGroup', key, { Name: name, GroupType: 'AIGC' }, signal);
+      if (typeof value.result.Id !== 'string' || !groupId.test(value.result.Id)) return invalid();
+      return { id: value.result.Id, requestId: value.requestId };
+    },
+    async getGroup(key, id, signal) {
+      const value = await call('GetAssetGroup', key, { Id: id }, signal);
+      if (value.result.Id !== id) return invalid();
+    },
+    async renameGroup(key, id, name, signal) {
+      const value = await call('UpdateAssetGroup', key, { Id: id, Name: name }, signal);
+      if (value.result.Id !== id) return invalid();
+    },
+    async deleteGroup(key, id, signal) {
+      const value = await call('DeleteAssetGroup', key, { Id: id }, signal);
+      if (value.result.Id !== id) return invalid();
+    },
+    async listMaterials(key, id, page, signal) {
+      if (!groupId.test(id) || !Number.isSafeInteger(page) || page < 1) return invalid();
+      const { result } = await call(
+        'ListAssets',
+        key,
+        { Filter: { GroupIds: [id] }, PageNumber: page, PageSize: 100 },
+        signal,
+      );
+      if (
+        !Array.isArray(result.Items) ||
+        result.Items.length > 100 ||
+        result.PageNumber !== page ||
+        !Number.isSafeInteger(result.PageSize) ||
+        Number(result.PageSize) < 1 ||
+        Number(result.PageSize) > 100 ||
+        !Number.isSafeInteger(result.TotalCount) ||
+        Number(result.TotalCount) < 0
+      )
+        return invalid();
+      const items = result.Items.map((value) => item(value, id));
+      if (new Set(items.map((value) => value.id)).size !== items.length) return invalid();
+      return { items, hasMore: page * Number(result.PageSize) < Number(result.TotalCount) };
+    },
+    async getMaterial(key, id, expectedGroup, signal) {
+      const { result } = await call('GetAsset', key, { Id: id }, signal);
+      const value = item(result, expectedGroup);
+      if (value.id !== id) return invalid();
+      return value;
+    },
+    async deleteMaterial(key, id, signal) {
+      await call('DeleteAsset', key, { Id: id }, signal);
+    },
+  };
+}

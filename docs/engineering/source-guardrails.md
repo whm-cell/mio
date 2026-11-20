@@ -2,9 +2,9 @@
 
 [底座规则总览](../foundation.md#已采用规则与验证)。本页维护检查器的覆盖口径、依赖约束与维护验证；普通文档任务无需展开。
 
-开发模块的 `developmentDependencies` 按源码根声明：护栏／任务协调只导入 `scripts/harness/` 内部模块；服务工具允许自身模块及认证、对话、供应商、资产和计算迁移需要的精确配置与 schema，以及共享计算合同的构建公开类型入口。动态目录的受控部署导入另精确允许 `src/providers/store.ts`、`contracts.ts`，由存储入口统一完成归属、版本和声明校验，导入程序自持并关闭该域池；不开放整个业务目录、`catalog.ts` 或 `service.ts`。总检查入口可组合各自命令。开发角色不等于职责边界，类型、重导出和别名解析后的越界均受核对；静态规则不是任意子进程或网络副作用沙箱。
+开发模块的 `developmentDependencies` 按源码根声明：护栏／任务协调只导入 `scripts/harness/` 内部模块；服务工具允许自身模块及认证、对话、供应商、资产、素材和计算迁移需要的精确配置与 schema，以及共享计算合同的构建公开类型入口。动态目录的受控部署导入另精确允许 `src/providers/store.ts`、`contracts.ts`，由存储入口统一完成归属、版本和声明校验，导入程序自持并关闭该域池；不开放整个业务目录、`catalog.ts` 或 `service.ts`。总检查入口可组合各自命令。开发角色不等于职责边界，类型、重导出和别名解析后的越界均受核对；静态规则不是任意子进程或网络副作用沙箱。
 
-认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts`、`src/compute/schema.ts`、`src/generations/store.ts` 与 `src/generations/schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
+认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts`、`src/compute/schema.ts`、`src/generations/store.ts` 与 `src/generations/schema.ts`、`src/materials/store.ts` 与 `src/materials/schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
 
 根服务 A 中 COS SDK 包仅允许 `src/integrations/cos.ts` 导入，开发工具和其他 A 模块不得直接或经别名导入；B 的精确适配器按下述多项目声明约束。检查按导入名称、解析包身份和真实归属识别。类型、别名及邻近非法文件反例见同一 fixture；运行权限仍由 COS 凭据、桶策略与实际测试保证。
 
@@ -24,7 +24,7 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 每项 `typecheck` 和 `build` 指向本项目真实 TypeScript 配置；对应生产文件须进入各自配置的文件集合，其他项目生产文件不得作为其显式编译根文件，本项目测试仍可进入类型检查。构建还须能生成运行代码、使用已登记的生成目录。生产导入按类型和构建两套配置解析，避免两者别名指向不同内部模块。此处核对配置与输入，不执行编译或证明产物存在；根入口仍须实际执行每个项目的类型检查和构建，并单独验证产物。
 
-根类型检查和构建先构建共享基础库与合同，再检查或构建 A 与 B；基础库构建清理旧输出。A 的 `dist/tools` 额外编译既有 auth、assets、compute 三个迁移入口及 profile 准备入口，使仓库外产物可初始化和装载；这些工具仍遵守其源码的 developmentDependencies，A 生产模块不反向导入工具。只编译本期实际需要的入口，其他业务域仍使用原有迁移方式；产物和数据库变化需实际验证。
+根类型检查和构建先构建共享基础库与合同，再检查或构建 A 与 B；基础库构建清理旧输出。A 的 `dist/tools` 额外编译auth、assets、compute、generations、providers、materials 迁移及供应商路由导入入口及 profile 准备入口，使仓库外产物可初始化和装载；这些工具仍遵守其源码的 developmentDependencies，A 生产模块不反向导入工具。只编译本期实际需要的入口，其他业务域仍使用原有迁移方式；产物和数据库变化需实际验证。
 
 服务只能依赖自身源码或 contract 的已声明公开入口，contract 只能依赖自身项目，不能导入其他服务或 contract。普通外部校验包仍可使用，但静态包边界不证明依赖纯净或没有副作用。contract 用 `publicEntries: [{"source":"contracts/compute/src/index.ts","export":"."}]` 将受审源码入口关联其 `packageRoot/package.json` 的 `exports`；运行条件须选择该入口编译得到的 `.js`，类型条件须选择对应 `.d.ts`。当前只支持按声明顺序选择 `types`、`node`、`import`、`default` 条件，不支持条件数组或其他条件；构建后应实际加载包验证。解析目标即使被 TypeScript 标记为外部包，也按真实路径及包身份识别本仓库项目；生成的 `.d.ts` 不代替源文件覆盖。
 
@@ -53,7 +53,7 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 常驻环境的 MQ 初始化工具通过 `developmentDependencies` 精确声明复用 `src/integrations/rabbitmq.ts` 的连接/关闭能力，验证 A/B 登录；不发布或消费业务消息。服务工具仍不能直接导入 amqplib，生产代码不依赖部署工具，拓扑声明留在 `scripts/service/`。
 
-精确的 `@earendil-works/pi-ai`（含 `/models`、`/api/*` 公开子路径）属于同一 DSH 适配边界，按导入名、解析 packageId 与真实包归属识别，不放宽其他 npm 包。conversations/providers 不能反向导入本地 src/dsh。合法适配、临近非法目录、普通业务、type-only 别名及本地越界在同一 guardrail fixture 验证。
+精确的 `@earendil-works/pi-ai`（含 `/models`、`/api/*` 公开子路径）属于同一 DSH 适配边界，按导入名、解析 packageId 与真实包归属识别，不放宽其他 npm 包。conversations/providers/materials 不能反向导入本地 src/dsh。合法适配、临近非法目录、普通业务、type-only 别名及本地越界在同一 guardrail fixture 验证。
 
 体量统计来自 TypeScript AST：物理行数（含注释/空行）、函数声明跨度、语法块嵌套深度、if/循环/case/catch/条件表达式节点数。`decisionNodes` 是文件级分支信号，不是完整圈复杂度或算法复杂度；职责聚合、时间/空间成本由相关变更审阅。配置/文档/生成文件不计入业务源码指标。依赖声明采用 `skipLibCheck`，严格类型检查覆盖本项目；第三方声明内部仍由依赖兼容与装载测试补充。
 

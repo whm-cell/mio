@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import {
   prepareLocalRegression,
   type ConnectSqlSession,
@@ -31,6 +31,7 @@ type MockState = {
   directConnect: boolean;
   allowRegressionLogin: boolean;
   allowAppLogin: boolean;
+  appLoginError?: Error;
 };
 
 function createMockConnect(initial: Partial<MockState> = {}) {
@@ -109,8 +110,11 @@ function createMockConnect(initial: Partial<MockState> = {}) {
     }
 
     if (parsed.username === 'mio_regression' && parsed.pathname === '/mio_dev') {
+      if (state.appLoginError) throw state.appLoginError;
       if (!state.allowAppLogin && !state.publicConnect && !state.directConnect) {
-        throw new Error('42501: permission denied for database mio_dev');
+        throw Object.assign(new Error('permission denied for database mio_dev'), {
+          code: '42501',
+        });
       }
       return {
         async query<Row extends Record<string, unknown>>() {
@@ -138,6 +142,28 @@ it('creates missing regression role and database on an existing dev volume and s
   await prepareLocalRegression('dev', baseValues(), mock.connect);
   expect(mock.executed.some((sql) => sql.startsWith('CREATE '))).toBe(false);
 });
+
+it.each([
+  Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' }),
+  Object.assign(new Error('connection timed out'), { code: 'ETIMEDOUT' }),
+  Object.assign(new Error('password authentication failed'), { code: '28P01' }),
+  new Error('42501: permission denied without a structured SQLSTATE'),
+  new Error('unknown failure'),
+])(
+  'does not report isolation ready when the forbidden login fails for another reason (%s)',
+  async (appLoginError) => {
+    const logged = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const mock = createMockConnect({ appLoginError });
+      await expect(prepareLocalRegression('dev', baseValues(), mock.connect)).rejects.toThrow(
+        'LOCAL_REGRESSION_ISOLATION_UNVERIFIED',
+      );
+      expect(logged).not.toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
+  },
+);
 
 it('rejects privileged roles, wrong database owners, leaked dev permissions, and bad passwords without resetting users', async () => {
   const superRole = createMockConnect({

@@ -138,11 +138,11 @@
 
 输入：`{requestId,revision,scope:"local"|"upstream"}`，字段限制同素材删除。
 
-成功：local 为 200 `{group:GroupView}`（state=deleted）；upstream 为 `{operation:OperationView}`，succeeded 200，其余 202。
+成功：local 为 200 `{group:GroupView}`（state=deleted）；upstream 新请求仅在精确确认上游组已不存在时收束为 200 `{operation:OperationView}`。既有 requestId 返回原操作，succeeded 200，其余 202。
 
-错误：有未删除素材 409 RESOURCE_IN_USE；在途创建/操作/组租约 409 MATERIAL_BUSY；其他同素材删除与共同约定。
+错误：本地有未删除素材，或上游组仍存在时，返回 409 RESOURCE_IN_USE；后者即使本地为空或仅有墓碑也适用。在途创建/操作/组租约 409 MATERIAL_BUSY；新请求的上游组权限、查询或凭据错误直接返回对应错误；其他同素材删除与共同约定。
 
-副作用：local 仅留本地墓碑；upstream 在持久意图后核验单资源权限并调用 DeleteAssetGroup，成功时同事务提交实体与操作终态。无隐式级联，不删除 COS。真人授权的撤销需要通过第三方平台实际提供的渠道单独办理。
+副作用：local 仅留本地墓碑；upstream 新请求先核验归属、revision 和精确 GetAssetGroup。DeleteAssetGroup 会级联删除组内素材，当前协议缺少原子的空组删除条件，因此组仍存在时在建立删除操作前拒绝，组保持可用；列表为空也无法排除查询后其他写者新增素材的竞争。仅精确确认该上游组不存在时，持久化并同事务完成本地墓碑与操作终态。既有 unknown 删除操作继续通过原资源查询收束，保留原请求身份。COS 原件保留。真人授权的撤销需要通过第三方平台实际提供的渠道单独办理。
 
 ## GET /api/v1/materials/operations/{id}
 

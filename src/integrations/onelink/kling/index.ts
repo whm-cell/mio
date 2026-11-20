@@ -137,7 +137,7 @@ export function createRoutedKlingImageProtocol(
         if (parsed.malformed || parsed.payload?.code !== 0)
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
         const data = jsonObject(parsed.payload.data);
-        if (!data || (data.task_id !== undefined && data.task_id !== upstreamTaskId))
+        if (!data || typeof data.task_id !== 'string' || data.task_id !== upstreamTaskId)
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
         const status = normalizeKlingTaskStatus(data.task_status);
         if (KLING_IN_FLIGHT_STATUSES.has(status)) return { state: 'processing', upstreamTaskId };

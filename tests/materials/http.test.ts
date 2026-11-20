@@ -113,6 +113,28 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
   expect(await denied.json()).toMatchObject({
     error: { code: 'BODY_INVALID', message: 'BODY_INVALID', requestId: expect.any(String) },
   });
+  expect(
+    (
+      await call(`/items/${row.id}/delete`, 'POST', {
+        requestId: randomUUID(),
+        revision: row.revision,
+        scope: 'local',
+      })
+    ).status,
+  ).toBe(200);
+  const blockedDelete = await call(`/groups/${id}/delete`, 'POST', {
+    requestId: randomUUID(),
+    revision: group.revision,
+    scope: 'upstream',
+  });
+  expect(blockedDelete.status).toBe(409);
+  expect(await blockedDelete.json()).toMatchObject({ error: { code: 'RESOURCE_IN_USE' } });
+  expect(f.items.has(row.upstream_asset_id!)).toBe(true);
+  expect(f.groups.has(group.upstream_group_id!)).toBe(true);
+  expect((await f.store.ownedGroup(f.actor.userId, id)).state).toBe('ready');
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+  ).toHaveLength(0);
 });
 
 it('pages equal-microsecond rows without dropping records or exposing database cursors', async () => {

@@ -134,7 +134,7 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 本地测试分别探测 PostgreSQL 和 Redis 的专用回归通道，每项优先选 `mio-dev`，其次 `mio-test`。缺少对应通道的配置或找不到可达端口时，由用例为该服务启动独立临时进程。选定通道后发生的登录、初始化或权限错误按实际失败报告。测试进程只从 `.env`／`.env.test` 提取专用回归通道配置。入口与显式环境选择见[测试导航](engineering/testing.md#按变更定位测试)。
 
-Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号，并在结束后清理本轮键。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。RabbitMQ 集成测试动态创建并清理独立临时 vhost 与账号。
+Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号；本轮独占 TCP 转发追踪实际 EVAL 键与连接，结束后清理本轮已观察键，释放断言只统计本轮连接。共享回归账号无 `SCAN`／`CLIENT LIST` 权限。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。RabbitMQ 集成测试动态创建并清理独立临时 vhost 与账号。
 
 区分**常规自动化回归**、**开发推进／协议摸底与本地真实业务验收**和**破坏性故障演练**：
 

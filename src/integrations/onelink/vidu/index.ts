@@ -107,12 +107,17 @@ export function createRoutedViduImageProtocol(
         }
         const parsed = await readAsyncJson(response);
         const payload = parsed.payload;
-        const state = payload?.state;
+        if (
+          parsed.malformed ||
+          !payload ||
+          ('id' in payload && (typeof payload.id !== 'string' || payload.id !== upstreamTaskId))
+        )
+          return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
+        const state = payload.state;
         if (state === 'created' || state === 'queueing' || state === 'processing')
           return { state: 'processing', upstreamTaskId };
         if (state === 'failed') return { state: 'failed', code: 'IMAGE_QUERY_FAILED' };
         if (
-          parsed.malformed ||
           state !== 'success' ||
           !Array.isArray(payload?.creations) ||
           !payload.creations.length ||

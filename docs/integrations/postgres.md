@@ -35,7 +35,7 @@
 - 本地自动探测按 `mio-dev`、`mio-test` 顺序选择已配置且端口可达的 `mio_regression_test`。没有候选库配置或候选端口均不可达时，用例使用 PATH 中的 `initdb`、`pg_ctl` 启动独立临时集群并在结束后清理。选定目标后，登录、权限或库未初始化等错误按实际失败报告。入口与显式环境选择见[测试导航](../engineering/testing.md#按变更定位测试)。
 - [CI 配置](../../.github/workflows/check.yml)使用固定 PostgreSQL `18.6` 镜像，与[常驻开发/测试环境](../local-environments.md)一致。这是配置的验证环境，不代表已证明所有服务端版本兼容或远端门禁已通过。
 
-两套常驻环境各自使用独立容器、账号和命名卷。常驻库 `mio_dev` 与 `mio_test` 长期保留；自动化回归使用同实例内另设的 `mio_regression_test`，其独立账号 `mio_regression` 无权连接 `mio_dev`／`mio_test`（既有数据卷通过 `pnpm env:init && pnpm regression:init:dev` 或 `regression:init:test` 无损补建）。服务账户 `mio` 仅有本业务库所需权限；用户指示推进功能开发、协议摸底或业务验收时，默认允许直接对 `mio_dev` 执行显式增量迁移、读取既有加密凭据与单次有界非破坏验证并保留数据（无需二次索要口令，并遵守[常驻环境](../local-environments.md#自动化回归与人工数据)三条核心安全底线），只有破坏性故障／重放演练才使用独立空库现场。PostgreSQL 18 卷挂到 `/var/lib/postgresql`，不沿用旧镜像的数据卷位置。
+两套常驻环境各自使用独立容器、账号和命名卷。常驻库 `mio_dev` 与 `mio_test` 长期保留；自动化回归使用同实例内另设的 `mio_regression_test`，其独立账号 `mio_regression` 无权连接 `mio_dev`／`mio_test`（既有数据卷通过 `pnpm env:init && pnpm regression:init:dev` 或 `regression:init:test` 无损补建）。初始化后的禁止连接探测只有收到结构化 SQLSTATE `42501` 才证明权限拒绝；网络、密码或其他连接失败不能报告隔离就绪。服务账户 `mio` 仅有本业务库所需权限；用户指示推进功能开发、协议摸底或业务验收时，默认允许直接对 `mio_dev` 执行显式增量迁移、读取既有加密凭据与单次有界非破坏验证并保留数据（无需二次索要口令，并遵守[常驻环境](../local-environments.md#自动化回归与人工数据)三条核心安全底线），只有破坏性故障／重放演练才使用独立空库现场。PostgreSQL 18 卷挂到 `/var/lib/postgresql`，不沿用旧镜像的数据卷位置。
 
 [认证集成测试](../../tests/auth/auth.test.ts)组合真实 PostgreSQL、DSH HTTP 和显式迁移命令，覆盖持久化、迁移、注册事务回滚与并发唯一性，并核对启动失败、启动中卸载的连接释放；认证业务覆盖和限制仍见[认证验证](../auth.md#验证)。当前结果须来自本次候选的实际执行，文档链接不等于测试通过。
 

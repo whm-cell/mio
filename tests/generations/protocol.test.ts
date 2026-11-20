@@ -184,6 +184,97 @@ function testKling(transport: typeof fetch) {
 }
 
 describe('Routed vendor image protocols', () => {
+  it.each(['processing', 'failed', 'success'])(
+    'rejects explicit invalid Vidu task identities before interpreting %s or downloading',
+    async (state) => {
+      const download = vi.fn();
+      const imageDownload: ImageDownload = async () => {
+        download();
+        throw new Error('Unexpected image download');
+      };
+      for (const id of ['', null, 1, {}, 'other-task', 'bad task id']) {
+        const transport = vi.fn<typeof fetch>().mockResolvedValue(
+          Response.json({
+            id,
+            state,
+            creations: [{ id: 'creation-id', url: 'https://image01.vidu.zone/result.jpg' }],
+          }),
+        );
+        const driver = createRoutedViduImageProtocol(
+          VIDU_ROUTE,
+          transport,
+          undefined,
+          imageDownload,
+        );
+        const protocol = createRoutedImageProtocol(
+          VIDU_ROUTE,
+          'generate',
+          transport,
+          undefined,
+          driver,
+        );
+        expect(
+          await protocol.queryAsync(
+            { model: 'image-vidu-q2', prompt: 'identity', async: true },
+            key,
+            'original-task',
+            1,
+          ),
+        ).toEqual({ state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' });
+        expect(transport).toHaveBeenCalledOnce();
+        expect(transport.mock.calls[0]![1]?.method).toBe('GET');
+      }
+      expect(download).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['processing', 'failed', 'succeed'])(
+    'requires the Kling task identity before interpreting %s or downloading',
+    async (taskStatus) => {
+      const download = vi.fn();
+      const imageDownload: ImageDownload = async () => {
+        download();
+        throw new Error('Unexpected image download');
+      };
+      for (const taskId of [undefined, '', null, 1, {}, 'other-task', 'bad task id']) {
+        const transport = vi.fn<typeof fetch>().mockResolvedValue(
+          Response.json({
+            code: 0,
+            data: {
+              task_id: taskId,
+              task_status: taskStatus,
+              task_result: { images: [{ url: 'https://cdn.kling.example/result.jpg' }] },
+            },
+          }),
+        );
+        const driver = createRoutedKlingImageProtocol(
+          KLING_MINIMAL_ROUTE,
+          transport,
+          undefined,
+          imageDownload,
+        );
+        const protocol = createRoutedImageProtocol(
+          KLING_MINIMAL_ROUTE,
+          'generate',
+          transport,
+          undefined,
+          driver,
+        );
+        expect(
+          await protocol.queryAsync(
+            { model: 'image-kling-v3', prompt: 'identity', async: true },
+            key,
+            'original-task',
+            1,
+          ),
+        ).toEqual({ state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' });
+        expect(transport).toHaveBeenCalledOnce();
+        expect(transport.mock.calls[0]![1]?.method).toBe('GET');
+      }
+      expect(download).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects excess Vidu creations before downloading and preserves all requested results and task identity', async () => {
     const route = {
       ...VIDU_ROUTE,

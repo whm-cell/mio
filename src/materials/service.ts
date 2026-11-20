@@ -395,9 +395,30 @@ export function createMaterialService(
         const inputHash = hash({ id, revision, scope });
         const old = await store.previous(owner, opKind, requestId, inputHash);
         if (old) return operationResult(owner, old);
-        if (kind === 'group') await store.ownedGroup(owner, id);
-        else await store.ownedMaterial(owner, id);
+        const group = kind === 'group' ? await store.ownedGroup(owner, id) : undefined;
+        if (kind === 'material') await store.ownedMaterial(owner, id);
         const snapshot = await credentials.snapshotAccount(owner);
+        if (group) {
+          if (group.revision !== revision)
+            throw new MaterialError(HTTP_STATUS.CONFLICT, 'REVISION_CONFLICT');
+          if (group.state !== 'ready' || !group.upstream_group_id)
+            throw new MaterialError(HTTP_STATUS.CONFLICT, 'MATERIAL_GROUP_NOT_READY');
+          stop.signal.throwIfAborted();
+          const key = credentials.openAccountSnapshot(owner, snapshot);
+          let absent = false;
+          try {
+            await upstream.getGroup(key, group.upstream_group_id, stop.signal);
+          } catch (error) {
+            if (
+              !(error instanceof MaterialUpstreamError) ||
+              error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
+            )
+              throw error;
+            absent = true;
+          }
+          // DeleteAssetGroup cascades remotely and has no atomic empty-group condition.
+          if (!absent) throw new MaterialError(HTTP_STATUS.CONFLICT, 'RESOURCE_IN_USE');
+        }
         const { operation: op, fresh } = await store.beginDelete(
           owner,
           requestId,
@@ -412,33 +433,30 @@ export function createMaterialService(
         let attempted = false;
         try {
           stop.signal.throwIfAborted();
-          const key = credentials.openAccountSnapshot(owner, snapshot);
-          const group = await store.ownedGroup(owner, op.target_group_id!);
-          let absent = false;
-          if (kind === 'material')
+          if (kind === 'material') {
+            const key = credentials.openAccountSnapshot(owner, snapshot);
+            const group = await store.ownedGroup(owner, op.target_group_id!);
             await upstream.getGroup(key, group.upstream_group_id!, stop.signal);
-          try {
-            if (kind === 'material')
+            let absent = false;
+            try {
               await upstream.getMaterial(
                 key,
                 op.protocol_snapshot.upstreamId!,
                 group.upstream_group_id!,
                 stop.signal,
               );
-            else await upstream.getGroup(key, op.protocol_snapshot.upstreamId!, stop.signal);
-          } catch (error) {
-            if (
-              !(error instanceof MaterialUpstreamError) ||
-              error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
-            )
-              throw error;
-            absent = true;
-          }
-          if (!absent) {
-            attempted = true;
-            if (kind === 'material')
+            } catch (error) {
+              if (
+                !(error instanceof MaterialUpstreamError) ||
+                error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
+              )
+                throw error;
+              absent = true;
+            }
+            if (!absent) {
+              attempted = true;
               await upstream.deleteMaterial(key, op.protocol_snapshot.upstreamId!, stop.signal);
-            else await upstream.deleteGroup(key, op.protocol_snapshot.upstreamId!, stop.signal);
+            }
           }
           returned = true;
           stop.signal.throwIfAborted();

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 
 /** Dedicated test DB only. Each run owns one schema; local mode owns and removes the entire cluster. */
@@ -62,9 +62,20 @@ export async function authDatabase() {
     }
     const pool = new Pool({ connectionString: url, connectionTimeoutMillis: 5000 });
     const schema = `mio_auth_${randomUUID().replaceAll('-', '')}`;
+    const smokeToken = randomBytes(32).toString('hex');
+    let identity: { database: string; user: string };
+    let createdSchema = false;
     try {
       await pool.query(`CREATE SCHEMA "${schema}"`);
+      createdSchema = true;
+      await pool.query(`COMMENT ON SCHEMA "${schema}" IS 'mio-auth-fixture:${smokeToken}'`);
+      identity = (
+        await pool.query<{ database: string; user: string }>(
+          'SELECT current_database() AS database, current_user AS "user"',
+        )
+      ).rows[0]!;
     } catch (error) {
+      if (createdSchema) await pool.query(`DROP SCHEMA "${schema}" CASCADE`).catch(() => {});
       await pool.end();
       const code = (error as { code?: unknown }).code;
       if (
@@ -88,6 +99,10 @@ export async function authDatabase() {
       url: scoped.toString(),
       observerURL: observer.toString(),
       applicationName: schema,
+      smokeEnvironment: {
+        MIO_SMOKE_AUTH_DATABASE_URL: scoped.toString(),
+        MIO_SMOKE_AUTH_FIXTURE: JSON.stringify({ ...identity, schema, token: smokeToken }),
+      },
       async close() {
         try {
           await pool.query(`DROP SCHEMA "${schema}" CASCADE`);

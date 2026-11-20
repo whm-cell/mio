@@ -11,7 +11,92 @@ import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import { createGenerationHandler } from '../../src/generations/http.ts';
+import type { GenerationTransports } from '../../src/generations/runner.ts';
 import { generationFixture } from './fixture.ts';
+
+it.each([
+  ['image-kling-v3', undefined, 'failed'],
+  ['image-kling-v3', 'other-task', 'failed'],
+  ['image-vidu-q2', 'other-task', 'failed'],
+  ['image-kling-v3', 'original-task', 'completed'],
+  ['image-vidu-q2', 'original-task', 'completed'],
+  ['image-vidu-q2', undefined, 'completed'],
+] as const)(
+  'checks %s query identity %s through the generation service',
+  async (model, responseId, expectedStatus) => {
+    const f = await generationFixture(model);
+    const transport = vi.fn<typeof fetch>().mockImplementation(async (_url, options) =>
+      options?.method === 'POST'
+        ? Response.json(
+            model === 'image-kling-v3'
+              ? { code: 0, data: { task_id: 'original-task' } }
+              : { task_id: 'original-task' },
+          )
+        : Response.json(
+            model === 'image-kling-v3'
+              ? {
+                  code: 0,
+                  data: {
+                    task_id: responseId,
+                    task_status: 'succeed',
+                    task_result: { images: [{ url: 'https://cdn.kling.example/result.png' }] },
+                  },
+                }
+              : {
+                  id: responseId,
+                  state: 'success',
+                  creations: [{ url: 'https://image01.vidu.zone/result.png' }],
+                },
+          ),
+    );
+    const downloadSpy = vi.fn();
+    const download: NonNullable<GenerationTransports['download']> = async (
+      url,
+      _signal,
+      consume,
+    ) => {
+      downloadSpy(url);
+      return consume(new Response(f.bytes));
+    };
+    try {
+      const service = await f.start({ transport, download });
+      const job = await service.createImage(f.actor, randomUUID(), f.asyncModelRef, {
+        prompt: 'identity',
+        async: true,
+      });
+      await vi.waitFor(
+        async () =>
+          expect((await service.getImage(f.actor, job.jobId)).status).toBe(expectedStatus),
+        { timeout: 6000 },
+      );
+      const result = await service.getImage(f.actor, job.jobId);
+      if (expectedStatus === 'failed') {
+        expect(result).toMatchObject({
+          errorCode: 'IMAGE_QUERY_UNKNOWN',
+          assetIds: [],
+          outputs: [],
+        });
+        expect(downloadSpy).not.toHaveBeenCalled();
+        expect(f.objects.putImage).not.toHaveBeenCalled();
+        expect(
+          (await f.pool.query('SELECT id FROM mio_assets WHERE owner_id=$1', [f.actor.userId]))
+            .rowCount,
+        ).toBe(0);
+      } else {
+        expect(result.assetIds).toHaveLength(1);
+        expect(result.outputs).toHaveLength(1);
+        expect(downloadSpy).toHaveBeenCalledOnce();
+        expect(f.objects.putImage).toHaveBeenCalledOnce();
+      }
+      expect(transport.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(
+        1,
+      );
+    } finally {
+      await f.close();
+    }
+  },
+  15000,
+);
 
 it('keeps image HTTP ownership, idempotency, output order and derived-image editing without B or MQ', async () => {
   const f = await generationFixture();

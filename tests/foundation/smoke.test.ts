@@ -59,7 +59,7 @@ it.each([
         env: {
           ...process.env,
           MIO_SMOKE_PROBE_STAGE: stage,
-          MIO_SMOKE_AUTH_DATABASE_URL: database.url,
+          ...database.smokeEnvironment,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,

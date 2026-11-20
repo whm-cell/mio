@@ -138,8 +138,13 @@ export async function prepareLocalRegression(
   let forbidden: SqlSession | undefined;
   try {
     forbidden = await connectSession(forbiddenAppUrl);
-  } catch {
-    forbidden = undefined;
+  } catch (error) {
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== '42501') {
+      throw new Error(
+        `LOCAL_REGRESSION_ISOLATION_UNVERIFIED: permission denial was not established for ${appDatabase}`,
+        { cause: error },
+      );
+    }
   }
   if (forbidden) {
     await forbidden.close();

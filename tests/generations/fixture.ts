@@ -16,12 +16,13 @@ import { createGenerationAdmission } from '../../src/generations/admission.ts';
 import { createGenerationService } from '../../src/generations/service.ts';
 import type { GenerationService } from '../../src/generations/service.ts';
 import type { GenerationObjects } from '../../src/generations/execution.ts';
+import type { GenerationTransports } from '../../src/generations/runner.ts';
 import type { ImageAssetRef, ImageRequestParameters } from '../../src/generations/contracts.ts';
 import type { AsyncImageTransport } from '../../src/integrations/onelink/shared/index.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';
 
-export async function generationFixture() {
+export async function generationFixture(asyncModel = 'image-vidu-q2') {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
@@ -36,11 +37,11 @@ export async function generationFixture() {
   const providerStore = await createProviderStore(config, true);
   await providerStore.importRoutes([
     findFixtureRoute('gpt-image-2', 'image.generate'),
-    findFixtureRoute('image-vidu-q2', 'image.generate'),
+    findFixtureRoute(asyncModel, 'image.generate'),
   ]);
   const provider = createProviderService(providerStore, config, async () =>
     Response.json({
-      data: ['gpt-image-2', 'image-vidu-q2'].map((id) => ({ id, object: 'model' })),
+      data: ['gpt-image-2', asyncModel].map((id) => ({ id, object: 'model' })),
     }),
   );
   const actor = { userId: randomUUID(), sessionId: 'generation-test' };
@@ -48,7 +49,7 @@ export async function generationFixture() {
   await provider.discover(actor);
   const catalog = (await provider.catalog(actor)).items;
   const modelRef = catalog.find((model) => model.modelId === 'gpt-image-2')!.modelRef;
-  const asyncModelRef = catalog.find((model) => model.modelId === 'image-vidu-q2')!.modelRef;
+  const asyncModelRef = catalog.find((model) => model.modelId === asyncModel)!.modelRef;
   const bytes = await sharp({ create: { width: 3, height: 2, channels: 4, background: '#7799bb' } })
     .png()
     .toBuffer();
@@ -116,16 +117,13 @@ export async function generationFixture() {
   };
   let store = new GenerationStore(new Pool({ connectionString: database.url }));
   let service: GenerationService | undefined;
-  const start = async () => {
+  const start = async (transports: GenerationTransports = { transport, asyncTransport }) => {
     service = await createGenerationService(
       store,
       objects,
       { dataDirectory: directory },
       () => provider,
-      {
-        transport,
-        asyncTransport,
-      },
+      transports,
     );
     return service;
   };

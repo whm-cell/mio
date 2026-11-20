@@ -490,7 +490,7 @@ it('loads the packed authentication plugin through an official isolated Profile'
     process.execPath,
     ['scripts/service/smoke.ts', ...(archive ? ['--archive', archive] : [])],
     {
-      env: { ...process.env, MIO_SMOKE_AUTH_DATABASE_URL: database.url },
+      env: { ...process.env, ...database.smokeEnvironment },
       encoding: 'utf8',
       timeout: 30000,
     },
@@ -498,6 +498,48 @@ it('loads the packed authentication plugin through an official isolated Profile'
   expect(smoke.status, smoke.stdout + smoke.stderr).toBe(0);
   expect(smoke.stdout).toContain('authentication registration, identity and logout');
 }, 45000);
+
+it('rejects an unproven or different smoke fixture before starting a Profile or registering accounts', async () => {
+  const other = await authDatabase();
+  const url = new URL(database.url);
+  const wrongTarget = new URL(database.url);
+  wrongTarget.port = '1';
+  wrongTarget.pathname = '/mio_dev';
+  const proof = JSON.parse(database.smokeEnvironment.MIO_SMOKE_AUTH_FIXTURE);
+  const otherProof = JSON.parse(other.smokeEnvironment.MIO_SMOKE_AUTH_FIXTURE);
+  const publicSchema = new URL(database.url);
+  publicSchema.searchParams.set('options', '-csearch_path=public');
+  const scenarios = [
+    { MIO_SMOKE_AUTH_DATABASE_URL: url.toString(), MIO_SMOKE_AUTH_FIXTURE: undefined },
+    { ...database.smokeEnvironment, MIO_SMOKE_AUTH_DATABASE_URL: wrongTarget.toString() },
+    { ...database.smokeEnvironment, MIO_SMOKE_AUTH_DATABASE_URL: publicSchema.toString() },
+    { ...database.smokeEnvironment, MIO_SMOKE_AUTH_DATABASE_URL: other.url },
+    {
+      ...database.smokeEnvironment,
+      MIO_SMOKE_AUTH_FIXTURE: JSON.stringify({ ...proof, token: otherProof.token }),
+    },
+    { ...database.smokeEnvironment, MIO_SMOKE_AUTH_FIXTURE: 'null' },
+  ];
+  const before = (await pool.query('SELECT count(*)::int AS count FROM "user"')).rows[0].count;
+  try {
+    for (const scenario of scenarios) {
+      const smoke = spawnSync(process.execPath, ['scripts/service/smoke.ts'], {
+        env: { ...process.env, ...scenario },
+        encoding: 'utf8',
+        timeout: 10000,
+      });
+      expect(smoke.status, smoke.stdout + smoke.stderr).toBe(1);
+      expect(smoke.stderr).toContain('SMOKE_DATABASE_TARGET');
+      expect(smoke.stdout).not.toContain('Plugin');
+      expect(smoke.stdout).not.toContain('authentication registration');
+    }
+    expect((await pool.query('SELECT count(*)::int AS count FROM "user"')).rows[0].count).toBe(
+      before,
+    );
+  } finally {
+    await other.close();
+  }
+});
 
 it('rolls back failed credential creation and cannot create duplicate accounts concurrently', async () => {
   await resetLimits();

@@ -19,7 +19,7 @@ npm pack --ignore-scripts --pack-destination .work/packed-test
 MIO_TEST_PACKED_ARCHIVE="$PWD/.work/packed-test/mio-plugin-0.1.0.tgz" pnpm test tests/auth tests/providers
 ```
 
-源码或构建输入改变后重新生成本批 archive；不把旧包当缓存。每次 Profile 仍独立解压，使用各自 HOME、schema 和端口；显式 archive 不可读、损坏或缺插件产物时失败，不退回重建。auth smoke 将同一 archive 显式传给 `smoke.ts --archive <path>` 并保留认证断言。未提供 archive 的独立测试继续使用原有按次构建 fallback；默认 `pnpm test:smoke` 始终打包当前根构建，保留 CI 最后的干净构建与 smoke。
+源码或构建输入改变后重新生成本批 archive；不把旧包当缓存。每次 Profile 仍独立解压，使用各自 HOME、schema 和端口；显式 archive 不可读、损坏或缺插件产物时失败，不退回重建。auth smoke 将同一 archive 显式传给 `smoke.ts --archive <path>` 并保留认证断言。认证 smoke 同时传递 `authDatabase()` 返回的 `smokeEnvironment`，在打包及启动 Profile 前核对本轮实际数据库、用户、随机 schema 的所有者和夹具随机标记；仅有 URL、schema 名称或 application_name 不构成本轮归属。普通无数据库 smoke 保持独立可运行。未提供 archive 的独立测试继续使用原有按次构建 fallback；默认 `pnpm test:smoke` 始终打包当前根构建，保留 CI 最后的干净构建与 smoke。
 
 本地可运行 `pnpm check:static:base`，依次执行格式、类型、lint 和护栏；`pnpm check:static` 运行这四项后再构建，均不运行测试或插件装载 smoke。完整 `pnpm check` 先验证 GitHub Actions 环境，再依次运行相同的四项静态检查、全部测试、完整构建和 `test:smoke`，使最终 smoke 使用测试后的构建产物；静态通过不能替代测试、完整覆盖或业务验收结论。
 

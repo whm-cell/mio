@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Client } from 'pg';
 import { launcher, prepareProfile } from './profile.ts';
 
 const project = resolve('.');
@@ -56,12 +57,74 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+async function verifyAuthenticationFixture() {
+  const url = process.env.MIO_SMOKE_AUTH_DATABASE_URL;
+  const raw = process.env.MIO_SMOKE_AUTH_FIXTURE;
+  if (!url) {
+    assert(!raw, 'SMOKE_DATABASE_TARGET: fixture identity requires a database URL');
+    return;
+  }
+  assert(raw, 'SMOKE_DATABASE_TARGET: this run must supply its fixture identity');
+  let fixture: Record<string, unknown>;
+  try {
+    fixture = JSON.parse(raw) as Record<string, unknown>;
+    assert(fixture && typeof fixture === 'object' && !Array.isArray(fixture));
+  } catch {
+    throw new Error('SMOKE_DATABASE_TARGET: invalid fixture identity');
+  }
+  const target = new URL(url);
+  assert(
+    typeof fixture.database === 'string' &&
+      typeof fixture.user === 'string' &&
+      typeof fixture.schema === 'string' &&
+      /^mio_auth_[a-f0-9]{32}$/.test(fixture.schema) &&
+      typeof fixture.token === 'string' &&
+      /^[a-f0-9]{64}$/.test(fixture.token) &&
+      decodeURIComponent(target.pathname.slice(1)) === fixture.database &&
+      decodeURIComponent(target.username) === fixture.user &&
+      target.searchParams.get('options') === `-csearch_path=${fixture.schema}`,
+    'SMOKE_DATABASE_TARGET: fixture target does not match this run',
+  );
+  const client = new Client({
+    connectionString: url,
+    connectionTimeoutMillis: 3000,
+    query_timeout: 3000,
+  });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      database: string;
+      user: string;
+      schema: string;
+      owner: string;
+      marker: string | null;
+    }>(
+      `SELECT current_database() AS database, current_user AS "user", current_schema() AS schema,
+              pg_get_userbyid(nspowner) AS owner, obj_description(oid, 'pg_namespace') AS marker
+         FROM pg_namespace WHERE nspname = current_schema()`,
+    );
+    const actual = result.rows[0];
+    assert(
+      result.rows.length === 1 &&
+        actual?.database === fixture.database &&
+        actual.user === fixture.user &&
+        actual.schema === fixture.schema &&
+        actual.owner === fixture.user &&
+        actual.marker === `mio-auth-fixture:${fixture.token}`,
+      'SMOKE_DATABASE_TARGET: database did not prove ownership of this fixture',
+    );
+  } finally {
+    await client.end();
+  }
+}
+
 try {
   const args = process.argv.slice(2);
   assert(
     args.length === 0 || (args.length === 2 && args[0] === '--archive' && args[1]),
     'SMOKE_ARGUMENTS',
   );
+  await verifyAuthenticationFixture();
   let archive = args[1] && resolve(args[1]);
   if (!archive) {
     await command('npm', ['pack', '--ignore-scripts', '--pack-destination', scratch]);

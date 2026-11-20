@@ -601,7 +601,7 @@ it('keeps Redis optional, rejects broken explicit configuration and closes a sta
     resume.resolve();
     await disposing;
     expect((await fetch(`${origin}/readyz`)).status).toBe(404);
-    await vi.waitFor(async () => expect(await server.activeClientCount()).toBe(1));
+    await vi.waitFor(async () => expect(await server.activeClientCount()).toBe(0));
     expect(
       (
         await pool.query('SELECT count(*)::int n FROM pg_stat_activity WHERE application_name=$1', [

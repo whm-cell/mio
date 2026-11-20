@@ -7,7 +7,7 @@ umask 077
   printf 'user mio on >%s ~mio:%s:* +hello +auth +ping +client|setinfo +eval +time +get +set +pttl +del\n' \
     "$MIO_LOCAL_REDIS_PASSWORD" "$MIO_REDIS_NAMESPACE"
   if [ -n "${MIO_LOCAL_REGRESSION_PASSWORD:-}" ]; then
-    printf 'user mio_regression on >%s ~mio:regtest-*:* +hello +auth +ping +client|setinfo +client|list +eval +time +get +set +pttl +del +scan\n' \
+    printf 'user mio_regression on >%s ~mio:regtest-*:* +hello +auth +ping +client|setinfo +eval +time +get +set +pttl +del\n' \
       "$MIO_LOCAL_REGRESSION_PASSWORD"
   fi
 } > /tmp/mio-users.acl

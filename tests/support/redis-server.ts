@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createClient } from '@redis/client';
+import { redisProxy } from './redis-proxy.ts';
 
 function resolveRedisBinary() {
   if (process.env.MIO_TEST_REDIS_SERVER) return process.env.MIO_TEST_REDIS_SERVER;
@@ -19,7 +20,7 @@ function resolveRedisBinary() {
 }
 
 /** Every fault test owns a version-checked process, port and directory; never a shared Redis URL. */
-export async function redisServer(password?: string) {
+export async function redisServer(password?: string, acl?: { file: string; user: string }) {
   const binary = resolveRedisBinary();
   const version = spawnSync(binary, ['--version'], { encoding: 'utf8' });
   if (version.status !== 0 || !/\bv=8\.2\.11\b/.test(version.stdout))
@@ -31,7 +32,7 @@ export async function redisServer(password?: string) {
   const address = probe.address();
   if (!address || typeof address === 'string') throw new Error('Redis test port missing');
   await new Promise<void>((resolve) => probe.close(() => resolve()));
-  const url = `redis://${password ? `:${password}@` : ''}127.0.0.1:${address.port}`;
+  const url = `redis://${password ? `${acl?.user ?? ''}:${password}@` : ''}127.0.0.1:${address.port}`;
   let child: ChildProcess | undefined;
   let client: ReturnType<typeof createClient>;
   let output = '';
@@ -67,7 +68,7 @@ export async function redisServer(password?: string) {
         directory,
         '--loglevel',
         'warning',
-        ...(password ? ['--requirepass', password] : []),
+        ...(acl ? ['--aclfile', acl.file] : password ? ['--requirepass', password] : []),
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
@@ -114,37 +115,31 @@ export async function redisServer(password?: string) {
   };
 }
 
-async function scanPattern(
-  client: { sendCommand(args: readonly string[]): Promise<unknown> },
-  pattern: string,
+/**
+ * Reuses the running local Redis container via ~mio:regtest-*:* ACL, falling back to an isolated process in CI.
+ * An explicitly supplied backend lets multiple fixtures observe the same owned process.
+ */
+export async function sharedTestRedis(
+  namespacePrefix: string,
+  backend?: Awaited<ReturnType<typeof redisServer>>,
 ) {
-  const found = new Set<string>();
-  let cursor = '0';
-  do {
-    const reply = (await client.sendCommand([
-      'SCAN',
-      cursor,
-      'MATCH',
-      pattern,
-      'COUNT',
-      '200',
-    ])) as [string, string[]];
-    cursor = reply[0];
-    for (const key of reply[1]) found.add(key);
-  } while (cursor !== '0');
-  return [...found];
-}
-
-/** Reuses the running local Redis container via ~mio:regtest-*:* ACL, falling back to an isolated process in CI. */
-export async function sharedTestRedis(namespacePrefix: string) {
   if (!/^regtest-[a-z0-9-]+$/.test(namespacePrefix))
     throw new Error('SHARED_REDIS_NAMESPACE: prefix must start with regtest-');
   const sharedUrl = process.env.MIO_TEST_REDIS_URL;
+  let isolated: Awaited<ReturnType<typeof redisServer>> | undefined;
+  let client: ReturnType<typeof createClient>;
+  let url: string;
   if (sharedUrl) {
     const parsed = new URL(sharedUrl);
-    if (parsed.username !== 'mio_regression')
-      throw new Error('SHARED_REDIS_TARGET: MIO_TEST_REDIS_URL must use mio_regression');
-    const client = createClient({
+    if (
+      parsed.username !== 'mio_regression' ||
+      parsed.protocol !== 'redis:' ||
+      !['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
+    )
+      throw new Error(
+        'SHARED_REDIS_TARGET: MIO_TEST_REDIS_URL must use a loopback mio_regression account',
+      );
+    client = createClient({
       url: sharedUrl,
       socket: { reconnectStrategy: false, connectTimeout: 3_000 },
     });
@@ -162,47 +157,71 @@ export async function sharedTestRedis(namespacePrefix: string) {
       }
       throw error;
     }
-    const keys = (pattern: string) => scanPattern(client, pattern);
-    const clear = async (pattern: string) => {
-      const matched = await keys(pattern);
-      if (matched.length) await client.del(matched);
-    };
-    return {
-      url: sharedUrl,
-      shared: true,
-      client,
-      keys,
-      clear,
-      async activeClientCount() {
-        const list = await client.clientList();
-        return list.filter((entry) => entry.user === 'mio_regression').length;
-      },
-      async close() {
-        try {
-          if (client.isOpen) await clear(`mio:${namespacePrefix}*`);
-        } finally {
-          if (client.isOpen) client.destroy();
-        }
-      },
-    };
+    url = sharedUrl;
+  } else if (backend) {
+    client = backend.client;
+    url = backend.url;
+  } else {
+    isolated = await redisServer();
+    client = isolated.client;
+    url = isolated.url;
   }
-  const isolated = await redisServer();
-  const keys = (pattern: string) => scanPattern(isolated.client, pattern);
+
+  const ownedKeys = new Set<string>();
+  const target = new URL(url);
+  let relay: Awaited<ReturnType<typeof redisProxy>>;
+  try {
+    relay = await redisProxy(
+      Number(target.port || '6379'),
+      (args) => {
+        const command = args[0]!.toUpperCase();
+        if (command !== 'EVAL') return;
+        for (const key of args.slice(3, 3 + Number(args[2])))
+          if (
+            key.startsWith(`mio:${namespacePrefix}:`) ||
+            key.startsWith(`mio:${namespacePrefix}-`)
+          )
+            ownedKeys.add(key);
+      },
+      target.hostname.replace(/^\[|\]$/g, ''),
+    );
+  } catch (error) {
+    if (sharedUrl && client.isOpen) client.destroy();
+    await isolated?.close();
+    throw error;
+  }
+  const proxied = new URL(relay.url);
+  target.hostname = proxied.hostname;
+  target.port = proxied.port;
+  const keys = async (pattern: string) => {
+    if (!pattern.endsWith('*') || pattern.slice(0, -1).includes('*'))
+      throw new Error('SHARED_REDIS_PATTERN: expected a literal owned prefix followed by *');
+    const prefix = pattern.slice(0, -1);
+    const known = [...ownedKeys].filter((key) => key.startsWith(prefix));
+    const ttls = await Promise.all(known.map((key) => client.pTTL(key)));
+    return known.filter((_key, index) => ttls[index] !== -2);
+  };
   const clear = async (pattern: string) => {
     const matched = await keys(pattern);
-    if (matched.length) await isolated.client.del(matched);
+    if (matched.length) await client.del(matched);
   };
   return {
-    url: isolated.url,
-    shared: false,
-    get client() {
-      return isolated.client;
-    },
+    url: target.toString(),
+    shared: Boolean(sharedUrl),
+    client,
     keys,
     clear,
     async activeClientCount() {
-      return (await isolated.client.clientList()).length;
+      return relay.clientConnections;
     },
-    close: () => isolated.close(),
+    async close() {
+      try {
+        if (client.isOpen) await clear(`mio:${namespacePrefix}*`);
+      } finally {
+        await relay.close();
+        if (sharedUrl && client.isOpen) client.destroy();
+        await isolated?.close();
+      }
+    },
   };
 }

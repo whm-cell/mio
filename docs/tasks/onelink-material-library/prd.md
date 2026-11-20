@@ -223,8 +223,8 @@ Pre-C1（`D-01`–`D-04`）已实证收口；下表核心唯一性与隔离约�
 
 - 组 `state`：`creating` / `ready` / `unknown` / `deleting` / `deleted` / `failed`；`auth_status` 与生命周期分列，真人 `verified` 才可接纳真人素材，AIGC 显式 `not_applicable`。
 - 素材 `state`：`registering` / `processing` / `active` / `rejected` / `unknown` / `deleting` / `deleted` / `failed`。`active` 只来自明确的上游状态映射（Pre-C1 实证首字母大写枚举 `"Active"`）；未知字符串保留原文并按不可用处理，不采用“未知就通过”。
-- 单一事实源与提交规则：PG 与远程平台/COS 不在同一事务。真人认证全程以 `mio_material_auth_sessions` 为唯一事实源；重命名与组内有界同步在 `mio_material_groups` 行锁/同步租约内执行并直接返回结果；仅不可逆远端变更（建组、登记素材、远端删素材/组）先提交 `mio_material_operations` 再出站，断线/超时 `unknown` 期间以操作表为恢复权威，获得确定外部结果后在同一 PG 事务内按 owner、租约与输入快照条件提交实体终态并收束操作行。唯一冲突读回原记录，不能重试创建。
-- 请求发出后超时进入 `unknown`，优先按上游请求 ID/幂等键/可核验列表找回。若上游无恢复能力，人工处置并披露资源残留；不能自动无限重发 `CreateAsset`/`CreateAssetGroup`/认证创建。
+- 单一事实源与提交规则：PG 与远程平台/COS 不在同一事务。真人认证全程以 `mio_material_auth_sessions` 为唯一事实源；重命名与组内有界同步在 `mio_material_groups` 行锁/同步租约内执行并直接返回结果；仅不可逆远端变更（建组、登记素材、远端删素材/组）先提交 `mio_material_operations` 再出站，断线/超时 `unknown` 期间以操作表为恢复权威，获得确定外部结果后在同一 PG 事务内按 owner、租约与输入快照条件提交实体终态并收束操作行。仅同 owner、同操作/requestId、同输入可幂等读回原操作；跨 owner 全局上游 ID 冲突必须拒绝，不读回他人记录、不重绑、不重试创建。
+- 请求发出后超时进入 `unknown`，优先按可精确核验的身份找回。`CreateAssetGroup` 已返回合法 ID 但本地提交失败时，fallback 将该 ID 写入原操作受限 `protocol_snapshot`（`version:1`、`upstreamId`），并保留 `upstream_request_id`；当前 owner 凭据在原操作冷却和组/操作双租约内单次 `GetAssetGroup({Id})` 证实存在后，同事务补本地映射并收束操作。403、404、跨 owner 唯一冲突继续显式 unknown，不返回远端 ID。无 ID 或 fallback 也失败时人工核对并披露资源残留；不能全池枚举、按名认领或自动重发 `CreateAsset`/`CreateAssetGroup`/认证创建。
 - 组内有界同步写入本地快照；一次分页缺失不能判定删除。只有完整覆盖或明确 `GetAsset` 返回 HTTP 404 + `Error.Code === "ResourceNotFound"` 且账号权限核实后才更新缺失事实；403 不当 404。
 - 复杂度依据（`DESIGN-OVER-001`）：`mio_material_operations` 严格收敛到跨断线不可逆远端变更，认证会话与组同步各自内聚在所属实体表上，避免双写冲突与多余轮询；不引入通用工作流引擎、缓存、消息队列或跨服务 saga。
 

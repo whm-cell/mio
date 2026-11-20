@@ -54,6 +54,7 @@ const preview = vi.fn<ConversationVision['preview']>(async (_owner, attachment) 
   fingerprint: 'stable',
 }));
 const vision: ConversationVision = {
+  prepareRequest: async (_owner, id) => ({ reference: ref(id), previewBytes: 2 }),
   prepare: async (_owner, id) => ref(id),
   preview,
   target: () => ({ width: 1, height: 1, maxBytes: 100 }),

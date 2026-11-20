@@ -146,6 +146,7 @@ export function createComputeService(
           config.brokerURL,
           config.brokerUser,
           config.expectedResultUser,
+          stop.signal,
         );
         if (stopping) {
           await acquired.close();

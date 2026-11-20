@@ -346,6 +346,7 @@ export function registerVendorRoutingCases() {
       expect(outcome.images).toHaveLength(15);
       for (const image of outcome.images) {
         expect(image).not.toBeNull();
+        if (!image || 'download' in image) throw new Error('expected buffered image');
         const bytes = Buffer.from(image!.base64, 'base64');
         expect(bytes).toEqual(Buffer.from(JPEG_BYTES));
         await expect(createImageDecoder()(bytes, image!.format ?? 'jpeg')).resolves.toBeUndefined();
@@ -390,6 +391,8 @@ export function registerVendorRoutingCases() {
       );
       expect(result.state).toBe('returned');
       if (result.state !== 'returned') throw new Error('expected image bytes');
+      if (!result.images[0] || 'download' in result.images[0])
+        throw new Error('expected buffered image');
       expect(result.images[0]?.format).toBe('jpeg');
       const bytes = Buffer.from(result.images[0]!.base64, 'base64');
       expect(bytes).toEqual(Buffer.from(JPEG_BYTES));
@@ -498,6 +501,7 @@ export function registerVendorRoutingCases() {
         expect(outcome.state).toBe('returned');
         if (outcome.state !== 'returned') throw new Error('expected returned image bytes');
         const image = outcome.images[0]!;
+        if ('download' in image) throw new Error('expected buffered image');
         const format = image.format ?? requestedFormat ?? fixedFormat ?? 'jpeg';
         const decoded = createImageDecoder()(Buffer.from(image.base64, 'base64'), format);
         if (expectedState === 'completed') await expect(decoded).resolves.toBeUndefined();

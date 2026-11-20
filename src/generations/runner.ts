@@ -8,7 +8,11 @@ import {
   defaultRouteAsyncTransport,
 } from '../integrations/onelink/router.ts';
 import { matchesImageSignature } from '../integrations/onelink/shared/index.ts';
-import type { AsyncImageTransport, ReadImage } from '../integrations/onelink/shared/index.ts';
+import type {
+  AsyncImageTransport,
+  ImageResult,
+  ReadImage,
+} from '../integrations/onelink/shared/index.ts';
 import { withPublicHttps } from '../integrations/onelink/public-https.ts';
 import { createImageDecoder } from './decode.ts';
 import type { GenerationExecution, GenerationObjects } from './execution.ts';
@@ -51,10 +55,7 @@ export function createGenerationRunner(
     )
       await verify(row);
   };
-  const returned = async (
-    row: GenerationExecution,
-    images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[],
-  ) => {
+  const returned = async (row: GenerationExecution, images: (ImageResult | null)[]) => {
     let stored;
     try {
       stored = await files.receive(
@@ -69,6 +70,16 @@ export function createGenerationRunner(
       throw error;
     }
     if (files.storageFailed) await store.storageFailure(row);
+    if (
+      !stored.checkpoint.receivedAll &&
+      row.upstream_task_id &&
+      !files.storageFailed &&
+      row.query_attempt < (row.async_max_queries ?? 0) &&
+      (await store.queryInTime(row))
+    ) {
+      await store.processing(row);
+      return;
+    }
     if (!(await store.checkpoint(row, stored.ref))) return;
     if (
       (await materializeGeneration(row, stored.checkpoint, store, files, objects, decode, stop)) ===
@@ -111,8 +122,10 @@ export function createGenerationRunner(
       row.command.input.operation ?? 'generate',
       transport,
       read,
-      transports.asyncTransport ?? defaultRouteAsyncTransport(route, transport, read, download),
+      transports.asyncTransport ??
+        defaultRouteAsyncTransport(route, transport, read, download, 'deferred'),
       download,
+      'deferred',
     );
   };
   const read = (): ReadImage => {
@@ -182,13 +195,22 @@ export function createGenerationRunner(
   const query = async (claimed: GenerationExecution) => {
     // A successful response can reach durable storage before its PG checkpoint.
     // Recover it before spending another query or rejecting an expired budget.
-    if (await files.load(claimed.id, claimed.command.messageId, claimed.command.input.n ?? 1)) {
+    const saved = await files.load(
+      claimed.id,
+      claimed.command.messageId,
+      claimed.command.input.n ?? 1,
+    );
+    const failQuery = async (row: GenerationExecution, code: string) => {
+      if (saved?.checkpoint.images.length) await materialize(row);
+      else await store.terminal(row, 'failed', code);
+    };
+    if (saved?.checkpoint.receivedAll) {
       await materialize(claimed);
       return;
     }
     const row = await store.beginQuery(claimed);
     if (!row) {
-      await store.terminal(claimed, 'failed', 'IMAGE_QUERY_LIMIT');
+      await failQuery(claimed, 'IMAGE_QUERY_LIMIT');
       return;
     }
     let key: string;
@@ -197,7 +219,7 @@ export function createGenerationRunner(
       if (!providers) throw new Error('IMAGE_CREDENTIAL_UNAVAILABLE');
       key = await providers.resolveImageTaskCredential(row.owner_id);
     } catch {
-      await store.terminal(row, 'failed', 'IMAGE_CREDENTIAL_UNAVAILABLE');
+      await failQuery(row, 'IMAGE_CREDENTIAL_UNAVAILABLE');
       return;
     }
     if (stop.aborted) {
@@ -205,7 +227,7 @@ export function createGenerationRunner(
       return;
     }
     if (!(await store.queryInTime(row))) {
-      await store.terminal(row, 'failed', 'IMAGE_QUERY_LIMIT');
+      await failQuery(row, 'IMAGE_QUERY_LIMIT');
       return;
     }
     const deadline = Math.min(row.command.expiresAt, row.async_deadline!.getTime());
@@ -223,13 +245,11 @@ export function createGenerationRunner(
     );
     if (result.state === 'returned') await returned(row, result.images);
     else if (stop.aborted) await store.release(row);
-    else if (result.state === 'processing') await store.processing(row);
-    else
-      await store.terminal(
-        row,
-        'failed',
-        epochMs() >= deadline ? 'IMAGE_QUERY_LIMIT' : result.code,
-      );
+    else if (result.state === 'processing') {
+      if (row.query_attempt >= (row.async_max_queries ?? 0) || !(await store.queryInTime(row)))
+        await failQuery(row, 'IMAGE_QUERY_LIMIT');
+      else await store.processing(row);
+    } else await failQuery(row, epochMs() >= deadline ? 'IMAGE_QUERY_LIMIT' : result.code);
   };
   return async (row: GenerationExecution): Promise<void> => {
     try {

@@ -88,14 +88,24 @@ export class AssetStore {
   }
 
   /** Only keys generated for this domain are selected; ready raw objects are never selected. */
-  async expiredStaging(): Promise<{ id: string; staging_key: string }[]> {
+  async expiredStaging(after?: {
+    expires_at: string;
+    id: string;
+  }): Promise<{ id: string; staging_key: string; expires_at: string }[]> {
     return (
-      await this.pool.query<{ id: string; staging_key: string }>(
-        `UPDATE mio_assets SET state=CASE WHEN state='ready' THEN state ELSE 'expired' END
-         WHERE id IN (SELECT id FROM mio_assets WHERE expires_at<=now() AND staging_deleted_at IS NULL AND staging_key IS NOT NULL
-         AND (state<>'finalizing' OR lease_until<=now()) ORDER BY expires_at LIMIT 100)
-         AND expires_at<=now() AND staging_deleted_at IS NULL
-         AND (state<>'finalizing' OR lease_until<=now()) RETURNING id,staging_key`,
+      await this.pool.query<{ id: string; staging_key: string; expires_at: string }>(
+        `WITH selected AS (
+           SELECT id FROM mio_assets WHERE expires_at<=now() AND staging_deleted_at IS NULL AND staging_key IS NOT NULL
+           AND (state<>'finalizing' OR lease_until<=now())
+           AND ($1::timestamptz IS NULL OR (expires_at,id)>($1::timestamptz,$2::uuid))
+           ORDER BY expires_at,id LIMIT 100
+         ), updated AS (
+           UPDATE mio_assets SET state=CASE WHEN state='ready' THEN state ELSE 'expired' END
+           WHERE id IN (SELECT id FROM selected)
+           AND expires_at<=now() AND staging_deleted_at IS NULL
+           AND (state<>'finalizing' OR lease_until<=now()) RETURNING id,staging_key,expires_at
+         ) SELECT id,staging_key,expires_at::text FROM updated ORDER BY expires_at,id`,
+        [after?.expires_at ?? null, after?.id ?? null],
       )
     ).rows;
   }

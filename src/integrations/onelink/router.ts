@@ -13,6 +13,7 @@ import type {
   AsyncImageSubmission,
   AsyncImageTransport,
   ImageSubmission,
+  ImageResultMode,
   ReadImage,
 } from './shared/index.ts';
 import { createRoutedViduImageProtocol } from './vidu/index.ts';
@@ -23,12 +24,13 @@ export function defaultRouteAsyncTransport(
   transport: typeof fetch,
   readImage?: ReadImage,
   download: typeof withPublicHttps = withPublicHttps,
+  resultMode: ImageResultMode = 'buffer',
 ): AsyncImageTransport | undefined {
   switch (route.driver) {
     case 'vidu-images':
-      return createRoutedViduImageProtocol(route, transport, readImage, download);
+      return createRoutedViduImageProtocol(route, transport, readImage, download, resultMode);
     case 'kling-images':
-      return createRoutedKlingImageProtocol(route, transport, readImage, download);
+      return createRoutedKlingImageProtocol(route, transport, readImage, download, resultMode);
     case 'openai-images':
     case 'volcengine-ark-images':
       return undefined;
@@ -47,6 +49,7 @@ export function createRoutedImageProtocol(
   readImage?: ReadImage,
   asyncTransport?: AsyncImageTransport,
   download: typeof withPublicHttps = withPublicHttps,
+  resultMode: ImageResultMode = 'buffer',
 ) {
   if (!validateImageRouteConfig(route) || !IMAGE_OPERATIONS.includes(operation as ImageOperation))
     throw new Error('IMAGE_PROTOCOL_UNSUPPORTED');
@@ -134,9 +137,11 @@ export function createRoutedImageProtocol(
             result.images.some(
               (image) =>
                 image !== null &&
-                (!validBase64(image.base64) ||
-                  (image.format !== undefined &&
-                    !['png', 'jpeg', 'webp'].includes(String(image.format)))),
+                ('download' in image
+                  ? typeof image.download !== 'function'
+                  : !validBase64(image.base64) ||
+                    (image.format !== undefined &&
+                      !['png', 'jpeg', 'webp'].includes(String(image.format)))),
             ))
         )
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
@@ -182,6 +187,7 @@ export function createRoutedImageProtocol(
             transport,
             read ?? readImage,
             download,
+            resultMode,
           );
         case 'vidu-images':
         case 'kling-images':

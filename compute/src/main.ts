@@ -63,9 +63,6 @@ async function start(): Promise<void> {
   const journal = new Journal(directory, instance);
   const stopping = new AbortController();
   let worker: Worker | null = null;
-  const stopped = new Promise<void>((resolve) => {
-    stopping.signal.addEventListener('abort', () => resolve(), { once: true });
-  });
   const stop = () => {
     worker?.stop();
     stopping.abort(new Error('WORKER_STOPPED'));
@@ -74,6 +71,9 @@ async function start(): Promise<void> {
   process.once('SIGTERM', stop);
   try {
     while (!stopping.signal.aborted) {
+      const { promise: stopped, resolve: resolveStopped } = Promise.withResolvers<void>();
+      const onStop = () => resolveStopped();
+      stopping.signal.addEventListener('abort', onStop, { once: true });
       let broker: Broker | undefined;
       let interval: ReturnType<typeof setInterval> | undefined;
       let maintenance: Maintenance | undefined;
@@ -107,6 +107,7 @@ async function start(): Promise<void> {
           log.error('JOURNAL_CONSUMPTION_STOPPED');
         } else if (!stopping.signal.aborted) log.error('BROKER_CONNECTION_ERROR');
       } finally {
+        stopping.signal.removeEventListener('abort', onStop);
         maintenance?.stop();
         if (interval) clearInterval(interval);
         worker?.stop();

@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
+import { setImmediate as yieldToIO } from 'node:timers/promises';
 import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
@@ -70,10 +71,12 @@ export function createDshConversationEngine(
         await handle.dispose();
       }
     },
-    async history(id, afterSeq, limit) {
-      const { events } = await ctx.mioKernel.history(id);
+    async history(id, afterSeq, limit, signal) {
+      const { events } = await ctx.mioKernel.history(id, signal);
       const items: HistoryItem[] = [];
-      for (const event of events) {
+      for (const [index, event] of events.entries()) {
+        if (index > 0 && index % 128 === 0) await yieldToIO(undefined, { signal });
+        signal?.throwIfAborted();
         if (event.seq <= afterSeq) continue;
         if (event.type === 'user/message' && event.data.source.kind === 'user') {
           const text = event.data.content

@@ -58,7 +58,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 输入：图片任务 UUID，无查询参数。
 
-成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是 `0..15`（单任务最多 16 张输出）的原始输出序号，即使前项缺失也不重排。A 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；A 使用 sharp 异步完整解码校验原图，不调整原始字节、格式、尺寸或顺序。收到的图片先可靠落盘并同步，再登记 PG 文件定位与摘要；COS 或入库失败时从该检查点继续，不能重新生成。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。
+成功：200 返回 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`；outputs 的每项为 `{index,assetId}`，index 是 `0..15`（单任务最多 16 张输出）的原始输出序号，即使前项缺失也不重排。A 为每次图片物化生成 `index-fileId.format` 的唯一 COS 键，成功后由 A 绑定 owner 资产，重试不会覆盖已登记键；已登记的 assetIds 通过[资产接口](assets.md)获取下载地址。`completed` 要求输出数等于请求数；上游返回较少或能明确判定部分输出无效时为 `partial`。`materializing` 表示已返回的图片正在有界落库，失败耗尽为 `materialization_failed`，仍可见已登记的部分资产；A 使用 sharp 异步完整解码校验原图，不调整原始字节、格式、尺寸或顺序。URL 结果在上游任务身份核验后按原索引逐张流入耐久暂存，单张最多 128 MiB，不整批转为 Base64 驻留；同步 JSON/Base64 回包继续使用独立的有界正文读取。收到的图片先可靠落盘并同步，再登记 PG 文件定位与摘要；COS 或入库失败时从该检查点继续，不能重新生成。此类原件可能长期保留，当前没有主动放弃入口。`unknown` 表示提交结果不明，不自动重发。
 
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
 
@@ -80,4 +80,4 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 A 使用 `MIO_GENERATIONS_ENABLED=true` 和绝对持久目录 `MIO_GENERATIONS_DATA_DIR`；身份、媒体数据库、COS 及 provider master key 仍须配置。先迁移 assets，再显式执行 `pnpm generations:migrate --apply`（本地为 `pnpm migrate:dev generations --apply`）。历史任务及输出原表继续使用；没有 A 执行记录的旧 B 任务只读查询，不被 A 重新提交。内部密文、上游 ID、执行阶段和文件定位不进入公开视图。
 
-切换沿[常驻环境](../local-environments.md#图片生成迁移与切换)先暂停新提交、排空并对账旧任务/outbox/MQ/B journal 和未确认上传，再停旧图片执行器、启动 A 并恢复接单。未对账 unknown、恢复数据缺失、存储权限不足阻止切换。A 接过新任务后先对账新任务，不能直接交旧 B 重跑。成功 COS/DB 对账后清理已确认临时图，失败与未知检查点保留；磁盘不足停止新任务准入，不自动删除恢复数据。
+切换沿[常驻环境](../local-environments.md#图片生成迁移与切换)先暂停新提交、排空并对账旧任务/outbox/MQ/B journal 和未确认上传，再停旧图片执行器、启动 A 并恢复接单。未对账 unknown、恢复数据缺失、存储权限不足阻止切换。A 接过新任务后先对账新任务，不能直接交旧 B 重跑。成功 COS/DB 对账后清理已确认临时图。进程在已完成提交后中断时，后台按确切完成检查点和 COS 输出补清；只处理全部完成且尝试键无歧义的文件，清理可幂等续接，失败项分页推进并后续回访。失败、部分完成与未知检查点保留；磁盘不足停止新任务准入，不自动删除恢复数据。

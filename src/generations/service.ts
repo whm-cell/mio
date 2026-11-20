@@ -12,6 +12,7 @@ import { GenerationFiles } from './files.ts';
 import { GenerationError } from './errors.ts';
 import { createGenerationAdmission } from './admission.ts';
 import { createGenerationRunner } from './runner.ts';
+import { cleanCompletedGeneration } from './materialize.ts';
 import type { GenerationTransports } from './runner.ts';
 
 const log = createLogger('app', 'generations');
@@ -65,6 +66,28 @@ export async function createGenerationService(
       );
     });
   const create = createGenerationAdmission(store, files, head, provider);
+  let cleanup: Promise<void> | undefined;
+  let cleanupCursor: string | undefined;
+  const clean = () => {
+    if (stopping || cleanup) return;
+    cleanup = (async () => {
+      const rows = await store.completedCleanup(cleanupCursor);
+      if (!rows.length) cleanupCursor = undefined;
+      for (const row of rows) {
+        if (stopping) break;
+        cleanupCursor = row.id;
+        try {
+          await cleanCompletedGeneration(row, store, files, head, stop.signal);
+        } catch {
+          log.error('GENERATION_FILE_CLEANUP_PENDING');
+        }
+      }
+    })()
+      .catch(() => log.error('GENERATION_FILE_CLEANUP_PENDING'))
+      .finally(() => {
+        cleanup = undefined;
+      });
+  };
   const admit = <T>(action: () => Promise<T>): Promise<T> => {
     if (stopping) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_UNAVAILABLE');
     const pending = action();
@@ -110,9 +133,13 @@ export async function createGenerationService(
     stop.abort();
     log.error('GENERATION_EXECUTOR_LEASE_LOST');
   });
-  const timer = setInterval(pump, 1000);
+  const timer = setInterval(() => {
+    pump();
+    clean();
+  }, 1000);
   timer.unref();
   pump();
+  clean();
   return {
     createImage(
       actor: { readonly userId: string; readonly sessionId?: string },
@@ -145,6 +172,7 @@ export async function createGenerationService(
         stop.abort();
         closing = (async () => {
           await pumping;
+          await cleanup;
           await Promise.allSettled([...admissions, ...active]);
           await store.close();
         })();

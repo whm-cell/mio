@@ -38,7 +38,8 @@ const makeRef = (id: string) => ({
   height: 1,
 });
 const vision: ConversationVision = {
-  prepare: vi.fn(async (_owner, id) => makeRef(id)),
+  prepare: async (_owner, id) => makeRef(id),
+  prepareRequest: vi.fn(async (_owner, id) => ({ reference: makeRef(id), previewBytes: 3 })),
   target: () => ({ width: 1, height: 1, maxBytes: 1024 }),
   preview: vi.fn<ConversationVision['preview']>(async (_owner, ref) => ({
     variantId: 'variant',
@@ -132,20 +133,66 @@ const post = (id: string, value: unknown, cookie = 'owner') =>
     body: JSON.stringify(value),
   });
 
+it('rejects a third fresh image preparation without queueing or receiving while replay stays available', async () => {
+  const replayId = await conversation();
+  const replay = {
+    requestId: 'replay-under-load',
+    text: 'accepted',
+    imageAssetIds: [randomUUID()],
+  };
+  expect((await post(replayId, replay)).status).toBe(202);
+  const ids = await Promise.all([conversation(), conversation(), conversation()]);
+  const release = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let active = 0;
+  vi.mocked(vision.prepareRequest).mockImplementation(async (_owner, assetId) => {
+    active++;
+    if (active === 2) entered.resolve();
+    await release.promise;
+    return { reference: makeRef(assetId), previewBytes: 3 };
+  });
+  const input = (requestId: string) => ({
+    requestId,
+    text: 'describe',
+    imageAssetIds: [randomUUID()],
+  });
+  const first = post(ids[0]!, input('first-under-load'));
+  const second = post(ids[1]!, input('second-under-load'));
+  const retry = input('retry-after-overload');
+  try {
+    await entered.promise;
+    const reads = vi.mocked(vision.prepareRequest).mock.calls.length;
+    const overloaded = await post(ids[2]!, retry);
+    expect(overloaded.status).toBe(503);
+    expect(await overloaded.json()).toMatchObject({ error: { code: 'IMAGE_UNAVAILABLE' } });
+    expect(vision.prepareRequest).toHaveBeenCalledTimes(reads);
+    expect(
+      (await service.request(actor, ids[2]!, retry.requestId).catch((error) => error)).code,
+    ).toBe('REQUEST_NOT_FOUND');
+    expect((await post(replayId, replay)).status).toBe(202);
+    expect(vision.prepareRequest).toHaveBeenCalledTimes(reads);
+  } finally {
+    release.resolve();
+    expect((await first).status).toBe(202);
+    expect((await second).status).toBe(202);
+  }
+  expect((await post(ids[2]!, retry)).status).toBe(202);
+});
+
 it('checks ownership and text-only capability before asset reads and maps asset errors', async () => {
   const id = await conversation();
   const body = { requestId: 'one', text: 'describe', imageAssetIds: [randomUUID()] };
   expect((await post(id, body, 'other')).status).toBe(404);
-  expect(vision.prepare).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
   snapshot = { ...snapshot, inputModalities: ['text'] };
   const textOnly = await post(id, body);
   expect(textOnly.status).toBe(409);
   expect(await textOnly.json()).toMatchObject({ error: { code: 'MODEL_MODALITY_UNSUPPORTED' } });
-  expect(vision.prepare).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
 
   snapshot = { ...snapshot, inputModalities: ['text', 'image'] };
   const reconcile = vi.spyOn(store, 'reconcileReception');
-  vi.mocked(vision.prepare).mockRejectedValueOnce(new AssetError(404, 'ASSET_NOT_FOUND'));
+  vi.mocked(vision.prepareRequest).mockRejectedValueOnce(new AssetError(404, 'ASSET_NOT_FOUND'));
   const missing = await post(id, body);
   expect(missing.status).toBe(404);
   expect(await missing.json()).toMatchObject({ error: { code: 'ASSET_NOT_FOUND' } });
@@ -158,10 +205,10 @@ it('serializes competing IDs without holding a PG row lock during image prefligh
   const asset = randomUUID();
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  vi.mocked(vision.prepare).mockImplementationOnce(async (_owner, imageId) => {
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async (_owner, imageId) => {
     entered.resolve();
     await release.promise;
-    return makeRef(imageId);
+    return { reference: makeRef(imageId), previewBytes: 3 };
   });
   const first = service.send(actor, id, 'same', 'hello', [asset]);
   await entered.promise;
@@ -177,7 +224,7 @@ it('serializes competing IDs without holding a PG row lock during image prefligh
   release.resolve();
   expect((await first).requestId).toBe('same');
   await expect(second).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
-  expect(vision.prepare).toHaveBeenCalledTimes(1);
+  expect(vision.prepareRequest).toHaveBeenCalledTimes(1);
   expect(engine.run).toHaveBeenCalledTimes(1);
 });
 
@@ -185,7 +232,7 @@ it('allows a waiting competitor to retry after preflight failure', async () => {
   const id = await conversation();
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  vi.mocked(vision.prepare).mockImplementationOnce(async () => {
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async () => {
     entered.resolve();
     await release.promise;
     throw new AssetError(404, 'ASSET_NOT_FOUND');
@@ -197,7 +244,7 @@ it('allows a waiting competitor to retry after preflight failure', async () => {
   release.resolve();
   await failed;
   expect((await second).requestId).toBe('retry');
-  expect(vision.prepare).toHaveBeenCalledTimes(2);
+  expect(vision.prepareRequest).toHaveBeenCalledTimes(2);
 });
 
 it('returns one receipt to concurrent identical image sends after a single preflight', async () => {
@@ -205,10 +252,10 @@ it('returns one receipt to concurrent identical image sends after a single prefl
   const asset = randomUUID();
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  vi.mocked(vision.prepare).mockImplementationOnce(async (_owner, imageId) => {
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async (_owner, imageId) => {
     entered.resolve();
     await release.promise;
-    return makeRef(imageId);
+    return { reference: makeRef(imageId), previewBytes: 3 };
   });
   const first = service.send(actor, id, 'same-image', 'hello', [asset]);
   await entered.promise;
@@ -216,7 +263,7 @@ it('returns one receipt to concurrent identical image sends after a single prefl
   release.resolve();
   expect((await first).requestId).toBe('same-image');
   expect((await second).requestId).toBe('same-image');
-  expect(vision.prepare).toHaveBeenCalledOnce();
+  expect(vision.prepareRequest).toHaveBeenCalledOnce();
   expect(engine.run).toHaveBeenCalledOnce();
 });
 
@@ -234,12 +281,12 @@ it('keeps an image receipt unknown after a lost reception acknowledgement withou
       status: 'unknown',
       error: 'RECEPTION_UNKNOWN',
     });
-    vi.mocked(vision.prepare).mockRejectedValueOnce(new Error('asset changed'));
+    vi.mocked(vision.prepareRequest).mockRejectedValueOnce(new Error('asset changed'));
     expect(await service.send(actor, id, 'lost', 'hello', [asset])).toMatchObject({
       status: 'unknown',
     });
     expect(engine.run).not.toHaveBeenCalled();
-    expect(vision.prepare).toHaveBeenCalledOnce();
+    expect(vision.prepareRequest).toHaveBeenCalledOnce();
   } finally {
     lost.mockRestore();
   }
@@ -262,7 +309,7 @@ it('returns an existing receipt before mutable checks and rejects busy new IDs b
   vi.mocked(provider.resolveChat).mockRejectedValueOnce(new Error('catalog unavailable'));
   expect((await post(id, body)).status).toBe(202);
   expect((await post(id, { ...body, requestId: 'new' })).status).toBe(409);
-  expect(vision.prepare).toHaveBeenCalledTimes(1);
+  expect(vision.prepareRequest).toHaveBeenCalledTimes(1);
   expect(provider.resolveChat).toHaveBeenCalledTimes(2);
   release.resolve();
 });
@@ -283,7 +330,7 @@ it('validates HTTP image identities and keeps the legacy digest for omitted or e
   expect(
     (await post(id, { requestId: 'invalid', text: '  ', imageAssetIds: [asset] })).status,
   ).toBe(400);
-  expect(vision.prepare).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
   expect((await post(id, { requestId: 'legacy', text: 'hello', imageAssetIds: [] })).status).toBe(
     202,
   );
@@ -293,7 +340,7 @@ it('validates HTTP image identities and keeps the legacy digest for omitted or e
   );
   expect(result.rows[0]!.digest).toBe(createHash('sha256').update('hello').digest('hex'));
   expect((await post(id, { requestId: 'legacy', text: 'hello' })).status).toBe(202);
-  expect(vision.prepare).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
 });
 
 it('binds request identity to ordered image IDs and returns existing receipts first', async () => {
@@ -310,13 +357,13 @@ it('binds request identity to ordered image IDs and returns existing receipts fi
       .update(JSON.stringify(['hello', ids]))
       .digest('hex')}`,
   );
-  const calls = vi.mocked(vision.prepare).mock.calls.length;
+  const calls = vi.mocked(vision.prepareRequest).mock.calls.length;
   vi.mocked(provider.resolveChat).mockRejectedValueOnce(new Error('catalog unavailable'));
   expect((await post(id, body)).status).toBe(202);
   const conflict = await post(id, { ...body, imageAssetIds: [...ids].reverse() });
   expect(conflict.status).toBe(409);
   expect(await conflict.json()).toMatchObject({ error: { code: 'REQUEST_ID_CONFLICT' } });
-  expect(vision.prepare).toHaveBeenCalledTimes(calls);
+  expect(vision.prepareRequest).toHaveBeenCalledTimes(calls);
 });
 
 it('accepts four distinct images in their original order at the HTTP limit', async () => {
@@ -324,7 +371,7 @@ it('accepts four distinct images in their original order at the HTTP limit', asy
   const imageAssetIds = Array.from({ length: 4 }, () => randomUUID());
   const response = await post(id, { requestId: 'four', text: 'describe', imageAssetIds });
   expect(response.status, await response.clone().text()).toBe(202);
-  expect(vi.mocked(vision.prepare).mock.calls.map((call) => call[1])).toEqual(imageAssetIds);
+  expect(vi.mocked(vision.prepareRequest).mock.calls.map((call) => call[1])).toEqual(imageAssetIds);
   expect(vi.mocked(engine.run).mock.calls[0]![6]?.map((image) => image.attachmentId)).toEqual(
     imageAssetIds,
   );
@@ -339,7 +386,7 @@ it('rejects current image count, encoded byte excess, and changed route before a
     imageAssetIds: [randomUUID(), randomUUID()],
   });
   expect(tooMany.status).toBe(400);
-  expect(vision.prepare).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
 
   const bytesId = await conversation();
   snapshot = { ...snapshot, imageBudget: { ...snapshot.imageBudget!, maxRequestImageBytes: 3 } };
@@ -355,9 +402,9 @@ it('rejects current image count, encoded byte excess, and changed route before a
 
   const driftId = await conversation();
   snapshot = { ...snapshot, imageBudget: { ...DEFAULT_CHAT_IMAGE_BUDGET } };
-  vi.mocked(vision.prepare).mockImplementationOnce(async (_owner, assetId) => {
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async (_owner, assetId) => {
     snapshot = { ...snapshot, imageBudget: { ...snapshot.imageBudget!, maxRequestImages: 2 } };
-    return makeRef(assetId);
+    return { reference: makeRef(assetId), previewBytes: 3 };
   });
   const drift = await post(driftId, {
     requestId: 'drift',

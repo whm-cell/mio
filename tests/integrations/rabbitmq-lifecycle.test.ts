@@ -1,8 +1,12 @@
-import { EventEmitter } from 'node:events';
+import type * as Amqplib from 'amqplib';
+import { EventEmitter, once } from 'node:events';
+import { createServer } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import type { ConsumeMessage } from 'amqplib';
 import { connect } from 'amqplib';
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { COMMAND_EXCHANGE, COMMAND_ROUTING_KEY } from '@mio/compute-contracts';
 import type { ComputeCommandV1 } from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
@@ -35,6 +39,7 @@ class TestConnection extends EventEmitter {
   });
 }
 beforeEach(() => vi.resetAllMocks());
+afterEach(() => vi.useRealTimers());
 function connections() {
   const consumer = new TestConnection(),
     publisher = new TestConnection();
@@ -44,6 +49,102 @@ function connections() {
   return { consumer, publisher };
 }
 const open = () => ComputeBroker.connect('amqp://a:secret@127.0.0.1/test', 'a', 'b');
+
+it.each(['amqp', 'amqps'])(
+  'destroys a real %s startup socket on service cancellation',
+  async (protocol) => {
+    const actual = await vi.importActual<typeof Amqplib>('amqplib');
+    vi.mocked(connect).mockImplementationOnce((url, options) => actual.connect(url, options));
+    const accepted = Promise.withResolvers<Socket>();
+    const server = createServer(accepted.resolve);
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const stop = new AbortController();
+    const failure = new Error('test shutdown');
+    const connecting = ComputeBroker.connect(
+      `${protocol}://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      'a',
+      'b',
+      stop.signal,
+    ).catch((error: unknown) => error);
+    const socket = await accepted.promise;
+    try {
+      await once(socket, 'data');
+      const closed = once(socket, 'close');
+      stop.abort(failure);
+      expect(await Promise.race([connecting, delay(750, 'startup pending')])).toBe(failure);
+      expect(await Promise.race([closed.then(() => 'closed'), delay(750, 'socket open')])).toBe(
+        'closed',
+      );
+    } finally {
+      socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await connecting;
+    }
+  },
+);
+
+it('applies the startup deadline to a stalled channel RPC and releases both transports', async () => {
+  const pair = connections();
+  pair.publisher.createConfirmChannel.mockImplementationOnce(() => new Promise(() => {}));
+  vi.useFakeTimers();
+  const connecting = open().catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(await connecting).toEqual(new Error('BROKER_STARTUP_TIMEOUT'));
+  expect(pair.consumer.close).toHaveBeenCalledOnce();
+  expect(pair.publisher.close).toHaveBeenCalledOnce();
+  expect(
+    vi
+      .mocked(connect)
+      .mock.calls.every(([, options]) => (options as { signal: AbortSignal }).signal.aborted),
+  ).toBe(true);
+});
+
+it.each(['channel', 'consume'] as const)(
+  'closes the PG pool when shutdown interrupts stalled %s setup',
+  async (stage) => {
+    const pair = connections();
+    if (stage === 'channel')
+      pair.publisher.createConfirmChannel.mockImplementationOnce(() => new Promise(() => {}));
+    else pair.consumer.channel.consume.mockImplementationOnce(() => new Promise(() => {}));
+    const store = {
+      claim: vi.fn(async () => undefined),
+      close: vi.fn(async () => {}),
+    } as unknown as ComputeStore;
+    vi.useFakeTimers();
+    const service = createComputeService(store, {} as AssetObjectStore, {
+      brokerURL: 'amqp://a:secret@127.0.0.1/test',
+      brokerUser: 'a',
+      expectedResultUser: 'b',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const closing = service.close();
+    await vi.advanceTimersByTimeAsync(5000);
+    await closing;
+    expect(store.close).toHaveBeenCalledOnce();
+    expect(pair.consumer.close).toHaveBeenCalledOnce();
+    expect(pair.publisher.close).toHaveBeenCalledOnce();
+  },
+);
+
+it('terminates a stalled close handshake at the deadline through the socket abort signals', async () => {
+  const pair = connections();
+  const broker = await open();
+  const transports = vi
+    .mocked(connect)
+    .mock.calls.map(([, options]) => (options as { signal: AbortSignal }).signal);
+  for (const [index, connection] of [pair.consumer, pair.publisher].entries()) {
+    connection.close.mockImplementationOnce(() => new Promise(() => {}));
+    transports[index]!.addEventListener('abort', () => connection.emit('close'), { once: true });
+  }
+  vi.useFakeTimers();
+  const closing = broker.close();
+  await vi.advanceTimersByTimeAsync(4999);
+  expect(transports.every((signal) => !signal.aborted)).toBe(true);
+  await vi.advanceTimersByTimeAsync(1);
+  await closing;
+  expect(transports.every((signal) => signal.aborted)).toBe(true);
+});
 
 it.each(['consumer', 'publisher'] as const)(
   'notifies when only the %s channel closes',

@@ -13,6 +13,52 @@ import sharp from 'sharp';
 import { createGenerationHandler } from '../../src/generations/http.ts';
 import type { GenerationTransports } from '../../src/generations/runner.ts';
 import { generationFixture } from './fixture.ts';
+import { GenerationFiles } from '../../src/generations/files.ts';
+
+it('cleans confirmed completed files after restart when PG committed before cleanup failed', async () => {
+  const f = await generationFixture();
+  const clean = vi
+    .spyOn(GenerationFiles.prototype, 'clean')
+    .mockRejectedValue(new Error('cleanup unavailable'));
+  try {
+    await f.start();
+    const job = await f.service.createImage(f.actor, randomUUID(), f.modelRef, {
+      prompt: 'cleanup recovery',
+    });
+    await vi.waitFor(
+      async () => expect((await f.service.getImage(f.actor, job.jobId)).status).toBe('completed'),
+      { timeout: 6000 },
+    );
+    const before = await f.service.getImage(f.actor, job.jobId);
+    expect(
+      (await readdir(join(f.directory, job.jobId))).some((file) => file.endsWith('.png')),
+    ).toBe(true);
+    await f.stop();
+    clean.mockRestore();
+    await f.start();
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await readdir(join(f.directory, job.jobId))).filter((file) => file.endsWith('.png')),
+        ).toEqual([]),
+      { timeout: 6000 },
+    );
+    expect(await f.service.getImage(f.actor, job.jobId)).toEqual(before);
+    expect(f.transport).toHaveBeenCalledOnce();
+    expect(f.asyncTransport.submit).not.toHaveBeenCalled();
+    expect(
+      (
+        await f.pool.query(
+          "SELECT checkpoint->'cleaned' AS cleaned FROM mio_image_executions WHERE job_id=$1",
+          [job.jobId],
+        )
+      ).rows[0]?.cleaned,
+    ).toBe(true);
+  } finally {
+    clean.mockRestore();
+    await f.close();
+  }
+});
 
 it.each([
   ['image-kling-v3', undefined, 'failed'],

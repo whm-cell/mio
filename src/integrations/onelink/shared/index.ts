@@ -36,10 +36,16 @@ export interface AsyncImageObservation {
   errorCategory?: AsyncImageErrorCategory;
 }
 
+export type ImageResultMode = 'buffer' | 'deferred';
+
+export type ImageResult =
+  | { base64: string; format?: 'png' | 'jpeg' | 'webp' }
+  | { download: (consume: (response: Response) => Promise<void>) => Promise<void> };
+
 export type ImageSubmission =
   | {
       state: 'returned';
-      images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[];
+      images: (ImageResult | null)[];
       observation?: ImageObservation;
     }
   | { state: 'unknown'; code: 'IMAGE_SUBMISSION_UNKNOWN'; observation?: ImageObservation }
@@ -72,7 +78,7 @@ export type AsyncImageQuery =
   | {
       state: 'returned';
       upstreamTaskId: string;
-      images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[];
+      images: (ImageResult | null)[];
     }
   | { state: 'failed'; code: 'IMAGE_QUERY_FAILED' | 'IMAGE_QUERY_LIMIT' }
   | { state: 'unknown'; code: 'IMAGE_QUERY_UNKNOWN' };
@@ -223,9 +229,17 @@ export async function downloadResultImage(
   rawUrl: unknown,
   download: typeof withPublicHttps,
   signal: AbortSignal,
-): Promise<{ base64: string; format: 'png' | 'jpeg' | 'webp' } | null> {
+  mode: ImageResultMode = 'buffer',
+): Promise<ImageResult | null> {
   const url = safeResultUrl(rawUrl);
   if (!url) return null;
+  if (mode === 'deferred') {
+    return {
+      download: async (consume) => {
+        await download(url, signal, consume);
+      },
+    };
+  }
   return download(url, signal, async (result) => {
     if (!result.ok) {
       await result.body?.cancel().catch(() => {});

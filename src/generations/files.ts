@@ -5,6 +5,8 @@ import { join, resolve, sep } from 'node:path';
 import type { CheckpointRef, ImageCheckpoint, SavedImage } from './execution.ts';
 import { GenerationError } from './errors.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { matchesImageSignature } from '../integrations/onelink/shared/index.ts';
+import type { ImageResult } from '../integrations/onelink/shared/index.ts';
 
 function digest(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -96,11 +98,13 @@ export class GenerationFiles {
     jobId: string,
     commandId: string,
     expectedCount: number,
-    images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[],
+    images: (ImageResult | null)[],
     defaultFormat: 'png' | 'jpeg' | 'webp',
   ): Promise<{ checkpoint: ImageCheckpoint; ref: CheckpointRef }> {
     const directory = this.directory(jobId);
-    const checkpoint: ImageCheckpoint = {
+    const previous = await this.load(jobId, commandId, expectedCount);
+    if (previous?.checkpoint.receivedAll) return previous;
+    const checkpoint: ImageCheckpoint = previous?.checkpoint ?? {
       version: 1,
       revision: 0,
       jobId,
@@ -124,10 +128,21 @@ export class GenerationFiles {
       throw error;
     }
     try {
+      const received = new Set(checkpoint.images.map((image) => image.index));
       for (let index = 0; index < expectedCount; index++) {
+        if (received.has(index) || checkpoint.invalidIndices.includes(index)) continue;
         const image = images[index];
         if (!image) checkpoint.invalidIndices.push(index);
-        else {
+        else if ('download' in image) {
+          try {
+            const saved = await this.receiveDownloadedImage(jobId, index, image.download);
+            if (saved) checkpoint.images.push(saved);
+            else checkpoint.invalidIndices.push(index);
+          } catch {
+            // A network failure retains the durable prefix for the original task query.
+            return (await this.load(jobId, commandId, expectedCount))!;
+          }
+        } else {
           const bytes = Buffer.from(image.base64, 'base64');
           const format = image.format ?? defaultFormat;
           const file = join(jobId, index + '-' + createId() + '.' + format);
@@ -150,6 +165,85 @@ export class GenerationFiles {
       this.storageFailed = true;
       // The last durable receipt still describes every confirmed file.
       return (await this.load(jobId, commandId, expectedCount))!;
+    }
+  }
+
+  private async receiveDownloadedImage(
+    jobId: string,
+    index: number,
+    download: (consume: (response: Response) => Promise<void>) => Promise<void>,
+  ): Promise<SavedImage | undefined> {
+    const relative = join(jobId, index + '-' + createId() + '.download');
+    const path = this.path(jobId, relative);
+    const file = await open(path, 'wx', 0o600).catch((error: unknown) => {
+      this.storageFailed = true;
+      throw error;
+    });
+    let saved: SavedImage | undefined;
+    try {
+      try {
+        await download(async (response) => {
+          if (!response.ok || !response.body) {
+            await response.body?.cancel().catch(() => {});
+            throw new Error('IMAGE_DOWNLOAD_FAILED');
+          }
+          const reader = response.body.getReader();
+          const hash = createHash('sha256');
+          const prefix = Buffer.alloc(12);
+          let prefixSize = 0;
+          let total = 0;
+          try {
+            for (;;) {
+              const part = await reader.read();
+              if (part.done) break;
+              total += part.value.byteLength;
+              if (total > 128 * 1024 * 1024) return;
+              if (prefixSize < prefix.length) {
+                const count = Math.min(prefix.length - prefixSize, part.value.byteLength);
+                prefix.set(part.value.subarray(0, count), prefixSize);
+                prefixSize += count;
+              }
+              hash.update(part.value);
+              try {
+                await file.writeFile(part.value);
+              } catch (error) {
+                this.storageFailed = true;
+                throw error;
+              }
+            }
+            const format = (['png', 'jpeg', 'webp'] as const).find((candidate) =>
+              matchesImageSignature(
+                prefix.subarray(0, prefixSize),
+                `image/${candidate}` as 'image/png' | 'image/jpeg' | 'image/webp',
+              ),
+            );
+            if (!format || !total) return;
+            try {
+              await file.sync();
+              await syncDirectory(this.directory(jobId));
+            } catch (error) {
+              this.storageFailed = true;
+              throw error;
+            }
+            saved = { index, file: relative, format, sizeBytes: total, sha256: hash.digest('hex') };
+          } finally {
+            await reader.cancel().catch(() => {});
+            reader.releaseLock();
+          }
+        });
+      } catch (error) {
+        // Complete, durable bytes survive a late transport teardown error.
+        if (!saved) throw error;
+      }
+      return saved;
+    } finally {
+      try {
+        await file.close();
+        if (!saved) await unlink(path);
+      } catch (error) {
+        this.storageFailed = true;
+        throw error;
+      }
     }
   }
 

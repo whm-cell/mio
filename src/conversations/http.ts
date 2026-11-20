@@ -299,16 +299,28 @@ export function createConversationHandler(
           await service.list(actor, after, integer(url.searchParams.get('limit'), 20, 1, 100)),
         );
       }
-      if (action === 'history')
-        return send(
-          HTTP_STATUS.OK,
-          await service.history(
-            actor,
-            id!,
-            integer(url.searchParams.get('afterSeq'), -1, -1, Number.MAX_SAFE_INTEGER),
-            integer(url.searchParams.get('limit'), 20, 1, 100),
-          ),
-        );
+      if (action === 'history') {
+        const stop = new AbortController();
+        const abort = () => stop.abort();
+        request.once('aborted', abort);
+        response.once('close', abort);
+        if (request.aborted || response.destroyed) abort();
+        try {
+          return send(
+            HTTP_STATUS.OK,
+            await service.history(
+              actor,
+              id!,
+              integer(url.searchParams.get('afterSeq'), -1, -1, Number.MAX_SAFE_INTEGER),
+              integer(url.searchParams.get('limit'), 20, 1, 100),
+              stop.signal,
+            ),
+          );
+        } finally {
+          request.removeListener('aborted', abort);
+          response.removeListener('close', abort);
+        }
+      }
       if (action === 'requests')
         return send(HTTP_STATUS.OK, await service.request(actor, id!, receiptId!));
       if (action === 'messages') {

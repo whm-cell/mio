@@ -542,6 +542,8 @@ describe('Routed vendor image protocols', () => {
     );
     expect(streamed.state).toBe('returned');
     if (streamed.state !== 'returned') throw new Error('expected returned');
+    if (!streamed.images[0] || 'download' in streamed.images[0])
+      throw new Error('expected buffered image');
     expect(streamed.images[0]?.base64.length).toBe(Math.ceil((65 * 1024 * 1024) / 3) * 4);
   }, 30000);
 
@@ -592,6 +594,8 @@ describe('Routed vendor image protocols', () => {
     const large = await protocol.submit(input, key);
     expect(large.state).toBe('returned');
     if (large.state !== 'returned') throw new Error('expected returned');
+    if (!large.images[0] || 'download' in large.images[0])
+      throw new Error('expected buffered image');
     expect(large.images[0]?.base64.length).toBe(base64.length);
   }, 30000);
 

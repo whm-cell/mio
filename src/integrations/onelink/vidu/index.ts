@@ -12,13 +12,20 @@ import {
   rejectAsyncSubmissionHttp,
   substituteTaskId,
 } from '../shared/index.ts';
-import type { AsyncImageErrorCategory, AsyncImageTransport, ReadImage } from '../shared/index.ts';
+import type {
+  AsyncImageErrorCategory,
+  AsyncImageTransport,
+  ImageResult,
+  ImageResultMode,
+  ReadImage,
+} from '../shared/index.ts';
 
 export function createRoutedViduImageProtocol(
   route: ImageRouteConfig,
   transport: typeof fetch = fetch,
   readImage?: ReadImage,
   download: typeof withPublicHttps = withPublicHttps,
+  resultMode: ImageResultMode = 'buffer',
 ): AsyncImageTransport {
   return {
     async submit(input, apiKey, signal) {
@@ -124,9 +131,14 @@ export function createRoutedViduImageProtocol(
           payload.creations.length > (input.n ?? 1)
         )
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
-        const images: { base64: string; format: 'png' | 'jpeg' | 'webp' }[] = [];
+        const images: ImageResult[] = [];
         for (const raw of payload.creations) {
-          const image = await downloadResultImage(jsonObject(raw)?.url, download, signal);
+          const image = await downloadResultImage(
+            jsonObject(raw)?.url,
+            download,
+            signal,
+            resultMode,
+          );
           if (!image) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
           images.push(image);
         }

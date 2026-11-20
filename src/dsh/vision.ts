@@ -9,6 +9,7 @@ import { ConversationError } from '../conversations/contracts.ts';
 import type {
   ConversationImagePreview,
   ConversationImageReference,
+  ConversationImageTarget,
   ConversationVision,
 } from '../conversations/contracts.ts';
 
@@ -40,9 +41,11 @@ class ImagePreparationGate {
     fail: () => void;
   }[] = [];
 
-  async acquire(signal: AbortSignal): Promise<() => void> {
+  async acquire(signal: AbortSignal, mode: 'wait' | 'reject' = 'wait'): Promise<() => void> {
     signal.throwIfAborted();
     if (this.active >= 2) {
+      if (mode === 'reject')
+        throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
       await new Promise<void>((resolve, reject) => {
         const entry = {
           signal,
@@ -70,8 +73,12 @@ class ImagePreparationGate {
     };
   }
 
-  async run<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
-    const release = await this.acquire(signal);
+  async run<T>(
+    signal: AbortSignal,
+    work: () => Promise<T>,
+    mode: 'wait' | 'reject' = 'wait',
+  ): Promise<T> {
+    const release = await this.acquire(signal, mode);
     try {
       signal.throwIfAborted();
       return await work();
@@ -116,33 +123,95 @@ async function normalized(source: VisionSource, signal: AbortSignal) {
   }
 }
 
+function requestTarget(
+  ref: ConversationImageReference,
+  budget: { maxPixels: number; maxBytes: number },
+): ConversationImageTarget {
+  return {
+    ...requestImageDimensions(ref.width, ref.height, budget.maxPixels),
+    maxBytes: budget.maxBytes,
+  };
+}
+
+async function previewPrepared(
+  prepared: Awaited<ReturnType<typeof prepareImageFile>>,
+  ref: ConversationImageReference,
+  target: ConversationImageTarget,
+  signal: AbortSignal,
+): Promise<ConversationImagePreview> {
+  const scale = Math.min(1, target.width / ref.width, target.height / ref.height);
+  const width = Math.max(1, Math.floor(ref.width * scale));
+  const height = Math.max(1, Math.floor(ref.height * scale));
+  const preview = await prepareImageFile(
+    { data: prepared.data, mediaType: prepared.ref.mediaType },
+    LIMITS,
+    { maxPixels: width * height, maxDimension: Math.max(width, height), maxBytes: target.maxBytes },
+  );
+  signal.throwIfAborted();
+  const metadata = await sharp(preview.data).metadata();
+  signal.throwIfAborted();
+  if (
+    !metadata.width ||
+    !metadata.height ||
+    metadata.width !== preview.ref.width ||
+    metadata.height !== preview.ref.height ||
+    metadata.width > target.width ||
+    metadata.height > target.height ||
+    metadata.depth !== 'uchar' ||
+    metadata.space !== 'srgb'
+  )
+    throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
+  const fingerprint = digest(preview.data);
+  return {
+    variantId: `sha256:${digest(JSON.stringify([ref.attachmentId, target, fingerprint]))}`,
+    attachment: ref,
+    data: preview.data,
+    mediaType: preview.ref.mediaType as ConversationImagePreview['mediaType'],
+    bytes: preview.data.byteLength,
+    width: metadata.width,
+    height: metadata.height,
+    depth: 'uchar',
+    space: 'srgb',
+    hasAlpha: metadata.hasAlpha === true,
+    fingerprint,
+  };
+}
+
 /** Bridges private assets into deterministic in-memory DSH request references. */
 export function createConversationVision(readSource: SourceReader): ConversationVision {
   const gate = new ImagePreparationGate();
   const requests = new ImagePreparationGate();
+  const prepare = async (ownerId: string, assetId: string, signal: AbortSignal) => {
+    const source = await readSource(ownerId, assetId, undefined, signal);
+    const prepared = await normalized(source, signal);
+    const ref: ConversationImageReference = {
+      attachmentId: `mio-v1:${assetId}:${source.etagDigest}:${source.sourceDigest}:${digest(prepared.data)}`,
+      mediaType: prepared.ref.mediaType as ConversationImageReference['mediaType'],
+      bytes: prepared.ref.bytes,
+      width: prepared.ref.width,
+      height: prepared.ref.height,
+    };
+    return { prepared, ref };
+  };
   return {
     acquireRequest: (signal) => requests.acquire(signal),
     assetId(ref) {
       return identity(ref).assetId;
     },
-    target(ref, budget) {
-      return {
-        ...requestImageDimensions(ref.width, ref.height, budget.maxPixels),
-        maxBytes: budget.maxBytes,
-      };
+    target: requestTarget,
+    prepareRequest(ownerId, assetId, budget, signal) {
+      return gate.run(
+        signal,
+        async () => {
+          const { prepared, ref } = await prepare(ownerId, assetId, signal);
+          const preview = await previewPrepared(prepared, ref, requestTarget(ref, budget), signal);
+          return { reference: ref, previewBytes: preview.bytes };
+        },
+        'reject',
+      );
     },
     prepare(ownerId, assetId, signal) {
-      return gate.run(signal, async () => {
-        const source = await readSource(ownerId, assetId, undefined, signal);
-        const prepared = await normalized(source, signal);
-        return {
-          attachmentId: `mio-v1:${assetId}:${source.etagDigest}:${source.sourceDigest}:${digest(prepared.data)}`,
-          mediaType: prepared.ref.mediaType as ConversationImageReference['mediaType'],
-          bytes: prepared.ref.bytes,
-          width: prepared.ref.width,
-          height: prepared.ref.height,
-        };
-      });
+      return gate.run(signal, async () => (await prepare(ownerId, assetId, signal)).ref);
     },
     preview(ownerId, ref, target, signal): Promise<ConversationImagePreview> {
       return gate.run(signal, async () => {
@@ -166,46 +235,7 @@ export function createConversationVision(readSource: SourceReader): Conversation
           prepared.ref.height !== ref.height
         )
           throw new ConversationError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
-        const scale = Math.min(1, target.width / ref.width, target.height / ref.height);
-        const width = Math.max(1, Math.floor(ref.width * scale));
-        const height = Math.max(1, Math.floor(ref.height * scale));
-        const preview = await prepareImageFile(
-          { data: prepared.data, mediaType: prepared.ref.mediaType },
-          LIMITS,
-          {
-            maxPixels: width * height,
-            maxDimension: Math.max(width, height),
-            maxBytes: target.maxBytes,
-          },
-        );
-        signal.throwIfAborted();
-        const metadata = await sharp(preview.data).metadata();
-        signal.throwIfAborted();
-        if (
-          !metadata.width ||
-          !metadata.height ||
-          metadata.width !== preview.ref.width ||
-          metadata.height !== preview.ref.height ||
-          metadata.width > target.width ||
-          metadata.height > target.height ||
-          metadata.depth !== 'uchar' ||
-          metadata.space !== 'srgb'
-        )
-          throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-        const fingerprint = digest(preview.data);
-        return {
-          variantId: `sha256:${digest(JSON.stringify([ref.attachmentId, target, fingerprint]))}`,
-          attachment: ref,
-          data: preview.data,
-          mediaType: preview.ref.mediaType as ConversationImagePreview['mediaType'],
-          bytes: preview.data.byteLength,
-          width: metadata.width,
-          height: metadata.height,
-          depth: 'uchar',
-          space: 'srgb',
-          hasAlpha: metadata.hasAlpha === true,
-          fingerprint,
-        };
+        return previewPrepared(prepared, ref, target, signal);
       });
     },
   };

@@ -164,6 +164,40 @@ it('admits one registration before source reads, rejecting parallel requests wit
   expect((await first).operation.state).toBe('succeeded');
 });
 
+it('releases the registration slot only after failed native decode settles and allows the next registration', async () => {
+  const f = await fixture(),
+    group = await f.create(),
+    asset = await f.asset();
+  const entered = Promise.withResolvers<void>(),
+    native = Promise.withResolvers<Buffer>();
+  const raw = vi.spyOn(sharp.prototype, 'raw').mockImplementationOnce(function () {
+    this.toBuffer = (async () => {
+      entered.resolve();
+      return native.promise;
+    }) as typeof this.toBuffer;
+    return this;
+  });
+  try {
+    const first = f.service.register(f.actor, group.groupId, randomUUID(), asset.id);
+    const failure = expect(first).rejects.toMatchObject({ code: 'MATERIAL_IMAGE_INVALID' });
+    await entered.promise;
+    await expect(
+      f.service.register(f.actor, group.groupId, randomUUID(), asset.id),
+    ).rejects.toMatchObject({ code: 'MATERIAL_BUSY' });
+    native.reject(new Error('fixture native timeout'));
+    await failure;
+    expect(
+      f.transport.mock.calls.filter(([url]) => String(url).includes('Action=CreateAsset&')),
+    ).toHaveLength(0);
+    expect(
+      (await f.service.register(f.actor, group.groupId, randomUUID(), asset.id)).operation.state,
+    ).toBe('succeeded');
+  } finally {
+    native.reject(new Error('fixture released'));
+    raw.mockRestore();
+  }
+});
+
 it.each(['other-asset', 'not-ready', 'other-group', 'corrupt', 'mime-mismatch', 'too-large'])(
   'rejects invalid registration before remote mutation and preserves source: %s',
   async (kind) => {

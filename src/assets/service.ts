@@ -159,12 +159,16 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
     }
   };
+  let cleanupCursor: { expires_at: string; id: string } | undefined;
   const clean = () => {
     if (stopping) return Promise.resolve();
     if (cleanup) return cleanup;
     cleanup = (async () => {
-      for (const row of await store.expiredStaging()) {
+      const rows = await store.expiredStaging(cleanupCursor);
+      if (!rows.length) cleanupCursor = undefined;
+      for (const row of rows) {
         if (stopping) break;
+        cleanupCursor = { expires_at: row.expires_at, id: row.id };
         try {
           if (row.staging_key !== `mio/staging/${row.id}`) {
             log.error('ASSET_STAGING_KEY_INVALID');

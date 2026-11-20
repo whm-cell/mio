@@ -60,7 +60,8 @@ export async function decodeMaterialImage(
     )
       throw invalid();
     signal.throwIfAborted();
-    await image.stats();
+    // The output pipeline installs libvips' timeout hook; stats() does not.
+    await image.raw().toBuffer();
     signal.throwIfAborted();
     return { width, height, pages, totalPixels };
   } catch (error) {

@@ -61,21 +61,29 @@ export default class MioKernel extends Service {
   }
 
   /** Trusted internal history; callers must apply resource authorization and public projection. */
-  async history(id: string): Promise<{ header: SessionHeader; events: readonly SessionEvent[] }> {
+  async history(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<{ header: SessionHeader; events: readonly SessionEvent[] }> {
+    signal?.throwIfAborted();
     const live = this.ctx.sessions.get(SessionId(id));
     if (live) {
       await this.flush(live);
-      const reader = await this.ctx.sessionPersistence.open(SessionId(id), 'read');
+      signal?.throwIfAborted();
+      const options = signal ? { signal } : undefined;
+      const reader = await this.ctx.sessionPersistence.open(SessionId(id), 'read', options);
       try {
-        const { events } = await reader.read(0);
+        const { events } = await reader.read(0, undefined, options);
+        signal?.throwIfAborted();
         return { header: reader.header, events };
       } finally {
         await reader.close();
       }
     }
-    const stored = await readColdSessionLog(this.ctx.sessionPersistence, SessionId(id));
+    const stored = await readColdSessionLog(this.ctx.sessionPersistence, SessionId(id), signal);
+    signal?.throwIfAborted();
     // A concurrent resume may have attached a writer while the cold read awaited I/O.
-    if (this.ctx.sessions.get(SessionId(id))) return this.history(id);
+    if (this.ctx.sessions.get(SessionId(id))) return this.history(id, signal);
     // Reuse the official replay validation and message projections, without publishing an Agent.
     Session.create(
       SessionId(id),
@@ -84,6 +92,7 @@ export default class MioKernel extends Service {
       stored.inheritedEventCount,
       this.ctx.sessions.messageProjections,
     );
+    signal?.throwIfAborted();
     return { header: stored.header, events: stored.events };
   }
 

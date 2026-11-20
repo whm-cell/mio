@@ -44,7 +44,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 错误：损坏/不可读日志返回脱敏 503，不伪装空历史；其余见本域共同约定。
 
-副作用：live 读取执行原生 flush；离线读取不启动 Agent 或模型，也不改写日志。底层仍可能完整读取/验证单会话日志。
+副作用：live 读取执行原生 flush；离线读取不启动 Agent 或模型，也不改写日志。底层仍可能完整读取/验证单会话日志。客户端断开或服务关闭会取消本次日志打开、读取和后续历史投影，并关闭本次读句柄；其他读者和已受理的模型轮次独立继续。
 
 ## POST /api/v1/conversations/:id/messages
 
@@ -54,7 +54,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 成功：202 原接收回执 `{conversationId,requestId,status,error?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
 
-错误：409 CONVERSATION_BUSY/REQUEST_ID_CONFLICT/CONVERSATION_UNKNOWN/CONVERSATION_MODEL_REQUIRED/MODEL_MODALITY_UNSUPPORTED/MODEL_VISION_CHANGED，以及共同约定的 BYOK 资格/解密错误；无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码/格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。拒绝时不新增 fresh 接收。已有同 ID 原回执早于当前目录、启停、默认、解密和资产检查；摘要不含可变化的凭据/目录/适配版本。接收 ACK/存储未知不重发，按原 ID 查询。
+错误：409 CONVERSATION_BUSY/REQUEST_ID_CONFLICT/CONVERSATION_UNKNOWN/CONVERSATION_MODEL_REQUIRED/MODEL_MODALITY_UNSUPPORTED/MODEL_VISION_CHANGED，以及共同约定的 BYOK 资格/解密错误；无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码/格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。每服务同时最多准备两个新的带图请求，满载立即返回 503 IMAGE_UNAVAILABLE，不排入图片准备等待队列，不读取本次原图、不新增 fresh 接收；同 ID 既有回执优先返回。拒绝时不新增 fresh 接收。已有同 ID 原回执早于当前目录、启停、默认、解密和资产检查；摘要不含可变化的凭据/目录/适配版本。接收 ACK/存储未知不重发，按原 ID 查询。
 
 副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；仅当 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
 

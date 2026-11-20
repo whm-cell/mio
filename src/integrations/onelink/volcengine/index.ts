@@ -12,7 +12,13 @@ import {
   rejectSyncHttp,
   validBase64,
 } from '../shared/index.ts';
-import type { ImageObservation, ImageSubmission, ReadImage } from '../shared/index.ts';
+import type {
+  ImageObservation,
+  ImageResult,
+  ImageResultMode,
+  ImageSubmission,
+  ReadImage,
+} from '../shared/index.ts';
 
 async function encodeReferenceImages(
   input: ImageInput,
@@ -40,6 +46,7 @@ export async function submitVolcengineImage(
   transport: typeof fetch,
   read?: ReadImage,
   download: typeof withPublicHttps = withPublicHttps,
+  resultMode: ImageResultMode = 'buffer',
 ): Promise<ImageSubmission> {
   if (!route.paramSpec.supportedOperations.includes(operation as 'generate' | 'edit' | 'outpaint'))
     return { state: 'rejected', code: 'IMAGE_INPUT_INVALID' };
@@ -95,7 +102,7 @@ export async function submitVolcengineImage(
     const requestedCount = input.n ?? 1;
     if (!Array.isArray(payload.data) || payload.data.length > requestedCount)
       throw new Error('IMAGE_DATA_INVALID');
-    const images: ({ base64: string; format?: 'png' | 'jpeg' | 'webp' } | null)[] = [];
+    const images: (ImageResult | null)[] = [];
     for (const raw of payload.data) {
       const item = jsonObject(raw);
       if (!item) {
@@ -114,7 +121,7 @@ export async function submitVolcengineImage(
         continue;
       }
       if (typeof item.url === 'string') {
-        const downloaded = await downloadResultImage(item.url, download, bounded);
+        const downloaded = await downloadResultImage(item.url, download, bounded, resultMode);
         images.push(downloaded);
         continue;
       }

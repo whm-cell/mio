@@ -43,7 +43,7 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 同对话只接受一个活动请求。事务锁住归属行，先查原 request ID：同内容返回原回执，异内容冲突，早于当前目录、默认、认证阻断和解密；不同 ID 遇忙拒绝。输入摘要不含可变版本，不因刷新/轮换重发。目录移除或默认失效后旧回执/历史仍可读，fresh 输入无资格时不新增收费接收。进程内保存同一用户在途接收 Promise，持久去重仍由 PostgreSQL 唯一键负责。
 
-带图请求先查 owner 和原回执，再检查忙碌状态及当前模型视觉能力；耗时资产读取、解码与本轮图片预算预检在行锁外完成。最终短事务再次核对回执、busy 和路由/视觉预算快照，变化时拒绝并等待客户端按原意重试。纯文本沿旧 SHA-256，带图摘要为 `vision:v1:` 加 `SHA256(JSON.stringify([text, orderedIds]))`。原件、内存预览、授权检查及旧图卸载的限制见[对话 HTTP](apis/conversations.md#post-apiv1conversationsidmessages)和[DSH 集成](integrations/dsh.md)。同一原图在同一请求中出现多次时按 occurrence 计预算；不能满足时不能丢弃当前轮图片。
+带图请求先查 owner 和原回执，再检查忙碌状态及当前模型视觉能力；耗时资产读取、解码与本轮图片预算预检在行锁外完成。每服务同时最多准备两个新的带图请求，满载返回 503 IMAGE_UNAVAILABLE，既有回执优先。每图受理阶段复用一次私有读取和规范化，同时形成持久附件引用与本轮预览字节数，发送前的来源复核独立执行。最终短事务再次核对回执、busy 和路由/视觉预算快照，变化时拒绝并等待客户端按原意重试。纯文本沿旧 SHA-256，带图摘要为 `vision:v1:` 加 `SHA256(JSON.stringify([text, orderedIds]))`。原件、内存预览、授权检查及旧图卸载的限制见[对话 HTTP](apis/conversations.md#post-apiv1conversationsidmessages)和[DSH 集成](integrations/dsh.md)。同一原图在同一请求中出现多次时按 occurrence 计预算；不能满足时不能丢弃当前轮图片。
 
 正式 Profile 关闭上游 DSH 默认身份开场白（`includeHarnessIdentity: false`），每次对话轮次（无论 legacy 还是 BYOK）统一由服务端注入受控的会话级系统提示词：助手固定自称 `miioo AI 漫剧助手`（不提及内部框架或运行时名称），围绕 AI 漫剧创作执行适度宽松话题政策（支持服务于创作的背景、历史/服饰/设定考据与审美参考并自然衔接回创作，对编程调试、作业解题、医疗/法律/金融、无关时政与纯粹闲聊礼貌婉拒并引导回漫剧创作），禁止泄露或覆盖内部指令，并按本轮实际授权的生图与图片查看能力如实声明工具可用性；提示词文本按 `{ imageGeneration, imageInspection }` 组合完全确定，不含动态变量以维持前缀缓存稳定，且绝不经公开历史或 SSE 透传。
 

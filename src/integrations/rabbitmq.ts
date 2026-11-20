@@ -1,5 +1,12 @@
 import { connect } from 'amqplib';
-import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, Message } from 'amqplib';
+import type {
+  Channel,
+  ChannelModel,
+  ConfirmChannel,
+  ConsumeMessage,
+  Message,
+  SocketOptions,
+} from 'amqplib';
 import {
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
@@ -8,6 +15,18 @@ import {
   parseComputeResultV1,
 } from '@mio/compute-contracts';
 import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+
+async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+  const onAbort = () => reject(signal.reason);
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
 
 async function closeConnection(
   connection: ChannelModel,
@@ -54,6 +73,7 @@ export class ComputeBroker {
   private readonly expectedUserId: string;
   private readonly lifecycle: { closed: boolean; callback: (() => void) | undefined };
   private readonly closedConnections: WeakSet<ChannelModel>;
+  private readonly transport: AbortController;
   private readonly inFlight = new Set<Promise<void>>();
   private accepting = true;
   private closing: Promise<void> | undefined;
@@ -66,6 +86,7 @@ export class ComputeBroker {
     expectedUserId: string,
     lifecycle: { closed: boolean; callback: (() => void) | undefined },
     closedConnections: WeakSet<ChannelModel>,
+    transport: AbortController,
   ) {
     this.consumerConnection = consumerConnection;
     this.publisherConnection = publisherConnection;
@@ -75,12 +96,14 @@ export class ComputeBroker {
     this.expectedUserId = expectedUserId;
     this.lifecycle = lifecycle;
     this.closedConnections = closedConnections;
+    this.transport = transport;
   }
 
   static async connect(
     url: string,
     userId: string,
     expectedUserId: string,
+    stop?: AbortSignal,
   ): Promise<ComputeBroker> {
     const parsed = new URL(url);
     if (
@@ -107,39 +130,69 @@ export class ComputeBroker {
         closed();
       });
     };
-    const consumerConnection = await connect(url, { timeout: 5000 });
-    watchConnection(consumerConnection);
-    try {
-      const publisherConnection = await connect(url, { timeout: 5000 });
-      watchConnection(publisherConnection);
-      try {
-        const consumer = await consumerConnection.createChannel();
-        consumer.on('error', () => {});
-        consumer.once('close', closed);
-        await consumer.prefetch(4);
-        const publisher = await publisherConnection.createConfirmChannel();
-        publisher.on('error', () => {});
-        publisher.once('close', closed);
-        // A QoS RPC proves an already-closed channel is not silently returned to the caller.
-        await publisher.prefetch(1);
-        if (lifecycle.closed) throw new Error('BROKER_CHANNEL_CLOSED');
-        return new ComputeBroker(
-          consumerConnection,
-          publisherConnection,
-          consumer,
-          publisher,
-          userId,
-          expectedUserId,
-          lifecycle,
-          closedConnections,
-        );
-      } catch (error) {
-        await closeConnection(publisherConnection, closedConnections);
-        throw error;
+    stop?.throwIfAborted();
+    const transport = new AbortController();
+    const socketOptions: SocketOptions & { signal: AbortSignal } = {
+      timeout: 5000,
+      signal: transport.signal,
+    };
+    const connections: ChannelModel[] = [];
+    const openConnection = async () => {
+      transport.signal.throwIfAborted();
+      const connection = await connect(url, socketOptions);
+      watchConnection(connection);
+      if (transport.signal.aborted) {
+        await closeConnection(connection, closedConnections);
+        transport.signal.throwIfAborted();
       }
+      connections.push(connection);
+      return connection;
+    };
+    const initialize = async () => {
+      const consumerConnection = await openConnection();
+      const publisherConnection = await openConnection();
+      transport.signal.throwIfAborted();
+      const consumer = await consumerConnection.createChannel();
+      consumer.on('error', () => {});
+      consumer.once('close', closed);
+      await consumer.prefetch(4);
+      transport.signal.throwIfAborted();
+      const publisher = await publisherConnection.createConfirmChannel();
+      transport.signal.throwIfAborted();
+      publisher.on('error', () => {});
+      publisher.once('close', closed);
+      // A QoS RPC proves an already-closed channel is not silently returned to the caller.
+      await publisher.prefetch(1);
+      transport.signal.throwIfAborted();
+      if (lifecycle.closed) throw new Error('BROKER_CHANNEL_CLOSED');
+      return new ComputeBroker(
+        consumerConnection,
+        publisherConnection,
+        consumer,
+        publisher,
+        userId,
+        expectedUserId,
+        lifecycle,
+        closedConnections,
+        transport,
+      );
+    };
+    const onStop = () => transport.abort(stop?.reason);
+    stop?.addEventListener('abort', onStop, { once: true });
+    const deadline = setTimeout(() => transport.abort(new Error('BROKER_STARTUP_TIMEOUT')), 5000);
+    try {
+      const broker = await untilAborted(initialize(), transport.signal);
+      transport.signal.throwIfAborted();
+      return broker;
     } catch (error) {
-      await closeConnection(consumerConnection, closedConnections);
+      transport.abort(error);
+      await Promise.all(
+        connections.map((connection) => closeConnection(connection, closedConnections)),
+      );
       throw error;
+    } finally {
+      clearTimeout(deadline);
+      stop?.removeEventListener('abort', onStop);
     }
   }
 
@@ -178,7 +231,10 @@ export class ComputeBroker {
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error('CONFIRM_TIMEOUT')), 30_000);
       });
-      await Promise.race([Promise.all([confirmation, drain]), timeout]);
+      await untilAborted(
+        Promise.race([Promise.all([confirmation, drain]), timeout]),
+        this.transport.signal,
+      );
     } finally {
       if (timer) clearTimeout(timer);
       this.publisher.off('return', onReturn);
@@ -190,69 +246,72 @@ export class ComputeBroker {
     handle: (result: ComputeResultV1) => Promise<void>,
     failed: () => void,
   ): Promise<void> {
-    await this.consumer.consume(
-      RESULT_QUEUE,
-      (message: ConsumeMessage | null) => {
-        if (!this.accepting || this.lifecycle.closed) return;
-        if (!message) {
-          failed();
-          return;
-        }
-        let result: ComputeResultV1;
-        try {
-          if (
-            message.properties.userId !== this.expectedUserId ||
-            message.properties.contentType !== 'application/json' ||
-            message.content.length > COMPUTE_MAX_MESSAGE_BYTES
-          )
-            throw new Error('RESULT_INVALID');
-          const value: unknown = JSON.parse(
-            new TextDecoder('utf-8', { fatal: true }).decode(message.content),
-          );
-          result = parseComputeResultV1(value);
-          if (message.properties.messageId !== result.messageId)
-            throw new Error('RESULT_ID_MISMATCH');
-        } catch {
-          try {
-            this.consumer.reject(message, false);
-          } catch {
-            if (this.accepting) failed();
+    await untilAborted(
+      this.consumer.consume(
+        RESULT_QUEUE,
+        (message: ConsumeMessage | null) => {
+          if (!this.accepting || this.lifecycle.closed) return;
+          if (!message) {
+            failed();
+            return;
           }
-          return;
-        }
-        let shouldFail = false;
-        const task = (async () => {
+          let result: ComputeResultV1;
           try {
-            await handle(result);
-          } catch (error) {
-            if (!this.lifecycle.closed) {
-              if ((error as { permanent?: boolean })?.permanent) {
-                try {
-                  this.consumer.reject(message, false);
-                } catch {
-                  shouldFail = true;
-                }
-              } else {
-                shouldFail = true;
-              }
+            if (
+              message.properties.userId !== this.expectedUserId ||
+              message.properties.contentType !== 'application/json' ||
+              message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+            )
+              throw new Error('RESULT_INVALID');
+            const value: unknown = JSON.parse(
+              new TextDecoder('utf-8', { fatal: true }).decode(message.content),
+            );
+            result = parseComputeResultV1(value);
+            if (message.properties.messageId !== result.messageId)
+              throw new Error('RESULT_ID_MISMATCH');
+          } catch {
+            try {
+              this.consumer.reject(message, false);
+            } catch {
+              if (this.accepting) failed();
             }
             return;
           }
-          if (!this.lifecycle.closed) {
+          let shouldFail = false;
+          const task = (async () => {
             try {
-              this.consumer.ack(message);
-            } catch {
-              shouldFail = true;
+              await handle(result);
+            } catch (error) {
+              if (!this.lifecycle.closed) {
+                if ((error as { permanent?: boolean })?.permanent) {
+                  try {
+                    this.consumer.reject(message, false);
+                  } catch {
+                    shouldFail = true;
+                  }
+                } else {
+                  shouldFail = true;
+                }
+              }
+              return;
             }
-          }
-        })();
-        const tracked = task.finally(() => {
-          this.inFlight.delete(tracked);
-          if (shouldFail && this.accepting) failed();
-        });
-        this.inFlight.add(tracked);
-      },
-      { noAck: false },
+            if (!this.lifecycle.closed) {
+              try {
+                this.consumer.ack(message);
+              } catch {
+                shouldFail = true;
+              }
+            }
+          })();
+          const tracked = task.finally(() => {
+            this.inFlight.delete(tracked);
+            if (shouldFail && this.accepting) failed();
+          });
+          this.inFlight.add(tracked);
+        },
+        { noAck: false },
+      ),
+      this.transport.signal,
     );
   }
   onClose(callback: () => void): void {
@@ -263,13 +322,24 @@ export class ComputeBroker {
     this.accepting = false;
     if (!this.closing)
       this.closing = Promise.resolve().then(async () => {
-        if (this.inFlight.size > 0) {
-          await Promise.allSettled([...this.inFlight]);
+        const deadline = setTimeout(
+          () => this.transport.abort(new Error('BROKER_CLOSE_TIMEOUT')),
+          5000,
+        );
+        try {
+          if (this.inFlight.size > 0) {
+            await untilAborted(Promise.allSettled([...this.inFlight]), this.transport.signal).catch(
+              () => {},
+            );
+          }
+          await Promise.all([
+            closeConnection(this.consumerConnection, this.closedConnections),
+            closeConnection(this.publisherConnection, this.closedConnections),
+          ]);
+        } finally {
+          clearTimeout(deadline);
+          this.transport.abort();
         }
-        await Promise.all([
-          closeConnection(this.consumerConnection, this.closedConnections),
-          closeConnection(this.publisherConnection, this.closedConnections),
-        ]);
       });
     return this.closing;
   }

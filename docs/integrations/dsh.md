@@ -30,7 +30,7 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 
 ## 历史、恢复与错误
 
-mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 flush，再通过公开持久化 read handle 读取真实前缀，finally 关闭句柄，不补终态。离线日志用公开 readColdSessionLog 并经官方 Session 重放验证；只在内存补 interrupted，不改原件。synthetic seq 不得作为活动流的持久水位。
+mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 flush，再通过公开持久化 read handle 读取真实前缀，finally 关闭句柄，不补终态。离线日志用公开 readColdSessionLog 并经官方 Session 重放验证；只在内存补 interrupted，不改原件。synthetic seq 不得作为活动流的持久水位。历史请求断开及服务关闭将取消信号传到本次公开持久化 open/read；读句柄始终在 finally 关闭，后续投影分段让出事件循环检查取消。活动 Session 的 flush 和官方同步重放仍按原生调用边界完成后检查取消。
 
 原生日志可恢复未完成的最后一行；完整格式/结构损坏拒绝读取，不变成空历史。强杀可能只留下用户输入和运行边界，没有未结算 chunk。可恢复前缀不代表任意崩溃零丢失；未知请求不自动重发，不承诺撤销已发生动作。
 

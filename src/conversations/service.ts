@@ -19,6 +19,7 @@ import type { ChatRuntimeSnapshot } from '../providers/contracts.ts';
 import { AssetError } from '../assets/contracts.ts';
 
 const log = createLogger('app', 'conversations');
+const IMAGE_PREPARATION_CONCURRENCY = 2;
 
 /** Authorization and request ownership remain above the DSH adapter and below HTTP. */
 export function createConversationService(
@@ -34,6 +35,7 @@ export function createConversationService(
   const cancellations = new Set<string>();
   const listeners = new Map<string, Set<(event: ConversationEvent) => void>>();
   let closing: Promise<void> | undefined;
+  let preparingImages = 0;
   const publish = (id: string, event: ConversationEvent) => {
     for (const listener of listeners.get(id) ?? []) {
       try {
@@ -108,10 +110,13 @@ export function createConversationService(
       check();
       return store.request(actor, id, requestId);
     },
-    history(actor: Principal, id: string, after: number, limit: number) {
+    history(actor: Principal, id: string, after: number, limit: number, signal?: AbortSignal) {
       return admit(async () => {
+        const stopped = AbortSignal.any([admissionStop.signal, ...(signal ? [signal] : [])]);
+        stopped.throwIfAborted();
         const row = await store.owned(actor, id);
-        return engine.history(row.dsh_session_id, after, limit);
+        stopped.throwIfAborted();
+        return engine.history(row.dsh_session_id, after, limit, stopped);
       });
     },
     send(
@@ -136,45 +141,50 @@ export function createConversationService(
         if (ids.length) {
           const old = await store.existing(actor, id, requestId, digest);
           if (old) return old;
-          const row = await store.owned(actor, id);
-          if (row.state !== 'ready')
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
-          if (row.active_request)
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
-          if (!providers)
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-          if (!row.model_binding)
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
-          preflight = await providerAction(() => providers.resolveChat(actor, row.model_binding!));
-          if (!preflight.inputModalities?.includes('image') || !preflight.imageBudget)
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-          if (ids.length > preflight.imageBudget.maxRequestImages)
-            throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-          if (!vision)
+          if (preparingImages >= IMAGE_PREPARATION_CONCURRENCY)
             throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
+          preparingImages++;
           try {
+            const row = await store.owned(actor, id);
+            if (row.state !== 'ready')
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+            if (row.active_request)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+            if (!providers)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+            if (!row.model_binding)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
+            preflight = await providerAction(() =>
+              providers.resolveChat(actor, row.model_binding!),
+            );
+            if (!preflight.inputModalities?.includes('image') || !preflight.imageBudget)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+            if (ids.length > preflight.imageBudget.maxRequestImages)
+              throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
+            if (!vision)
+              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
             let representedBytes = 0;
             for (const assetId of ids) {
-              const image = await vision.prepare(actor.userId, assetId, admissionStop.signal);
-              const target = vision.target(image, {
-                maxPixels: preflight.imageBudget.requestImagePixelBudget,
-                maxBytes: preflight.imageBudget.requestImageMaxBytes,
-              });
-              const preview = await vision.preview(
+              const prepared = await vision.prepareRequest(
                 actor.userId,
-                image,
-                target,
+                assetId,
+                {
+                  maxPixels: preflight.imageBudget.requestImagePixelBudget,
+                  maxBytes: preflight.imageBudget.requestImageMaxBytes,
+                },
                 admissionStop.signal,
               );
-              representedBytes += Math.ceil(preview.bytes / 3) * 4;
+              representedBytes += Math.ceil(prepared.previewBytes / 3) * 4;
               if (representedBytes > preflight.imageBudget.maxRequestImageBytes)
                 throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-              images.push(image);
+              images.push(prepared.reference);
             }
           } catch (error) {
             if (error instanceof ConversationError) throw error;
             if (error instanceof AssetError) throw new ConversationError(error.status, error.code);
             throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
+          } finally {
+            preparingImages--;
           }
         }
         let received;

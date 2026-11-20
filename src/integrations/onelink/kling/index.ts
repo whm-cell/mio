@@ -12,7 +12,13 @@ import {
   rejectAsyncSubmissionHttp,
   substituteTaskId,
 } from '../shared/index.ts';
-import type { AsyncImageErrorCategory, AsyncImageTransport, ReadImage } from '../shared/index.ts';
+import type {
+  AsyncImageErrorCategory,
+  AsyncImageTransport,
+  ImageResult,
+  ImageResultMode,
+  ReadImage,
+} from '../shared/index.ts';
 
 const KLING_IN_FLIGHT_STATUSES = new Set([
   'not_start',
@@ -36,6 +42,7 @@ export function createRoutedKlingImageProtocol(
   transport: typeof fetch = fetch,
   readImage?: ReadImage,
   download: typeof withPublicHttps = withPublicHttps,
+  resultMode: ImageResultMode = 'buffer',
 ): AsyncImageTransport {
   return {
     async submit(input, apiKey, signal) {
@@ -151,9 +158,14 @@ export function createRoutedKlingImageProtocol(
           rawImages.length > (input.n ?? 1)
         )
           return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
-        const images: { base64: string; format: 'png' | 'jpeg' | 'webp' }[] = [];
+        const images: ImageResult[] = [];
         for (const raw of rawImages) {
-          const image = await downloadResultImage(jsonObject(raw)?.url, download, signal);
+          const image = await downloadResultImage(
+            jsonObject(raw)?.url,
+            download,
+            signal,
+            resultMode,
+          );
           if (!image) return { state: 'unknown', code: 'IMAGE_QUERY_UNKNOWN' };
           images.push(image);
         }

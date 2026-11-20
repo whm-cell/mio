@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS mio_image_executions (
 ALTER TABLE mio_image_executions ADD COLUMN IF NOT EXISTS storage_failed boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS mio_image_executions_storage_failed ON mio_image_executions(job_id) WHERE storage_failed;
 CREATE INDEX IF NOT EXISTS mio_image_executions_pending ON mio_image_executions(phase)
-  WHERE phase <> 'done';`;
+  WHERE phase <> 'done';
+CREATE INDEX IF NOT EXISTS mio_image_executions_cleanup ON mio_image_executions(job_id)
+  WHERE phase='done' AND checkpoint IS NOT NULL
+    AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb;`;
 
 export async function checkGenerationSchema(pool: Pool): Promise<void> {
   await pool.query('SELECT asset_kind FROM mio_assets LIMIT 0');

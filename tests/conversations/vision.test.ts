@@ -13,6 +13,52 @@ vi.mock('@deepseek-ai/dsh-attachment-local', async (original) => {
 
 const digest = (value: Uint8Array | string) => createHash('sha256').update(value).digest('hex');
 
+it('prepares the admission reference and target byte budget from one private read', async () => {
+  const assetId = randomUUID();
+  const data = await sharp({
+    create: { width: 13, height: 7, channels: 4, background: '#4488aa80' },
+  })
+    .png()
+    .toBuffer();
+  let etag = 'immutable';
+  const read = vi.fn(
+    async (
+      _owner: string,
+      _id: string,
+      expected: { etagDigest: string; sourceDigest: string } | undefined,
+    ) => {
+      if (expected && expected.etagDigest !== digest(etag)) throw new Error('source changed');
+      return {
+        assetId,
+        contentType: 'image/png' as const,
+        data,
+        etagDigest: digest(etag),
+        sourceDigest: digest(data),
+      };
+    },
+  );
+  const vision = createConversationVision(read);
+  const signal = new AbortController().signal;
+  const budget = { maxPixels: 30, maxBytes: 1024 * 1024 };
+  vi.mocked(prepareImageFile).mockClear();
+  const admitted = await vision.prepareRequest('owner', assetId, budget, signal);
+  expect(read).toHaveBeenCalledOnce();
+  expect(prepareImageFile).toHaveBeenCalledTimes(2);
+  expect(vision.assetId(admitted.reference)).toBe(assetId);
+  const preview = await vision.preview(
+    'owner',
+    admitted.reference,
+    vision.target(admitted.reference, budget),
+    signal,
+  );
+  expect(preview.bytes).toBe(admitted.previewBytes);
+  expect(read).toHaveBeenCalledTimes(2);
+  etag = 'changed before sending';
+  await expect(
+    vision.preview('owner', admitted.reference, vision.target(admitted.reference, budget), signal),
+  ).rejects.toThrow('source changed');
+});
+
 it('rechecks source identity and fits a non-integral transparent preview in memory', async () => {
   const assetId = randomUUID();
   const data = await sharp({
@@ -191,6 +237,15 @@ it('releases queued and active request/decode permits on abort', async () => {
   const a = vision.prepare('owner', assetId, first.signal);
   const b = vision.prepare('owner', assetId, second.signal);
   await entered.promise;
+  await expect(
+    vision.prepareRequest(
+      'owner',
+      assetId,
+      { maxPixels: 4, maxBytes: 1024 },
+      new AbortController().signal,
+    ),
+  ).rejects.toMatchObject({ status: 503, code: 'IMAGE_UNAVAILABLE' });
+  expect(calls).toBe(2);
   const c = vision.prepare('owner', assetId, queued.signal);
   const cancelledC = expect(c).rejects.toThrow();
   queued.abort();

@@ -133,6 +133,27 @@ export class GenerationStore {
     );
   }
 
+  async completedCleanup(after?: string): Promise<GenerationExecution[]> {
+    return (
+      await this.pool.query<GenerationExecution>(
+        selection +
+          ` WHERE j.state='completed' AND e.phase='done' AND e.checkpoint IS NOT NULL
+            AND e.checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb
+            AND ($1::uuid IS NULL OR j.id>$1::uuid) ORDER BY j.id LIMIT 100`,
+        [after ?? null],
+      )
+    ).rows;
+  }
+
+  async markFilesCleaned(id: string, ref: CheckpointRef): Promise<void> {
+    await this.pool.query(
+      `UPDATE mio_image_executions e SET checkpoint=checkpoint||'{"cleaned":true}'::jsonb
+       FROM mio_image_jobs j WHERE e.job_id=$1 AND j.id=e.job_id AND j.state='completed'
+       AND e.phase='done' AND e.checkpoint=$2::jsonb`,
+      [id, JSON.stringify(ref)],
+    );
+  }
+
   imageRequest(owner: string, requestId: string, includeToolDefaults = false) {
     return findImageRequest(this.pool, owner, requestId, includeToolDefaults);
   }

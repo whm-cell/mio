@@ -1,14 +1,69 @@
 import { createId } from '@mio/foundation/identifiers';
-import { imageOutputKey } from './contracts.ts';
+import { imageOutputIndex, imageOutputKey } from './contracts.ts';
 import type { GenerationFiles } from './files.ts';
 import type { GenerationStore } from './store.ts';
 import type {
   GeneratedObject,
+  CheckpointRef,
   GenerationExecution,
   GenerationObjects,
   ImageCheckpoint,
   SavedImage,
 } from './execution.ts';
+
+async function cleanConfirmedFiles(
+  id: string,
+  checkpoint: ImageCheckpoint,
+  ref: CheckpointRef,
+  store: GenerationStore,
+  files: GenerationFiles,
+): Promise<void> {
+  if (Object.values(checkpoint.attemptedKeys).some((keys) => keys.length > 1)) return;
+  await files.clean(checkpoint);
+  await store.markFilesCleaned(id, ref);
+}
+
+/** Rechecks the exact completed receipt before removing files left by an interrupted cleanup. */
+export async function cleanCompletedGeneration(
+  row: GenerationExecution,
+  store: GenerationStore,
+  files: GenerationFiles,
+  head: GenerationObjects['head'],
+  signal: AbortSignal,
+): Promise<void> {
+  if (!row.checkpoint) return;
+  const saved = await files.load(
+    row.id,
+    row.command.messageId,
+    row.command.input.n ?? 1,
+    row.checkpoint,
+  );
+  if (
+    !saved ||
+    saved.ref.revision !== row.checkpoint.revision ||
+    saved.ref.sha256 !== row.checkpoint.sha256 ||
+    !saved.checkpoint.receivedAll ||
+    saved.checkpoint.images.length !== saved.checkpoint.expectedCount ||
+    saved.checkpoint.invalidIndices.length ||
+    Object.keys(saved.checkpoint.outputs).length !== saved.checkpoint.expectedCount ||
+    Object.values(saved.checkpoint.attemptedKeys).some((keys) => keys.length > 1)
+  )
+    return;
+  for (const image of saved.checkpoint.images) {
+    signal.throwIfAborted();
+    const output = saved.checkpoint.outputs[image.index];
+    if (
+      !output ||
+      imageOutputIndex(row.id, output.key, output.contentType) !== image.index ||
+      output.sizeBytes !== image.sizeBytes ||
+      output.sha256 !== image.sha256 ||
+      !matches(await head(output.key), image, output.etag)
+    )
+      return;
+  }
+  signal.throwIfAborted();
+  await cleanConfirmedFiles(row.id, saved.checkpoint, saved.ref, store, files);
+}
 
 function matches(
   actual: Awaited<ReturnType<GenerationObjects['head']>> | undefined,
@@ -98,7 +153,7 @@ export async function materializeGeneration(
   }
   const permitted = checkpoint.attempts < 3;
   if (permitted) checkpoint.attempts++;
-  await files.save(checkpoint);
+  let ref = await files.save(checkpoint);
   const verifiedOutputs: [index: number, output: GeneratedObject][] = [];
   let failed = !checkpoint.receivedAll;
   for (const image of checkpoint.images) {
@@ -116,7 +171,7 @@ export async function materializeGeneration(
         checkpoint.invalidIndices.push(image.index);
       else failed = true;
     }
-    await files.save(checkpoint);
+    ref = await files.save(checkpoint);
   }
   const outputs = verifiedOutputs.sort(([a], [b]) => a - b).map(([, output]) => output);
   const state = failed
@@ -126,11 +181,9 @@ export async function materializeGeneration(
     : outputs.length === checkpoint.expectedCount
       ? 'completed'
       : 'partial';
-  const ref = await files.save(checkpoint);
   const committed = await store.acceptOutputs(row, outputs, state, ref);
   if (committed && state === 'completed') {
-    const ambiguous = Object.values(checkpoint.attemptedKeys).some((keys) => keys.length > 1);
-    if (!ambiguous) await files.clean(checkpoint);
+    await cleanConfirmedFiles(row.id, checkpoint, ref, store, files);
     return 'completed';
   }
   return 'other';

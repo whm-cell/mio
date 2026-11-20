@@ -73,6 +73,12 @@ export interface ConversationImagePreview {
   readonly fingerprint: string;
 }
 export interface ConversationVision {
+  prepareRequest(
+    ownerId: string,
+    assetId: string,
+    budget: { maxPixels: number; maxBytes: number },
+    signal: AbortSignal,
+  ): Promise<{ reference: ConversationImageReference; previewBytes: number }>;
   prepare(
     ownerId: string,
     assetId: string,
@@ -168,7 +174,7 @@ export type ConversationEvent =
 export interface ConversationEngine {
   readonly available: boolean;
   create(id: string, selection?: ChatSelection): Promise<void>;
-  history(id: string, afterSeq: number, limit: number): Promise<HistoryPage>;
+  history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
   run(
     id: string,
     requestId: string,

@@ -82,7 +82,7 @@
 
 错误：读取前已有登记占槽 409 MATERIAL_BUSY，不排队、不读取第二份原件；未配置资产读取 409 MATERIAL_REGISTRATION_UNAVAILABLE；原件不存在/非本人或非 ready 为 404 ASSET_NOT_FOUND；单文件超限/类型非法 400 ASSET_INPUT_INVALID，内容损坏/尺寸比或像素预算非法 400 MATERIAL_IMAGE_INVALID；ETag/长度变化 409 ASSET_SOURCE_CHANGED/ASSET_SIZE_MISMATCH；其余同共同约定。PNG 按当前解码器主图核验；带 APNG 扩展仍作为普通 PNG 提交完整原件，不新增专门支持、拒绝或静态化，不承诺所有动画帧已验证；最终审核由上游处理。
 
-副作用：先按 owner/requestId/input 查询既有操作；仅新登记在图片读取前同步认领单服务槽，覆盖读取、真实解码和出站/提交；单原件最多 20 MiB，不缩窄资产 1 GiB 或放宽视觉 10 MiB。冻结 rawKey/raw ETag，If-Match 有界读取并核对实际字节和 SHA-256，使用纯 sharp 真实解码校验每帧宽高 300–6000、宽高比 0.4–2.5、可解码多页累计最多 36M 像素，单解码 15 秒处理预算；WebP 使用 frame pageHeight，不把 stacked height 当单帧高度。签名前复核本人 ready 与 raw HEAD 一致，签发固定 raw 的 600 秒 GET（无 attachment，保留 STS 编码），不持久保存 URL。短事务保存素材 registering、受控原件摘要与原操作意图，再单次 CreateAsset，按组/操作租约提交 processing/操作终态；原件与 COS 不被删除。已知返回 ID 的提交失败只记原操作受限身份，经当前 owner 的精确 GetAsset/组核验恢复真实状态；无 ID 保持 unknown/manual，绝不自动重发。
+副作用：先按 owner/requestId/input 查询既有操作；仅新登记在图片读取前同步认领单服务槽，覆盖读取、真实解码和出站/提交；单原件最多 20 MiB，不缩窄资产 1 GiB 或放宽视觉 10 MiB。冻结 rawKey/raw ETag，If-Match 有界读取并核对实际字节和 SHA-256，使用纯 sharp 真实解码校验每帧宽高 300–6000、宽高比 0.4–2.5、可解码多页累计最多 36M 像素，单解码通过原生输出管线执行 15 秒处理预算，并在原生调用前后检查服务取消，待本次原生工作收束后释放登记槽；WebP 使用 frame pageHeight，不把 stacked height 当单帧高度。签名前复核本人 ready 与 raw HEAD 一致，签发固定 raw 的 600 秒 GET（无 attachment，保留 STS 编码），不持久保存 URL。短事务保存素材 registering、受控原件摘要与原操作意图，再单次 CreateAsset，按组/操作租约提交 processing/操作终态；原件与 COS 不被删除。已知返回 ID 的提交失败只记原操作受限身份，经当前 owner 的精确 GetAsset/组核验恢复真实状态；无 ID 保持 unknown/manual，绝不自动重发。
 
 ## GET /api/v1/materials/groups/{id}/materials
 

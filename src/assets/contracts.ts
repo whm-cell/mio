@@ -2,6 +2,7 @@ import { HttpError } from '@mio/foundation/errors';
 
 export const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
 export const MAX_VISION_SOURCE_BYTES = 10 * 1024 * 1024;
+export const MAX_MATERIAL_SOURCE_BYTES = 20 * 1024 * 1024;
 
 export interface AssetPrincipal {
   userId: string;
@@ -11,6 +12,7 @@ export interface AssetPrincipal {
 export interface AssetObjectStore {
   uploadUrl(key: string, size: number): string;
   downloadUrl(key: string): string;
+  materialUrl?(key: string): string;
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   putImage?(
@@ -42,6 +44,12 @@ export interface VisionSource {
   readonly data: Uint8Array;
   readonly etagDigest: string;
   readonly sourceDigest: string;
+}
+
+export interface MaterialImageSource extends VisionSource {
+  readonly rawKey: string;
+  readonly rawEtag: string;
+  readonly size: number;
 }
 
 export class AssetError extends HttpError<AssetErrorCode> {}

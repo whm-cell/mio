@@ -8,6 +8,8 @@
 
 AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?}`；`status` 为 pending、finalizing、ready 或 expired，仅 ready 包含短期下载地址。文件名和 MIME 是用户描述，不证明文件类型或内容安全。地址是临时 bearer 凭证，必须避免日志、公开缓存和转交；COS 浏览器直传需配置指定 Origin 的 CORS。若选定的 W3/P5 环境使用临时 COS 凭据，签名 URL 的实际有效期还受该凭据有效期限制；长期受限 Key 不需要额外会话配置。
 
+[素材登记](materials.md#post-apiv1materialsgroupsidmaterials)复用本域的 ready 原件和已登记 derived 图片；不要求客户端重传已知 assetId。内部 `readMaterialSource` 使用独立 20 MiB 上限（视觉 `readVisionSource` 仍为 10 MiB，通用资产仍为 1 GiB），按 raw ETag 的 If-Match 读取并冻结 SHA-256/大小/键；`materialUrl` 重新核对归属、ready 与 raw HEAD 后签发 600 秒无 attachment 的供应商 GET。该 URL 不进入公开 AssetView、日志或永久文件身份；原上传 URL 不得覆盖 ready raw。
+
 ## POST /api/v1/assets/uploads
 
 身份：当前登录用户。

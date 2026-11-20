@@ -12,6 +12,9 @@ import type {
   OperationRow,
 } from './contracts.ts';
 import type { MaterialStore, MaterialCursor } from './store.ts';
+import { AssetError } from '../assets/contracts.ts';
+import type { createAssetService } from '../assets/service.ts';
+import { decodeMaterialImage } from './decode.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
 import { MaterialUpstreamError } from '../integrations/onelink/materials.ts';
@@ -21,7 +24,7 @@ const hash = (value: unknown) => sha256Utf8(JSON.stringify(value));
 const unavailable = () =>
   new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
 const errorCode = (error: unknown) =>
-  error instanceof MaterialError || error instanceof ProviderError
+  error instanceof MaterialError || error instanceof ProviderError || error instanceof AssetError
     ? error.code
     : 'UPSTREAM_RESULT_UNKNOWN';
 
@@ -78,8 +81,10 @@ export function createMaterialService(
   store: MaterialStore,
   credentials: Credentials,
   upstream: MaterialUpstream,
+  assets?: Pick<ReturnType<typeof createAssetService>, 'readMaterialSource' | 'materialUrl'>,
 ) {
   let stopping = false;
+  let registering = false;
   let closing: Promise<void> | undefined;
   const stop = new AbortController();
   const active = new Set<Promise<unknown>>();
@@ -190,6 +195,91 @@ export function createMaterialService(
             ? { group: groupView(await store.ownedGroup(owner, op.target_group_id!)) }
             : {}),
         };
+      });
+    },
+    register(
+      actor: MaterialPrincipal,
+      groupId: string,
+      requestId: string,
+      assetId: string,
+      name = '',
+    ): Promise<{ operation: OperationView; material?: ReturnType<typeof materialView> }> {
+      if (stopping) throw unavailable();
+      return admit(async () => {
+        const owner = actor.userId;
+        const inputHash = hash({ groupId, assetId, name });
+        const old = await store.previous(owner, 'register_material', requestId, inputHash);
+        if (old) return operationResult(owner, old);
+        if (!assets) throw new MaterialError(409, 'MATERIAL_REGISTRATION_UNAVAILABLE');
+        if (registering) throw new MaterialError(409, 'MATERIAL_BUSY');
+        registering = true;
+        try {
+          const group = await store.ownedGroup(owner, groupId);
+          if (
+            group.state !== 'ready' ||
+            (group.group_type === 'real' && group.auth_status !== 'verified')
+          )
+            throw new MaterialError(409, 'MATERIAL_GROUP_NOT_READY');
+          const snapshot = await credentials.snapshotAccount(owner);
+          const source = await assets.readMaterialSource(owner, assetId, stop.signal);
+          const dimensions = await decodeMaterialImage(
+            source.data,
+            source.contentType,
+            stop.signal,
+          );
+          const key = credentials.openAccountSnapshot(owner, snapshot);
+          await upstream.getGroup(key, group.upstream_group_id!, stop.signal);
+          const url = await assets.materialUrl(owner, source, stop.signal);
+          stop.signal.throwIfAborted();
+          const frozen = {
+            version: 1 as const,
+            rawKey: source.rawKey,
+            rawEtag: source.rawEtag,
+            size: source.size,
+            contentType: source.contentType,
+            sha256: source.sourceDigest,
+            ...dimensions,
+          };
+          const { operation: op, fresh } = await store.beginRegister(
+            owner,
+            requestId,
+            inputHash,
+            group,
+            assetId,
+            name,
+            frozen,
+            snapshot,
+          );
+          if (!fresh) return operationResult(owner, op);
+          let remote: Awaited<ReturnType<MaterialUpstream['createMaterial']>> | undefined;
+          let attempted = false,
+            returned = false;
+          try {
+            stop.signal.throwIfAborted();
+            attempted = true;
+            remote = await upstream.createMaterial(
+              key,
+              group.upstream_group_id!,
+              url,
+              name,
+              stop.signal,
+            );
+            returned = true;
+            stop.signal.throwIfAborted();
+            await store.finishRegister(owner, op, remote.id, remote.requestId);
+          } catch (error) {
+            await settleFailure(owner, op, error, returned, attempted, remote);
+          }
+          const result = await operationResult(owner, op);
+          return {
+            ...result,
+            ...(result.operation.state === 'succeeded'
+              ? { material: materialView(await store.ownedMaterial(owner, op.target_material_id!)) }
+              : {}),
+          };
+        } finally {
+          registering = false;
+        }
       });
     },
     rename(actor: MaterialPrincipal, id: string, revision: number, name: string) {
@@ -365,13 +455,31 @@ export function createMaterialService(
         if (
           op.state !== 'unknown' ||
           (op.kind === 'create_group' && !op.protocol_snapshot.upstreamId) ||
-          op.kind === 'register_material'
+          (op.kind === 'register_material' && !op.protocol_snapshot.upstreamId)
         )
           return operationView(op);
         const claim = await store.claimRecovery(owner, id);
         if (!claim) return operationView(op);
         try {
           await outbound(owner, async (key, signal) => {
+            if (claim.kind === 'register_material') {
+              const group = await store.ownedGroup(owner, claim.target_group_id!);
+              if (
+                group.state !== 'ready' ||
+                group.upstream_group_id !== claim.protocol_snapshot.upstreamGroupId
+              )
+                throw new MaterialError(409, 'MATERIAL_GROUP_NOT_READY');
+              await upstream.getGroup(key, group.upstream_group_id!, signal);
+              const item = await upstream.getMaterial(
+                key,
+                claim.protocol_snapshot.upstreamId!,
+                group.upstream_group_id!,
+                signal,
+              );
+              signal.throwIfAborted();
+              await store.finishRecovery(owner, claim, true, null, item);
+              return;
+            }
             if (claim.kind === 'create_group') {
               await upstream.getGroup(key, claim.protocol_snapshot.upstreamId!, signal);
               signal.throwIfAborted();

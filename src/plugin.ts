@@ -136,10 +136,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
     let materials: MaterialService | undefined;
+    let assets: ReturnType<typeof createAssetService> | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
-      let assets: ReturnType<typeof createAssetService> | undefined;
       try {
         const acquired = (assets = createAssetService(store, createCosStorage(assetConfig)));
         vision = createConversationVision((owner, id, expected, signal) =>
@@ -149,6 +149,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           const failures: unknown[] = [];
           try {
             await conversations?.close();
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await materials?.close();
           } catch (error) {
             failures.push(error);
           }
@@ -254,7 +259,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const store = await createMaterialStore(materialConfig.databaseURL);
       let acquired: MaterialService | undefined;
       try {
-        materials = acquired = createMaterialService(store, providers, createMaterialUpstream());
+        materials = acquired = createMaterialService(
+          store,
+          providers,
+          createMaterialUpstream(),
+          assets,
+        );
         const owned = acquired;
         ctx.effect(() => async () => {
           await owned.close();

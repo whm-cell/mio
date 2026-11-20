@@ -51,6 +51,9 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         }),
       );
     },
+    materialUrl(Key) {
+      return encodeUrlToken(cos.getObjectUrl({ Bucket, Region, Key, Method: 'GET', Expires: 600 }));
+    },
     async head(Key) {
       const object = await cos.headObject({ Bucket, Region, Key });
       const size = Number(object.headers?.['content-length']);
@@ -94,7 +97,15 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       });
       // A stream failure can precede the SDK's completion callback.
       void completed.catch(() => {});
-      const abort = () => stream.destroy(new Error('ASSET_READ_ABORTED'));
+      let rejectAbort: ((error: Error) => void) | undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+      });
+      void aborted.catch(() => {});
+      const abort = () => {
+        stream.destroy(new Error('ASSET_READ_ABORTED'));
+        rejectAbort?.(new Error('ASSET_READ_ABORTED'));
+      };
       signal.addEventListener('abort', abort, { once: true });
       try {
         const chunks: Buffer[] = [];
@@ -110,13 +121,13 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
           }
           chunks.push(part);
         }
-        await completed;
+        await Promise.race([completed, aborted]);
         if (length !== size) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
         return Buffer.concat(chunks, length);
       } catch (error) {
         if (!stream.destroyed)
           stream.destroy(error instanceof Error ? error : new Error('ASSET_OBJECT_RESPONSE'));
-        await completed.catch(() => {});
+        void completed.catch(() => {});
         throw error;
       } finally {
         signal.removeEventListener('abort', abort);

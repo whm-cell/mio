@@ -3,8 +3,18 @@ import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { createHash } from 'node:crypto';
 import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
-import { AssetError, MAX_ASSET_BYTES, MAX_VISION_SOURCE_BYTES } from './contracts.ts';
-import type { AssetObjectStore, AssetPrincipal, VisionSource } from './contracts.ts';
+import {
+  AssetError,
+  MAX_ASSET_BYTES,
+  MAX_VISION_SOURCE_BYTES,
+  MAX_MATERIAL_SOURCE_BYTES,
+} from './contracts.ts';
+import type {
+  AssetObjectStore,
+  AssetPrincipal,
+  VisionSource,
+  MaterialImageSource,
+} from './contracts.ts';
 import type { AssetRow, AssetStore } from './store.ts';
 
 const log = createLogger('app', 'assets');
@@ -78,6 +88,77 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         );
     });
   };
+  const readOwnedImage = async (
+    ownerId: string,
+    id: string,
+    maxBytes: number,
+    expected: { etagDigest: string; sourceDigest: string } | undefined,
+    signal: AbortSignal,
+  ): Promise<MaterialImageSource> => {
+    const combined = AbortSignal.any([signal, stop.signal, AbortSignal.timeout(60_000)]);
+    combined.throwIfAborted();
+    const row = await store.owned(id, ownerId);
+    const size = Number(row.size_bytes);
+    if (
+      row.state !== 'ready' ||
+      !row.raw_key ||
+      !isValidImageAssetObjectKey(id, row.raw_key, row.content_type)
+    )
+      throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+    if (!Number.isSafeInteger(size) || size < 1 || size > maxBytes)
+      throw new AssetError(HTTP_STATUS.BAD_REQUEST, 'ASSET_INPUT_INVALID');
+    if (!objects.readImage)
+      throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
+    let head: Awaited<ReturnType<AssetObjectStore['head']>>;
+    let data: Uint8Array;
+    try {
+      head = await waitObject(() => objects.head(row.raw_key!), combined);
+      combined.throwIfAborted();
+      if (
+        head.size !== size ||
+        !head.etag ||
+        head.etag.length > 256 ||
+        /[\x00-\x1f\x7f]/.test(head.etag)
+      )
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+      const etagDigest = createHash('sha256').update(head.etag).digest('hex');
+      if (expected && expected.etagDigest !== etagDigest)
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+      data = await waitObject(
+        () => objects.readImage!(row.raw_key!, head.etag, size, combined),
+        combined,
+      );
+      combined.throwIfAborted();
+      if (data.byteLength !== size)
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+      const sourceDigest = createHash('sha256').update(data).digest('hex');
+      if (expected && expected.sourceDigest !== sourceDigest)
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+      const current = await store.owned(id, ownerId);
+      if (
+        current.state !== 'ready' ||
+        current.raw_key !== row.raw_key ||
+        current.size_bytes !== row.size_bytes ||
+        current.content_type !== row.content_type
+      )
+        throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+      return {
+        rawKey: row.raw_key,
+        rawEtag: head.etag,
+        size,
+        assetId: id,
+        contentType: row.content_type as VisionSource['contentType'],
+        data,
+        etagDigest,
+        sourceDigest,
+      };
+    } catch (error) {
+      if (error instanceof AssetError) throw error;
+      if (statusCode(error) === 412)
+        throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+      throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
+    }
+  };
   const clean = () => {
     if (stopping) return Promise.resolve();
     if (cleanup) return cleanup;
@@ -149,63 +230,48 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       signal: AbortSignal,
     ): Promise<VisionSource> {
       return admit(async () => {
-        const combined = AbortSignal.any([signal, stop.signal, AbortSignal.timeout(60_000)]);
-        combined.throwIfAborted();
-        const row = await store.owned(id, ownerId);
-        const size = Number(row.size_bytes);
+        const {
+          rawKey: _key,
+          rawEtag: _etag,
+          size: _size,
+          ...source
+        } = await readOwnedImage(ownerId, id, MAX_VISION_SOURCE_BYTES, expected, signal);
+        void _key;
+        void _etag;
+        void _size;
+        return source;
+      });
+    },
+    readMaterialSource(
+      ownerId: string,
+      id: string,
+      signal: AbortSignal,
+    ): Promise<MaterialImageSource> {
+      return admit(() => readOwnedImage(ownerId, id, MAX_MATERIAL_SOURCE_BYTES, undefined, signal));
+    },
+    materialUrl(
+      ownerId: string,
+      source: MaterialImageSource,
+      signal: AbortSignal,
+    ): Promise<string> {
+      return admit(async () => {
+        signal.throwIfAborted();
+        const row = await store.owned(source.assetId, ownerId);
         if (
           row.state !== 'ready' ||
-          !row.raw_key ||
-          !isValidImageAssetObjectKey(id, row.raw_key, row.content_type)
+          row.raw_key !== source.rawKey ||
+          Number(row.size_bytes) !== source.size ||
+          row.content_type !== source.contentType
         )
-          throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
-        if (!Number.isSafeInteger(size) || size < 1 || size > MAX_VISION_SOURCE_BYTES)
-          throw new AssetError(HTTP_STATUS.BAD_REQUEST, 'ASSET_INPUT_INVALID');
-        if (!objects.readImage)
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+        if (!objects.materialUrl)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
-        let head: Awaited<ReturnType<AssetObjectStore['head']>>;
-        let data: Uint8Array;
-        try {
-          head = await waitObject(() => objects.head(row.raw_key!), combined);
-          combined.throwIfAborted();
-          if (
-            head.size !== size ||
-            !head.etag ||
-            head.etag.length > 256 ||
-            /[\x00-\x1f\x7f]/.test(head.etag)
-          )
-            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-          const etagDigest = createHash('sha256').update(head.etag).digest('hex');
-          if (expected && expected.etagDigest !== etagDigest)
-            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
-          data = await objects.readImage(row.raw_key, head.etag, size, combined);
-          combined.throwIfAborted();
-          if (data.byteLength !== size)
-            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-          const sourceDigest = createHash('sha256').update(data).digest('hex');
-          if (expected && expected.sourceDigest !== sourceDigest)
-            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
-          const current = await store.owned(id, ownerId);
-          if (
-            current.state !== 'ready' ||
-            current.raw_key !== row.raw_key ||
-            current.size_bytes !== row.size_bytes ||
-            current.content_type !== row.content_type
-          )
-            throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
-          return {
-            assetId: id,
-            contentType: row.content_type as VisionSource['contentType'],
-            data,
-            etagDigest,
-            sourceDigest,
-          };
-        } catch (error) {
-          if (error instanceof AssetError) throw error;
-          if (statusCode(error) === 412)
-            throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
-          throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
-        }
+        const combined = AbortSignal.any([signal, stop.signal, AbortSignal.timeout(60_000)]);
+        const head = await waitObject(() => objects.head(source.rawKey), combined);
+        if (head.etag !== source.rawEtag || head.size !== source.size)
+          throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+        combined.throwIfAborted();
+        return objects.materialUrl(source.rawKey);
       });
     },
     complete(actor: AssetPrincipal, id: string) {

@@ -3,6 +3,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { AssetError } from '../assets/contracts.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import { MaterialError } from './contracts.ts';
 import type { MaterialPrincipal } from './contracts.ts';
@@ -19,7 +20,7 @@ function route(path: string): { kind: string; id?: string; methods: string[] } |
   const id = match[2];
   if (entity === 'groups' && !action) return { kind: 'group', id, methods: ['GET', 'PATCH'] };
   if (entity === 'groups' && action === 'materials')
-    return { kind: 'materials', id, methods: ['GET'] };
+    return { kind: 'materials', id, methods: ['GET', 'POST'] };
   if (entity === 'groups' && action === 'sync') return { kind: 'sync', id, methods: ['POST'] };
   if (entity === 'items' && !action) return { kind: 'material', id, methods: ['GET'] };
   if (entity === 'items' && action === 'refresh') return { kind: 'refresh', id, methods: ['POST'] };
@@ -124,11 +125,13 @@ export function createMaterialHandler(
           ? ['requestId', 'type', 'name']
           : endpoint.kind === 'group'
             ? ['revision', 'name']
-            : endpoint.kind === 'sync'
-              ? ['cursor']
-              : endpoint.kind.startsWith('delete')
-                ? ['requestId', 'revision', 'scope']
-                : [];
+            : endpoint.kind === 'materials'
+              ? ['requestId', 'assetId', 'name']
+              : endpoint.kind === 'sync'
+                ? ['cursor']
+                : endpoint.kind.startsWith('delete')
+                  ? ['requestId', 'revision', 'scope']
+                  : [];
       if (Object.keys(body).some((key) => !keys.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (result: unknown, status: number = HTTP_STATUS.OK) => {
@@ -160,6 +163,25 @@ export function createMaterialHandler(
       }
       if (typeof body.requestId !== 'string' || !isUuidV4(body.requestId))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      if (endpoint.kind === 'materials') {
+        if (
+          typeof body.assetId !== 'string' ||
+          !isUuidV4(body.assetId) ||
+          ('name' in body && !validName(body.name))
+        )
+          return fail(400, 'BODY_INVALID');
+        const result = await service.register(
+          actor,
+          id,
+          body.requestId,
+          body.assetId,
+          body.name as string | undefined,
+        );
+        return send(
+          result,
+          result.operation.state === 'succeeded' ? HTTP_STATUS.CREATED : HTTP_STATUS.ACCEPTED,
+        );
+      }
       if (endpoint.kind === 'groups') {
         if (body.type !== 'aigc' || !validName(body.name))
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
@@ -187,6 +209,7 @@ export function createMaterialHandler(
       );
     } catch (error) {
       if (
+        error instanceof AssetError ||
         error instanceof MaterialError ||
         error instanceof ProviderError ||
         error instanceof RequestBodyError

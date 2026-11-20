@@ -116,3 +116,28 @@ it('enforces a twenty-second timeout even if the transport ignores cancellation,
     vi.useRealTimers();
   }
 });
+
+it('encodes fixed image registration and returns only the validated remote identity to its internal caller', async () => {
+  const transport = vi.fn(async () => envelope('CreateAsset', { Id: asset }));
+  const upstream = createMaterialUpstream(transport);
+  expect(
+    await upstream.createMaterial(
+      key,
+      group,
+      'https://private.example/raw?signature=secret',
+      'Image',
+      signal(),
+    ),
+  ).toMatchObject({ id: asset });
+  expect(transport.mock.calls[0]).toEqual([
+    expect.stringMatching(/Action=CreateAsset&Version=2024-01-01$/),
+    expect.objectContaining({
+      body: JSON.stringify({
+        GroupId: group,
+        URL: 'https://private.example/raw?signature=secret',
+        AssetType: 'Image',
+        Name: 'Image',
+      }),
+    }),
+  ]);
+});

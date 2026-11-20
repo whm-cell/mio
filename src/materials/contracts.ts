@@ -79,6 +79,7 @@ export interface OperationRow {
     version: 1;
     upstreamId?: string;
     previousState?: GroupState | MaterialState;
+    upstreamGroupId?: string;
   };
   upstream_request_id: string | null;
   attempt: number;
@@ -122,6 +123,18 @@ export interface OperationView {
   errorCode: string | null;
   pollAfterMs: number;
 }
+export interface MaterialSourceSnapshot {
+  version: 1;
+  rawKey: string;
+  rawEtag: string;
+  size: number;
+  contentType: string;
+  sha256: string;
+  width: number;
+  height: number;
+  pages: number;
+  totalPixels: number;
+}
 export interface UpstreamMaterial {
   id: string;
   groupId: string;
@@ -131,6 +144,13 @@ export interface UpstreamMaterial {
 export interface MaterialUpstream {
   createGroup(
     key: string,
+    name: string,
+    signal: AbortSignal,
+  ): Promise<{ id: string; requestId: string | null }>;
+  createMaterial(
+    key: string,
+    groupId: string,
+    url: string,
     name: string,
     signal: AbortSignal,
   ): Promise<{ id: string; requestId: string | null }>;

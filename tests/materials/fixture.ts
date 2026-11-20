@@ -10,6 +10,7 @@ import { materialSchemaSQL } from '../../src/materials/schema.ts';
 import { createMaterialStore } from '../../src/materials/store.ts';
 import { createMaterialService } from '../../src/materials/service.ts';
 import { createMaterialUpstream } from '../../src/integrations/onelink/materials.ts';
+import type { createAssetService } from '../../src/assets/service.ts';
 import type { ModelTransport } from '../../src/integrations/onelink/models.ts';
 
 export function envelope(
@@ -32,7 +33,9 @@ export function envelope(
     { status },
   );
 }
-export async function materialFixture() {
+export async function materialFixture(
+  assets?: Pick<ReturnType<typeof createAssetService>, 'readMaterialSource' | 'materialUrl'>,
+) {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
@@ -68,6 +71,17 @@ export async function materialFixture() {
       groups.set(id, String(body.Name));
       return envelope(action, { Id: id });
     }
+    if (action === 'CreateAsset') {
+      const Id = `asset-${String(++sequence).padStart(14, '0')}-abcde`;
+      items.set(Id, {
+        Id,
+        GroupId: String(body.GroupId),
+        Name: String(body.Name ?? ''),
+        AssetType: 'Image',
+        Status: 'Processing',
+      });
+      return envelope(action, { Id });
+    }
     if (action === 'GetAssetGroup')
       return groups.has(id)
         ? envelope(action, { Id: id, Name: groups.get(id) })
@@ -102,7 +116,7 @@ export async function materialFixture() {
     throw new Error(`FORBIDDEN_ACTION_${action}`);
   });
   const store = await createMaterialStore(database.url);
-  const service = createMaterialService(store, provider, createMaterialUpstream(transport));
+  const service = createMaterialService(store, provider, createMaterialUpstream(transport), assets);
   const create = async (name = 'Example') => {
     const result = await service.createGroup(actor, randomUUID(), name);
     if (!('group' in result)) throw new Error(`Group failed: ${result.operation.errorCode}`);

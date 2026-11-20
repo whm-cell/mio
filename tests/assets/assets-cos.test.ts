@@ -503,3 +503,31 @@ it.each(['server error', 'connection reset'])(
     }
   },
 );
+
+it('signs a separate600-second supplier GET without attachment and preserves session-token URL encoding', () => {
+  const token = 'fixture+token=/&%#?';
+  const signer = vi.spyOn(COS.prototype, 'getObjectUrl');
+  try {
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://fixture/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'fixture',
+      secretKey: 'fixture',
+      sessionToken: token,
+    });
+    const url = new URL(storage.materialUrl!('mio/raw/fixture/immutable'));
+    expect(signer).toHaveBeenLastCalledWith(
+      expect.objectContaining({ Method: 'GET', Expires: 600, Key: 'mio/raw/fixture/immutable' }),
+    );
+    expect(signer.mock.calls.at(-1)![0]).not.toHaveProperty('Query');
+    expect(url.searchParams.has('response-content-disposition')).toBe(false);
+    expect(url.searchParams.get('x-cos-security-token')).toBe(token);
+    const [from, to] = url.searchParams.get('q-sign-time')!.split(';').map(Number);
+    expect(to! - from!).toBe(600);
+    const download = new URL(storage.downloadUrl('mio/raw/fixture/immutable'));
+    expect(download.searchParams.get('response-content-disposition')).toBe('attachment');
+  } finally {
+    signer.mockRestore();
+  }
+});

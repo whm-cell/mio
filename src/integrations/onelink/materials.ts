@@ -150,6 +150,17 @@ export function createMaterialUpstream(transport: ModelTransport = fetch): Mater
       if (typeof value.result.Id !== 'string' || !groupId.test(value.result.Id)) return invalid();
       return { id: value.result.Id, requestId: value.requestId };
     },
+    async createMaterial(key, id, url, name, signal) {
+      if (!groupId.test(id)) return invalid();
+      const value = await call(
+        'CreateAsset',
+        key,
+        { GroupId: id, URL: url, AssetType: 'Image', Name: name },
+        signal,
+      );
+      if (typeof value.result.Id !== 'string' || !assetId.test(value.result.Id)) return invalid();
+      return { id: value.result.Id, requestId: value.requestId };
+    },
     async getGroup(key, id, signal) {
       const value = await call('GetAssetGroup', key, { Id: id }, signal);
       if (value.result.Id !== id) return invalid();

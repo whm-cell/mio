@@ -104,9 +104,14 @@ export class MaterialAuthStore {
       return { session: old, fresh: false };
     });
   }
-  async created(row: MaterialAuthRow, envelope: CredentialEnvelope, digest: string): Promise<void> {
+  async created(
+    row: MaterialAuthRow,
+    envelope: CredentialEnvelope,
+    digest: string,
+    requestId: string | null,
+  ): Promise<void> {
     const result = await this.pool.query(
-      `UPDATE mio_material_auth_sessions SET state='pending',cipher_format=$4,master_key_id=$5,nonce=$6,ciphertext=$7,auth_tag=$8,token_digest=$9,lease_id=NULL,lease_until=NULL,error_code=NULL,updated_at=now()
+      `UPDATE mio_material_auth_sessions SET state='pending',cipher_format=$4,master_key_id=$5,nonce=$6,ciphertext=$7,auth_tag=$8,token_digest=$9,upstream_create_request_id=$11,lease_id=NULL,lease_until=NULL,error_code=NULL,updated_at=now()
       WHERE owner_id=$1 AND id=$2 AND lease_id=$3 AND state='creating' AND lease_until>clock_timestamp() AND expires_at>clock_timestamp() AND input_hash=$10`,
       [
         row.owner_id,
@@ -119,6 +124,7 @@ export class MaterialAuthStore {
         envelope.auth_tag,
         digest,
         row.input_hash,
+        requestId,
       ],
     );
     if (result.rowCount !== 1) throw superseded();
@@ -127,11 +133,12 @@ export class MaterialAuthStore {
     row: MaterialAuthRow,
     uncertain: boolean,
     code: string,
+    requestId: string | null,
     known?: { envelope: CredentialEnvelope; digest: string },
   ): Promise<void> {
     await this.pool.query(
       `UPDATE mio_material_auth_sessions SET state=$4,error_code=$5,
-      cipher_format=COALESCE($6,cipher_format),master_key_id=COALESCE($7,master_key_id),nonce=COALESCE($8,nonce),ciphertext=COALESCE($9,ciphertext),auth_tag=COALESCE($10,auth_tag),token_digest=COALESCE($11,token_digest),lease_id=NULL,lease_until=NULL,updated_at=now()
+      cipher_format=COALESCE($6,cipher_format),master_key_id=COALESCE($7,master_key_id),nonce=COALESCE($8,nonce),ciphertext=COALESCE($9,ciphertext),auth_tag=COALESCE($10,auth_tag),token_digest=COALESCE($11,token_digest),upstream_create_request_id=COALESCE($13,upstream_create_request_id),lease_id=NULL,lease_until=NULL,updated_at=now()
       WHERE owner_id=$1 AND id=$2 AND input_hash=$12 AND expires_at>clock_timestamp() AND ((state='creating' AND lease_id=$3) OR (state='unknown' AND lease_id IS NULL AND ciphertext IS NULL AND $9::bytea IS NOT NULL))`,
       [
         row.owner_id,
@@ -146,6 +153,7 @@ export class MaterialAuthStore {
         known?.envelope.auth_tag ?? null,
         known?.digest ?? null,
         row.input_hash,
+        requestId,
       ],
     );
   }
@@ -159,14 +167,26 @@ export class MaterialAuthStore {
       )
     ).rows[0];
   }
-  async verificationFailed(row: MaterialAuthRow, code: string): Promise<void> {
+  async verificationFailed(
+    row: MaterialAuthRow,
+    code: string,
+    resultRequestId: string | null,
+    groupRequestId: string | null,
+  ): Promise<void> {
     await this.pool.query(
-      "UPDATE mio_material_auth_sessions SET state='unknown',error_code=$4,lease_id=NULL,lease_until=NULL,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND expires_at>clock_timestamp()",
-      [row.owner_id, row.id, row.lease_id, code],
+      `UPDATE mio_material_auth_sessions SET state='unknown',error_code=$4,lease_id=NULL,lease_until=NULL,updated_at=now(),
+        upstream_result_request_id=COALESCE($5,upstream_result_request_id),upstream_group_request_id=COALESCE($6,upstream_group_request_id)
+      WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND expires_at>clock_timestamp()`,
+      [row.owner_id, row.id, row.lease_id, code, resultRequestId, groupRequestId],
     );
     await this.expire(row.id);
   }
-  async complete(row: MaterialAuthRow, upstreamId: string): Promise<MaterialAuthRow> {
+  async complete(
+    row: MaterialAuthRow,
+    upstreamId: string,
+    resultRequestId: string | null,
+    groupRequestId: string | null,
+  ): Promise<MaterialAuthRow> {
     return this.transaction(async (client) => {
       const current = (
         await client.query<MaterialAuthRow>(
@@ -183,9 +203,10 @@ export class MaterialAuthStore {
       );
       const result = (
         await client.query<MaterialAuthRow>(
-          `UPDATE mio_material_auth_sessions SET state='completed',group_id=$4,${clear},lease_id=NULL,lease_until=NULL,error_code=NULL,updated_at=now()
+          `UPDATE mio_material_auth_sessions SET state='completed',group_id=$4,${clear},lease_id=NULL,lease_until=NULL,error_code=NULL,updated_at=now(),
+            upstream_result_request_id=COALESCE($5,upstream_result_request_id),upstream_group_request_id=COALESCE($6,upstream_group_request_id)
         WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND lease_until>clock_timestamp() AND expires_at>clock_timestamp() RETURNING *`,
-          [row.owner_id, row.id, row.lease_id, groupId],
+          [row.owner_id, row.id, row.lease_id, groupId, resultRequestId, groupRequestId],
         )
       ).rows[0];
       if (!result) throw superseded();

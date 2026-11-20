@@ -1,13 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { vi } from 'vitest';
 import { materialFixture, envelope } from './fixture.ts';
-import { materialAuthSchemaSQL } from '../../src/materials/auth-schema.ts';
 import { createMaterialAuthService } from '../../src/materials/auth-service.ts';
 import { createMaterialAuthUpstream } from '../../src/integrations/onelink/materials.ts';
 import type { ModelTransport } from '../../src/integrations/onelink/models.ts';
 export async function materialAuthFixture() {
-  const f = await materialFixture();
-  await f.pool.query(materialAuthSchemaSQL);
+  const f = await materialFixture(undefined, true);
   const tokens = new Map<string, { group: string; callback: string; launchUrl: string }>();
   let override:
     ((action: string, body: Record<string, unknown>) => Promise<Response | undefined>) | undefined;
@@ -40,7 +38,7 @@ export async function materialAuthFixture() {
     throw new Error('FORBIDDEN_AUTH_ACTION');
   });
   const origin = 'https://materials.example.test:8443';
-  const authentication = await createMaterialAuthService(
+  const authentication = createMaterialAuthService(
     f.store.authentication,
     f.provider,
     createMaterialAuthUpstream(transport),

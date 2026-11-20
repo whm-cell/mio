@@ -2,10 +2,15 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { expect, it, onTestFinished, vi } from 'vitest';
 import { materialAuthFixture } from './auth-fixture.ts';
+import { materialAuthSchemaSQL } from '../../src/materials/auth-schema.ts';
+import { createMaterialAuthService } from '../../src/materials/auth-service.ts';
 import { createMaterialHandler } from '../../src/materials/http.ts';
 import { createMaterialService } from '../../src/materials/service.ts';
 import { createMaterialStore } from '../../src/materials/store.ts';
-import { createMaterialUpstream } from '../../src/integrations/onelink/materials.ts';
+import {
+  createMaterialAuthUpstream,
+  createMaterialUpstream,
+} from '../../src/integrations/onelink/materials.ts';
 async function fixture() {
   const f = await materialAuthFixture();
   onTestFinished(() => f.close());
@@ -36,7 +41,7 @@ async function fixture() {
     });
   return { ...f, base, request };
 }
-it('exposes only exact launch/complete publicly while all authenticated routes preserve Cookie/Origin/strict input', async () => {
+it('exposes the exact launch publicly while authenticated routes preserve Cookie/Origin/strict input', async () => {
   const f = await fixture();
   const input = { requestId: randomUUID(), source: 'materials', returnTarget: 'materials' };
   expect((await f.request('/api/v1/materials/auth-sessions', input, { cookie: '' })).status).toBe(
@@ -87,29 +92,114 @@ it('exposes only exact launch/complete publicly while all authenticated routes p
   expect((await fetch(`${f.base}/api/v1/materials/auth-sessions/${id}/launch/extra`)).status).toBe(
     404,
   );
-  const endpoint = `${f.base}/api/v1/materials/auth-sessions/${id}/complete`;
-  const wrong = await fetch(
-    `${endpoint}?bytedToken=${encodeURIComponent('different-valid-token-' + randomUUID())}&resultCode=10000`,
-  );
-  expect(wrong.status).toBe(400);
-  expect(await wrong.text()).not.toContain(token);
-  expect(
-    (
-      await fetch(
-        `${endpoint}?bytedToken=${encodeURIComponent(token)}&bytedToken=${encodeURIComponent(token)}`,
-      )
-    ).status,
-  ).toBe(400);
-  const success = await fetch(
-    `${endpoint}?bytedToken=${encodeURIComponent(token)}&resultCode=10000`,
-  );
+});
+
+it('accepts supplier extras while binding public completion to the original session, owner and verified group', async () => {
+  const f = await fixture();
+  const created = await f.request('/api/v1/materials/auth-sessions', {
+    requestId: randomUUID(),
+    source: 'materials',
+    returnTarget: 'materials',
+  });
+  expect(created.status).toBe(201);
+  const { sessionId } = (await created.json()) as { sessionId: string };
+  const [token, upstream] = [...f.tokens.entries()][0]!;
+  const sessionPath = `/api/v1/materials/auth-sessions/${sessionId}`;
+  const endpoint = `${f.base}${sessionPath}/complete`;
+  const proof = `bytedToken=${encodeURIComponent(token)}`;
+  const extras = new URLSearchParams({
+    ownerId: 'ignored-owner',
+    GroupId: 'ignored-group',
+    state: 'failed',
+    returnTarget: 'https://ignored-target.example.test/',
+  });
+  extras.append('supplier', 'ignored-value');
+  extras.append('supplier', '');
+
+  const failures = [
+    ['', 'AUTH_PROOF_INVALID'],
+    ['bytedToken=another-synthetic-token', 'AUTH_PROOF_INVALID'],
+    [`${proof}&%62ytedToken=`, 'AUTH_QUERY_INVALID'],
+    [`${proof}&resultCode=10000&result%43ode=`, 'AUTH_QUERY_INVALID'],
+    [`${proof}&resultCode=`, 'AUTH_QUERY_INVALID'],
+    [`${proof}&resultCode=10001`, 'AUTH_RESULT_UNCONFIRMED'],
+    [`${proof}&padding=${'a'.repeat(8192)}`, 'AUTH_QUERY_INVALID'],
+  ];
+  for (const [query, code] of failures) {
+    const invalid = await fetch(`${endpoint}?${query}&${extras}`);
+    expect(invalid.status).toBe(400);
+    const html = await invalid.text();
+    expect(html).toContain(code);
+    expect(html).not.toContain(token);
+  }
+  expect((await fetch(`${endpoint}?${proof}&${extras}`, { method: 'POST' })).status).toBe(405);
+  expect((await fetch(`${endpoint}/extra?${proof}&${extras}`)).status).toBe(404);
+  expect(f.authTransport).toHaveBeenCalledTimes(1);
+  expect(await f.store.authentication.get(sessionId, f.actor.userId)).toMatchObject({
+    state: 'pending',
+    query_count: 0,
+  });
+
+  const success = await fetch(`${endpoint}?${proof}&resultCode=10000&${extras}`);
   expect(success.status).toBe(200);
   const html = await success.text();
   expect(html).toContain('AUTH_COMPLETED');
   expect(html).toContain('请返回电脑查看真人素材组');
+  expect(html).toContain('href="/materials"');
   expect(html).not.toContain(token);
-  expect(html).not.toMatch(/group-|BytedToken|H5Link/);
-  expect((await f.authentication.get(f.actor, id)).state).toBe('completed');
+  expect(html).not.toMatch(/group-|BytedToken|H5Link|ignored-/);
+  expect(f.authTransport).toHaveBeenCalledTimes(3);
+  const ownerSession = await f.request(sessionPath);
+  expect(ownerSession.status).toBe(200);
+  const view = (await ownerSession.json()) as { groupId: string };
+  expect(view).toMatchObject({ sessionId, state: 'completed', groupId: expect.any(String) });
+  const groups = await f.request('/api/v1/materials/groups?type=real');
+  expect(groups.status).toBe(200);
+  expect(await groups.json()).toMatchObject({
+    items: [{ groupId: view.groupId, type: 'real', authStatus: 'verified' }],
+  });
+  expect(await f.store.ownedGroup(f.actor.userId, view.groupId)).toMatchObject({
+    upstream_group_id: upstream.group,
+    source_session_id: sessionId,
+  });
+  expect(await f.store.authentication.get(sessionId, f.actor.userId)).toMatchObject({
+    cipher_format: null,
+    master_key_id: null,
+    nonce: null,
+    ciphertext: null,
+    auth_tag: null,
+  });
+  const refreshed = await f.request(`${sessionPath}/refresh`, {});
+  expect(refreshed.status).toBe(200);
+  expect(await refreshed.json()).toEqual(view);
+  const replay = await fetch(`${endpoint}?${proof}&${extras}`);
+  expect(replay.status).toBe(200);
+  expect(await replay.text()).toBe(html);
+  expect(f.authTransport).toHaveBeenCalledTimes(3);
+
+  await f.authentication.close();
+  const reopenedStore = await createMaterialStore(f.database.url, true);
+  try {
+    const restarted = createMaterialAuthService(
+      reopenedStore.authentication,
+      f.provider,
+      createMaterialAuthUpstream(f.authTransport),
+      f.origin,
+    );
+    try {
+      expect(await restarted.get(f.actor, sessionId)).toEqual(view);
+      expect(await restarted.refresh(f.actor, sessionId)).toEqual(view);
+      expect(await reopenedStore.ownedGroup(f.actor.userId, view.groupId)).toMatchObject({
+        group_type: 'real',
+        auth_status: 'verified',
+      });
+      expect(f.authTransport).toHaveBeenCalledTimes(3);
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await reopenedStore.close();
+  }
 });
 it('bounds the public pipeline before database admission and does not retain pending work after excess random sessions', async () => {
   const f = await fixture();
@@ -158,28 +248,67 @@ it('releases material metadata pool even if its authentication consumer close re
   expect(close).toHaveBeenCalledTimes(1);
 });
 
-it('cleans expired authentication during service startup and keeps old session proof across close/restart', async () => {
+it('cleans existing auth sessions at startup and on the timer without public routes or new audit columns', async () => {
   const f = await fixture();
-  const pending = await f.authentication.create(f.actor, randomUUID(), 'materials', 'materials');
-  await f.pool.query(
-    "UPDATE mio_material_auth_sessions SET created_at=created_at-interval '21 minutes',expires_at=expires_at-interval '21 minutes' WHERE id=$1",
-    [pending.sessionId],
-  );
+  const first = await f.authentication.create(f.actor, randomUUID(), 'materials', 'materials');
+  const second = await f.authentication.create(f.actor, randomUUID(), 'materials', 'materials');
   await f.authentication.close();
-  const { createMaterialAuthService } = await import('../../src/materials/auth-service.ts');
-  const { createMaterialAuthUpstream } =
-    await import('../../src/integrations/onelink/materials.ts');
-  const restarted = await createMaterialAuthService(
-    f.store.authentication,
-    f.provider,
-    createMaterialAuthUpstream(f.authTransport),
-    f.origin,
+  await f.pool.query(
+    `ALTER TABLE mio_material_auth_sessions
+      DROP COLUMN upstream_create_request_id,
+      DROP COLUMN upstream_result_request_id,
+      DROP COLUMN upstream_group_request_id`,
   );
+  await expect(createMaterialStore(f.database.url, true)).rejects.toThrow('MATERIAL_SCHEMA');
+  const expireFixture = (id: string) =>
+    f.pool.query(
+      "UPDATE mio_material_auth_sessions SET created_at=created_at-interval '21 minutes',expires_at=expires_at-interval '21 minutes' WHERE id=$1",
+      [id],
+    );
+  const storedRow = async (id: string) =>
+    (await f.pool.query('SELECT * FROM mio_material_auth_sessions WHERE id=$1', [id])).rows[0];
+  await expireFixture(first.sessionId);
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
   try {
-    expect(await restarted.get(f.actor, pending.sessionId)).toMatchObject({ state: 'expired' });
-    expect((await f.store.authentication.get(pending.sessionId)).ciphertext).toBeNull();
+    const storeWithoutPublicAuth = await createMaterialStore(f.database.url);
+    try {
+      expect(await storedRow(first.sessionId)).toMatchObject({
+        state: 'expired',
+        ciphertext: null,
+      });
+      expect(await storedRow(second.sessionId)).toMatchObject({
+        state: 'pending',
+        ciphertext: expect.any(Buffer),
+      });
+      await expireFixture(second.sessionId);
+      const expire = vi.spyOn(storeWithoutPublicAuth.authentication, 'expire');
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(expire).toHaveBeenCalledTimes(1);
+      await expire.mock.results[0]!.value;
+      expect(await storedRow(second.sessionId)).toMatchObject({
+        state: 'expired',
+        ciphertext: null,
+        token_digest: expect.any(String),
+      });
+    } finally {
+      await storeWithoutPublicAuth.close();
+    }
   } finally {
-    await restarted.close();
+    vi.useRealTimers();
+  }
+  const beforeMigration = await storedRow(second.sessionId);
+  await f.pool.query(materialAuthSchemaSQL);
+  const upgraded = await createMaterialStore(f.database.url, true);
+  try {
+    expect(await storedRow(second.sessionId)).toEqual({
+      ...beforeMigration,
+      upstream_create_request_id: null,
+      upstream_result_request_id: null,
+      upstream_group_request_id: null,
+    });
+    expect(f.authTransport).toHaveBeenCalledTimes(2);
+  } finally {
+    await upgraded.close();
   }
 });
 
@@ -190,7 +319,27 @@ it('keeps the owner recovery endpoint private with strict empty JSON and no publ
   expect((await f.request(path, {}, { cookie: '' })).status).toBe(401);
   expect((await f.request(path, { token: 'forged' })).status).toBe(400);
   expect((await fetch(f.base + path)).status).toBe(405);
-  const result = await f.request(path, {});
+
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.authOverride(async (action) => {
+    if (action === 'GetVisualValidateResult') {
+      entered.resolve();
+      await release.promise;
+    }
+    return undefined;
+  });
+  const inFlight = f.request(path, {});
+  try {
+    await Promise.race([entered.promise, inFlight]);
+    const limited = await f.request(path, {});
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('retry-after')).toBe('3');
+    expect(await limited.json()).toMatchObject({ error: { code: 'AUTH_QUERY_LIMITED' } });
+  } finally {
+    release.resolve();
+  }
+  const result = await inFlight;
   expect(result.status).toBe(200);
   expect(await result.json()).toMatchObject({ state: 'completed', sessionId: view.sessionId });
 });

@@ -30,9 +30,22 @@ export interface MaterialCursor {
 export class MaterialStore {
   readonly authentication: MaterialAuthStore;
   private readonly pool: Pool;
-  constructor(pool: Pool) {
+  private readonly authCleanupTimer?: ReturnType<typeof setInterval>;
+  private authCleanup: Promise<void> | undefined;
+
+  constructor(pool: Pool, authentication: MaterialAuthStore, cleanupAuthSessions: boolean) {
     this.pool = pool;
-    this.authentication = new MaterialAuthStore(pool);
+    this.authentication = authentication;
+    if (cleanupAuthSessions)
+      this.authCleanupTimer = setInterval(() => {
+        if (this.authCleanup) return;
+        this.authCleanup = this.authentication
+          .expire()
+          .catch(() => log.error('MATERIAL_AUTH_EXPIRY_CLEANUP_FAILED'))
+          .finally(() => {
+            this.authCleanup = undefined;
+          });
+      }, 30_000).unref();
   }
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -907,14 +920,16 @@ export class MaterialStore {
     });
   }
 
-  close(): Promise<void> {
-    return this.pool.end();
+  async close(): Promise<void> {
+    clearInterval(this.authCleanupTimer);
+    await this.authCleanup;
+    await this.pool.end();
   }
 }
 
 export async function createMaterialStore(
   databaseURL: string,
-  authentication = false,
+  requireAuthentication = false,
 ): Promise<MaterialStore> {
   const pool = new Pool({
     connectionString: databaseURL,
@@ -927,8 +942,17 @@ export async function createMaterialStore(
   pool.on('error', () => log.error('MATERIAL_DATABASE_CONNECTION_ERROR'));
   try {
     await checkMaterialSchema(pool);
-    if (authentication) await checkMaterialAuthSchema(pool);
-    return new MaterialStore(pool);
+    if (requireAuthentication) await checkMaterialAuthSchema(pool);
+    const hasAuthSessions =
+      requireAuthentication ||
+      (
+        await pool.query<{ present: boolean }>(
+          "SELECT to_regclass('mio_material_auth_sessions') IS NOT NULL AS present",
+        )
+      ).rows[0]!.present;
+    const authentication = new MaterialAuthStore(pool);
+    if (hasAuthSessions) await authentication.expire();
+    return new MaterialStore(pool, authentication, hasAuthSessions);
   } catch {
     await pool.end();
     throw new Error('MATERIAL_SCHEMA: run materials:migrate and check database access');

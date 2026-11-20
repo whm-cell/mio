@@ -6,6 +6,7 @@ import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
+import { materialAuthSchemaSQL } from '../../src/materials/auth-schema.ts';
 import { materialSchemaSQL } from '../../src/materials/schema.ts';
 import { createMaterialStore } from '../../src/materials/store.ts';
 import { createMaterialService } from '../../src/materials/service.ts';
@@ -35,12 +36,14 @@ export function envelope(
 }
 export async function materialFixture(
   assets?: Pick<ReturnType<typeof createAssetService>, 'readMaterialSource' | 'materialUrl'>,
+  authentication = false,
 ) {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
   await pool.query(providerSchemaSQL);
   await pool.query(materialSchemaSQL);
+  if (authentication) await pool.query(materialAuthSchemaSQL);
   const config = {
     databaseURL: database.url,
     masterKey: randomBytes(32),
@@ -115,7 +118,7 @@ export async function materialFixture(
     }
     throw new Error(`FORBIDDEN_ACTION_${action}`);
   });
-  const store = await createMaterialStore(database.url);
+  const store = await createMaterialStore(database.url, authentication);
   const service = createMaterialService(store, provider, createMaterialUpstream(transport), assets);
   const create = async (name = 'Example') => {
     const result = await service.createGroup(actor, randomUUID(), name);

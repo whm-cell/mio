@@ -1,10 +1,10 @@
 # 素材库 HTTP 契约
 
-[API 导航](index.md)；需求与分期见[素材库 PRD](../tasks/onelink-material-library/prd.md)。当前采纳 Unit 1 管理、同步、读取与删除，以及 Unit 2 图片核验/登记候选；Unit 3 认证会话为实现候选，真实手机协议/HTTPS 证据尚待本人配合；视频仍按后续单元推进。
+[API 导航](index.md)；需求与分期见[素材库 PRD](../tasks/onelink-material-library/prd.md)。当前采纳 Unit 1 管理、同步、读取与删除，以及 Unit 2 图片核验/登记候选；Unit 3 真人认证会话为实现候选；视频仍按后续单元推进。
 
 ## 本域共同约定
 
-显式设置 `MIO_MATERIALS_ENABLED=true`，配置认证、供应商和 `MIO_ASSETS_DATABASE_URL`，先迁移 assets，再执行 `pnpm materials:migrate --apply`（本地 `pnpm migrate:dev materials --apply`）。素材域独立持池；仅素材管理且所有 COS 字段缺省时不注册资产 HTTP；任一 COS 字段出现则沿既有资产完整配置校验，部分配置失败。启动只读检查三表和确切全局上游唯一索引，缺结构失败，不自动迁移或联网。未启用时不注册本域。真人认证额外显式设置 `MIO_MATERIALS_PUBLIC_BASE_URL` 为可达 HTTPS origin（可含非默认 HTTPS 端口，不能有用户信息、路径、query 或 fragment）；缺省时素材管理/图片登记照常使用，不注册认证端点。不得从请求 Host 或既有生产认证域推导。执行当前 `materials:migrate` 会显式增量建立 auth_sessions 表；启用公开认证时启动才要求并只读核验该表的 owner/requestId 唯一约束、owner/group 复合 FK 及到期清理索引。
+显式设置 `MIO_MATERIALS_ENABLED=true`，配置认证、供应商和 `MIO_ASSETS_DATABASE_URL`，先迁移 assets，再执行 `pnpm materials:migrate --apply`（本地 `pnpm migrate:dev materials --apply`）。素材域独立持池；仅素材管理且所有 COS 字段缺省时不注册资产 HTTP；任一 COS 字段出现则沿既有资产完整配置校验，部分配置失败。启动只读检查三表和确切全局上游唯一索引，缺结构失败，不自动迁移或联网。未启用时不注册本域。真人认证额外显式设置 `MIO_MATERIALS_PUBLIC_BASE_URL` 为可达 HTTPS origin（可含非默认 HTTPS 端口，不能有用户信息、路径、query 或 fragment）；缺省时素材管理/图片登记照常使用，不注册认证端点。不得从请求 Host 或既有生产认证域推导。执行当前 `materials:migrate` 显式增量建立 auth_sessions 表及审计列；启用公开认证时启动只读核验该表的列、owner/requestId 唯一约束、owner/group 复合 FK 及到期清理索引。已有会话表时，素材服务的到期清理也覆盖关闭认证入口的运行环境。
 
 身份仅来自登录 Cookie，资源按 owner 查询；服务 Bearer 不授予用户身份。写入要求允许的精确 Origin 和 `application/json`，GET 提供 Origin 时也须匹配；OPTIONS 无需登录但须允许 Origin。JSON 为对象、8192 字节、10 秒，拒绝额外字段且读完复核会话。响应均 `no-store`、`X-Request-Id`；错误 `{error:{code,message,requestId}}`。常见错误为 400 BODY_INVALID/QUERY_INVALID/CURSOR_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED/PROVIDER_RESOURCE_FORBIDDEN、404 NOT_FOUND/MATERIAL_NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED、409 REVISION_CONFLICT/IDEMPOTENCY_CONFLICT/MATERIAL_BUSY/MATERIAL_GROUP_NOT_READY/RESOURCE_IN_USE/PROVIDER_UNAVAILABLE/UPSTREAM_RESOURCE_COLLISION、429 MATERIAL_QUERY_LIMITED（`Retry-After: 4`）、503 MATERIAL_UNAVAILABLE/UPSTREAM_RESULT_UNKNOWN/UPSTREAM_RESPONSE_INVALID/UPSTREAM_REJECTED/UPSTREAM_RATE_LIMITED。不返回密钥、密文、上游 ID、签名 URL 或供应商原始响应。
 
@@ -142,7 +142,7 @@
 
 错误：有未删除素材 409 RESOURCE_IN_USE；在途创建/操作/组租约 409 MATERIAL_BUSY；其他同素材删除与共同约定。
 
-副作用：local 仅留本地墓碑；upstream 在持久意图后核验单资源权限并调用 DeleteAssetGroup，成功时同事务提交实体与操作终态。无隐式级联，不删除 COS，不把删组解释成撤销真人授权。
+副作用：local 仅留本地墓碑；upstream 在持久意图后核验单资源权限并调用 DeleteAssetGroup，成功时同事务提交实体与操作终态。无隐式级联，不删除 COS。真人授权的撤销需要通过第三方平台实际提供的渠道单独办理。
 
 ## GET /api/v1/materials/operations/{id}
 
@@ -166,7 +166,7 @@
 
 错误：配置未启用 404；供应商拒绝 409 PROVIDER_UNAVAILABLE；其余见共同约定。创建已发后超时/PG 失败保留 unknown，无自动第二次 Create；若有效返回证明已获得，fallback 保存原会话可恢复密文，fallback 同样失败或未得 token 则人工核对，不伪造恢复。
 
-副作用：先持久 creating 意图与 owner/凭据版本/固定协议/20 分钟期限，再单次 CreateVisualValidateSession。会话独立于 operations 表；H5Link 与 BytedToken 用 provider 同部署主密钥 AES-256-GCM 五元组加密，AAD 固定材料会话用途+owner/session/keyId，与旧凭据用途隔离；另保留 SHA-256 token_digest。返回/日志不含远端 URL、token、密文或 PII，不创建真人组直到服务端复核通过。
+副作用：先持久 creating 意图与 owner/凭据版本/固定协议/20 分钟期限，再单次 CreateVisualValidateSession。会话独立于 operations 表；H5Link 与 BytedToken 用 provider 同部署主密钥 AES-256-GCM 五元组加密，AAD 固定材料会话用途+owner/session/keyId，与旧凭据用途隔离；另保留 SHA-256 token_digest。经校验的上游 RequestId 仅在会话表用于单次动作审计，会话仍以本地 id 和原 token 摘要关联。返回/日志不含远端 URL、token、密文或 PII，不创建真人组直到服务端复核通过。
 
 ## GET /api/v1/materials/auth-sessions/{id}
 
@@ -178,7 +178,7 @@
 
 错误：他人会话统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
-副作用：只读本地事实并收敛到期/失效 creating/verifying 租约，不解密、不联网。逻辑有效期固定创建后 20 分钟，访问到期即转 expired 并清五元组；健康后台启动及每 30 秒最多清理 100 条到期记录，不承诺故障/积压情况下密文同毫秒销毁。completed 保留脱敏结果/映射与 replay 所需 digest，完成事务立即清密文。
+副作用：只读本地事实并收敛到期/失效 creating/verifying 租约，不解密、不联网。逻辑有效期固定创建后 20 分钟，访问到期即转 expired 并清五元组；素材服务启动及健康运行时每 30 秒最多清理 100 条到期记录。停机期间的后台清理顺延至服务恢复。completed 保留脱敏结果/映射与 replay 所需 digest，完成事务立即清密文。
 
 ## POST /api/v1/materials/auth-sessions/{id}/refresh
 
@@ -208,10 +208,10 @@
 
 身份：公开手机 GET 回跳，仅精确此路径；当前无 HMAC 协议，不信任 resultCode 本身。
 
-输入：严格单值 `bytedToken`（16–512 非控制/空白字符）和可选数字 `resultCode`；query 总路径不超过 8192 字符，拒绝未知/重复参数。首期字段来自已知旧协议候选，实际手机回跳与 GetVisualValidateResult 精确字段仍需真机验证；不接受客户端 GroupId/状态。
+输入：仅读取必传单值 `bytedToken`（16–512 非控制/空白字符）和可选单值 `resultCode`（1–10 位十进制数字），任一重复即拒绝。含查询串的请求路径不超过 8192 字符。忽略供应商随手机回跳附带的其他参数，包括客户端附带的身份、目标、GroupId 或状态。
 
 成功：200 脱敏固定 HTML；服务端将 supplied token 的 SHA-256 与原会话 digest 常量时间比较，再持久认领会话、用存储的原 token 与 owner 当前启用凭据单次 GetVisualValidateResult，要求合法 GroupId 并经单资源 GetAssetGroup 确认为 LivenessFace，方在同 PG 事务原子新建本人 verified 真人组、完成会话并立即清五元组。completed 合法重放返回原成功，不再查询或造组；固定返回链接 `/materials`。
 
-错误：错误/跨会话 token 400 AUTH_PROOF_INVALID，negative resultCode 400 AUTH_RESULT_UNCONFIRMED，不消耗查询预算或终止合法 pending；到期 410。公开槽上限 4、同会话 3 秒持久冷却/60 秒租约、会话生存期最多 8 次验证 claim；在途/冷却/预算耗尽 429 AUTH_QUERY_LIMITED/Retry-After:3，unknown 不被伪造为 failed。403/404/未知响应/组类型不符/跨 owner 上游 ID 碰撞保留 unknown 与脱敏错误，不拒绝整个 provider、不绑定他人组。
+错误：错误/跨会话 token 400 AUTH_PROOF_INVALID；请求路径超长、支持字段重复或 resultCode 格式无效 400 AUTH_QUERY_INVALID；未完成会话收到非 `10000` 的 resultCode 返回 400 AUTH_RESULT_UNCONFIRMED，保留原会话和查询预算；到期 410。公开槽上限 4、同会话 3 秒持久冷却/60 秒租约、会话生存期最多 8 次验证 claim；在途/冷却/预算耗尽 429 AUTH_QUERY_LIMITED/Retry-After:3，unknown 不被伪造为 failed。403/404/未知响应/组类型不符/跨 owner 上游 ID 碰撞保留 unknown 与脱敏错误，不拒绝整个 provider、不绑定他人组。
 
-副作用：验证出站/结果写入按原会话身份、owner、token digest、clock_timestamp 租约和到期 CAS；迟到结果不能覆盖新终态，实体与完成/清密文在同事务提交。Create 与 callback 不双写 operations；无 token 的 unknown 不自动重建。错误 HTML 与日志不回显 query/token/远端原文，所有响应 no-store/no-referrer；真实授权页面/本人扫码/HTTPS 可达与平台字段未取得前保持业务验收 pending。
+副作用：验证出站/结果写入按原会话身份、owner、token digest、clock_timestamp 租约和到期 CAS；迟到结果不能覆盖新终态，实体与完成/清密文在同事务提交。会话审计保留查询结果、核验组各自最近一次经校验的上游 RequestId，覆盖仍有有效会话认领的失败回退。Create 与 callback 不双写 operations；无 token 的 unknown 不自动重建。错误 HTML 与日志不回显 query/token/远端原文，所有响应 no-store/no-referrer。业务验收须核对本人在公开 HTTPS 上从授权页到回跳、落库的完整链路。

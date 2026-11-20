@@ -24,6 +24,9 @@ export interface MaterialAuthRow {
   next_query_at: Date | null;
   query_count: number;
   error_code: string | null;
+  upstream_create_request_id: string | null;
+  upstream_result_request_id: string | null;
+  upstream_group_request_id: string | null;
   created_at: Date;
   updated_at: Date;
   expires_at: Date;
@@ -42,9 +45,13 @@ export interface MaterialAuthUpstream {
     key: string,
     callback: string,
     signal: AbortSignal,
-  ): Promise<{ launchUrl: string; token: string }>;
-  result(key: string, token: string, signal: AbortSignal): Promise<{ groupId: string }>;
-  verifiedGroup(key: string, id: string, signal: AbortSignal): Promise<void>;
+  ): Promise<{ launchUrl: string; token: string; requestId: string | null }>;
+  result(
+    key: string,
+    token: string,
+    signal: AbortSignal,
+  ): Promise<{ groupId: string; requestId: string | null }>;
+  verifiedGroup(key: string, id: string, signal: AbortSignal): Promise<string | null>;
 }
 export function materialAuthView(row: MaterialAuthRow, origin: string): MaterialAuthView {
   return {

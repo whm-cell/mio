@@ -55,7 +55,7 @@ const report: {
   proxyOrigin?: string;
   publicOrigin?: string;
   actions: Record<string, number>;
-  publicEvents: { kind: string; queryNames: string[] }[];
+  publicEvents: { kind: string; queryNames: string[]; statusCode?: number }[];
   observedResultFields?: Record<string, string>;
   observedGroupFields?: Record<string, string>;
   errorCode?: string;
@@ -132,11 +132,16 @@ try {
       raw.length <= 8192 &&
       report.publicEvents.length < 20
     ) {
-      report.publicEvents.push({
+      const event: (typeof report.publicEvents)[number] = {
         kind: path.endsWith('/launch') ? 'launch' : 'complete',
         queryNames: [...new URL(raw, 'http://mio.invalid').searchParams.keys()].map((name) =>
           ['bytedToken', 'resultCode'].includes(name) ? name : 'other',
         ),
+      };
+      report.publicEvents.push(event);
+      res.once('finish', () => {
+        event.statusCode = res.statusCode;
+        save();
       });
       save();
     }

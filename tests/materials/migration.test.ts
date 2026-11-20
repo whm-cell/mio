@@ -53,6 +53,12 @@ it('previews without writes, migrates explicitly and idempotently without modify
   expect(
     (await pool.query("SELECT to_regclass('mio_material_groups') AS value")).rows[0].value,
   ).toBeNull();
+  await pool.query(materialSchemaSQL);
+  const legacyStore = await createMaterialStore(db.url);
+  await legacyStore.close();
+  expect(
+    (await pool.query("SELECT to_regclass('mio_material_auth_sessions') AS value")).rows[0].value,
+  ).toBeNull();
   for (let i = 0; i < 2; i++) {
     const result = migrate(true);
     expect(result.status, result.stderr).toBe(0);

@@ -56,18 +56,12 @@ export function createMaterialAuthPublicHandler(service: MaterialAuthService) {
           response.writeHead(302, { location: target }).end();
           return true;
         }
-        if (
-          [...url.searchParams.keys()].some(
-            (key) =>
-              !['bytedToken', 'resultCode'].includes(key) ||
-              url.searchParams.getAll(key).length !== 1,
-          )
-        )
+        const [token, duplicateToken] = url.searchParams.getAll('bytedToken');
+        const [resultCode, duplicateResultCode] = url.searchParams.getAll('resultCode');
+        if (duplicateToken !== undefined || duplicateResultCode !== undefined)
           throw new MaterialError(400, 'AUTH_QUERY_INVALID');
-        const token = url.searchParams.get('bytedToken');
         if (!token || token.length < 16 || token.length > 512 || /[\x00-\x20\x7f]/.test(token))
           throw new MaterialError(400, 'AUTH_PROOF_INVALID');
-        const resultCode = url.searchParams.get('resultCode') ?? undefined;
         if (resultCode !== undefined && !/^[0-9]{1,10}$/.test(resultCode))
           throw new MaterialError(400, 'AUTH_QUERY_INVALID');
         const result = await service.complete(match[1], token, resultCode);

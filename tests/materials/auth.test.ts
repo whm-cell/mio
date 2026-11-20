@@ -160,6 +160,19 @@ it('verifies result and real group atomically, clears secrets immediately and re
     null,
   ]);
   expect(row.token_digest).not.toBeNull();
+  expect(row).toMatchObject({
+    upstream_create_request_id: expect.any(String),
+    upstream_result_request_id: expect.any(String),
+    upstream_group_request_id: expect.any(String),
+  });
+  expect(
+    new Set([
+      row.upstream_create_request_id,
+      row.upstream_result_request_id,
+      row.upstream_group_request_id,
+    ]).size,
+  ).toBe(3);
+  expect(JSON.stringify(result)).not.toContain(row.upstream_result_request_id);
   expect(await f.store.ownedGroup(f.actor.userId, result.groupId!)).toMatchObject({
     group_type: 'real',
     auth_status: 'verified',
@@ -206,7 +219,8 @@ it('retains known creation proof after PG failure for original-session launch/ca
   expect(p.result.launchUrl).toBe(`${f.origin}/api/v1/materials/auth-sessions/${p.row.id}/launch`);
   expect((await f.authentication.get(f.actor, p.row.id)).launchUrl).toBe(p.result.launchUrl);
   expect(p.row.ciphertext).not.toBeNull();
-  const recovered = await createMaterialAuthService(
+  expect(p.row.upstream_create_request_id).toEqual(expect.any(String));
+  const recovered = createMaterialAuthService(
     f.store.authentication,
     f.provider,
     createMaterialAuthUpstream(f.authTransport),
@@ -235,6 +249,7 @@ it('leaves lost-token create unknown and does not automatically re-create or for
   const request = randomUUID();
   const view = await f.authentication.create(f.actor, request, 'materials', 'materials');
   expect(view).toMatchObject({ state: 'unknown' });
+  expect((await f.store.authentication.get(view.sessionId)).upstream_create_request_id).toBeNull();
   expect(view).not.toHaveProperty('launchUrl');
   expect(await f.authentication.create(f.actor, request, 'materials', 'materials')).toEqual(view);
   await expect(f.authentication.launch(view.sessionId)).rejects.toMatchObject({
@@ -278,7 +293,21 @@ it('serializes concurrent callbacks and prevents an expired old verifier from ov
     ).rows[0].count,
   ).toBe('1');
 });
-it.each([403, 404, 'invalid', 'wrongtype'])(
+it('retains the upstream creation request ID from a known rejection without saving a token', async () => {
+  const f = await fixture();
+  f.authOverride(async (action) => envelope(action, {}, 403, 'Forbidden'));
+  const requestId = randomUUID();
+  const view = await f.authentication.create(f.actor, requestId, 'materials', 'materials');
+  expect(view).toMatchObject({ state: 'failed', errorCode: 'PROVIDER_RESOURCE_FORBIDDEN' });
+  const stored = await f.store.authentication.get(view.sessionId, f.actor.userId);
+  expect(stored).toMatchObject({
+    upstream_create_request_id: expect.any(String),
+    token_digest: null,
+  });
+  expect(stored.upstream_create_request_id).not.toBe(requestId);
+  expect(JSON.stringify(view)).not.toContain(stored.upstream_create_request_id);
+});
+it.each([403, 404, 'invalid', 'wrongtype', 'group-rejected', 'missing-request-id'])(
   'fails closed on result/group issue %s and keeps session recoverable',
   async (kind) => {
     const f = await fixture(),
@@ -288,12 +317,32 @@ it.each([403, 404, 'invalid', 'wrongtype'])(
         return envelope(action, {}, kind, kind === 404 ? 'ResourceNotFound' : 'Forbidden');
       if (action === 'GetVisualValidateResult' && kind === 'invalid')
         return envelope(action, { State: 'succeeded' });
+      if (action === 'GetVisualValidateResult' && kind === 'missing-request-id')
+        return Response.json(
+          {
+            ResponseMetadata: {
+              Action: action,
+              Service: 'ark',
+              Version: '2024-01-01',
+              Error: { Code: 'Forbidden' },
+            },
+          },
+          { status: 403 },
+        );
       if (action === 'GetAssetGroup' && kind === 'wrongtype')
         return envelope(action, { Id: f.tokens.get(p.token)!.group, GroupType: 'AIGC' });
+      if (action === 'GetAssetGroup' && kind === 'group-rejected')
+        return envelope(action, {}, 403, 'Forbidden');
       return;
     });
     await expect(f.authentication.complete(p.row.id, p.token, '10000')).rejects.toBeDefined();
-    expect((await f.store.authentication.get(p.row.id)).state).toBe('unknown');
+    expect(await f.store.authentication.get(p.row.id)).toMatchObject({
+      state: 'unknown',
+      upstream_result_request_id: ['invalid', 'missing-request-id'].includes(String(kind))
+        ? null
+        : expect.any(String),
+      upstream_group_request_id: kind === 'group-rejected' ? expect.any(String) : null,
+    });
     expect((await f.pool.query('SELECT count(*) FROM mio_material_groups')).rows[0].count).toBe(
       '0',
     );
@@ -320,7 +369,11 @@ it('never rebinds a completed session group ID already owned by another user', a
   await expect(f.authentication.complete(p.row.id, p.token, '10000')).rejects.toMatchObject({
     code: 'UPSTREAM_RESOURCE_COLLISION',
   });
-  expect((await f.store.authentication.get(p.row.id)).state).toBe('unknown');
+  expect(await f.store.authentication.get(p.row.id)).toMatchObject({
+    state: 'unknown',
+    upstream_result_request_id: expect.any(String),
+    upstream_group_request_id: expect.any(String),
+  });
   expect(
     (
       await f.pool.query(
@@ -330,6 +383,28 @@ it('never rebinds a completed session group ID already owned by another user', a
     ).rows,
   ).toEqual([{ owner_id: 'other-owner', group_type: 'aigc' }]);
 });
+it('omits malformed or secret-like request metadata from the durable authentication audit', async () => {
+  const f = await fixture(),
+    p = await pending(f);
+  const { group } = f.tokens.get(p.token)!;
+  f.authOverride(async (action) => {
+    const isResult = action === 'GetVisualValidateResult';
+    const response = envelope(
+      action,
+      isResult ? { GroupId: group } : { Id: group, GroupType: 'LivenessFace' },
+    );
+    const payload = (await response.json()) as { ResponseMetadata: { RequestId: string } };
+    payload.ResponseMetadata.RequestId = isResult ? p.token : 'https://example.test/?opaque=secret';
+    return Response.json(payload);
+  });
+  expect(await f.authentication.complete(p.row.id, p.token, '10000')).toMatchObject({
+    state: 'completed',
+  });
+  expect(await f.store.authentication.get(p.row.id)).toMatchObject({
+    upstream_result_request_id: null,
+    upstream_group_request_id: null,
+  });
+});
 it('persists verification query budget across service restart and leaves budget exhaustion unknown without remote replay', async () => {
   const f = await fixture(),
     p = await pending(f);
@@ -337,7 +412,7 @@ it('persists verification query budget across service restart and leaves budget 
     "UPDATE mio_material_auth_sessions SET query_count=8,state='unknown' WHERE id=$1",
     [p.row.id],
   );
-  const recovered = await createMaterialAuthService(
+  const recovered = createMaterialAuthService(
     f.store.authentication,
     f.provider,
     createMaterialAuthUpstream(f.authTransport),
@@ -470,7 +545,7 @@ it('recovers after the phone callback page was closed using only the original ow
     p.row.id,
   ]);
   await f.authentication.close();
-  const restarted = await createMaterialAuthService(
+  const restarted = createMaterialAuthService(
     f.store.authentication,
     f.provider,
     createMaterialAuthUpstream(f.authTransport),

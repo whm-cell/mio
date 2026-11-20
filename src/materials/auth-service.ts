@@ -18,8 +18,11 @@ const code = (error: unknown) =>
   error instanceof MaterialError || error instanceof ProviderError
     ? error.code
     : 'UPSTREAM_RESULT_UNKNOWN';
+function auditRequestId(id: string | null, token?: string): string | null {
+  return id && /^[A-Za-z0-9._-]{1,256}$/.test(id) && id !== token ? id : null;
+}
 /** Persistent sessions are the sole auth authority. No operations row, automatic create retry or token logging. */
-export async function createMaterialAuthService(
+export function createMaterialAuthService(
   store: MaterialAuthStore,
   credentials: Credentials,
   upstream: MaterialAuthUpstream,
@@ -39,22 +42,6 @@ export async function createMaterialAuthService(
     );
     return action;
   };
-  await store.expire();
-  let cleaning = false;
-  const cleanup = () => {
-    if (stopping || cleaning) return;
-    cleaning = true;
-    const action = store.expire().finally(() => {
-      cleaning = false;
-    });
-    active.add(action);
-    void action.then(
-      () => active.delete(action),
-      () => active.delete(action),
-    );
-  };
-  const timer = setInterval(cleanup, 30_000);
-  timer.unref();
   const view = (row: MaterialAuthRow) => materialAuthView(row, origin);
   const verify = async (row: MaterialAuthRow) => {
     if (row.state === 'completed') return view(row);
@@ -66,6 +53,9 @@ export async function createMaterialAuthService(
       if (current.state === 'completed') return view(current);
       throw new MaterialError(429, 'AUTH_QUERY_LIMITED');
     }
+    let token: string | undefined;
+    let resultRequestId: string | null = null;
+    let groupRequestId: string | null = null;
     try {
       const remote = credentials.openMaterialAuth(
         claimed.owner_id,
@@ -74,15 +64,25 @@ export async function createMaterialAuthService(
       );
       if (digest(remote.token) !== claimed.token_digest)
         throw new MaterialError(503, 'MATERIAL_AUTH_SECRET_UNAVAILABLE');
+      token = remote.token;
       const snapshot = await credentials.snapshotAccount(claimed.owner_id);
       stop.signal.throwIfAborted();
       const key = credentials.openAccountSnapshot(claimed.owner_id, snapshot);
-      const result = await upstream.result(key, remote.token, stop.signal);
-      await upstream.verifiedGroup(key, result.groupId, stop.signal);
+      const result = await upstream.result(key, token, stop.signal);
+      resultRequestId = auditRequestId(result.requestId, token);
+      const groupAuditId = await upstream.verifiedGroup(key, result.groupId, stop.signal);
+      groupRequestId = auditRequestId(groupAuditId, token);
       stop.signal.throwIfAborted();
-      return view(await store.complete(claimed, result.groupId));
+      return view(await store.complete(claimed, result.groupId, resultRequestId, groupRequestId));
     } catch (error) {
-      await store.verificationFailed(claimed, code(error)).catch(() => {});
+      if (error instanceof MaterialUpstreamError && error.request) {
+        const id = auditRequestId(error.request.id, token);
+        if (error.request.action === 'GetVisualValidateResult') resultRequestId = id;
+        if (error.request.action === 'GetAssetGroup') groupRequestId = id;
+      }
+      await store
+        .verificationFailed(claimed, code(error), resultRequestId, groupRequestId)
+        .catch(() => {});
       throw error;
     }
   };
@@ -102,27 +102,42 @@ export async function createMaterialAuthService(
         if (!fresh) return view(await store.get(session.id, actor.userId));
         let attempted = false,
           returned = false;
-        let known: Parameters<MaterialAuthStore['createFailed']>[3];
+        let createAuditId: string | null = null;
+        let known: Parameters<MaterialAuthStore['createFailed']>[4];
         try {
           stop.signal.throwIfAborted();
           const key = credentials.openAccountSnapshot(actor.userId, snapshot);
           const callback = `${origin}/api/v1/materials/auth-sessions/${session.id}/complete`;
           attempted = true;
-          const remote = await upstream.create(key, callback, stop.signal);
+          const {
+            launchUrl,
+            token,
+            requestId: upstreamRequestId,
+          } = await upstream.create(key, callback, stop.signal);
           returned = true;
+          createAuditId = auditRequestId(upstreamRequestId, token);
           known = {
-            envelope: credentials.sealMaterialAuth(actor.userId, session.id, remote),
-            digest: digest(remote.token),
+            envelope: credentials.sealMaterialAuth(actor.userId, session.id, {
+              launchUrl,
+              token,
+            }),
+            digest: digest(token),
           };
           stop.signal.throwIfAborted();
-          await store.created(session, known.envelope, known.digest);
+          await store.created(session, known.envelope, known.digest, createAuditId);
         } catch (error) {
+          if (
+            error instanceof MaterialUpstreamError &&
+            error.request?.action === 'CreateVisualValidateSession'
+          )
+            createAuditId = auditRequestId(error.request.id);
           await store
             .createFailed(
               session,
               returned ||
                 (attempted && (!(error instanceof MaterialUpstreamError) || error.uncertain)),
               code(error),
+              createAuditId,
               known,
             )
             .catch(() => {});
@@ -178,7 +193,6 @@ export async function createMaterialAuthService(
     close(): Promise<void> {
       if (closing) return closing;
       stopping = true;
-      clearInterval(timer);
       closing = (async () => {
         const deadline = setTimeout(() => stop.abort(), 5000);
         try {
@@ -191,4 +205,4 @@ export async function createMaterialAuthService(
     },
   };
 }
-export type MaterialAuthService = Awaited<ReturnType<typeof createMaterialAuthService>>;
+export type MaterialAuthService = ReturnType<typeof createMaterialAuthService>;

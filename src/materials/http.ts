@@ -50,7 +50,7 @@ function revision(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0 && Number(value) < 2147483647;
 }
 
-/** Unit 1 exposes only authenticated account endpoints; no public callback bypass exists yet. */
+/** Authenticated material routes share this entry with the exact public mobile paths. */
 export function createMaterialHandler(
   service: MaterialService,
   identity: (headers: Headers) => Promise<MaterialPrincipal | null>,
@@ -65,7 +65,8 @@ export function createMaterialHandler(
     if (publicHandler && (await publicHandler(request, response))) return;
     const requestId = startHttpResponse(response);
     const fail = (status: number, code: string) => {
-      if (status === 429) response.setHeader('retry-after', '4');
+      if (status === 429)
+        response.setHeader('retry-after', code === 'AUTH_QUERY_LIMITED' ? '3' : '4');
       return writeApiError(
         response,
         status,

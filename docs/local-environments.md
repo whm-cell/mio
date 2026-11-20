@@ -56,7 +56,7 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 素材管理显式设置 `MIO_MATERIALS_ENABLED=true` 后启用，沿现有认证、供应商与媒体数据库配置；先 `pnpm migrate:dev assets --apply`，再 `pnpm migrate:dev materials --apply`（test 对应 test）。新增三表保留既有资产，启动仅检查，不自动迁移、枚举上游组或重发 unknown 创建。配置和 HTTP 见[素材契约](apis/materials.md)。Unit 1 不需要模型/default/目录资格，图片登记、真人认证及视频引用随后续单元接入。
 
-真人认证额外配置 `MIO_MATERIALS_PUBLIC_BASE_URL=https://实际可达的本候选入口`，不能因 `.env` 的 `MIO_AUTH_BASE_URL` 指向既有域名就复用该生产回调。先显式 `pnpm migrate:dev materials --apply` 增加 auth_sessions，启动仅检查；缺省此变量保持 Unit 1/2 功能且不暴露认证入口。手机必须访问该公开 HTTPS origin 下的精确 launch/complete，隧道/代理选择及真实权限由具体现场核对，不改其他人的 DNS/代理；本机先用协议替身完成隔离回归，真实 Create 与本人扫码待具体 UI/HTTPS 路线被解锁。20 分钟逻辑到期，访问即时清密文，健康后台每 30 秒有界清理 100 条；不可把后台故障期间的延迟说成即时销毁。
+真人认证额外配置 `MIO_MATERIALS_PUBLIC_BASE_URL=https://实际可达的本候选入口`，不能因 `.env` 的 `MIO_AUTH_BASE_URL` 指向既有域名就复用该生产回调。先显式 `pnpm migrate:dev materials --apply` 增加 auth_sessions 及审计列，启动只读检查结构；缺省此变量保持 Unit 1/2 功能且不暴露认证入口。手机必须访问该公开 HTTPS origin 下的精确 launch/complete，隧道/代理选择及真实权限由具体现场核对，不改其他人的 DNS/代理；本机先用协议替身完成隔离回归，真人验收需使用可达的 HTTPS 路线并由本人同意和扫码。20 分钟逻辑到期，访问即时清密文。已有会话表时，即使撤下公开配置，素材服务启动及健康运行期间每 30 秒仍分批清理，每批最多 100 条。整个素材服务停机期间的后台清理顺延至恢复运行。
 
 ## 常驻 dev 的 OneLink 与对话
 

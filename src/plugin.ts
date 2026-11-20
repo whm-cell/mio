@@ -266,10 +266,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         Boolean(materialAuthConfig),
       );
       let acquired: MaterialService | undefined;
-      let authentication: Awaited<ReturnType<typeof createMaterialAuthService>> | undefined;
+      let authentication: ReturnType<typeof createMaterialAuthService> | undefined;
       try {
         if (materialAuthConfig)
-          authentication = await createMaterialAuthService(
+          authentication = createMaterialAuthService(
             store.authentication,
             providers,
             createMaterialAuthUpstream(),

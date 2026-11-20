@@ -8,9 +8,16 @@ import type { ModelTransport } from './models.ts';
 /** An uncertain mutation must never be automatically submitted again. */
 export class MaterialUpstreamError extends MaterialError {
   readonly uncertain: boolean;
-  constructor(status: number, code: string, uncertain = false) {
+  readonly request: { action: string; id: string } | undefined;
+  constructor(
+    status: number,
+    code: string,
+    uncertain = false,
+    request?: { action: string; id: string },
+  ) {
     super(status, code);
     this.uncertain = uncertain;
+    this.request = request;
   }
 }
 const groupId = /^group-[0-9]{14}-[a-zA-Z0-9]{5}$/;
@@ -113,12 +120,32 @@ function materialCall(transport: ModelTransport) {
         metadata.Service !== 'ark'
       )
         return invalid();
+      const requestId =
+        typeof metadata.RequestId === 'string' &&
+        metadata.RequestId.length <= 256 &&
+        !/[\x00-\x1f\x7f]/.test(metadata.RequestId)
+          ? metadata.RequestId
+          : null;
       if (!response.ok || metadata.Error) {
         const error = record(metadata.Error) ? metadata.Error : undefined;
+        const request =
+          requestId && typeof error?.Code === 'string' && /^[A-Za-z0-9._-]{1,100}$/.test(error.Code)
+            ? { action, id: requestId }
+            : undefined;
         if (response.status === 403)
-          throw new MaterialUpstreamError(HTTP_STATUS.FORBIDDEN, 'PROVIDER_RESOURCE_FORBIDDEN');
+          throw new MaterialUpstreamError(
+            HTTP_STATUS.FORBIDDEN,
+            'PROVIDER_RESOURCE_FORBIDDEN',
+            false,
+            request,
+          );
         if (response.status === 404 && error?.Code === 'ResourceNotFound')
-          throw new MaterialUpstreamError(HTTP_STATUS.NOT_FOUND, 'UPSTREAM_RESOURCE_NOT_FOUND');
+          throw new MaterialUpstreamError(
+            HTTP_STATUS.NOT_FOUND,
+            'UPSTREAM_RESOURCE_NOT_FOUND',
+            false,
+            request,
+          );
         throw new MaterialUpstreamError(
           HTTP_STATUS.SERVICE_UNAVAILABLE,
           response.status === 429
@@ -127,15 +154,10 @@ function materialCall(transport: ModelTransport) {
               ? 'PROVIDER_UNAVAILABLE'
               : 'UPSTREAM_REJECTED',
           response.status >= 500,
+          request,
         );
       }
       if (!record(body.Result)) return invalid();
-      const requestId =
-        typeof metadata.RequestId === 'string' &&
-        metadata.RequestId.length <= 256 &&
-        !/[\x00-\x1f\x7f]/.test(metadata.RequestId)
-          ? metadata.RequestId
-          : null;
       return { result: body.Result, requestId };
     } catch (error) {
       if (error instanceof MaterialUpstreamError) throw error;
@@ -264,17 +286,18 @@ export function createMaterialAuthUpstream(
         returned.searchParams.get('redirect_url') !== callback
       )
         return invalid();
-      return { launchUrl: H5Link, token: BytedToken };
+      return { launchUrl: H5Link, token: BytedToken, requestId: value.requestId };
     },
     async result(key, token, signal) {
       const value = await call('GetVisualValidateResult', key, { BytedToken: token }, signal);
       if (typeof value.result.GroupId !== 'string' || !groupId.test(value.result.GroupId))
         return invalid();
-      return { groupId: value.result.GroupId };
+      return { groupId: value.result.GroupId, requestId: value.requestId };
     },
     async verifiedGroup(key, id, signal) {
       const value = await call('GetAssetGroup', key, { Id: id }, signal);
       if (value.result.Id !== id || value.result.GroupType !== 'LivenessFace') return invalid();
+      return value.requestId;
     },
   };
 }

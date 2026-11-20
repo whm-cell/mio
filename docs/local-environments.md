@@ -132,10 +132,14 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号，并在结束后清理本轮键。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。RabbitMQ 集成测试动态创建并清理独立临时 vhost 与账号。
 
-区分**破坏性自动化回归**与**获授权的本地真实业务／模型验收**：
+区分**常规自动化回归**、**开发推进／协议摸底与本地真实业务验收**和**破坏性故障演练**：
 
-- **自动化确定性回归（Vitest）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，使用常驻服务的隔离通道（`mio_regression_test` 随机 schema、`~mio:regtest-*:*` 前缀、临时 vhost）或独立临时夹具，严禁读写 `mio_dev` 业务表、`mio:dev:*` 键或 `mio-dev` 业务队列。
-- **获授权的本地真实业务／模型验收（含 `*-live.ts` 验收脚本）**：统一直接读写常驻 `mio_dev`（`.env` + `mio_dev` + `mio-dev` Redis/MQ + `.runtime/dev/{dsh,compute}`）并保留测试数据——`providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及 `live-image-loop.ts dev` 模式均先对 `mio_dev` 执行增量迁移，再复用既有账号／凭据或保留的测试账号完成真实业务验证，不再新建即用即删的隔离库，使生成的路由、会话、资产与验证记录直接留在 `mio_dev` 中可查可用。
+- **常规自动化回归（`pnpm test`、`pnpm check` 与 CI）**：覆盖空库首迁、旧结构升级、破坏约束与故障注入，严格使用常驻服务的隔离通道（`mio_regression_test` 随机 schema、`~mio:regtest-*:*` 前缀、临时 vhost 与协议替身）或独立临时夹具，严禁读写 `mio_dev` 业务表与凭据、`mio:dev:*` 键或 `mio-dev` 业务队列，也不因本机存在凭据而自动联网。
+- **开发推进、协议摸底与本地真实业务验收（默认放行常驻 `mio_dev`）**：当用户指示推进功能开发、协议摸底（如 Pre-C1）或业务验收时，默认允许直接使用常驻 `mio_dev`（`.env`、已加密落库的供应商凭据、私有测试 COS、`mio_dev` PG、`mio-dev` Redis/MQ 与 `.runtime/dev/{dsh,compute}`）执行单次有界、最小规格的真实外部调用与非破坏增量迁移并保留数据，Agent 无需为读取 `mio_dev` 既有凭据再停下二次索要账号或调用口令。`providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及 `live-image-loop.ts dev` 模式均先对 `mio_dev` 执行增量迁移，再复用既有账号／凭据或保留的测试账号完成真实业务验证，不再新建即用即删的隔离库，使生成的路由、会话、资产与验证记录直接留在 `mio_dev` 中可查可用。独立 `*-live.ts`／`*-probe.ts` 脚本的显式环境变量开关（如 `MIO_RUN_COS_PROBE=yes`、`MIO_RUN_LIVE_IMAGE=yes`）保留，用作防止普通测试误触发的脚本安全阀，不再解释为需要向用户二次讨口令。
+- **三条核心安全底线**：
+  - **常规自动化回归离线隔离**：`pnpm test`、`pnpm check` 与 CI 仍严格走隔离通道与协议替身，严禁读取 `mio_dev` 凭据或自动联网；`*-live.ts`／`*-probe.ts` 的环境变量开关继续作为防误触发安全阀。
+  - **只读与纯文档不联网**：纯讨论、只读审阅或纯文档编制任务不触发真实外部调用。
+  - **单次有界与高敏例外**：真实外部调用须保持单次有界与最小规格，禁止自动无限重试（保留单次生成 POST 审计等防失控机制）；若传入新 `apiKey` 覆盖既有用户凭据、改写影响他人的全局路由、发送真实扣费手机短信、采集需本人扫码配合的真人生物识别信息或执行大额批量付费生成，仍须最小必要触发或由用户明确指定／配合。
 - **破坏性中间件／重放故障演练**：如强杀在途执行器与故障重放（使用隔离 generation 场景；旧 `live-image-loop.ts prepare/execute` 已退役）、容器停启探针（`local-environments-live.ts`、`local-brokers-live.ts`）或队列容量告警探针（`live-compute-queue-probe.ts`），因会中断在途进程或触发容器级告警，仍按场景使用显式隔离现场。
 
 Redis 故障测试保留独占夹具，不能对常驻 Redis 执行 OOM、淘汰策略修改或停机。CI 不读取私有环境文件，使用相同 PostgreSQL 镜像版本。改变常驻配置后须重新核对外部条件和实际行为，不能直接复用旧环境的验证结论。
@@ -156,4 +160,4 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 
 预检不停止进程、不消费/清空队列、不接受或重跑任务。操作者逐项处理阻断并确认旧进程已不再发送生成 POST 后，才启动 A 图片执行器。新链路及历史读取验证后恢复接单，再退役图片专用队列和 RSA 密钥；视频队列、B 重媒体 journal、历史任务表及旧恢复原件保留。A 尚无新任务时可回旧版本；存在 A 新任务时先对账，不把任务交旧 B 重跑。
 
-新的 `live-image-loop.ts dev` 只启动 A，并在进程中安装单次生成 POST 审计；入口不配置 RabbitMQ 或启动 B，继续走正式登录、目录刷新、图片 HTTP、资产下载、重启和幂等读取。真实供应商验收仍需明确 opt-in、干净候选和当前授权的登录/Key 文件；未执行不算通过。该入口保留新建测试用户、业务任务、COS 产物及私有审计证据。
+新的 `live-image-loop.ts dev` 只启动 A，并在进程中安装单次生成 POST 审计；入口不配置 RabbitMQ 或启动 B，继续走正式登录、目录刷新、图片 HTTP、资产下载、重启和幂等读取。用户指示推进开发或验收时，默认允许复用常驻 `mio_dev` 既有账号／凭据与私有测试 COS 执行单次有界、最小规格的真实供应商验收（脚本的 `MIO_RUN_LIVE_IMAGE=yes` 环境变量保留为防普通测试误触发的脚本安全阀，不再要求为此二次索要口令），正式验收取证仍须基于干净候选且未执行不算通过；若传入新 `apiKey` 覆盖既有凭据或改写影响他人的全局路由，仍须最小必要触发或由用户明确指定。该入口保留测试用户、业务任务、COS 产物及私有审计证据。

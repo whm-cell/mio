@@ -8,7 +8,7 @@
 
 本地使用 `pnpm test <测试文件或业务子目录>`，可提供多个范围，例如 `pnpm test tests/auth tests/environment/local-environment.test.ts`；`compute/tests` 也是有效范围。每个范围必须命中配置发现的测试文件，仓库根、`tests` 总目录和越界路径不接受。支持用例名称、报告等常用 Vitest 选项，不允许通过选项改写文件发现。`pnpm test <范围>` 与 `pnpm check:local <范围>` 分别探测 PostgreSQL 和 Redis 的隔离通道，每项优先复用 `mio-dev`，其次 `mio-test`。没有针对该服务的配置或端口不可达时，由用例启动隔离临时进程。显式运行 `node scripts/service/local.ts <dev|test> check <范围>` 时只探测选定环境，已有配置不合规时会报错。
 
-PostgreSQL 复用 `mio_regression_test` 随机 schema（既有卷首次执行 `pnpm env:init && pnpm regression:init:dev`）。Redis 常规限流回归复用 `~mio:regtest-*:*` 前缀账号并自动清理，全局 OOM／停机故障用例自动识别 `.runtime/redis-build` 临时进程。RabbitMQ 集成测试自动创建并清理临时 vhost。完整 `pnpm check` 由 GitHub Actions 执行。
+PostgreSQL 复用 `mio_regression_test` 随机 schema（既有卷首次执行 `pnpm env:init && pnpm regression:init:dev`）。Redis 常规限流回归复用 `~mio:regtest-*:*` 前缀账号并自动清理，全局 OOM／停机故障用例自动识别 `.runtime/redis-build` 临时进程。RabbitMQ 集成测试自动创建并清理临时 vhost。常规自动化回归（`pnpm test`、`pnpm check` 与 CI）严格保持离线隔离，严禁读取 `mio_dev` 凭据或自动联网；完整 `pnpm check` 由 GitHub Actions 执行。
 
 本地连续验证多个打包 Profile 时，可沿现有 `MIO_TEST_PACKED_ARCHIVE` 约定对当前候选只构建、打包一次，再为本批显式选定的测试提供绝对路径：
 
@@ -40,9 +40,9 @@ MIO_TEST_PACKED_ARCHIVE="$PWD/.work/packed-test/mio-plugin-0.1.0.tgz" pnpm test 
 
 名称模式只用于定位。文件发现以 [Vitest 配置](../../vitest.config.ts)和实际文件为准，例如 `rg --files tests compute/tests -g '*.test.ts'`；同域新增测试不逐个登记，未知或未匹配文件保持待判断。新增能力只补对应入口；PRD 迁移追查身份、链接和交付，不按目录名重新分配运行时测试。
 
-共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。获授权的本地真实业务与模型验收（含 `providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及下述图片 `dev` 模式）默认直接读写[常驻 mio_dev 环境](../local-environments.md#自动化回归与人工数据)并保留数据；发现入口不等于授权执行。
+共享影响还包括非 import 关系：CLI 由子进程执行，测试可能读取文档、模板、配置或构建产物；辅助文件与共享 fixture 也须追查消费者。[provider setup](../../tests/providers-setup.ts)全局加载，不能按文件名限定为供应商域。公共 setup、依赖或测试配置改变时重新判断全部消费者与原覆盖依据。当用户指示推进功能开发、协议摸底（如 Pre-C1）或业务验收时，默认放行使用[常驻 `mio_dev` 环境](../local-environments.md#自动化回归与人工数据)（`.env`、已加密落库的供应商凭据与私有测试 COS）执行单次有界、最小规格的真实验证与非破坏增量迁移并保留数据（含 `providers-live.ts`、`conversations-live.ts`、`live-cos-probe.ts` 及下述图片 `dev` 模式），无需再为读取 `mio_dev` 既有凭据二次索要口令；独立 `*-live.ts`／`*-probe.ts` 脚本的显式环境变量开关（如 `MIO_RUN_COS_PROBE=yes`、`MIO_RUN_LIVE_IMAGE=yes`）保留为防普通测试误触发的脚本安全阀。纯讨论、只读审阅或纯文档编制任务不触发真实外部调用；常规 `pnpm test`、`pnpm check` 与 CI 仍严格走离线隔离通道与协议替身，严禁读取 `mio_dev` 凭据或自动联网。
 
-已授权的图片真实闭环使用 `dev` 模式，直接增量迁移并读写常驻开发环境（认证与供应商使用配置的 `mio_dev`，媒体任务和资产使用实际 `MIO_ASSETS_DATABASE_URL`，可为独立分域库），保留生成的资产、任务与路由：
+推进图片开发或验收时的真实闭环使用 `dev` 模式，默认可直接增量迁移并读写常驻开发环境（认证与供应商使用配置的 `mio_dev`，媒体任务和资产使用实际 `MIO_ASSETS_DATABASE_URL`，可为独立分域库），保留生成的资产、任务与路由（`MIO_RUN_LIVE_IMAGE=yes` 保留为防普通测试误触发的脚本安全阀）：
 
 ```sh
 MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>] dev <.runtime/run-dir> <login-or-key-file> <task-id>
@@ -50,9 +50,9 @@ MIO_RUN_LIVE_IMAGE=yes node tests/compute/live-image-loop.ts [--scenario <name>]
 
 入口只启动 A，显式启用图片生成并指定本环境的专属持久目录，不配置 RabbitMQ 或启动 B。旧 `prepare`／`execute` 阶段已退役，调用会拒绝；已有私人原件保持历史身份，不自动恢复或冒充 A 的当前证据。提交意图、落盘与 PG 检查点、COS 故障等恢复边界由 `tests/generations/` 在隔离回归通道注入故障验证。
 
-任务须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`。入口核对同一 task ID、`{commit, contractRevision}`、干净工作区与实际运行产物摘要；实际执行仍须核对场景、环境、凭据和费用授权。
+正式验收取证须已 sync 到干净提交并处于 `C1_EVIDENCE_PENDING`。入口核对同一 task ID、`{commit, contractRevision}`、干净工作区与实际运行产物摘要；推进开发或验收时默认可复用常驻 `mio_dev` 既有凭据与私有测试 COS 执行单次有界、最小规格验证，无需再二次索要调用口令，但禁止自动无限重试，且涉及新 `apiKey` 覆盖、共享全局路由改写、真实扣费短信、需本人扫码配合的真人生物识别或大额批量付费生成等高敏操作仍须最小必要触发或由用户明确指定／配合。
 
-`dev` 使用已有登录 JSON（`email`、`password`，可选 `apiKey`）可复用账号；若输入原始 Key，则创建保留的专用账号并在本次私有运行目录的 `owner-login.json`（仅文件所有者可读写）保存登录信息，不保存 Key。登录文件包含 `apiKey` 时入口会保存并轮换该账号的供应商凭据；导入与现有声明不同的全局模型路由也会影响其他用户。执行前须核对账号、凭据及现有全局路由，确认这些写入符合本次授权。运行目录和登录文件不得提交或输出。旧链路切换前的任务、消息、journal 与上传身份盘点沿[迁移与切换](../local-environments.md#图片生成迁移与切换)执行；该 live 入口不代替切换预检或旧执行器停机确认。
+`dev` 使用已有登录 JSON（`email`、`password`，可选 `apiKey`）可复用账号；若输入原始 Key，则创建保留的专用账号并在本次私有运行目录的 `owner-login.json`（仅文件所有者可读写）保存登录信息，不保存 Key。复用既有 `mio_dev` 账号与已落库凭据且不改写他人共享路由时默认放行；但登录文件包含新 `apiKey` 时入口会保存并轮换该账号的供应商凭据，导入与现有声明不同的全局模型路由也会影响其他用户，这两类高敏写入仍须先核对范围并最小必要触发或由用户明确指定。运行目录和登录文件不得提交或输出。旧链路切换前的任务、消息、journal 与上传身份盘点沿[迁移与切换](../local-environments.md#图片生成迁移与切换)执行；该 live 入口不代替切换预检或旧执行器停机确认。
 
 A 进程内的单次生成 POST 审计保留跨重启标记，不以重新运行或新 requestId 重发未知任务。异步查询只放行与本次提交后 PG 持久化的上游任务身份一致的请求，最多八次，受持久化的 600 秒绝对期限和命令期限约束；观察可等待已发起操作的下载与 COS 物化结束，不延长上游查询期限。超过观察上界保留现场并记为未验证，不承诺覆盖任意故障。完成后重启 A，检查相同 requestId 的 HTTP 幂等、历史与资产下载；这不代表已完成真实强杀、旧 MQ 重放、B 并行资源或生产验收。
 

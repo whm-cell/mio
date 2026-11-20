@@ -394,7 +394,9 @@ it('omits malformed or secret-like request metadata from the durable authenticat
       isResult ? { GroupId: group } : { Id: group, GroupType: 'LivenessFace' },
     );
     const payload = (await response.json()) as { ResponseMetadata: { RequestId: string } };
-    payload.ResponseMetadata.RequestId = isResult ? p.token : 'https://example.test/?opaque=secret';
+    payload.ResponseMetadata.RequestId = isResult
+      ? `upstream-${p.token}-opaque`
+      : 'https://example.test/?opaque=secret';
     return Response.json(payload);
   });
   expect(await f.authentication.complete(p.row.id, p.token, '10000')).toMatchObject({

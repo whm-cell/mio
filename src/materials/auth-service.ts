@@ -19,7 +19,9 @@ const code = (error: unknown) =>
     ? error.code
     : 'UPSTREAM_RESULT_UNKNOWN';
 function auditRequestId(id: string | null, token?: string): string | null {
-  return id && /^[A-Za-z0-9._-]{1,256}$/.test(id) && id !== token ? id : null;
+  return id && /^[A-Za-z0-9._-]{1,256}$/.test(id) && (token === undefined || !id.includes(token))
+    ? id
+    : null;
 }
 /** Persistent sessions are the sole auth authority. No operations row, automatic create retry or token logging. */
 export function createMaterialAuthService(

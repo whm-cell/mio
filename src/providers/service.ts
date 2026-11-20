@@ -14,7 +14,7 @@ import type {
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
-import { decryptCredential } from './credentials.ts';
+import { decryptCredential, encryptMaterialAuth, decryptMaterialAuth } from './credentials.ts';
 import {
   catalogView,
   findModel,
@@ -171,6 +171,22 @@ export function createProviderService(
       config,
     );
   return {
+    sealMaterialAuth(
+      ownerId: string,
+      sessionId: string,
+      payload: { launchUrl: string; token: string },
+    ) {
+      assertOpen();
+      return encryptMaterialAuth(payload, ownerId, sessionId, config);
+    },
+    openMaterialAuth(
+      ownerId: string,
+      sessionId: string,
+      envelope: Parameters<typeof decryptMaterialAuth>[0],
+    ) {
+      assertOpen();
+      return decryptMaterialAuth(envelope, ownerId, sessionId, config);
+    },
     async snapshotAccount(ownerId: string): Promise<AccountCredentialSnapshot> {
       assertOpen();
       const row = await store.current(ownerId);

@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import { readAssetDatabaseURL } from '../../src/assets/config.ts';
+import { materialAuthSchemaSQL, checkMaterialAuthSchema } from '../../src/materials/auth-schema.ts';
 import { materialSchemaSQL, checkMaterialSchema } from '../../src/materials/schema.ts';
 
 if (process.argv.slice(2).some((arg) => arg !== '--apply'))
@@ -13,6 +14,8 @@ try {
     try {
       await client.query('BEGIN');
       await client.query(materialSchemaSQL);
+      await client.query(materialAuthSchemaSQL);
+      await checkMaterialAuthSchema(client);
       await checkMaterialSchema(client);
       await client.query('COMMIT');
     } catch (error) {
@@ -22,7 +25,7 @@ try {
       client.release();
     }
     console.log('Material metadata schema is current.');
-  } else console.log(materialSchemaSQL);
+  } else console.log(materialSchemaSQL + materialAuthSchemaSQL);
 } finally {
   await pool.end();
 }

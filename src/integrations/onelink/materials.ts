@@ -1,5 +1,6 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MaterialError } from '../../materials/contracts.ts';
+import type { MaterialAuthUpstream } from '../../materials/auth-contracts.ts';
 import type { MaterialUpstream, UpstreamMaterial } from '../../materials/contracts.ts';
 import { ONELINK_ORIGIN } from './models.ts';
 import type { ModelTransport } from './models.ts';
@@ -58,8 +59,8 @@ function bounded<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 /** Fixed OpenAPI actions only: a shared supplier pool must never be enumerated. */
-export function createMaterialUpstream(transport: ModelTransport = fetch): MaterialUpstream {
-  const call = async (
+function materialCall(transport: ModelTransport) {
+  return async (
     action: string,
     key: string,
     input: Record<string, unknown>,
@@ -103,6 +104,7 @@ export function createMaterialUpstream(transport: ModelTransport = fetch): Mater
       const raw = Buffer.concat(parts).toString('utf8');
       if (raw.includes(key)) return invalid();
       const body: unknown = JSON.parse(raw);
+      if (JSON.stringify(body).includes(key)) return invalid();
       if (!record(body) || !record(body.ResponseMetadata)) return invalid();
       const metadata = body.ResponseMetadata;
       if (
@@ -144,6 +146,9 @@ export function createMaterialUpstream(transport: ModelTransport = fetch): Mater
       );
     }
   };
+}
+export function createMaterialUpstream(transport: ModelTransport = fetch): MaterialUpstream {
+  const call = materialCall(transport);
   return {
     async createGroup(key, name, signal) {
       const value = await call('CreateAssetGroup', key, { Name: name, GroupType: 'AIGC' }, signal);
@@ -204,6 +209,72 @@ export function createMaterialUpstream(transport: ModelTransport = fetch): Mater
     },
     async deleteMaterial(key, id, signal) {
       await call('DeleteAsset', key, { Id: id }, signal);
+    },
+  };
+}
+
+/** Only the observed auth actions; no client supplied action or resource pool discovery. */
+export function createMaterialAuthUpstream(
+  transport: ModelTransport = fetch,
+): MaterialAuthUpstream {
+  const call = materialCall(transport);
+  return {
+    async create(key, callback, signal) {
+      const value = await call(
+        'CreateVisualValidateSession',
+        key,
+        { CallbackURL: callback },
+        signal,
+      );
+      const { H5Link, BytedToken, CallbackURL } = value.result;
+      if (
+        typeof H5Link !== 'string' ||
+        H5Link.length > 4096 ||
+        typeof BytedToken !== 'string' ||
+        BytedToken.length < 16 ||
+        BytedToken.length > 512 ||
+        /[\x00-\x20\x7f]/.test(BytedToken) ||
+        typeof CallbackURL !== 'string'
+      )
+        return invalid();
+      let launch: URL, returned: URL;
+      try {
+        launch = new URL(H5Link);
+        returned = new URL(CallbackURL);
+      } catch {
+        return invalid();
+      }
+      if (
+        launch.origin !== 'https://ark.volcengine.com' ||
+        launch.pathname !== '/region:cn-beijing/mobile/livenees-face-manage/authorization' ||
+        launch.username ||
+        launch.password ||
+        launch.hash ||
+        returned.origin !== ONELINK_ORIGIN ||
+        returned.pathname !== '/volc/callback' ||
+        returned.username ||
+        returned.password ||
+        returned.hash ||
+        [...returned.searchParams.keys()].some(
+          (name) =>
+            !['redirect_url', 'supplier'].includes(name) ||
+            returned.searchParams.getAll(name).length !== 1,
+        ) ||
+        returned.searchParams.getAll('redirect_url').length !== 1 ||
+        returned.searchParams.get('redirect_url') !== callback
+      )
+        return invalid();
+      return { launchUrl: H5Link, token: BytedToken };
+    },
+    async result(key, token, signal) {
+      const value = await call('GetVisualValidateResult', key, { BytedToken: token }, signal);
+      if (typeof value.result.GroupId !== 'string' || !groupId.test(value.result.GroupId))
+        return invalid();
+      return { groupId: value.result.GroupId };
+    },
+    async verifiedGroup(key, id, signal) {
+      const value = await call('GetAssetGroup', key, { Id: id }, signal);
+      if (value.result.Id !== id || value.result.GroupType !== 'LivenessFace') return invalid();
     },
   };
 }

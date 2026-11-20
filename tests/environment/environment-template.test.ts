@@ -12,7 +12,7 @@ import { readAssetConfig } from '../../src/assets/config.ts';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { readComputeConfig } from '../../src/compute/config.ts';
 import { readConversationConfig } from '../../src/conversations/config.ts';
-import { readMaterialConfig } from '../../src/materials/config.ts';
+import { readMaterialConfig, readMaterialAuthConfig } from '../../src/materials/config.ts';
 import { readGenerationConfig } from '../../src/generations/config.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
 
@@ -116,6 +116,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
     ...officialKey,
     ...assetSettings,
     ...enableSwitches,
+    MIO_MATERIALS_PUBLIC_BASE_URL: 'https://materials.example.com',
   };
   const template = await readTemplate(templatePath);
   const { optional } = assignmentKeys(template);
@@ -142,6 +143,9 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(readComputeConfig(configured) !== undefined, 'MIO_COMPUTE_ENABLED').toBe(true);
   expect(readGenerationConfig(configured) !== undefined, 'MIO_GENERATIONS_ENABLED').toBe(true);
   expect(readMaterialConfig(configured) !== undefined, 'MIO_MATERIALS_ENABLED').toBe(true);
+  expect(readMaterialAuthConfig(configured)).toEqual({
+    publicOrigin: 'https://materials.example.com',
+  });
 });
 
 it('keeps optional domains off after initialization and preserves switch semantics', async () => {
@@ -210,4 +214,14 @@ it('keeps fixed routes out of BYOK selection and validation', () => {
     expect(config?.provider === undefined, 'MIO_MODEL_PROVIDER').toBe(true);
     expect(config?.model === undefined, 'MIO_MODEL').toBe(true);
   }
+});
+
+it('keeps material authentication independently off by default and accepts only explicitly supplied HTTPS origin', () => {
+  expect(readMaterialAuthConfig({ MIO_MATERIALS_ENABLED: 'true' })).toBeUndefined();
+  expect(
+    readMaterialAuthConfig({
+      MIO_MATERIALS_ENABLED: 'true',
+      MIO_MATERIALS_PUBLIC_BASE_URL: 'https://materials.example.com:8443',
+    }),
+  ).toEqual({ publicOrigin: 'https://materials.example.com:8443' });
 });

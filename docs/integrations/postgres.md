@@ -6,7 +6,9 @@
 
 [认证服务](../../src/auth/service.ts)、[对话存储](../../src/conversations/store.ts)、[供应商存储](../../src/providers/store.ts)、[资产存储](../../src/assets/store.ts)、[计算任务存储](../../src/compute/store.ts)、[素材存储](../../src/materials/store.ts)和[图片生成存储](../../src/generations/store.ts)各持有自己的池，装配由[插件入口](../../src/plugin.ts)负责。对话的专用租约连接及各域显式迁移见业务规范；没有共享认证内部池或通用数据层。资产迁移由 `pnpm assets:migrate --apply` 显式执行，只读取资产数据库 URL，不连接 COS。计算任务使用同一媒体数据库的独立池，先执行资产迁移，再执行 `pnpm compute:migrate --apply`；增量迁移保留已有资产并允许结果资产没有 staging 对象。任务与待发布命令在一个事务中写入，结果事件去重、结果资产及任务终态也在一个事务中提交；消息 broker 与 COS 不在该事务中。图片生成独立执行 `pnpm generations:migrate --apply`，增量复用 `mio_image_jobs`、`mio_image_outputs` 并增加 A 内部执行记录；没有 A 执行行的旧任务不会重新提交。A 通过原子认领和短事务持久化提交意图、查询预算及文件检查点，外部网络请求不持长事务，图片不写入 MQ。单 A 的执行器锁只防止同库重复启动，不提供多副本接管保证。
 
-素材库在同一 `MIO_ASSETS_DATABASE_URL` 独立持最多 5 个连接，连接/语句/查询等待各 5 秒。先迁移 assets，再显式 `pnpm materials:migrate --apply`；三表为 groups/materials/operations，不变更 mio_assets 核心列、不建跨供应商或认证库外键。启动只读核验列与确切全局部分唯一索引；现行素材状态、墓碑、租约和恢复见[素材 HTTP](../apis/materials.md)。网络在短事务外，迟到同步/刷新及操作终态在同一事务按当前租约和生命周期提交。
+素材库在同一 `MIO_ASSETS_DATABASE_URL` 独立持最多 5 个连接，连接/语句/查询等待各 5 秒。先迁移 assets，再显式 `pnpm materials:migrate --apply`；管理/登记三表为 groups/materials/operations，不变更 mio_assets 核心列、不建跨供应商或认证库外键。启动只读核验列与确切全局部分唯一索引；现行素材状态、墓碑、租约和恢复见[素材 HTTP](../apis/materials.md)。网络在短事务外，迟到同步/刷新及操作终态在同一事务按当前租约和生命周期提交。
+
+素材认证在同一媒体域池增量建立 `mio_material_auth_sessions`，仅会话表承担创建/验证意图、独立用途密文、20 分钟 TTL、token digest、租约及最多 8 次查询计数，不双写 operation。owner/group 复合 FK 只在媒体库内；source/密钥/认证库无跨库 FK。启动按公开认证配置只读检查关键结构；后台按到期索引每批最多 100 清理，完成实体/会话终态/清密文同事务，网络不持事务。
 
 ## 必须遵守的约束
 

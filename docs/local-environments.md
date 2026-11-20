@@ -56,6 +56,8 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 素材管理显式设置 `MIO_MATERIALS_ENABLED=true` 后启用，沿现有认证、供应商与媒体数据库配置；先 `pnpm migrate:dev assets --apply`，再 `pnpm migrate:dev materials --apply`（test 对应 test）。新增三表保留既有资产，启动仅检查，不自动迁移、枚举上游组或重发 unknown 创建。配置和 HTTP 见[素材契约](apis/materials.md)。Unit 1 不需要模型/default/目录资格，图片登记、真人认证及视频引用随后续单元接入。
 
+真人认证额外配置 `MIO_MATERIALS_PUBLIC_BASE_URL=https://实际可达的本候选入口`，不能因 `.env` 的 `MIO_AUTH_BASE_URL` 指向既有域名就复用该生产回调。先显式 `pnpm migrate:dev materials --apply` 增加 auth_sessions，启动仅检查；缺省此变量保持 Unit 1/2 功能且不暴露认证入口。手机必须访问该公开 HTTPS origin 下的精确 launch/complete，隧道/代理选择及真实权限由具体现场核对，不改其他人的 DNS/代理；本机先用协议替身完成隔离回归，真实 Create 与本人扫码待具体 UI/HTTPS 路线被解锁。20 分钟逻辑到期，访问即时清密文，健康后台每 30 秒有界清理 100 条；不可把后台故障期间的延迟说成即时销毁。
+
 ## 常驻 dev 的 OneLink 与对话
 
 以下只配置本人授权的开发环境。先停止旧 dev 应用，备份目标库和现有 `.env`，保留原文件的 600 权限；不要覆盖已有主密钥。向 `.env` 显式加入模板中的 `MIO_PROVIDERS_DATABASE_URL`、`MIO_PROVIDERS_MASTER_KEY`、`MIO_PROVIDERS_MASTER_KEY_ID` 和 `MIO_CONVERSATIONS_DATABASE_URL`。两个 URL 可以各自填写 `.env` 中 `MIO_AUTH_DATABASE_URL` 的完整值；这只是共用物理数据库，各域仍持独立池。文件读取不展开 `$MIO_AUTH_DATABASE_URL`，不能只写变量引用。主密钥是独立 32 字节随机数的标准 base64（初次可用 `openssl rand -base64 32` 生成），ID 可用稳定的 `dev-onelink-v1`；与数据库及 DSH 目录一起安全备份，后续启动继续使用相同值。不要放进仓库、命令历史或共享日志。`.env.test` 仅在需要该环境时独立配置，不回退 `.env`。
@@ -163,3 +165,5 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 预检不停止进程、不消费/清空队列、不接受或重跑任务。操作者逐项处理阻断并确认旧进程已不再发送生成 POST 后，才启动 A 图片执行器。新链路及历史读取验证后恢复接单，再退役图片专用队列和 RSA 密钥；视频队列、B 重媒体 journal、历史任务表及旧恢复原件保留。A 尚无新任务时可回旧版本；存在 A 新任务时先对账，不把任务交旧 B 重跑。
 
 新的 `live-image-loop.ts dev` 只启动 A，并在进程中安装单次生成 POST 审计；入口不配置 RabbitMQ 或启动 B，继续走正式登录、目录刷新、图片 HTTP、资产下载、重启和幂等读取。用户指示推进开发或验收时，默认允许复用常驻 `mio_dev` 既有账号／凭据与私有测试 COS 执行单次有界、最小规格的真实供应商验收（脚本的 `MIO_RUN_LIVE_IMAGE=yes` 环境变量保留为防普通测试误触发的脚本安全阀，不再要求为此二次索要口令），正式验收取证仍须基于干净候选且未执行不算通过；若传入新 `apiKey` 覆盖既有凭据或改写影响他人的全局路由，仍须最小必要触发或由用户明确指定。该入口保留测试用户、业务任务、COS 产物及私有审计证据。
+
+临时手机验收可使用 Cloudflare Quick Tunnel，但 tunnel 只能指向本任务回环过滤代理 `scripts/service/material-auth-proxy.ts`。代理在转发前只允许精确 `GET /api/v1/materials/auth-sessions/{UUID}/launch` 与 `/complete`，其余登录、metadata、health、恢复 POST、管理端及其他方法一律拒绝；不转发 Cookie/Authorization/Origin，不记录 query/token，单代理最多 4 个在途。隧道的 HTTPS origin 明确注入当前候选，不改 DNS 或既有生产路由；Cloudflare 转发属于用户已选择的本次临时暴露边界，验收后关闭任务隧道/代理。公开 origin 不能通过这段说明获得任意生产部署授权。

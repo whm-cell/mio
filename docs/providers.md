@@ -38,6 +38,10 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 [素材域](apis/materials.md)是当前消费者。本地列表与详情不依赖当前 Key、不解密或联网；新出站使用当前账号快照，轮换不重绑资源 owner 或改写历史。对已有资源仅通过单资源 Get 核验访问，素材 403 只阻塞该资源出站，不把整个 provider 标 rejected，不删除本地映射；精确 404/ResourceNotFound 与 403 分开处理。素材操作成功不赋予模型 verified，模型目录发现也不授予素材资源权限。关闭先收敛素材消费者，即使消费者清理失败仍关闭供应商池并聚合错误。
 
+## 素材认证会话密文
+
+素材认证复用同一部署 32 字节主密钥与 AES-256-GCM 五元组；`sealMaterialAuth/openMaterialAuth` 仅给材料会话保存必要 H5Link/BytedToken，AAD 使用独立固定 `mio:materials:auth-session:1`、ownerId、sessionId 与 masterKeyId，不能与凭据用途互解，旧凭据 AAD 和字节格式保持原样。普通会话元数据读取不解密；只在公开 launch 的受控重定向或有 digest 证明的服务端结果复核时打开。会话完成/到期清密文与授权保留策略见[认证会话接口](apis/materials.md#post-apiv1materialsauth-sessions)。Key 轮换保留会话归属，验证使用当前 owner 账号资格，不给模型赋予 verified，不把资源 403 扩大为整个账号 rejected。
+
 ## 目录、刷新与资格
 
 当前 Key 的完整成功 GET /v1/models 是唯一成员权威，raw ID 的大小写、标点和线路后缀不归一。新 ID 无需修改生产名单或发布即进入目录。稳定 `onelink:model:<UUID>` 不含分类/协议；同 ID 移除后再次发现仍复用身份。旧 `onelink:<category>:<rawId>` 无损解析 raw ID，分类不参与新身份，也不重写旧回执。

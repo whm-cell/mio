@@ -35,12 +35,16 @@ import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
-import { readMaterialConfig } from './materials/config.ts';
+import { createMaterialAuthService } from './materials/auth-service.ts';
+import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
 import { createMaterialStore } from './materials/store.ts';
 import { createMaterialService } from './materials/service.ts';
 import type { MaterialService } from './materials/service.ts';
 import { createMaterialHandler } from './materials/http.ts';
-import { createMaterialUpstream } from './integrations/onelink/materials.ts';
+import {
+  createMaterialUpstream,
+  createMaterialAuthUpstream,
+} from './integrations/onelink/materials.ts';
 import { readGenerationConfig } from './generations/config.ts';
 import { createGenerationStore } from './generations/store.ts';
 import { createGenerationService } from './generations/service.ts';
@@ -67,6 +71,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const authConfig = readAuthConfig();
   const providerConfig = readProviderConfig();
   const materialConfig = readMaterialConfig();
+  const materialAuthConfig = readMaterialAuthConfig();
   // A materials-only installation shares the media URL but does not opt into COS/assets.
   // Any partial COS configuration still reaches the existing strict asset validation.
   const materialDatabaseOnly =
@@ -256,14 +261,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     if (materialConfig && providers) {
-      const store = await createMaterialStore(materialConfig.databaseURL);
+      const store = await createMaterialStore(
+        materialConfig.databaseURL,
+        Boolean(materialAuthConfig),
+      );
       let acquired: MaterialService | undefined;
+      let authentication: Awaited<ReturnType<typeof createMaterialAuthService>> | undefined;
       try {
+        if (materialAuthConfig)
+          authentication = await createMaterialAuthService(
+            store.authentication,
+            providers,
+            createMaterialAuthUpstream(),
+            materialAuthConfig.publicOrigin,
+          );
         materials = acquired = createMaterialService(
           store,
           providers,
           createMaterialUpstream(),
           assets,
+          () => authentication?.close() ?? Promise.resolve(),
         );
         const owned = acquired;
         ctx.effect(() => async () => {
@@ -273,11 +290,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/materials',
-            handler: createMaterialHandler(owned, auth.identity, authConfig.origins),
+            handler: createMaterialHandler(
+              owned,
+              auth.identity,
+              authConfig.origins,
+              authentication,
+            ),
           }),
         );
       } catch (error) {
-        await (acquired ? acquired.close() : store.close());
+        const failures: unknown[] = [error];
+        if (!acquired) {
+          try {
+            await authentication?.close();
+          } catch (failure) {
+            failures.push(failure);
+          }
+        }
+        try {
+          await (acquired ? acquired.close() : store.close());
+        } catch (failure) {
+          failures.push(failure);
+        }
+        if (failures.length > 1)
+          throw new AggregateError(failures, 'Material startup cleanup failed');
         throw error;
       }
     }

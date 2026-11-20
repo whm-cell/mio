@@ -82,6 +82,7 @@ export function createMaterialService(
   credentials: Credentials,
   upstream: MaterialUpstream,
   assets?: Pick<ReturnType<typeof createAssetService>, 'readMaterialSource' | 'materialUrl'>,
+  beforeClose?: () => Promise<void>,
 ) {
   let stopping = false;
   let registering = false;
@@ -521,12 +522,23 @@ export function createMaterialService(
       stopping = true;
       closing = (async () => {
         const deadline = setTimeout(() => stop.abort(), 5000);
+        const failures: unknown[] = [];
         try {
-          await Promise.allSettled([...active]);
+          const consumer = Promise.resolve()
+            .then(() => beforeClose?.())
+            .catch((error) => {
+              failures.push(error);
+            });
+          await Promise.allSettled([...active, consumer]);
         } finally {
           clearTimeout(deadline);
-          await store.close();
+          try {
+            await store.close();
+          } catch (error) {
+            failures.push(error);
+          }
         }
+        if (failures.length) throw new AggregateError(failures, 'Material domain cleanup failed');
       })();
       return closing;
     },

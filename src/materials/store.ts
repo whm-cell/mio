@@ -13,6 +13,8 @@ import type {
   MaterialSourceSnapshot,
 } from './contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
+import { MaterialAuthStore } from './auth-store.ts';
+import { checkMaterialAuthSchema } from './auth-schema.ts';
 import { checkMaterialSchema } from './schema.ts';
 
 const log = createLogger('app', 'material-store');
@@ -26,9 +28,11 @@ export interface MaterialCursor {
 
 /** Short database transactions own every claim. No upstream request runs inside a transaction. */
 export class MaterialStore {
+  readonly authentication: MaterialAuthStore;
   private readonly pool: Pool;
   constructor(pool: Pool) {
     this.pool = pool;
+    this.authentication = new MaterialAuthStore(pool);
   }
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -908,7 +912,10 @@ export class MaterialStore {
   }
 }
 
-export async function createMaterialStore(databaseURL: string): Promise<MaterialStore> {
+export async function createMaterialStore(
+  databaseURL: string,
+  authentication = false,
+): Promise<MaterialStore> {
   const pool = new Pool({
     connectionString: databaseURL,
     max: 5,
@@ -920,6 +927,7 @@ export async function createMaterialStore(databaseURL: string): Promise<Material
   pool.on('error', () => log.error('MATERIAL_DATABASE_CONNECTION_ERROR'));
   try {
     await checkMaterialSchema(pool);
+    if (authentication) await checkMaterialAuthSchema(pool);
     return new MaterialStore(pool);
   } catch {
     await pool.end();

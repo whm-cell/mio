@@ -1,10 +1,10 @@
 # 素材库 HTTP 契约
 
-[API 导航](index.md)；需求与分期见[素材库 PRD](../tasks/onelink-material-library/prd.md)。当前采纳 Unit 1 管理、同步、读取与删除，以及 Unit 2 图片核验/登记候选；真人认证和视频消费仍按后续单元推进。
+[API 导航](index.md)；需求与分期见[素材库 PRD](../tasks/onelink-material-library/prd.md)。当前采纳 Unit 1 管理、同步、读取与删除，以及 Unit 2 图片核验/登记候选；Unit 3 认证会话为实现候选，真实手机协议/HTTPS 证据尚待本人配合；视频仍按后续单元推进。
 
 ## 本域共同约定
 
-显式设置 `MIO_MATERIALS_ENABLED=true`，配置认证、供应商和 `MIO_ASSETS_DATABASE_URL`，先迁移 assets，再执行 `pnpm materials:migrate --apply`（本地 `pnpm migrate:dev materials --apply`）。素材域独立持池；仅素材管理且所有 COS 字段缺省时不注册资产 HTTP；任一 COS 字段出现则沿既有资产完整配置校验，部分配置失败。启动只读检查三表和确切全局上游唯一索引，缺结构失败，不自动迁移或联网。未启用时不注册本域。
+显式设置 `MIO_MATERIALS_ENABLED=true`，配置认证、供应商和 `MIO_ASSETS_DATABASE_URL`，先迁移 assets，再执行 `pnpm materials:migrate --apply`（本地 `pnpm migrate:dev materials --apply`）。素材域独立持池；仅素材管理且所有 COS 字段缺省时不注册资产 HTTP；任一 COS 字段出现则沿既有资产完整配置校验，部分配置失败。启动只读检查三表和确切全局上游唯一索引，缺结构失败，不自动迁移或联网。未启用时不注册本域。真人认证额外显式设置 `MIO_MATERIALS_PUBLIC_BASE_URL` 为可达 HTTPS origin（可含非默认 HTTPS 端口，不能有用户信息、路径、query 或 fragment）；缺省时素材管理/图片登记照常使用，不注册认证端点。不得从请求 Host 或既有生产认证域推导。执行当前 `materials:migrate` 会显式增量建立 auth_sessions 表；启用公开认证时启动才要求并只读核验该表的 owner/requestId 唯一约束、owner/group 复合 FK 及到期清理索引。
 
 身份仅来自登录 Cookie，资源按 owner 查询；服务 Bearer 不授予用户身份。写入要求允许的精确 Origin 和 `application/json`，GET 提供 Origin 时也须匹配；OPTIONS 无需登录但须允许 Origin。JSON 为对象、8192 字节、10 秒，拒绝额外字段且读完复核会话。响应均 `no-store`、`X-Request-Id`；错误 `{error:{code,message,requestId}}`。常见错误为 400 BODY_INVALID/QUERY_INVALID/CURSOR_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED/PROVIDER_RESOURCE_FORBIDDEN、404 NOT_FOUND/MATERIAL_NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED、409 REVISION_CONFLICT/IDEMPOTENCY_CONFLICT/MATERIAL_BUSY/MATERIAL_GROUP_NOT_READY/RESOURCE_IN_USE/PROVIDER_UNAVAILABLE/UPSTREAM_RESOURCE_COLLISION、429 MATERIAL_QUERY_LIMITED（`Retry-After: 4`）、503 MATERIAL_UNAVAILABLE/UPSTREAM_RESULT_UNKNOWN/UPSTREAM_RESPONSE_INVALID/UPSTREAM_REJECTED/UPSTREAM_RATE_LIMITED。不返回密钥、密文、上游 ID、签名 URL 或供应商原始响应。
 
@@ -155,3 +155,63 @@
 错误：他人操作统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
 副作用：本地读取并收敛到期操作；CreateAssetGroup/CreateAsset 已返回合法 ID 但提交失败时，fallback 将 ID/RequestId 仅保留于受限操作快照/审计；fallback 也不可用时披露人工核对。已知建组/素材登记或远端删除的 unknown 由 5 秒持久冷却、操作/组双租约认领，最多执行本次必要的 GetAssetGroup/GetAsset 复核，已知建组确认存在才同事务发布 ready/succeeded；已知素材登记经当前组和 GetAsset 核验后按真实上游状态发布素材并收束 succeeded（跨 owner 全局冲突拒绝且不读回他人）；远端删除精确 404 才收束 deleted/succeeded。建组 403/404、删除仍存在或未知继续 unknown；不重发 Delete，不枚举共享池。
+
+## POST /api/v1/materials/auth-sessions
+
+身份：当前登录 Cookie 用户，要求精确允许 Origin 与 JSON；未配置公开认证 origin 时返回 404。
+
+输入：`{requestId,source:"materials",returnTarget:"materials"}`；小写 UUID v4，拒绝额外字段、任意 URL/owner/上游身份。相同本人 requestId/输入读回原会话，异输入 409 IDEMPOTENCY_CONFLICT。
+
+成功：201 AuthSessionView（pending/completed），未取得确定就绪为 202 原视图；`AuthSessionView={sessionId,state,expiresAt,pollAfterMs,errorCode,launchUrl?,groupId?}`，state 为 creating/pending/verifying/completed/failed/expired/unknown，非终态 pollAfterMs 3000。pending 或 unknown 且仍有已验证上游创建证明密文时返回本系统 HTTPS launchUrl；无 token 的 unknown 不提供重建/launch 权限。
+
+错误：配置未启用 404；供应商拒绝 409 PROVIDER_UNAVAILABLE；其余见共同约定。创建已发后超时/PG 失败保留 unknown，无自动第二次 Create；若有效返回证明已获得，fallback 保存原会话可恢复密文，fallback 同样失败或未得 token 则人工核对，不伪造恢复。
+
+副作用：先持久 creating 意图与 owner/凭据版本/固定协议/20 分钟期限，再单次 CreateVisualValidateSession。会话独立于 operations 表；H5Link 与 BytedToken 用 provider 同部署主密钥 AES-256-GCM 五元组加密，AAD 固定材料会话用途+owner/session/keyId，与旧凭据用途隔离；另保留 SHA-256 token_digest。返回/日志不含远端 URL、token、密文或 PII，不创建真人组直到服务端复核通过。
+
+## GET /api/v1/materials/auth-sessions/{id}
+
+身份：会话所有者，Cookie/Origin 同本域共同约定。
+
+输入：本地小写 UUID v4，无查询参数。
+
+成功：200 AuthSessionView；completed 返回本地 groupId；有密文 unknown 仍可重新打开原 launchUrl，无密文 unknown 显示需核对。模型/目录能力不参与视图读取。
+
+错误：他人会话统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
+
+副作用：只读本地事实并收敛到期/失效 creating/verifying 租约，不解密、不联网。逻辑有效期固定创建后 20 分钟，访问到期即转 expired 并清五元组；健康后台启动及每 30 秒最多清理 100 条到期记录，不承诺故障/积压情况下密文同毫秒销毁。completed 保留脱敏结果/映射与 replay 所需 digest，完成事务立即清密文。
+
+## POST /api/v1/materials/auth-sessions/{id}/refresh
+
+身份：会话所有者 Cookie；要求本域原有精确 Origin/JSON。此端点不属于公开手机路径，不通过临时隧道转发。
+
+输入：正文严格 `{}`，本地小写 UUID v4，无 query。不得提交 token、上游会话或 GroupId。
+
+成功：200 AuthSessionView。手机回跳查询超时/断线，或回调页已关闭时，owner 可用原 sessionId 显式复核，不依赖再打开 H5 必定触发回跳；使用存储的原 token 与 owner 当前账号凭据，同一 verify 路径成功后原子完成。completed 重复返回原结果，不查询或创建远端会话。
+
+错误：他人会话统一 404 MATERIAL_NOT_FOUND，且不解密/联网；原 token 未取得的 unknown 为 409 AUTH_RECOVERY_UNAVAILABLE，明确需人工核对；到期 410 AUTH_EXPIRED；共享 3 秒冷却/8 次终生验证 claim/60 秒租约，在途、冷却或预算耗尽 429 AUTH_QUERY_LIMITED/Retry-After:3。缺证保持 unknown，不发第二次 Create。
+
+副作用：显式 owner 恢复可以受控解密并执行必要单资源 GetResult/GetGroup；与公开 complete 复用同一原会话、digest/租约/预算/硬截止/事务终态，公开回调仍须先证明 supplied token digest。GET 状态继续只读本地，无隐式出站；私有恢复不扩大公开 allowlist。
+
+## GET /api/v1/materials/auth-sessions/{id}/launch
+
+身份：无桌面 Cookie/Origin 的公开手机入口，仅精确此路径和 GET；其他素材接口不继承公开放行。
+
+输入：高熵小写 UUID v4，无查询参数，无 returnUrl/Host 推导。
+
+成功：302 至创建时校验过的 `https://ark.volcengine.com/region:cn-beijing/mobile/livenees-face-manage/authorization` 原 H5Link；no-store/no-referrer/CSP，Location 是本次必要手机 launch 权限，不进入日志或公开结果。
+
+错误：不存在 404、expired 410 AUTH_EXPIRED、无可用创建证明/状态 409 AUTH_NOT_READY、解密失败 503 MATERIAL_AUTH_SECRET_UNAVAILABLE、公开处理器最多 4 个在途，超出即 429 AUTH_QUERY_LIMITED/Retry-After:3，不进入 PG；非 GET 405。方法和 query 的失败不触发上游。
+
+副作用：按原会话状态/到期检查后受控解密一次供重定向，不调用远端创建；禁止任意 host/path/open redirect，校验与凭据目的不同的密文不能解开。
+
+## GET /api/v1/materials/auth-sessions/{id}/complete
+
+身份：公开手机 GET 回跳，仅精确此路径；当前无 HMAC 协议，不信任 resultCode 本身。
+
+输入：严格单值 `bytedToken`（16–512 非控制/空白字符）和可选数字 `resultCode`；query 总路径不超过 8192 字符，拒绝未知/重复参数。首期字段来自已知旧协议候选，实际手机回跳与 GetVisualValidateResult 精确字段仍需真机验证；不接受客户端 GroupId/状态。
+
+成功：200 脱敏固定 HTML；服务端将 supplied token 的 SHA-256 与原会话 digest 常量时间比较，再持久认领会话、用存储的原 token 与 owner 当前启用凭据单次 GetVisualValidateResult，要求合法 GroupId 并经单资源 GetAssetGroup 确认为 LivenessFace，方在同 PG 事务原子新建本人 verified 真人组、完成会话并立即清五元组。completed 合法重放返回原成功，不再查询或造组；固定返回链接 `/materials`。
+
+错误：错误/跨会话 token 400 AUTH_PROOF_INVALID，negative resultCode 400 AUTH_RESULT_UNCONFIRMED，不消耗查询预算或终止合法 pending；到期 410。公开槽上限 4、同会话 3 秒持久冷却/60 秒租约、会话生存期最多 8 次验证 claim；在途/冷却/预算耗尽 429 AUTH_QUERY_LIMITED/Retry-After:3，unknown 不被伪造为 failed。403/404/未知响应/组类型不符/跨 owner 上游 ID 碰撞保留 unknown 与脱敏错误，不拒绝整个 provider、不绑定他人组。
+
+副作用：验证出站/结果写入按原会话身份、owner、token digest、clock_timestamp 租约和到期 CAS；迟到结果不能覆盖新终态，实体与完成/清密文在同事务提交。Create 与 callback 不双写 operations；无 token 的 unknown 不自动重建。错误 HTML 与日志不回显 query/token/远端原文，所有响应 no-store/no-referrer；真实授权页面/本人扫码/HTTPS 可达与平台字段未取得前保持业务验收 pending。

@@ -141,3 +141,41 @@ it('encodes fixed image registration and returns only the validated remote ident
     }),
   ]);
 });
+
+it.each(['h5-host', 'h5-path', 'callback-target', 'missing-token', 'result-shape', 'group-type'])(
+  'keeps auth protocol failclosed on %s',
+  async (kind) => {
+    const { createMaterialAuthUpstream } =
+      await import('../../src/integrations/onelink/materials.ts');
+    const callback =
+      'https://materials.example.test/api/v1/materials/auth-sessions/11111111-1111-4111-8111-111111111111/complete';
+    const transport = async (input: Parameters<typeof fetch>[0]) => {
+      const action = new URL(String(input)).searchParams.get('Action')!;
+      return envelope(
+        action,
+        action === 'CreateVisualValidateSession'
+          ? {
+              BytedToken: kind === 'missing-token' ? '' : 'synthetic-private-byted-token',
+              H5Link: `https://${kind === 'h5-host' ? 'evil.example' : 'ark.volcengine.com'}${kind === 'h5-path' ? '/unexpected' : '/region:cn-beijing/mobile/livenees-face-manage/authorization'}?launch=opaque`,
+              CallbackURL: `https://api.onelinkai.cloud/volc/callback?redirect_url=${encodeURIComponent(kind === 'callback-target' ? 'https://evil.example' : callback)}`,
+            }
+          : action === 'GetVisualValidateResult'
+            ? { Status: 'success' }
+            : { Id: group, GroupType: 'AIGC' },
+      );
+    };
+    const client = createMaterialAuthUpstream(transport);
+    if (kind === 'result-shape')
+      await expect(
+        client.result(key, 'synthetic-private-byted-token', signal()),
+      ).rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_INVALID' });
+    else if (kind === 'group-type')
+      await expect(client.verifiedGroup(key, group, signal())).rejects.toMatchObject({
+        code: 'UPSTREAM_RESPONSE_INVALID',
+      });
+    else
+      await expect(client.create(key, callback, signal())).rejects.toMatchObject({
+        code: 'UPSTREAM_RESPONSE_INVALID',
+      });
+  },
+);

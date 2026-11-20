@@ -7,10 +7,19 @@ import { AssetError } from '../assets/contracts.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import { MaterialError } from './contracts.ts';
 import type { MaterialPrincipal } from './contracts.ts';
+import type { MaterialAuthService } from './auth-service.ts';
+import { createMaterialAuthPublicHandler } from './auth-http.ts';
 import type { MaterialService } from './service.ts';
 
 const BASE = '/api/v1/materials';
 function route(path: string): { kind: string; id?: string; methods: string[] } | undefined {
+  if (path === `${BASE}/auth-sessions`) return { kind: 'authCreate', methods: ['POST'] };
+  const refresh = path.match(/^\/api\/v1\/materials\/auth-sessions\/([^/]+)\/refresh$/);
+  if (refresh?.[1] && isUuidV4(refresh[1]))
+    return { kind: 'authRefresh', id: refresh[1], methods: ['POST'] };
+  const session = path.match(/^\/api\/v1\/materials\/auth-sessions\/([^/]+)$/);
+  if (session?.[1] && isUuidV4(session[1]))
+    return { kind: 'authGet', id: session[1], methods: ['GET'] };
   if (path === `${BASE}/groups`) return { kind: 'groups', methods: ['GET', 'POST'] };
   const match = path.match(
     /^\/api\/v1\/materials\/(groups|items|operations)\/([^/]+)(?:\/(sync|materials|refresh|delete))?$/,
@@ -46,9 +55,14 @@ export function createMaterialHandler(
   service: MaterialService,
   identity: (headers: Headers) => Promise<MaterialPrincipal | null>,
   origins: readonly string[],
+  authentication?: MaterialAuthService,
 ) {
   const allowed = new Set(origins);
+  const publicHandler = authentication
+    ? createMaterialAuthPublicHandler(authentication)
+    : undefined;
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    if (publicHandler && (await publicHandler(request, response))) return;
     const requestId = startHttpResponse(response);
     const fail = (status: number, code: string) => {
       if (status === 429) response.setHeader('retry-after', '4');
@@ -70,7 +84,8 @@ export function createMaterialHandler(
       }
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       const endpoint = route(url.pathname);
-      if (!endpoint) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      if (!endpoint || (endpoint.kind.startsWith('auth') && !authentication))
+        return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       if (request.method === 'OPTIONS') {
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
         response
@@ -121,17 +136,19 @@ export function createMaterialHandler(
       if (type !== undefined && type !== 'aigc' && type !== 'real')
         return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       const keys =
-        endpoint.kind === 'groups'
-          ? ['requestId', 'type', 'name']
-          : endpoint.kind === 'group'
-            ? ['revision', 'name']
-            : endpoint.kind === 'materials'
-              ? ['requestId', 'assetId', 'name']
-              : endpoint.kind === 'sync'
-                ? ['cursor']
-                : endpoint.kind.startsWith('delete')
-                  ? ['requestId', 'revision', 'scope']
-                  : [];
+        endpoint.kind === 'authCreate'
+          ? ['requestId', 'source', 'returnTarget']
+          : endpoint.kind === 'groups'
+            ? ['requestId', 'type', 'name']
+            : endpoint.kind === 'group'
+              ? ['revision', 'name']
+              : endpoint.kind === 'materials'
+                ? ['requestId', 'assetId', 'name']
+                : endpoint.kind === 'sync'
+                  ? ['cursor']
+                  : endpoint.kind.startsWith('delete')
+                    ? ['requestId', 'revision', 'scope']
+                    : [];
       if (Object.keys(body).some((key) => !keys.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (result: unknown, status: number = HTTP_STATUS.OK) => {
@@ -142,6 +159,7 @@ export function createMaterialHandler(
       const id = endpoint.id!;
       if (!writing) {
         const cursor = url.searchParams.get('cursor') ?? undefined;
+        if (endpoint.kind === 'authGet') return send(await authentication!.get(actor, id));
         if (endpoint.kind === 'groups')
           return send(await service.groups(actor, type, limit, cursor));
         if (endpoint.kind === 'materials')
@@ -150,6 +168,7 @@ export function createMaterialHandler(
         if (endpoint.kind === 'material') return send(await service.material(actor, id));
         return send(await service.operation(actor, id));
       }
+      if (endpoint.kind === 'authRefresh') return send(await authentication!.refresh(actor, id));
       if (endpoint.kind === 'sync') {
         if ('cursor' in body && typeof body.cursor !== 'string')
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
@@ -163,6 +182,22 @@ export function createMaterialHandler(
       }
       if (typeof body.requestId !== 'string' || !isUuidV4(body.requestId))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      if (endpoint.kind === 'authCreate') {
+        if (body.source !== 'materials' || body.returnTarget !== 'materials')
+          return fail(400, 'BODY_INVALID');
+        const result = await authentication!.create(
+          actor,
+          body.requestId,
+          'materials',
+          'materials',
+        );
+        return send(
+          result,
+          ['pending', 'completed'].includes(result.state)
+            ? HTTP_STATUS.CREATED
+            : HTTP_STATUS.ACCEPTED,
+        );
+      }
       if (endpoint.kind === 'materials') {
         if (
           typeof body.assetId !== 'string' ||

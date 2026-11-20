@@ -63,3 +63,67 @@ export function decryptCredential(
     throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_CREDENTIAL_UNAVAILABLE');
   }
 }
+
+/** Same deployment key/envelope, a distinct purpose binding. Credential AAD above is unchanged. */
+export function encryptMaterialAuth(
+  payload: { launchUrl: string; token: string },
+  ownerId: string,
+  sessionId: string,
+  config: ProviderConfig,
+): CredentialEnvelope {
+  const nonce = randomBytes(12),
+    cipher = createCipheriv('aes-256-gcm', config.masterKey, nonce);
+  cipher.setAAD(
+    Buffer.from(
+      JSON.stringify(['mio:materials:auth-session:1', ownerId, sessionId, config.masterKeyId]),
+    ),
+  );
+  return {
+    cipher_format: 1,
+    master_key_id: config.masterKeyId,
+    nonce,
+    ciphertext: Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]),
+    auth_tag: cipher.getAuthTag(),
+  };
+}
+export function decryptMaterialAuth(
+  envelope: CredentialEnvelope,
+  ownerId: string,
+  sessionId: string,
+  config: ProviderConfig,
+): { launchUrl: string; token: string } {
+  try {
+    if (
+      envelope.cipher_format !== 1 ||
+      envelope.master_key_id !== config.masterKeyId ||
+      envelope.nonce.length !== 12 ||
+      envelope.auth_tag.length !== 16 ||
+      envelope.ciphertext.length > 8192
+    )
+      throw new Error();
+    const decipher = createDecipheriv('aes-256-gcm', config.masterKey, envelope.nonce, {
+      authTagLength: 16,
+    });
+    decipher.setAAD(
+      Buffer.from(
+        JSON.stringify(['mio:materials:auth-session:1', ownerId, sessionId, config.masterKeyId]),
+      ),
+    );
+    decipher.setAuthTag(envelope.auth_tag);
+    const payload: unknown = JSON.parse(
+      Buffer.concat([decipher.update(envelope.ciphertext), decipher.final()]).toString('utf8'),
+    );
+    if (
+      !payload ||
+      typeof payload !== 'object' ||
+      !('launchUrl' in payload) ||
+      !('token' in payload) ||
+      typeof payload.launchUrl !== 'string' ||
+      typeof payload.token !== 'string'
+    )
+      throw new Error();
+    return { launchUrl: payload.launchUrl, token: payload.token };
+  } catch {
+    throw new ProviderError(503, 'MATERIAL_AUTH_SECRET_UNAVAILABLE');
+  }
+}

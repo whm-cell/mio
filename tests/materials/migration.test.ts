@@ -65,6 +65,7 @@ it('previews without writes, migrates explicitly and idempotently without modify
     )
   ).rows;
   expect(tables.map((row) => row.tablename)).toEqual([
+    'mio_material_auth_sessions',
     'mio_material_groups',
     'mio_material_operations',
     'mio_materials',

@@ -4,7 +4,7 @@
 
 开发模块的 `developmentDependencies` 按源码根声明：护栏／任务协调只导入 `scripts/harness/` 内部模块；服务工具允许自身模块及认证、对话、供应商、资产、素材和计算迁移需要的精确配置与 schema，以及共享计算合同的构建公开类型入口。动态目录的受控部署导入另精确允许 `src/providers/store.ts`、`contracts.ts`，由存储入口统一完成归属、版本和声明校验，导入程序自持并关闭该域池；不开放整个业务目录、`catalog.ts` 或 `service.ts`。总检查入口可组合各自命令。开发角色不等于职责边界，类型、重导出和别名解析后的越界均受核对；静态规则不是任意子进程或网络副作用沙箱。
 
-认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts`、`src/compute/schema.ts`、`src/generations/store.ts` 与 `src/generations/schema.ts`、`src/materials/store.ts` 与 `src/materials/schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
+认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts`、`src/compute/schema.ts`、`src/generations/store.ts` 与 `src/generations/schema.ts`、`src/materials/store.ts` 与 `src/materials/schema.ts`、`src/materials/auth-store.ts` 与 `src/materials/auth-schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
 
 根服务 A 中 COS SDK 包仅允许 `src/integrations/cos.ts` 导入，开发工具和其他 A 模块不得直接或经别名导入；B 的精确适配器按下述多项目声明约束。检查按导入名称、解析包身份和真实归属识别。类型、别名及邻近非法文件反例见同一 fixture；运行权限仍由 COS 凭据、桶策略与实际测试保证。
 

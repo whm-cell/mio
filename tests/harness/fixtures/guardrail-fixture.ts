@@ -20,6 +20,7 @@ export function legacyHarness(): HarnessConfig {
         'src/assets/schema.ts',
         'src/materials/config.ts',
         'src/materials/schema.ts',
+        'src/materials/auth-schema.ts',
         'src/providers/config.ts',
         'src/providers/schema.ts',
         'src/providers/store.ts',

@@ -440,6 +440,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/providers/schema.ts',
         'src/materials/store.ts',
         'src/materials/schema.ts',
+        'src/materials/auth-store.ts',
+        'src/materials/auth-schema.ts',
         'src/assets/store.ts',
         'src/assets/schema.ts',
         'src/compute/store.ts',

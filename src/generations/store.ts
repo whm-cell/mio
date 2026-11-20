@@ -301,6 +301,12 @@ export class GenerationStore {
 
   async beginQuery(row: GenerationExecution): Promise<GenerationExecution | undefined> {
     return transaction(this.pool, async (client) => {
+      // Transitions touching both rows always lock execution before job.
+      const execution = await client.query(
+        "SELECT job_id FROM mio_image_executions WHERE job_id=$1 AND claim_id=$2 AND phase='waiting' FOR UPDATE",
+        [row.id, row.claim_id],
+      );
+      if (!execution.rowCount) return undefined;
       const job = await client.query(
         `UPDATE mio_image_jobs j SET query_attempt=query_attempt+1,next_query_at=NULL
          FROM mio_image_executions e WHERE j.id=$1 AND e.job_id=j.id AND e.claim_id=$2
@@ -449,6 +455,12 @@ export class GenerationStore {
   async imageRecover(owner: string, id: string): Promise<void> {
     await transaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock($1)', [QUOTA_LOCK]);
+      // Take the execution lock first, then reread both rows after any wait.
+      await client.query(
+        `SELECT e.job_id FROM mio_image_executions e JOIN mio_image_jobs j ON j.id=e.job_id
+         WHERE e.job_id=$1 AND j.owner_id=$2 FOR UPDATE OF e`,
+        [id, owner],
+      );
       const row = (
         await client.query<GenerationExecution>(
           selection + ' WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j,e',

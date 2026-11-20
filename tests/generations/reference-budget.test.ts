@@ -251,7 +251,7 @@ it('keeps oversized frozen inputs out of waiting, unknown and durable-result rec
   try {
     const source = await f.addImageSource();
     const jobs: { jobId: string; phase: string }[] = [];
-    for (const phase of ['waiting', 'submitting', 'receipt', 'materializing'] as const) {
+    for (const phase of ['submitting', 'receipt', 'materializing', 'waiting'] as const) {
       const job = await f.admit(
         randomUUID(),
         phase,
@@ -266,6 +266,7 @@ it('keeps oversized frozen inputs out of waiting, unknown and durable-result rec
         JSON.stringify(16 * MiB + 1),
       ]);
       const row = (await f.store.claim())!;
+      expect(row.id).toBe(job.jobId);
       expect(await f.store.submitting(row)).toBe(true);
       if (phase === 'waiting') await f.store.submitted(row, 'original-task');
       if (phase === 'receipt' || phase === 'materializing') {

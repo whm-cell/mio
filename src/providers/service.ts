@@ -189,7 +189,7 @@ export function createProviderService(
     },
     async listImageModels(actor: Pick<ProviderPrincipal, 'userId'>) {
       assertOpen();
-      const row = await store.state(actor.userId);
+      const row = await store.state(actor.userId, false);
       assertOpen();
       if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
       const providerReason = membershipError(row, undefined);

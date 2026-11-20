@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { legacyReference } from '../../src/providers/catalog.ts';
@@ -119,6 +119,69 @@ it('omits verification aggregation only for fresh runtime snapshots and retains 
     states.mockRestore();
   }
 });
+
+it.each(['empty', 'current', 'stale'] as const)(
+  'omits unconsumed verification reads for model listing, preferences and recording with %s observations',
+  async (observations) => {
+    const f = await fixture(async () => metadata(['projection-chat', 'image-vidu-q2']));
+    await f.service.discover(f.actor);
+    const catalog = await f.service.catalog(f.actor);
+    const ref = catalog.items.find((item) => item.modelId === 'projection-chat')!.modelRef;
+    await f.declare(ref);
+    await f.store.importRoutes([findFixtureRoute('image-vidu-q2', 'image.generate')]);
+    const snapshot = await f.service.resolveChat(f.actor, await f.service.selectChat(f.actor, ref));
+    if (observations !== 'empty') {
+      await f.store.recordVerification(f.actor.userId, snapshot, 'fixture:existing-observation');
+      if (observations === 'stale')
+        await pool.query(
+          "UPDATE mio_provider_model_verifications SET tested_tuple=jsonb_set(tested_tuple,'{credentialVersion}','0') WHERE provider_id=$1",
+          [snapshot.providerConfigId],
+        );
+    }
+    const before = await f.service.listImageModels(f.actor);
+    expect(before.map((item) => item.modelId)).toEqual(['image-vidu-q2']);
+    const queries = vi.spyOn(Client.prototype, 'query');
+    try {
+      expect(await f.service.listImageModels(f.actor)).toEqual(before);
+      const changed = await f.service.preference(
+        f.actor,
+        (await f.service.get(f.actor))!.revision,
+        ref,
+        { name: 'preferred chat', usage: 'chat', isDefault: true },
+      );
+      expect(changed.id).toBe(snapshot.providerConfigId);
+      await f.store.recordVerification(f.actor.userId, snapshot, 'fixture:latest-observation');
+      const stateReads = queries.mock.calls
+        .map(([sql]) => sql)
+        .filter((sql): sql is string => typeof sql === 'string' && sql.startsWith('SELECT c.*,'));
+      expect(stateReads).toHaveLength(3);
+      for (const sql of stateReads) expect(sql).not.toContain('mio_provider_model_verifications');
+      const visible = await f.service.catalog(f.actor);
+      expect(visible.items.find((item) => item.modelRef === ref)).toMatchObject({
+        name: 'preferred chat',
+        adaptation: {
+          verification: { status: 'verified', evidence: 'fixture:latest-observation' },
+        },
+      });
+      expect(visible.defaults).toContainEqual(
+        expect.objectContaining({
+          modelRef: ref,
+          effective: true,
+        }),
+      );
+      expect(
+        queries.mock.calls.some(
+          ([sql]) =>
+            typeof sql === 'string' &&
+            sql.startsWith('SELECT c.*,') &&
+            sql.includes('mio_provider_model_verifications'),
+        ),
+      ).toBe(true);
+    } finally {
+      queries.mockRestore();
+    }
+  },
+);
 
 it('discovers new exact identities without a release, keeps unknown metadata pending and freezes current versions', async () => {
   let ids = ['Future-Q', 'future-Q', 'claude-does-not-prove-protocol', 'vendor:route-K'];

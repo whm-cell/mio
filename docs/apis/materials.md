@@ -8,7 +8,7 @@
 
 身份仅来自登录 Cookie，资源按 owner 查询；服务 Bearer 不授予用户身份。写入要求允许的精确 Origin 和 `application/json`，GET 提供 Origin 时也须匹配；OPTIONS 无需登录但须允许 Origin。JSON 为对象、8192 字节、10 秒，拒绝额外字段且读完复核会话。响应均 `no-store`、`X-Request-Id`；错误 `{error:{code,message,requestId}}`。常见错误为 400 BODY_INVALID/QUERY_INVALID/CURSOR_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED/PROVIDER_RESOURCE_FORBIDDEN、404 NOT_FOUND/MATERIAL_NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED、409 REVISION_CONFLICT/IDEMPOTENCY_CONFLICT/MATERIAL_BUSY/MATERIAL_GROUP_NOT_READY/RESOURCE_IN_USE/PROVIDER_UNAVAILABLE/UPSTREAM_RESOURCE_COLLISION、429 MATERIAL_QUERY_LIMITED（`Retry-After: 4`）、503 MATERIAL_UNAVAILABLE/UPSTREAM_RESULT_UNKNOWN/UPSTREAM_RESPONSE_INVALID/UPSTREAM_REJECTED/UPSTREAM_RATE_LIMITED。不返回密钥、密文、上游 ID、签名 URL 或供应商原始响应。
 
-`GroupView={groupId,type,name,authStatus,state,revision,materialCount,lastSyncedAt,lastSyncStatus,lastSyncErrorCode}`；type 为 real/aigc，authStatus 为 verified/not_applicable，state 为 creating/ready/unknown/deleting/deleted/failed，lastSyncStatus 为 running/succeeded/failed/null。`MaterialView={materialId,groupId,sourceAssetId,assetType,name,state,revision,lastSyncedAt,errorCode,pollAfterMs}`，assetType 为 image，state 为 registering/processing/active/rejected/unknown/deleting/deleted/failed；remote-only 来源 sourceAssetId 为 null，当前无预览 URL，processing 的 pollAfterMs 为 4000，其他为 0。`OperationView={operationId,kind,state,resultLocalId,errorCode,pollAfterMs}`，kind 只允许 create_group/register_material/delete_material_upstream/delete_group_upstream，state 为 creating/deleting/succeeded/failed/unknown，creating/deleting 的 pollAfterMs 为 3000，其他为 0。unknown 建组须人工核对；不能换 requestId 自动重发。
+`GroupView={groupId,type,name,authStatus,state,revision,materialCount,lastSyncedAt,lastSyncStatus,lastSyncErrorCode}`；type 为 real/aigc，authStatus 为 verified/not_applicable，state 为 creating/ready/unknown/deleting/deleted/failed，lastSyncStatus 为 running/succeeded/failed/null。`MaterialView={materialId,groupId,sourceAssetId,assetType,name,state,revision,lastSyncedAt,errorCode,pollAfterMs}`，assetType 为 image，state 为 registering/processing/active/rejected/unknown/deleting/deleted/failed；remote-only 来源 sourceAssetId 为 null，当前无预览 URL，processing 的 pollAfterMs 为 4000，其他为 0。`OperationView={operationId,kind,state,resultLocalId,errorCode,pollAfterMs}`，kind 只允许 create_group/register_material/delete_material_upstream/delete_group_upstream，state 为 creating/deleting/succeeded/failed/unknown，creating/deleting 的 pollAfterMs 为 3000，其他为 0。unknown 建组已保存确切上游 ID 时可通过原 operation 精确复核恢复；无 ID 须人工核对，不能换 requestId 自动重发。
 
 本地 PG 是组归属唯一权威，严禁枚举上游共享组池或按名称认领。非空 `(provider_type,upstream_group_id)` 与 `(provider_type,upstream_asset_id)` 全局唯一，墓碑保留唯一身份。只对本人已知组执行组内同步；凭据轮换保留归属和历史，新出站使用 owner 当前启用且非 rejected 的账号级凭据，不依赖目录或模型。资源 403 不拒绝整个 provider，也不删除资源；精确 HTTP 404/ResourceNotFound 与 403 分开处理。
 
@@ -138,8 +138,8 @@
 
 输入：本地小写 UUID v4，无查询参数。
 
-成功：200 OperationView；expired creating/deleting 租约转 unknown，同事务保留实体未知事实。unknown create 不自动找全池或重发，需人工核对远端残留。
+成功：200 OperationView；expired creating/deleting 租约转 unknown，同事务保留实体未知事实。unknown create 在已保存确切上游 ID 时由当前 owner 凭据执行单资源 GetAssetGroup，确认存在后按原操作输入/双租约在同一事务补映射并收束 succeeded；无 ID 则需人工核对远端残留，不全池查找或重发。
 
 错误：他人操作统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
-副作用：本地读取并收敛到期操作；已知远端删除的 unknown 由 5 秒持久冷却、操作/组双租约认领，最多执行本次必要的 GetAssetGroup/GetAsset 复核，精确 404 才同事务收束 deleted/succeeded。存在、403 或未知继续 unknown；不重发 Delete，不枚举共享池。
+副作用：本地读取并收敛到期操作；Create 已返回合法 ID 但提交失败时，fallback 将 ID/RequestId 仅保留于受限操作快照/审计；fallback 也不可用时披露人工核对。已知建组或远端删除的 unknown 由 5 秒持久冷却、操作/组双租约认领，最多执行本次必要的 GetAssetGroup/GetAsset 复核，已知建组确认存在才同事务发布 ready/succeeded（跨 owner 全局冲突拒绝且不读回他人）；远端删除精确 404 才收束 deleted/succeeded。建组 403/404、删除仍存在或未知继续 unknown；不重发 Delete，不枚举共享池。

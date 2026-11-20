@@ -269,13 +269,26 @@ export class MaterialStore {
     operation: OperationRow,
     uncertain: boolean,
     code: string,
+    knownCreate?: { id: string; requestId: string | null },
   ): Promise<void> {
     await this.transaction(async (client) => {
       const row = (
         await client.query<OperationRow>(
-          `UPDATE mio_material_operations SET state=$4,error_code=$5,lease_id=NULL,lease_until=NULL,updated_at=now()
-        WHERE owner_id=$1 AND id=$2 AND lease_id=$3 AND state IN ('creating','deleting') RETURNING *`,
-          [owner, operation.id, operation.lease_id, uncertain ? 'unknown' : 'failed', code],
+          `UPDATE mio_material_operations SET state=$4,error_code=$5,lease_id=NULL,lease_until=NULL,updated_at=now(),
+          protocol_snapshot=CASE WHEN kind='create_group' AND $6::text IS NOT NULL THEN jsonb_build_object('version',1,'upstreamId',$6::text) ELSE protocol_snapshot END,
+          upstream_request_id=CASE WHEN kind='create_group' AND $6::text IS NOT NULL THEN $7 ELSE upstream_request_id END
+        WHERE owner_id=$1 AND id=$2 AND input_hash=$8 AND ((lease_id=$3 AND state IN ('creating','deleting')) OR
+          (kind='create_group' AND state='unknown' AND lease_id IS NULL AND protocol_snapshot->>'upstreamId' IS NULL AND $6::text IS NOT NULL)) RETURNING *`,
+          [
+            owner,
+            operation.id,
+            operation.lease_id,
+            uncertain ? 'unknown' : 'failed',
+            code,
+            knownCreate?.id ?? null,
+            knownCreate?.requestId ?? null,
+            operation.input_hash,
+          ],
         )
       ).rows[0];
       if (!row) return;
@@ -675,7 +688,8 @@ export class MaterialStore {
       const claim = (
         await client.query<OperationRow>(
           `UPDATE mio_material_operations SET lease_id=$3,lease_until=clock_timestamp()+interval '60 seconds',next_query_at=now()+interval '5 seconds'
-        WHERE owner_id=$1 AND id=$2 AND state='unknown' AND kind IN ('delete_material_upstream','delete_group_upstream')
+        WHERE owner_id=$1 AND id=$2 AND state='unknown' AND kind IN ('create_group','delete_material_upstream','delete_group_upstream')
+        AND (kind<>'create_group' OR protocol_snapshot->>'upstreamId' IS NOT NULL)
         AND (lease_until IS NULL OR lease_until<=clock_timestamp()) AND (next_query_at IS NULL OR next_query_at<=now()) RETURNING *`,
           [owner, id, lease],
         )
@@ -692,7 +706,7 @@ export class MaterialStore {
   async finishRecovery(
     owner: string,
     op: OperationRow,
-    absent: boolean,
+    confirmed: boolean,
     code: string | null,
   ): Promise<void> {
     await this.transaction(async (client) => {
@@ -709,13 +723,19 @@ export class MaterialStore {
         )
       ).rows[0];
       if (!current) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
-      if (absent) {
+      if (confirmed) {
         const table = op.target_material_id ? 'mio_materials' : 'mio_material_groups';
         const id = op.target_material_id ?? op.target_group_id;
-        const saved = await client.query(
-          `UPDATE ${table} SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state IN ('unknown','deleting')`,
-          [owner, id],
-        );
+        const saved =
+          op.kind === 'create_group'
+            ? await client.query(
+                "UPDATE mio_material_groups SET state='ready',upstream_group_id=$3,revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_group_id IS NULL",
+                [owner, id, current.protocol_snapshot.upstreamId],
+              )
+            : await client.query(
+                `UPDATE ${table} SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state IN ('unknown','deleting')`,
+                [owner, id],
+              );
         if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
         await client.query(
           "UPDATE mio_material_operations SET state='succeeded',error_code=NULL,result_local_id=$4,lease_id=NULL,lease_until=NULL,updated_at=now() WHERE owner_id=$1 AND id=$2 AND lease_id=$3",

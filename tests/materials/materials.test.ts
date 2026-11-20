@@ -124,9 +124,12 @@ it('persists creation intention, blocks local removal in flight, and leaves post
   );
   expect(await f.service.operation(f.actor, result.operation.operationId)).toHaveProperty(
     'state',
-    'unknown',
+    'succeeded',
   );
-  expect(f.transport).toHaveBeenCalledTimes(count);
+  expect(f.transport).toHaveBeenCalledTimes(count + 1);
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=CreateAssetGroup')),
+  ).toHaveLength(1);
 });
 
 it('keeps lost-ID create unknown over restart and does not auto-submit when its lease expires', async () => {
@@ -574,4 +577,143 @@ it('rolls back the entire sync if a lease expires during entity writes, includin
   expect((await f.store.ownedGroup(f.actor.userId, group.groupId)).last_sync_status).toBe(
     'running',
   );
+});
+
+it('retains a confirmed create identity after PG failure and recovers across restart using one exact Get without a second Create', async () => {
+  const f = await fixture();
+  const request = randomUUID();
+  vi.spyOn(f.store, 'finishCreate').mockRejectedValueOnce(new Error('PG_COMMIT_LOST'));
+  const result = await f.service.createGroup(f.actor, request, 'Known after response');
+  expect(result.operation.state).toBe('unknown');
+  const op = await f.store.operation(f.actor.userId, result.operation.operationId);
+  expect(op.protocol_snapshot.upstreamId).toMatch(/^group-/);
+  expect(op.upstream_request_id).toMatch(/^[0-9a-f-]{36}$/);
+  await f.service.close();
+  const restarted = createMaterialService(
+    await createMaterialStore(f.database.url),
+    f.provider,
+    createMaterialUpstream(f.transport),
+  );
+  try {
+    await expect(
+      restarted.operation({ userId: 'other', sessionId: 'other' }, op.id),
+    ).rejects.toMatchObject({ code: 'MATERIAL_NOT_FOUND' });
+    expect(await restarted.operation(f.actor, op.id)).toMatchObject({
+      state: 'succeeded',
+      resultLocalId: op.target_group_id,
+    });
+    expect(await restarted.group(f.actor, op.target_group_id!)).toMatchObject({
+      state: 'ready',
+      name: 'Known after response',
+    });
+    expect(
+      (await restarted.createGroup(f.actor, request, 'Known after response')).operation.state,
+    ).toBe('succeeded');
+  } finally {
+    await restarted.close();
+  }
+  const calls = f.transport.mock.calls.map(([url]) =>
+    new URL(String(url)).searchParams.get('Action'),
+  );
+  expect(calls.filter((action) => action === 'CreateAssetGroup')).toHaveLength(1);
+  expect(calls.filter((action) => action === 'GetAssetGroup')).toHaveLength(1);
+  const get = f.transport.mock.calls.find(([url]) => String(url).includes('Action=GetAssetGroup'))!;
+  expect(JSON.parse(String(get[1]?.body))).toEqual({ Id: op.protocol_snapshot.upstreamId });
+});
+
+it.each([403, 404])(
+  'keeps known-create recovery unknown for exact resource %s and does not claim or repeat',
+  async (status) => {
+    const f = await fixture();
+    vi.spyOn(f.store, 'finishCreate').mockRejectedValueOnce(new Error('PG_COMMIT_LOST'));
+    const result = await f.service.createGroup(f.actor, randomUUID(), 'Cannot verify');
+    f.override(async (action) =>
+      action === 'GetAssetGroup'
+        ? envelope(action, {}, status, status === 404 ? 'ResourceNotFound' : 'Forbidden')
+        : undefined,
+    );
+    expect(await f.service.operation(f.actor, result.operation.operationId)).toMatchObject({
+      state: 'unknown',
+      errorCode: status === 404 ? 'UPSTREAM_RESOURCE_NOT_FOUND' : 'PROVIDER_RESOURCE_FORBIDDEN',
+    });
+    const calls = f.transport.mock.calls.length;
+    await Promise.all(
+      Array.from({ length: 4 }, () => f.service.operation(f.actor, result.operation.operationId)),
+    );
+    expect(f.transport).toHaveBeenCalledTimes(calls);
+    const op = await f.store.operation(f.actor.userId, result.operation.operationId);
+    const group = await f.store.ownedGroup(f.actor.userId, op.target_group_id!);
+    expect(group).toMatchObject({ state: 'unknown', upstream_group_id: null });
+    expect(
+      f.transport.mock.calls.filter(([url]) => String(url).includes('Action=CreateAssetGroup')),
+    ).toHaveLength(1);
+  },
+);
+
+it('does not bind a known-create recovery ID already owned by another user and serializes concurrent recovery', async () => {
+  const f = await fixture();
+  const existing = await f.create();
+  const other = { userId: randomUUID(), sessionId: 'other' };
+  await f.provider.save(other, 0, 'synthetic-other-key');
+  f.override(async (action) =>
+    action === 'CreateAssetGroup' ? envelope(action, { Id: existing.upstreamId }) : undefined,
+  );
+  const collision = await f.service.createGroup(other, randomUUID(), 'Collision');
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  f.override(async (action) => {
+    if (action === 'GetAssetGroup') {
+      entered.resolve();
+      await release.promise;
+    }
+    return;
+  });
+  const first = f.service.operation(other, collision.operation.operationId);
+  await entered.promise;
+  const before = f.transport.mock.calls.length;
+  const rest = await Promise.all(
+    Array.from({ length: 5 }, () => f.service.operation(other, collision.operation.operationId)),
+  );
+  expect(rest.every((op) => op.state === 'unknown')).toBe(true);
+  expect(f.transport).toHaveBeenCalledTimes(before);
+  release.resolve();
+  expect(await first).toMatchObject({ state: 'unknown', errorCode: 'UPSTREAM_RESOURCE_COLLISION' });
+  expect(
+    (
+      await f.pool.query('SELECT owner_id FROM mio_material_groups WHERE upstream_group_id=$1', [
+        existing.upstreamId,
+      ])
+    ).rows,
+  ).toEqual([{ owner_id: f.actor.userId }]);
+});
+
+it('preserves a late known create response even after an expired operation was made unknown', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  f.override(async (action) => {
+    if (action === 'CreateAssetGroup') {
+      entered.resolve();
+      await release.promise;
+    }
+    return;
+  });
+  const pending = f.service.createGroup(f.actor, randomUUID(), 'Late known');
+  await entered.promise;
+  const row = (
+    await f.pool.query('SELECT id FROM mio_material_operations WHERE owner_id=$1', [f.actor.userId])
+  ).rows[0];
+  await f.pool.query(
+    "UPDATE mio_material_operations SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",
+    [row.id],
+  );
+  expect((await f.store.operation(f.actor.userId, row.id)).state).toBe('unknown');
+  release.resolve();
+  expect((await pending).operation.state).toBe('unknown');
+  const op = await f.store.operation(f.actor.userId, row.id);
+  expect(op.protocol_snapshot.upstreamId).toMatch(/^group-/);
+  expect(await f.service.operation(f.actor, row.id)).toMatchObject({ state: 'succeeded' });
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=CreateAssetGroup')),
+  ).toHaveLength(1);
 });

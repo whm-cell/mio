@@ -108,6 +108,7 @@ export function createMaterialService(
     error: unknown,
     returned: boolean,
     attempted: boolean,
+    knownCreate?: { id: string; requestId: string | null },
   ) => {
     // A database failure after a successful response is just as uncertain as a transport timeout.
     const uncertain =
@@ -120,6 +121,7 @@ export function createMaterialService(
         !attempted && !(error instanceof MaterialError) && !(error instanceof ProviderError)
           ? 'MATERIAL_UNAVAILABLE'
           : errorCode(error),
+        knownCreate,
       )
       .catch(() => {});
   };
@@ -169,16 +171,17 @@ export function createMaterialService(
         if (!fresh) return operationResult(owner, op);
         let returned = false;
         let attempted = false;
+        let remote: Awaited<ReturnType<MaterialUpstream['createGroup']>> | undefined;
         try {
           stop.signal.throwIfAborted();
           const key = credentials.openAccountSnapshot(owner, snapshot);
           attempted = true;
-          const remote = await upstream.createGroup(key, name, stop.signal);
+          remote = await upstream.createGroup(key, name, stop.signal);
           returned = true;
           stop.signal.throwIfAborted();
           await store.finishCreate(owner, op, remote.id, remote.requestId);
         } catch (error) {
-          await settleFailure(owner, op, error, returned, attempted);
+          await settleFailure(owner, op, error, returned, attempted, remote);
         }
         const result = await operationResult(owner, op);
         return {
@@ -359,12 +362,22 @@ export function createMaterialService(
       return admit(async () => {
         const owner = actor.userId;
         const op = await store.operation(owner, id);
-        if (op.state !== 'unknown' || op.kind === 'create_group' || op.kind === 'register_material')
+        if (
+          op.state !== 'unknown' ||
+          (op.kind === 'create_group' && !op.protocol_snapshot.upstreamId) ||
+          op.kind === 'register_material'
+        )
           return operationView(op);
         const claim = await store.claimRecovery(owner, id);
         if (!claim) return operationView(op);
         try {
           await outbound(owner, async (key, signal) => {
+            if (claim.kind === 'create_group') {
+              await upstream.getGroup(key, claim.protocol_snapshot.upstreamId!, signal);
+              signal.throwIfAborted();
+              await store.finishRecovery(owner, claim, true, null);
+              return;
+            }
             const group = await store.ownedGroup(owner, claim.target_group_id!);
             if (claim.target_material_id)
               await upstream.getGroup(key, group.upstream_group_id!, signal);

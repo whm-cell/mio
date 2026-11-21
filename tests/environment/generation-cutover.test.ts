@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
 import { access, lstat, mkdtemp, readdir, rm, statfs, writeFile } from 'node:fs/promises';
+import type * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -13,7 +14,7 @@ import { inspectGenerationCutover } from '../../scripts/service/generation-cutov
 import { authDatabase } from '../support/auth-database.ts';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
-  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  const fs = await importOriginal<typeof fsPromises>();
   return { ...fs, access: vi.fn(fs.access), statfs: vi.fn(fs.statfs) };
 });
 

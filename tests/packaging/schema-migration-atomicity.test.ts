@@ -146,10 +146,11 @@ it.each(migrations)(
       expect(await readHistory()).toEqual(damagedHistory);
 
       await pool.query(migration.repair);
+      const legacySchema = await schema(pool);
       const first = run('--apply');
       expect(first.status, first.stderr).toBe(0);
       const migrated = await schema(pool);
-      expect(migrated).not.toEqual(damagedSchema);
+      expect(migrated).not.toEqual(legacySchema);
       expect(await readHistory()).toEqual(legacyHistory);
 
       const repeated = run('--apply');

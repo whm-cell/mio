@@ -24,6 +24,10 @@ docker compose --env-file "$RABBITMQ_ENV_FILE" -p mio-compute -f deploy/rabbitmq
 本机测试可在共享协议包构建后使用一次性 bootstrap：
 
 ```sh
+(
+  umask 077
+  mkdir -p .runtime/compute-environment
+)
 node scripts/service/prepare-compute-broker.ts "$RABBITMQ_ENV_FILE" .runtime/compute-environment/broker-p3
 ```
 

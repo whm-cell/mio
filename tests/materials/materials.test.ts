@@ -70,7 +70,7 @@ it('deduplicates same request and input, rejects different input and never disco
   await expect(f.service.createGroup(f.actor, request, 'Different')).rejects.toMatchObject({
     code: 'IDEMPOTENCY_CONFLICT',
   });
-  const existing = (await f.service.groups(f.actor, undefined, 20)).items[0] as { groupId: string };
+  const existing = (await f.service.groups(f.actor, undefined, 20)).items[0]!;
   const upstream = (await f.store.ownedGroup(f.actor.userId, existing.groupId)).upstream_group_id;
   const other = { userId: randomUUID(), sessionId: 'other' };
   await f.provider.save(other, 0, 'other-synthetic-key');
@@ -180,10 +180,7 @@ it('syncs only one owned group and one bounded page, preserves missing-page reco
     PageSize: 100,
   });
   await f.service.sync(f.actor, group.groupId, '2');
-  const all = (await f.service.materials(f.actor, group.groupId, 100)).items as {
-    materialId: string;
-    revision: number;
-  }[];
+  const all = (await f.service.materials(f.actor, group.groupId, 100)).items;
   expect(all).toHaveLength(100);
   await f.service.remove(
     f.actor,

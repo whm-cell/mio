@@ -12,30 +12,76 @@ import { createMaterialAuthPublicHandler } from './auth-http.ts';
 import type { MaterialService } from './service.ts';
 
 const BASE = '/api/v1/materials';
-function route(path: string): { kind: string; id?: string; methods: string[] } | undefined {
-  if (path === `${BASE}/auth-sessions`) return { kind: 'authCreate', methods: ['POST'] };
-  const refresh = path.match(/^\/api\/v1\/materials\/auth-sessions\/([^/]+)\/refresh$/);
-  if (refresh?.[1] && isUuidV4(refresh[1]))
-    return { kind: 'authRefresh', id: refresh[1], methods: ['POST'] };
-  const session = path.match(/^\/api\/v1\/materials\/auth-sessions\/([^/]+)$/);
-  if (session?.[1] && isUuidV4(session[1]))
-    return { kind: 'authGet', id: session[1], methods: ['GET'] };
-  if (path === `${BASE}/groups`) return { kind: 'groups', methods: ['GET', 'POST'] };
+type MaterialAction =
+  | { kind: 'listGroups'; method: 'GET' }
+  | { kind: 'createGroup'; method: 'POST' }
+  | {
+      kind: 'getGroup' | 'listMaterials' | 'getMaterial' | 'getOperation';
+      method: 'GET';
+      id: string;
+    }
+  | { kind: 'renameGroup'; method: 'PATCH'; id: string }
+  | {
+      kind: 'syncGroup' | 'registerMaterial' | 'refreshMaterial' | 'deleteGroup' | 'deleteMaterial';
+      method: 'POST';
+      id: string;
+    }
+  | { kind: 'authCreate'; method: 'POST'; authentication: MaterialAuthService }
+  | { kind: 'authGet'; method: 'GET'; id: string; authentication: MaterialAuthService }
+  | { kind: 'authRefresh'; method: 'POST'; id: string; authentication: MaterialAuthService };
+
+const bodyKeys: Record<Exclude<MaterialAction, { method: 'GET' }>['kind'], readonly string[]> = {
+  authCreate: ['requestId', 'source', 'returnTarget'],
+  authRefresh: [],
+  createGroup: ['requestId', 'type', 'name'],
+  renameGroup: ['revision', 'name'],
+  syncGroup: ['cursor'],
+  registerMaterial: ['requestId', 'assetId', 'name'],
+  refreshMaterial: [],
+  deleteGroup: ['requestId', 'revision', 'scope', 'confirmCascade'],
+  deleteMaterial: ['requestId', 'revision', 'scope'],
+};
+
+function route(path: string, authentication?: MaterialAuthService): MaterialAction[] | undefined {
+  if (authentication) {
+    if (path === `${BASE}/auth-sessions`)
+      return [{ kind: 'authCreate', method: 'POST', authentication }];
+    const session = path.match(/^\/api\/v1\/materials\/auth-sessions\/([^/]+)(\/refresh)?$/);
+    if (session?.[1] && isUuidV4(session[1])) {
+      const id = session[1];
+      return session[2]
+        ? [{ kind: 'authRefresh', method: 'POST', id, authentication }]
+        : [{ kind: 'authGet', method: 'GET', id, authentication }];
+    }
+  }
+  if (path === `${BASE}/groups`)
+    return [
+      { kind: 'listGroups', method: 'GET' },
+      { kind: 'createGroup', method: 'POST' },
+    ];
   const match = path.match(
     /^\/api\/v1\/materials\/(groups|items|operations)\/([^/]+)(?:\/(sync|materials|refresh|delete))?$/,
   );
   if (!match || !match[2] || !isUuidV4(match[2])) return;
   const [, entity, , action] = match;
   const id = match[2];
-  if (entity === 'groups' && !action) return { kind: 'group', id, methods: ['GET', 'PATCH'] };
+  if (entity === 'groups' && !action)
+    return [
+      { kind: 'getGroup', method: 'GET', id },
+      { kind: 'renameGroup', method: 'PATCH', id },
+    ];
   if (entity === 'groups' && action === 'materials')
-    return { kind: 'materials', id, methods: ['GET', 'POST'] };
-  if (entity === 'groups' && action === 'sync') return { kind: 'sync', id, methods: ['POST'] };
-  if (entity === 'items' && !action) return { kind: 'material', id, methods: ['GET'] };
-  if (entity === 'items' && action === 'refresh') return { kind: 'refresh', id, methods: ['POST'] };
+    return [
+      { kind: 'listMaterials', method: 'GET', id },
+      { kind: 'registerMaterial', method: 'POST', id },
+    ];
+  if (entity === 'groups' && action === 'sync') return [{ kind: 'syncGroup', method: 'POST', id }];
+  if (entity === 'items' && !action) return [{ kind: 'getMaterial', method: 'GET', id }];
+  if (entity === 'items' && action === 'refresh')
+    return [{ kind: 'refreshMaterial', method: 'POST', id }];
   if ((entity === 'groups' || entity === 'items') && action === 'delete')
-    return { kind: entity === 'groups' ? 'deleteGroup' : 'deleteMaterial', id, methods: ['POST'] };
-  if (entity === 'operations' && !action) return { kind: 'operation', id, methods: ['GET'] };
+    return [{ kind: entity === 'groups' ? 'deleteGroup' : 'deleteMaterial', method: 'POST', id }];
+  if (entity === 'operations' && !action) return [{ kind: 'getOperation', method: 'GET', id }];
 }
 function validName(value: unknown): value is string {
   return (
@@ -84,24 +130,25 @@ export function createMaterialHandler(
         response.setHeader('vary', 'Origin');
       }
       const url = new URL(request.url ?? '', 'http://mio.invalid');
-      const endpoint = route(url.pathname);
-      if (!endpoint || (endpoint.kind.startsWith('auth') && !authentication))
-        return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      if (request.method === 'OPTIONS') {
+      const actions = route(url.pathname, authentication);
+      if (!actions) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      const action = actions.find(({ method }) => method === request.method);
+      if (!action) {
+        const methods = [...actions.map(({ method }) => method), 'OPTIONS'].join(', ');
+        if (request.method !== 'OPTIONS') {
+          response.setHeader('allow', methods);
+          return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
+        }
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
         response
           .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': [...endpoint.methods, 'OPTIONS'].join(', '),
+            'access-control-allow-methods': methods,
             'access-control-allow-headers': 'Content-Type',
           })
           .end();
         return;
       }
-      if (!endpoint.methods.includes(request.method ?? '')) {
-        response.setHeader('allow', [...endpoint.methods, 'OPTIONS'].join(', '));
-        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
-      }
-      const writing = request.method !== 'GET';
+      const writing = action.method !== 'GET';
       if (writing && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
       if (writing && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
         return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
@@ -114,9 +161,9 @@ export function createMaterialHandler(
         actor = await identity(headers);
         if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       }
-      const list = request.method === 'GET' && ['groups', 'materials'].includes(endpoint.kind);
+      const list = action.kind === 'listGroups' || action.kind === 'listMaterials';
       const queryKeys = list
-        ? endpoint.kind === 'groups'
+        ? action.kind === 'listGroups'
           ? ['cursor', 'limit', 'type']
           : ['cursor', 'limit']
         : [];
@@ -136,121 +183,117 @@ export function createMaterialHandler(
       const type = url.searchParams.get('type') ?? undefined;
       if (type !== undefined && type !== 'aigc' && type !== 'real')
         return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
-      const keys =
-        endpoint.kind === 'authCreate'
-          ? ['requestId', 'source', 'returnTarget']
-          : endpoint.kind === 'groups'
-            ? ['requestId', 'type', 'name']
-            : endpoint.kind === 'group'
-              ? ['revision', 'name']
-              : endpoint.kind === 'materials'
-                ? ['requestId', 'assetId', 'name']
-                : endpoint.kind === 'sync'
-                  ? ['cursor']
-                  : endpoint.kind === 'deleteGroup'
-                    ? ['requestId', 'revision', 'scope', 'confirmCascade']
-                    : endpoint.kind === 'deleteMaterial'
-                      ? ['requestId', 'revision', 'scope']
-                      : [];
-      if (Object.keys(body).some((key) => !keys.includes(key)))
-        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      if (action.method !== 'GET') {
+        const keys = bodyKeys[action.kind];
+        if (Object.keys(body).some((key) => !keys.includes(key)))
+          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      }
       const send = (result: unknown, status: number = HTTP_STATUS.OK) => {
         response
           .writeHead(status, { 'content-type': 'application/json' })
           .end(JSON.stringify(result));
       };
-      const id = endpoint.id!;
-      if (!writing) {
-        const cursor = url.searchParams.get('cursor') ?? undefined;
-        if (endpoint.kind === 'authGet') return send(await authentication!.get(actor, id));
-        if (endpoint.kind === 'groups')
+      const cursor = url.searchParams.get('cursor') ?? undefined;
+      const mutationId =
+        typeof body.requestId === 'string' && isUuidV4(body.requestId) ? body.requestId : undefined;
+      switch (action.kind) {
+        case 'authGet':
+          return send(await action.authentication.get(actor, action.id));
+        case 'listGroups':
           return send(await service.groups(actor, type, limit, cursor));
-        if (endpoint.kind === 'materials')
-          return send(await service.materials(actor, id, limit, cursor));
-        if (endpoint.kind === 'group') return send(await service.group(actor, id));
-        if (endpoint.kind === 'material') return send(await service.material(actor, id));
-        return send(await service.operation(actor, id));
+        case 'listMaterials':
+          return send(await service.materials(actor, action.id, limit, cursor));
+        case 'getGroup':
+          return send(await service.group(actor, action.id));
+        case 'getMaterial':
+          return send(await service.material(actor, action.id));
+        case 'getOperation':
+          return send(await service.operation(actor, action.id));
+        case 'authRefresh':
+          return send(await action.authentication.refresh(actor, action.id));
+        case 'syncGroup': {
+          const syncCursor = body.cursor;
+          if (syncCursor !== undefined && typeof syncCursor !== 'string')
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          return send(await service.sync(actor, action.id, syncCursor));
+        }
+        case 'refreshMaterial':
+          return send(await service.refresh(actor, action.id));
+        case 'renameGroup':
+          if (!revision(body.revision) || !validName(body.name))
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          return send(await service.rename(actor, action.id, body.revision, body.name));
+        case 'authCreate': {
+          if (!mutationId || body.source !== 'materials' || body.returnTarget !== 'materials')
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          const result = await action.authentication.create(
+            actor,
+            mutationId,
+            'materials',
+            'materials',
+          );
+          return send(
+            result,
+            ['pending', 'completed'].includes(result.state)
+              ? HTTP_STATUS.CREATED
+              : HTTP_STATUS.ACCEPTED,
+          );
+        }
+        case 'registerMaterial': {
+          const { assetId, name } = body;
+          if (
+            !mutationId ||
+            typeof assetId !== 'string' ||
+            !isUuidV4(assetId) ||
+            (name !== undefined && !validName(name))
+          )
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          const result = await service.register(actor, action.id, mutationId, assetId, name);
+          return send(
+            result,
+            result.operation.state === 'succeeded' ? HTTP_STATUS.CREATED : HTTP_STATUS.ACCEPTED,
+          );
+        }
+        case 'createGroup': {
+          if (!mutationId || body.type !== 'aigc' || !validName(body.name))
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          const result = await service.createGroup(actor, mutationId, body.name);
+          return send(
+            result,
+            result.operation.state === 'succeeded' ? HTTP_STATUS.CREATED : HTTP_STATUS.ACCEPTED,
+          );
+        }
+        case 'deleteGroup':
+        case 'deleteMaterial': {
+          if (
+            !mutationId ||
+            !revision(body.revision) ||
+            (body.scope !== 'local' && body.scope !== 'upstream')
+          )
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          if (
+            'confirmCascade' in body &&
+            (body.scope !== 'upstream' || typeof body.confirmCascade !== 'boolean')
+          )
+            return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+          const result = await service.remove(
+            actor,
+            action.kind === 'deleteGroup' ? 'group' : 'material',
+            action.id,
+            mutationId,
+            body.revision,
+            body.scope,
+            body.confirmCascade === true,
+          );
+          return send(
+            result,
+            'operation' in result && result.operation.state !== 'succeeded'
+              ? HTTP_STATUS.ACCEPTED
+              : HTTP_STATUS.OK,
+          );
+        }
       }
-      if (endpoint.kind === 'authRefresh') return send(await authentication!.refresh(actor, id));
-      if (endpoint.kind === 'sync') {
-        if ('cursor' in body && typeof body.cursor !== 'string')
-          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        return send(await service.sync(actor, id, body.cursor as string | undefined));
-      }
-      if (endpoint.kind === 'refresh') return send(await service.refresh(actor, id));
-      if (endpoint.kind === 'group') {
-        if (!revision(body.revision) || !validName(body.name))
-          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        return send(await service.rename(actor, id, body.revision, body.name));
-      }
-      if (typeof body.requestId !== 'string' || !isUuidV4(body.requestId))
-        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-      if (endpoint.kind === 'authCreate') {
-        if (body.source !== 'materials' || body.returnTarget !== 'materials')
-          return fail(400, 'BODY_INVALID');
-        const result = await authentication!.create(
-          actor,
-          body.requestId,
-          'materials',
-          'materials',
-        );
-        return send(
-          result,
-          ['pending', 'completed'].includes(result.state)
-            ? HTTP_STATUS.CREATED
-            : HTTP_STATUS.ACCEPTED,
-        );
-      }
-      if (endpoint.kind === 'materials') {
-        if (
-          typeof body.assetId !== 'string' ||
-          !isUuidV4(body.assetId) ||
-          ('name' in body && !validName(body.name))
-        )
-          return fail(400, 'BODY_INVALID');
-        const result = await service.register(
-          actor,
-          id,
-          body.requestId,
-          body.assetId,
-          body.name as string | undefined,
-        );
-        return send(
-          result,
-          result.operation.state === 'succeeded' ? HTTP_STATUS.CREATED : HTTP_STATUS.ACCEPTED,
-        );
-      }
-      if (endpoint.kind === 'groups') {
-        if (body.type !== 'aigc' || !validName(body.name))
-          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        const result = await service.createGroup(actor, body.requestId, body.name);
-        return send(
-          result,
-          result.operation.state === 'succeeded' ? HTTP_STATUS.CREATED : HTTP_STATUS.ACCEPTED,
-        );
-      }
-      if (!revision(body.revision) || (body.scope !== 'local' && body.scope !== 'upstream'))
-        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-      if (
-        'confirmCascade' in body &&
-        (body.scope !== 'upstream' || typeof body.confirmCascade !== 'boolean')
-      )
-        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-      const result = await service.remove(
-        actor,
-        endpoint.kind === 'deleteGroup' ? 'group' : 'material',
-        id,
-        body.requestId,
-        body.revision,
-        body.scope,
-        body.confirmCascade === true,
-      );
-      return send(
-        result,
-        'operation' in result && result.operation.state !== 'succeeded'
-          ? HTTP_STATUS.ACCEPTED
-          : HTTP_STATUS.OK,
-      );
+      return action satisfies never;
     } catch (error) {
       if (
         error instanceof AssetError ||

@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { expect, it, onTestFinished } from 'vitest';
+import { expect, it, onTestFinished, vi } from 'vitest';
 import { materialFixture, envelope } from './fixture.ts';
 import { createMaterialHandler } from '../../src/materials/http.ts';
 
@@ -8,16 +8,14 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
   const f = await materialFixture();
   onTestFinished(() => f.close());
   const origin = 'https://client.example';
-  const handler = createMaterialHandler(
-    f.service,
-    async (headers) =>
-      headers.get('cookie') === 'session=owner'
-        ? f.actor
-        : headers.get('cookie') === 'session=other'
-          ? { userId: 'other', sessionId: 'other' }
-          : null,
-    [origin],
+  const identity = vi.fn(async (headers: Headers) =>
+    headers.get('cookie') === 'session=owner'
+      ? f.actor
+      : headers.get('cookie') === 'session=other'
+        ? { userId: 'other', sessionId: 'other' }
+        : null,
   );
+  const handler = createMaterialHandler(f.service, identity, [origin]);
   const server = createServer((req, res) => void handler(req, res));
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   onTestFinished(() => new Promise<void>((resolve) => server.close(() => resolve())));
@@ -40,6 +38,37 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
       },
       ...(value !== undefined ? { body: JSON.stringify(value) } : {}),
     });
+  const groupPath = `/groups/${randomUUID()}`;
+  const methods = [
+    ['/groups', 'GET, POST, OPTIONS'],
+    [groupPath, 'GET, PATCH, OPTIONS'],
+    [`${groupPath}/materials`, 'GET, POST, OPTIONS'],
+    [`${groupPath}/sync`, 'POST, OPTIONS'],
+  ] as const;
+  for (const [path, allowed] of methods) {
+    const preflight = await call(path, 'OPTIONS', undefined, { cookie: '' });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-methods')).toBe(allowed);
+    expect(preflight.headers.get('access-control-allow-headers')).toBe('Content-Type');
+    expect(preflight.headers.get('access-control-allow-credentials')).toBe('true');
+    const deniedMethod = await call(path, 'PUT', undefined, { cookie: '' });
+    expect(deniedMethod.status).toBe(405);
+    expect(deniedMethod.headers.get('allow')).toBe(allowed);
+  }
+  expect((await fetch(`${base}/groups`, { method: 'OPTIONS' })).status).toBe(403);
+  expect((await call('/groups/malformed/materials', 'OPTIONS')).status).toBe(404);
+  expect((await call('/auth-sessions', 'OPTIONS')).status).toBe(404);
+  expect((await call(`/auth-sessions/${randomUUID()}/refresh`, 'OPTIONS')).status).toBe(404);
+  expect(identity).not.toHaveBeenCalled();
+  identity.mockResolvedValueOnce(f.actor).mockResolvedValueOnce(null);
+  const revoked = await call('/groups', 'POST', {
+    requestId: randomUUID(),
+    type: 'aigc',
+    name: 'Revoked',
+  });
+  expect(revoked.status).toBe(401);
+  expect(identity).toHaveBeenCalledTimes(2);
+  expect(f.transport).not.toHaveBeenCalled();
   expect(
     (await call('/groups', 'GET', undefined, { cookie: '', authorization: 'Bearer service-token' }))
       .status,

@@ -22,6 +22,7 @@ const env: NodeJS.ProcessEnv = {
   MIO_AUTH_SECRET: randomBytes(40).toString('hex'),
   MIO_AUTH_RATE_LIMIT_BACKEND: 'database',
   MIO_ASSETS_DATABASE_URL: database.url,
+  MIO_CONVERSATIONS_DATABASE_URL: database.url,
 };
 const migrate = (name: string) => {
   const result = spawnSync(
@@ -32,7 +33,7 @@ const migrate = (name: string) => {
   if (result.status !== 0) throw new Error(`PORTABLE_MIGRATION_FAILED:${name}`);
 };
 try {
-  for (const name of ['auth', 'assets']) migrate(name);
+  for (const name of ['auth', 'assets', 'conversations']) migrate(name);
   const id = randomUUID();
   await pool.query(
     `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at)
@@ -55,7 +56,8 @@ try {
   );
   console.log('PORTABLE_COMPUTE_MIGRATION_EXISTING_ASSET_OK');
 
-  for (const name of ['auth', 'assets', 'compute', 'generations', 'materials']) migrate(name);
+  for (const name of ['auth', 'assets', 'compute', 'conversations', 'generations', 'materials'])
+    migrate(name);
   assert.deepEqual((await readOriginal()).rows, expected, 'repeated migration changed the asset');
   await pool.query('SELECT id FROM mio_compute_jobs LIMIT 0');
   await pool.query('SELECT id FROM mio_compute_outbox LIMIT 0');
@@ -72,6 +74,9 @@ try {
   );
   console.log('PORTABLE_AUTH_ASSET_COMPUTE_MIGRATIONS_OK');
   console.log('PORTABLE_GENERATIONS_MIGRATION_EXISTING_ASSET_OK');
+  await pool.query('SELECT id FROM mio_conversations LIMIT 0');
+  await pool.query('SELECT conversation_id,request_id FROM mio_conversation_requests LIMIT 0');
+  console.log('PORTABLE_CONVERSATIONS_MIGRATION_OK');
   await pool.query('SELECT id FROM mio_material_groups LIMIT 0');
   await pool.query('SELECT id FROM mio_materials LIMIT 0');
   await pool.query('SELECT id FROM mio_material_operations LIMIT 0');

@@ -13,6 +13,7 @@ try {
     try {
       await client.query('BEGIN');
       await client.query(conversationSchemaSQL);
+      await checkConversationSchema(client);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -20,7 +21,6 @@ try {
     } finally {
       client.release();
     }
-    await checkConversationSchema(pool);
     console.log('Conversation metadata schema is current.');
   } else console.log(conversationSchemaSQL);
 } finally {

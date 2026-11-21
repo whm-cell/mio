@@ -20,7 +20,7 @@ ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS model_binding jso
 ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS model_observations jsonb NOT NULL DEFAULT '[]'::jsonb;`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
-export async function checkConversationSchema(pool: Pool): Promise<void> {
+export async function checkConversationSchema(database: Pick<Pool, 'query'>): Promise<void> {
   for (const [table, columns, types] of [
     [
       'mio_conversations',
@@ -33,7 +33,7 @@ export async function checkConversationSchema(pool: Pool): Promise<void> {
       [2950, 25, 25, 25, 25, 1184, 1184, 3802, 3802],
     ],
   ] as const) {
-    const result = await pool.query(`SELECT ${columns} FROM ${table} LIMIT 0`);
+    const result = await database.query(`SELECT ${columns} FROM ${table} LIMIT 0`);
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('CONVERSATION_SCHEMA: incompatible metadata columns');
   }

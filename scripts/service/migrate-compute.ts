@@ -13,6 +13,7 @@ try {
     try {
       await client.query('BEGIN');
       await client.query(computeSchemaSQL);
+      await checkComputeSchema(client);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -20,7 +21,6 @@ try {
     } finally {
       client.release();
     }
-    await checkComputeSchema(pool);
     console.log('Compute metadata schema is current.');
   } else console.log(computeSchemaSQL);
 } finally {

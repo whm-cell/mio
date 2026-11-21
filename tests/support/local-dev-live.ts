@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { connect as connectTcp, createServer as createTcpServer } from 'node:net';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -33,8 +33,23 @@ function isPortListening(port: number): Promise<boolean> {
 }
 
 export async function parseLiveAuthInput(path: string): Promise<ParsedLiveAuthInput> {
-  const raw = await readFile(path, 'utf8');
-  assert(Buffer.byteLength(raw) <= 8192, 'LIVE_CREDENTIAL_FILE_INVALID');
+  const limit = 8192;
+  const contents = Buffer.alloc(limit + 1);
+  const handle = await open(path, 'r');
+  let length = 0;
+  try {
+    while (length < contents.length) {
+      const { bytesRead } = await handle.read(contents, length, contents.length - length, null);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  assert(length <= limit, 'LIVE_CREDENTIAL_FILE_INVALID');
+  const raw = contents.toString('utf8', 0, length);
+  // Retain the decoded size limit when UTF-8 replacement characters expand the text.
+  assert(Buffer.byteLength(raw) <= limit, 'LIVE_CREDENTIAL_FILE_INVALID');
   const trimmed = raw.trim();
   assert(trimmed.length > 0, 'LIVE_CREDENTIAL_FILE_INVALID');
   if (trimmed.startsWith('{')) {
@@ -188,7 +203,7 @@ export async function createPersistentDevProfileController(
     child = spawn(process.execPath, [launcher(), '--profile', 'mio'], {
       cwd: runtimeEnv.DSH_HOME,
       env: runtimeEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: 'ignore',
     });
     for (let attempt = 0; attempt < 120; attempt++) {
       assert(child.exitCode === null && child.signalCode === null, 'DEV_PROFILE_EXITED_EARLY');

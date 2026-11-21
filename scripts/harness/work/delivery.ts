@@ -12,7 +12,12 @@ import {
   taskRevision,
 } from './records.ts';
 import type { Candidate, ResultDraft, Task } from './records.ts';
-import { replacePublication, withPublication } from './delivery-store.ts';
+import {
+  publicationRecoveries,
+  publishFiles,
+  settlePublication,
+  withPublication,
+} from './delivery-store.ts';
 import { normsIssues } from './norms-review.ts';
 import { documentCatalog, resolvePrd } from '../task-documents.ts';
 import {
@@ -174,13 +179,18 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
   )
     throw new Error('WORK_DELIVERY_STAGE: verify before recording human acceptance');
 
-  // Expensive assessment happens before the short PRD publication lock.
-  const beforeLock = (await readBook(root, ref.prd, catalog)).book;
-  const wasPublished = isDeepStrictEqual(
-    beforeLock.results.find((entry) => entry.key === result.key),
-    result,
-  );
-  if (!wasPublished) {
+  // Fresh publication verifies outside the lock. An interrupted exchange must
+  // settle under the lock before its public bytes can prove a replay.
+  const publicationPaths = [paths.records, paths.report];
+  const interrupted = (await publicationRecoveries(root, publicationPaths)).length > 0;
+  const beforeLock = interrupted ? null : (await readBook(root, ref.prd, catalog)).book;
+  const wasPublished =
+    beforeLock !== null &&
+    isDeepStrictEqual(
+      beforeLock.results.find((entry) => entry.key === result.key),
+      result,
+    );
+  if (beforeLock && !wasPublished) {
     if (alreadyReleased) throw new Error('WORK_DELIVERY_CONFLICT: accepted result changed');
     await verified(root, task, ref.candidate);
     await validateLocations(root, ref.result, catalog);
@@ -189,6 +199,7 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
   // A matching published result is the recovery proof even if the two outputs now make
   // the checkout dirty. New publication still requires a clean candidate.
   return withPublication(root, paths.records, async () => {
+    await settlePublication(root, publicationPaths);
     const {
       book,
       source: reportBefore,
@@ -203,6 +214,10 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
     if (!replayed) {
       if (alreadyReleased || wasPublished)
         throw new Error('WORK_DELIVERY_CONFLICT: accepted result changed');
+      if (interrupted) {
+        await verified(root, task, ref.candidate);
+        await validateLocations(root, ref.result, catalog);
+      }
       book.results = book.results
         .filter((entry) => entry.key !== result.key)
         .concat(result)
@@ -212,14 +227,14 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
     const candidateReport = committedReport(root, ref.candidate, paths.report);
     if (reportBefore !== null && reportBefore !== candidateReport && reportBefore !== source)
       throw new Error(`WORK_DELIVERY_CONFLICT: ${paths.report}`);
+    const files = [{ path: paths.report, expected: reportBefore, content: source }];
     if (!replayed) {
       const bytes = publicText(await format(json(book), { parser: 'json', printWidth: 100 }));
       parseRecords(bytes);
       await requireCandidate(root, task);
-      // The records rename is the publication point. Everything after it is recoverable.
-      await replacePublication(root, paths.records, recordsSource, bytes);
+      files.unshift({ path: paths.records, expected: recordsSource, content: bytes });
     }
-    await replacePublication(root, paths.report, reportBefore, source);
+    await publishFiles(root, files);
     if (!alreadyReleased) {
       task.delivery!.accepted = accepted;
       task.stage = 'C1_RELEASED';

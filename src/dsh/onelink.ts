@@ -294,7 +294,8 @@ export class OneLinkAdapter extends LlmAdapter {
     let release: (() => void) | undefined;
     execution.started = false;
     const observation = (finish: string): ModelObservation => {
-      if (!usage || (usage.inputTokens === 0 && usage.outputTokens === 0))
+      // DSH can report cached input with both uncached input and output at zero.
+      if (!usage || !Object.values(usage).some((count) => count > 0))
         return {
           ...facts,
           finish,

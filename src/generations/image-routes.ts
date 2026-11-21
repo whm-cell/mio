@@ -449,7 +449,7 @@ function validImageAssetRef(value: unknown, mask = false): value is ImageAssetRe
   );
 }
 
-function validImageGeometry(value: unknown): value is ImageGeometry {
+export function validImageGeometry(value: unknown): value is ImageGeometry {
   if (!isRecord(value) || Object.keys(value).length !== IMAGE_GEOMETRY_EDGES.length) return false;
   if (IMAGE_GEOMETRY_EDGES.some((edge) => !Object.hasOwn(value, edge))) return false;
   const values = IMAGE_GEOMETRY_EDGES.map((edge) => value[edge]);

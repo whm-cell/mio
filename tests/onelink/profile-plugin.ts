@@ -46,6 +46,25 @@ export function apply(ctx: Context) {
     );
     const messages = body.messages as { role: string; content: unknown }[];
     const text = JSON.stringify(messages.filter((message) => message.role === 'user').at(-1));
+    if (text.includes('FIXTURE_OUTPUT_LIMIT'))
+      return protocolResponse(request, '保留已生成的正文', false, { ending: 'max-tokens' });
+    if (text.includes('FIXTURE_CACHE_READ'))
+      return protocolResponse(request, 'cache read fixture', false, {
+        messagesUsage: { input: 0, output: 0, cacheRead: 48, cacheWrite: 0 },
+      });
+    if (text.includes('FIXTURE_CACHE_WRITE'))
+      return protocolResponse(request, 'cache write fixture', false, {
+        messagesUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 14 },
+      });
+    if (text.includes('FIXTURE_CACHE_PARTIAL'))
+      return protocolResponse(request, 'unsettled failure text', false, {
+        ending: 'incomplete',
+        messagesUsage: { input: 0, output: 0, cacheRead: 31, cacheWrite: 12 },
+      });
+    if (text.includes('FIXTURE_CACHE_ZERO'))
+      return protocolResponse(request, 'zero usage fixture', false, {
+        messagesUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
     return protocolResponse(
       request,
       text.includes('HOLD') ? 'held fixture text' : 'fixture answer',

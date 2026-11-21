@@ -26,7 +26,7 @@ O7 采纳结论冻结如下：
 
 - **可信身份与对话基线**：沿[认证底座](../../auth.md)、[DSH 契约](../../integrations/dsh.md)与[本地对话服务](../../conversations.md)，消费已接受的 `conversation-kernel`、`conversation-service` 及 `onelink-user-chat`（[对话成果](../conversation-service/complete/report.md)、[万联成果](../onelink-integration/complete/report.md)）。
 - **单轨原厂路由与图片计算基线**：沿[供应商配置](../../providers.md)、[OneLinkAI 集成](../../integrations/onelink.md)与[计算任务 HTTP 契约](../../apis/compute.md)，消费已接受的 `onelink-db-vendor-routing`（[原厂路由成果](../onelink-vendor-routing/complete/report.md)）、私有资产与 Worker 队列 `private-user-assets`/`compute-jobs`/`compute-worker`（[计算成果](../compute-service/complete/report.md)）及图片生成/编辑/异步切片 `seedream-sync-slice`/`reference-outpaint-slice`/`async-image-slice`/`kling-async-image-slice`（[图片成果](../onelink-image-generation/complete/report.md)）。
-- **未决隔离**：上游 outpaint `geometry` 真实协议与视频/音频/素材库工具属于其他独立切片的未决或后续事项，不阻塞 Unit 1 的 C0/C1；Unit 1 的 `submit_image_job` 不开放未经验证的 `geometry` 参数（`DESIGN-OVER-001`）。
+- **图片工具边界**：`list_image_models` 只列出 `generate` 和 `edit`，`submit_image_job` 的声明和执行也只支持这两种操作。对话工具拒绝 `geometry`。图片 HTTP 接口按自身路由能力受理 `outpaint`。上游 `geometry` 真实协议与视频、音频和素材库工具由其他切片处理。
 
 ## 3. C1 实施要点
 
@@ -40,10 +40,10 @@ O7 采纳结论冻结如下：
 
 Unit 1（`onelink-conversation-image-tools`）须同时满足以下验证与接受门槛：
 
-- **真实隔离端到端闭环（`tests/conversations/conversation-image-tools.test.ts`）**：经真实隔离 PostgreSQL、队列通道（本机 `.env.test` 环境下使用 `mio-test` 真实 RabbitMQ 独立临时 vhost，无 RabbitMQ 容器的 `GITHUB_ACTIONS=true` 环境由真实 PG outbox 驱动同一 Worker B）、Worker B（受控上游协议替身与 COS 替身）、官方 DSH Agent Loop、真实 JSONL 持久化及正式打包 Profile 验证：
+- **隔离端到端闭环（`tests/conversations/conversation-image-tools.test.ts`）**经隔离 PostgreSQL、OneLink 和 COS 协议替身、官方 DSH Agent Loop、真实 JSONL 持久化以及正式打包的 A Profile 验证。只迁移 auth、assets、providers、conversations、generations，并在 Profile 就绪后核对视频表缺席。用例包括
   - 第 1 轮调用 `list_image_models` 发现模型并调用 `submit_image_job`（覆盖同步 Volcengine Seedream 与省略 `async` 自动补齐的异步 Kling 标准/Omni 路由），核对实时 SSE `event: tool` 帧与 `GET /history` 的 `role: 'tool'` 投影，且不透传 `list_image_models` 或原始 `tool/call`；
-  - Worker 完成后第 2 轮调用 `get_image_job` 取得输出 `assetId`，再调用 `submit_image_job` 完成携带 `imageAssetIds` 与 PNG `maskAssetId` 的编辑/参考图闭环，核对多步 `model_observations` 数组记录与最终聊天模型 `verified` 记录；
-  - 跨用户 `assetId`/`jobId`、非法 UUID `jobId`（零 PG `22P02`）、未发现/禁用/待适配模型、未知或敏感参数（`apiKey`/`userId`/`url`/`base64`）均被脱敏拒绝且无越权副作用；Prompt 注入尝试调用无关工具（如 `counted_fixture`）及根 `ctx.tools.execute` 直接调用均被 `MIO_TOOL_DENIED` 阻断且工具函数执行 `0` 次；
+  - A 执行器完成后第 2 轮调用 `get_image_job` 取得输出 `assetId`，再调用 `submit_image_job` 完成携带 `imageAssetIds` 与 PNG `maskAssetId` 的编辑/参考图闭环，核对多步 `model_observations` 数组记录与最终聊天模型 `verified` 记录；
+  - owner 在本用例建立已完成任务和输出资产，另一个 owner 的 `assetId`/`jobId` 调用被拒绝。核对唯一工具调用标识与实际错误码后验证脱敏。非法 UUID `jobId`（零 PG `22P02`）、未发现/禁用/待适配模型、未知或敏感参数均被拒绝且无越权副作用。Prompt 注入尝试调用无关工具（如 `counted_fixture`）及根 `ctx.tools.execute` 直接调用均被 `MIO_TOOL_DENIED` 阻断且工具函数执行 `0` 次。
   - 同轮第 5 次 `submit_image_job` 被 `MIO_TOOL_BUDGET_EXCEEDED` 拦截（仅创建 4 个任务，第 5 次 `0` 执行），单轮超过 8 步触发 `TURN_STEP_BUDGET_EXCEEDED` 熔断，相同 `clientOperationKey` 重试复用同一 `jobId`（`0` 重复生图），中途取消与正式打包 Profile 重启后冷读 `history` 正确投影 `role: 'tool'` 且不重放工具。
 - **既有基线与工程护栏回归**：`tests/foundation/plugin.test.ts` 与 `tests/foundation/kernel.test.ts` 原断言 100% 保持通过；`pnpm format:check`、`pnpm typecheck`、`pnpm lint`、`pnpm guard`、`pnpm build`、`pnpm test:smoke`、`pnpm work documents` 及受影响本地回归通过，形成覆盖 `pnpm check` 的有效结论。
 - **审查与人类接受**：完成真实 `quality-review`、v2 `norms-review` 与独立只读审查，经 `deliver prepare` 交回人类审阅；确定性隔离闭环、正式 Profile、真实付费供应商观察与生产证据分别报告，取得真实人类接受前不宣称已接受或扩大到其他媒体工具。

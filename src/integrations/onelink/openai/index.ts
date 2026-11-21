@@ -36,12 +36,13 @@ async function buildOpenAiEditFormData(
   form.set('model', input.model);
   form.set('prompt', input.prompt);
   form.set('response_format', 'b64_json');
+  const imageField = refs.length === 1 ? 'image' : 'image[]';
   for (const ref of refs) {
     const source = await read?.(ref, bounded);
     if (!source || !matchesImageSignature(source, ref.contentType)) return null;
     const sourceBytes = Uint8Array.from(source);
     form.append(
-      'image',
+      imageField,
       new Blob([sourceBytes.buffer as ArrayBuffer], { type: ref.contentType }),
       `image.${imageExtension(ref.contentType)}`,
     );

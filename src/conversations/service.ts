@@ -2,7 +2,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { sha256Utf8 } from '@mio/foundation/hash';
-import { ConversationError } from './contracts.ts';
+import { ConversationError, isInFlightRequest, outputTruncation } from './contracts.ts';
 import type {
   Conversation,
   ConversationEngine,
@@ -228,6 +228,7 @@ export function createConversationService(
         const cancelledBeforeStart = cancellations.delete(key);
         publish(id, { type: 'state', receipt: received.receipt });
         const running = (async () => {
+          let executionEnded = false;
           try {
             const result = cancelledBeforeStart
               ? 'cancelled'
@@ -266,28 +267,30 @@ export function createConversationService(
                     : undefined,
                   images,
                 );
+            executionEnded = true;
+            const truncated = result === outputTruncation.reason;
             publish(id, {
               type: 'state',
               receipt: await store.finish(
                 id,
                 requestId,
-                result,
+                truncated ? 'completed' : result,
                 result === 'failed'
                   ? 'MODEL_FAILED'
                   : result === 'unknown'
                     ? 'PROCESS_INTERRUPTED'
                     : undefined,
+                truncated ? outputTruncation.reason : undefined,
               ),
             });
           } catch {
-            // The same request identity remains queryable; no retry through either storage.
-            await engine.cancel(received.row.dsh_session_id, requestId).catch(() => {});
+            if (!executionEnded)
+              await engine.cancel(received.row.dsh_session_id, requestId).catch(() => {});
             try {
-              const stored = await store.request(actor, id, requestId);
-              const final = ['completed', 'cancelled', 'failed'].includes(stored.status)
-                ? stored
-                : await store.finish(id, requestId, 'unknown', 'EXECUTION_UNKNOWN');
-              publish(id, { type: 'state', receipt: final });
+              publish(id, {
+                type: 'state',
+                receipt: await store.reconcileExecution(actor, id, requestId),
+              });
             } catch {
               store.markUnavailable();
               publish(id, { type: 'error', code: 'CONVERSATION_UNAVAILABLE' });
@@ -315,8 +318,7 @@ export function createConversationService(
         cancellations.add(key);
         await engine.cancel(row.dsh_session_id, row.active_request);
         const receipt = await store.request(actor, id, row.active_request);
-        if (['completed', 'cancelled', 'failed', 'unknown'].includes(receipt.status))
-          cancellations.delete(key);
+        if (!isInFlightRequest(receipt.status)) cancellations.delete(key);
       }
       return { requested: row.active_request !== null, requestId: row.active_request };
     },

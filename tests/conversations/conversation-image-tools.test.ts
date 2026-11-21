@@ -1,9 +1,8 @@
 import { createImageDecoder } from '../../src/generations/decode.ts';
-import { generationSchemaSQL } from '../../src/generations/schema.ts';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -43,8 +42,7 @@ interface RecordedImageUpstream {
   json?: Record<string, unknown>;
   multipart?: {
     fields: Record<string, string>;
-    imageCount: number;
-    imageTypes: string[];
+    images: { field: string; type: string; sha256: string }[];
     hasMask: boolean;
     maskType: string | null;
   };
@@ -724,16 +722,6 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
                   },
                 },
                 {
-                  id: 'neg_forbidden_arg',
-                  name: 'submit_image_job',
-                  args: {
-                    modelRef: 'onelink:image:doubao-seedream-4.0',
-                    prompt: 'forbidden arg',
-                    apiKey: 'sk-injected-secret-value',
-                    url: 'https://evil.invalid/payload.png',
-                  },
-                },
-                {
                   id: 'neg_injected_tool',
                   name: 'counted_fixture',
                   args: { value: 42 },
@@ -747,11 +735,43 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
           return;
         }
 
-        if (prompt === 'SEED45_INVALID_FORMAT_TURN') {
+        if (prompt.startsWith('IMAGE_ARGUMENT_POLICY_TURN:')) {
+          const [, ownerAssetId] = prompt.split(':');
           if (toolOutputs.length === 0) {
             streamOpenAiToolCalls(
               res,
               [
+                {
+                  id: 'neg_forbidden_arg',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:doubao-seedream-4.0',
+                    prompt: 'forbidden arg',
+                    apiKey: 'sk-injected-secret-value',
+                    url: 'https://evil.invalid/payload.png',
+                  },
+                },
+                {
+                  id: 'neg_outpaint',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:gpt-image-2',
+                    prompt: 'outpaint is outside the tool operation schema',
+                    operation: 'outpaint',
+                    imageAssetIds: [ownerAssetId],
+                  },
+                },
+                {
+                  id: 'neg_geometry',
+                  name: 'submit_image_job',
+                  args: {
+                    modelRef: 'onelink:image:gpt-image-2',
+                    prompt: 'geometry is outside the tool argument schema',
+                    operation: 'edit',
+                    imageAssetIds: [ownerAssetId],
+                    geometry: { left: 16, top: 0, right: 0, bottom: 0 },
+                  },
+                },
                 {
                   id: 'neg_seed45_output_format',
                   name: 'submit_image_job',
@@ -766,7 +786,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             );
             return;
           }
-          streamOpenAiText(res, 'Seedream 4.5 rejected output_format=png at admission.', reqSeq);
+          streamOpenAiText(res, 'The image tool rejected the supplied arguments.', reqSeq);
           return;
         }
 
@@ -1025,14 +1045,20 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             headers: { 'content-type': contentType },
           }).formData();
           const fields: Record<string, string> = {};
-          const imageTypes: string[] = [];
+          const images: NonNullable<RecordedImageUpstream['multipart']>['images'] = [];
           let hasMask = false;
           let maskType: string | null = null;
           for (const [key, value] of form.entries()) {
             if (typeof value === 'string') {
               fields[key] = value;
-            } else if (key === 'image') {
-              imageTypes.push(value.type);
+            } else if (key === 'image' || key === 'image[]') {
+              images.push({
+                field: key,
+                type: value.type,
+                sha256: createHash('sha256')
+                  .update(Buffer.from(await value.arrayBuffer()))
+                  .digest('hex'),
+              });
             } else if (key === 'mask') {
               hasMask = true;
               maskType = value.type;
@@ -1045,8 +1071,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             contentType,
             multipart: {
               fields,
-              imageCount: imageTypes.length,
-              imageTypes,
+              images,
               hasMask,
               maskType,
             },
@@ -1193,14 +1218,13 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
       MIO_COS_REGION: 'ap-shanghai',
       MIO_COS_SECRET_ID: 'synthetic-cos-id',
       MIO_COS_SECRET_KEY: 'synthetic-cos-secret',
-      MIO_COMPUTE_ENABLED: 'true',
       MIO_PROVIDERS_DATABASE_URL: database.url,
       MIO_PROVIDERS_MASTER_KEY: masterKey,
       MIO_PROVIDERS_MASTER_KEY_ID: masterKeyId,
       MIO_CONVERSATIONS_DATABASE_URL: database.url,
     };
 
-    for (const domain of ['auth', 'assets', 'compute', 'providers', 'conversations']) {
+    for (const domain of ['auth', 'assets', 'providers', 'conversations', 'generations']) {
       const args = [`scripts/service/migrate-${domain}.ts`, '--apply'];
       const result = spawnSync(process.execPath, args, {
         env: migrateEnv,
@@ -1215,10 +1239,20 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
       rawModelId: 'disabled-route-img',
       enabled: false,
     };
-    await importRoutesViaCli(migrateEnv, [...ONELINK_FIXTURE_ROUTES, disabledRoute]);
-
-    // The actual A executor runs inside the packed Profile; B and MQ stay unconfigured.
-    await observer.query(generationSchemaSQL);
+    const imageRoutes = ONELINK_FIXTURE_ROUTES.map((route) =>
+      route.rawModelId === 'gpt-image-2'
+        ? {
+            ...route,
+            paramSpec: {
+              ...route.paramSpec,
+              supportedOperations: ['edit', 'outpaint', 'generate'] as const,
+              allowOutpaintGeometry: true,
+            },
+            source: 'Synthetic outpaint capability for isolated Profile regression',
+          }
+        : route,
+    );
+    await importRoutesViaCli(migrateEnv, [...imageRoutes, disabledRoute]);
 
     // Build and pack official Profile with temporary child-Profile overlay
     const profileDir = await mkdtemp(join(tmpdir(), 'mio-conv-img-profile-'));
@@ -1422,6 +1456,15 @@ export function apply(ctx: Context) {
     };
 
     await profileControl.start('database');
+    const {
+      rows: [schema],
+    } = await observer.query(`
+      SELECT to_regclass('mio_image_jobs') IS NOT NULL AS image_jobs,
+             to_regclass('mio_compute_jobs') IS NULL AND
+             to_regclass('mio_compute_outbox') IS NULL AND
+             to_regclass('mio_compute_inbox') IS NULL AS no_video_tables
+    `);
+    expect(schema).toEqual({ image_jobs: true, no_video_tables: true });
 
     for (const [idx, label] of ['owner-zero', 'owner-one'].entries()) {
       const signup = await call(
@@ -1505,6 +1548,7 @@ export function apply(ctx: Context) {
     expect(inspectTools).toEqual({
       countedFixtureExecutions: 0,
       rootToolNames: ['counted_fixture'],
+      negativeToolErrors: [],
     });
 
     for (const name of ['counted_fixture', 'list_image_models', 'submit_image_job']) {
@@ -1530,14 +1574,8 @@ export function apply(ctx: Context) {
     expect(await prefRes.json()).toMatchObject({ error: { code: 'MODEL_USAGE_UNSUPPORTED' } });
   });
 
-  let workflowConversationId = '';
-  let turn1SeedJobId = '';
-  let turn1KlingJobId = '';
-  let turn1SeedAssetId = '';
-  let turn1KlingAssetId = '';
-
   it('drives multi-turn cross-vendor image generation, async auto-fill, derived asset editing, and verification persistence', async () => {
-    workflowConversationId = await createConversation(0);
+    const workflowConversationId = await createConversation(0);
     const chatCountBeforeTurn1 = chatRequests.length;
 
     const sseTurn1Res = await fetch(
@@ -1574,7 +1612,11 @@ export function apply(ctx: Context) {
     const submitSchema = turn1Chats[0]!.tools.find(
       (tool) => tool.function?.name === 'submit_image_job',
     )?.function?.parameters;
-    expect(submitSchema?.additionalProperties).toBe(false);
+    expect(submitSchema).toMatchObject({
+      additionalProperties: false,
+      properties: { operation: { enum: ['generate', 'edit'] } },
+    });
+    expect(submitSchema?.properties).not.toHaveProperty('geometry');
 
     // Inspect list_image_models output seen by the model on step 2
     const listOutput = JSON.parse(currentTurnToolOutputs(turn1Chats[1]!.messages)[0]!.text) as {
@@ -1621,6 +1663,8 @@ export function apply(ctx: Context) {
     expect(klingSummary.requiresAsync).toBe(true);
     const seed45Summary = listOutput.models.find((item) => item.modelId === 'doubao-seedream-4.5')!;
     expect(seed45Summary.allowedOutputFormats).toEqual([]);
+    const gptSummary = listOutput.models.find((item) => item.modelId === 'gpt-image-2');
+    expect(gptSummary?.supportedOperations).toEqual(['edit', 'generate']);
 
     // Live SSE whitelist: only submit_image_job cards projected, zero list_image_models or raw tool/call
     const turn1ToolFrames = turn1Frames.filter((frame) => frame.event === 'tool');
@@ -1629,16 +1673,16 @@ export function apply(ctx: Context) {
       'submit_image_job',
       'submit_image_job',
     ]);
-    turn1SeedJobId = String((turn1ToolFrames[0]!.data.job as { jobId: string }).jobId);
-    turn1KlingJobId = String((turn1ToolFrames[1]!.data.job as { jobId: string }).jobId);
+    const turn1SeedJobId = String((turn1ToolFrames[0]!.data.job as { jobId: string }).jobId);
+    const turn1KlingJobId = String((turn1ToolFrames[1]!.data.job as { jobId: string }).jobId);
 
     // Wait for A to finish both jobs (sync Seedream + omitted-async Kling)
     const [seedCompleted, klingCompleted] = await Promise.all([
       waitImageJobCompleted(turn1SeedJobId, 0),
       waitImageJobCompleted(turn1KlingJobId, 0),
     ]);
-    turn1SeedAssetId = seedCompleted.assetIds[0]!;
-    turn1KlingAssetId = klingCompleted.assetIds[0]!;
+    const turn1SeedAssetId = seedCompleted.assetIds[0]!;
+    const turn1KlingAssetId = klingCompleted.assetIds[0]!;
     expect(turn1SeedAssetId).toBeTruthy();
     expect(turn1KlingAssetId).toBeTruthy();
 
@@ -1720,7 +1764,7 @@ export function apply(ctx: Context) {
     const viduJobId = historyBody.items.filter((item) => item.role === 'tool').at(-1)!.job!.jobId;
     await waitImageJobCompleted(viduJobId, 0);
 
-    // Verify Worker B encoded vendor-specific reference payloads accurately
+    // Verify the A executor encoded ordered references with the vendor's field names.
     const recentUpstream = imageUpstreamRequests.slice(upstreamBeforeTurn2);
     const gptEditReq = recentUpstream.find((r) => r.path === '/v1/images/edits');
     expect(gptEditReq?.multipart).toMatchObject({
@@ -1729,8 +1773,18 @@ export function apply(ctx: Context) {
         prompt: 'blend mountain and lake with mask',
         size: '1024x1024',
       },
-      imageCount: 2,
-      imageTypes: ['image/jpeg', 'image/png'],
+      images: [
+        {
+          field: 'image[]',
+          type: 'image/jpeg',
+          sha256: createHash('sha256').update(jpegSample).digest('hex'),
+        },
+        {
+          field: 'image[]',
+          type: 'image/png',
+          sha256: createHash('sha256').update(pngSample).digest('hex'),
+        },
+      ],
       hasMask: true,
       maskType: 'image/png',
     });
@@ -1826,6 +1880,32 @@ export function apply(ctx: Context) {
   }, 45_000);
 
   it('enforces cross-owner isolation, invalid UUID rejection, forbidden arg sanitization, and prompt-injection denial', async () => {
+    const ownerAssetId = await uploadOwnerPngMask(0);
+    const geometry = { left: 16, top: 0, right: 0, bottom: 0 };
+    const upstreamBeforeOutpaint = imageUpstreamRequests.length;
+    const ownerAdmission = await call('/api/v1/compute/images', 'POST', {
+      requestId: randomUUID(),
+      modelRef: 'onelink:image:gpt-image-2',
+      parameters: {
+        prompt: 'expand the owner fixture',
+        operation: 'outpaint',
+        imageAssetId: ownerAssetId,
+        geometry,
+      },
+    });
+    expect(ownerAdmission.status, await ownerAdmission.clone().text()).toBe(202);
+    const { jobId } = (await ownerAdmission.json()) as { jobId: string };
+    const foreignJob = await waitImageJobCompleted(jobId, 0);
+    expect(foreignJob.assetIds).toHaveLength(1);
+    const foreignAssetId = foreignJob.assetIds[0]!;
+    const outpaintRequests = imageUpstreamRequests.slice(upstreamBeforeOutpaint);
+    expect(outpaintRequests).toHaveLength(1);
+    expect(outpaintRequests[0]).toMatchObject({
+      path: '/v1/images/edits',
+      multipart: { images: [{ field: 'image' }] },
+    });
+    expect(JSON.parse(outpaintRequests[0]!.multipart!.fields.geometry!)).toEqual(geometry);
+
     const owner1Conv = await createConversation(1);
     const jobsBefore = Number(
       (await observer.query<{ count: string }>('SELECT count(*) FROM mio_image_jobs')).rows[0]!
@@ -1845,7 +1925,7 @@ export function apply(ctx: Context) {
       'POST',
       {
         requestId: 'neg-1',
-        text: `ISOLATION_AND_INJECTION_TURN:${turn1SeedJobId}:${turn1SeedAssetId}`,
+        text: `ISOLATION_AND_INJECTION_TURN:${foreignJob.jobId}:${foreignAssetId}`,
       },
       1,
     );
@@ -1867,7 +1947,15 @@ export function apply(ctx: Context) {
     // Verify tool errors seen by LLM on step 2 are sanitized and counted_fixture never ran
     const step2Messages = chatRequests[chatBefore + 1]!.messages;
     const negOutputs = currentTurnToolOutputs(step2Messages);
-    expect(negOutputs).toHaveLength(8);
+    expect(negOutputs.map((output) => output.toolCallId).sort()).toEqual([
+      'neg_bad_uuid',
+      'neg_disabled_route',
+      'neg_foreign_asset',
+      'neg_foreign_job',
+      'neg_injected_tool',
+      'neg_missing_model',
+      'neg_unadapted_model',
+    ]);
     expect(negOutputs.find((o) => o.toolCallId === 'neg_bad_uuid')?.text).toContain(
       'IMAGE_JOB_ID_INVALID',
     );
@@ -1877,10 +1965,6 @@ export function apply(ctx: Context) {
     expect(negOutputs.find((o) => o.toolCallId === 'neg_foreign_asset')?.text).toContain(
       'ASSET_NOT_FOUND',
     );
-    const forbiddenArgText =
-      negOutputs.find((o) => o.toolCallId === 'neg_forbidden_arg')?.text ?? '';
-    expect(forbiddenArgText).not.toContain('sk-injected-secret-value');
-    expect(forbiddenArgText).not.toContain('https://evil.invalid/payload.png');
     expect(negOutputs.find((o) => o.toolCallId === 'neg_injected_tool')?.text).toContain(
       'MIO_TOOL_DENIED',
     );
@@ -1895,33 +1979,64 @@ export function apply(ctx: Context) {
     ).json()) as { items: { role: string }[] };
     expect(history.items.map((item) => item.role)).toEqual(['user', 'assistant', 'status']);
 
-    // Passing output_format: 'png' to doubao-seedream-4.5 fails local admission with IMAGE_INPUT_INVALID and 0 upstream POSTs.
-    const chatBeforeSeed45Neg = chatRequests.length;
-    const upstreamBeforeSeed45Neg = imageUpstreamRequests.length;
+    const argumentConv = await createConversation(0);
+    const chatBeforeArguments = chatRequests.length;
+    const argumentSse = await fetch(
+      `${profileControl.origin}/api/v1/conversations/${argumentConv}/events`,
+      { headers: { origin: profileControl.origin, cookie: cookies[0]! } },
+    );
+    const argumentFrames = collectSseFrames(argumentSse, 'neg-arguments');
     expect(
       (
         await call(
-          `/api/v1/conversations/${owner1Conv}/messages`,
+          `/api/v1/conversations/${argumentConv}/messages`,
           'POST',
-          { requestId: 'neg-seed45-format', text: 'SEED45_INVALID_FORMAT_TURN' },
-          1,
+          { requestId: 'neg-arguments', text: `IMAGE_ARGUMENT_POLICY_TURN:${ownerAssetId}` },
+          0,
         )
       ).status,
     ).toBe(202);
-    expect((await waitReceiptStatus(owner1Conv, 'neg-seed45-format', 1)).status).toBe('completed');
-    const seed45NegOutputs = currentTurnToolOutputs(
-      chatRequests[chatBeforeSeed45Neg + 1]!.messages,
-    );
-    expect(seed45NegOutputs).toHaveLength(1);
-    expect(seed45NegOutputs[0]!.text).toContain('IMAGE_INPUT_INVALID');
-    expect(
-      imageUpstreamRequests.slice(upstreamBeforeSeed45Neg).filter((r) => r.method === 'POST'),
-    ).toHaveLength(0);
-    const jobsAfterSeed45Neg = Number(
+    expect((await waitReceiptStatus(argumentConv, 'neg-arguments', 0)).status).toBe('completed');
+    const argumentOutputs = currentTurnToolOutputs(chatRequests[chatBeforeArguments + 1]!.messages);
+    const expectedErrors = {
+      neg_bad_uuid: 'IMAGE_JOB_ID_INVALID',
+      neg_foreign_asset: 'ASSET_NOT_FOUND',
+      neg_foreign_job: 'JOB_NOT_FOUND',
+      neg_forbidden_arg: 'INVALID_ARGS',
+      neg_geometry: 'INVALID_ARGS',
+      neg_outpaint: 'INVALID_ARGS',
+      neg_seed45_output_format: 'IMAGE_INPUT_INVALID',
+    };
+    expect(argumentOutputs.map((output) => output.toolCallId).sort()).toEqual([
+      'neg_forbidden_arg',
+      'neg_geometry',
+      'neg_outpaint',
+      'neg_seed45_output_format',
+    ]);
+    const inspected = (await (await fetch(`${profileControl.origin}/__test/tools`)).json()) as {
+      negativeToolErrors: { toolCallId: string; code: string | null }[];
+    };
+    for (const [toolCallId, code] of Object.entries(expectedErrors)) {
+      expect(
+        inspected.negativeToolErrors.filter((result) => result.toolCallId === toolCallId),
+      ).toEqual([{ toolCallId, code }]);
+    }
+    const forbidden = argumentOutputs.find((output) => output.toolCallId === 'neg_forbidden_arg')!;
+    expect(forbidden.text).toContain('invalid arguments: unexpected parameter');
+    expect(forbidden.text).not.toContain('sk-injected-secret-value');
+    expect(forbidden.text).not.toContain('https://evil.invalid/payload.png');
+    expect((await argumentFrames).filter((frame) => frame.event === 'tool')).toHaveLength(0);
+    const argumentHistory = (await (
+      await call(`/api/v1/conversations/${argumentConv}/history`)
+    ).json()) as {
+      items: { role: string }[];
+    };
+    expect(argumentHistory.items.map((item) => item.role)).toEqual(['user', 'assistant', 'status']);
+    const jobsAfterArguments = Number(
       (await observer.query<{ count: string }>('SELECT count(*) FROM mio_image_jobs')).rows[0]!
         .count,
     );
-    expect(jobsAfterSeed45Neg).toBe(jobsBefore);
+    expect(jobsAfterArguments).toBe(jobsBefore);
     expect(
       imageUpstreamRequests.slice(upstreamBeforeNeg).filter((r) => r.method === 'POST'),
     ).toHaveLength(0);
@@ -1964,6 +2079,7 @@ export function apply(ctx: Context) {
     expect(idemFinalOutputs[1]!.text).not.toContain('PROVIDER_DISABLED');
     const secondIdemJob = JSON.parse(idemFinalOutputs[1]!.text) as { jobId: string };
     expect(secondIdemJob.jobId).toBe(firstIdemJob.jobId);
+    const submittedIds = [firstIdemJob.jobId, secondIdemJob.jobId];
     expect(idemFinalOutputs[2]!.text).toContain('REQUEST_CONFLICT');
     expect(idemFinalOutputs[3]!.text).toContain('PROVIDER_DISABLED');
     await waitImageJobCompleted(firstIdemJob.jobId, 0);
@@ -2005,6 +2121,7 @@ export function apply(ctx: Context) {
     );
     for (let idx = 0; idx < 4; idx += 1) {
       const createdJob = JSON.parse(submitBudgetOutputs[idx]!.text) as { jobId: string };
+      submittedIds.push(createdJob.jobId);
       await waitImageJobCompleted(createdJob.jobId, 0);
     }
 
@@ -2073,20 +2190,11 @@ export function apply(ctx: Context) {
       await waitImageJobCompleted(row.id, 0);
     }
 
-    // 6. Graceful packed-Profile stop & restart cold-reads JSONL history with role:'tool' and 0 tool replays
-    await profileControl.stop();
-    await profileControl.start('database');
-
-    const chatBeforeColdHistory = chatRequests.length;
-    const upstreamBeforeColdHistory = imageUpstreamRequests.length;
-    const coldHistoryRes = await call(
-      `/api/v1/conversations/${workflowConversationId}/history?limit=100`,
-      'GET',
-      undefined,
-      0,
-    );
-    expect(coldHistoryRes.status).toBe(200);
-    const coldHistory = (await coldHistoryRes.json()) as {
+    // 6. Compare this conversation's public tool history before and after reopening its JSONL.
+    const historyPath = `/api/v1/conversations/${budgetConv}/history?limit=100`;
+    const warmHistoryRes = await call(historyPath);
+    expect(warmHistoryRes.status).toBe(200);
+    const warmHistory = (await warmHistoryRes.json()) as {
       items: {
         seq: number;
         role: string;
@@ -2094,23 +2202,23 @@ export function apply(ctx: Context) {
         job?: { jobId: string; status: string };
       }[];
     };
+    const warmToolItems = warmHistory.items.filter((item) => item.role === 'tool');
+    expect(
+      warmToolItems.slice(0, submittedIds.length).map((item) => [item.tool, item.job?.jobId]),
+    ).toEqual(submittedIds.map((id) => ['submit_image_job', id]));
+    const chatBeforeColdHistory = chatRequests.length;
+    const upstreamBeforeColdHistory = imageUpstreamRequests.length;
+
+    await profileControl.stop();
+    await profileControl.start('database');
+    const coldHistoryRes = await call(historyPath);
+    expect(coldHistoryRes.status).toBe(200);
+    const coldHistory = (await coldHistoryRes.json()) as typeof warmHistory;
     expect(chatRequests.length).toBe(chatBeforeColdHistory);
     expect(imageUpstreamRequests.length).toBe(upstreamBeforeColdHistory);
 
     const coldToolItems = coldHistory.items.filter((item) => item.role === 'tool');
-    // Turn 1: 2 submits; Turn 2: 2 gets + 4 submits; Turn 3: 1 submit => 9 public tool items total
-    expect(coldToolItems).toHaveLength(9);
-    expect(coldToolItems.map((item) => item.tool)).toEqual([
-      'submit_image_job',
-      'submit_image_job',
-      'get_image_job',
-      'get_image_job',
-      'submit_image_job',
-      'submit_image_job',
-      'submit_image_job',
-      'submit_image_job',
-      'submit_image_job',
-    ]);
+    expect(coldToolItems).toEqual(warmToolItems);
     const seqs = coldHistory.items.map((item) => item.seq);
     expect(seqs.every((seq, idx) => idx === 0 || seq > seqs[idx - 1]!)).toBe(true);
   }, 60_000);

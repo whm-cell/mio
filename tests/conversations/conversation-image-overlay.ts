@@ -12,6 +12,7 @@ export function apply(ctx: Context) {
   const onelinkOrigin = process.env.MIO_TEST_ONELINK_ORIGIN ?? '';
   const cosOrigin = process.env.MIO_TEST_COS_ORIGIN ?? '';
   let countedFixtureExecutions = 0;
+  const negativeToolErrors: { toolCallId: string; code: string | null }[] = [];
 
   const originalFetch = globalThis.fetch;
   const interceptedFetch: typeof fetch = async (input, init) => {
@@ -115,6 +116,14 @@ export function apply(ctx: Context) {
   });
 
   ctx.inject(['tools', 'webServer'], (subCtx) => {
+    subCtx.on('tools/result', (exec, result) => {
+      if (result.isError && exec.callId.startsWith('neg_')) {
+        negativeToolErrors.push({
+          toolCallId: exec.callId,
+          code: result.error.info?.code ?? null,
+        });
+      }
+    });
     subCtx.tools.register(
       defineTool({
         name: 'counted_fixture',
@@ -143,6 +152,7 @@ export function apply(ctx: Context) {
             JSON.stringify({
               countedFixtureExecutions,
               rootToolNames: subCtx.tools.definitions().map((item) => item.name),
+              negativeToolErrors,
             }),
           );
         },

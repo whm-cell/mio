@@ -3,13 +3,14 @@ import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { checkConversationSchema } from './schema.ts';
-import { ConversationError } from './contracts.ts';
+import { ConversationError, isInFlightRequest, outputTruncation } from './contracts.ts';
 import type {
   Conversation,
   ConversationSnapshot,
   Principal,
   Receipt,
   RequestStatus,
+  TerminalRequestStatus,
   ModelObservation,
 } from './contracts.ts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
@@ -32,6 +33,7 @@ interface RequestRow {
   digest: string;
   status: RequestStatus;
   error_code: string | null;
+  truncation_reason: string | null;
 }
 type ReceiptRow = Omit<RequestRow, 'digest'>;
 const receipt = (row: ReceiptRow): Receipt => ({
@@ -39,6 +41,7 @@ const receipt = (row: ReceiptRow): Receipt => ({
   requestId: row.request_id,
   status: row.status,
   ...(row.error_code ? { error: row.error_code } : {}),
+  ...(row.truncation_reason === outputTruncation.reason ? { truncation: outputTruncation } : {}),
 });
 const conversation = (row: ConversationRow): Conversation => ({
   id: row.id,
@@ -188,7 +191,7 @@ export class ConversationStore {
         `SELECT c.active_request, row_to_json(r) AS latest
          FROM mio_conversations c
          LEFT JOIN LATERAL (
-           SELECT conversation_id, request_id, status, error_code
+           SELECT conversation_id, request_id, status, error_code, truncation_reason
            FROM mio_conversation_requests WHERE conversation_id=c.id
            ORDER BY created_at DESC, request_id DESC LIMIT 1
          ) r ON true
@@ -330,23 +333,38 @@ export class ConversationStore {
   async finish(
     id: string,
     requestId: string,
-    status: RequestStatus,
+    status: TerminalRequestStatus,
     error?: string,
+    truncationReason?: typeof outputTruncation.reason,
   ): Promise<Receipt> {
     this.assertActive();
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const row = (
-        await client.query<RequestRow>(
-          'UPDATE mio_conversation_requests SET status=$3,error_code=$4,updated_at=now() WHERE conversation_id=$1 AND request_id=$2 RETURNING *',
-          [id, requestId, status, error ?? null],
+      // Match the conversation-first lock order in receive() and reconcileReception().
+      await client.query('SELECT id FROM mio_conversations WHERE id=$1 FOR UPDATE', [id]);
+      const changed = (
+        await client.query<ReceiptRow>(
+          `UPDATE mio_conversation_requests SET status=$3,error_code=$4,truncation_reason=$5,updated_at=now()
+           WHERE conversation_id=$1 AND request_id=$2 AND status IN ('accepted','input-persisted')
+           RETURNING conversation_id,request_id,status,error_code,truncation_reason`,
+          [id, requestId, status, error ?? null, truncationReason ?? null],
         )
-      ).rows[0]!;
-      await client.query(
-        'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
-        [id, requestId],
-      );
+      ).rows[0];
+      if (changed)
+        await client.query(
+          'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
+          [id, requestId],
+        );
+      const row =
+        changed ??
+        (
+          await client.query<ReceiptRow>(
+            'SELECT conversation_id,request_id,status,error_code,truncation_reason FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+            [id, requestId],
+          )
+        ).rows[0];
+      if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'REQUEST_NOT_FOUND');
       await client.query('COMMIT');
       return receipt(row);
     } catch (error) {
@@ -354,6 +372,18 @@ export class ConversationStore {
       throw error;
     } finally {
       client.release();
+    }
+  }
+  /** Read back a committed receipt before attempting to settle an unresolved execution. */
+  async reconcileExecution(actor: Principal, id: string, requestId: string): Promise<Receipt> {
+    const current = await this.request(actor, id, requestId);
+    if (!isInFlightRequest(current.status)) return current;
+    try {
+      return await this.finish(id, requestId, 'unknown', 'EXECUTION_UNKNOWN');
+    } catch (error) {
+      const stored = await this.request(actor, id, requestId);
+      if (!isInFlightRequest(stored.status)) return stored;
+      throw error;
     }
   }
   close(): Promise<void> {

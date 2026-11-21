@@ -172,6 +172,115 @@ it('only appends missing groups or the generation directory and preserves partia
   );
 });
 
+function startInitializer(root: string, pauseAtRead: boolean) {
+  const entry = pathToFileURL(resolve('scripts/service/local.ts')).href;
+  const script = `
+    import fs from 'node:fs';
+    import { once } from 'node:events';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { resolve } from 'node:path';
+    const { mkdir, readFile } = fs.promises;
+    const target = resolve('.env');
+    const lock = resolve('.env.init.lock');
+    let reportedWait = false;
+    fs.promises.mkdir = async (path, ...args) => {
+      try { return await mkdir(path, ...args); }
+      catch (error) {
+        if (!reportedWait && path === lock && error.code === 'EEXIST') {
+          reportedWait = true;
+          process.send('waiting for the other initializer');
+        }
+        throw error;
+      }
+    };
+    fs.promises.readFile = async (path, ...args) => {
+      const bytes = await readFile(path, ...args);
+      if (path === target) {
+        if (${pauseAtRead}) {
+          const proceed = once(process, 'message');
+          process.send('read the environment');
+          await proceed;
+        } else {
+          process.send('read the environment');
+        }
+      }
+      return bytes;
+    };
+    syncBuiltinESMExports();
+    process.argv = [process.execPath, ${JSON.stringify(entry)}, 'dev', 'init'];
+    await import(${JSON.stringify(entry)});
+    process.disconnect();
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: root,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => (output += String(chunk)));
+  child.stderr.on('data', (chunk) => (output += String(chunk)));
+  const outcome = once(child, 'close').then(([code]) => ({ code, output }));
+  return {
+    child,
+    firstMessage: Promise.race([
+      once(child, 'message').then(([message]) => message),
+      outcome.then(({ code, output }) => {
+        throw new Error(`Initializer exited before handshake (${code}): ${output}`);
+      }),
+    ]),
+    outcome,
+  };
+}
+
+it('serializes two env init processes and publishes each missing credential group exactly once', async () => {
+  const root = await fixture();
+  const path = join(root, '.env');
+  const added = [
+    ...localComputeKeys,
+    'MIO_GENERATIONS_DATA_DIR',
+    'MIO_LOCAL_REGRESSION_PASSWORD',
+    'MIO_TEST_DATABASE_URL',
+  ];
+  const original = await readFile(path, 'utf8');
+  const legacy = Buffer.from(
+    [
+      ...original.split('\n').filter((line) => !added.includes(line.split('=', 1)[0]!)),
+      '# Private legacy comment with café\r\n',
+    ].join('\n'),
+  );
+  await writeFile(path, legacy);
+  await chmod(path, 0o700);
+  const owner = startInitializer(root, true);
+  const children = [owner];
+  try {
+    expect(await owner.firstMessage).toBe('read the environment');
+    const waiter = startInitializer(root, false);
+    children.push(waiter);
+    expect(await waiter.firstMessage).toBe('waiting for the other initializer');
+    expect((await readFile(path)).equals(legacy)).toBe(true);
+    owner.child.send('continue');
+    expect(await owner.outcome).toEqual({
+      code: 0,
+      output: 'dev: private configuration upgraded\n',
+    });
+    expect(await waiter.outcome).toEqual({
+      code: 0,
+      output: 'dev: private configuration preserved\n',
+    });
+  } finally {
+    for (const { child } of children) child.kill();
+    await Promise.allSettled(children.map(({ outcome }) => outcome));
+  }
+
+  const bytes = await readFile(path);
+  expect(bytes.subarray(0, legacy.length).equals(legacy)).toBe(true);
+  const contents = bytes.toString('utf8');
+  for (const key of added)
+    expect(contents.split('\n').filter((line) => line.startsWith(`${key}=`))).toHaveLength(1);
+  const parsed = await readLocalEnvironment('dev', root, {});
+  expect(parsed.values.MIO_AUTH_SECRET).toEqual(parseEnv(original).MIO_AUTH_SECRET);
+  expect((await stat(path)).mode & 0o777).toBe(0o700);
+});
+
 it('shares local COS settings while keeping B broker, journal and other credentials scoped', async () => {
   const root = await fixture();
   const file = join(root, '.env.test');

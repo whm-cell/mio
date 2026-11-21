@@ -136,13 +136,13 @@
 
 身份：组所有者。
 
-输入：`{requestId,revision,scope:"local"|"upstream"}`，字段限制同素材删除。
+输入：`{requestId,revision,scope:"local"|"upstream",confirmCascade?:boolean}`，requestId 和 revision 限制同素材删除。仅组的 `scope:"upstream"` 可提交 `confirmCascade`，缺失或 `false` 表示未确认。其他动作提交该字段或提交非布尔值返回 400 BODY_INVALID。
 
-成功：local 为 200 `{group:GroupView}`（state=deleted）；upstream 新请求仅在精确确认上游组已不存在时收束为 200 `{operation:OperationView}`。既有 requestId 返回原操作，succeeded 200，其余 202。
+成功：local 为 200 `{group:GroupView}`（state=deleted）。upstream 返回 `{operation:OperationView}`，succeeded 为 200，其余为 202。已受理的同 requestId、组、revision 和确认意图返回原操作。`resultLocalId` 在成功后为目标组 ID。
 
-错误：本地有未删除素材，或上游组仍存在时，返回 409 RESOURCE_IN_USE；后者即使本地为空或仅有墓碑也适用。在途创建/操作/组租约 409 MATERIAL_BUSY；新请求的上游组权限、查询或凭据错误直接返回对应错误；其他同素材删除与共同约定。
+错误：未确认的 upstream 在本地有未删除成员或远端组仍存在时返回 409 RESOURCE_IN_USE，local 在本地有未删除成员时同样拒绝。在途操作、租约、组状态及 revision 校验对确认删除同样适用。首次组查询、组权限或凭据错误直接返回对应错误。同一远端删除 requestId 改组、revision 或确认意图返回 409 IDEMPOTENCY_CONFLICT。其他见共同约定。
 
-副作用：local 仅留本地墓碑；upstream 新请求先核验归属、revision 和精确 GetAssetGroup。DeleteAssetGroup 会级联删除组内素材，当前协议缺少原子的空组删除条件，因此组仍存在时在建立删除操作前拒绝，组保持可用；列表为空也无法排除查询后其他写者新增素材的竞争。仅精确确认该上游组不存在时，持久化并同事务完成本地墓碑与操作终态。既有 unknown 删除操作继续通过原资源查询收束，保留原请求身份。COS 原件保留。真人授权的撤销需要通过第三方平台实际提供的渠道单独办理。
+副作用：local 仅留本地墓碑。upstream 以本地映射的原组 ID 做精确 `GetAssetGroup`。未确认请求须通过本地空组检查，且该查询精确返回 HTTP 404 `ResourceNotFound`，才受理并落本地组墓碑。精确不存在回执须符合固定信封且缺省 Result 或带空 Result。明确提交 `confirmCascade:true` 授权永久删除指定远端组及供应商执行时的全部成员，包括本地未同步、已本地移除及确认后并发新增的成员。已确认删除复核本人组、账号配置绑定与当前 Key 权限，在出站前持久化操作意图、目标、凭据版本和输入摘要。若组仍存在，仅对目标发一次 `DeleteAssetGroup`。回执 `Result.Id` 须与目标相符，回执 `Result:{}` 则仅在精确查询目标确认不存在后收束。超时、身份不符、协议不明或本地提交失败都保留 unknown。确认成功后，在一个事务中更新目标组、本地已知成员墓碑与操作终态。现有墓碑及历史、其他组和 COS 原件保留。撤销真人授权须经第三方平台单独办理。
 
 ## GET /api/v1/materials/operations/{id}
 
@@ -154,7 +154,7 @@
 
 错误：他人操作统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
-副作用：本地读取并收敛到期操作；CreateAssetGroup/CreateAsset 已返回合法 ID 但提交失败时，fallback 将 ID/RequestId 仅保留于受限操作快照/审计；fallback 也不可用时披露人工核对。已知建组/素材登记或远端删除的 unknown 由 5 秒持久冷却、操作/组双租约认领，最多执行本次必要的 GetAssetGroup/GetAsset 复核，已知建组确认存在才同事务发布 ready/succeeded；已知素材登记经当前组和 GetAsset 核验后按真实上游状态发布素材并收束 succeeded（跨 owner 全局冲突拒绝且不读回他人）；远端删除精确 404 才收束 deleted/succeeded。建组 403/404、删除仍存在或未知继续 unknown；不重发 Delete，不枚举共享池。
+副作用：本地读取并收敛到期操作；CreateAssetGroup/CreateAsset 已返回合法 ID 但提交失败时，fallback 将 ID/RequestId 仅保留于受限操作快照/审计；fallback 也不可用时披露人工核对。已知建组/素材登记或远端删除的 unknown 由 5 秒持久冷却、操作/组双租约认领，最多执行本次必要的 GetAssetGroup/GetAsset 复核。已知建组确认存在才同事务发布 ready/succeeded；已知素材登记经当前组和 GetAsset 核验后按真实上游状态发布素材并收束 succeeded（跨 owner 全局冲突拒绝且不读回他人）。远端删除须精确查询原资源收到 HTTP 404 `ResourceNotFound` 才收束 deleted/succeeded。组操作按受理时的确认意图处理成员墓碑，历史未确认操作继续依赖本地空组检查。建组 403/404、删除仍存在或状态未知继续 unknown。恢复只查询原资源。
 
 ## POST /api/v1/materials/auth-sessions
 

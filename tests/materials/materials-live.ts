@@ -98,7 +98,7 @@ try {
     CreateAssetGroup: 1,
     UpdateAssetGroup: 1,
     DeleteAssetGroup: 1,
-    GetAssetGroup: 3,
+    GetAssetGroup: 4,
     ListAssets: 1,
   };
   globalThis.fetch = async (input, init) => {
@@ -184,6 +184,7 @@ try {
     requestId: randomUUID(),
     revision: renamed.revision,
     scope: 'upstream',
+    confirmCascade: true,
   });
   report.observations.push({ delete: deleted });
   await save();

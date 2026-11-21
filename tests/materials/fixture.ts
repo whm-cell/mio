@@ -60,6 +60,10 @@ export async function materialFixture(
     string,
     { Id: string; GroupId: string; Name: string; AssetType: 'Image'; Status: string }
   >();
+  const deleteRemoteGroup = (id: string) => {
+    groups.delete(id);
+    for (const [itemId, item] of items) if (item.GroupId === id) items.delete(itemId);
+  };
   let sequence = 0;
   let override:
     ((action: string, body: Record<string, unknown>) => Promise<Response | undefined>) | undefined;
@@ -94,7 +98,7 @@ export async function materialFixture(
       return envelope(action, { Id: id });
     }
     if (action === 'DeleteAssetGroup') {
-      groups.delete(id);
+      deleteRemoteGroup(id);
       return envelope(action, { Id: id });
     }
     if (action === 'ListAssets') {
@@ -146,6 +150,7 @@ export async function materialFixture(
     actor,
     groups,
     items,
+    deleteRemoteGroup,
     store,
     service,
     transport,

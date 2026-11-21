@@ -634,13 +634,13 @@ export class MaterialStore {
       throw conflict('RESOURCE_IN_USE');
   }
 
-  async precheckGroupDelete(owner: string, id: string, revision: number): Promise<string> {
+  async precheckGroupDelete(owner: string, id: string, revision: number, confirmCascade: boolean) {
     return this.transaction(async (client) => {
       const group = await this.group(client, owner, id, true);
       this.assertMutable(group, revision);
       await this.assertIdle(client, owner, group);
-      await this.assertEmpty(client, owner, id);
-      return group.upstream_group_id!;
+      if (!confirmCascade) await this.assertEmpty(client, owner, id);
+      return { upstreamId: group.upstream_group_id!, providerConfigId: group.provider_config_id };
     });
   }
 
@@ -652,6 +652,7 @@ export class MaterialStore {
     id: string,
     revision: number,
     credential: AccountCredentialSnapshot,
+    groupCheck?: { upstreamId: string; confirmCascade: boolean },
   ): Promise<{ operation: OperationRow; fresh: boolean }> {
     return this.transaction(async (client) => {
       const opKind: OperationKind =
@@ -691,9 +692,14 @@ export class MaterialStore {
       if (['deleted', 'deleting', 'registering'].includes(row.state))
         throw conflict('MATERIAL_BUSY');
       await this.assertIdle(client, owner, group, material?.id, op.id);
-      if (kind === 'group') await this.assertEmpty(client, owner, id);
+      const confirmed = kind === 'group' && groupCheck?.confirmCascade === true;
+      if (kind === 'group' && !confirmed) await this.assertEmpty(client, owner, id);
       const upstreamId = material ? material.upstream_asset_id : group.upstream_group_id;
       if (!upstreamId) throw conflict('MATERIAL_GROUP_NOT_READY');
+      if (groupCheck && upstreamId !== groupCheck.upstreamId)
+        throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+      if (confirmed && group.provider_config_id !== credential.providerConfigId)
+        throw conflict('PROVIDER_UNAVAILABLE');
       const table = kind === 'group' ? 'mio_material_groups' : 'mio_materials';
       await client.query(
         `UPDATE ${table} SET state='deleting',revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2`,
@@ -706,7 +712,12 @@ export class MaterialStore {
             op.id,
             group.id,
             material?.id ?? null,
-            { version: 1, upstreamId, previousState: row.state },
+            {
+              version: 1,
+              upstreamId,
+              previousState: row.state,
+              ...(confirmed ? { confirmCascade: true } : {}),
+            },
           ],
         )
       ).rows[0]!;
@@ -714,7 +725,34 @@ export class MaterialStore {
     });
   }
 
-  async finishDelete(owner: string, op: OperationRow): Promise<void> {
+  private async tombstoneGroup(
+    client: PoolClient,
+    op: OperationRow,
+    states: GroupRow['state'][],
+  ): Promise<void> {
+    const { owner_id: owner, target_group_id: id, protocol_snapshot: snapshot } = op;
+    const confirmed = snapshot.confirmCascade === true;
+    const saved = await client.query(
+      `UPDATE mio_material_groups SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now()
+       WHERE owner_id=$1 AND id=$2 AND state=ANY($3::text[]) AND upstream_group_id=$4
+       AND ($5::uuid IS NULL OR provider_config_id=$5)`,
+      [owner, id, states, snapshot.upstreamId, confirmed ? op.provider_config_id : null],
+    );
+    if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+    if (confirmed)
+      await client.query(
+        `UPDATE mio_materials SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now()
+         WHERE owner_id=$1 AND group_id=$2 AND state<>'deleted'`,
+        [owner, id],
+      );
+    else await this.assertEmpty(client, owner, id!);
+  }
+
+  async finishDelete(
+    owner: string,
+    op: OperationRow,
+    requestId: string | null = null,
+  ): Promise<void> {
     await this.transaction(async (client) => {
       const claim = (
         await client.query<OperationRow>(
@@ -723,16 +761,19 @@ export class MaterialStore {
         )
       ).rows[0];
       if (!claim) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
-      const table = op.target_material_id ? 'mio_materials' : 'mio_material_groups';
-      const id = op.target_material_id ?? op.target_group_id;
-      const saved = await client.query(
-        `UPDATE ${table} SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='deleting'`,
-        [owner, id],
-      );
-      if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+      const id = claim.target_material_id ?? claim.target_group_id;
+      if (claim.kind === 'delete_group_upstream')
+        await this.tombstoneGroup(client, claim, ['deleting']);
+      else {
+        const saved = await client.query(
+          "UPDATE mio_materials SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='deleting'",
+          [owner, id],
+        );
+        if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+      }
       const closed = await client.query(
-        "UPDATE mio_material_operations SET state='succeeded',result_local_id=$2,lease_id=NULL,lease_until=NULL,updated_at=now() WHERE owner_id=$1 AND id=$3 AND lease_id=$4 AND input_hash=$5 AND lease_until>clock_timestamp()",
-        [owner, id, op.id, op.lease_id, op.input_hash],
+        "UPDATE mio_material_operations SET state='succeeded',result_local_id=$2,upstream_request_id=$6,lease_id=NULL,lease_until=NULL,updated_at=now() WHERE owner_id=$1 AND id=$3 AND lease_id=$4 AND input_hash=$5 AND lease_until>clock_timestamp()",
+        [owner, id, op.id, op.lease_id, op.input_hash, requestId],
       );
       if (closed.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
     });
@@ -833,7 +874,14 @@ export class MaterialStore {
         )
       ).rows[0];
       if (!existing?.target_group_id) return;
-      await this.group(client, owner, existing.target_group_id, true);
+      const group = await this.group(client, owner, existing.target_group_id, true);
+      if (
+        existing.kind === 'delete_group_upstream' &&
+        (group.upstream_group_id !== existing.protocol_snapshot.upstreamId ||
+          (existing.protocol_snapshot.confirmCascade === true &&
+            group.provider_config_id !== existing.provider_config_id))
+      )
+        return;
       const busy = await client.query(
         'SELECT 1 FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND sync_lease_until>clock_timestamp()',
         [owner, existing.target_group_id],
@@ -888,31 +936,34 @@ export class MaterialStore {
       )
         throw conflict('UPSTREAM_RESPONSE_INVALID');
       if (confirmed) {
-        const table = op.target_material_id ? 'mio_materials' : 'mio_material_groups';
-        const id = op.target_material_id ?? op.target_group_id;
-        const saved =
-          op.kind === 'register_material'
-            ? await client.query(
-                "UPDATE mio_materials SET state=$5,upstream_asset_id=$3,upstream_status=$6,last_synced_at=now(),error_code=NULL,next_query_at=now()+interval '4 seconds',revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_asset_id IS NULL AND group_id=$4",
-                [
-                  owner,
-                  id,
-                  current.protocol_snapshot.upstreamId,
-                  op.target_group_id,
-                  materialState(material!.status),
-                  material!.status,
-                ],
-              )
-            : op.kind === 'create_group'
+        const id = current.target_material_id ?? current.target_group_id;
+        if (current.kind === 'delete_group_upstream')
+          await this.tombstoneGroup(client, current, ['unknown', 'deleting']);
+        else {
+          const saved =
+            current.kind === 'register_material'
               ? await client.query(
-                  "UPDATE mio_material_groups SET state='ready',upstream_group_id=$3,revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_group_id IS NULL",
-                  [owner, id, current.protocol_snapshot.upstreamId],
+                  "UPDATE mio_materials SET state=$5,upstream_asset_id=$3,upstream_status=$6,last_synced_at=now(),error_code=NULL,next_query_at=now()+interval '4 seconds',revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_asset_id IS NULL AND group_id=$4",
+                  [
+                    owner,
+                    id,
+                    current.protocol_snapshot.upstreamId,
+                    op.target_group_id,
+                    materialState(material!.status),
+                    material!.status,
+                  ],
                 )
-              : await client.query(
-                  `UPDATE ${table} SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state IN ('unknown','deleting')`,
-                  [owner, id],
-                );
-        if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+              : current.kind === 'create_group'
+                ? await client.query(
+                    "UPDATE mio_material_groups SET state='ready',upstream_group_id=$3,revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_group_id IS NULL",
+                    [owner, id, current.protocol_snapshot.upstreamId],
+                  )
+                : await client.query(
+                    "UPDATE mio_materials SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state IN ('unknown','deleting')",
+                    [owner, id],
+                  );
+          if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
+        }
         await client.query(
           "UPDATE mio_material_operations SET state='succeeded',error_code=NULL,result_local_id=$4,lease_id=NULL,lease_until=NULL,updated_at=now() WHERE owner_id=$1 AND id=$2 AND lease_id=$3",
           [owner, op.id, op.lease_id, id],

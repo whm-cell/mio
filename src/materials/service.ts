@@ -8,7 +8,6 @@ import type {
   OperationView,
   MaterialPrincipal,
   MaterialUpstream,
-  OperationKind,
   OperationRow,
 } from './contracts.ts';
 import type { MaterialStore, MaterialCursor } from './store.ts';
@@ -76,7 +75,18 @@ function syncPage(cursor?: string): number {
   return Number(cursor);
 }
 
-/** No scheduler or automatic mutation retry. Each admitted request owns one bounded remote action. */
+async function upstreamExists(get: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await get();
+    return true;
+  } catch (error) {
+    if (error instanceof MaterialUpstreamError && error.code === 'UPSTREAM_RESOURCE_NOT_FOUND')
+      return false;
+    throw error;
+  }
+}
+
+/** Each admitted operation submits at most one remote mutation. */
 export function createMaterialService(
   store: MaterialStore,
   credentials: Credentials,
@@ -102,8 +112,11 @@ export function createMaterialService(
   const outbound = async <T>(
     owner: string,
     work: (key: string, signal: AbortSignal) => Promise<T>,
+    providerConfigId?: string,
   ) => {
     const snapshot = await credentials.snapshotAccount(owner);
+    if (providerConfigId !== undefined && snapshot.providerConfigId !== providerConfigId)
+      throw new MaterialError(HTTP_STATUS.CONFLICT, 'PROVIDER_UNAVAILABLE');
     stop.signal.throwIfAborted();
     const key = credentials.openAccountSnapshot(owner, snapshot);
     return work(key, stop.signal);
@@ -134,6 +147,81 @@ export function createMaterialService(
   const operationResult = async (owner: string, op: OperationRow) => {
     const current = await store.operation(owner, op.id);
     return { operation: operationView(current) };
+  };
+  const removeUpstreamGroup = async (
+    owner: string,
+    id: string,
+    requestId: string,
+    revision: number,
+    confirmCascade: boolean,
+  ) => {
+    const inputHash = hash({
+      id,
+      revision,
+      scope: 'upstream',
+      ...(confirmCascade ? { confirmCascade } : {}),
+    });
+    const previous = () => store.previous(owner, 'delete_group_upstream', requestId, inputHash);
+    const old = await previous();
+    if (old) return operationResult(owner, old);
+
+    let target: Awaited<ReturnType<MaterialStore['precheckGroupDelete']>>;
+    let snapshot: Awaited<ReturnType<Credentials['snapshotAccount']>>;
+    let key: string;
+    let exists: boolean;
+    try {
+      target = await store.precheckGroupDelete(owner, id, revision, confirmCascade);
+      snapshot = await credentials.snapshotAccount(owner);
+      if (confirmCascade && target.providerConfigId !== snapshot.providerConfigId)
+        throw new MaterialError(HTTP_STATUS.CONFLICT, 'PROVIDER_UNAVAILABLE');
+      stop.signal.throwIfAborted();
+      key = credentials.openAccountSnapshot(owner, snapshot);
+      exists = await upstreamExists(() => upstream.getGroup(key, target.upstreamId, stop.signal));
+      if (exists && !confirmCascade)
+        throw new MaterialError(HTTP_STATUS.CONFLICT, 'RESOURCE_IN_USE');
+    } catch (error) {
+      // A concurrent request can be accepted while this request is still in preflight.
+      const accepted = await previous();
+      if (accepted) return operationResult(owner, accepted);
+      throw error;
+    }
+    const { operation: op, fresh } = await store.beginDelete(
+      owner,
+      requestId,
+      inputHash,
+      'group',
+      id,
+      revision,
+      snapshot,
+      { upstreamId: target.upstreamId, confirmCascade },
+    );
+    if (!fresh) return operationResult(owner, op);
+
+    let attempted = false;
+    let returned = !exists;
+    try {
+      stop.signal.throwIfAborted();
+      let upstreamRequestId = null;
+      if (exists) {
+        if (op.protocol_snapshot.confirmCascade !== true)
+          throw new MaterialError(HTTP_STATUS.CONFLICT, 'RESOURCE_IN_USE');
+        const upstreamId = op.protocol_snapshot.upstreamId!;
+        attempted = true;
+        const receipt = await upstream.deleteGroup(key, upstreamId, stop.signal);
+        returned = true;
+        upstreamRequestId = receipt.requestId;
+        if (
+          !receipt.confirmed &&
+          (await upstreamExists(() => upstream.getGroup(key, upstreamId, stop.signal)))
+        )
+          throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'UPSTREAM_RESULT_UNKNOWN');
+      }
+      stop.signal.throwIfAborted();
+      await store.finishDelete(owner, op, upstreamRequestId);
+    } catch (error) {
+      await settleFailure(owner, op, error, returned, attempted);
+    }
+    return operationResult(owner, op);
   };
   return {
     groups(actor: MaterialPrincipal, type: string | undefined, limit: number, cursor?: string) {
@@ -379,9 +467,12 @@ export function createMaterialService(
       requestId: string,
       revision: number,
       scope: 'local' | 'upstream',
+      confirmCascade = false,
     ) {
       return admit(async () => {
         const owner = actor.userId;
+        if (confirmCascade && (kind !== 'group' || scope !== 'upstream'))
+          throw new MaterialError(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         if (scope === 'local') {
           const row = await store.removeLocal(owner, kind, id, revision);
           return kind === 'group'
@@ -390,32 +481,13 @@ export function createMaterialService(
                 material: materialView(row as Awaited<ReturnType<MaterialStore['ownedMaterial']>>),
               };
         }
-        const opKind: OperationKind =
-          kind === 'group' ? 'delete_group_upstream' : 'delete_material_upstream';
+        if (kind === 'group')
+          return removeUpstreamGroup(owner, id, requestId, revision, confirmCascade);
         const inputHash = hash({ id, revision, scope });
-        const old = await store.previous(owner, opKind, requestId, inputHash);
+        const old = await store.previous(owner, 'delete_material_upstream', requestId, inputHash);
         if (old) return operationResult(owner, old);
-        const upstreamGroupId =
-          kind === 'group' ? await store.precheckGroupDelete(owner, id, revision) : undefined;
-        if (kind === 'material') await store.ownedMaterial(owner, id);
+        await store.ownedMaterial(owner, id);
         const snapshot = await credentials.snapshotAccount(owner);
-        if (upstreamGroupId) {
-          stop.signal.throwIfAborted();
-          const key = credentials.openAccountSnapshot(owner, snapshot);
-          let absent = false;
-          try {
-            await upstream.getGroup(key, upstreamGroupId, stop.signal);
-          } catch (error) {
-            if (
-              !(error instanceof MaterialUpstreamError) ||
-              error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
-            )
-              throw error;
-            absent = true;
-          }
-          // DeleteAssetGroup cascades remotely and has no atomic empty-group condition.
-          if (!absent) throw new MaterialError(HTTP_STATUS.CONFLICT, 'RESOURCE_IN_USE');
-        }
         const { operation: op, fresh } = await store.beginDelete(
           owner,
           requestId,
@@ -430,30 +502,17 @@ export function createMaterialService(
         let attempted = false;
         try {
           stop.signal.throwIfAborted();
-          if (kind === 'material') {
-            const key = credentials.openAccountSnapshot(owner, snapshot);
-            const group = await store.ownedGroup(owner, op.target_group_id!);
-            await upstream.getGroup(key, group.upstream_group_id!, stop.signal);
-            let absent = false;
-            try {
-              await upstream.getMaterial(
-                key,
-                op.protocol_snapshot.upstreamId!,
-                group.upstream_group_id!,
-                stop.signal,
-              );
-            } catch (error) {
-              if (
-                !(error instanceof MaterialUpstreamError) ||
-                error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
-              )
-                throw error;
-              absent = true;
-            }
-            if (!absent) {
-              attempted = true;
-              await upstream.deleteMaterial(key, op.protocol_snapshot.upstreamId!, stop.signal);
-            }
+          const key = credentials.openAccountSnapshot(owner, snapshot);
+          const group = await store.ownedGroup(owner, op.target_group_id!);
+          await upstream.getGroup(key, group.upstream_group_id!, stop.signal);
+          const upstreamId = op.protocol_snapshot.upstreamId!;
+          if (
+            await upstreamExists(() =>
+              upstream.getMaterial(key, upstreamId, group.upstream_group_id!, stop.signal),
+            )
+          ) {
+            attempted = true;
+            await upstream.deleteMaterial(key, upstreamId, stop.signal);
           }
           returned = true;
           stop.signal.throwIfAborted();
@@ -477,55 +536,54 @@ export function createMaterialService(
         const claim = await store.claimRecovery(owner, id);
         if (!claim) return operationView(op);
         try {
-          await outbound(owner, async (key, signal) => {
-            if (claim.kind === 'register_material') {
-              const group = await store.ownedGroup(owner, claim.target_group_id!);
-              if (
-                group.state !== 'ready' ||
-                group.upstream_group_id !== claim.protocol_snapshot.upstreamGroupId
-              )
-                throw new MaterialError(409, 'MATERIAL_GROUP_NOT_READY');
-              await upstream.getGroup(key, group.upstream_group_id!, signal);
-              const item = await upstream.getMaterial(
-                key,
-                claim.protocol_snapshot.upstreamId!,
-                group.upstream_group_id!,
-                signal,
-              );
-              signal.throwIfAborted();
-              await store.finishRecovery(owner, claim, true, null, item);
-              return;
-            }
-            if (claim.kind === 'create_group') {
-              await upstream.getGroup(key, claim.protocol_snapshot.upstreamId!, signal);
-              signal.throwIfAborted();
-              await store.finishRecovery(owner, claim, true, null);
-              return;
-            }
-            const group = await store.ownedGroup(owner, claim.target_group_id!);
-            if (claim.target_material_id)
-              await upstream.getGroup(key, group.upstream_group_id!, signal);
-            try {
-              if (claim.target_material_id)
-                await upstream.getMaterial(
+          await outbound(
+            owner,
+            async (key, signal) => {
+              if (claim.kind === 'register_material') {
+                const group = await store.ownedGroup(owner, claim.target_group_id!);
+                if (
+                  group.state !== 'ready' ||
+                  group.upstream_group_id !== claim.protocol_snapshot.upstreamGroupId
+                )
+                  throw new MaterialError(409, 'MATERIAL_GROUP_NOT_READY');
+                await upstream.getGroup(key, group.upstream_group_id!, signal);
+                const item = await upstream.getMaterial(
                   key,
                   claim.protocol_snapshot.upstreamId!,
                   group.upstream_group_id!,
                   signal,
                 );
-              else await upstream.getGroup(key, claim.protocol_snapshot.upstreamId!, signal);
-            } catch (error) {
-              if (
-                !(error instanceof MaterialUpstreamError) ||
-                error.code !== 'UPSTREAM_RESOURCE_NOT_FOUND'
-              )
-                throw error;
+                signal.throwIfAborted();
+                await store.finishRecovery(owner, claim, true, null, item);
+                return;
+              }
+              if (claim.kind === 'create_group') {
+                await upstream.getGroup(key, claim.protocol_snapshot.upstreamId!, signal);
+                signal.throwIfAborted();
+                await store.finishRecovery(owner, claim, true, null);
+                return;
+              }
+              const upstreamId = claim.protocol_snapshot.upstreamId!;
+              let exists;
+              if (claim.kind === 'delete_group_upstream')
+                exists = await upstreamExists(() => upstream.getGroup(key, upstreamId, signal));
+              else {
+                const group = await store.ownedGroup(owner, claim.target_group_id!);
+                await upstream.getGroup(key, group.upstream_group_id!, signal);
+                exists = await upstreamExists(() =>
+                  upstream.getMaterial(key, upstreamId, group.upstream_group_id!, signal),
+                );
+              }
               signal.throwIfAborted();
-              await store.finishRecovery(owner, claim, true, null);
-              return;
-            }
-            await store.finishRecovery(owner, claim, false, 'UPSTREAM_RESULT_UNKNOWN');
-          });
+              await store.finishRecovery(
+                owner,
+                claim,
+                !exists,
+                exists ? 'UPSTREAM_RESULT_UNKNOWN' : null,
+              );
+            },
+            claim.protocol_snapshot.confirmCascade === true ? claim.provider_config_id : undefined,
+          );
         } catch (error) {
           await store.finishRecovery(owner, claim, false, errorCode(error)).catch(() => {});
         }

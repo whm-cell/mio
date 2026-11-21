@@ -8,6 +8,8 @@
 
 素材库在同一 `MIO_ASSETS_DATABASE_URL` 独立持最多 5 个连接，连接/语句/查询等待各 5 秒。先迁移 assets，再显式 `pnpm materials:migrate --apply`；管理/登记三表为 groups/materials/operations，不变更 mio_assets 核心列、不建跨供应商或认证库外键。启动只读核验列与确切全局部分唯一索引；现行素材状态、墓碑、租约和恢复见[素材 HTTP](../apis/materials.md)。网络在短事务外，迟到同步/刷新及操作终态在同一事务按当前租约和生命周期提交。
 
+已确认的远端组删除复用 `mio_material_operations` 的版本 1 快照，冻结原远端组映射、确认意图、输入摘要和账号配置/凭据版本。组删除确认成功时，同一个短事务提交目标组、按 owner 和组 ID 批量更新的成员墓碑以及操作终态。缺少确认字段的历史操作沿本地空组条件恢复。旧快照及输入摘要继续有效，无需改表或回填。
+
 素材认证在同一媒体域池增量建立 `mio_material_auth_sessions`，仅会话表承担创建/验证意图、独立用途密文、20 分钟 TTL、token digest、租约及最多 8 次查询计数，不双写 operation。`upstream_create_request_id`、`upstream_result_request_id`、`upstream_group_request_id` 分别保存创建、查结果、验组三个动作最近一次取得的有效 RequestId，来源为通过校验的成功或明确拒绝信封，每项最多 256 个字符。显式迁移保留旧行并将新增列置空；收到有效值后随原会话状态提交，仅供内部审计。owner/group 复合 FK 只在媒体库内；source/密钥/认证库无跨库 FK。公开认证启用时启动只读检查当前结构。有会话表的素材服务在启动及运行期间按到期索引每批最多清理 100 条，包括关闭认证入口时；完成实体/会话终态/清密文同事务，网络不持事务。
 
 ## 必须遵守的约束

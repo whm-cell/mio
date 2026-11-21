@@ -392,9 +392,14 @@ it('keeps local deletion offline and rejects nonempty group deletion without imp
   expect(f.groups.size).toBe(1);
 });
 
-it.each(['sync lease', 'unsettled operation'] as const)(
-  'rejects remote group deletion with an active %s before credentials or upstream access',
-  async (scenario) => {
+it.each([
+  ['sync lease', false],
+  ['sync lease', true],
+  ['unsettled operation', false],
+  ['unsettled operation', true],
+] as const)(
+  'rejects remote group deletion with an active %s (confirmCascade=%s) before credentials or upstream access',
+  async (scenario, confirmCascade) => {
     const f = await fixture();
     const group = await f.create();
     if (scenario === 'sync lease') {
@@ -420,7 +425,15 @@ it.each(['sync lease', 'unsettled operation'] as const)(
     const decrypt = vi.spyOn(f.provider, 'openAccountSnapshot');
     const before = f.transport.mock.calls.length;
     await expect(
-      f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'upstream'),
+      f.service.remove(
+        f.actor,
+        'group',
+        group.groupId,
+        randomUUID(),
+        group.revision,
+        'upstream',
+        confirmCascade,
+      ),
     ).rejects.toMatchObject({ status: 409, code: 'MATERIAL_BUSY' });
     expect(snapshot).not.toHaveBeenCalled();
     expect(decrypt).not.toHaveBeenCalled();
@@ -635,6 +648,20 @@ it('keeps historical unknown group deletion idempotent and holds recovery to one
   );
   if (!('operation' in deleting)) throw new Error();
   expect(deleting.operation).toMatchObject({ operationId: operation.id, state: 'unknown' });
+  await expect(
+    f.service.remove(f.actor, 'group', group.groupId, requestId, group.revision, 'upstream', true),
+  ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  expect(
+    await f.service.remove(
+      f.actor,
+      'group',
+      group.groupId,
+      requestId,
+      group.revision,
+      'upstream',
+      false,
+    ),
+  ).toEqual(deleting);
   expect(f.transport).toHaveBeenCalledTimes(beforeReplay);
   f.override(async (action) =>
     action === 'GetAssetGroup' ? envelope(action, {}, 403, 'Forbidden') : undefined,

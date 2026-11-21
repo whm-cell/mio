@@ -80,6 +80,7 @@ export interface OperationRow {
     upstreamId?: string;
     previousState?: GroupState | MaterialState;
     upstreamGroupId?: string;
+    confirmCascade?: true;
   };
   upstream_request_id: string | null;
   attempt: number;
@@ -156,7 +157,11 @@ export interface MaterialUpstream {
   ): Promise<{ id: string; requestId: string | null }>;
   getGroup(key: string, id: string, signal: AbortSignal): Promise<void>;
   renameGroup(key: string, id: string, name: string, signal: AbortSignal): Promise<void>;
-  deleteGroup(key: string, id: string, signal: AbortSignal): Promise<void>;
+  deleteGroup(
+    key: string,
+    id: string,
+    signal: AbortSignal,
+  ): Promise<{ confirmed: boolean; requestId: string | null }>;
   listMaterials(
     key: string,
     id: string,

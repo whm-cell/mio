@@ -147,9 +147,11 @@ export function createMaterialHandler(
                 ? ['requestId', 'assetId', 'name']
                 : endpoint.kind === 'sync'
                   ? ['cursor']
-                  : endpoint.kind.startsWith('delete')
-                    ? ['requestId', 'revision', 'scope']
-                    : [];
+                  : endpoint.kind === 'deleteGroup'
+                    ? ['requestId', 'revision', 'scope', 'confirmCascade']
+                    : endpoint.kind === 'deleteMaterial'
+                      ? ['requestId', 'revision', 'scope']
+                      : [];
       if (Object.keys(body).some((key) => !keys.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (result: unknown, status: number = HTTP_STATUS.OK) => {
@@ -229,6 +231,11 @@ export function createMaterialHandler(
       }
       if (!revision(body.revision) || (body.scope !== 'local' && body.scope !== 'upstream'))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      if (
+        'confirmCascade' in body &&
+        (body.scope !== 'upstream' || typeof body.confirmCascade !== 'boolean')
+      )
+        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const result = await service.remove(
         actor,
         endpoint.kind === 'deleteGroup' ? 'group' : 'material',
@@ -236,6 +243,7 @@ export function createMaterialHandler(
         body.requestId,
         body.revision,
         body.scope,
+        body.confirmCascade === true,
       );
       return send(
         result,

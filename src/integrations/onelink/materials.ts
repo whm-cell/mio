@@ -126,12 +126,24 @@ function materialCall(transport: ModelTransport) {
         !/[\x00-\x1f\x7f]/.test(metadata.RequestId)
           ? metadata.RequestId
           : null;
+      const groupDelete = action === 'DeleteAssetGroup';
+      const groupLookup = action === 'GetAssetGroup';
+      if ((groupDelete || groupLookup) && response.ok && 'Error' in metadata) return invalid();
       if (!response.ok || metadata.Error) {
         const error = record(metadata.Error) ? metadata.Error : undefined;
-        const request =
-          requestId && typeof error?.Code === 'string' && /^[A-Za-z0-9._-]{1,100}$/.test(error.Code)
-            ? { action, id: requestId }
+        const code =
+          typeof error?.Code === 'string' && /^[A-Za-z0-9._-]{1,100}$/.test(error.Code)
+            ? error.Code
             : undefined;
+        const exactAbsence = response.status === 404 && code === 'ResourceNotFound';
+        if (
+          (groupDelete || (groupLookup && exactAbsence)) &&
+          'Result' in body &&
+          (!record(body.Result) || Object.keys(body.Result).length !== 0)
+        )
+          return invalid();
+        if (groupDelete && !code) return invalid();
+        const request = requestId && code ? { action, id: requestId } : undefined;
         if (response.status === 403)
           throw new MaterialUpstreamError(
             HTTP_STATUS.FORBIDDEN,
@@ -139,11 +151,18 @@ function materialCall(transport: ModelTransport) {
             false,
             request,
           );
-        if (response.status === 404 && error?.Code === 'ResourceNotFound')
+        if (exactAbsence)
           throw new MaterialUpstreamError(
             HTTP_STATUS.NOT_FOUND,
             'UPSTREAM_RESOURCE_NOT_FOUND',
             false,
+            request,
+          );
+        if (groupDelete && response.status === 408)
+          throw new MaterialUpstreamError(
+            HTTP_STATUS.SERVICE_UNAVAILABLE,
+            'UPSTREAM_RESULT_UNKNOWN',
+            true,
             request,
           );
         throw new MaterialUpstreamError(
@@ -197,8 +216,11 @@ export function createMaterialUpstream(transport: ModelTransport = fetch): Mater
       if (value.result.Id !== id) return invalid();
     },
     async deleteGroup(key, id, signal) {
-      const value = await call('DeleteAssetGroup', key, { Id: id }, signal);
-      if (value.result.Id !== id) return invalid();
+      if (!groupId.test(id)) return invalid();
+      const { result, requestId } = await call('DeleteAssetGroup', key, { Id: id }, signal);
+      if (result.Id === id) return { confirmed: true, requestId };
+      if (Object.keys(result).length === 0) return { confirmed: false, requestId };
+      return invalid();
     },
     async listMaterials(key, id, page, signal) {
       if (!groupId.test(id) || !Number.isSafeInteger(page) || page < 1) return invalid();

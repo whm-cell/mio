@@ -135,6 +135,55 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
   expect(
     f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
   ).toHaveLength(0);
+  const deleteBody = { requestId: randomUUID(), revision: group.revision, scope: 'upstream' };
+  const deletePath = `/groups/${id}/delete`;
+  for (const confirmCascade of ['true', 1, null, {}])
+    expect((await call(deletePath, 'POST', { ...deleteBody, confirmCascade })).status).toBe(400);
+  expect((await call(deletePath, 'POST', { ...deleteBody, confirmCascade: false })).status).toBe(
+    409,
+  );
+  expect(
+    (await call(deletePath, 'POST', { ...deleteBody, scope: 'local', confirmCascade: true }))
+      .status,
+  ).toBe(400);
+  expect(
+    (await call(`/items/${row.id}/delete`, 'POST', { ...deleteBody, confirmCascade: false }))
+      .status,
+  ).toBe(400);
+  const confirmed = { ...deleteBody, confirmCascade: true };
+  expect(
+    (await call(deletePath, 'POST', { ...confirmed, upstreamGroupId: 'spoofed' })).status,
+  ).toBe(400);
+  expect(
+    (await call(deletePath, 'POST', confirmed, { origin: 'https://evil.example' })).status,
+  ).toBe(403);
+  expect((await call(deletePath, 'POST', confirmed, { cookie: 'session=other' })).status).toBe(404);
+  expect((await call(deletePath, 'POST', confirmed, { cookie: '' })).status).toBe(401);
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+  ).toHaveLength(0);
+
+  f.add(group.upstream_group_id!, 2);
+  expect((await call(`/groups/${id}/sync`, 'POST', {})).status).toBe(200);
+  const deleted = await call(deletePath, 'POST', confirmed);
+  expect(deleted.status).toBe(200);
+  const deletion = (await deleted.json()) as {
+    operation: { operationId: string; resultLocalId: string };
+  };
+  expect(deletion).toMatchObject({
+    operation: { kind: 'delete_group_upstream', state: 'succeeded', resultLocalId: id },
+  });
+  expect(await (await call(deletePath, 'POST', confirmed)).json()).toEqual(deletion);
+  expect((await call(deletePath, 'POST', deleteBody)).status).toBe(409);
+  expect((await call(`/groups/${id}`)).status).toBe(404);
+  expect(f.groups.has(group.upstream_group_id!)).toBe(false);
+  expect(f.items.size).toBe(0);
+  expect(await (await call(`/operations/${deletion.operation.operationId}`)).json()).toEqual(
+    deletion.operation,
+  );
+  expect(
+    f.transport.mock.calls.filter(([url]) => String(url).includes('Action=DeleteAssetGroup')),
+  ).toHaveLength(1);
 });
 
 it('pages equal-microsecond rows without dropping records or exposing database cursors', async () => {

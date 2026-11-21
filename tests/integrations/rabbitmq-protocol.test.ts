@@ -1,19 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import { connect, type SocketOptions } from 'amqplib';
 import { expect, it, vi } from 'vitest';
-import { COMMAND_QUEUE, RESULT_QUEUE, type ComputeCommandV1 } from '@mio/compute-contracts';
+import {
+  COMMAND_QUEUE,
+  RESULT_QUEUE,
+  type ComputeCommandV1,
+  type ComputeResultV1,
+} from '@mio/compute-contracts';
 import { Broker } from '../../compute/src/adapters/rabbitmq.ts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { withLocalTestBroker } from '../support/local-broker-fixture.ts';
 
-async function assertReadDenied(url: string, forbiddenQueue: string, drainedQueue?: string) {
+async function assertQueueBoundary(url: string, drainedQueue: string, forbiddenQueue: string) {
   const socket: SocketOptions & { signal: AbortSignal } = { signal: AbortSignal.timeout(5_000) };
   const connection = await connect(url, socket);
   connection.on('error', () => {});
   try {
     const channel = await connection.createChannel();
     channel.on('error', () => {});
-    if (drainedQueue) expect(await channel.get(drainedQueue, { noAck: false })).toBe(false);
+    expect(await channel.get(drainedQueue, { noAck: false })).toBe(false);
     await expect(channel.consume(forbiddenQueue, () => {}, { noAck: false })).rejects.toMatchObject(
       {
         code: 403,
@@ -25,7 +30,7 @@ async function assertReadDenied(url: string, forbiddenQueue: string, drainedQueu
   }
 }
 
-it('routes an A command to B, honors the ACK, and refuses each role the other queue', async () => {
+it('routes an A command and B result, honors both ACKs, and refuses each role the other queue', async () => {
   await withLocalTestBroker(async ({ appBrokerUrl, workerBrokerUrl, userA, userB }) => {
     const assetId = randomUUID();
     const command: ComputeCommandV1 = {
@@ -38,24 +43,43 @@ it('routes an A command to B, honors the ACK, and refuses each role the other qu
       profile: 'mp4-h264-aac-720p24-v1',
       input: { assetId, key: `mio/raw/${assetId}/${randomUUID()}`, sizeBytes: 1, etag: 'etag' },
     };
-    const received = vi.fn<(value: ComputeCommandV1) => void>();
-    const failed = vi.fn<(error: unknown) => void>();
+    const result: ComputeResultV1 = {
+      version: 1,
+      type: 'transcode.result',
+      messageId: randomUUID(),
+      commandId: command.messageId,
+      jobId: command.jobId,
+      attemptId: command.attemptId,
+      attempt: command.attempt,
+      state: 'running',
+    };
+    const receivedCommand = vi.fn<(value: ComputeCommandV1) => void>();
+    const receivedResult = vi.fn<(value: ComputeResultV1) => void>();
+    const failed = vi.fn();
     const app = await ComputeBroker.connect(appBrokerUrl, userA, userB);
     try {
+      await app.consume(async (value) => {
+        receivedResult(value);
+      }, failed);
       const worker = await Broker.connect(workerBrokerUrl, userB, userA);
       try {
         await worker.consume(
           async (value, ack) => {
             ack();
-            received(value);
+            receivedCommand(value);
+            await worker.publish(result);
           },
           failed,
           () => true,
         );
         await app.publish(command);
-        await vi.waitFor(() => expect(received).toHaveBeenCalledExactlyOnceWith(command), {
-          timeout: 5_000,
-        });
+        await vi.waitFor(
+          () => {
+            expect(receivedCommand).toHaveBeenCalledExactlyOnceWith(command);
+            expect(receivedResult).toHaveBeenCalledExactlyOnceWith(result);
+          },
+          { timeout: 5_000 },
+        );
         // Closing this channel after ACK requeues any delivery that the broker still sees as unacked.
         await worker.pause();
         expect(failed).not.toHaveBeenCalled();
@@ -65,8 +89,8 @@ it('routes an A command to B, honors the ACK, and refuses each role the other qu
     } finally {
       await app.close();
     }
-    await assertReadDenied(workerBrokerUrl, RESULT_QUEUE, COMMAND_QUEUE);
-    await assertReadDenied(appBrokerUrl, COMMAND_QUEUE);
+    await assertQueueBoundary(workerBrokerUrl, COMMAND_QUEUE, RESULT_QUEUE);
+    await assertQueueBoundary(appBrokerUrl, RESULT_QUEUE, COMMAND_QUEUE);
   });
 }, 90_000);
 

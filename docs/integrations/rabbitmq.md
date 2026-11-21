@@ -24,4 +24,4 @@ A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute
 
 上游依据：[HTTP API](https://www.rabbitmq.com/docs/http-api-reference)、[访问控制](https://www.rabbitmq.com/docs/access-control)、[vhost](https://www.rabbitmq.com/docs/vhosts)、[告警](https://www.rabbitmq.com/docs/alarms)。公共参数、权限、持久化或恢复变化须沿实际 A/B 消费者回归；纯部署环境扩展不改变消息业务协议。
 
-[常规协议回归](../../tests/integrations/rabbitmq-protocol.test.ts)真实验证 A 发布重媒体命令、B 收取并 ACK、关闭 B 的消费通道后消息不重投，以及反向读取返回 AMQP `403 ACCESS_REFUSED`。成功与故意失败的用例都检查临时 vhost 和 A/B 用户是否删除。运行条件见[测试导航](../engineering/testing.md#按变更定位测试)。
+[常规协议回归](../../tests/integrations/rabbitmq-protocol.test.ts)真实验证 A 发布重媒体命令、B 收取并 ACK、B 发布关联结果、A 收取并 ACK、关闭各自消费通道后原消息不重投，以及反向读取返回 AMQP `403 ACCESS_REFUSED`。成功与故意失败的用例都检查临时 vhost 和 A/B 用户是否删除。运行条件见[测试导航](../engineering/testing.md#按变更定位测试)。

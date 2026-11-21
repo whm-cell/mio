@@ -136,7 +136,7 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号；本轮独占 TCP 转发追踪实际 EVAL 键与连接，结束后清理本轮已观察键，释放断言只统计本轮连接。共享回归账号无 `SCAN`／`CLIENT LIST` 权限。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。
 
-`pnpm test tests/integrations/rabbitmq-protocol.test.ts` 使用健康的 `mio-dev-rabbitmq-1` 和本机 Docker Unix socket。容器内的管理 CLI 只为本轮随机 `mio-regtest-*` vhost 及 A/B 账号准备拓扑与权限，验证后删除并确认对象消失。该用例只连接回环 AMQP，夹具无需读取私有环境文件或人工管理密码。未启动容器时先运行 `pnpm infra:up:dev`。GitHub Actions 使用自己的 RabbitMQ 服务容器。RabbitMQ 生命周期与 Worker 协议替身仍可独立运行。
+`pnpm test tests/integrations/rabbitmq-protocol.test.ts` 使用健康的 `mio-dev-rabbitmq-1` 和本机 Docker Unix socket。容器内的管理 CLI 只为本轮随机 `mio-regtest-*` vhost 及 A/B 账号准备拓扑与权限，验证后凭本轮所有权标记与临时密码删除对象，并逐个确认消失。创建回执未知时也核对实际对象；清理失败使测试失败。该用例只连接回环 AMQP，夹具无需读取私有环境文件或人工管理密码。未启动容器时先运行 `pnpm infra:up:dev`。GitHub Actions 使用自己的 RabbitMQ 服务容器。RabbitMQ 生命周期与 Worker 协议替身仍可独立运行。
 
 区分**常规自动化回归**、**开发推进／协议摸底与本地真实业务验收**和**破坏性故障演练**：
 

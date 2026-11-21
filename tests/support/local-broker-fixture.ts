@@ -19,7 +19,9 @@ type TestBroker = {
   userB: string;
 };
 
-async function docker(args: string[], operation: string, input?: string) {
+type MissingObject = { code: number; stderr: string };
+
+async function docker(args: string[], operation: string, input?: string, missing?: MissingObject) {
   const pending = run('docker', args, { timeout: 12_000 });
   // A failing CLI can close stdin before receiving the input. Its exit is reported below.
   pending.child.stdin?.on('error', () => {});
@@ -27,7 +29,9 @@ async function docker(args: string[], operation: string, input?: string) {
   try {
     return (await pending).stdout.trim();
   } catch (error) {
-    const failure = error as NodeJS.ErrnoException & { signal?: string };
+    const failure = error as { code?: number | string; signal?: string; stderr?: string };
+    if (missing && failure.code === missing.code && failure.stderr?.trim() === missing.stderr)
+      return undefined;
     // CLI diagnostics can include Erlang authentication details. Keep only the exit and operation.
     throw new Error(`RABBITMQ_TEST_CONTROL ${operation}: ${failure.signal ?? failure.code}`);
   }
@@ -37,7 +41,10 @@ async function testBrokerTarget() {
   const host =
     (!process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST) ||
     (await docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], 'context'));
-  assert(host.startsWith('unix:///'), 'RABBITMQ_TEST_TARGET: a local Docker socket is required');
+  assert(
+    typeof host === 'string' && host.startsWith('unix:///'),
+    'RABBITMQ_TEST_TARGET: a local Docker socket is required',
+  );
 
   const ci = process.env.GITHUB_ACTIONS === 'true';
   const target = ci ? process.env.MIO_TEST_RABBITMQ_CONTAINER_ID : 'mio-dev-rabbitmq-1';
@@ -59,6 +66,7 @@ async function testBrokerTarget() {
     [...dockerArgs, 'container', 'inspect', '--format', `[${inspectFields.join(',')}]`, target],
     ci ? 'inspect CI RabbitMQ service' : 'inspect mio-dev-rabbitmq-1 (pnpm infra:up:dev)',
   );
+  assert(raw, 'RABBITMQ_TEST_TARGET: missing container metadata');
   const [id, configuredImage, regressionLabel, project, service, health, bindings] = JSON.parse(
     raw,
   ) as [
@@ -85,11 +93,12 @@ async function testBrokerTarget() {
   );
   return {
     port: binding.HostPort,
-    ctl: (args: string[], input?: string) =>
+    ctl: (args: string[], input?: string, missing?: MissingObject) =>
       docker(
         [...dockerArgs, 'exec', '-i', id, 'rabbitmqctl', '-q', ...args],
         args.join(' '),
         input,
+        missing,
       ),
   };
 }
@@ -140,36 +149,47 @@ export async function withLocalTestBroker<T>(
   const users = [a, b];
   const amqpUrl = ({ name, password }: (typeof users)[number]) =>
     `amqp://${name}:${password}@127.0.0.1:${port}/${vhost}`;
-  const listVhosts = async () =>
-    JSON.parse(await ctl(['--formatter=json', 'list_vhosts', 'name', 'description'])) as {
-      name: string;
-      description: string;
-    }[];
-  const listUsers = async () =>
-    JSON.parse(await ctl(['--formatter=json', 'list_users'])) as { user: string }[];
+  const userExists = async (name: string) =>
+    (await ctl(['--formatter=json', 'list_user_permissions', name], undefined, {
+      code: 69,
+      stderr: `Error:\n{:no_such_user, "${name}"}`,
+    })) !== undefined;
+  const vhostExists = async () =>
+    (await ctl(['--formatter=json', 'list_permissions', '--vhost', vhost], undefined, {
+      code: 65,
+      stderr: `Virtual host '${vhost}' does not exist`,
+    })) !== undefined;
+  const ownsVhost = async () => {
+    // rabbitmqctl cannot filter vhost descriptions. Match the random name and ownership marker.
+    const output = await ctl(['--formatter=json', 'list_vhosts', 'name', 'description']);
+    assert(output, 'RABBITMQ_TEST_CONTROL: missing vhost descriptions');
+    const entries = JSON.parse(output) as { name: string; description: string }[];
+    return entries.some((entry) => entry.name === vhost && entry.description === description);
+  };
   const assertAbsent = async () => {
-    const [vhosts, brokerUsers] = await Promise.all([listVhosts(), listUsers()]);
-    assert(!vhosts.some((item) => item.name === vhost), `RABBITMQ_TEST_VHOST_PRESENT: ${vhost}`);
-    for (const { name } of users) {
-      assert(
-        !brokerUsers.some((item) => item.user === name),
-        `RABBITMQ_TEST_USER_PRESENT: ${name}`,
-      );
-    }
+    const [hasVhost, hasA, hasB] = await Promise.all([
+      vhostExists(),
+      userExists(a.name),
+      userExists(b.name),
+    ]);
+    assert(!hasVhost, `RABBITMQ_TEST_VHOST_PRESENT: ${vhost}`);
+    assert(!hasA && !hasB, `RABBITMQ_TEST_USER_PRESENT: ${vhost}`);
   };
 
   await assertAbsent();
-  const ownedUsers: string[] = [];
+  const attemptedUsers: (typeof users)[number][] = [];
   const cleanup = async () => {
     const failures: unknown[] = [];
     try {
-      const entry = (await listVhosts()).find((item) => item.name === vhost);
-      if (entry?.description === description) await ctl(['delete_vhost', vhost]);
+      if ((await vhostExists()) && (await ownsVhost())) await ctl(['delete_vhost', vhost]);
     } catch (error) {
       failures.push(error);
     }
-    for (const name of ownedUsers) {
+    for (const { name, password } of attemptedUsers) {
       try {
+        if (!(await userExists(name))) continue;
+        // An add_user error can arrive after creation. Prove ownership before deleting.
+        await ctl(['authenticate_user', name], `${password}\n`);
         await ctl(['delete_user', name]);
       } catch (error) {
         failures.push(error);
@@ -186,11 +206,10 @@ export async function withLocalTestBroker<T>(
   let result: T;
   try {
     await ctl(['add_vhost', vhost, '--description', description]);
-    const entry = (await listVhosts()).find((item) => item.name === vhost);
-    assert.equal(entry?.description, description, `RABBITMQ_TEST_VHOST_OWNERSHIP: ${vhost}`);
-    for (const { name, password } of users) {
-      await ctl(['add_user', name], `${password}\n`);
-      ownedUsers.push(name);
+    assert(await ownsVhost(), `RABBITMQ_TEST_VHOST_OWNERSHIP: ${vhost}`);
+    for (const user of users) {
+      attemptedUsers.push(user);
+      await ctl(['add_user', user.name], `${user.password}\n`);
     }
     await ctl([
       'set_operator_policy',

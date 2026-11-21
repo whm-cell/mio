@@ -1,8 +1,17 @@
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
 
 const scratch: string[] = [];
@@ -67,7 +76,92 @@ it('both probes reject the source workspace when invoked from outside it', async
   }
 });
 
-// This only shortens the shutdown deadline in the probe process. Child signals remain real.
+const immovableLinks = [
+  {
+    name: 'an absolute component alias still valid at the staging path',
+    links: [{ path: 'delivery/a', target: 'delivery/package', absolute: true }],
+  },
+  {
+    name: 'an absolute link within a component',
+    links: [
+      { path: 'delivery/a', target: 'package' },
+      { path: 'delivery/package/entry', target: 'delivery/package/library', absolute: true },
+    ],
+  },
+  {
+    name: 'a relative component alias through an absolute directory link',
+    links: [
+      { path: 'delivery/a', target: 'aliases/current/package' },
+      { path: 'delivery/aliases/current', target: 'delivery', absolute: true },
+    ],
+  },
+  {
+    name: 'a component alias that leaves the delivery and returns',
+    links: [
+      { path: 'delivery/a', target: 'bridge/package' },
+      { path: 'delivery/bridge', target: '../outside' },
+      { path: 'outside/package', target: '../delivery/package' },
+    ],
+  },
+  {
+    name: 'an internal link that relies on a sibling directory',
+    links: [
+      { path: 'delivery/a', target: 'package' },
+      { path: 'delivery/package/entry', target: '../sibling' },
+      { path: 'delivery/sibling', target: 'package/library' },
+    ],
+  },
+];
+
+it.each(immovableLinks)('both probes reject $name before side effects', async ({ links }) => {
+  const temporary = await temporaryDirectory();
+  const root = join(temporary, 'delivery');
+  for (const path of [
+    'delivery/package/library',
+    'delivery/aliases',
+    'delivery/b',
+    'delivery/host',
+    'outside',
+  ])
+    await mkdir(join(temporary, path), { recursive: true });
+  for (const { path, target, absolute } of links)
+    await symlink(absolute ? join(temporary, target) : target, join(temporary, path), 'dir');
+
+  for (const probe of ['artifact', 'migrations'] as const) {
+    const result = run(probe, temporary, root);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('ARTIFACT_EXTERNAL_LINK');
+    expect(result.stderr).not.toContain('PORTABLE_FOUNDATION_LOAD_FAILED');
+    expect(result.stderr).not.toContain('Invalid URL');
+  }
+});
+
+it('allows a shared parent directory but rejects aliases that use the actual source checkout', async () => {
+  const temporary = await temporaryDirectory();
+  const source = join(temporary, 'checkout/tests/packaging/portable-root.ts');
+  await mkdir(dirname(source), { recursive: true });
+  await copyFile(fileURLToPath(new URL('./portable-root.ts', import.meta.url)), source);
+  await mkdir(join(temporary, 'package'));
+  const script = `import { portableRoot, portableComponent } from ${JSON.stringify(pathToFileURL(source).href)};
+    portableComponent(portableRoot(process.argv[1]), 'a');`;
+  const invoke = () =>
+    spawnSync(process.execPath, ['--input-type=module', '-e', script, temporary], {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+  const alias = join(temporary, 'a');
+  await symlink('package', alias, 'dir');
+  expect(invoke().status).toBe(0);
+  for (const target of ['checkout', 'checkout/../package']) {
+    await rm(alias);
+    await symlink(target, alias, 'dir');
+    const result = invoke();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('ARTIFACT_EXTERNAL_LINK');
+  }
+});
+
+// Deadlines are shortened only in the probe process. HTTP and child signals remain real.
 const quickDeadline =
   'data:text/javascript,' +
   encodeURIComponent(`
@@ -76,10 +170,12 @@ const quickDeadline =
   const delay = timers.setTimeout;
   timers.setTimeout = (ms, ...args) => delay(ms === 10000 ? 100 : ms, ...args);
   syncBuiltinESMExports();
+  const timeout = AbortSignal.timeout;
+  AbortSignal.timeout = (ms) => timeout(ms === 3000 ? 150 : ms);
 `);
 
-it.each(['graceful', 'stuck', 'stuck-after-error'] as const)(
-  'runs a moved delivery with relative aliases and reaps a %s host',
+it.each(['graceful', 'stuck', 'stuck-after-error', 'authenticated', 'unauthenticated'] as const)(
+  'runs a moved delivery with relative aliases and reaps the host in the %s case',
   async (shutdown) => {
     const temporary = await temporaryDirectory();
     const staged = join(temporary, 'staged');
@@ -98,11 +194,15 @@ it.each(['graceful', 'stuck', 'stuck-after-error'] as const)(
       }),
       'host/node_modules/@deepseek-ai/dsh/lib/bin.js': `
         import { createServer } from 'node:http';
-        import { writeFileSync } from 'node:fs';
+        import { appendFileSync, writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         const server = createServer((request, response) => {
-          response.writeHead(request.url === '/readyz' ? 200
-            : request.headers.authorization ? ${shutdown === 'stuck-after-error' ? 502 : 200} : 401,
+          const check = request.url === '/readyz' ? 'ready'
+            : request.headers.authorization ? 'authenticated' : 'unauthenticated';
+          appendFileSync(join(process.env.HOME, 'requests'), check + String.fromCharCode(10));
+          if (check === ${JSON.stringify(shutdown)}) return;
+          response.writeHead(check === 'ready' ? 200
+            : check === 'authenticated' ? ${shutdown === 'stuck-after-error' ? 502 : 200} : 401,
           { connection: 'close' }).end();
         });
         process.on('SIGTERM', () => {
@@ -124,7 +224,8 @@ it.each(['graceful', 'stuck', 'stuck-after-error'] as const)(
       join(staged, 'inside-a/node_modules/@mio/foundation'),
       'dir',
     );
-    await symlink('inside-a', join(staged, 'a'), 'dir');
+    await symlink('inside-a', join(staged, 'active-a'), 'dir');
+    await symlink('active-a', join(staged, 'a'), 'dir');
     await rename(staged, moved);
 
     const result = run(
@@ -145,6 +246,16 @@ it.each(['graceful', 'stuck', 'stuck-after-error'] as const)(
       expect(result.stdout).not.toContain('PORTABLE_DSH_PLUGIN_AND_WORKER_INIT_OK');
       expect(result.stderr).toContain('PORTABLE_DSH_STILL_STOPPING');
       if (shutdown === 'stuck-after-error') expect(result.stderr).toContain('502 !== 200');
+      if (shutdown === 'unauthenticated' || shutdown === 'authenticated') {
+        const requests = (await readFile(join(moved, 'smoke-state/requests'), 'utf8'))
+          .trim()
+          .split('\n');
+        expect(requests[0]).toBe('ready');
+        expect(requests.filter((request) => request !== 'ready')).toEqual(
+          shutdown === 'authenticated' ? ['authenticated'] : ['authenticated', 'unauthenticated'],
+        );
+        expect(result.stderr).toContain('TimeoutError');
+      }
     }
   },
 );

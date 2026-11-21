@@ -117,11 +117,14 @@ try {
     await delay(100);
   }
   if (!ready) throw new Error('PORTABLE_DSH_NOT_READY');
-  const capabilities = await fetch(`http://127.0.0.1:${port}/api/v1/capabilities`, {
+  const capabilitiesURL = `http://127.0.0.1:${port}/api/v1/capabilities`;
+  const capabilities = await fetch(capabilitiesURL, {
     headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(3000),
   });
   assert.equal(capabilities.status, 200);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/v1/capabilities`)).status, 401);
+  const unauthorized = await fetch(capabilitiesURL, { signal: AbortSignal.timeout(3000) });
+  assert.equal(unauthorized.status, 401);
 } catch (error) {
   probeError = error;
 } finally {

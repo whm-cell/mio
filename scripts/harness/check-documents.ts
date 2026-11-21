@@ -25,6 +25,7 @@ export async function checkDocuments(
   root: string,
   files: readonly string[],
   config: HarnessConfig,
+  listResults = false,
 ) {
   const errors: string[] = [];
   const canonicalRoot = await realpath(root);
@@ -33,6 +34,8 @@ export async function checkDocuments(
   const aliases = new Set(registry.documents.flatMap((entry) => entry.aliases ?? []));
   const documents = new Map<string, MarkdownNode>();
   const edges = new Map<string, string[]>();
+  const resolvedLinks = new Map<string, Promise<string>>();
+  const anchors = new Map<string, Set<string>>();
   for (const file of files.filter((path) => path.endsWith('.md'))) {
     const source = await readFile(join(root, file), 'utf8');
     if (/\/(?:Users|Volumes|home)\//.test(source)) errors.push(`PERSONAL_PATH ${file}`);
@@ -60,15 +63,28 @@ export async function checkDocuments(
         continue;
       }
       try {
-        local = relative(canonicalRoot, await realpath(path)).replaceAll('\\', '/');
+        let resolved = resolvedLinks.get(path);
+        if (!resolved) {
+          resolved = realpath(path).then((target) =>
+            relative(canonicalRoot, target).replaceAll('\\', '/'),
+          );
+          resolvedLinks.set(path, resolved);
+        }
+        local = await resolved;
         if (privateLink(local, config)) {
           errors.push(`LINK_PRIVATE ${file}: ${url}`);
           continue;
         }
         if (navigation.has(url)) edges.get(file)!.push(local);
         const destination = documents.get(local);
-        if (anchor && destination && !headingAnchors(destination).has(anchor))
-          errors.push(`LINK_ANCHOR ${file}: ${url}`);
+        if (anchor && destination) {
+          let destinationAnchors = anchors.get(local);
+          if (!destinationAnchors) {
+            destinationAnchors = headingAnchors(destination);
+            anchors.set(local, destinationAnchors);
+          }
+          if (!destinationAnchors.has(anchor)) errors.push(`LINK_ANCHOR ${file}: ${url}`);
+        }
       } catch {
         errors.push(`LINK_MISSING ${file}: ${url}`);
       }
@@ -133,8 +149,15 @@ export async function checkDocuments(
   }
   errors.push(...checkApiDocuments(documents, edges));
   const indexChecked = await checkIndex(root, config, errors);
-  errors.push(...(await checkReports(root, files)));
-  return { errors, indexChecked };
+  const reportFiles = files.filter(resultDocument);
+  // The listing includes registered PRDs even when none has published files.
+  const reports =
+    !registry.errors.length && (reportFiles.length || listResults)
+      ? await checkReports(root, reportFiles, { config, ...registry })
+      : undefined;
+  if (reports) errors.push(...reports.errors);
+  else if (reportFiles.length) errors.push(registry.errors.join('\n'));
+  return { errors, indexChecked, documents: registry.documents, results: reports?.results ?? [] };
 }
 
 async function checkIndex(root: string, config: HarnessConfig, errors: string[]) {

@@ -949,16 +949,18 @@ it('reads records without a report, while guard checks its derivation and PRD ow
   await rm(join(root, paths.report));
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
   expect(await readPublicResult(root, [prd, 'sibling'])).toBeTruthy();
-  expect((await checkReports(root, [paths.records]))[0]).toContain('WORK_REPORT_DRIFT');
+  expect((await checkReports(root, [paths.records], catalog)).errors[0]).toContain(
+    'WORK_REPORT_DRIFT',
+  );
   await put(root, paths.report, 'stale');
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
-  expect((await checkReports(root, [paths.report, paths.records]))[0]).toContain(
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors[0]).toContain(
     'WORK_REPORT_DRIFT',
   );
   await rm(join(root, paths.report));
   await symlink('unexpected-target.md', join(root, paths.report));
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
-  expect((await checkReports(root, [paths.report, paths.records]))[0]).toContain(
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors[0]).toContain(
     'WORK_REPORT_DRIFT',
   );
   await rm(join(root, paths.report));
@@ -991,11 +993,12 @@ it('uses a stable PRD identity, rejects orphan results and leaves the static ind
   const book = (await readBook(root, prd)).book;
   expect(book.prd).toBe(identity);
   expect(await readFile(join(root, taskIndexPath), 'utf8')).toBe(before);
-  const paths = bookPaths(prd, await documentCatalog(root));
-  expect(await checkReports(root, [paths.report, paths.records])).toEqual([]);
+  const catalog = await documentCatalog(root);
+  const paths = bookPaths(prd, catalog);
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors).toEqual([]);
   const orphan = 'docs/tasks/product/complete/extra.md';
   await put(root, orphan, '# Orphan\n');
-  expect(await checkReports(root, [paths.report, paths.records, orphan])).toEqual([
-    `WORK_REPORT_ORPHAN: ${orphan}`,
-  ]);
+  expect((await checkReports(root, [paths.report, paths.records, orphan], catalog)).errors).toEqual(
+    [`WORK_REPORT_ORPHAN: ${orphan}`],
+  );
 });

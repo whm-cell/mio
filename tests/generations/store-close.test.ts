@@ -1,10 +1,72 @@
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { expect, it, vi } from 'vitest';
 import { GenerationStore } from '../../src/generations/store.ts';
 import { createGenerationService } from '../../src/generations/service.ts';
 import { generationFixture } from './fixture.ts';
+
+it('only rewrites stale claims and interrupted queries after acquiring the executor lease', async () => {
+  const f = await generationFixture();
+  const contender = new GenerationStore(new Pool({ connectionString: f.database.url }));
+  try {
+    for (const [phase, claimed] of [
+      ['ready', false],
+      ['ready', true],
+      ['submitting', true],
+      ['waiting', false],
+      ['querying', false],
+      ['querying', true],
+      ['materializing', false],
+      ['materializing', true],
+      ['done', true],
+    ] as const) {
+      const { jobId } = await f.admit();
+      await f.pool.query('UPDATE mio_image_executions SET phase=$2,claim_id=$3 WHERE job_id=$1', [
+        jobId,
+        phase,
+        claimed ? randomUUID() : null,
+      ]);
+    }
+    const read = async () =>
+      (
+        await f.pool.query<{
+          job_id: string;
+          phase: string;
+          claim_id: string | null;
+          version: string;
+        }>(
+          'SELECT job_id,phase,claim_id,ctid::text AS version FROM mio_image_executions ORDER BY job_id',
+        )
+      ).rows;
+    const before = await read();
+    await f.store.startExecutor(() => {});
+    const recovered = await read();
+    for (const [index, row] of before.entries()) {
+      const next = recovered[index]!;
+      const changed = row.phase !== 'done' && (row.claim_id !== null || row.phase === 'querying');
+      if (changed) {
+        expect(next).toMatchObject({
+          job_id: row.job_id,
+          phase: row.phase === 'querying' ? 'waiting' : row.phase,
+          claim_id: null,
+        });
+        expect(next.version).not.toBe(row.version);
+      } else expect(next).toEqual(row);
+    }
+    await expect(contender.startExecutor(() => {})).rejects.toThrow(
+      'GENERATION_EXECUTOR_ALREADY_RUNNING',
+    );
+    expect(await read()).toEqual(recovered);
+    await f.stop();
+    await f.store.startExecutor(() => {});
+    expect(await read()).toEqual(recovered);
+  } finally {
+    await contender.close();
+    await f.close();
+  }
+});
 
 it.each([false, true])(
   'settles the owned pool through public close with lost executor=%s',
@@ -52,6 +114,7 @@ it('preserves unlock, release and pool errors while attempting every cleanup', a
     query: vi
       .fn()
       .mockResolvedValueOnce({ rows: [{ acquired: true }] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockRejectedValue(unlock),
     on: vi.fn(),
     off: vi.fn(),
@@ -61,7 +124,6 @@ it('preserves unlock, release and pool errors while attempting every cleanup', a
   };
   const pool = {
     connect: async () => client,
-    query: vi.fn().mockResolvedValue({ rows: [] }),
     end: vi.fn().mockRejectedValue(end),
   };
   const store = new GenerationStore(pool as unknown as Pool);

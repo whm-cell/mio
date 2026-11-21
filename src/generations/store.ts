@@ -106,8 +106,10 @@ export class GenerationStore {
       this.executorFailure = onLost;
       client.on('error', onLost);
       this.executor = client;
-      await this.pool.query(
-        "UPDATE mio_image_executions SET claim_id=NULL,phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END WHERE phase <> 'done'",
+      await client.query(
+        `UPDATE mio_image_executions
+         SET claim_id=NULL,phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END
+         WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`,
       );
     } catch (error) {
       client.release(true);

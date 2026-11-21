@@ -1,6 +1,7 @@
 import type { FileHandle } from 'node:fs/promises';
 import { originalChunks, originalDigest, withArtifact } from './original.ts';
 import type { Evidence } from './records.ts';
+import { JsonSyntax } from './json-syntax.ts';
 
 export const resultMarker = '\n--- mio-command-result ---\n';
 const headerEnd = Buffer.from('\n}\n');
@@ -8,19 +9,32 @@ const resultStart = Buffer.from(resultMarker);
 
 async function jsonRange(file: FileHandle, start: number, end: number) {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-  let text = '';
-  for await (const bytes of originalChunks(file, start, end)) {
-    const part = decoder.decode(bytes, { stream: true });
-    if (text) {
-      text += part;
-      continue;
+  const syntax = new JsonSyntax();
+  let position = start;
+  let contentStart: number | undefined;
+  let contentEnd = start;
+  const inspect = (part: string) => {
+    syntax.push(part);
+    const tail = part.trimEnd();
+    if (tail.length > 0) {
+      contentStart ??= position + tail.length - tail.trimStart().length;
+      contentEnd = position + Buffer.byteLength(tail);
     }
-    const first = part.search(/[^ \t\r\n]/);
-    if (first < 0) continue;
-    // Command output may contain a marker even when the real result was never written.
-    if (!'{["tfn-0123456789'.includes(part[first]!)) throw new SyntaxError('Invalid JSON record');
-    text = part.slice(first);
+    position += Buffer.byteLength(part);
+  };
+
+  for await (const bytes of originalChunks(file, start, end)) {
+    if (bytes.length === end - start) return JSON.parse(decoder.decode(bytes));
+    inspect(decoder.decode(bytes, { stream: true }));
   }
+  inspect(decoder.decode());
+  syntax.finish();
+
+  // A false delimiter can make command output resemble a large metadata record. Materialize only
+  // verified JSON, excluding leading and trailing whitespace. The same descriptor is used throughout.
+  let text = '';
+  for await (const bytes of originalChunks(file, contentStart ?? start, contentEnd))
+    text += decoder.decode(bytes, { stream: true });
   return JSON.parse(text + decoder.decode());
 }
 

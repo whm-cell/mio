@@ -493,11 +493,15 @@ it('distinguishes missing, malformed and unfinalized command originals', async (
 
   const marker = original.lastIndexOf(resultMarker);
   const incomplete = original.slice(0, marker);
+  const longOutput = 'x'.repeat(256 * 1024);
   for (const malformed of [
     original + resultMarker + '{',
     'Missing header\n' + original.slice(marker),
     incomplete,
-    incomplete + resultMarker + 'Unframed output'.padEnd(256 * 1024, 'x'),
+    incomplete + resultMarker + 'Unframed output' + longOutput,
+    incomplete + resultMarker + '{"unexpected":?' + longOutput,
+    incomplete + resultMarker + '{"detail":"' + longOutput,
+    '{\n"unexpected":?' + longOutput + '\n}\n' + original.slice(marker),
   ]) {
     await writeFile(target, malformed);
     entry.sha256 = digest(malformed);

@@ -3,16 +3,20 @@ import { createId, isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs } from '@mio/foundation/time';
 import {
+  IMAGE_GEOMETRY_EDGES,
   IMAGE_MAX_MESSAGE_BYTES,
   canonicalImageRouteConfig,
+  canonicalImageValue,
   isImageDriver,
   isValidImageAssetObjectKey,
   imageReferencesWithinBudget,
+  validImageGeometry,
   validateImageInputByRoute,
   validateImageRouteConfig,
 } from './contracts.ts';
 import type {
   ImageAssetRef,
+  ImageGeometryEdge,
   ImageInput,
   ImageOperation,
   ImageRequestParameters,
@@ -63,10 +67,36 @@ function validateRequest(requestId: string, modelRef: string, parameters: ImageR
 }
 
 function requestHash(modelRef: string, parameters: ImageRequestParameters): string {
-  const normalized = Object.fromEntries(
-    Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
+  return sha256Utf8(JSON.stringify([modelRef, canonicalImageValue(parameters)]));
+}
+
+function geometryKeyOrders(edges: readonly ImageGeometryEdge[]): ImageGeometryEdge[][] {
+  if (edges.length === 0) return [[]];
+  return edges.flatMap((edge) =>
+    geometryKeyOrders(edges.filter((other) => other !== edge)).map((rest) => [edge, ...rest]),
   );
-  return sha256Utf8(JSON.stringify([modelRef, normalized]));
+}
+
+const LEGACY_GEOMETRY_ORDERS = geometryKeyOrders(IMAGE_GEOMETRY_EDGES);
+
+function matchesRequestHash(
+  savedHash: string,
+  modelRef: string,
+  parameters: ImageRequestParameters,
+  hash = requestHash(modelRef, parameters),
+): boolean {
+  if (savedHash === hash) return true;
+  const { geometry } = parameters;
+  if (!validImageGeometry(geometry)) return false;
+  // Older hashes sorted only the top-level keys. Geometry has four keys and
+  // is the only nested object in accepted inputs, so at most 24 orders can match.
+  const normalized = canonicalImageValue(parameters) as ImageRequestParameters;
+  return LEGACY_GEOMETRY_ORDERS.some((order) => {
+    const ordered = Object.fromEntries(order.map((edge) => [edge, geometry[edge]]));
+    return (
+      savedHash === sha256Utf8(JSON.stringify([modelRef, { ...normalized, geometry: ordered }]))
+    );
+  });
 }
 
 function toolParameters(
@@ -222,15 +252,22 @@ export function createGenerationAdmission(
     tool?.signal.throwIfAborted();
     const httpHash = tool ? undefined : requestHash(modelRef, intent);
     // Tool retries use the winning job's defaults, including jobs admitted before this lookup.
-    const matchesTool = tool
-      ? (record: ImageRequestRecord) =>
-          record.input_hash === requestHash(modelRef, toolParameters(intent, record))
-      : undefined;
+    const existingRequest = {
+      includeToolDefaults: Boolean(tool),
+      matches(record: ImageRequestRecord) {
+        const parameters = tool ? toolParameters(intent, record) : intent;
+        return matchesRequestHash(record.input_hash, modelRef, parameters, httpHash);
+      },
+    };
     const replay = async () => {
-      const previous = await store.imageRequest(actor.userId, requestId, Boolean(matchesTool));
+      const previous = await store.imageRequest(
+        actor.userId,
+        requestId,
+        existingRequest.includeToolDefaults,
+      );
       tool?.signal.throwIfAborted();
       if (!previous) return;
-      if (matchesTool ? !matchesTool(previous) : previous.input_hash !== httpHash)
+      if (!existingRequest.matches(previous))
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
       return store.imageGet(actor.userId, previous.id);
     };
@@ -338,7 +375,7 @@ export function createGenerationAdmission(
         command,
         admitted,
         snapshot,
-        matchesTool,
+        existingRequest,
       );
       return store.imageGet(actor.userId, id);
     } catch (error) {

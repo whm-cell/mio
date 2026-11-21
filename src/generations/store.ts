@@ -165,7 +165,10 @@ export class GenerationStore {
     command: GenerationRequest,
     admitted: Record<string, unknown>,
     snapshot: ImageAdmissionSnapshot,
-    matchesTool?: (previous: ImageRequestRecord) => boolean,
+    existingRequest?: {
+      includeToolDefaults: boolean;
+      matches: (previous: ImageRequestRecord) => boolean;
+    },
   ): Promise<string> {
     if (
       command.ownerId !== owner ||
@@ -175,10 +178,15 @@ export class GenerationStore {
       throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
     return transaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock($1)', [QUOTA_LOCK]);
-      const existing = await findImageRequest(client, owner, requestId, Boolean(matchesTool));
+      const existing = await findImageRequest(
+        client,
+        owner,
+        requestId,
+        existingRequest?.includeToolDefaults ?? false,
+      );
       if (existing) {
-        if (matchesTool ? !matchesTool(existing) : existing.input_hash !== hash)
-          throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
+        const matches = existingRequest?.matches(existing) ?? existing.input_hash === hash;
+        if (!matches) throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return existing.id;
       }
       await capacity(client, owner);

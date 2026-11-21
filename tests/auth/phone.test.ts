@@ -1,10 +1,11 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
@@ -79,7 +80,16 @@ beforeAll(async () => {
       MIO_AUTH_DATABASE_URL: database.url,
     })!,
   );
-  await (await getMigrations(authOptions(configs[0]!, pool))).runMigrations();
+  const migrated = spawnSync(process.execPath, ['scripts/service/migrate-auth.ts', '--apply'], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: {
+      MIO_AUTH_BASE_URL: origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: database.url,
+    },
+  });
+  expect(migrated.status, migrated.stderr).toBe(0);
   for (const [index, config] of configs.entries()) {
     const auth = await createAuthentication(config, undefined, sender);
     auths.push(auth);
@@ -151,7 +161,7 @@ it('fails closed before SMS or WeChat work when the authentication rate store fa
     Number((await pool.query(`SELECT count(*) FROM "${table}"`)).rows[0].count);
   try {
     const before = await Promise.all(
-      ['mioSmsBudget', 'mioPhoneChallenge', 'verification'].map(count),
+      ['mioSmsBudget', 'mioSmsBudgetEvent', 'mioPhoneChallenge', 'verification'].map(count),
     );
     for (const [path, body] of [
       ['/api/auth/phone-number/send-otp', { phoneNumber: '13800138090' }],
@@ -172,7 +182,9 @@ it('fails closed before SMS or WeChat work when the authentication rate store fa
     expect(consumed).toBe(3);
     expect(sent).toBe(0);
     expect(
-      await Promise.all(['mioSmsBudget', 'mioPhoneChallenge', 'verification'].map(count)),
+      await Promise.all(
+        ['mioSmsBudget', 'mioSmsBudgetEvent', 'mioPhoneChallenge', 'verification'].map(count),
+      ),
     ).toEqual(before);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -301,6 +313,12 @@ it('does not activate a failed send and retains its budget across instances', as
   expect(await sent.text()).not.toContain('private details');
   const code = delivered.get(`+86${phoneNumber}`)!;
   expect((await call('/api/auth/phone-number/verify', { phoneNumber, code })).status).toBe(400);
+  expect(
+    (await pool.query('SELECT count(*)::int AS count FROM "mioSmsBudgetEvent"')).rows[0],
+  ).toEqual({ count: 3 });
+  expect((await pool.query('SELECT status FROM "mioPhoneChallenge"')).rows).toEqual([
+    { status: 'pending' },
+  ]);
   failSend = false;
   expect(
     (await call('/api/auth/phone-number/send-otp', { phoneNumber }, undefined, 1)).status,
@@ -368,26 +386,85 @@ it('rejects a bound number belonging to another user and a revoked binding sessi
   ).toBe(401);
 });
 
+async function observeBlockedAuthQuery(
+  lockerPid: number,
+  statement: string,
+  expiry: { at: Date; crossed: boolean; waiterPid?: number },
+) {
+  return vi.waitFor(
+    async () => {
+      const { rows } = await pool.query<{
+        pid: number;
+        startedBeforeExpiry: boolean;
+        expired: boolean;
+      }>(
+        `SELECT pid, query_start < $3::timestamptz AS "startedBeforeExpiry",
+              clock_timestamp() >= $3::timestamptz AS expired
+       FROM pg_stat_activity
+       WHERE datname = current_database() AND application_name = $4
+         AND wait_event_type = 'Lock' AND query = $2 AND $1::int = ANY(pg_blocking_pids(pid))`,
+        [lockerPid, statement, expiry.at, database.applicationName],
+      );
+      expect(rows).toHaveLength(1);
+      const waiter = rows[0]!;
+      expect(waiter.startedBeforeExpiry).toBe(true);
+      expect(waiter.expired).toBe(expiry.crossed);
+      if (expiry.waiterPid !== undefined) expect(waiter.pid).toBe(expiry.waiterPid);
+      return waiter.pid;
+    },
+    { timeout: 2000, interval: 10 },
+  );
+}
+
 it('checks expiry after waiting for the challenge row lock', async () => {
   const phoneNumber = '13800138019';
   const code = await send('/api/auth/phone-number/send-otp', phoneNumber);
+  const challengeKey = createHash('sha256').update(`login\0+86${phoneNumber}`).digest('hex');
   const locker = await pool.connect();
+  let waiting: Promise<Response> | undefined;
   try {
     await locker.query('BEGIN');
-    await locker.query(
-      `UPDATE "mioPhoneChallenge" SET "expiresAt" = clock_timestamp() + interval '300 milliseconds'`,
+    const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
+      `SELECT pg_backend_pid() AS pid, "expiresAt"
+       FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE`,
+      [challengeKey],
     );
-    const waiting = call('/api/auth/phone-number/verify', { phoneNumber, code });
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(rows).toHaveLength(1);
+    const { pid, expiresAt } = rows[0]!;
+    const statement = 'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE';
+    waiting = call('/api/auth/phone-number/verify', { phoneNumber, code });
+    void waiting.catch(() => {});
+    const waiterPid = await observeBlockedAuthQuery(pid, statement, {
+      at: expiresAt,
+      crossed: false,
+    });
+    // Set the new deadline only after the verifying statement is already waiting.
+    const updated = await locker.query<{ expiresAt: Date }>(
+      `UPDATE "mioPhoneChallenge"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '25 milliseconds'
+       WHERE "challengeKey" = $1 RETURNING "expiresAt"`,
+      [challengeKey],
+    );
+    await observeBlockedAuthQuery(pid, statement, {
+      at: updated.rows[0]!.expiresAt,
+      crossed: true,
+      waiterPid,
+    });
     await locker.query('COMMIT');
-    expect((await waiting).status).toBe(400);
+    const response = await waiting;
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'INVALID_OTP' });
     const count = await pool.query('SELECT count(*) FROM "user" WHERE "phoneNumber" = $1', [
       `+86${phoneNumber}`,
     ]);
     expect(Number(count.rows[0].count)).toBe(0);
   } finally {
-    await locker.query('ROLLBACK');
-    locker.release();
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
   }
 });
 
@@ -397,21 +474,47 @@ it('rechecks binding session expiry after its row lock is released', async () =>
   const phoneNumber = '13800138020';
   const code = await send('/api/auth/phone-binding/send-otp', phoneNumber, owner);
   const locker = await pool.connect();
+  let waiting: Promise<Response> | undefined;
   try {
     await locker.query('BEGIN');
-    await locker.query(
-      `UPDATE "session" SET "expiresAt" = clock_timestamp() + interval '300 milliseconds' WHERE id = $1`,
-      [sessionId],
+    const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
+      `SELECT pg_backend_pid() AS pid, "expiresAt"
+       FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE`,
+      [sessionId, userId],
     );
-    const waiting = call('/api/auth/phone-binding/confirm', { phoneNumber, code }, owner);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(rows).toHaveLength(1);
+    const { pid, expiresAt } = rows[0]!;
+    const statement = 'SELECT id FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE';
+    waiting = call('/api/auth/phone-binding/confirm', { phoneNumber, code }, owner);
+    void waiting.catch(() => {});
+    const waiterPid = await observeBlockedAuthQuery(pid, statement, {
+      at: expiresAt,
+      crossed: false,
+    });
+    const updated = await locker.query<{ expiresAt: Date }>(
+      `UPDATE "session"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '25 milliseconds'
+       WHERE id = $1 AND "userId" = $2 RETURNING "expiresAt"`,
+      [sessionId, userId],
+    );
+    await observeBlockedAuthQuery(pid, statement, {
+      at: updated.rows[0]!.expiresAt,
+      crossed: true,
+      waiterPid,
+    });
     await locker.query('COMMIT');
-    expect((await waiting).status).toBe(401);
+    const response = await waiting;
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
     const user = await pool.query('SELECT "phoneNumber" FROM "user" WHERE id = $1', [userId]);
     expect(user.rows[0].phoneNumber).toBeNull();
   } finally {
-    await locker.query('ROLLBACK');
-    locker.release();
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
   }
 });
 
@@ -438,12 +541,166 @@ it('retains the rolling hourly phone budget after the cooldown has elapsed', asy
   const phoneNumber = '13800138022';
   for (let index = 0; index < 5; index++) {
     expect((await call('/api/auth/phone-number/send-otp', { phoneNumber })).status).toBe(200);
-    await pool.query(`UPDATE "mioSmsBudget" SET events = (
-      SELECT COALESCE(json_agg((value::text)::bigint - 61000)::text, '[]')
-      FROM json_array_elements(events::json)
-    )`);
+    await pool.query('UPDATE "mioSmsBudgetEvent" SET "occurredAtMs" = "occurredAtMs" - 61000');
   }
   expect(
     (await call('/api/auth/phone-number/send-otp', { phoneNumber }, undefined, 1)).status,
   ).toBe(429);
+});
+
+async function seedBudget(key: string, entries: number, ageMs: number) {
+  await pool.query(
+    `WITH bucket AS (
+       INSERT INTO "mioSmsBudget" (id, events, "updatedAt")
+       VALUES ($1, '[]', clock_timestamp()) RETURNING id
+     )
+     INSERT INTO "mioSmsBudgetEvent" ("budgetId", "occurredAtMs")
+     SELECT id, floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint - $3::bigint
+     FROM bucket CROSS JOIN generate_series(1, $2::int)`,
+    [key, entries, ageMs],
+  );
+}
+
+it.each([
+  { label: 'phone cooldown', kind: 'phone', count: 1, youngMs: 1_000, oldMs: 61_000 },
+  { label: 'phone day', kind: 'phone', count: 10, youngMs: 7_200_000, oldMs: 86_401_000 },
+  { label: 'IP hour', kind: 'ip', count: 20, youngMs: 120_000, oldMs: 3_601_000 },
+  { label: 'IP day', kind: 'ip', count: 100, youngMs: 7_200_000, oldMs: 86_401_000 },
+])('retains the $label window until it expires', async ({ kind, count, youngMs, oldMs }) => {
+  const phoneNumber = '13800138023';
+  const address = kind === 'phone' ? `+86${phoneNumber}` : '127.0.0.1';
+  const key = `${kind}:${createHash('sha256').update(address).digest('hex')}`;
+  await seedBudget(key, count, youngMs);
+  const blocked = await call('/api/auth/phone-number/send-otp', { phoneNumber });
+  expect(blocked.status).toBe(429);
+  expect(delivered.size).toBe(0);
+  await pool.query(
+    'UPDATE "mioSmsBudgetEvent" SET "occurredAtMs" = "occurredAtMs" - $2 WHERE "budgetId" = $1',
+    [key, oldMs - youngMs],
+  );
+  expect(await send('/api/auth/phone-number/send-otp', phoneNumber)).toMatch(/^\d{6}$/);
+  const { rows } = await pool.query('SELECT count(*)::int AS count FROM "mioSmsBudgetEvent"');
+  expect(rows[0].count).toBe(oldMs > 86_400_000 ? 3 : count + 3);
+});
+
+it('admits only one of two different phones queued for the last global slot', async () => {
+  await seedBudget('global', 999, 7_200_000);
+  const locker = await pool.connect();
+  let waiting: Promise<Response[]> | undefined;
+  try {
+    await locker.query('BEGIN');
+    const gate = await locker.query<{ pid: number }>(
+      `SELECT pg_backend_pid() AS pid FROM "mioSmsBudget" WHERE id = 'global' FOR UPDATE`,
+    );
+    const lockerPid = gate.rows[0]!.pid;
+    waiting = Promise.all([
+      call('/api/auth/phone-number/send-otp', { phoneNumber: '13800138024' }),
+      call('/api/auth/phone-number/send-otp', { phoneNumber: '13800138025' }, undefined, 1),
+    ]);
+    void waiting.catch(() => {});
+    await vi.waitFor(
+      async () => {
+        const { rows } = await pool.query<{ pid: number; blockers: number[] }>(
+          `SELECT pid, pg_blocking_pids(pid) AS blockers FROM pg_stat_activity
+         WHERE application_name = $1 AND query = $2 AND wait_event_type = 'Lock'`,
+          [
+            database.applicationName,
+            `SELECT id FROM ${database.applicationName}."mioSmsBudget" WHERE id = $1 FOR UPDATE`,
+          ],
+        );
+        expect(rows).toHaveLength(2);
+        expect(rows.some(({ blockers }) => blockers.includes(lockerPid))).toBe(true);
+        expect(
+          rows.every(({ blockers }) =>
+            blockers.some((pid) => pid === lockerPid || rows.some((other) => other.pid === pid)),
+          ),
+        ).toBe(true);
+      },
+      { timeout: 2000, interval: 10 },
+    );
+    await locker.query('COMMIT');
+    expect((await waiting).map(({ status }) => status).sort()).toEqual([200, 429]);
+    const { rows } = await pool.query(
+      'SELECT count(*)::int AS count FROM "mioSmsBudgetEvent" WHERE "budgetId" = $1',
+      ['global'],
+    );
+    expect(rows[0].count).toBe(1000);
+    expect(delivered.size).toBe(1);
+    expect((await pool.query('SELECT status FROM "mioPhoneChallenge"')).rows).toEqual([
+      { status: 'active' },
+    ]);
+  } finally {
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
+  }
+});
+
+it('rolls back all event debits when the pending challenge write fails', async () => {
+  const phoneNumber = '13800138026';
+  await pool.query(`CREATE FUNCTION reject_phone_challenge() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'test pending challenge failure'; END $$`);
+  await pool.query(`CREATE TRIGGER reject_phone_challenge BEFORE INSERT ON "mioPhoneChallenge"
+    FOR EACH ROW EXECUTE FUNCTION reject_phone_challenge()`);
+  try {
+    const failure = await call('/api/auth/phone-number/send-otp', { phoneNumber });
+    expect(failure.status).toBe(503);
+    expect(await failure.text()).not.toContain('test pending challenge failure');
+    expect(delivered.size).toBe(0);
+    const { rows } = await pool.query(`SELECT
+      (SELECT count(*)::int FROM "mioSmsBudget") AS keys,
+      (SELECT count(*)::int FROM "mioSmsBudgetEvent") AS events,
+      (SELECT count(*)::int FROM "mioPhoneChallenge") AS challenges`);
+    expect(rows[0]).toEqual({ keys: 0, events: 0, challenges: 0 });
+  } finally {
+    await pool.query('DROP TRIGGER reject_phone_challenge ON "mioPhoneChallenge"');
+    await pool.query('DROP FUNCTION reject_phone_challenge()');
+  }
+  expect(await send('/api/auth/phone-number/send-otp', phoneNumber)).toMatch(/^\d{6}$/);
+});
+
+it('uses the budget time after the global lock and drops just-expired entries', async () => {
+  await seedBudget('global', 1000, 7_200_000);
+  const locker = await pool.connect();
+  let waiting: Promise<Response> | undefined;
+  try {
+    await locker.query('BEGIN');
+    const gate = await locker.query<{ pid: number; expiresAt: Date }>(
+      `SELECT pg_backend_pid() AS pid, clock_timestamp() + interval '22 hours' AS "expiresAt"
+       FROM "mioSmsBudget" WHERE id = 'global' FOR UPDATE`,
+    );
+    const { pid, expiresAt } = gate.rows[0]!;
+    const statement = `SELECT id FROM ${database.applicationName}."mioSmsBudget" WHERE id = $1 FOR UPDATE`;
+    const phoneNumber = '13800138027';
+    waiting = call('/api/auth/phone-number/send-otp', { phoneNumber });
+    void waiting.catch(() => {});
+    const waiterPid = await observeBlockedAuthQuery(pid, statement, {
+      at: expiresAt,
+      crossed: false,
+    });
+    const updated = await locker.query<{ expiresAt: Date }>(`WITH deadline AS MATERIALIZED (
+        SELECT date_trunc('milliseconds', clock_timestamp()) + interval '25 milliseconds' AS at
+      )
+      UPDATE "mioSmsBudgetEvent" SET "occurredAtMs" = (extract(epoch FROM deadline.at) * 1000)::bigint - 86400000
+      FROM deadline WHERE "budgetId" = 'global' RETURNING deadline.at AS "expiresAt"`);
+    await observeBlockedAuthQuery(pid, statement, {
+      at: updated.rows[0]!.expiresAt,
+      crossed: true,
+      waiterPid,
+    });
+    await locker.query('COMMIT');
+    expect((await waiting).status).toBe(200);
+    const { rows } = await pool.query('SELECT count(*)::int AS count FROM "mioSmsBudgetEvent"');
+    expect(rows[0].count).toBe(3);
+  } finally {
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
+  }
 });

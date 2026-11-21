@@ -125,7 +125,7 @@ async function main(name: 'dev' | 'test') {
     return;
   }
   if (action === 'migrate') {
-    const domain = args[0] && args[0] !== '--apply' ? args.shift()! : 'auth';
+    const domain = args[0] && !args[0].startsWith('--') ? args.shift()! : 'auth';
     if (
       ![
         'auth',
@@ -136,11 +136,14 @@ async function main(name: 'dev' | 'test') {
         'generations',
         'materials',
       ].includes(domain) ||
-      args.some((arg) => !['--apply', '--with-conversations'].includes(arg)) ||
-      (domain !== 'providers' && args.includes('--with-conversations'))
+      args.some(
+        (arg) => !['--apply', '--with-conversations', '--rollback-sms-budget'].includes(arg),
+      ) ||
+      (domain !== 'providers' && args.includes('--with-conversations')) ||
+      (domain !== 'auth' && args.includes('--rollback-sms-budget'))
     )
       throw new Error(
-        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials] [--apply]',
+        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials] [--apply] [--rollback-sms-budget for auth]',
       );
     console.log(`${name}: ${domain} migration ${args.includes('--apply') ? 'apply' : 'preview'}`);
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);

@@ -15,7 +15,14 @@ import {
   consumePhoneChallenge,
   reservePhoneChallenge,
 } from './phone-store.ts';
-import type { BindingIdentity, PhoneLimits, PhonePurpose } from './phone-store.ts';
+import type { BindingIdentity, PhonePurpose } from './phone-store.ts';
+import type { PhoneLimits } from './phone-budget.ts';
+import type { SmsBudgetTables } from './phone-budget-schema.ts';
+
+export interface PhoneSmsRuntime {
+  sender: SmsSender;
+  tables: SmsBudgetTables;
+}
 
 const schema = {
   user: {
@@ -36,6 +43,7 @@ const schema = {
       expiresAt: { type: 'date', index: true },
     },
   },
+  // The legacy field remains a schema-compatible write fence after the event cutover.
   mioSmsBudget: {
     fields: {
       events: { type: 'string' },
@@ -81,7 +89,7 @@ function failure(code: string): never {
 export function phonePlugin(
   config: { secret: string; smsLimits: PhoneLimits },
   pool: Pool,
-  sender: SmsSender | undefined,
+  sms: PhoneSmsRuntime | undefined,
   domain: string,
 ) {
   const send = (purpose: PhonePurpose) =>
@@ -90,7 +98,7 @@ export function phonePlugin(
       { method: 'POST' },
       async (ctx) => {
         const { phone } = parseInput(ctx.body, false);
-        if (!sender) return failure('SMS_UNAVAILABLE');
+        if (!sms) return failure('SMS_UNAVAILABLE');
         let binding: BindingIdentity | undefined;
         if (purpose === 'bind') {
           const session = await getAuthoritativeSessionFromCtx(ctx);
@@ -103,6 +111,7 @@ export function phonePlugin(
         try {
           const challenge = await reservePhoneChallenge(
             pool,
+            sms.tables,
             config.secret,
             config.smsLimits,
             purpose,
@@ -110,7 +119,7 @@ export function phonePlugin(
             ip,
             binding,
           );
-          await sender(phone, challenge.code);
+          await sms.sender(phone, challenge.code);
           if (!(await activatePhoneChallenge(pool, challenge.id)))
             return failure('SMS_UNAVAILABLE');
         } catch (error) {
@@ -125,7 +134,7 @@ export function phonePlugin(
       { method: 'POST' },
       async (ctx) => {
         const { phone, code } = parseInput(ctx.body, true);
-        if (!sender) return failure('SMS_UNAVAILABLE');
+        if (!sms) return failure('SMS_UNAVAILABLE');
         let binding: BindingIdentity | undefined;
         if (purpose === 'bind') {
           const session = await getAuthoritativeSessionFromCtx(ctx);

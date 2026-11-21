@@ -36,7 +36,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 参考图和 PNG 蒙版每次出现的冻结长度各不得超过 16 MiB（16 × 1024² 字节），单任务合计不得超过 32 MiB，均含边界。同一资产同时作为参考图和蒙版时计两次。新 HTTP／工具准入在归属、对象快照与路由结构核对后、创建任务前以 413 `IMAGE_REFERENCE_LIMIT` 拒绝超限输入；已受理的同 requestId 请求仍先重放原任务。历史 `ready` 执行若超限，在读取任何参考对象、写提交意图或调用上游前进入 `rejected`，`errorCode=IMAGE_REFERENCE_LIMIT`，内部执行终结且不再重试。该预算只约束新准入和未提交任务，已提交查询、unknown 判定及已保存结果的恢复沿原身份继续。原始资产上传上限和原图字节、顺序不变；这些固定限制是单 A 的保守资源边界，不代表已测得生产容量。
 
-`openai-images` 的 JSON `generate` 仅发送模型、提示词及驱动支持的生成选项。兼容网关使用的 `aspect_ratio` 仅在路由 `allowedAspectRatios` 声明对应值时发送。参考图通过 multipart `edit` 提交。新导入的 OpenAI 路由不得为 `generate` 声明参考图能力。已保存的路由仍可用于纯文本生成和编辑。新 OpenAI 参考图 `generate` 请求返回 `IMAGE_OPERATION_UNSUPPORTED`，已冻结的同类任务在写提交意图与调用上游之前以 `IMAGE_INPUT_INVALID` 终止。其他驱动按各自声明支持参考图生成。
+`openai-images` 的 JSON `generate` 仅发送模型、提示词及驱动支持的生成选项。兼容网关使用的 `aspect_ratio` 由 JSON 生成按路由 `allowedAspectRatios` 发送。Multipart 编辑（含获路由授权的 `outpaint`）以 `size` 指定尺寸，传入 `aspect_ratio` 在受理前返回 `IMAGE_INPUT_INVALID`。编辑单图用 `image`，多图逐份使用 `image[]` 并保留提交顺序。可选 PNG 遮罩使用独立的 `mask` 字段。新导入的 OpenAI 路由不得为 `generate` 声明参考图能力。已保存的路由仍可用于纯文本生成和编辑。新 OpenAI 参考图 `generate` 请求返回 `IMAGE_OPERATION_UNSUPPORTED`，已冻结的同类任务在写提交意图与调用上游之前以 `IMAGE_INPUT_INVALID` 终止。其他驱动按各自声明支持参考图生成。
 
 首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为路由异步时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
 
@@ -46,7 +46,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 错误：400 IMAGE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 ASSET_NOT_FOUND、409 REQUEST_CONFLICT/IMAGE_OPERATION_UNSUPPORTED 或供应商资格错误、413 IMAGE_REFERENCE_LIMIT、429 COMPUTE_QUOTA_EXCEEDED、503 IMAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
 
-副作用：受理仅占用独立的图片活动任务名额（每用户最多 32 个、全局最多 1000 个 `accepted` 或 `materializing` 状态任务，独立事务锁，不与视频转码名额互相挤占），在 PostgreSQL 短事务中建立图片任务和内部执行记录，立即唤醒 A 的后台执行器。单 A 通过数据库原子认领任务，网络请求期间不持长事务；网络并发上限 4，解码独立排队且并发 1。提交意图先持久化，再发送唯一一次生成 POST；提交结果不明进入 unknown，不自动重发。参考图与遮罩输入快照保存在图片任务命令中，COS `If-Match` 读取或签名校验失败均发生在持久提交意图 与调用上游之前（0 次上游 POST）；四个原厂图片驱动（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`）返回的 URL 结果统一按公网 HTTPS、限时有界下载及真实图片格式核对后进入既有 COS/Asset 物化，不依赖固定结果域名清单；Mio 不记录费用、计费、余额或预算。
+副作用：受理仅占用独立的图片活动任务名额（每用户最多 32 个、全局最多 1000 个 `accepted` 或 `materializing` 状态任务，独立事务锁，不与视频转码名额互相挤占），在 PostgreSQL 短事务中建立图片任务和内部执行记录，立即唤醒 A 的后台执行器。单 A 通过数据库原子认领任务，网络请求期间不持长事务；网络并发上限 4，解码独立排队且并发 1。提交意图先持久化，再发送唯一一次生成 POST；提交结果不明进入 unknown，不自动重发。参考图与遮罩输入快照保存在图片任务命令中，COS `If-Match` 读取或签名校验失败均发生在持久提交意图 与调用上游之前（0 次上游 POST）。Volcengine Ark、Vidu、Kling 图片结果的 URL 路径走公网 HTTPS 限时有界下载，再核对实际图片格式并落入既有 COS/Asset 物化。OpenAI Images 已实现 `data[].b64_json` 路径。编辑接口文档也列出 `data[].url`，显式请求 Base64 时仅返回 URL 的目标路由行为仍待实证。详见 [OneLink 图片协议](../integrations/onelink.md#必须遵守的约束)。Mio 不记录费用、计费、余额或预算。
 
 参考图或遮罩的实际字节签名与冻结 MIME 不符时，任务进入 `rejected`，`errorCode` 为 `IMAGE_INPUT_INVALID`。条件读取错误沿用执行器在提交前的现有重试。
 

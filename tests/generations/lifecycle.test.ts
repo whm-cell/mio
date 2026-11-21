@@ -298,8 +298,8 @@ it('keeps legacy OpenAI jobs for generate and edit while rejecting generate with
     });
     const [editCall] = f.transport.mock.calls.filter(([url]) => String(url).endsWith('/edits'));
     const form = editCall?.[1]?.body as FormData;
-    expect([...form.keys()]).toEqual(['model', 'prompt', 'response_format', 'image', 'image']);
-    const images = form.getAll('image') as File[];
+    expect([...form.keys()]).toEqual(['model', 'prompt', 'response_format', 'image[]', 'image[]']);
+    const images = form.getAll('image[]') as File[];
     expect(
       await Promise.all(images.map(async (image) => Buffer.from(await image.arrayBuffer()))),
     ).toEqual([f.bytes, secondBytes]);
@@ -318,6 +318,19 @@ it('keeps legacy OpenAI jobs for generate and edit while rejecting generate with
         imageAssetIds,
       }),
     ).rejects.toMatchObject({ code: 'IMAGE_OPERATION_UNSUPPORTED' });
+    const invalidEditId = randomUUID();
+    await expect(
+      service.createImage(f.actor, invalidEditId, f.modelRef, {
+        prompt: 'edit with unsupported aspect ratio',
+        operation: 'edit',
+        imageAssetIds,
+        aspect_ratio: '16:9',
+      }),
+    ).rejects.toMatchObject({ code: 'IMAGE_INPUT_INVALID' });
+    expect(
+      (await f.pool.query('SELECT 1 FROM mio_image_jobs WHERE request_id=$1', [invalidEditId]))
+        .rowCount,
+    ).toBe(0);
     expect(f.transport).toHaveBeenCalledTimes(2);
   } finally {
     submitting.mockRestore();

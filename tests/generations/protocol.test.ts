@@ -847,7 +847,7 @@ describe('Routed vendor image protocols', () => {
     const transport = vi
       .fn<typeof fetch>()
       .mockResolvedValue(Response.json({ data: [{ b64_json: 'YWJj' }] }));
-    const bytes = Uint8Array.from(Buffer.from('89504e470d0a1a0a', 'hex'));
+    const bytes = encodedContentImage('png');
     const image = {
       assetId: '00000000-0000-4000-8000-000000000001',
       key: 'mio/raw/00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002',
@@ -863,47 +863,81 @@ describe('Routed vendor image protocols', () => {
       contentType: 'image/png' as const,
     };
     const read = vi.fn(async () => bytes);
-    const result = await createRoutedImageProtocol(GPT_ROUTE, 'edit', transport, read).submit(
-      { ...input, operation: 'edit', image, mask, n: 1, quality: 'high' },
-      key,
+    const protocol = createRoutedImageProtocol(
+      {
+        ...GPT_ROUTE,
+        paramSpec: { ...GPT_ROUTE.paramSpec, allowedAspectRatios: ['3:2'] },
+      },
+      'edit',
+      transport,
+      read,
     );
+    const parameters = { ...input, operation: 'edit', image, mask, n: 1, quality: 'high' } as const;
+    await expect(protocol.submit({ ...parameters, aspect_ratio: '3:2' }, key)).resolves.toEqual({
+      state: 'rejected',
+      code: 'IMAGE_INPUT_INVALID',
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(transport).not.toHaveBeenCalled();
+    const result = await protocol.submit({ ...parameters, size: '1536x1024' }, key);
     expect(result).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
     expect(read).toHaveBeenCalledTimes(2);
+    expect(transport).toHaveBeenCalledOnce();
     const [url, options] = transport.mock.calls[0]!;
     expect(url).toBe('https://api.onelinkai.cloud/v1/images/edits');
     expect(options?.headers).toEqual({ Authorization: `Bearer ${key}` });
-    const form = await new Response(options?.body).formData();
+    const wire = new Response(options?.body);
+    const form = await wire.clone().formData();
     expect(form.get('model')).toBe(input.model);
     expect(form.get('prompt')).toBe(input.prompt);
     expect(form.get('response_format')).toBe('b64_json');
     expect(form.get('quality')).toBe('high');
-    expect(form.get('image')).toBeInstanceOf(File);
-    expect(form.get('mask')).toBeInstanceOf(File);
-    expect(JSON.stringify(options?.body)).not.toContain(image.key);
-    expect(JSON.stringify(options?.body)).not.toContain(image.etag);
+    expect(form.get('size')).toBe('1536x1024');
+    expect(form.get('aspect_ratio')).toBeNull();
+    expect(form.getAll('image')).toHaveLength(1);
+    expect(form.getAll('image[]')).toEqual([]);
+    const source = form.get('image') as File;
+    expect(source).toMatchObject({ name: 'image.png', type: 'image/png' });
+    expect(Buffer.from(await source.arrayBuffer())).toEqual(bytes);
+    const maskFile = form.get('mask') as File;
+    expect(maskFile).toMatchObject({ name: 'mask.png', type: 'image/png' });
+    expect(Buffer.from(await maskFile.arrayBuffer())).toEqual(bytes);
+    const payload = await wire.text();
+    for (const ref of [image, mask]) {
+      expect(payload).not.toContain(ref.assetId);
+      expect(payload).not.toContain(ref.key);
+      expect(payload).not.toContain(ref.etag);
+    }
+    expect(payload).not.toContain(key);
   });
 
   it('posts ordered GPT reference arrays and explicit outpaint geometry in one multipart request', async () => {
     const transport = vi
       .fn<typeof fetch>()
       .mockResolvedValue(Response.json({ data: [{ b64_json: 'YWJj' }] }));
-    const bytes = Uint8Array.from(Buffer.from('89504e470d0a1a0a', 'hex'));
-    const image = (assetId: string, rawId: string) => ({
+    const firstBytes = encodedContentImage('png');
+    const secondBytes = encodedContentImage('png', '32x16');
+    expect(firstBytes.equals(secondBytes)).toBe(false);
+    const image = (assetId: string, rawId: string, sizeBytes: number) => ({
       assetId,
       key: `mio/raw/${assetId}/${rawId}`,
-      sizeBytes: bytes.length,
+      sizeBytes,
       etag: `etag-${assetId.slice(-1)}`,
       contentType: 'image/png' as const,
     });
     const first = image(
       '00000000-0000-4000-8000-000000000001',
       '00000000-0000-4000-8000-000000000002',
+      firstBytes.length,
     );
     const second = image(
       '00000000-0000-4000-8000-000000000003',
       '00000000-0000-4000-8000-000000000004',
+      secondBytes.length,
     );
-    const read = vi.fn(async () => bytes);
+    const read = vi.fn<ReadImage>(async (ref) =>
+      ref.assetId === first.assetId ? firstBytes : secondBytes,
+    );
     const result = await createRoutedImageProtocol(GPT_ROUTE, 'outpaint', transport, read).submit(
       {
         ...input,
@@ -914,15 +948,29 @@ describe('Routed vendor image protocols', () => {
       key,
     );
     expect(result).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
-    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls.map(([ref]) => ref.assetId)).toEqual([first.assetId, second.assetId]);
+    expect(transport).toHaveBeenCalledOnce();
     const [, options] = transport.mock.calls[0]!;
-    const form = await new Response(options?.body).formData();
-    const files = form.getAll('image');
-    expect(files).toHaveLength(2);
-    expect(files.map((value) => (value as File).name)).toEqual(['image.png', 'image.png']);
+    const wire = new Response(options?.body);
+    const form = await wire.clone().formData();
+    expect(form.getAll('image')).toEqual([]);
+    const files = form.getAll('image[]') as File[];
+    expect(files.map((file) => [file.name, file.type])).toEqual([
+      ['image.png', 'image/png'],
+      ['image.png', 'image/png'],
+    ]);
+    expect(
+      await Promise.all(files.map(async (file) => Buffer.from(await file.arrayBuffer()))),
+    ).toEqual([firstBytes, secondBytes]);
+    expect(form.get('mask')).toBeNull();
     expect(form.get('geometry')).toBe(JSON.stringify({ left: 16, top: 0, right: 32, bottom: 0 }));
-    expect(JSON.stringify(options?.body)).not.toContain(first.key);
-    expect(JSON.stringify(options?.body)).not.toContain(first.etag);
+    const payload = await wire.text();
+    for (const ref of [first, second]) {
+      expect(payload).not.toContain(ref.assetId);
+      expect(payload).not.toContain(ref.key);
+      expect(payload).not.toContain(ref.etag);
+    }
+    expect(payload).not.toContain(key);
   });
 
   it('uses one fixed POST, preserves optional defaults, and strips unrelated response fields', async () => {

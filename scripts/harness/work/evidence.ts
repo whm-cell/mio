@@ -1,11 +1,27 @@
 import { isDeepStrictEqual } from 'node:util';
 import { candidateRef, digest, json, sameCandidate } from './records.ts';
-import type { Candidate, Evidence } from './records.ts';
+import type { Candidate, Evidence, Task } from './records.ts';
 import { metadata, record, textField } from './report-format.ts';
 import { artifact } from './original.ts';
 import { readCommandOriginal } from './command-original.ts';
 export { artifact } from './original.ts';
 export { resultMarker } from './command-original.ts';
+
+export function candidateEvidence(task: Task, candidate: Candidate | null) {
+  const groups = new Map<string, Evidence[]>();
+  if (!candidate) return groups;
+  const methods = new Map(
+    task.plan.acceptance.map((criterion) => [criterion.id, criterion.method]),
+  );
+  for (const entry of task.evidence) {
+    if (methods.get(entry.criterion) !== entry.method || !sameCandidate(entry.candidate, candidate))
+      continue;
+    const entries = groups.get(entry.criterion);
+    if (entries) entries.push(entry);
+    else groups.set(entry.criterion, [entry]);
+  }
+  return groups;
+}
 
 /** Manual coverage is an explicit observation, never an automatically inherited pass. */
 export function coverageEvidenceResult(

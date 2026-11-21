@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { format } from 'prettier';
-import { assess, requireCandidate } from './context.ts';
+import { assessWithEvidence, firstUncommittedPath, requireCandidate } from './context.ts';
 import {
   contractRevision,
   json,
@@ -20,14 +20,7 @@ import {
 } from './delivery-store.ts';
 import { normsIssues } from './norms-review.ts';
 import { documentCatalog, resolvePrd } from '../task-documents.ts';
-import {
-  bookPaths,
-  matchingEvidence,
-  readBook,
-  readDraft,
-  renderBook,
-  validateLocations,
-} from './reports.ts';
+import { bookPaths, readBook, readDraft, renderBook, validateLocations } from './reports.ts';
 import { parseAcceptance, parseDetails, parseRecords } from './compact-store.ts';
 import { fields, publicText, record, textField } from './report-format.ts';
 
@@ -63,13 +56,15 @@ async function verified(root: string, task: Task, expected?: Candidate) {
   const candidate = await requireCandidate(root, task);
   if (expected && !sameCandidate(expected, candidate))
     throw new Error('WORK_DELIVERY_STALE: candidate changed');
-  const assessment = await assess(root, task, { inspectDelivery: false });
+  const { assessment, selectedEvidence } = await assessWithEvidence(root, task, {
+    inspectDelivery: false,
+  });
   if (!assessment.ready) throw new Error(assessment.errors.join('\n'));
   const normsErrors = await normsIssues(root, task.plan, true);
   if (normsErrors.length) throw new Error(normsErrors.join('\n'));
   if (assessment.evidence.some((entry) => entry.result !== 'pass'))
     throw new Error('WORK_DELIVERY_EVIDENCE: all criteria need matching passing originals');
-  return candidate;
+  return { candidate, selectedEvidence };
 }
 
 export async function deliver(root: string, id: string, rawRequest: string) {
@@ -104,7 +99,7 @@ async function prepare(root: string, task: Task, raw: string, request: Record<st
   if (task.archived) throw new Error('WORK_ARCHIVED: reopen before delivery');
   if (task.stage !== 'C1_EVIDENCE_PENDING' || task.reviewDecision !== 'PENDING')
     throw new Error('WORK_DELIVERY_STAGE: verify before preparing for human acceptance');
-  const candidate = await verified(root, task);
+  const { candidate, selectedEvidence } = await verified(root, task);
   const catalog = await documentCatalog(root);
   const result = parseDetails({
     key: task.plan.result!.key,
@@ -115,20 +110,19 @@ async function prepare(root: string, task: Task, raw: string, request: Record<st
     limitations: request.limitations,
   });
   await validateLocations(root, result, catalog);
-  for (const { path } of result.locations) {
-    const check = spawnSync('git', ['cat-file', '-e', `${candidate.commit}:${path}`], {
-      cwd: root,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-    });
-    if (check.status !== 0)
-      throw new Error(`WORK_REPORT_LOCATION: location is absent from the candidate: ${path}`);
-  }
+  const missing = firstUncommittedPath(
+    root,
+    candidate.commit,
+    result.locations.map(({ path }) => path),
+  );
+  if (missing)
+    throw new Error(`WORK_REPORT_LOCATION: location is absent from the candidate: ${missing}`);
   const draft: ResultDraft = {
     id: randomUUID(),
     prd: task.plan.result!.prd,
     candidate,
     result,
-    evidence: await matchingEvidence(root, task, candidate),
+    evidence: selectedEvidence,
   };
   task.delivery!.draft = draft;
   task.reviewDecision = 'PENDING';

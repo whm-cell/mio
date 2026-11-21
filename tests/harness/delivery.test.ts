@@ -929,6 +929,31 @@ it('does not prepare when a later supplemental check failed', async () => {
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
 });
 
+it('freezes the assessed originals in criterion and ledger order', async () => {
+  const root = await fixture();
+  const candidate = await setup(root);
+  const { task, raw } = await loadTask(root, 'probe');
+  const [checks, quality, norms] = task.evidence;
+  const artifact = '.work/tasks/probe/evidence/supplemental-pass.log';
+  const content =
+    json({ candidate, contract: contractPlan(task), argv: ['node', '-v'] }) +
+    resultMarker +
+    json({ exitCode: 0, signal: null, cancelled: false, unsettled: false, contextChanged: false });
+  await put(root, artifact, content);
+  const supplemental = { ...checks!, artifact, sha256: digest(content) };
+  task.evidence.push(supplemental, {
+    ...quality!,
+    method: 'behavior',
+    artifact: '.work/tasks/probe/evidence/wrong-method.md',
+  });
+  await saveTask(root, task, raw);
+  const prepared = await prepare(root);
+  expect(prepared).toMatchObject({
+    draft: { evidence: [checks, supplemental, quality, norms] },
+    readyForAcceptance: true,
+  });
+});
+
 it('rechecks the middle of a large command original before completing its prepared result', async () => {
   const root = await fixture();
   await setup(root);

@@ -15,7 +15,7 @@ import {
   reportPath,
 } from './compact-store.ts';
 import type { ResultBook } from './compact-store.ts';
-import { automatedEvidence } from './evidence.ts';
+import { automatedEvidence, candidateEvidence } from './evidence.ts';
 import { manualEvidenceResult } from './manual-evidence.ts';
 import { artifact } from './original.ts';
 
@@ -105,25 +105,22 @@ export async function readResultInput(root: string, path: string, catalog?: Cata
 }
 
 /** Bind a draft to the originals selected by each current criterion. */
-export async function matchingEvidence(root: string, task: Task, candidate: Candidate) {
+async function matchingEvidence(root: string, task: Task, candidate: Candidate) {
   const selected: Evidence[] = [];
+  const grouped = candidateEvidence(task, candidate);
+  const contract = contractPlan(task);
   for (const criterion of task.plan.acceptance) {
-    const entries = task.evidence.filter(
-      (item) =>
-        item.criterion === criterion.id &&
-        item.method === criterion.method &&
-        sameCandidate(item.candidate, candidate),
-    );
+    const entries = grouped.get(criterion.id) ?? [];
     if (criterion.method === 'automated') {
       const observation = await automatedEvidence(
         root,
         task.plan.id,
         entries,
         criterion.command,
-        contractPlan(task),
+        contract,
       );
       if (observation.result !== 'pass') throw new Error(`WORK_DELIVERY_EVIDENCE: ${criterion.id}`);
-      selected.push(...observation.evidence);
+      for (const entry of observation.evidence) selected.push(entry);
       continue;
     }
     const entry = entries.at(-1);

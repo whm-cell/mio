@@ -208,6 +208,53 @@ it('does not bind an ignored declared source that is absent from the clean commi
   expect((await state(root, id)).checkpoint).toBeNull();
 });
 
+it('preserves the first declared input error between Git and local checks', async () => {
+  const root = await fixture();
+  const ignored = 'docs/ignored.md';
+  await writeFile(join(root, '.gitignore'), `.work/\n${ignored}\n`);
+  commit(root, 'Ignore the candidate-only fixture path');
+  await writeFile(join(root, ignored), '# Worktree file\n');
+  const id = create(root);
+  const task = await state(root, id);
+  for (const [local, diagnostic] of [
+    ['docs/missing.md', 'WORK_INPUT_MISSING: docs/missing.md'],
+    ['.work/private.md', 'WORK_PRIVATE: .work/private.md'],
+    ['docs/tasks/fixture/complete/records.json#result=', 'WORK_REPORT_SELECTOR:'],
+  ] as const) {
+    for (const [sources, first] of [
+      [[ignored, local], `WORK_INPUT_UNCOMMITTED: ${ignored}`],
+      [[local, ignored], diagnostic],
+    ] as const) {
+      // Set a malformed local fixture directly to exercise sync's first failing declaration.
+      task.plan.sources = [...sources];
+      await writeFile(join(root, `.work/tasks/${id}/state.json`), JSON.stringify(task));
+      const result = invoke(root, ['sync', id, 'Check declaration order.']);
+      expect(result.status, result.output).toBe(1);
+      expect(result.output.startsWith(first), result.output).toBe(true);
+    }
+  }
+  expect((await state(root, id)).checkpoint).toBeNull();
+});
+
+it('binds a directory and input names containing whitespace to the same clean commit', async () => {
+  const root = await fixture();
+  const paths = [
+    'src/file with spaces.ts',
+    ...(process.platform === 'win32' ? [] : ['src/file with a newline\n.ts']),
+  ];
+  for (const path of paths) await writeFile(join(root, path), 'export const fixture = true;\n');
+  const commitId = commit(root, 'Add whitespace paths');
+  const id = create(root);
+  const task = await state(root, id);
+  ok(root, ['update', id, '--stdin'], {
+    revision: task.revision,
+    reason: 'Declare committed files and directories.',
+    plan: { inputs: [...paths, 'src', '.'] },
+  });
+  ok(root, ['sync', id, 'Bind the declared paths to the candidate.']);
+  expect((await state(root, id)).checkpoint?.candidate).toMatchObject({ commit: commitId });
+});
+
 it('keeps historical strings and originals without treating an old head as a current candidate', async () => {
   const root = await fixture();
   const id = create(root);

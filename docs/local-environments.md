@@ -24,6 +24,8 @@
 
 收到 `LOCAL_ENV_BUSY` 时先确认另一初始化进程是否仍在运行。进程被强杀且已无初始化写入时，可移除错误中标出的空占用目录并重新初始化。
 
+转码使用的 A/B 用户、权限及容量策略由部署者在中间件启动后[预置](integrations/rabbitmq.md#预置本地-broker)。完成后运行对应的 `broker:init`。
+
 ```sh
 pnpm env:init
 pnpm infra:up:dev
@@ -31,6 +33,7 @@ pnpm regression:init:dev
 pnpm infra:up:test
 pnpm regression:init:test
 pnpm build
+# 完成各自的 Broker 预置后运行。
 pnpm broker:init:dev
 pnpm broker:init:test
 pnpm migrate:dev --apply
@@ -44,7 +47,7 @@ pnpm start:test
 
 手机号短信默认关闭。需要使用时，仅在选定环境的私有配置文件中按[模板](../.env.example)填写该环境授权的腾讯短信应用、签名、模板和凭据，再设 `MIO_AUTH_SMS_ENABLED=true`；另一个环境不会继承这些设置。应用启动不发送短信，实际调用会产生外部费用；模板须有验证码与有效分钟数两个参数。认证结构仍需先预览并显式迁移，详见[认证底座](auth.md#配置与迁移)。
 
-`broker:init:dev/test` 只准备本地重媒体命令、结果及各自 DLQ/DLX，先核对已有资源和受限 A/B 权限；任何不匹配报 `LOCAL_BROKER_CONFLICT`，不覆盖、不清队列、不轮换密码。旧图片队列及权限不被初始化静默收缩，须先按下面的切换步骤对账后单独退役。仅启用图片生成时无需运行 broker 初始化或启动 B。
+`broker:init:dev/test` 核对所选 vhost、A/B 用户、权限与容量策略，补齐前置已满足的重媒体拓扑。`LOCAL_BROKER_PREPROVISION_REQUIRED` 列出部署者应补的资源，预置完按原命令重跑。已有配置冲突报 `LOCAL_BROKER_CONFLICT` 并保留现场和已有消息。旧图片队列和权限按下面的切换步骤单独对账及退役。仅启用图片生成时可跳过 Broker 初始化和 B。
 
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。
 

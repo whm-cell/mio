@@ -138,6 +138,9 @@ importers:
       jsonc-parser:
         specifier: 3.3.1
         version: 3.3.1
+      koffi:
+        specifier: 3.1.1
+        version: 3.1.1
       prettier:
         specifier: 3.9.10
         version: 3.9.10

@@ -55,6 +55,30 @@ it('preserves HTTP paths, closed input, origin checks, preflight and session rec
     expect(f.transport).not.toHaveBeenCalled();
     expect((await f.pool.query('SELECT count(*) FROM mio_image_jobs')).rows[0].count).toBe('0');
     revoked = false;
+    const readPrevious = vi.spyOn(f.store, 'imageRequest');
+    const readRoute = vi.spyOn(f.provider, 'snapshotImage');
+    const readAsset = vi.spyOn(f.store, 'imageInput');
+    const invalidShapes = [
+      { n: { count: 1 } },
+      { size: ['1024x1024'] },
+      { imageAssetIds: [[randomUUID()]] },
+      { imageAssetIds: null },
+      { operation: null, imageAssetIds: null },
+      { operation: 'generate', imageAssetIds: null, imageAssetId: randomUUID() },
+      { operation: null, imageAssetIds: ['invalid-asset-id'] },
+      {
+        imageAssetId: randomUUID(),
+        geometry: { left: { pixels: 16 }, top: 0, right: 0, bottom: 0 },
+      },
+    ];
+    for (const invalid of invalidShapes) {
+      const response = await post({ ...input, parameters: { ...input.parameters, ...invalid } });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: 'IMAGE_INPUT_INVALID' } });
+    }
+    expect(readPrevious).not.toHaveBeenCalled();
+    expect(readRoute).not.toHaveBeenCalled();
+    expect(readAsset).not.toHaveBeenCalled();
     const accepted = await post(input);
     expect(accepted.status).toBe(202);
     const job = await accepted.json();

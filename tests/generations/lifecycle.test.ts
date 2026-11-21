@@ -1,3 +1,4 @@
+import { sha256Utf8 } from '@mio/foundation/hash';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readdir, readFile } from 'node:fs/promises';
@@ -298,8 +299,8 @@ it('keeps legacy OpenAI jobs for generate and edit while rejecting generate with
     });
     const [editCall] = f.transport.mock.calls.filter(([url]) => String(url).endsWith('/edits'));
     const form = editCall?.[1]?.body as FormData;
-    expect([...form.keys()]).toEqual(['model', 'prompt', 'response_format', 'image', 'image']);
-    const images = form.getAll('image') as File[];
+    expect([...form.keys()]).toEqual(['model', 'prompt', 'response_format', 'image[]', 'image[]']);
+    const images = form.getAll('image[]') as File[];
     expect(
       await Promise.all(images.map(async (image) => Buffer.from(await image.arrayBuffer()))),
     ).toEqual([f.bytes, secondBytes]);
@@ -321,6 +322,131 @@ it('keeps legacy OpenAI jobs for generate and edit while rejecting generate with
     expect(f.transport).toHaveBeenCalledTimes(2);
   } finally {
     submitting.mockRestore();
+    await f.close();
+  }
+}, 15000);
+
+it('resumes a frozen OpenAI edit while rejecting aspect_ratio on new multipart requests', async () => {
+  const f = await generationFixture();
+  const server = createServer();
+  try {
+    await f.pool.query(
+      `UPDATE mio_provider_model_routes SET param_spec=param_spec || '{
+         "supportedOperations":["generate","edit","outpaint"],
+         "allowOutpaintGeometry":true,"allowedAspectRatios":["3:2"]
+       }'::jsonb, capability_metadata=capability_metadata - 'image'
+       WHERE raw_model_id='gpt-image-2' AND operation='image.generate'`,
+    );
+    const secondBytes = await sharp(f.bytes).negate().png().toBuffer();
+    const [first, second, mask] = await Promise.all([
+      f.addImageSource(),
+      f.addImageSource(secondBytes),
+      f.addImageSource(),
+    ]);
+    const legacyRequestId = randomUUID();
+    // Earlier admissions hashed the parameters with these top-level keys sorted.
+    const legacyParameters = {
+      aspect_ratio: '3:2',
+      imageAssetIds: [first.assetId, second.assetId],
+      maskAssetId: mask.assetId,
+      operation: 'edit' as const,
+      prompt: 'frozen edit with aspect ratio',
+      size: '1536x1024',
+    };
+    const { aspect_ratio, ...parameters } = legacyParameters;
+    const { jobId } = await f.admit(legacyRequestId, parameters.prompt, parameters);
+    // Recreate the old accepted snapshot before starting the current executor.
+    await f.pool.query(
+      `UPDATE mio_image_jobs SET command=jsonb_set(command,'{input,aspect_ratio}',to_jsonb($2::text)),
+       input_hash=$3 WHERE id=$1`,
+      [jobId, aspect_ratio, sha256Utf8(JSON.stringify([f.modelRef, legacyParameters]))],
+    );
+    const readExecution = async () =>
+      (
+        await f.pool.query(
+          `SELECT j.state,e.phase,j.command,j.route_snapshot FROM mio_image_jobs j
+           JOIN mio_image_executions e ON e.job_id=j.id WHERE j.id=$1`,
+          [jobId],
+        )
+      ).rows[0];
+    const frozen = await readExecution();
+    expect(frozen).toMatchObject({
+      state: 'accepted',
+      phase: 'ready',
+      command: { input: { operation: 'edit', size: '1536x1024', aspect_ratio: '3:2' } },
+      route_snapshot: { paramSpec: { allowedAspectRatios: ['3:2'] } },
+    });
+    expect(f.transport).not.toHaveBeenCalled();
+
+    const service = await f.start();
+    await vi.waitFor(
+      async () =>
+        expect(await service.getImage(f.actor, jobId)).toMatchObject({
+          status: 'completed',
+          errorCode: null,
+        }),
+      { timeout: 6000 },
+    );
+    expect(f.transport).toHaveBeenCalledOnce();
+    const [url, request] = f.transport.mock.calls[0]!;
+    expect(url).toBe('https://api.onelinkai.cloud/v1/images/edits');
+    expect(request?.method).toBe('POST');
+    const form = await new Response(request?.body).formData();
+    expect(form.get('size')).toBe('1536x1024');
+    expect(form.has('aspect_ratio')).toBe(false);
+    const images = form.getAll('image[]') as File[];
+    expect(
+      await Promise.all(images.map(async (file) => Buffer.from(await file.arrayBuffer()))),
+    ).toEqual([f.bytes, secondBytes]);
+    expect(Buffer.from(await (form.get('mask') as File).arrayBuffer())).toEqual(f.bytes);
+    expect(await readExecution()).toEqual({ ...frozen, state: 'completed', phase: 'done' });
+
+    const origin = 'https://app.fixture';
+    server.on(
+      'request',
+      createGenerationHandler(service, async () => f.actor, [origin]),
+    );
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    const submit = (requestId: string, input: object) =>
+      fetch(`http://127.0.0.1:${address.port}/api/v1/compute/images`, {
+        method: 'POST',
+        headers: { origin, 'content-type': 'application/json' },
+        body: JSON.stringify({ requestId, modelRef: f.modelRef, parameters: input }),
+      });
+    const replay = await submit(legacyRequestId, legacyParameters);
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({ jobId, status: 'completed' });
+    const geometry = { left: 16, top: 0, right: 0, bottom: 0 };
+    for (const input of [
+      legacyParameters,
+      { ...legacyParameters, operation: 'outpaint', geometry },
+    ]) {
+      const requestId = randomUUID();
+      const rejected = await submit(requestId, input);
+      const error = await rejected.json();
+      expect(rejected.status, JSON.stringify(error)).toBe(400);
+      expect(error).toMatchObject({ error: { code: 'IMAGE_INPUT_INVALID' } });
+      expect(
+        (await f.pool.query('SELECT 1 FROM mio_image_jobs WHERE request_id=$1', [requestId]))
+          .rowCount,
+      ).toBe(0);
+    }
+
+    await f.stop();
+    const claim = vi.spyOn(f.store, 'claim');
+    await f.start();
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled());
+    expect(await claim.mock.results[0]!.value).toBeUndefined();
+    expect(f.transport).toHaveBeenCalledOnce();
+  } finally {
+    if (server.listening) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
     await f.close();
   }
 }, 15000);

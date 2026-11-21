@@ -1,6 +1,15 @@
 /** Protocol-only substitute: no Agent, request selection, credentials or persistence implementation. */
-export function protocolResponse(request: Request, text: string, hold = false): Response {
+export function protocolResponse(
+  request: Request,
+  text: string,
+  hold = false,
+  options: {
+    ending?: 'max-tokens' | 'incomplete';
+    messagesUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  } = {},
+): Response {
   const anthropic = new URL(request.url).pathname === '/v1/messages';
+  const usage = options.messagesUsage;
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -30,7 +39,16 @@ export function protocolResponse(request: Request, text: string, hold = false): 
               model: 'claude-fixture',
               content: [],
               stop_reason: null,
-              usage: { input_tokens: 5, output_tokens: 0 },
+              usage: {
+                input_tokens: usage?.input ?? 5,
+                output_tokens: 0,
+                ...(usage
+                  ? {
+                      cache_read_input_tokens: usage.cacheRead,
+                      cache_creation_input_tokens: usage.cacheWrite,
+                    }
+                  : {}),
+              },
             },
           },
           'message_start',
@@ -43,13 +61,13 @@ export function protocolResponse(request: Request, text: string, hold = false): 
           { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
           'content_block_delta',
         );
-        if (!hold) {
-          send({ type: 'content_block_stop', index: 0 }, 'content_block_stop');
+        if (!hold) send({ type: 'content_block_stop', index: 0 }, 'content_block_stop');
+        if (!hold && options.ending !== 'incomplete') {
           send(
             {
               type: 'message_delta',
-              delta: { stop_reason: 'end_turn' },
-              usage: { output_tokens: 4 },
+              delta: { stop_reason: options.ending === 'max-tokens' ? 'max_tokens' : 'end_turn' },
+              usage: { output_tokens: usage?.output ?? 4 },
             },
             'message_delta',
           );
@@ -62,12 +80,18 @@ export function protocolResponse(request: Request, text: string, hold = false): 
           model: 'deepseek-v4.1-flash',
           choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
         });
-        if (!hold) {
+        if (!hold && options.ending !== 'incomplete') {
           send({
             id: 'chatcmpl_fixture',
             object: 'chat.completion.chunk',
             model: 'deepseek-v4.1-flash',
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: options.ending === 'max-tokens' ? 'length' : 'stop',
+              },
+            ],
             usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 },
           });
           send('[DONE]');

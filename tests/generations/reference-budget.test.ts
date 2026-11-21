@@ -124,7 +124,7 @@ it('accepts inclusive limits and preserves original reference order and repeated
     );
     const forms = f.transport.mock.calls.map(([, options]) => options!.body as FormData);
     const orderedForm = forms.find((form) => form.get('prompt') === 'ordered exact total')!;
-    const orderedFiles = orderedForm.getAll('image') as File[];
+    const orderedFiles = orderedForm.getAll('image[]') as File[];
     expect(orderedFiles).toHaveLength(2);
     for (const [index, expected] of [first, second].entries())
       expect(Buffer.from(await orderedFiles[index]!.arrayBuffer()).equals(expected)).toBe(true);

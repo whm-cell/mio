@@ -16,7 +16,11 @@ type Identity = (headers: Headers) => Promise<Principal | null>;
 function coveredBySnapshot(baseline: Receipt | null, receipt: Receipt): boolean {
   if (baseline?.requestId !== receipt.requestId) return false;
   if (baseline.status === receipt.status) {
-    return receipt.error === undefined || baseline.error !== undefined;
+    return (
+      (receipt.error === undefined || baseline.error !== undefined) &&
+      (receipt.truncation === undefined ||
+        baseline.truncation?.reason === receipt.truncation.reason)
+    );
   }
   return (
     receipt.status === 'accepted' ||

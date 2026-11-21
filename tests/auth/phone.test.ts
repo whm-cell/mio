@@ -1,10 +1,10 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
@@ -368,26 +368,66 @@ it('rejects a bound number belonging to another user and a revoked binding sessi
   ).toBe(401);
 });
 
+async function waitForExpiryWhileBlocked(lockerPid: number, statement: string, expiresAt: Date) {
+  const waiters = async () =>
+    (
+      await pool.query<{ pid: number; expired: boolean }>(
+        `SELECT pid, clock_timestamp() >= $3::timestamptz AS expired
+         FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = $4
+           AND wait_event_type = 'Lock' AND query = $2 AND $1::int = ANY(pg_blocking_pids(pid))`,
+        [lockerPid, statement, expiresAt, database.applicationName],
+      )
+    ).rows;
+  const polling = { timeout: 2000, interval: 10 };
+  const waiter = await vi.waitFor(async () => {
+    const rows = await waiters();
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  }, polling);
+  expect(waiter.expired).toBe(false);
+  await vi.waitFor(async () => {
+    expect(await waiters()).toEqual([{ pid: waiter.pid, expired: true }]);
+  }, polling);
+}
+
 it('checks expiry after waiting for the challenge row lock', async () => {
   const phoneNumber = '13800138019';
   const code = await send('/api/auth/phone-number/send-otp', phoneNumber);
+  const challengeKey = createHash('sha256').update(`login\0+86${phoneNumber}`).digest('hex');
   const locker = await pool.connect();
+  let waiting: Promise<Response> | undefined;
   try {
     await locker.query('BEGIN');
-    await locker.query(
-      `UPDATE "mioPhoneChallenge" SET "expiresAt" = clock_timestamp() + interval '300 milliseconds'`,
+    const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
+      `UPDATE "mioPhoneChallenge"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '1500 milliseconds'
+       WHERE "challengeKey" = $1 RETURNING pg_backend_pid() AS pid, "expiresAt"`,
+      [challengeKey],
     );
-    const waiting = call('/api/auth/phone-number/verify', { phoneNumber, code });
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(rows).toHaveLength(1);
+    waiting = call('/api/auth/phone-number/verify', { phoneNumber, code });
+    void waiting.catch(() => {});
+    await waitForExpiryWhileBlocked(
+      rows[0]!.pid,
+      'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE',
+      rows[0]!.expiresAt,
+    );
     await locker.query('COMMIT');
-    expect((await waiting).status).toBe(400);
+    const response = await waiting;
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'INVALID_OTP' });
     const count = await pool.query('SELECT count(*) FROM "user" WHERE "phoneNumber" = $1', [
       `+86${phoneNumber}`,
     ]);
     expect(Number(count.rows[0].count)).toBe(0);
   } finally {
-    await locker.query('ROLLBACK');
-    locker.release();
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
   }
 });
 
@@ -397,21 +437,36 @@ it('rechecks binding session expiry after its row lock is released', async () =>
   const phoneNumber = '13800138020';
   const code = await send('/api/auth/phone-binding/send-otp', phoneNumber, owner);
   const locker = await pool.connect();
+  let waiting: Promise<Response> | undefined;
   try {
     await locker.query('BEGIN');
-    await locker.query(
-      `UPDATE "session" SET "expiresAt" = clock_timestamp() + interval '300 milliseconds' WHERE id = $1`,
-      [sessionId],
+    const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
+      `UPDATE "session"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '1500 milliseconds'
+       WHERE id = $1 AND "userId" = $2 RETURNING pg_backend_pid() AS pid, "expiresAt"`,
+      [sessionId, userId],
     );
-    const waiting = call('/api/auth/phone-binding/confirm', { phoneNumber, code }, owner);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(rows).toHaveLength(1);
+    waiting = call('/api/auth/phone-binding/confirm', { phoneNumber, code }, owner);
+    void waiting.catch(() => {});
+    await waitForExpiryWhileBlocked(
+      rows[0]!.pid,
+      'SELECT id FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE',
+      rows[0]!.expiresAt,
+    );
     await locker.query('COMMIT');
-    expect((await waiting).status).toBe(401);
+    const response = await waiting;
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
     const user = await pool.query('SELECT "phoneNumber" FROM "user" WHERE id = $1', [userId]);
     expect(user.rows[0].phoneNumber).toBeNull();
   } finally {
-    await locker.query('ROLLBACK');
-    locker.release();
+    try {
+      await locker.query('ROLLBACK');
+    } finally {
+      locker.release();
+      await waiting?.catch(() => {});
+    }
   }
 });
 

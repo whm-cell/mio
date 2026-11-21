@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { afterEach, expect, it } from 'vitest';
 import { legacyBuild, legacyHarness, legacyTypecheck } from './fixtures/guardrail-fixture.ts';
+import { loadConfig } from '../../scripts/harness/inventory.ts';
 
 const project = resolve('.');
 const scratch: string[] = [];
@@ -229,12 +230,13 @@ async function fixture(extra: Record<string, string>) {
   return root;
 }
 
-function check(root: string) {
+function check(root: string, env = process.env) {
   const result = spawnSync(
     process.execPath,
     [join(project, 'scripts/harness/check-guardrails.ts'), root],
     {
       encoding: 'utf8',
+      env,
     },
   );
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
@@ -655,14 +657,72 @@ it('resolves conditional package aliases in the actual import or require mode', 
   expect(check(root).status).toBe(0);
 });
 
-it('rejects forcibly tracked private files without reading their contents', async () => {
-  const root = await fixture({ '.work/record.txt': 'private fixture content' });
-  expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
-  expect(spawnSync('git', ['add', '-f', '.work/record.txt'], { cwd: root }).status).toBe(0);
+function git(root: string, ...args: string[]) {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  expect(result.status, result.stderr).toBe(0);
+  return result.stdout.trim();
+}
+
+it('reports tracked private and configured generated files, including nested package outputs', async () => {
+  const excluded = [
+    '.work/record.txt',
+    'compute/dist/worker.js',
+    'contracts/compute/node_modules/package/package.json',
+    'packages/foundation/dist/index.js',
+  ];
+  const root = await fixture({
+    ...Object.fromEntries(excluded.map((path) => [path, 'private fixture content'])),
+    '.env.example': 'PUBLIC_TEMPLATE=value',
+  });
+  const config = { ...legacyHarness(), generatedRoots: (await loadConfig(project)).generatedRoots };
+  await writeFile(join(root, 'harness.config.json'), JSON.stringify(config));
+  git(root, 'init', '-q');
+  git(root, 'add', '-f', ...excluded, '.env.example');
   const result = check(root);
   expect(result.status).toBe(1);
-  expect(result.output).toContain('INDEX_PRIVATE .work/record.txt');
+  expect(result.output).toContain('Git index: checked');
+  expect(result.output.match(/INDEX_PRIVATE [^\n]+/g)?.sort()).toEqual(
+    excluded.map((path) => `INDEX_PRIVATE ${path}`).sort(),
+  );
   expect(result.output).not.toContain('private fixture content');
+});
+
+it('passes a source export and fails an unreadable index in regular and linked worktrees', async () => {
+  const root = await fixture({});
+  const noGit = { ...process.env, PATH: join(root, 'missing-directory') };
+  const exported = check(root, noGit);
+  expect(exported.status, exported.output).toBe(0);
+  expect(exported.output).toContain('Git index: unavailable (not verified)');
+
+  git(root, 'init', '-q');
+  git(root, 'add', '.');
+  git(
+    root,
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    'commit',
+    '-qm',
+    'fixture',
+  );
+  const worktree = `${root}-linked`;
+  scratch.push(worktree);
+  git(root, 'worktree', 'add', '-q', '--detach', worktree);
+  expect((await readFile(join(worktree, '.git'), 'utf8')).startsWith('gitdir: ')).toBe(true);
+  for (const checkout of [root, worktree]) {
+    const available = check(checkout);
+    expect(available.status, available.output).toBe(0);
+    expect(available.output).toContain('Git index: checked');
+    const missingExecutable = check(checkout, noGit);
+    expect(missingExecutable.status, missingExecutable.output).toBe(1);
+    expect(missingExecutable.output).toContain('INDEX_READ');
+    const index = resolve(checkout, git(checkout, 'rev-parse', '--git-path', 'index'));
+    await writeFile(index, 'Corrupted Git index fixture\n');
+    const corruptIndex = check(checkout);
+    expect(corruptIndex.status, corruptIndex.output).toBe(1);
+    expect(corruptIndex.output).toContain('INDEX_READ');
+  }
 });
 
 it('requires projects when a second production root is classified', async () => {

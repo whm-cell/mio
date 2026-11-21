@@ -929,6 +929,31 @@ it('does not prepare when a later supplemental check failed', async () => {
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
 });
 
+it('rechecks the middle of a large command original before completing its prepared result', async () => {
+  const root = await fixture();
+  await setup(root);
+  const { task, raw } = await loadTask(root, 'probe');
+  const entry = task.evidence.find(({ criterion }) => criterion === 'checks')!;
+  const old = await readFile(join(root, entry.artifact), 'utf8');
+  const marker = old.lastIndexOf(resultMarker);
+  const payload = 'x'.repeat(256 * 1024);
+  const body = old.slice(0, marker) + payload + old.slice(marker);
+  entry.sha256 = digest(body);
+  await put(root, entry.artifact, body);
+  await saveTask(root, task, raw);
+
+  await prepare(root);
+  const request = await completeRequest(root);
+  const changed = marker + payload.length / 2;
+  await put(root, entry.artifact, body.slice(0, changed) + 'y' + body.slice(changed + 1));
+  await expect(deliver(root, 'probe', json(request))).rejects.toThrow('WORK_DELIVERY_EVIDENCE');
+  expect((await readBook(root, prd)).book.results).toEqual([sibling]);
+
+  await put(root, entry.artifact, body);
+  await deliver(root, 'probe', json(request));
+  expect((await readBook(root, prd)).book.results.map(({ key }) => key)).toContain('probe');
+});
+
 it('rejects fresh publication with staged or untracked changes even when the draft was reviewed', async () => {
   const root = await fixture();
   await setup(root);

@@ -28,6 +28,7 @@ import { changeCommand } from './change-read.ts';
 import { runCommand, withTaskCommand } from './command.ts';
 import { conditions } from './verification-environment.ts';
 import { coverageEvidenceResult, resultMarker } from './evidence.ts';
+import { originalDigest, withArtifact } from './original.ts';
 import { requirementIssues } from './requirements.ts';
 import type { CommandActivity } from './command.ts';
 import {
@@ -393,7 +394,13 @@ async function main(activity?: CommandActivity) {
       method: 'automated',
       result: changed || outcome.unsettled ? 'pending' : passed ? 'pass' : 'fail',
       artifact: relative,
-      ...(outcome.unsettled ? {} : { sha256: digest(await readFile(path)) }),
+      ...(outcome.unsettled
+        ? {}
+        : {
+            sha256: await withArtifact(root, task.plan.id, relative, (file, stat) =>
+              originalDigest(file, stat.size),
+            ),
+          }),
       candidate,
       summary: `exit ${outcome.status}; cancelled=${outcome.cancelled}; unsettled=${outcome.unsettled}; contextChanged=${changed}; coverage=${completeCheck ? 'complete' : 'supplement'}${contextError ? `; ${contextError}` : ''}`,
       environment: json(executionEnvironment).trim(),

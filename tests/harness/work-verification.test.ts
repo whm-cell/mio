@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { link, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { expect, it } from 'vitest';
-import { digest } from '../../scripts/harness/work/records.ts';
+import { resultMarker } from '../../scripts/harness/work/evidence.ts';
+import { contractPlan, digest, json } from '../../scripts/harness/work/records.ts';
 import type { Candidate } from '../../scripts/harness/work/records.ts';
 import {
   check,
@@ -9,6 +10,7 @@ import {
   commit,
   create,
   fixture,
+  fullCommand,
   git,
   invoke,
   ok,
@@ -316,4 +318,110 @@ it('records the actual command, contract, environment and settled outcome', asyn
   expect(log).toContain('"exitCode": 0');
   expect(log).toContain('"cancelled": false');
   expect(checks(root, id)).toMatchObject({ result: 'pass', basis: 'execution', executionCount: 1 });
+});
+
+it('verifies large command frames and reads codepoints across chunk boundaries', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const chunk = 64 * 1024;
+  const header = {
+    candidate: entry.candidate,
+    contract: contractPlan(task),
+    argv: fullCommand,
+    detail: '',
+  };
+  const emptyHeaderEnd = Buffer.byteLength(json(header)) - 3;
+  header.detail = 'h'.repeat(2 * chunk - 1 - emptyHeaderEnd);
+  const beforeOutput = json(header) + resultMarker + json({ exitCode: 7 });
+  const prefix = beforeOutput.padEnd(3 * chunk - 1, 'a');
+  const beforeResult = (prefix + '𠮷汉').padEnd(4 * chunk - 6, 'b');
+  const original =
+    beforeResult + resultMarker + json({ exitCode: 0, signal: null, detail: '尾'.repeat(chunk) });
+  entry.sha256 = digest(original);
+  await writeFile(target, original);
+  await writeFile(ledger, json(task));
+
+  expect(checks(root, id)).toMatchObject({ result: 'pass', basis: 'execution', executionCount: 1 });
+  const read = ['read', id, 'evidence', '0'];
+  const page = JSON.parse(ok(root, [...read, '--offset', String(prefix.length), '--limit', '2']));
+  expect(page).toMatchObject({
+    integrity: 'verified',
+    actualSha256: entry.sha256,
+    text: '𠮷汉',
+    page: { total: [...original].length, offset: prefix.length, count: 2 },
+  });
+  expect(JSON.parse(ok(root, page.page.next.argv)).text).toBe('bb');
+  expect(JSON.parse(ok(root, [...read, '--select', '/entry/sha256'])).text).toBe(entry.sha256);
+
+  const damaged = Buffer.from(original);
+  damaged[Buffer.byteLength(prefix) - 1] = 'z'.charCodeAt(0);
+  await writeFile(target, damaged);
+  expect(checks(root, id).result).toBe('corrupt');
+  expect(JSON.parse(ok(root, [...read, '--limit', '2']))).toMatchObject({
+    integrity: 'mismatch',
+    text: '{\n',
+  });
+
+  damaged[Buffer.byteLength(prefix) + 1] = 0xff;
+  await writeFile(target, damaged);
+  for (const options of [[], ['--select', '/entry']]) {
+    const invalid = invoke(root, [...read, ...options]);
+    expect(invalid.status).toBe(1);
+    expect(invalid.output).toContain('WORK_READ_ENCODING');
+  }
+});
+
+it('distinguishes missing, malformed and unfinalized command originals', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const original = await readFile(target, 'utf8');
+  const read = ['read', id, 'evidence', '0'];
+
+  const marker = original.lastIndexOf(resultMarker);
+  const incomplete = original.slice(0, marker);
+  for (const malformed of [
+    original + resultMarker + '{',
+    'Missing header\n' + original.slice(marker),
+    incomplete,
+    incomplete + resultMarker + 'Unframed output'.padEnd(256 * 1024, 'x'),
+  ]) {
+    await writeFile(target, malformed);
+    entry.sha256 = digest(malformed);
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('invalid');
+  }
+
+  await rm(target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('ENOENT');
+
+  const alias = join(dirname(target), 'aliased.log');
+  await writeFile(alias, original);
+  await symlink(alias, target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('WORK_SYMLINK');
+  await rm(target);
+  await link(alias, target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('WORK_ARTIFACT');
+  await rm(target);
+
+  await writeFile(target, incomplete);
+  entry.result = 'pending';
+  delete entry.sha256;
+  await writeFile(ledger, json(task));
+  expect(checks(root, id).result).toBe('pending');
+  expect(JSON.parse(ok(root, read))).toMatchObject({ integrity: 'pending', actualSha256: null });
 });

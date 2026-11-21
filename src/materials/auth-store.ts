@@ -1,9 +1,10 @@
-import type { Pool, PoolClient } from 'pg';
+import type { Pool } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { MaterialError } from './contracts.ts';
 import type { MaterialAuthRow } from './auth-contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
 import type { CredentialEnvelope } from '../providers/credentials.ts';
+import { withMaterialTransaction } from './transaction.ts';
 
 const clear = 'cipher_format=NULL,master_key_id=NULL,nonce=NULL,ciphertext=NULL,auth_tag=NULL';
 const superseded = () => new MaterialError(409, 'MATERIAL_AUTH_SUPERSEDED');
@@ -12,23 +13,6 @@ export class MaterialAuthStore {
   private readonly pool: Pool;
   constructor(pool: Pool) {
     this.pool = pool;
-  }
-  private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await action(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      if (error instanceof MaterialError) throw error;
-      if ((error as { code?: string }).code === '23505')
-        throw new MaterialError(409, 'UPSTREAM_RESOURCE_COLLISION');
-      throw new MaterialError(503, 'MATERIAL_UNAVAILABLE');
-    } finally {
-      client.release();
-    }
   }
   async expire(id?: string): Promise<void> {
     await this.pool.query(
@@ -76,7 +60,7 @@ export class MaterialAuthStore {
     inputHash: string,
     credential: AccountCredentialSnapshot,
   ): Promise<{ session: MaterialAuthRow; fresh: boolean }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const session = (
         await client.query<MaterialAuthRow>(
           `INSERT INTO mio_material_auth_sessions(id,owner_id,provider_type,provider_config_id,credential_version,request_id,input_hash,state,protocol_snapshot,return_target,lease_id,lease_until,expires_at)
@@ -187,7 +171,7 @@ export class MaterialAuthStore {
     resultRequestId: string | null,
     groupRequestId: string | null,
   ): Promise<MaterialAuthRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = (
         await client.query<MaterialAuthRow>(
           "SELECT * FROM mio_material_auth_sessions WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND lease_until>clock_timestamp() AND expires_at>clock_timestamp() AND token_digest=$4 FOR UPDATE",

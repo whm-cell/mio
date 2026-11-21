@@ -16,6 +16,7 @@ import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
 import { MaterialAuthStore } from './auth-store.ts';
 import { checkMaterialAuthSchema } from './auth-schema.ts';
 import { checkMaterialSchema } from './schema.ts';
+import { withMaterialTransaction } from './transaction.ts';
 
 const log = createLogger('app', 'material-store');
 const missing = () => new MaterialError(HTTP_STATUS.NOT_FOUND, 'MATERIAL_NOT_FOUND');
@@ -48,24 +49,6 @@ export class MaterialStore {
             this.authCleanup = undefined;
           });
       }, 30_000).unref();
-  }
-
-  private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const value = await action(client);
-      await client.query('COMMIT');
-      return value;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      if (error instanceof MaterialError) throw error;
-      if ((error as { code?: string }).code === '23505')
-        throw conflict('UPSTREAM_RESOURCE_COLLISION');
-      throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
-    } finally {
-      client.release();
-    }
   }
 
   private async group(client: Query, owner: string, id: string, lock = false): Promise<GroupRow> {
@@ -150,7 +133,7 @@ export class MaterialStore {
   }
 
   async operation(owner: string, id: string): Promise<OperationRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const row = (
         await client.query<OperationRow>(
           'SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 FOR UPDATE',
@@ -215,7 +198,7 @@ export class MaterialStore {
     source: MaterialSourceSnapshot,
     credential: AccountCredentialSnapshot,
   ): Promise<{ operation: OperationRow; fresh: boolean }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = await this.group(client, owner, group.id, true);
       const previous = (
         await client.query<OperationRow>(
@@ -289,7 +272,7 @@ export class MaterialStore {
     id: string,
     requestId: string | null,
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    await withMaterialTransaction(this.pool, async (client) => {
       await this.group(client, owner, op.target_group_id!, true);
       const group = await client.query(
         "SELECT 1 FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() AND upstream_group_id=$4",
@@ -326,7 +309,7 @@ export class MaterialStore {
     name: string,
     credential: AccountCredentialSnapshot,
   ): Promise<{ operation: OperationRow; fresh: boolean }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const op = (
         await client.query<OperationRow>(
           `INSERT INTO mio_material_operations(id,owner_id,request_id,kind,input_hash,state,provider_config_id,credential_version,protocol_snapshot,lease_id,lease_until)
@@ -377,7 +360,7 @@ export class MaterialStore {
     upstreamId: string,
     requestId: string | null,
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    await withMaterialTransaction(this.pool, async (client) => {
       const claim = (
         await client.query<OperationRow>(
           "SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 AND state='creating' AND lease_id=$3 AND lease_until>clock_timestamp() AND input_hash=$4 FOR UPDATE",
@@ -405,7 +388,7 @@ export class MaterialStore {
     code: string,
     knownCreate?: { id: string; requestId: string | null },
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    await withMaterialTransaction(this.pool, async (client) => {
       const row = (
         await client.query<OperationRow>(
           `UPDATE mio_material_operations SET state=$4,error_code=$5,lease_id=NULL,lease_until=NULL,updated_at=now(),
@@ -485,7 +468,7 @@ export class MaterialStore {
     revision: number | undefined,
     cursor?: string | null,
   ): Promise<{ group: GroupRow; lease: string }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const row = await this.group(client, owner, id, true);
       this.assertMutable(row, revision);
       const registration = await client.query(
@@ -529,7 +512,7 @@ export class MaterialStore {
     next: string | null,
     credentialVersion: number,
   ): Promise<GroupRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = (
         await client.query<GroupRow>(
           "SELECT * FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() FOR UPDATE",
@@ -597,7 +580,7 @@ export class MaterialStore {
     id: string,
     revision: number,
   ): Promise<GroupRow | MaterialRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const material = kind === 'material' ? await this.material(client, owner, id) : undefined;
       const group = await this.group(client, owner, material?.group_id ?? id, true);
       const row = material ? await this.material(client, owner, id, true) : group;
@@ -651,7 +634,7 @@ export class MaterialStore {
   }
 
   async precheckGroupDelete(owner: string, id: string, revision: number, confirmCascade: boolean) {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const group = await this.group(client, owner, id, true);
       this.assertMutable(group, revision);
       await this.assertIdle(client, owner, group);
@@ -670,7 +653,7 @@ export class MaterialStore {
     credential: AccountCredentialSnapshot,
     groupCheck?: { upstreamId: string; confirmCascade: boolean },
   ): Promise<{ operation: OperationRow; fresh: boolean }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const opKind: OperationKind =
         kind === 'group' ? 'delete_group_upstream' : 'delete_material_upstream';
       const op = (
@@ -769,7 +752,7 @@ export class MaterialStore {
     op: OperationRow,
     requestId: string | null = null,
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    await withMaterialTransaction(this.pool, async (client) => {
       const claim = (
         await client.query<OperationRow>(
           "SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 AND state='deleting' AND lease_id=$3 AND lease_until>clock_timestamp() AND input_hash=$4 FOR UPDATE",
@@ -801,7 +784,7 @@ export class MaterialStore {
     groupId: string,
     lease: string,
   ): Promise<MaterialRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       await this.group(client, owner, groupId, true);
       const group = await client.query(
         "SELECT 1 FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp()",
@@ -837,7 +820,7 @@ export class MaterialStore {
     lease: string,
     item: UpstreamMaterial | null,
   ): Promise<MaterialRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = await this.group(client, owner, group.id, true);
       const valid = await client.query(
         "SELECT 1 FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp()",
@@ -885,7 +868,7 @@ export class MaterialStore {
   }
 
   async claimRecovery(owner: string, id: string): Promise<OperationRow | undefined> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const existing = (
         await client.query<OperationRow>(
           'SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2',
@@ -929,7 +912,7 @@ export class MaterialStore {
     code: string | null,
     material?: UpstreamMaterial,
   ): Promise<void> {
-    await this.transaction(async (client) => {
+    await withMaterialTransaction(this.pool, async (client) => {
       await this.group(client, owner, op.target_group_id!, true);
       const group = await client.query(
         'SELECT 1 FROM mio_material_groups WHERE owner_id=$1 AND id=$2 AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp()',

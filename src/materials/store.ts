@@ -3,7 +3,7 @@ import type { PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
-import { MaterialError, materialState } from './contracts.ts';
+import { MATERIAL_SYNC_LEASE_EXPIRED, MaterialError, observedMaterialStatus } from './contracts.ts';
 import type {
   GroupRow,
   MaterialRow,
@@ -20,6 +20,8 @@ import { checkMaterialSchema } from './schema.ts';
 const log = createLogger('app', 'material-store');
 const missing = () => new MaterialError(HTTP_STATUS.NOT_FOUND, 'MATERIAL_NOT_FOUND');
 const conflict = (code = 'REVISION_CONFLICT') => new MaterialError(HTTP_STATUS.CONFLICT, code);
+const syncExpired = `(last_sync_status IS NOT DISTINCT FROM 'running' AND
+  (sync_lease_until IS NULL OR sync_lease_until<=statement_timestamp())) AS sync_expired`;
 type Query = Pick<Pool, 'query'> | PoolClient;
 export interface MaterialCursor {
   createdAt: string;
@@ -69,7 +71,7 @@ export class MaterialStore {
   private async group(client: Query, owner: string, id: string, lock = false): Promise<GroupRow> {
     const row = (
       await client.query<GroupRow>(
-        `SELECT * FROM mio_material_groups WHERE owner_id=$1 AND id=$2${lock ? ' FOR UPDATE' : ''}`,
+        `SELECT *, ${syncExpired} FROM mio_material_groups WHERE owner_id=$1 AND id=$2${lock ? ' FOR UPDATE' : ''}`,
         [owner, id],
       )
     ).rows[0];
@@ -121,7 +123,7 @@ export class MaterialStore {
   ): Promise<GroupRow[]> {
     return (
       await this.pool.query<GroupRow>(
-        `SELECT g.*, to_char(g.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time, (SELECT count(*)::int FROM mio_materials m WHERE m.owner_id=g.owner_id AND m.group_id=g.id AND m.state<>'deleted') AS material_count
+        `SELECT g.*, ${syncExpired}, to_char(g.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time, (SELECT count(*)::int FROM mio_materials m WHERE m.owner_id=g.owner_id AND m.group_id=g.id AND m.state<>'deleted') AS material_count
       FROM mio_material_groups g WHERE g.owner_id=$1 AND g.state<>'deleted' AND ($2::text IS NULL OR g.group_type=$2)
       AND ($3::timestamptz IS NULL OR (g.created_at,g.id)<($3::timestamptz,$4::uuid))
       ORDER BY g.created_at DESC,g.id DESC LIMIT $5`,
@@ -268,10 +270,7 @@ export class MaterialStore {
         VALUES($1,$2,'onelink',$3,$4,'image',$5,'registering',$6,$7)`,
         [id, owner, current.id, assetId, name, source, credential.credentialVersion],
       );
-      await client.query(
-        "UPDATE mio_material_groups SET sync_lease_id=$3,sync_lease_until=clock_timestamp()+interval '75 seconds' WHERE owner_id=$1 AND id=$2",
-        [owner, current.id, lease],
-      );
+      await this.claimGroupLease(client, owner, current.id, lease, 75);
       return {
         operation: (
           await client.query<OperationRow>(
@@ -459,11 +458,32 @@ export class MaterialStore {
     if (row.state !== 'ready' || !row.upstream_group_id) throw conflict('MATERIAL_GROUP_NOT_READY');
   }
 
+  private async claimGroupLease(
+    client: PoolClient,
+    owner: string,
+    id: string,
+    lease: string,
+    seconds: number,
+    cursor?: string | null,
+  ): Promise<void> {
+    // The prior holder is inactive. Settle its expired sync before replacing its deadline.
+    const claim = await client.query(
+      `UPDATE mio_material_groups SET sync_lease_id=$3,sync_lease_until=clock_timestamp()+($4::integer*interval '1 second'),
+      sync_cursor=COALESCE($5::text,sync_cursor),
+      last_sync_attempt_at=CASE WHEN $5 IS NOT NULL THEN now() ELSE last_sync_attempt_at END,
+      last_sync_status=CASE WHEN $5 IS NOT NULL THEN 'running' WHEN last_sync_status='running' THEN 'failed' ELSE last_sync_status END,
+      last_sync_error_code=CASE WHEN $5 IS NOT NULL THEN NULL WHEN last_sync_status='running' THEN $6 ELSE last_sync_error_code END
+      WHERE owner_id=$1 AND id=$2 AND (sync_lease_until IS NULL OR sync_lease_until<=clock_timestamp())`,
+      [owner, id, lease, seconds, cursor ?? null, MATERIAL_SYNC_LEASE_EXPIRED],
+    );
+    if (claim.rowCount !== 1) throw conflict('MATERIAL_BUSY');
+  }
+
   async claimGroup(
     owner: string,
     id: string,
     revision: number | undefined,
-    cursor: string | null,
+    cursor?: string | null,
   ): Promise<{ group: GroupRow; lease: string }> {
     return this.transaction(async (client) => {
       const row = await this.group(client, owner, id, true);
@@ -474,16 +494,8 @@ export class MaterialStore {
       );
       if (registration.rowCount) throw conflict('MATERIAL_BUSY');
       const lease = createId();
-      const claim = (
-        await client.query<GroupRow>(
-          `UPDATE mio_material_groups SET sync_lease_id=$3,sync_lease_until=clock_timestamp()+interval '60 seconds',sync_cursor=$4,
-        last_sync_attempt_at=now(),last_sync_status='running',last_sync_error_code=NULL
-        WHERE owner_id=$1 AND id=$2 AND (sync_lease_until IS NULL OR sync_lease_until<=clock_timestamp()) RETURNING *`,
-          [owner, id, lease, cursor],
-        )
-      ).rows[0];
-      if (!claim) throw conflict('MATERIAL_BUSY');
-      return { group: claim, lease };
+      await this.claimGroupLease(client, owner, id, lease, 60, cursor);
+      return { group: row, lease };
     });
   }
 
@@ -491,7 +503,7 @@ export class MaterialStore {
     const row = (
       await this.pool.query<GroupRow>(
         `UPDATE mio_material_groups SET name=$4,revision=revision+1,sync_lease_id=NULL,sync_lease_until=NULL,
-      last_sync_status=NULL,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() RETURNING *`,
+      updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='ready' AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() RETURNING *`,
         [owner, id, lease, name],
       )
     ).rows[0];
@@ -499,11 +511,13 @@ export class MaterialStore {
     return row;
   }
 
-  async releaseGroup(owner: string, id: string, lease: string, code: string): Promise<void> {
+  async releaseGroup(owner: string, id: string, lease: string, syncError?: string): Promise<void> {
     await this.pool.query(
-      `UPDATE mio_material_groups SET sync_lease_id=NULL,sync_lease_until=NULL,last_sync_status='failed',last_sync_error_code=$4
+      `UPDATE mio_material_groups SET sync_lease_id=NULL,sync_lease_until=NULL,
+      last_sync_status=CASE WHEN $4::text IS NOT NULL THEN 'failed' ELSE last_sync_status END,
+      last_sync_error_code=COALESCE($4,last_sync_error_code)
       WHERE owner_id=$1 AND id=$2 AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() AND state='ready'`,
-      [owner, id, lease, code],
+      [owner, id, lease, syncError ?? null],
     );
   }
 
@@ -542,24 +556,26 @@ export class MaterialStore {
             ).rowCount)
         )
           continue;
+        const observation = observedMaterialStatus(item.status);
         if (old)
           await client.query(
-            'UPDATE mio_materials SET name=$3,state=$4,upstream_status=$5,last_synced_at=now(),revision=revision+1,error_code=NULL,updated_at=now() WHERE owner_id=$1 AND id=$2',
-            [owner, old.id, item.name, materialState(item.status), item.status],
+            'UPDATE mio_materials SET name=$3,state=$4,upstream_status=$5,last_synced_at=now(),revision=revision+1,error_code=$6,updated_at=now() WHERE owner_id=$1 AND id=$2',
+            [owner, old.id, item.name, observation.state, item.status, observation.errorCode],
           );
         else
           await client.query(
-            `INSERT INTO mio_materials(id,owner_id,provider_type,group_id,upstream_asset_id,asset_type,name,state,upstream_status,registration_credential_version,last_synced_at)
-          VALUES($1,$2,'onelink',$3,$4,'image',$5,$6,$7,$8,now())`,
+            `INSERT INTO mio_materials(id,owner_id,provider_type,group_id,upstream_asset_id,asset_type,name,state,upstream_status,registration_credential_version,last_synced_at,error_code)
+          VALUES($1,$2,'onelink',$3,$4,'image',$5,$6,$7,$8,now(),$9)`,
             [
               createId(),
               owner,
               group.id,
               item.id,
               item.name,
-              materialState(item.status),
+              observation.state,
               item.status,
               credentialVersion,
+              observation.errorCode,
             ],
           );
       }
@@ -842,6 +858,9 @@ export class MaterialStore {
       if (pending.rowCount) throw conflict('MATERIAL_BUSY');
       if (item && (item.id !== row.upstream_asset_id || item.groupId !== group.upstream_group_id))
         throw conflict('UPSTREAM_RESPONSE_INVALID');
+      const observation = item
+        ? observedMaterialStatus(item.status)
+        : { state: 'deleted', errorCode: 'UPSTREAM_RESOURCE_NOT_FOUND' };
       const saved = (
         await client.query<MaterialRow>(
           `UPDATE mio_materials SET state=$3,name=$4,upstream_status=$5,error_code=$6,last_synced_at=now(),revision=revision+1,
@@ -849,15 +868,15 @@ export class MaterialStore {
           [
             owner,
             row.id,
-            item ? materialState(item.status) : 'deleted',
+            observation.state,
             item?.name ?? row.name,
             item?.status ?? null,
-            item ? null : 'UPSTREAM_RESOURCE_NOT_FOUND',
+            observation.errorCode,
           ],
         )
       ).rows[0]!;
       const released = await client.query(
-        "UPDATE mio_material_groups SET sync_lease_id=NULL,sync_lease_until=NULL,last_sync_status='succeeded',last_sync_error_code=NULL WHERE owner_id=$1 AND id=$2 AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() AND state='ready'",
+        "UPDATE mio_material_groups SET sync_lease_id=NULL,sync_lease_until=NULL WHERE owner_id=$1 AND id=$2 AND sync_lease_id=$3 AND sync_lease_until>clock_timestamp() AND state='ready'",
         [owner, group.id, lease],
       );
       if (released.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
@@ -898,10 +917,7 @@ export class MaterialStore {
         )
       ).rows[0];
       if (!claim) return;
-      await client.query(
-        "UPDATE mio_material_groups SET sync_lease_id=$3,sync_lease_until=clock_timestamp()+interval '60 seconds' WHERE owner_id=$1 AND id=$2",
-        [owner, claim.target_group_id, lease],
-      );
+      await this.claimGroupLease(client, owner, existing.target_group_id, lease, 60);
       return claim;
     });
   }
@@ -937,20 +953,22 @@ export class MaterialStore {
         throw conflict('UPSTREAM_RESPONSE_INVALID');
       if (confirmed) {
         const id = current.target_material_id ?? current.target_group_id;
+        const observation = material ? observedMaterialStatus(material.status) : undefined;
         if (current.kind === 'delete_group_upstream')
           await this.tombstoneGroup(client, current, ['unknown', 'deleting']);
         else {
           const saved =
             current.kind === 'register_material'
               ? await client.query(
-                  "UPDATE mio_materials SET state=$5,upstream_asset_id=$3,upstream_status=$6,last_synced_at=now(),error_code=NULL,next_query_at=now()+interval '4 seconds',revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_asset_id IS NULL AND group_id=$4",
+                  "UPDATE mio_materials SET state=$5,upstream_asset_id=$3,upstream_status=$6,last_synced_at=now(),error_code=$7,next_query_at=now()+interval '4 seconds',revision=revision+1,updated_at=now() WHERE owner_id=$1 AND id=$2 AND state='unknown' AND upstream_asset_id IS NULL AND group_id=$4",
                   [
                     owner,
                     id,
                     current.protocol_snapshot.upstreamId,
                     op.target_group_id,
-                    materialState(material!.status),
+                    observation!.state,
                     material!.status,
+                    observation!.errorCode,
                   ],
                 )
               : current.kind === 'create_group'

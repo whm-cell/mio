@@ -1,6 +1,6 @@
 /** Both ordinary OAuth and QR login accept only a path under the configured auth origin. */
 export function wechatCallbackURL(value: unknown, origin: string, fallback: string) {
-  const path = value ?? fallback;
+  const path = value === undefined ? fallback : value;
   if (
     typeof path !== 'string' ||
     !path.startsWith('/') ||

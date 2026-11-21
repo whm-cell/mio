@@ -39,7 +39,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 身份：允许匿名发起微信网站注册或登录；本入口不绑定当前用户的微信。
 
-输入：JSON 对象，可选 `callbackURL`，不接受其他字段。该值仅接受以单个 `/` 开始且位于固定 `MIO_AUTH_BASE_URL` 下的相对路径，拒绝反斜线和控制字符，缺省 `/auth/wechat/qr-complete`。Origin、正文类型、16 KiB 与读取期限沿共同约定。
+输入：JSON 对象，可选 `callbackURL`，不接受其他字段。该值仅接受以单个 `/` 开始且位于固定 `MIO_AUTH_BASE_URL` 下的相对路径，拒绝反斜线和控制字符。仅省略时使用 `/auth/wechat/qr-complete`，显式 `null` 返回 400 `INVALID_INPUT`。Origin、正文类型、16 KiB 与读取期限沿共同约定。
 
 成功：201 和 `{qrcode_id,authorization_url,expire_seconds:300}`。QR ID 为不透明 UUID v4；同时转发 Better Auth 的 OAuth state Cookie 并设置 `mio.wechat_qr` Cookie（HTTPS 名称带 `__Secure-` 前缀）。QR Cookie 为 HttpOnly、SameSite=Lax，HTTPS 带 Secure，路径精确到本 ID 的 poll 入口，Max-Age 为 900 秒；QR 本身仍只在 300 秒内有效，较长 Cookie 只用于观察过期。响应保持 `Cache-Control: no-store`。
 
@@ -75,7 +75,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 身份：允许匿名发起微信网站登录。
 
-输入：`provider` 必须为 `wechat`；可选 `callbackURL` 只接受以单个 `/` 开始的本站路径，缺省 `/`。不接受 `idToken`、其他 provider、额外授权参数或未声明字段。
+输入：`provider` 必须为 `wechat`；可选 `callbackURL` 只接受以单个 `/` 开始的本站路径。仅省略时使用 `/`，显式 `null` 在建立 OAuth state 前返回 400 `INVALID_INPUT`。不接受 `idToken`、其他 provider、额外授权参数或未声明字段。
 
 成功：返回库的 `{url,redirect:false}` 并设置短期 state Cookie；前端在同一浏览器中打开 `url`，完成授权后返回指定本站路径。返回的授权地址并不代表已经登录。
 

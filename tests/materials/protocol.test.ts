@@ -77,20 +77,34 @@ it.each([
     code: 'UPSTREAM_RESPONSE_INVALID',
   });
 });
-it('bounds response bytes and cancels a stalled stream when the request is aborted', async () => {
+it('rejects a response larger than the byte limit', async () => {
   const large = createMaterialUpstream(async () => new Response('x'.repeat(2 * 1024 * 1024 + 1)));
   await expect(large.getGroup(key, group, signal())).rejects.toMatchObject({
     code: 'UPSTREAM_RESPONSE_INVALID',
   });
+});
+
+it('rejects the request and cancels the body once when an in-progress read is aborted', async () => {
   const cancelled = vi.fn();
   const stop = new AbortController();
+  const reading = Promise.withResolvers<void>();
   const waiting = createMaterialUpstream(
-    async () => new Response(new ReadableStream({ cancel: cancelled })),
+    async () =>
+      new Response(
+        new ReadableStream(
+          { pull: () => reading.resolve(), cancel: cancelled },
+          { highWaterMark: 0 },
+        ),
+      ),
   );
   const operation = waiting.getGroup(key, group, stop.signal);
-  await Promise.resolve();
+  await reading.promise;
   stop.abort();
-  await expect(operation).rejects.toMatchObject({ uncertain: true });
+  await expect(operation).rejects.toMatchObject({
+    code: 'UPSTREAM_RESULT_UNKNOWN',
+    uncertain: true,
+  });
+  expect(cancelled).toHaveBeenCalledTimes(1);
 });
 it('enforces a twenty-second timeout even if the transport ignores cancellation, without retry', async () => {
   vi.useFakeTimers();

@@ -847,3 +847,42 @@ it('rejects a missing route primary key during startup check until providerSchem
     await isolatedService.close();
   }
 });
+
+it('rejects keys that cannot form Node Headers before replacing the working credential', async () => {
+  const owner = 1;
+  const oldKey = 'synthetic-retained-credential';
+  expect((await save(oldKey, owner)).status).toBe(200);
+  const before = await current(owner);
+  const requestCount = outbound.length;
+  for (const key of ['synthetic-key-\u0100', 'synthetic-key-🧪', 'synthetic-key-\uD800']) {
+    expect(() => new Headers({ authorization: 'Bearer ' + key })).toThrow(TypeError);
+    const invalid = await save(key, owner);
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: { code: 'PROVIDER_KEY_INVALID' } });
+  }
+  expect(await current(owner)).toEqual(before);
+  expect(outbound).toHaveLength(requestCount);
+
+  upstream = async () => Response.json({ data: [{ id: 'retained-key-model' }] });
+  const retained = await call(base + '/test', 'POST', {}, owner);
+  expect(retained.status).toBe(200);
+  expect(await retained.json()).toMatchObject({
+    status: 'connected',
+    credentialVersion: before.credentialVersion,
+  });
+  expect(outbound.at(-1)?.authorization).toBe('Bearer ' + oldKey);
+
+  const previous = await current(owner);
+  const newKey = 'synthetic-rotated-clé';
+  const rotated = await save(newKey, owner);
+  expect(rotated.status).toBe(200);
+  expect(await rotated.json()).toMatchObject({
+    credentialVersion: previous.credentialVersion + 1,
+    revision: previous.revision + 1,
+  });
+  expect(outbound).toHaveLength(requestCount + 1);
+  const tested = await call(base + '/test', 'POST', {}, owner);
+  expect(tested.status).toBe(200);
+  expect(await tested.json()).toMatchObject({ status: 'connected' });
+  expect(outbound.at(-1)?.authorization).toBe('Bearer ' + newKey);
+});

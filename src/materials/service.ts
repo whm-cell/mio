@@ -376,7 +376,7 @@ export function createMaterialService(
         const owner = actor.userId;
         await store.ownedGroup(owner, id);
         const snapshot = await credentials.snapshotAccount(owner);
-        const { group, lease } = await store.claimGroup(owner, id, revision, null);
+        const { group, lease } = await store.claimGroup(owner, id, revision);
         try {
           stop.signal.throwIfAborted();
           const key = credentials.openAccountSnapshot(owner, snapshot);
@@ -386,7 +386,7 @@ export function createMaterialService(
           await store.rename(owner, id, lease, name);
           return groupView(await store.ownedGroup(owner, id));
         } catch (error) {
-          await store.releaseGroup(owner, id, lease, errorCode(error)).catch(() => {});
+          await store.releaseGroup(owner, id, lease).catch(() => {});
           throw error;
         }
       });
@@ -430,7 +430,7 @@ export function createMaterialService(
         if (!material.upstream_asset_id || ['deleting', 'registering'].includes(material.state))
           throw new MaterialError(HTTP_STATUS.CONFLICT, 'MATERIAL_BUSY');
         const snapshot = await credentials.snapshotAccount(owner);
-        const { group, lease } = await store.claimGroup(owner, owned.id, owned.revision, null);
+        const { group, lease } = await store.claimGroup(owner, owned.id, owned.revision);
         try {
           material = await store.claimRefresh(owner, id, group.id, lease);
           stop.signal.throwIfAborted();
@@ -455,7 +455,7 @@ export function createMaterialService(
           stop.signal.throwIfAborted();
           return materialView(await store.applyRefresh(owner, material, group, lease, item));
         } catch (error) {
-          await store.releaseGroup(owner, group.id, lease, errorCode(error)).catch(() => {});
+          await store.releaseGroup(owner, group.id, lease).catch(() => {});
           throw error;
         }
       });

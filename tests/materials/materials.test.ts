@@ -294,7 +294,15 @@ it('validates a late sync lease in the same transaction as all writes and does n
     "UPDATE mio_material_groups SET sync_lease_until=now()-interval '1 second' WHERE id=$1",
     [group.groupId],
   );
-  await f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'local');
+  expect(
+    await f.service.remove(f.actor, 'group', group.groupId, randomUUID(), group.revision, 'local'),
+  ).toMatchObject({
+    group: {
+      state: 'deleted',
+      lastSyncStatus: 'failed',
+      lastSyncErrorCode: 'MATERIAL_SYNC_LEASE_EXPIRED',
+    },
+  });
   release.resolve();
   await expect(syncing).rejects.toMatchObject({ code: 'MATERIAL_OPERATION_SUPERSEDED' });
   expect(
@@ -310,11 +318,72 @@ it('validates a late sync lease in the same transaction as all writes and does n
   ).toMatchObject({ state: 'deleted' });
 });
 
+it('reports expired sync locally and fences its response from the next rename lease', async () => {
+  const f = await fixture();
+  const group = await f.create();
+  const prior = (await f.service.sync(f.actor, group.groupId)).group;
+  expect(prior.lastSyncedAt).toEqual(expect.any(String));
+  f.add(group.upstreamId);
+  const listStarted = Promise.withResolvers<void>();
+  const finishList = Promise.withResolvers<void>();
+  const renameStarted = Promise.withResolvers<void>();
+  const finishRename = Promise.withResolvers<void>();
+  f.override(async (action) => {
+    if (action === 'ListAssets') {
+      listStarted.resolve();
+      await finishList.promise;
+    }
+    if (action === 'UpdateAssetGroup') {
+      renameStarted.resolve();
+      await finishRename.promise;
+    }
+  });
+  const syncing = f.service.sync(f.actor, group.groupId);
+  let renaming: Promise<unknown> | undefined;
+  try {
+    await listStarted.promise;
+    expect(await f.service.group(f.actor, group.groupId)).toMatchObject({
+      lastSyncStatus: 'running',
+      lastSyncedAt: prior.lastSyncedAt,
+    });
+    await f.pool.query(
+      "UPDATE mio_material_groups SET sync_lease_until=now()-interval '1 second' WHERE id=$1",
+      [group.groupId],
+    );
+    const expired = {
+      lastSyncStatus: 'failed',
+      lastSyncErrorCode: 'MATERIAL_SYNC_LEASE_EXPIRED',
+      lastSyncedAt: prior.lastSyncedAt,
+    };
+    const calls = f.transport.mock.calls.length;
+    expect(await f.service.group(f.actor, group.groupId)).toMatchObject(expired);
+    expect((await f.service.groups(f.actor, undefined, 20)).items).toMatchObject([expired]);
+    expect(f.transport).toHaveBeenCalledTimes(calls);
+
+    renaming = f.service.rename(f.actor, group.groupId, group.revision, 'New lease');
+    await renameStarted.promise;
+    expect(await f.service.group(f.actor, group.groupId)).toMatchObject(expired);
+    finishList.resolve();
+    await expect(syncing).rejects.toMatchObject({ code: 'MATERIAL_OPERATION_SUPERSEDED' });
+    await expect(f.service.sync(f.actor, group.groupId)).rejects.toMatchObject({
+      code: 'MATERIAL_BUSY',
+    });
+    finishRename.resolve();
+    expect(await renaming).toMatchObject({ ...expired, name: 'New lease' });
+    expect(await f.service.materials(f.actor, group.groupId, 20)).toMatchObject({ items: [] });
+  } finally {
+    finishList.resolve();
+    finishRename.resolve();
+    await Promise.allSettled([syncing, renaming]);
+  }
+});
+
 it('claims revision before remote rename and refuses stale revision without remote side effects', async () => {
   const f = await fixture();
   const group = await f.create();
+  const beforeSync = await f.store.ownedGroup(f.actor.userId, group.groupId);
   const renamed = await f.service.rename(f.actor, group.groupId, group.revision, 'Renamed');
-  expect(renamed).toMatchObject({ name: 'Renamed', revision: 2 });
+  expect(renamed).toMatchObject({ name: 'Renamed', revision: 2, lastSyncStatus: null });
   expect(f.groups.get(group.upstreamId)).toBe('Renamed');
   const before = f.transport.mock.calls.length;
   await expect(f.service.rename(f.actor, group.groupId, 1, 'Old')).rejects.toMatchObject({
@@ -331,7 +400,105 @@ it('claims revision before remote rename and refuses stale revision without remo
   expect(await f.service.group(f.actor, group.groupId)).toMatchObject({
     name: 'Renamed',
     revision: 2,
-    lastSyncErrorCode: 'UPSTREAM_RESULT_UNKNOWN',
+    lastSyncStatus: null,
+    lastSyncErrorCode: null,
+    lastSyncedAt: null,
+  });
+  expect(await f.store.ownedGroup(f.actor.userId, group.groupId)).toMatchObject({
+    last_sync_attempt_at: beforeSync.last_sync_attempt_at,
+    sync_cursor: beforeSync.sync_cursor,
+    sync_lease_id: null,
+  });
+});
+
+it('preserves a real sync failure summary through successful and failed rename and refresh attempts', async () => {
+  const f = await fixture();
+  const group = await f.create();
+  f.add(group.upstreamId);
+  const first = (await f.service.sync(f.actor, group.groupId)).group;
+  const row = (await f.store.materials(f.actor.userId, group.groupId, 20))[0]!;
+  f.override(async (action) =>
+    action === 'ListAssets' ? envelope(action, {}, 429, 'RateLimit') : undefined,
+  );
+  await expect(f.service.sync(f.actor, group.groupId, '2')).rejects.toMatchObject({
+    code: 'UPSTREAM_RATE_LIMITED',
+  });
+  const failed = await f.store.ownedGroup(f.actor.userId, group.groupId);
+  const summary = {
+    lastSyncStatus: 'failed',
+    lastSyncErrorCode: 'UPSTREAM_RATE_LIMITED',
+    lastSyncedAt: first.lastSyncedAt,
+  };
+  f.override(undefined);
+  const renamed = await f.service.rename(f.actor, group.groupId, group.revision, 'After failure');
+  expect(renamed).toMatchObject(summary);
+  expect(await f.service.refresh(f.actor, row.id)).toMatchObject({ state: 'active' });
+  await f.pool.query('UPDATE mio_materials SET next_query_at=NULL WHERE id=$1', [row.id]);
+  f.override(async (action) =>
+    ['GetAsset', 'UpdateAssetGroup'].includes(action)
+      ? envelope(action, {}, 403, 'AccessDenied')
+      : undefined,
+  );
+  await expect(
+    f.service.rename(f.actor, group.groupId, renamed.revision, 'Denied'),
+  ).rejects.toMatchObject({
+    code: 'PROVIDER_RESOURCE_FORBIDDEN',
+  });
+  await expect(f.service.refresh(f.actor, row.id)).rejects.toMatchObject({
+    code: 'PROVIDER_RESOURCE_FORBIDDEN',
+  });
+  expect(await f.service.group(f.actor, group.groupId)).toMatchObject(summary);
+  expect(await f.store.ownedGroup(f.actor.userId, group.groupId)).toMatchObject({
+    sync_cursor: '2',
+    last_sync_attempt_at: failed.last_sync_attempt_at,
+    sync_lease_id: null,
+    sync_lease_until: null,
+  });
+});
+
+it('stores exact supplier failure and projects only historically observed Failed rows from unknown', async () => {
+  const f = await fixture();
+  const group = await f.create();
+  const failed = f.add(group.upstreamId, 1, 'Failed');
+  const unknown = f.add(group.upstreamId, 2, 'FutureStatus');
+  const rejected = f.add(group.upstreamId, 3, 'Rejected');
+  await f.service.sync(f.actor, group.groupId);
+  const rows = await f.store.materials(f.actor.userId, group.groupId, 20);
+  const failedRow = rows.find((item) => item.upstream_asset_id === failed)!;
+  const unknownRow = rows.find((item) => item.upstream_asset_id === unknown)!;
+  const rejectedRow = rows.find((item) => item.upstream_asset_id === rejected)!;
+  expect(failedRow).toMatchObject({ state: 'failed', error_code: 'UPSTREAM_MATERIAL_FAILED' });
+  expect(unknownRow).toMatchObject({ state: 'unknown', error_code: null });
+  expect(rejectedRow).toMatchObject({ state: 'rejected', error_code: null });
+  for (const id of [failedRow.id, unknownRow.id]) {
+    await f.pool.query(
+      "UPDATE mio_materials SET state='unknown',upstream_status='Failed',error_code=$2 WHERE id=$1",
+      [id, id === unknownRow.id ? 'UPSTREAM_RESULT_UNKNOWN' : null],
+    );
+  }
+  const expected = { state: 'failed', errorCode: 'UPSTREAM_MATERIAL_FAILED' };
+  expect(await f.service.material(f.actor, failedRow.id)).toMatchObject(expected);
+  expect((await f.service.materials(f.actor, group.groupId, 20)).items).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ materialId: failedRow.id, ...expected }),
+      expect.objectContaining({
+        materialId: unknownRow.id,
+        state: 'unknown',
+        errorCode: 'UPSTREAM_RESULT_UNKNOWN',
+      }),
+    ]),
+  );
+  // A later observation also replaces the old classification and clears its local error.
+  f.items.get(failed)!.Status = 'Active';
+  f.items.get(unknown)!.Status = 'Failed';
+  await f.service.sync(f.actor, group.groupId);
+  expect(await f.service.material(f.actor, failedRow.id)).toMatchObject({
+    state: 'active',
+    errorCode: null,
+  });
+  expect(await f.store.ownedMaterial(f.actor.userId, unknownRow.id)).toMatchObject({
+    state: 'failed',
+    error_code: expected.errorCode,
   });
 });
 
@@ -403,7 +570,7 @@ it.each([
     const f = await fixture();
     const group = await f.create();
     if (scenario === 'sync lease') {
-      await f.store.claimGroup(f.actor.userId, group.groupId, undefined, null);
+      await f.store.claimGroup(f.actor.userId, group.groupId, undefined, '1');
     } else {
       f.add(group.upstreamId);
       await f.service.sync(f.actor, group.groupId);
@@ -807,7 +974,7 @@ it('rolls back the entire sync if a lease expires during entity writes, includin
     f.actor.userId,
     group.groupId,
     undefined,
-    null,
+    '1',
   );
   await f.pool.query(
     'CREATE FUNCTION delay_material_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END $$',

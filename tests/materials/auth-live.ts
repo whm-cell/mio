@@ -21,6 +21,7 @@ import {
   materialAuthProxyPath,
 } from '../../scripts/service/material-auth-proxy.ts';
 import * as Mio from '../../src/plugin.ts';
+import { auditMaterialAuthResponse } from './auth-live-audit.ts';
 
 assert.equal(process.env.MIO_RUN_LIVE_MATERIAL_AUTH, 'yes', 'MATERIAL_AUTH_LIVE_OPT_IN');
 const taskId = process.argv[2],
@@ -218,23 +219,17 @@ try {
       report.actions[action] = (report.actions[action] ?? 0) + 1;
       save();
       const response = await nativeFetch(input, init);
-      if (action === 'GetVisualValidateResult' || action === 'GetAssetGroup') {
-        const body = (await response
-          .clone()
-          .json()
-          .catch(() => null)) as { Result?: Record<string, unknown> } | null;
-        if (body?.Result) {
-          const fields = Object.fromEntries(
-            Object.entries(body.Result).map(([name, value]) => [
-              name,
-              Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value,
-            ]),
-          );
-          if (action === 'GetVisualValidateResult') report.observedResultFields = fields;
-          else report.observedGroupFields = fields;
-          save();
-        }
-      }
+      if (action === 'GetVisualValidateResult' || action === 'GetAssetGroup')
+        return auditMaterialAuthResponse(
+          response,
+          action,
+          (fields) => {
+            if (action === 'GetVisualValidateResult') report.observedResultFields = fields;
+            else report.observedGroupFields = fields;
+            save();
+          },
+          init?.signal ?? undefined,
+        );
       return response;
     }
     return nativeFetch(input, init);

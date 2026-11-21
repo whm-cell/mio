@@ -42,6 +42,7 @@ export interface GroupRow {
   updated_at: Date;
   deleted_at: Date | null;
   material_count?: number;
+  sync_expired?: boolean;
 }
 export interface MaterialRow {
   id: string;
@@ -177,6 +178,8 @@ export interface MaterialUpstream {
   deleteMaterial(key: string, id: string, signal: AbortSignal): Promise<void>;
 }
 export function groupView(row: GroupRow): GroupView {
+  const expired =
+    row.sync_expired || (row.state === 'deleted' && row.last_sync_status === 'running');
   return {
     groupId: row.id,
     type: row.group_type,
@@ -186,22 +189,31 @@ export function groupView(row: GroupRow): GroupView {
     revision: row.revision,
     materialCount: row.material_count ?? 0,
     lastSyncedAt: row.last_synced_at?.toISOString() ?? null,
-    lastSyncStatus: row.last_sync_status,
-    lastSyncErrorCode: row.last_sync_error_code,
+    lastSyncStatus: expired ? 'failed' : row.last_sync_status,
+    lastSyncErrorCode: expired ? MATERIAL_SYNC_LEASE_EXPIRED : row.last_sync_error_code,
   };
 }
 export function materialView(row: MaterialRow): MaterialView {
+  // Older successful observations stored Failed as unknown, with no local operation error.
+  const { state, errorCode } =
+    row.state === 'unknown' &&
+    row.error_code === null &&
+    row.upstream_status === 'Failed' &&
+    row.upstream_asset_id !== null &&
+    row.last_synced_at !== null
+      ? observedMaterialStatus(row.upstream_status)
+      : { state: row.state, errorCode: row.error_code };
   return {
     materialId: row.id,
     groupId: row.group_id,
     sourceAssetId: row.source_asset_id,
     assetType: row.asset_type,
     name: row.name,
-    state: row.state,
+    state,
     revision: row.revision,
     lastSyncedAt: row.last_synced_at?.toISOString() ?? null,
-    errorCode: row.error_code,
-    pollAfterMs: row.state === 'processing' ? 4000 : 0,
+    errorCode,
+    pollAfterMs: state === 'processing' ? 4000 : 0,
   };
 }
 export function operationView(row: OperationRow): OperationView {
@@ -214,16 +226,23 @@ export function operationView(row: OperationRow): OperationView {
     pollAfterMs: ['creating', 'deleting'].includes(row.state) ? 3000 : 0,
   };
 }
-export function materialState(status: string): MaterialState {
+export const MATERIAL_SYNC_LEASE_EXPIRED = 'MATERIAL_SYNC_LEASE_EXPIRED';
+
+export function observedMaterialStatus(status: string): {
+  state: MaterialState;
+  errorCode: string | null;
+} {
   switch (status) {
     case 'Active':
-      return 'active';
+      return { state: 'active', errorCode: null };
     case 'Processing':
     case 'Pending':
-      return 'processing';
+      return { state: 'processing', errorCode: null };
     case 'Rejected':
-      return 'rejected';
+      return { state: 'rejected', errorCode: null };
+    case 'Failed':
+      return { state: 'failed', errorCode: 'UPSTREAM_MATERIAL_FAILED' };
     default:
-      return 'unknown';
+      return { state: 'unknown', errorCode: null };
   }
 }

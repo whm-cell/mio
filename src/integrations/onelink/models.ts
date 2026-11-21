@@ -78,6 +78,7 @@ export async function discoverModels(
         typeof item.id !== 'string' ||
         !item.id ||
         item.id.includes(apiKey) ||
+        !item.id.isWellFormed() ||
         Buffer.byteLength(item.id) > 256 ||
         /[\u0000-\u001f\u007f]/.test(item.id)
       )
@@ -92,9 +93,15 @@ export async function discoverModels(
       const metadata: Record<string, unknown> = {};
       for (const field of ['object', 'owned_by', 'description'] as const) {
         if (field in item) {
-          if (typeof item[field] !== 'string' || item[field].includes(apiKey))
+          const value = item[field];
+          if (
+            typeof value !== 'string' ||
+            !value.isWellFormed() ||
+            value.includes('\0') ||
+            value.includes(apiKey)
+          )
             throw new DiscoveryError('UPSTREAM_RESPONSE_INVALID');
-          metadata[field] = item[field];
+          metadata[field] = value;
         }
       }
       if ('created' in item) {

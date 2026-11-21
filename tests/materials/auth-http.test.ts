@@ -343,3 +343,48 @@ it('keeps the owner recovery endpoint private with strict empty JSON and no publ
   expect(result.status).toBe(200);
   expect(await result.json()).toMatchObject({ state: 'completed', sessionId: view.sessionId });
 });
+
+it.each(['callback', 'owner refresh'] as const)(
+  'reports expiry through %s when the deadline passes before claiming verification',
+  async (entry) => {
+    const f = await fixture();
+    const view = await f.authentication.create(f.actor, randomUUID(), 'materials', 'materials');
+    const store = f.store.authentication;
+    const claim = store.claim.bind(store);
+    const beforeClaim = vi.spyOn(store, 'claim').mockImplementationOnce(async (row) => {
+      expect(row.state).toBe('pending');
+      await f.pool.query(
+        "UPDATE mio_material_auth_sessions SET created_at=created_at-interval '21 minutes',expires_at=expires_at-interval '21 minutes' WHERE id=$1",
+        [row.id],
+      );
+      return claim(row);
+    });
+    const path = `/api/v1/materials/auth-sessions/${view.sessionId}`;
+    const proof = new URLSearchParams({
+      bytedToken: [...f.tokens.keys()][0]!,
+      resultCode: '10000',
+    });
+    const response =
+      entry === 'callback'
+        ? await fetch(`${f.base}${path}/complete?${proof}`)
+        : await f.request(`${path}/refresh`, {});
+
+    expect(response.status).toBe(410);
+    expect(response.headers.get('retry-after')).toBeNull();
+    if (entry === 'callback') expect(await response.text()).toContain('AUTH_EXPIRED');
+    else expect(await response.json()).toMatchObject({ error: { code: 'AUTH_EXPIRED' } });
+    expect(beforeClaim).toHaveBeenCalledTimes(1);
+    expect(f.authTransport).toHaveBeenCalledTimes(1);
+    const stored = (
+      await f.pool.query('SELECT * FROM mio_material_auth_sessions WHERE id=$1', [view.sessionId])
+    ).rows[0];
+    expect(stored).toMatchObject({
+      state: 'expired',
+      error_code: 'AUTH_EXPIRED',
+      lease_id: null,
+      query_count: 0,
+      ciphertext: null,
+      token_digest: expect.any(String),
+    });
+  },
+);

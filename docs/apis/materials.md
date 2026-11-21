@@ -30,7 +30,7 @@
 
 输入：可选 `type=real|aigc`、不透明 `cursor`、`limit`（默认 20、1–100），参数不得重复。
 
-成功：200 `{items:GroupView[],nextCursor:string|null}`，按 createdAt/id 降序；本地已删除组不出现，分页游标保留数据库微秒精度。
+成功：200 `{items:GroupView[],nextCursor:string|null}`，按 createdAt/id 降序；本地已删除组不出现，分页游标保留数据库微秒精度。同步租约到期后，列表和详情立即按数据库时间报告 `lastSyncStatus=failed`、`lastSyncErrorCode=MATERIAL_SYNC_LEASE_EXPIRED`，保留最近成功的 `lastSyncedAt`。无需发起新的同步来结束旧状态。
 
 错误：参数或游标非法 400；其余见共同约定。
 
@@ -58,7 +58,7 @@
 
 错误：旧 revision 409 REVISION_CONFLICT；在途租约 409 MATERIAL_BUSY；超时/未知结果明确失败，不返回假成功；其余见共同约定。
 
-副作用：原子认领组 revision/租约，事务外通过 GetAssetGroup 核验权限，再调用 UpdateAssetGroup，租约仍有效且组仍 ready 时落本地名称。失败保留既有名称及最近错误；迟到响应不能覆盖新状态。无异步 operationId。
+副作用：原子认领组 revision/租约，事务外通过 GetAssetGroup 核验权限，再调用 UpdateAssetGroup，租约仍有效且组仍 ready 时落本地名称。失败保留既有名称，并在本次 HTTP 响应报告错误。改名沿用组级互斥，保留同步时间、摘要和游标；迟到响应不能覆盖后续结果。无异步 operationId。
 
 ## POST /api/v1/materials/groups/{id}/sync
 
@@ -70,7 +70,7 @@
 
 错误：越组响应或非法信封 503 UPSTREAM_RESPONSE_INVALID；ID 与他人/其他组冲突 409 UPSTREAM_RESOURCE_COLLISION；租约过期/替代 409 MATERIAL_OPERATION_SUPERSEDED；其余见共同约定。
 
-副作用：组租约内事务外核验 GetAssetGroup 并调用一页 ListAssets，强制非空 `Filter.GroupIds:[id]`、PageNumber/PageSize、每调用 20 秒及响应 2 MiB 上限。每项 GroupId 二次核验，实体与摘要在同一事务重验租约后提交；单页缺失不删除，本地墓碑与未收束删除不复活。无异步 operationId。
+副作用：组租约内事务外核验 GetAssetGroup 并调用一页 ListAssets，强制非空 `Filter.GroupIds:[id]`、PageNumber/PageSize、每调用 20 秒及响应 2 MiB 上限。每项 GroupId 二次核验，实体与摘要在同一事务重验租约后提交；单页缺失不删除，本地墓碑与未收束删除不复活。组同步负责组同步摘要、时间及游标，后续组操作接手租约时只收束先前已过期的同步。无异步 operationId。
 
 ## POST /api/v1/materials/groups/{id}/materials
 
@@ -78,7 +78,7 @@
 
 输入：`{requestId,assetId,name?}`；requestId/assetId 为小写 UUID v4，仅接受本人已完成 assets complete 的 ready 原件或支持的已登记 derived 图片；不接受 URL、上游 ID、owner、桶或对象键。可选名称为 1–100 个 Unicode 字符且无控制字符，省略时保留空展示名。
 
-成功：201 `{material:MaterialView,operation:OperationView}`；CreateAsset 返回仅表示登记成功，素材先 processing，按 pollAfterMs 查询/刷新后才可为 active/rejected/unknown。已有操作读回 `{operation}`，未确认成功为 202；同 owner/requestId 同输入不重复创建，异输入 409 IDEMPOTENCY_CONFLICT。
+成功：201 `{material:MaterialView,operation:OperationView}`；CreateAsset 返回仅表示登记成功，素材先 processing，之后按 pollAfterMs 刷新。已有操作读回 `{operation}`，未确认成功为 202；同 owner/requestId 同输入不重复创建，异输入 409 IDEMPOTENCY_CONFLICT。
 
 错误：读取前已有登记占槽 409 MATERIAL_BUSY，不排队、不读取第二份原件；未配置资产读取 409 MATERIAL_REGISTRATION_UNAVAILABLE；原件不存在/非本人或非 ready 为 404 ASSET_NOT_FOUND；单文件超限/类型非法 400 ASSET_INPUT_INVALID，内容损坏/尺寸比或像素预算非法 400 MATERIAL_IMAGE_INVALID；ETag/长度变化 409 ASSET_SOURCE_CHANGED/ASSET_SIZE_MISMATCH；其余同共同约定。PNG 按当前解码器主图核验；带 APNG 扩展仍作为普通 PNG 提交完整原件，不新增专门支持、拒绝或静态化，不承诺所有动画帧已验证；最终审核由上游处理。
 
@@ -114,7 +114,7 @@
 
 输入：正文 `{}`，无查询参数。
 
-成功：200 MaterialView；未知上游状态映射 unknown，不自动当 active；仅精确 GetAsset 404/ResourceNotFound 且 GetAssetGroup 权限核验成功后可返回 deleted。
+成功：200 MaterialView。单项刷新、组同步和已知远端 ID 的登记恢复按同一规则投影。`Active` 为 active，`Processing`/`Pending` 为 processing，`Rejected` 为 rejected，`Failed` 为 failed 并附固定 `UPSTREAM_MATERIAL_FAILED`。其他状态为 unknown。历史 `unknown` 记录若保留确定的 `Failed` 观察且无本地操作错误，读回显示 failed。仅精确 GetAsset 404/ResourceNotFound 且 GetAssetGroup 权限核验成功后可返回 deleted。
 
 错误：已有查询在途 409 MATERIAL_BUSY；持久冷却内 429 MATERIAL_QUERY_LIMITED/Retry-After:4；403 保留本地资源与 provider 状态；其余见共同约定。
 

@@ -70,9 +70,13 @@ async function identity(cookie: string) {
   return (await response.json()) as { userId: string; sessionId: string };
 }
 
-async function start(path: '/sign-in/social' | '/link-social', cookie?: string) {
+async function start(
+  path: '/sign-in/social' | '/link-social',
+  cookie?: string,
+  body: { provider: 'wechat'; callbackURL?: string } = { provider: 'wechat', callbackURL: '/done' },
+) {
   const response = await call(`/api/auth${path}`, {
-    body: { provider: 'wechat', callbackURL: '/done' },
+    body,
     ...(cookie ? { cookie } : {}),
   });
   expect(response.status, await response.clone().text()).toBe(200);
@@ -393,6 +397,31 @@ it('rejects arbitrary providers, direct tokens, unsafe return paths and missing 
   expect((await call('/api/auth/callback/wechat', { body: {}, origin: false })).status).toBe(405);
   expect((await call('/api/auth/callback/google', { origin: false })).status).toBe(404);
 });
+
+it.each(['/sign-in/social', '/link-social'] as const)(
+  'rejects a null return path without creating OAuth state and defaults an omitted path for %s',
+  async (path) => {
+    const session = path === '/link-social' ? await emailUser() : undefined;
+    const invalid = await call(`/api/auth${path}`, {
+      body: { provider: 'wechat', callbackURL: null },
+      ...(session ? { cookie: session } : {}),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: { code: 'INVALID_INPUT' } });
+    expect(invalid.headers.getSetCookie()).toEqual([]);
+    expect(
+      (await pool.query(`SELECT id FROM "verification" WHERE identifier LIKE 'auth-state:%'`)).rows,
+    ).toHaveLength(0);
+    expect(exchanges).toBe(0);
+
+    fixtures.set('default-return', { openid: 'default-return-wechat' });
+    const flow = await start(path, session, { provider: 'wechat' });
+    const completed = await callback(flow, 'default-return', session);
+    expect(completed.status).toBe(302);
+    expect(completed.headers.get('location')).toBe(`${origins[0]}/`);
+    expect(exchanges).toBe(1);
+  },
+);
 
 it('rejects a configured AppID change when existing WeChat accounts use another namespace', async () => {
   fixtures.set('existing', { openid: 'existing-wechat' });

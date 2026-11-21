@@ -33,7 +33,7 @@ revision 在配置/模型展示信息/偏好修改、刷新开始及结束递增
 
 身份：当前登录用户。
 
-输入：`{apiKey,expectedRevision}`。初建 revision=0，否则为当前非负整数且小于 2147483647。Key 非空、最多 4096 字节，无空白、控制字符、`*` 或 `•`。
+输入：`{apiKey,expectedRevision}`。初建 revision=0，否则为当前非负整数且小于 2147483647。Key 非空、最多 4096 字节，无空白、控制字符、`*` 或 `•`，且能由 Node `Headers` 构造 `Authorization: Bearer <apiKey>`。
 
 成功：200 ProviderView；初建 enabled=true、水印 false。轮换递增凭据版本，清空本凭据尝试、auth=unchecked，旧目录和模型留历史，保留偏好/default 目标，须重新成功发现。
 
@@ -59,7 +59,7 @@ revision 在配置/模型展示信息/偏好修改、刷新开始及结束递增
 
 输入：`{}`。
 
-成功：200 discovery；connected 表示当前用户 Key 的完整目录成功，空列表也是成功；`ids` 的数量就是本次最新目录数量。failed 携稳定脱敏 error：UPSTREAM_AUTH_REJECTED/RATE_LIMITED/UNAVAILABLE/TIMEOUT/CANCELLED/RESPONSE_INVALID/RESPONSE_TOO_LARGE/RESPONSE_OR_TRANSPORT_ERROR（各项均带 UPSTREAM_ 前缀）。失败不覆盖同凭据最近成功快照；认证失败额外阻止新调用。
+成功：200 discovery；connected 表示当前用户 Key 的完整目录成功，空列表也是成功；`ids` 的数量就是本次最新目录数量。failed 携稳定脱敏 error：UPSTREAM_AUTH_REJECTED/RATE_LIMITED/UNAVAILABLE/TIMEOUT/CANCELLED/RESPONSE_INVALID/RESPONSE_TOO_LARGE/RESPONSE_OR_TRANSPORT_ERROR（各项均带 UPSTREAM_ 前缀）。模型 ID 和需持久化的元数据字符串含 NUL 或未配对 UTF-16 代理项时，整次尝试记为 UPSTREAM_RESPONSE_INVALID。失败不覆盖同凭据最近成功快照；认证失败额外阻止新调用。
 
 错误：409 PROVIDER_CREDENTIAL_CHANGED 或 PROVIDER_REFRESH_SUPERSEDED 表示响应已失效、未发布；503 PROVIDER_CREDENTIAL_UNAVAILABLE 表示不能验证密文，最近尝试仍记录失败。
 

@@ -202,6 +202,84 @@ it('returns the accepted request before current revision or permissions and pers
   }
 });
 
+it('blocks confirmed deletion during live sync and never imports its late page after cascade', async () => {
+  const f = await fixture();
+  const group = await f.create();
+  f.add(group.upstreamId, 1);
+  f.add(group.upstreamId, 2);
+  await f.service.sync(f.actor, group.groupId);
+  const [localTombstone] = await f.store.materials(f.actor.userId, group.groupId, 20);
+  await f.service.remove(
+    f.actor,
+    'material',
+    localTombstone!.id,
+    randomUUID(),
+    localTombstone!.revision,
+    'local',
+  );
+  f.add(group.upstreamId, 3);
+  const listStarted = Promise.withResolvers<void>();
+  const returnList = Promise.withResolvers<void>();
+  f.override(async (action) => {
+    if (action !== 'ListAssets') return;
+    const items = [...f.items.values()];
+    listStarted.resolve();
+    await returnList.promise;
+    return envelope(action, {
+      Items: items,
+      PageNumber: 1,
+      PageSize: 100,
+      TotalCount: items.length,
+    });
+  });
+  const syncing = f.service.sync(f.actor, group.groupId);
+  try {
+    await listStarted.promise;
+    const before = f.transport.mock.calls.length;
+    await expect(cascade(f, group)).rejects.toMatchObject({ status: 409, code: 'MATERIAL_BUSY' });
+    expect(calls(f, before)).toEqual([]);
+    await f.pool.query(
+      "UPDATE mio_material_groups SET sync_lease_until=now()-interval '1 second' WHERE id=$1",
+      [group.groupId],
+    );
+    expect(await cascade(f, group)).toMatchObject({ state: 'succeeded' });
+    expect(calls(f, before)).toEqual([
+      { action: 'GetAssetGroup', body: { Id: group.upstreamId } },
+      { action: 'DeleteAssetGroup', body: { Id: group.upstreamId } },
+    ]);
+    const members = () =>
+      f.pool.query(
+        'SELECT id,owner_id,upstream_asset_id,state,deleted_at,revision FROM mio_materials WHERE group_id=$1 ORDER BY id',
+        [group.groupId],
+      );
+    const storedGroup = () =>
+      f.pool.query('SELECT * FROM mio_material_groups WHERE id=$1', [group.groupId]);
+    const afterDeletion = (await members()).rows;
+    const deletedGroup = (await storedGroup()).rows[0];
+    expect(deletedGroup).toMatchObject({
+      state: 'deleted',
+      owner_id: f.actor.userId,
+      upstream_group_id: group.upstreamId,
+      deleted_at: expect.any(Date),
+    });
+    expect(afterDeletion).toHaveLength(2);
+    for (const member of afterDeletion)
+      expect(member).toMatchObject({
+        state: 'deleted',
+        owner_id: f.actor.userId,
+        deleted_at: expect.any(Date),
+      });
+    returnList.resolve();
+    await expect(syncing).rejects.toMatchObject({ code: 'MATERIAL_OPERATION_SUPERSEDED' });
+    expect((await members()).rows).toEqual(afterDeletion);
+    expect((await storedGroup()).rows[0]).toEqual(deletedGroup);
+    await expect(f.service.group(f.actor, group.groupId)).rejects.toMatchObject({ status: 404 });
+  } finally {
+    returnList.resolve();
+    await Promise.allSettled([syncing]);
+  }
+});
+
 it('returns the concurrently accepted operation when an overlapping preflight is rejected', async () => {
   const f = await fixture();
   const group = await f.create();

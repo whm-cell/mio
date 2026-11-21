@@ -53,6 +53,7 @@ export function createMaterialAuthService(
     if (!claimed) {
       const current = await store.get(row.id);
       if (current.state === 'completed') return view(current);
+      if (current.state === 'expired') throw new MaterialError(410, 'AUTH_EXPIRED');
       throw new MaterialError(429, 'AUTH_QUERY_LIMITED');
     }
     let token: string | undefined;

@@ -124,12 +124,15 @@ it('registers one owned ready immutable original, persists summaries but no sign
   await expect(
     f.service.register(f.actor, group.groupId, request, asset.id, 'Different'),
   ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
-  for (const status of ['Active', 'Rejected', 'unexpected']) {
+  for (const [status, state, errorCode] of [
+    ['Active', 'active', null],
+    ['Failed', 'failed', 'UPSTREAM_MATERIAL_FAILED'],
+    ['Rejected', 'rejected', null],
+    ['unexpected', 'unknown', null],
+  ] as const) {
     f.items.get(row.upstream_asset_id!)!.Status = status;
     await f.pool.query('UPDATE mio_materials SET next_query_at=NULL WHERE id=$1', [id]);
-    expect((await f.service.refresh(f.actor, id)).state).toBe(
-      status === 'Active' ? 'active' : status === 'Rejected' ? 'rejected' : 'unknown',
-    );
+    expect(await f.service.refresh(f.actor, id)).toMatchObject({ state, errorCode });
   }
   expect(
     f.transport.mock.calls.filter(([url]) => String(url).includes('Action=CreateAsset&')),
@@ -277,6 +280,7 @@ it('recovers known registration identity across restart with exact GetAsset and 
     upstreamId: expect.stringMatching(/^asset-/),
     upstreamGroupId: group.upstreamId,
   });
+  f.items.get(original.protocol_snapshot.upstreamId!)!.Status = 'Failed';
   await f.pool.query('DROP TRIGGER reject_material ON mio_materials');
   const restarted = createMaterialService(
     await createMaterialStore(f.database.url),
@@ -285,8 +289,14 @@ it('recovers known registration identity across restart with exact GetAsset and 
     f.assets,
   );
   try {
-    expect(await restarted.operation(f.actor, known.operation.operationId)).toMatchObject({
+    const recovered = await restarted.operation(f.actor, known.operation.operationId);
+    expect(recovered).toMatchObject({
       state: 'succeeded',
+      resultLocalId: original.target_material_id,
+    });
+    expect(await restarted.material(f.actor, recovered.resultLocalId!)).toMatchObject({
+      state: 'failed',
+      errorCode: 'UPSTREAM_MATERIAL_FAILED',
     });
   } finally {
     await restarted.close();

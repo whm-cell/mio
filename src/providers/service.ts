@@ -347,6 +347,11 @@ export function createProviderService(
       assertOpen();
       if (!apiKey || Buffer.byteLength(apiKey) > 4096 || /\s|[\u0000-\u001f\u007f*•]/.test(apiKey))
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'PROVIDER_KEY_INVALID');
+      try {
+        new Headers({ authorization: `Bearer ${apiKey}` });
+      } catch {
+        throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'PROVIDER_KEY_INVALID');
+      }
       return store.save(actor.userId, expected, apiKey);
     },
     settings(actor: ProviderPrincipal, expected: number, patch: SettingsPatch) {

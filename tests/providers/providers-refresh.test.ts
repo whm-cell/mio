@@ -633,6 +633,94 @@ it('rejects conflicting duplicates and partial/malformed metadata without replac
   }
 });
 
+it('finishes an unpersistable discovery as failed and retains the last Unicode catalog', async () => {
+  const model = {
+    id: '模型-🧪',
+    object: '模型',
+    owned_by: '供应商',
+    description: '说明𐐷',
+  };
+  let response = () => Response.json({ data: [{ ...model, ignored: '\0\uD800' }] });
+  const f = await fixture(async () => response());
+  expect(await f.service.discover(f.actor)).toMatchObject({ status: 'connected', ids: [model.id] });
+  const { items, provider } = await f.service.catalog(f.actor);
+  expect(items).toHaveLength(1);
+  expect(items[0]).toMatchObject({
+    modelId: model.id,
+    supplierMetadata: {
+      object: model.object,
+      owned_by: model.owned_by,
+      description: model.description,
+    },
+  });
+  expect(items[0]?.supplierMetadata).not.toHaveProperty('ignored');
+  for (const invalid of [
+    { id: 'id\0suffix' },
+    { id: 'id\uD800suffix' },
+    { id: 'id\uDC00suffix' },
+    { id: 'new', description: 'invalid\0description' },
+    { id: 'new', owned_by: 'invalid\uD800owner' },
+    { id: 'new', object: 'invalid\uDC00object' },
+  ]) {
+    response = () => Response.json({ data: [{ id: 'valid-sibling' }, invalid] });
+    const result = await f.service.discover(f.actor);
+    expect(result).toMatchObject({ status: 'failed', ids: [], error: 'UPSTREAM_RESPONSE_INVALID' });
+    const catalog = await f.service.catalog(f.actor);
+    expect(catalog.provider).toMatchObject({
+      catalog: { ...provider!.catalog, stale: true },
+      discovery: result,
+      lastAttempt: {
+        status: 'failed',
+        seq: result.refreshSeq,
+        credentialVersion: result.credentialVersion,
+        finishedAt: expect.any(String),
+        error: 'UPSTREAM_RESPONSE_INVALID',
+      },
+    });
+    expect(catalog.items).toEqual(items);
+  }
+});
+
+it.each(['newer refresh', 'credential rotation'] as const)(
+  'discards an invalid response arriving after a %s',
+  async (race) => {
+    const entered = Promise.withResolvers<void>();
+    const delayed = Promise.withResolvers<Response>();
+    let first = true;
+    const f = await fixture(async () => {
+      if (!first) return metadata(['current-catalog']);
+      first = false;
+      entered.resolve();
+      return delayed.promise;
+    });
+    const old = f.service.discover(f.actor);
+    const rejected = expect(old).rejects.toMatchObject({
+      code:
+        race === 'credential rotation'
+          ? 'PROVIDER_CREDENTIAL_CHANGED'
+          : 'PROVIDER_REFRESH_SUPERSEDED',
+    });
+    const invalid = () =>
+      Response.json({ data: [{ id: 'late', description: 'invalid\0metadata' }] });
+    try {
+      await entered.promise;
+      if (race === 'credential rotation')
+        await f.service.save(f.actor, (await f.service.get(f.actor))!.revision, 'rotated-race-key');
+      expect(await f.service.discover(f.actor)).toMatchObject({
+        status: 'connected',
+        ids: ['current-catalog'],
+      });
+      const latest = await f.service.catalog(f.actor);
+      delayed.resolve(invalid());
+      await rejected;
+      expect(await f.service.catalog(f.actor)).toEqual(latest);
+    } finally {
+      delayed.resolve(invalid());
+      await old.catch(() => {});
+    }
+  },
+);
+
 it('does not manufacture members or verification through route data and isolates per-user verification and default targets', async () => {
   const one = await fixture(async () => metadata(['Same-ID']));
   const two = await fixture(async () => metadata(['Same-ID']));

@@ -12,6 +12,7 @@ const fixtures = vi.hoisted(() => ({
   readFile: vi.fn(),
   writeFile: vi.fn(),
   query: vi.fn(),
+  observation: vi.fn(),
 }));
 
 vi.mock('node:fs/promises', async (importOriginal) => ({
@@ -25,7 +26,9 @@ vi.mock('node:fs', async (importOriginal) => ({
   ...(await importOriginal<typeof Fs>()),
   createWriteStream: () =>
     new Writable({
-      write(_chunk, _encoding, done) {
+      write(chunk, _encoding, done) {
+        const record = JSON.parse(String(chunk)) as { type: string };
+        if (record.type === 'observation') fixtures.observation(record);
         done();
       },
     }),
@@ -36,7 +39,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
     [Symbol.for('nodejs.util.promisify.custom')]: async (command: string) => ({
       stdout:
         command === 'ps'
-          ? '12345 1 0.1 19000 node\n'
+          ? processSnapshot
           : JSON.stringify({ CPUPerc: '1%', MemUsage: '2 MiB / 1 GiB' }),
     }),
   }),
@@ -63,6 +66,15 @@ const composeEnv = [
   'RABBITMQ_MANAGEMENT_PORT = "15680"',
   '',
 ].join('\r\n');
+const processSnapshot = [
+  '12348 12347 0.25 2000 /tools/ffmpeg',
+  '54322 54321 0.75 4000 /tools/ffmpeg',
+  '12347 12346 0.5 8000 node',
+  '12346 12345 0.75 1000 node',
+  '12345 1 0.25 19000 node',
+  '54321 1 1.25 12000 node',
+  '88888 99999 100 60000 ffmpeg',
+].join('\n');
 
 afterEach(() => {
   vi.useRealTimers();
@@ -114,13 +126,27 @@ it('rejects invalid inferred ports and missing credentials', () => {
 });
 
 it.each([
-  { warmup: 1, duration: 600, monitorAvailable: true, eligible: false },
-  { warmup: 60, duration: 2, monitorAvailable: true, eligible: false },
-  { warmup: 60, duration: 600, monitorAvailable: true, eligible: true },
-  { warmup: 60, duration: 600, monitorAvailable: false, eligible: false },
+  { warmup: 1, duration: 600, monitorAvailable: true, eligible: false, bPid: '0', b: null },
+  {
+    warmup: 60,
+    duration: 2,
+    monitorAvailable: true,
+    eligible: false,
+    bPid: '54321',
+    b: { count: 2, ffmpegProcesses: 1, cpuPercent: 2, rssKiB: 16000 },
+  },
+  {
+    warmup: 60,
+    duration: 600,
+    monitorAvailable: true,
+    eligible: true,
+    bPid: '12347',
+    b: { count: 2, ffmpegProcesses: 1, cpuPercent: 0.75, rssKiB: 10000 },
+  },
+  { warmup: 60, duration: 600, monitorAvailable: false, eligible: false, bPid: '99999', b: null },
 ])(
-  'runs observation sampling with $warmup s warmup and $duration s measurement (monitor $monitorAvailable)',
-  async ({ warmup, duration, monitorAvailable, eligible }) => {
+  'samples with $warmup s warmup, $duration s measurement, B PID $bPid and monitor $monitorAvailable',
+  async ({ warmup, duration, monitorAvailable, eligible, bPid, b }) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     for (const [name, value] of Object.entries({
       OBSERVE_BASE_URL: 'http://127.0.0.1:18080',
@@ -131,7 +157,7 @@ it.each([
       OBSERVE_MQ_ENV: '.runtime/private.env',
       OBSERVE_MQ_CONTAINER: 'isolated-container',
       OBSERVE_A_PID: '12345',
-      OBSERVE_B_PID: '0',
+      OBSERVE_B_PID: bPid,
       OBSERVE_QPS: '1',
       OBSERVE_WARMUP_SECONDS: String(warmup),
       OBSERVE_DURATION_SECONDS: String(duration),
@@ -155,6 +181,12 @@ it.each([
     const result = observeCompute();
     await vi.advanceTimersByTimeAsync((warmup + duration + 12) * 1000);
     await result;
+    expect(fixtures.observation).toHaveBeenCalled();
+    for (const [observation] of fixtures.observation.mock.calls)
+      expect(observation).toMatchObject({
+        a: { count: 4, ffmpegProcesses: 1, cpuPercent: 1.75, rssKiB: 30000 },
+        b,
+      });
     const summary = JSON.parse(fixtures.writeFile.mock.calls[0]![1] as string);
     expect(summary).toMatchObject({
       warmupSeconds: warmup,

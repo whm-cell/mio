@@ -49,6 +49,7 @@ type Baseline = {
   measurement: Record<string, Stats>;
   monitoringErrors: number;
 };
+type ProcessRow = { pid: number; parent: number; cpu: number; rss: number; ffmpeg: boolean };
 type ProcessStats = {
   count: number;
   ffmpegProcesses: number;
@@ -149,23 +150,25 @@ export function compareMeasurements(
   return { comparison, conclusion };
 }
 function processTree(
-  rows: { pid: number; parent: number; cpu: number; rss: number; ffmpeg: boolean }[],
+  rows: readonly ProcessRow[],
+  children: ReadonlyMap<number, readonly number[]>,
   root: number,
 ): ProcessStats {
-  if (!rows.some((row) => row.pid === root)) return null;
   const members = new Set([root]);
-  let size = 0;
-  while (size !== members.size) {
-    size = members.size;
-    for (const row of rows) if (members.has(row.parent)) members.add(row.pid);
+  // Set iteration includes descendants added as each parent is visited.
+  for (const pid of members) {
+    for (const child of children.get(pid) ?? []) members.add(child);
   }
-  const selected = rows.filter((row) => members.has(row.pid));
-  return {
-    count: selected.length,
-    ffmpegProcesses: selected.filter((row) => row.ffmpeg).length,
-    cpuPercent: selected.reduce((sum, row) => sum + row.cpu, 0),
-    rssKiB: selected.reduce((sum, row) => sum + row.rss, 0),
-  };
+  const stats = { count: 0, ffmpegProcesses: 0, cpuPercent: 0, rssKiB: 0 };
+  // Preserve snapshot order for floating-point CPU accumulation.
+  for (const row of rows) {
+    if (!members.has(row.pid)) continue;
+    stats.count++;
+    if (row.ffmpeg) stats.ffmpegProcesses++;
+    stats.cpuPercent += row.cpu;
+    stats.rssKiB += row.rss;
+  }
+  return stats;
 }
 async function processes(
   aPid: number,
@@ -193,7 +196,18 @@ async function processes(
           ]
         : [];
     });
-  return { a: processTree(rows, aPid), b: processTree(rows, bPid) };
+  const children = new Map<number, number[]>();
+  const pids = new Set<number>();
+  for (const row of rows) {
+    pids.add(row.pid);
+    const siblings = children.get(row.parent);
+    if (siblings) siblings.push(row.pid);
+    else children.set(row.parent, [row.pid]);
+  }
+  return {
+    a: pids.has(aPid) ? processTree(rows, children, aPid) : null,
+    b: pids.has(bPid) ? processTree(rows, children, bPid) : null,
+  };
 }
 function byteSize(text: string): number {
   const match = /^(\d+(?:\.\d+)?)\s*(B|kB|MB|GB|KiB|MiB|GiB)$/.exec(text.trim());

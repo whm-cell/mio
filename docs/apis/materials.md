@@ -42,7 +42,7 @@
 
 输入：本地小写 UUID v4，无查询参数。
 
-成功：200 GroupView。
+成功：200 GroupView。各入口返回的 `materialCount` 为本人该组未删除的本地素材数。
 
 错误：他人或已删除组统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
@@ -70,7 +70,7 @@
 
 错误：越组响应或非法信封 503 UPSTREAM_RESPONSE_INVALID；ID 与他人/其他组冲突 409 UPSTREAM_RESOURCE_COLLISION；租约过期/替代 409 MATERIAL_OPERATION_SUPERSEDED；其余见共同约定。
 
-副作用：组租约内事务外核验 GetAssetGroup 并调用一页 ListAssets，强制非空 `Filter.GroupIds:[id]`、PageNumber/PageSize、每调用 20 秒及响应 2 MiB 上限。每项 GroupId 二次核验，实体与摘要在同一事务重验租约后提交；单页缺失不删除，本地墓碑与未收束删除不复活。组同步负责组同步摘要、时间及游标，后续组操作接手租约时只收束先前已过期的同步。无异步 operationId。
+副作用：组租约内事务外核验 GetAssetGroup 并调用一页 ListAssets，强制非空 `Filter.GroupIds:[id]`、PageNumber/PageSize、每调用 20 秒及响应 2 MiB 上限。每项 GroupId 二次核验，单页实体批量写入与摘要在同一事务重验租约后提交。单页缺失不删除，本地墓碑及登记或删除未收束的素材不被覆盖，包括操作结果仍 unknown 的素材。组同步负责组同步摘要、时间及游标，后续组操作接手租约时只收束先前已过期的同步。无异步 operationId。
 
 ## POST /api/v1/materials/groups/{id}/materials
 
@@ -178,7 +178,7 @@
 
 错误：他人会话统一 404 MATERIAL_NOT_FOUND；其余见共同约定。
 
-副作用：只读本地事实并收敛到期/失效 creating/verifying 租约，不解密、不联网。逻辑有效期固定创建后 20 分钟，访问到期即转 expired 并清五元组；素材服务启动及健康运行时每 30 秒最多清理 100 条到期记录。停机期间的后台清理顺延至服务恢复。completed 保留脱敏结果/映射与 replay 所需 digest，完成事务立即清密文。
+副作用：未到期且无失效租约时，本人状态和创建幂等读仅查询状态字段与密文是否存在，不取密文、不写库、不联网。到期或 creating/verifying 失去租约时，按当前本人状态收敛。逻辑有效期固定创建后 20 分钟，访问到期即转 expired 并清五元组；素材服务启动及健康运行时每 30 秒最多清理 100 条到期记录。停机期间的后台清理顺延至服务恢复。completed 保留脱敏结果/映射与 replay 所需 digest，完成事务立即清密文。
 
 ## POST /api/v1/materials/auth-sessions/{id}/refresh
 

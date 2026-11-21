@@ -537,6 +537,29 @@ function pollQR(flow: { id: string; cookie: string }, session?: string, instance
   });
 }
 
+it('reads a pending QR over HTTP while another transaction holds its row lock', async () => {
+  const session = await emailUser();
+  const qr = await startQR();
+  const blocker = await pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    const held = await blocker.query(
+      'SELECT xmin::text FROM "mioWechatQR" WHERE id=$1 FOR UPDATE',
+      [qr.id],
+    );
+    const response = await pollQR(qr, session, 1);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: 'pending' });
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(
+      (await blocker.query('SELECT xmin::text FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows,
+    ).toEqual(held.rows);
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+});
+
 it('completes QR registration through the OAuth session and consumes the result once across instances', async () => {
   const qr = await startQR();
   expect(await (await pollQR(qr)).json()).toEqual({ status: 'pending' });
@@ -582,6 +605,49 @@ it('requires the confirmed user session and does not consume QR for another or r
   expect(
     (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0].status,
   ).toBe('confirmed');
+});
+
+it('expires a confirmed QR when its competing row lock is released after the deadline', async () => {
+  const qr = await startQR();
+  fixtures.set('qr-deadline', { openid: 'qr-deadline-owner' });
+  const completed = await callback(qr, 'qr-deadline');
+  expect(completed.status).toBe(302);
+  await pool.query(
+    `UPDATE "mioWechatQR" SET "expiresAt"=clock_timestamp()+interval '2 seconds' WHERE id=$1`,
+    [qr.id],
+  );
+  const blocker = await pool.connect();
+  let polling: Promise<Response> | undefined;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM "mioWechatQR" WHERE id=$1 FOR UPDATE', [qr.id]);
+    polling = pollQR(qr, cookies(completed), 1);
+    await expect
+      .poll(
+        async () => {
+          const observed = await blocker.query<{ blocked: boolean }>(
+            `SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname=current_database() AND pg_backend_pid()=ANY(pg_blocking_pids(pid))
+        ) AS blocked`,
+          );
+          return observed.rows[0]?.blocked;
+        },
+        { timeout: 1500 },
+      )
+      .toBe(true);
+    await blocker.query(
+      `SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM "expiresAt"-clock_timestamp()))+0.01)
+       FROM "mioWechatQR" WHERE id=$1`,
+      [qr.id],
+    );
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+    await polling;
+  }
+  expect(await (await polling!).json()).toEqual({ status: 'expired' });
+  expect(await (await pollQR(qr)).json()).toEqual({ status: 'expired' });
 });
 
 it('does not mistake an old session or failed callback for a successful QR login', async () => {

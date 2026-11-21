@@ -18,6 +18,7 @@ import type {
 const CLIENT_OPERATION_KEY_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const ERROR_CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
 const TOOL_IMAGE_OPERATIONS = ['generate', 'edit'] as const;
+type ToolImageOperation = (typeof TOOL_IMAGE_OPERATIONS)[number];
 const IMAGE_JOB_STATES = new Set([
   'accepted',
   'submitted',
@@ -298,8 +299,9 @@ export function registerConversationImageTools(
             return {
               models: models.map((model) => ({
                 ...model,
-                supportedOperations: TOOL_IMAGE_OPERATIONS.filter((operation) =>
-                  model.supportedOperations.includes(operation),
+                supportedOperations: model.supportedOperations.filter(
+                  (operation): operation is ToolImageOperation =>
+                    TOOL_IMAGE_OPERATIONS.some((allowed) => allowed === operation),
                 ),
               })),
             };

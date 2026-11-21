@@ -1245,7 +1245,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
             ...route,
             paramSpec: {
               ...route.paramSpec,
-              supportedOperations: ['generate', 'edit', 'outpaint'] as const,
+              supportedOperations: ['edit', 'outpaint', 'generate'] as const,
               allowOutpaintGeometry: true,
             },
             source: 'Synthetic outpaint capability for isolated Profile regression',
@@ -1664,7 +1664,7 @@ export function apply(ctx: Context) {
     const seed45Summary = listOutput.models.find((item) => item.modelId === 'doubao-seedream-4.5')!;
     expect(seed45Summary.allowedOutputFormats).toEqual([]);
     const gptSummary = listOutput.models.find((item) => item.modelId === 'gpt-image-2');
-    expect(gptSummary?.supportedOperations).toEqual(['generate', 'edit']);
+    expect(gptSummary?.supportedOperations).toEqual(['edit', 'generate']);
 
     // Live SSE whitelist: only submit_image_job cards projected, zero list_image_models or raw tool/call
     const turn1ToolFrames = turn1Frames.filter((frame) => frame.event === 'tool');

@@ -3,7 +3,11 @@ import { sha256Utf8 } from '@mio/foundation/hash';
 import { MaterialError } from './contracts.ts';
 import type { MaterialPrincipal } from './contracts.ts';
 import { materialAuthView, materialAuthEnvelope } from './auth-contracts.ts';
-import type { MaterialAuthUpstream, MaterialAuthRow } from './auth-contracts.ts';
+import type {
+  MaterialAuthUpstream,
+  MaterialAuthRow,
+  MaterialAuthStatusRow,
+} from './auth-contracts.ts';
 import type { MaterialAuthStore } from './auth-store.ts';
 import type { ProviderService } from '../providers/service.ts';
 import { ProviderError } from '../providers/contracts.ts';
@@ -44,7 +48,7 @@ export function createMaterialAuthService(
     );
     return action;
   };
-  const view = (row: MaterialAuthRow) => materialAuthView(row, origin);
+  const view = (row: MaterialAuthStatusRow | MaterialAuthRow) => materialAuthView(row, origin);
   const verify = async (row: MaterialAuthRow) => {
     if (row.state === 'completed') return view(row);
     if (row.state === 'expired') throw new MaterialError(410, 'AUTH_EXPIRED');
@@ -102,7 +106,7 @@ export function createMaterialAuthService(
         if (old) return view(old);
         const snapshot = await credentials.snapshotAccount(actor.userId);
         const { session, fresh } = await store.begin(actor.userId, requestId, inputHash, snapshot);
-        if (!fresh) return view(await store.get(session.id, actor.userId));
+        if (!fresh) return view(await store.status(actor.userId, session.id));
         let attempted = false,
           returned = false;
         let createAuditId: string | null = null;
@@ -145,11 +149,11 @@ export function createMaterialAuthService(
             )
             .catch(() => {});
         }
-        return view(await store.get(session.id, actor.userId));
+        return view(await store.status(actor.userId, session.id));
       });
     },
     get(actor: MaterialPrincipal, id: string) {
-      return admit(async () => view(await store.get(id, actor.userId)));
+      return admit(async () => view(await store.status(actor.userId, id)));
     },
     launch(id: string) {
       return admit(async () => {

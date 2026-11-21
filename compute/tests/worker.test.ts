@@ -329,10 +329,13 @@ describe('worker journal and real ffmpeg', () => {
     await worker.reconcileOne();
     expect(journal.get(input.attemptId)).toMatchObject({ ackDispatched: false, cleaned: true });
     expect(existsSync(paths(root, input.attemptId).input)).toBe(false);
+    const readAttempt = vi.spyOn(journal, 'get');
     let dispatched = false;
     await worker.handle(input, () => {
       dispatched = true;
     });
+    expect(readAttempt).toHaveBeenCalledTimes(4);
+    readAttempt.mockRestore();
     expect(dispatched).toBe(true);
     expect(downloads).toBe(0);
     expect(journal.lastEvent(input.attemptId)?.message.messageId).toBe(terminal.messageId);

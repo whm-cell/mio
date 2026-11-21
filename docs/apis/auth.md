@@ -57,19 +57,19 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：200 和以下一个状态；不返回用户资料、Session token 或供应商凭据。
 
-| status    | 含义                                                                                                                   |
-| --------- | ---------------------------------------------------------------------------------------------------------------------- |
-| pending   | 尚未由本次微信 callback 完成授权。                                                                                     |
-| confirmed | 本次 callback 已产生 Session，当前浏览器 Session 有效且属于该确认用户；这一响应同时在数据库行锁内将记录转为 consumed。 |
-| failed    | 对应 callback 授权失败；不返回供应商原始错误或内部失败原因码。                                                         |
-| expired   | 已超过 5 分钟；即使此前 confirmed、failed 或 consumed，过期检查也优先返回此状态。                                      |
-| consumed  | 有效期内的成功结果已经被首次 confirmed 轮询消费，不能再次取得确认结果。                                                |
+| status    | 含义                                                                                                                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------------- |
+| pending   | 尚未由本次微信 callback 完成授权。                                                                                         |
+| confirmed | 本次 callback 已产生 Session，当前浏览器 Session 有效且属于该确认用户；服务端锁定该 QR 记录并重验期限后原子转为 consumed。 |
+| failed    | 对应 callback 授权失败；不返回供应商原始错误或内部失败原因码。                                                             |
+| expired   | 已超过 5 分钟；即使此前 confirmed、failed 或 consumed，过期检查也优先返回此状态。                                          |
+| consumed  | 有效期内的成功结果已经被首次 confirmed 轮询消费，不能再次取得确认结果。                                                    |
 
 不提供无法可靠观察的 scanned。并发轮询至多一个返回 confirmed；其他请求读取 consumed。若记录已被后续创建清理，则返回未知 ID 的 404，不承诺永久保留 expired 状态。
 
 错误：未知或无效 ID 为 404 `NOT_FOUND`，此判断不要求 Cookie；已知 ID 缺少或错配 QR Cookie 为 400 `STATE_MISMATCH`。confirmed 状态下 Session 缺失、过期、撤销或用户不符为 401 `UNAUTHORIZED`，且不消费记录。微信关闭为 503 `WECHAT_UNAVAILABLE`，数据库或会话查询失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法和限流沿共同约定。
 
-副作用：读取并按有效期更新 QR 状态；首次合格确认在同一事务中消费成功结果。poll 不新建、不续期也不发放 Session Cookie；前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
+副作用：稳定 pending 只执行一次 QR 状态读取，无行锁或写入。确认事务先锁定已验证的 Session 并核对归属，再锁定原 QR 记录。取得锁后以同一数据库时刻核对两者有效期，首次合格请求按原 QR Cookie 和确认用户原子消费。到期记录按原 QR Cookie 收敛为 expired。poll 不新建、不续期也不发放 Session Cookie。前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
 
 ## POST /api/auth/sign-in/social
 

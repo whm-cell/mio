@@ -263,9 +263,7 @@ export class Worker {
     this.#busy = true;
     this.#activeAttemptId = command.attemptId;
     try {
-      let attempt = this.#journal.get(command.attemptId);
-      if (attempt) attempt = this.#journal.accept(command);
-      if (!attempt) attempt = this.#journal.accept(command);
+      const attempt = this.#journal.accept(command);
       if (
         [
           'launching',

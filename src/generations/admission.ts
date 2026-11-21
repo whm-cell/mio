@@ -3,16 +3,20 @@ import { createId, isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs } from '@mio/foundation/time';
 import {
+  IMAGE_GEOMETRY_EDGES,
   IMAGE_MAX_MESSAGE_BYTES,
   canonicalImageRouteConfig,
+  canonicalImageValue,
   isImageDriver,
   isValidImageAssetObjectKey,
   imageReferencesWithinBudget,
+  validImageGeometry,
   validateImageInputByRoute,
   validateImageRouteConfig,
 } from './contracts.ts';
 import type {
   ImageAssetRef,
+  ImageGeometryEdge,
   ImageInput,
   ImageOperation,
   ImageRequestParameters,
@@ -22,51 +26,99 @@ import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 import type { GenerationRequest } from './execution.ts';
-import type { GenerationStore, ImageRequestRecord } from './store.ts';
+import type { GenerationStore, ImageInputAsset, ImageRequestRecord } from './store.ts';
 import type { GenerationFiles } from './files.ts';
 import { GenerationError } from './errors.ts';
+
+const parameterKinds = {
+  prompt: 'string',
+  async: 'boolean',
+  operation: 'string',
+  imageAssetId: 'string',
+  imageAssetIds: 'assetIds',
+  maskAssetId: 'string',
+  geometry: 'geometry',
+  n: 'number',
+  background: 'string',
+  moderation: 'string',
+  quality: 'string',
+  size: 'string',
+  aspect_ratio: 'string',
+  output_format: 'string',
+  output_compression: 'number',
+  user: 'string',
+} as const satisfies Record<keyof ImageRequestParameters, string>;
 
 function inputError(): never {
   throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
 }
 
 function validateRequest(requestId: string, modelRef: string, parameters: ImageRequestParameters) {
-  const fields = [
-    'prompt',
-    'async',
-    'operation',
-    'imageAssetId',
-    'imageAssetIds',
-    'maskAssetId',
-    'geometry',
-    'n',
-    'background',
-    'moderation',
-    'quality',
-    'size',
-    'aspect_ratio',
-    'output_format',
-    'output_compression',
-    'user',
-  ];
   if (
     !isUuidV4(requestId) ||
     typeof modelRef !== 'string' ||
     !parameters ||
     typeof parameters.prompt !== 'string' ||
     !parameters.prompt.trim() ||
-    parameters.prompt.length > 32000 ||
-    Object.keys(parameters).some((key) => !fields.includes(key)) ||
-    (parameters.async !== undefined && typeof parameters.async !== 'boolean')
+    parameters.prompt.length > 32000
   )
     inputError();
+  // Check the input shape before hashing. Routing and asset checks still run
+  // only after looking for an already admitted request.
+  let replayOnly = false;
+  for (const [key, value] of Object.entries(parameters)) {
+    if (!Object.hasOwn(parameterKinds, key)) inputError();
+    if (value === undefined) continue;
+    // Prior releases could save these null values in the request hash.
+    if (
+      value === null &&
+      (key === 'operation' || (key === 'imageAssetIds' && parameters.operation === 'generate'))
+    ) {
+      replayOnly = true;
+      continue;
+    }
+    const kind = parameterKinds[key as keyof ImageRequestParameters];
+    if (kind === 'geometry') {
+      if (!validImageGeometry(value)) inputError();
+    } else if (kind === 'assetIds') {
+      if (!Array.isArray(value) || value.some((id: unknown) => typeof id !== 'string'))
+        inputError();
+    } else if (typeof value !== kind) inputError();
+  }
+  return replayOnly;
 }
 
 function requestHash(modelRef: string, parameters: ImageRequestParameters): string {
-  const normalized = Object.fromEntries(
-    Object.entries(parameters).sort(([a], [b]) => a.localeCompare(b)),
+  return sha256Utf8(JSON.stringify([modelRef, canonicalImageValue(parameters)]));
+}
+
+function geometryKeyOrders(edges: readonly ImageGeometryEdge[]): ImageGeometryEdge[][] {
+  if (edges.length === 0) return [[]];
+  return edges.flatMap((edge) =>
+    geometryKeyOrders(edges.filter((other) => other !== edge)).map((rest) => [edge, ...rest]),
   );
-  return sha256Utf8(JSON.stringify([modelRef, normalized]));
+}
+
+const LEGACY_GEOMETRY_ORDERS = geometryKeyOrders(IMAGE_GEOMETRY_EDGES);
+
+function matchesRequestHash(
+  savedHash: string,
+  modelRef: string,
+  parameters: ImageRequestParameters,
+  hash = requestHash(modelRef, parameters),
+): boolean {
+  if (savedHash === hash) return true;
+  const { geometry } = parameters;
+  if (geometry === undefined) return false;
+  // Older hashes sorted only the top-level keys. Geometry has four keys and
+  // is the only nested object in accepted inputs, so at most 24 orders can match.
+  const normalized = canonicalImageValue(parameters) as ImageRequestParameters;
+  return LEGACY_GEOMETRY_ORDERS.some((order) => {
+    const ordered = Object.fromEntries(order.map((edge) => [edge, geometry[edge]]));
+    return (
+      savedHash === sha256Utf8(JSON.stringify([modelRef, { ...normalized, geometry: ordered }]))
+    );
+  });
 }
 
 function toolParameters(
@@ -162,14 +214,11 @@ function capability(
 }
 
 async function inputAsset(
-  store: GenerationStore,
   head: AssetObjectStore['head'],
-  owner: string,
   id: string,
+  asset: ImageInputAsset | undefined,
   mask = false,
 ): Promise<ImageAssetRef> {
-  if (!isUuidV4(id)) inputError();
-  const asset = await store.imageInput(owner, id);
   if (
     !asset ||
     !asset.raw_key.startsWith(
@@ -218,24 +267,33 @@ export function createGenerationAdmission(
     intent: ImageRequestParameters,
     tool?: { signal: AbortSignal },
   ) => {
-    validateRequest(requestId, modelRef, intent);
+    const replayOnly = validateRequest(requestId, modelRef, intent);
     tool?.signal.throwIfAborted();
+    if (replayOnly && references(intent).ids.some((id) => !isUuidV4(id))) inputError();
     const httpHash = tool ? undefined : requestHash(modelRef, intent);
     // Tool retries use the winning job's defaults, including jobs admitted before this lookup.
-    const matchesTool = tool
-      ? (record: ImageRequestRecord) =>
-          record.input_hash === requestHash(modelRef, toolParameters(intent, record))
-      : undefined;
+    const existingRequest = {
+      includeToolDefaults: Boolean(tool),
+      matches(record: ImageRequestRecord) {
+        const parameters = tool ? toolParameters(intent, record) : intent;
+        return matchesRequestHash(record.input_hash, modelRef, parameters, httpHash);
+      },
+    };
     const replay = async () => {
-      const previous = await store.imageRequest(actor.userId, requestId, Boolean(matchesTool));
+      const previous = await store.imageRequest(
+        actor.userId,
+        requestId,
+        existingRequest.includeToolDefaults,
+      );
       tool?.signal.throwIfAborted();
       if (!previous) return;
-      if (matchesTool ? !matchesTool(previous) : previous.input_hash !== httpHash)
+      if (!existingRequest.matches(previous))
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
       return store.imageGet(actor.userId, previous.id);
     };
     const previous = await replay();
     if (previous) return previous;
+    if (replayOnly) inputError();
     try {
       if (await store.storageBlocked())
         throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
@@ -256,11 +314,20 @@ export function createGenerationAdmission(
         : intent;
       const { operation, ids } = httpReferences ?? references(parameters);
       const route = capability(snapshot, parameters, operation, ids.length);
-      const images = await Promise.all(ids.map((id) => inputAsset(store, head, actor.userId, id)));
+      // Apply the multipart restriction to new admissions. Frozen jobs retain their wire behavior.
+      if (
+        route.driver === 'openai-images' &&
+        operation !== 'generate' &&
+        parameters.aspect_ratio !== undefined
+      )
+        inputError();
+      if (ids.some((id) => !isUuidV4(id))) inputError();
+      const maskId = parameters.maskAssetId;
+      const assetIds = maskId === undefined || ids.includes(maskId) ? ids : [...ids, maskId];
+      const assets = await store.imageInputs(actor.userId, assetIds);
+      const images = await Promise.all(ids.map((id) => inputAsset(head, id, assets.get(id))));
       const mask =
-        parameters.maskAssetId !== undefined
-          ? await inputAsset(store, head, actor.userId, parameters.maskAssetId, true)
-          : undefined;
+        maskId === undefined ? undefined : await inputAsset(head, maskId, assets.get(maskId), true);
       const {
         imageAssetId,
         imageAssetIds: _imageAssetIds,
@@ -338,7 +405,7 @@ export function createGenerationAdmission(
         command,
         admitted,
         snapshot,
-        matchesTool,
+        existingRequest,
       );
       return store.imageGet(actor.userId, id);
     } catch (error) {

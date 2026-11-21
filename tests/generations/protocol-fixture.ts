@@ -289,6 +289,13 @@ export function registerVendorRoutingCases() {
       expect(editRes.state).toBe('returned');
       expect(calls[0]?.url).toBe('https://api.onelinkai.cloud/v1/images/generations');
       expect(calls[1]?.url).toBe('https://api.onelinkai.cloud/v1/images/edits');
+      expect(calls[1]?.body).toEqual([
+        ['model', 'gpt-image-1'],
+        ['prompt', 'replace sky'],
+        ['response_format', 'b64_json'],
+        ['image', 'image.png'],
+        ['mask', 'mask.png'],
+      ]);
       const serialized = JSON.stringify(calls[1]?.body);
       expect(serialized).not.toContain(ref.assetId);
       expect(serialized).not.toContain(ref.key);

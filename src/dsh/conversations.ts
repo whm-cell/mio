@@ -6,6 +6,7 @@ import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
 import type { TurnEndReason } from '@deepseek-ai/dsh-session';
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
 import type { ConversationConfig } from '../conversations/config.ts';
+import { outputTruncation } from '../conversations/contracts.ts';
 import type {
   ConversationEngine,
   ConversationImageTools,
@@ -115,8 +116,9 @@ export function createDshConversationEngine(
         }
         if (event.type === 'turn/end') {
           const reason = event.data.reason;
+          const truncated = reason.kind === outputTruncation.reason;
           const status =
-            reason.kind === 'completed'
+            reason.kind === 'completed' || truncated
               ? 'completed'
               : reason.kind === 'interrupted'
                 ? 'interrupted'
@@ -125,7 +127,12 @@ export function createDshConversationEngine(
                     ? 'cancelled'
                     : 'interrupted'
                   : 'failed';
-          items.push({ seq: event.seq, role: 'status', status });
+          items.push({
+            seq: event.seq,
+            role: 'status',
+            status,
+            ...(truncated ? { truncation: outputTruncation } : {}),
+          });
         }
         if (items.length > limit) break;
       }
@@ -289,7 +296,7 @@ export function createDshConversationEngine(
           // A disposed session can leave only a durable prefix, with no turn/end
           // event. Cold replay then reports interruption, not a definite failure.
           if (!end || end.kind === 'interrupted') return 'unknown' as const;
-          if (end.kind === 'completed') return 'completed' as const;
+          if (end.kind === 'completed' || end.kind === outputTruncation.reason) return end.kind;
           if (end.kind === 'aborted' && end.reason.kind === 'user') return 'cancelled' as const;
           if (end.kind === 'aborted' && end.reason.kind === 'disposed') return 'unknown' as const;
           return 'failed' as const;

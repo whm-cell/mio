@@ -2,19 +2,6 @@ import type { ImageInput } from './image-routes.ts';
 
 export * from './image-routes.ts';
 
-export type ImageErrorCode =
-  | 'IMAGE_INPUT_INVALID'
-  | 'IMAGE_REFERENCE_LIMIT'
-  | 'IMAGE_AUTH'
-  | 'IMAGE_LIMITED'
-  | 'IMAGE_REJECTED'
-  | 'IMAGE_SUBMISSION_UNKNOWN'
-  | 'IMAGE_QUERY_UNKNOWN'
-  | 'IMAGE_QUERY_FAILED'
-  | 'IMAGE_QUERY_LIMIT'
-  | 'IMAGE_CREDENTIAL_UNAVAILABLE'
-  | 'IMAGE_HANDLER_UNAVAILABLE';
-
 const uuidText = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
 const uuid = new RegExp(`^${uuidText}$`);
 const imageKey = new RegExp(`^([0-9]|1[0-5])-(${uuidText})\\.(png|jpeg|webp)$`);

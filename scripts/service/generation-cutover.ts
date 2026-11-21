@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access, lstat, readFile } from 'node:fs/promises';
+import { access, lstat, readFile, statfs } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -288,7 +288,9 @@ export async function inspectGenerationCutover(
   try {
     const stat = await lstat(options.dataDirectory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('DIRECTORY_PATH');
-    await access(options.dataDirectory, constants.R_OK | constants.W_OK);
+    await access(options.dataDirectory, constants.R_OK | constants.W_OK | constants.X_OK);
+    const disk = await statfs(options.dataDirectory, { bigint: true });
+    if (disk.bavail * disk.bsize <= 0n) throw new Error('DIRECTORY_FULL');
     directory = 'writable';
   } catch {
     blockers.push('A_GENERATION_DIRECTORY_UNAVAILABLE');

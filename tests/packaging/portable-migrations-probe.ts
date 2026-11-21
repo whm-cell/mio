@@ -1,17 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Pool } from 'pg';
 import { authDatabase } from '../support/auth-database.ts';
+import { portableComponent, portableRoot } from './portable-root.ts';
 
-const argument = process.argv[2];
-if (!argument) throw new Error('PORTABLE_ARTIFACT_ROOT_REQUIRED');
-const root = realpathSync(argument);
-const workspace = realpathSync('.');
-if (root === workspace || root.startsWith(`${workspace}${sep}`))
-  throw new Error('PORTABLE_ROOT_MUST_BE_OUTSIDE_WORKSPACE');
+const root = portableRoot(process.argv[2]);
+const a = portableComponent(root, 'a');
 const database = await authDatabase();
 const pool = new Pool({ connectionString: database.observerURL });
 const env: NodeJS.ProcessEnv = {
@@ -22,17 +18,18 @@ const env: NodeJS.ProcessEnv = {
   MIO_AUTH_SECRET: randomBytes(40).toString('hex'),
   MIO_AUTH_RATE_LIMIT_BACKEND: 'database',
   MIO_ASSETS_DATABASE_URL: database.url,
+  MIO_CONVERSATIONS_DATABASE_URL: database.url,
 };
 const migrate = (name: string) => {
   const result = spawnSync(
     process.execPath,
-    [join(root, 'a/dist/tools/scripts/service', `migrate-${name}.js`), '--apply'],
+    [join(a, 'dist/tools/scripts/service', `migrate-${name}.js`), '--apply'],
     { cwd: root, env, encoding: 'utf8', timeout: 30000 },
   );
   if (result.status !== 0) throw new Error(`PORTABLE_MIGRATION_FAILED:${name}`);
 };
 try {
-  for (const name of ['auth', 'assets']) migrate(name);
+  for (const name of ['auth', 'assets', 'conversations']) migrate(name);
   const id = randomUUID();
   await pool.query(
     `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at)
@@ -55,7 +52,8 @@ try {
   );
   console.log('PORTABLE_COMPUTE_MIGRATION_EXISTING_ASSET_OK');
 
-  for (const name of ['auth', 'assets', 'compute', 'generations', 'materials']) migrate(name);
+  for (const name of ['auth', 'assets', 'compute', 'conversations', 'generations', 'materials'])
+    migrate(name);
   assert.deepEqual((await readOriginal()).rows, expected, 'repeated migration changed the asset');
   await pool.query('SELECT id FROM mio_compute_jobs LIMIT 0');
   await pool.query('SELECT id FROM mio_compute_outbox LIMIT 0');
@@ -72,6 +70,9 @@ try {
   );
   console.log('PORTABLE_AUTH_ASSET_COMPUTE_MIGRATIONS_OK');
   console.log('PORTABLE_GENERATIONS_MIGRATION_EXISTING_ASSET_OK');
+  await pool.query('SELECT id FROM mio_conversations LIMIT 0');
+  await pool.query('SELECT conversation_id,request_id FROM mio_conversation_requests LIMIT 0');
+  console.log('PORTABLE_CONVERSATIONS_MIGRATION_OK');
   await pool.query('SELECT id FROM mio_material_groups LIMIT 0');
   await pool.query('SELECT id FROM mio_materials LIMIT 0');
   await pool.query('SELECT id FROM mio_material_operations LIMIT 0');

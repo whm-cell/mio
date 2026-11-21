@@ -154,7 +154,7 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 
 ## 图片生成迁移与切换
 
-先暂停新的图片提交但继续历史查询。对媒体库执行增量迁移，再运行 `node scripts/service/local.ts dev generations-preflight`（或 test）；默认只读，不发送供应商生成请求。它核对旧 PG 状态/outbox、旧图片命令和 DLQ 的消息与消费者、B journal 的未完成项及未确认上传身份，并检查 A 目录。目录缺失先创建权限为 700 的专属目录；不自动删除现有内容。
+先暂停新的图片提交但继续历史查询。对媒体库执行增量迁移，再运行 `node scripts/service/local.ts dev generations-preflight`（或 test）；默认只读，不发送供应商生成请求。它核对旧 PG 状态/outbox、旧图片命令和 DLQ 的消息与消费者、B journal 的未完成项及未确认上传身份，并确认 A 目录可读、可写、可进入且磁盘有可用空间。目录检查不创建文件。目录缺失先创建权限为 700 的专属目录；不自动删除现有内容。
 
 旧 B 的 `partial` 要与 journal 完成记录中的任务、命令和请求数量对账，并逐项核对 PG 已登记产物的原序号、对象键、类型和大小。早期数组载荷需要至少一项能与 PG 核对的实际产物，且所有产物都要一致。journal 缺失、缺少对应终态记录或证据不符时，预检报告 `LEGACY_IMAGE_PARTIALS_UNRECONCILED` 并停止切换。已对账的旧部分结果保留 `partial` 状态，未确认上传仍单独阻断。仅有已确认的完整旧历史或 A 自有任务时，继续核对其余门禁。
 

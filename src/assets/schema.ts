@@ -15,8 +15,8 @@ CREATE TABLE IF NOT EXISTS mio_assets (
 CREATE INDEX IF NOT EXISTS mio_assets_cleanup ON mio_assets(expires_at)
   WHERE staging_deleted_at IS NULL;`;
 
-export async function checkAssetSchema(pool: Pool): Promise<void> {
-  const result = await pool.query(
+export async function checkAssetSchema(database: Pick<Pool, 'query'>): Promise<void> {
+  const result = await database.query(
     'SELECT id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,lease_id,lease_until,created_at,expires_at,staging_deleted_at FROM mio_assets LIMIT 0',
   );
   const types = [2950, 25, 25, 25, 20, 25, 25, 25, 25, 2950, 1184, 1184, 1184, 1184];

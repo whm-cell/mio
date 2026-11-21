@@ -9,6 +9,7 @@ import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import type { Authentication } from '../../src/auth/service.ts';
+import { pollWechatQR } from '../../src/auth/wechat-qr-store.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
@@ -605,6 +606,47 @@ it('requires the confirmed user session and does not consume QR for another or r
   expect(
     (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [qr.id])).rows[0].status,
   ).toBe('confirmed');
+});
+
+it('uses one transaction connection to check the current session before consuming a confirmed QR', async () => {
+  const owner = await identity(await emailUser());
+  const id = randomUUID();
+  const digest = 'fixture-confirmed-qr';
+  await pool.query(
+    `INSERT INTO "mioWechatQR" (id,"cookieHash",status,"userId","confirmedAt","expiresAt")
+     VALUES ($1,$2,'confirmed',$3,now(),now()+interval '5 minutes')`,
+    [id, digest, owner.userId],
+  );
+  const claimPool = new Pool({
+    connectionString: database.url,
+    max: 1,
+    connectionTimeoutMillis: 2000,
+  });
+  try {
+    const client = await claimPool.connect();
+    const trace = vi.spyOn(client, 'query');
+    client.release();
+    await expect(pollWechatQR(claimPool, id, digest, async () => owner)).resolves.toEqual({
+      status: 'confirmed',
+    });
+    const statements = trace.mock.calls.map(([query]) =>
+      typeof query === 'string' ? query : (query as { text?: string }).text,
+    );
+    expect(statements.slice(statements.indexOf('BEGIN'))).toEqual([
+      'BEGIN',
+      expect.stringContaining('SET LOCAL lock_timeout'),
+      expect.stringContaining('SET LOCAL statement_timeout'),
+      expect.stringContaining('FROM "session" WHERE id=$1 AND "userId"=$2 FOR SHARE'),
+      expect.stringContaining('FROM "mioWechatQR"'),
+      expect.stringContaining('"expiresAt">statement_timestamp()'),
+      'COMMIT',
+    ]);
+    expect(
+      (await pool.query('SELECT status FROM "mioWechatQR" WHERE id=$1', [id])).rows[0],
+    ).toEqual({ status: 'consumed' });
+  } finally {
+    await claimPool.end();
+  }
 });
 
 it('expires a confirmed QR when its competing row lock is released after the deadline', async () => {

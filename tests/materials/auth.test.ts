@@ -259,6 +259,68 @@ it('settles a lost verification lease from an idempotent view without dropping i
   });
   expect(f.authTransport).toHaveBeenCalledTimes(1);
 });
+it('clears an expired session at the database time after the settlement lock', async () => {
+  const f = await fixture();
+  const p = await pending(f);
+  await f.pool.query(
+    `WITH t AS (SELECT clock_timestamp() AS sampled)
+     UPDATE mio_material_auth_sessions SET state='verifying',lease_id=$2,
+       lease_until=t.sampled-interval '1 second',created_at=t.sampled-interval '1198 seconds',
+       expires_at=t.sampled+interval '2 seconds'
+     FROM t WHERE id=$1`,
+    [p.row.id, randomUUID()],
+  );
+  const blocker = await f.pool.connect();
+  let status: ReturnType<typeof f.authentication.get> | undefined;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT 1 FROM mio_material_auth_sessions WHERE id=$1 FOR UPDATE', [
+      p.row.id,
+    ]);
+    const blockerPid = (await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+      .rows[0]!.pid;
+    status = f.authentication.get(f.actor, p.row.id);
+    await expect
+      .poll(
+        async () =>
+          (
+            await f.pool.query<{ blocked: boolean }>(
+              `SELECT EXISTS (
+                SELECT 1 FROM pg_stat_activity
+                WHERE $1=ANY(pg_blocking_pids(pid))
+                  AND query LIKE 'SELECT 1 FROM mio_material_auth_sessions%FOR UPDATE'
+              ) AS blocked`,
+              [blockerPid],
+            )
+          ).rows[0]?.blocked,
+        { timeout: 1500 },
+      )
+      .toBe(true);
+    await blocker.query(
+      `SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM expires_at-clock_timestamp()))+0.01)
+       FROM mio_material_auth_sessions WHERE id=$1`,
+      [p.row.id],
+    );
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+    await status?.catch(() => {});
+  }
+  expect(await status).toMatchObject({ state: 'expired', errorCode: 'AUTH_EXPIRED' });
+  expect(await f.store.authentication.get(p.row.id, f.actor.userId)).toMatchObject({
+    state: 'expired',
+    lease_id: null,
+    lease_until: null,
+    cipher_format: null,
+    master_key_id: null,
+    nonce: null,
+    ciphertext: null,
+    auth_tag: null,
+    token_digest: p.row.token_digest,
+  });
+  expect(f.authTransport).toHaveBeenCalledTimes(1);
+});
+
 it('retains known creation proof after PG failure for original-session launch/callback recovery and never repeats create across restart', async () => {
   const f = await fixture();
   vi.spyOn(f.store.authentication, 'created').mockRejectedValueOnce(new Error('PG_COMMIT_LOST'));

@@ -88,7 +88,9 @@ export function wechatQRPlugin(baseURL: string, pool: Pool): BetterAuthPlugin {
               query: { disableCookieCache: true, disableRefresh: true },
               asResponse: false,
             });
-            return identity?.user.id;
+            return identity
+              ? { userId: identity.user.id, sessionId: identity.session.id }
+              : undefined;
           }).catch(wechatUnavailable);
           if ('error' in result) return fail(result.error);
           return ctx.json(result);

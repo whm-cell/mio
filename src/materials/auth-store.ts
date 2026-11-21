@@ -15,6 +15,7 @@ const needsSettlement = `((state NOT IN ('completed','expired') AND ${pastDeadli
   OR (state IN ('creating','verifying') AND lease_until<=statement_timestamp()))`;
 const statusFields =
   'id,state,expires_at,group_id,error_code,ciphertext IS NOT NULL AS has_ciphertext';
+const sessionMatch = 'id=$1 AND ($2::text IS NULL OR owner_id=$2)';
 const creationFields = 'id,owner_id,input_hash,lease_id';
 type CreationClaim = Pick<MaterialAuthRow, 'id' | 'owner_id' | 'input_hash' | 'lease_id'>;
 const superseded = () => new MaterialError(409, 'MATERIAL_AUTH_SUPERSEDED');
@@ -49,26 +50,48 @@ export class MaterialAuthStore {
     );
   }
   async get(id: string, owner?: string): Promise<MaterialAuthRow> {
-    await this.settle(id, owner);
-    const stored = (
-      await this.pool.query<MaterialAuthRow>(
-        'SELECT * FROM mio_material_auth_sessions WHERE id=$1 AND ($2::text IS NULL OR owner_id=$2)',
+    const row = (
+      await this.pool.query<MaterialAuthRow & { unsettled: boolean }>(
+        `SELECT *,${needsSettlement} AS unsettled FROM mio_material_auth_sessions WHERE ${sessionMatch}`,
         [id, owner ?? null],
       )
     ).rows[0];
+    const stored = row?.unsettled ? await this.settle<MaterialAuthRow>(id, owner, '*') : row;
     if (!stored) throw new MaterialError(404, 'MATERIAL_NOT_FOUND');
     return stored;
   }
 
-  private async settle(id: string, owner?: string): Promise<void> {
-    await this.pool.query(
-      `UPDATE mio_material_auth_sessions SET
-        state=CASE WHEN ${pastDeadline} THEN 'expired' ELSE 'unknown' END,
-        error_code=CASE WHEN ${pastDeadline} THEN 'AUTH_EXPIRED' ELSE 'UPSTREAM_RESULT_UNKNOWN' END,
-        ${clearExpired},lease_id=NULL,lease_until=NULL,updated_at=now()
-       WHERE id=$1 AND ($2::text IS NULL OR owner_id=$2) AND ${needsSettlement}`,
-      [id, owner ?? null],
-    );
+  private async settle<Row extends MaterialAuthRow | MaterialAuthStatusRow>(
+    id: string,
+    owner: string | undefined,
+    fields: '*' | typeof statusFields,
+  ): Promise<Row | undefined> {
+    return this.transaction(async (client) => {
+      const values = [id, owner ?? null];
+      const locked = await client.query(
+        `SELECT 1 FROM mio_material_auth_sessions WHERE ${sessionMatch} FOR UPDATE`,
+        values,
+      );
+      if (!locked.rowCount) return;
+      // The UPDATE's statement timestamp is sampled after any wait for the session lock.
+      const updated = await client.query<Row>(
+        `UPDATE mio_material_auth_sessions SET
+          state=CASE WHEN ${pastDeadline} THEN 'expired' ELSE 'unknown' END,
+          error_code=CASE WHEN ${pastDeadline} THEN 'AUTH_EXPIRED' ELSE 'UPSTREAM_RESULT_UNKNOWN' END,
+          ${clearExpired},lease_id=NULL,lease_until=NULL,updated_at=statement_timestamp()
+         WHERE ${sessionMatch} AND ${needsSettlement} RETURNING ${fields}`,
+        values,
+      );
+      return (
+        updated.rows[0] ??
+        (
+          await client.query<Row>(
+            `SELECT ${fields} FROM mio_material_auth_sessions WHERE ${sessionMatch}`,
+            values,
+          )
+        ).rows[0]
+      );
+    });
   }
 
   private async readStatus(
@@ -88,14 +111,7 @@ export class MaterialAuthStore {
     if (byRequest && row.input_hash !== requestHash)
       throw new MaterialError(409, 'IDEMPOTENCY_CONFLICT');
     if (!row.unsettled) return row;
-    // A concurrent verifier or expiry cleanup may have settled the row while we read.
-    await this.settle(row.id, owner);
-    return (
-      await this.pool.query<MaterialAuthStatusRow>(
-        `SELECT ${statusFields} FROM mio_material_auth_sessions WHERE owner_id=$1 AND id=$2`,
-        [owner, row.id],
-      )
-    ).rows[0];
+    return this.settle<MaterialAuthStatusRow>(row.id, owner, statusFields);
   }
 
   async status(owner: string, id: string): Promise<MaterialAuthStatusRow> {

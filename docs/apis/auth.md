@@ -69,7 +69,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 错误：未知或无效 ID 为 404 `NOT_FOUND`，此判断不要求 Cookie；已知 ID 缺少或错配 QR Cookie 为 400 `STATE_MISMATCH`。confirmed 状态下 Session 缺失、过期、撤销或用户不符为 401 `UNAUTHORIZED`，且不消费记录。微信关闭为 503 `WECHAT_UNAVAILABLE`，数据库或会话查询失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法和限流沿共同约定。
 
-副作用：稳定 pending 只执行一次 QR 状态读取，无行锁或写入。确认时查验有效 Session，首次合格请求按原 QR Cookie 和确认用户原子消费。到期记录按原 QR Cookie 收敛为 expired；并发确认取得行锁后以数据库时间重验期限。poll 不新建、不续期也不发放 Session Cookie；前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
+副作用：稳定 pending 只执行一次 QR 状态读取，无行锁或写入。确认事务先锁定已验证的 Session 并核对归属，再锁定原 QR 记录。取得锁后以同一数据库时刻核对两者有效期，首次合格请求按原 QR Cookie 和确认用户原子消费。到期记录按原 QR Cookie 收敛为 expired。poll 不新建、不续期也不发放 Session Cookie。前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
 
 ## POST /api/auth/sign-in/social
 

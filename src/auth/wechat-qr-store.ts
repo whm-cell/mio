@@ -24,6 +24,11 @@ interface QRRow {
   expiresAt: Date;
 }
 
+interface SessionIdentity {
+  userId: string;
+  sessionId: string;
+}
+
 async function transaction<T>(pool: Pool, action: (client: PoolClient) => Promise<T>) {
   const client = await pool.connect();
   try {
@@ -113,11 +118,16 @@ async function readWechatQRPoll(pool: Pool, id: string) {
   ).rows[0];
 }
 
-/** Time is checked after obtaining the row lock, even if a competing transaction only locked it. */
-function claimWechatQR(pool: Pool, id: string, cookieHash: string, userId: string) {
+function claimWechatQR(pool: Pool, id: string, cookieHash: string, identity: SessionIdentity) {
   const match = `id=$1 AND "cookieHash"=$2 AND "userId"=$3 AND status='confirmed'`;
   return transaction(pool, async (client) => {
-    const values = [id, cookieHash, userId];
+    // Lock the session before the QR row. The claim shares its ordering with other QR claims.
+    const session = await client.query(
+      'SELECT 1 FROM "session" WHERE id=$1 AND "userId"=$2 FOR SHARE',
+      [identity.sessionId, identity.userId],
+    );
+    if (!session.rowCount) return;
+    const values = [id, cookieHash, identity.userId];
     const locked = await client.query(
       `SELECT 1 FROM "mioWechatQR" WHERE ${match} FOR UPDATE`,
       values,
@@ -125,13 +135,16 @@ function claimWechatQR(pool: Pool, id: string, cookieHash: string, userId: strin
     if (!locked.rowCount) return;
     const saved = (
       await client.query<{ status: 'expired' | 'consumed' }>(
-        `UPDATE "mioWechatQR" SET status=CASE WHEN "expiresAt"<=clock_timestamp() THEN 'expired' ELSE 'consumed' END
-         WHERE ${match} RETURNING status`,
-        values,
+        `UPDATE "mioWechatQR"
+         SET status=CASE WHEN "expiresAt"<=statement_timestamp() THEN 'expired' ELSE 'consumed' END
+         WHERE ${match} AND EXISTS (
+           SELECT 1 FROM "session"
+           WHERE id=$4 AND "userId"=$3 AND "expiresAt">statement_timestamp()
+         ) RETURNING status`,
+        [...values, identity.sessionId],
       )
     ).rows[0];
-    if (!saved) throw new Error('QR_UNAVAILABLE');
-    return { status: saved.status === 'consumed' ? 'confirmed' : 'expired' } as const;
+    if (saved) return { status: saved.status === 'consumed' ? 'confirmed' : 'expired' } as const;
   });
 }
 
@@ -139,13 +152,13 @@ export async function pollWechatQR(
   pool: Pool,
   id: string,
   cookieHash: string,
-  loadUserId: () => Promise<string | undefined>,
+  loadIdentity: () => Promise<SessionIdentity | undefined>,
 ) {
   let row = await readWechatQRPoll(pool, id);
   if (row?.cookieHash === cookieHash && !row.expired && row.status === 'confirmed') {
-    const userId = await loadUserId();
-    if (userId && userId === row.userId) {
-      const claimed = await claimWechatQR(pool, id, cookieHash, userId);
+    const identity = await loadIdentity();
+    if (identity && identity.userId === row.userId) {
+      const claimed = await claimWechatQR(pool, id, cookieHash, identity);
       if (claimed) return claimed;
     }
     row = await readWechatQRPoll(pool, id);

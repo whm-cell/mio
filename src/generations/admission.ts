@@ -30,40 +30,52 @@ import type { GenerationStore, ImageRequestRecord } from './store.ts';
 import type { GenerationFiles } from './files.ts';
 import { GenerationError } from './errors.ts';
 
+const parameterKinds = {
+  prompt: 'string',
+  async: 'boolean',
+  operation: 'string',
+  imageAssetId: 'string',
+  imageAssetIds: 'assetIds',
+  maskAssetId: 'string',
+  geometry: 'geometry',
+  n: 'number',
+  background: 'string',
+  moderation: 'string',
+  quality: 'string',
+  size: 'string',
+  aspect_ratio: 'string',
+  output_format: 'string',
+  output_compression: 'number',
+  user: 'string',
+} as const satisfies Record<keyof ImageRequestParameters, string>;
+
 function inputError(): never {
   throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
 }
 
 function validateRequest(requestId: string, modelRef: string, parameters: ImageRequestParameters) {
-  const fields = [
-    'prompt',
-    'async',
-    'operation',
-    'imageAssetId',
-    'imageAssetIds',
-    'maskAssetId',
-    'geometry',
-    'n',
-    'background',
-    'moderation',
-    'quality',
-    'size',
-    'aspect_ratio',
-    'output_format',
-    'output_compression',
-    'user',
-  ];
   if (
     !isUuidV4(requestId) ||
     typeof modelRef !== 'string' ||
     !parameters ||
     typeof parameters.prompt !== 'string' ||
     !parameters.prompt.trim() ||
-    parameters.prompt.length > 32000 ||
-    Object.keys(parameters).some((key) => !fields.includes(key)) ||
-    (parameters.async !== undefined && typeof parameters.async !== 'boolean')
+    parameters.prompt.length > 32000
   )
     inputError();
+  // Check the input shape before hashing. Routing and asset checks still run
+  // only after looking for an already admitted request.
+  for (const [key, value] of Object.entries(parameters)) {
+    if (!Object.hasOwn(parameterKinds, key)) inputError();
+    if (value === undefined) continue;
+    const kind = parameterKinds[key as keyof ImageRequestParameters];
+    if (kind === 'geometry') {
+      if (!validImageGeometry(value)) inputError();
+    } else if (kind === 'assetIds') {
+      if (!Array.isArray(value) || value.some((id: unknown) => typeof id !== 'string'))
+        inputError();
+    } else if (typeof value !== kind) inputError();
+  }
 }
 
 function requestHash(modelRef: string, parameters: ImageRequestParameters): string {
@@ -87,7 +99,7 @@ function matchesRequestHash(
 ): boolean {
   if (savedHash === hash) return true;
   const { geometry } = parameters;
-  if (!validImageGeometry(geometry)) return false;
+  if (geometry === undefined) return false;
   // Older hashes sorted only the top-level keys. Geometry has four keys and
   // is the only nested object in accepted inputs, so at most 24 orders can match.
   const normalized = canonicalImageValue(parameters) as ImageRequestParameters;

@@ -31,6 +31,10 @@ export interface MaterialAuthRow {
   updated_at: Date;
   expires_at: Date;
 }
+export type MaterialAuthStatusRow = Pick<
+  MaterialAuthRow,
+  'id' | 'state' | 'expires_at' | 'group_id' | 'error_code'
+> & { has_ciphertext: boolean };
 export interface MaterialAuthView {
   sessionId: string;
   state: MaterialAuthState;
@@ -53,11 +57,15 @@ export interface MaterialAuthUpstream {
   ): Promise<{ groupId: string; requestId: string | null }>;
   verifiedGroup(key: string, id: string, signal: AbortSignal): Promise<string | null>;
 }
-export function materialAuthView(row: MaterialAuthRow, origin: string): MaterialAuthView {
+export function materialAuthView(
+  row: MaterialAuthStatusRow | MaterialAuthRow,
+  origin: string,
+): MaterialAuthView {
+  const hasCiphertext = 'has_ciphertext' in row ? row.has_ciphertext : row.ciphertext !== null;
   return {
     sessionId: row.id,
     state: row.state,
-    ...(['pending', 'unknown'].includes(row.state) && row.ciphertext
+    ...(['pending', 'unknown'].includes(row.state) && hasCiphertext
       ? { launchUrl: `${origin}/api/v1/materials/auth-sessions/${row.id}/launch` }
       : {}),
     expiresAt: row.expires_at.toISOString(),

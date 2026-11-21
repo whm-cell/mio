@@ -113,12 +113,18 @@ it('persists creation intent before one remote call, stores only encrypted launc
   expect(JSON.stringify(view)).not.toMatch(/synthetic|H5Link|BytedToken|ciphertext/);
   const open = vi.spyOn(f.provider, 'openMaterialAuth');
   const calls = f.authTransport.mock.calls.length;
-  expect(await f.authentication.get(f.actor, view.sessionId)).toEqual(view);
+  const blocker = await f.pool.connect();
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE mio_material_auth_sessions IN SHARE MODE');
+    expect(await f.authentication.get(f.actor, view.sessionId)).toEqual(view);
+    expect(await f.authentication.create(f.actor, request, 'materials', 'materials')).toEqual(view);
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+  }
   expect(open).not.toHaveBeenCalled();
   expect(f.authTransport).toHaveBeenCalledTimes(calls);
-  expect(
-    (await f.authentication.create(f.actor, request, 'materials', 'materials')).sessionId,
-  ).toBe(view.sessionId);
   expect(
     f.authTransport.mock.calls.filter(([url]) =>
       String(url).includes('Action=CreateVisualValidateSession'),
@@ -193,9 +199,26 @@ it('expires logical access at20minutes and clears all reversible secrets on acce
   const f = await fixture(),
     p = await pending(f);
   await f.pool.query(
-    "UPDATE mio_material_auth_sessions SET created_at=created_at-interval '21 minutes',expires_at=expires_at-interval '21 minutes' WHERE id=$1",
-    [p.row.id],
+    `UPDATE mio_material_auth_sessions SET created_at=created_at-interval '21 minutes',
+      expires_at=expires_at-interval '21 minutes',state='verifying',lease_id=$2,
+      lease_until=now()-interval '1 minute' WHERE id=$1`,
+    [p.row.id, randomUUID()],
   );
+  await expect(
+    f.authentication.get({ userId: 'other', sessionId: 'other' }, p.row.id),
+  ).rejects.toMatchObject({ code: 'MATERIAL_NOT_FOUND' });
+  expect(
+    (await f.pool.query('SELECT state FROM mio_material_auth_sessions WHERE id=$1', [p.row.id]))
+      .rows[0]?.state,
+  ).toBe('verifying');
+  const views = await Promise.all(
+    Array.from({ length: 2 }, () => f.authentication.get(f.actor, p.row.id)),
+  );
+  expect(views).toMatchObject([
+    { state: 'expired', errorCode: 'AUTH_EXPIRED' },
+    { state: 'expired', errorCode: 'AUTH_EXPIRED' },
+  ]);
+  expect(views.every((view) => !view.launchUrl)).toBe(true);
   await expect(f.authentication.launch(p.row.id)).rejects.toMatchObject({ code: 'AUTH_EXPIRED' });
   const row = await f.store.authentication.get(p.row.id);
   expect(row).toMatchObject({
@@ -210,6 +233,31 @@ it('expires logical access at20minutes and clears all reversible secrets on acce
   await expect(f.authentication.complete(p.row.id, p.token, '10000')).rejects.toMatchObject({
     code: 'AUTH_EXPIRED',
   });
+});
+it('settles a lost verification lease from an idempotent view without dropping its recovery proof', async () => {
+  const f = await fixture();
+  const request = randomUUID();
+  const p = await f.authentication.create(f.actor, request, 'materials', 'materials');
+  await f.pool.query(
+    `UPDATE mio_material_auth_sessions SET state='verifying',lease_id=$2,
+      lease_until=now()-interval '1 minute' WHERE id=$1`,
+    [p.sessionId, randomUUID()],
+  );
+  await expect(
+    f.store.authentication.previous(f.actor.userId, request, 'a'.repeat(64)),
+  ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  expect(await f.authentication.create(f.actor, request, 'materials', 'materials')).toMatchObject({
+    state: 'unknown',
+    errorCode: 'UPSTREAM_RESULT_UNKNOWN',
+    launchUrl: p.launchUrl,
+  });
+  expect(await f.store.authentication.get(p.sessionId, f.actor.userId)).toMatchObject({
+    lease_id: null,
+    lease_until: null,
+    ciphertext: expect.any(Buffer),
+    token_digest: expect.any(String),
+  });
+  expect(f.authTransport).toHaveBeenCalledTimes(1);
 });
 it('retains known creation proof after PG failure for original-session launch/callback recovery and never repeats create across restart', async () => {
   const f = await fixture();

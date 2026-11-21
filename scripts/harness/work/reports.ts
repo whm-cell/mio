@@ -2,7 +2,7 @@ import { stat } from 'node:fs/promises';
 import { dirname, relative } from 'node:path';
 import { format } from 'prettier';
 import { beneath } from '../inventory.ts';
-import { documentCatalog, resolvePrd, resolveDocument, resultDocument } from '../task-documents.ts';
+import { documentCatalog, resolvePrd, resolveDocument } from '../task-documents.ts';
 import { checkedPath, contractPlan, digest, json, sameCandidate } from './records.ts';
 import type { Candidate, Evidence, ResultDetails, Task } from './records.ts';
 import { optionalText } from './report-format.ts';
@@ -15,7 +15,7 @@ import {
   reportPath,
 } from './compact-store.ts';
 import type { ResultBook } from './compact-store.ts';
-import { automatedEvidence } from './evidence.ts';
+import { automatedEvidence, candidateEvidence } from './evidence.ts';
 import { manualEvidenceResult } from './manual-evidence.ts';
 import { artifact } from './original.ts';
 
@@ -105,25 +105,22 @@ export async function readResultInput(root: string, path: string, catalog?: Cata
 }
 
 /** Bind a draft to the originals selected by each current criterion. */
-export async function matchingEvidence(root: string, task: Task, candidate: Candidate) {
+async function matchingEvidence(root: string, task: Task, candidate: Candidate) {
   const selected: Evidence[] = [];
+  const grouped = candidateEvidence(task, candidate);
+  const contract = contractPlan(task);
   for (const criterion of task.plan.acceptance) {
-    const entries = task.evidence.filter(
-      (item) =>
-        item.criterion === criterion.id &&
-        item.method === criterion.method &&
-        sameCandidate(item.candidate, candidate),
-    );
+    const entries = grouped.get(criterion.id) ?? [];
     if (criterion.method === 'automated') {
       const observation = await automatedEvidence(
         root,
         task.plan.id,
         entries,
         criterion.command,
-        contractPlan(task),
+        contract,
       );
       if (observation.result !== 'pass') throw new Error(`WORK_DELIVERY_EVIDENCE: ${criterion.id}`);
-      selected.push(...observation.evidence);
+      for (const entry of observation.evidence) selected.push(entry);
       continue;
     }
     const entry = entries.at(-1);
@@ -188,16 +185,16 @@ export function renderBook(book: ResultBook, currentPath: string) {
   return `# 已接受开发成果\n\nPRD：[当前需求](${link(path, currentPath)})。完成范围、接受结论、验证摘要与限制见[成果记录](records.json)，也可用 work read-result 按成果键读取。这里只导航已接受结果，不表示整份 PRD、当前源码或生产验收完成；不保存可恢复代码或详细证据。\n\n${entries}\n\`\`\`mio-prd-results\n${json({ version: 5, prd: book.prd, records: { path: recordsPath(currentPath) } })}\`\`\`\n`;
 }
 
-export async function checkReports(root: string, files: readonly string[]) {
-  if (!files.some(resultDocument)) return [];
-  let catalog;
-  try {
-    catalog = await documentCatalog(root);
-  } catch (error) {
-    return [error instanceof Error ? error.message : String(error)];
-  }
+export async function checkReports(root: string, reportFiles: readonly string[], catalog: Catalog) {
   const linked = new Set<string>();
   const errors: string[] = [];
+  const results: {
+    prd: string;
+    report: string | null;
+    records: string | null;
+    keys: string[];
+    read: string[];
+  }[] = [];
   for (const entry of catalog.documents.filter((document) => document.kind === 'prd')) {
     try {
       const paths = bookPaths(entry.identity, catalog);
@@ -208,19 +205,28 @@ export async function checkReports(root: string, files: readonly string[]) {
         entry.identity,
         catalog,
       );
-      if (
-        reportError !== null ||
-        (recordsSource === null) !== (source === null) ||
-        (recordsSource !== null &&
-          (source === null || !(await sameMarkdown(source, renderBook(book, paths.currentPath)))))
-      )
-        errors.push(`WORK_REPORT_DRIFT: derive ${paths.report} from records`);
-      for (const result of book.results) await validateLocations(root, result, catalog);
+      if (reportFiles.length) {
+        if (
+          reportError !== null ||
+          (recordsSource === null) !== (source === null) ||
+          (recordsSource !== null &&
+            (source === null || !(await sameMarkdown(source, renderBook(book, paths.currentPath)))))
+        )
+          errors.push(`WORK_REPORT_DRIFT: derive ${paths.report} from records`);
+        for (const result of book.results) await validateLocations(root, result, catalog);
+      }
+      results.push({
+        prd: entry.identity,
+        report: source === null ? null : paths.report,
+        records: recordsSource === null ? null : paths.records,
+        keys: book.results.map((result) => result.key),
+        read: ['read-result', entry.identity],
+      });
     } catch (error) {
+      if (!reportFiles.length) throw error;
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }
-  for (const path of files.filter((file) => resultDocument(file)))
-    if (!linked.has(path)) errors.push(`WORK_REPORT_ORPHAN: ${path}`);
-  return [...new Set(errors)];
+  for (const path of reportFiles) if (!linked.has(path)) errors.push(`WORK_REPORT_ORPHAN: ${path}`);
+  return { errors: [...new Set(errors)], results };
 }

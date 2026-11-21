@@ -197,7 +197,7 @@ it('replays historically admitted null parameters over HTTP without admitting a 
     const provider = await f.provider.get(f.actor);
     await f.provider.settings(f.actor, provider!.revision, { enabled: false });
     const readProvider = vi.spyOn(f.provider, 'snapshotImage');
-    const readAsset = vi.spyOn(f.store, 'imageInput');
+    const readAsset = vi.spyOn(f.store, 'imageInputs');
     for (const [index, { parameters }] of retained.entries()) {
       const { requestId, jobId } = previous[index]!;
       const retry = parameters.geometry

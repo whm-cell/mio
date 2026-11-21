@@ -1,11 +1,27 @@
 import { isDeepStrictEqual } from 'node:util';
 import { candidateRef, digest, json, sameCandidate } from './records.ts';
-import type { Candidate, Evidence } from './records.ts';
+import type { Candidate, Evidence, Task } from './records.ts';
 import { metadata, record, textField } from './report-format.ts';
 import { artifact } from './original.ts';
+import { readCommandOriginal } from './command-original.ts';
 export { artifact } from './original.ts';
+export { resultMarker } from './command-original.ts';
 
-export const resultMarker = '\n--- mio-command-result ---\n';
+export function candidateEvidence(task: Task, candidate: Candidate | null) {
+  const groups = new Map<string, Evidence[]>();
+  if (!candidate) return groups;
+  const methods = new Map(
+    task.plan.acceptance.map((criterion) => [criterion.id, criterion.method]),
+  );
+  for (const entry of task.evidence) {
+    if (methods.get(entry.criterion) !== entry.method || !sameCandidate(entry.candidate, candidate))
+      continue;
+    const entries = groups.get(entry.criterion);
+    if (entries) entries.push(entry);
+    else groups.set(entry.criterion, [entry]);
+  }
+  return groups;
+}
 
 /** Manual coverage is an explicit observation, never an automatically inherited pass. */
 export function coverageEvidenceResult(
@@ -29,6 +45,14 @@ export function coverageEvidenceResult(
   return report.result as 'pass' | 'fail' | 'pending';
 }
 
+async function readAutomatedOriginal(root: string, id: string, entry: Evidence) {
+  if (!entry.artifact.endsWith('.md')) return readCommandOriginal(root, id, entry);
+  const bytes = await artifact(root, id, entry.artifact);
+  if (digest(bytes) !== entry.sha256) return { result: 'corrupt' } as const;
+  if (entry.result === 'pending') return { result: 'pending' } as const;
+  return { result: 'read', source: bytes.toString('utf8') } as const;
+}
+
 /** A later failure, pending run or damaged original cannot be hidden by an older pass. */
 export async function automatedEvidence(
   root: string,
@@ -46,24 +70,20 @@ export async function automatedEvidence(
       newerIssue ??= 'pending';
       continue;
     }
-    let bytes: Buffer;
+    let original: Awaited<ReturnType<typeof readAutomatedOriginal>>;
     try {
-      bytes = await artifact(root, id, entry.artifact);
+      original = await readAutomatedOriginal(root, id, entry);
     } catch {
       newerIssue ??= 'missing';
       continue;
     }
-    if (digest(bytes) !== entry.sha256) {
-      newerIssue ??= 'corrupt';
-      continue;
-    }
-    if (entry.result === 'pending') {
-      newerIssue ??= 'pending';
+    if (original.result !== 'read') {
+      newerIssue ??= original.result;
       continue;
     }
     try {
-      const source = bytes.toString('utf8');
-      if (entry.artifact.endsWith('.md')) {
+      if ('source' in original) {
+        const { source } = original;
         if (typeof entry.candidate === 'string') throw new Error('Historical candidate');
         const observed = coverageEvidenceResult(source, entry.candidate, entry.criterion, contract);
         if (observed !== entry.result) throw new Error('Coverage result mismatch');
@@ -76,13 +96,8 @@ export async function automatedEvidence(
           ...(coverage.mode === 'ci' ? { remoteExecution: coverage.remoteExecution } : {}),
         };
       }
-      const end = source.indexOf('\n}\n');
-      const header = JSON.parse(source.slice(0, end + 2));
-      const marker = source.lastIndexOf(resultMarker);
-      const outcome = JSON.parse(source.slice(marker + resultMarker.length));
+      const { header, outcome } = original;
       if (
-        end < 0 ||
-        marker < 0 ||
         !sameCandidate(candidateRef(header.candidate), entry.candidate) ||
         !isDeepStrictEqual(header.contract, contract) ||
         !Array.isArray(header.argv) ||

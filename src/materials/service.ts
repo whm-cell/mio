@@ -3,7 +3,6 @@ import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MaterialError, groupView, materialView, operationView } from './contracts.ts';
 import type {
-  GroupRow,
   GroupView,
   OperationView,
   MaterialPrincipal,
@@ -48,10 +47,10 @@ function listCursor(value?: string): MaterialCursor | undefined {
     throw new MaterialError(HTTP_STATUS.BAD_REQUEST, 'CURSOR_INVALID');
   }
 }
-function page<T extends { id: string; created_at: Date; cursor_time?: string }>(
+function page<T extends { id: string; created_at: Date; cursor_time?: string }, View>(
   rows: T[],
   limit: number,
-  view: (row: T) => unknown,
+  view: (row: T) => View,
 ) {
   const selected = rows.slice(0, limit);
   const last = selected.at(-1);
@@ -230,7 +229,7 @@ export function createMaterialService(
       );
     },
     group(actor: MaterialPrincipal, id: string) {
-      return admit(async () => groupView(await store.ownedGroup(actor.userId, id)));
+      return admit(async () => groupView(await store.ownedGroupSummary(actor.userId, id)));
     },
     materials(actor: MaterialPrincipal, id: string, limit: number, cursor?: string) {
       return admit(async () =>
@@ -281,7 +280,7 @@ export function createMaterialService(
         return {
           ...result,
           ...(result.operation.state === 'succeeded'
-            ? { group: groupView(await store.ownedGroup(owner, op.target_group_id!)) }
+            ? { group: groupView(await store.ownedGroupSummary(owner, op.target_group_id!)) }
             : {}),
         };
       });
@@ -384,7 +383,7 @@ export function createMaterialService(
           await upstream.renameGroup(key, group.upstream_group_id!, name, stop.signal);
           stop.signal.throwIfAborted();
           await store.rename(owner, id, lease, name);
-          return groupView(await store.ownedGroup(owner, id));
+          return groupView(await store.ownedGroupSummary(owner, id));
         } catch (error) {
           await store.releaseGroup(owner, id, lease).catch(() => {});
           throw error;
@@ -412,7 +411,7 @@ export function createMaterialService(
           const next = batch.hasMore ? String(number + 1) : null;
           await store.applySync(owner, group, lease, batch.items, next, snapshot.credentialVersion);
           return {
-            group: groupView(await store.ownedGroup(owner, id)),
+            group: groupView(await store.ownedGroupSummary(owner, id)),
             syncedCount: batch.items.length,
             nextCursor: next,
           };
@@ -475,11 +474,10 @@ export function createMaterialService(
           throw new MaterialError(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         if (scope === 'local') {
           const row = await store.removeLocal(owner, kind, id, revision);
-          return kind === 'group'
-            ? { group: groupView(row as GroupRow) }
-            : {
-                material: materialView(row as Awaited<ReturnType<MaterialStore['ownedMaterial']>>),
-              };
+          // Group tombstones are committed only once all members have been removed.
+          return 'group_type' in row
+            ? { group: groupView({ ...row, material_count: 0 }) }
+            : { material: materialView(row) };
         }
         if (kind === 'group')
           return removeUpstreamGroup(owner, id, requestId, revision, confirmCascade);

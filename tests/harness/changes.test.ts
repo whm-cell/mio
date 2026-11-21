@@ -270,12 +270,24 @@ it('lists valid records during report drift but blocks mixed invalid or orphaned
       documents: [{ kind: 'prd', identity: otherPrd, path: otherPrd }],
     }),
   );
+  const first = invoke(root, ['documents', '--select', '/results', '--limit', '1']);
+  expect(first.status, first.output).toBe(1);
+  expect(first.value().items).toMatchObject([{ prd, report: null, records, keys: ['accepted'] }]);
+  expect(first.value().page.total).toBe(2);
+  const next = invoke(root, first.value().page.next.argv);
+  expect(next.status, next.output).toBe(1);
+  expect(next.value().items).toMatchObject([
+    { prd: otherPrd, report: null, records: null, keys: [] },
+  ]);
   await writeFile(join(root, otherRecords), 'invalid JSON');
   const mixed = invoke(root, ['documents']);
   expect(mixed.status).toBe(1);
   expect(mixed.value().issues.join('\n')).toContain('WORK_REPORT_DRIFT');
   expect(mixed.value().issues.length).toBeGreaterThan(1);
   expect(mixed.value().results).toEqual([]);
+  const invalidPage = invoke(root, first.value().page.next.argv);
+  expect(invalidPage.status, invalidPage.output).toBe(1);
+  expect(invalidPage.output).toContain('WORK_READ_RANGE');
 
   await rm(join(root, 'docs/tasks/z-other'), { recursive: true });
   const orphan = 'docs/tasks/unregistered/complete/orphan.md';
@@ -285,6 +297,74 @@ it('lists valid records during report drift but blocks mixed invalid or orphaned
   expect(unowned.status).toBe(1);
   expect(unowned.value().issues.join('\n')).toContain('WORK_REPORT_ORPHAN');
   expect(unowned.value().results).toEqual([]);
+});
+
+it('reports each reference to the same missing or private link target', async () => {
+  const { root } = await fixture(['bug']);
+  expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+  const readme = join(root, 'README.md');
+  const index = join(root, 'docs/index.md');
+  await writeFile(join(root, '.env'), 'PRIVATE_LINK_FIXTURE=hidden\n');
+  await symlink('../.env', join(root, 'docs/alias.md'));
+  await writeFile(
+    readme,
+    (await readFile(readme, 'utf8')) +
+      '\n[Missing](docs/missing.md#first) [Private](docs/alias.md#first)\n',
+  );
+  await writeFile(
+    index,
+    (await readFile(index, 'utf8')) + '\n[Missing](missing.md#second) [Private](alias.md#second)\n',
+  );
+  const checked = invoke(root, ['documents']);
+  expect(checked.status, checked.output).toBe(1);
+  expect(
+    checked
+      .value()
+      .issues.filter((issue: string) => issue.startsWith('LINK_'))
+      .sort(),
+  ).toEqual([
+    'LINK_MISSING README.md: docs/missing.md#first',
+    'LINK_MISSING docs/index.md: missing.md#second',
+    'LINK_PRIVATE README.md: docs/alias.md#first',
+    'LINK_PRIVATE docs/index.md: alias.md#second',
+  ]);
+  expect(checked.output).not.toContain('PRIVATE_LINK_FIXTURE');
+});
+
+it.skipIf(process.platform === 'win32')(
+  'returns inventory issues without opening unsupported unpublished results',
+  async () => {
+    const { root } = await fixture(['bug']);
+    expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+    const records = 'docs/tasks/product/complete/records.json';
+    await mkdir(dirname(join(root, records)), { recursive: true });
+    expect(spawnSync('mkfifo', [records], { cwd: root }).status).toBe(0);
+    const checked = spawnSync(process.execPath, [cli, 'documents'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    expect(checked.status, checked.stderr).toBe(1);
+    expect(JSON.parse(checked.stdout)).toMatchObject({
+      results: [],
+      issues: [`INVENTORY_UNSUPPORTED ${records}`],
+    });
+  },
+);
+
+it('keeps document diagnostics ahead of listing unpublished results', async () => {
+  const { root } = await fixture(['bug']);
+  expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+  const records = 'docs/tasks/product/complete/records.json';
+  await mkdir(join(root, records), { recursive: true });
+  const readme = join(root, 'README.md');
+  await writeFile(readme, (await readFile(readme, 'utf8')) + '\n[Missing](docs/missing.md)\n');
+  const checked = invoke(root, ['documents']);
+  expect(checked.status, checked.output).toBe(1);
+  expect(checked.value()).toMatchObject({
+    results: [],
+    issues: ['LINK_MISSING README.md: docs/missing.md'],
+  });
 });
 
 it('pages selected summaries or one body with explicit offsets', async () => {

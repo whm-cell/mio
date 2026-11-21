@@ -1,7 +1,15 @@
-import { artifact, assess, requireCandidate } from './context.ts';
-import { contractPlan, digest, json, loadTask, taskRevision } from './records.ts';
-import type { Task } from './records.ts';
-import { finiteOutput, hasReadReference, readPage } from './output.ts';
+import { assess, requireCandidate } from './context.ts';
+import { contractPlan, json, loadTask, taskRevision } from './records.ts';
+import type { Evidence, Task } from './records.ts';
+import {
+  defaultTextLimit,
+  finiteOutput,
+  hasReadReference,
+  maxTextLimit,
+  readPage,
+  textSlice,
+} from './output.ts';
+import { originalChunks, originalDigest, withArtifact } from './original.ts';
 import type { ReadOptions } from './output.ts';
 import { normsDraft, normsIssues } from './norms-review.ts';
 import { qualityDraft } from './quality-review.ts';
@@ -125,6 +133,40 @@ export function assessmentOutput(task: Task, assessment: Record<string, unknown>
   return { ...result.assessment, requiredContext: result.task };
 }
 
+async function readEvidenceOriginal(
+  root: string,
+  id: string,
+  evidence: Evidence,
+  options: ReadOptions,
+) {
+  return withArtifact(root, id, evidence.artifact, async (file, { size }) => {
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const textWindow = options.select === '/text' ? { text: '', total: 0 } : undefined;
+    let remaining = Math.min(options.limit ?? defaultTextLimit, maxTextLimit);
+    const decode = (bytes?: Buffer) => {
+      let part: string;
+      try {
+        part = bytes ? decoder.decode(bytes, { stream: true }) : decoder.decode();
+      } catch {
+        throw new Error('WORK_READ_ENCODING: bound evidence is not UTF-8 text');
+      }
+      if (!textWindow) return;
+      const offset = Math.max(0, options.offset - textWindow.total);
+      const slice = textSlice(part, offset, remaining);
+      remaining -= Math.min(remaining, Math.max(0, slice.total - offset));
+      textWindow.total += slice.total;
+      textWindow.text += slice.text;
+    };
+    const actualSha256 =
+      evidence.sha256 === undefined ? null : await originalDigest(file, size, decode);
+    if (actualSha256 === null) {
+      for await (const bytes of originalChunks(file, 0, size)) decode(bytes);
+    }
+    decode();
+    return { textWindow, actualSha256 };
+  });
+}
+
 /** The source is this task's validated state or a ledger-bound evidence entry, never an arbitrary path. */
 export async function readTask(
   root: string,
@@ -194,14 +236,14 @@ export async function readTask(
   const evidence = task.evidence[Number(entry)];
   if (!evidence) throw new Error('WORK_READ_EVIDENCE: ledger entry does not exist');
   command.push(entry);
-  const bytes = await artifact(root, task.plan.id, evidence.artifact);
-  let text;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    throw new Error('WORK_READ_ENCODING: bound evidence is not UTF-8 text');
-  }
-  const actualSha256 = evidence.sha256 === undefined ? null : digest(bytes);
+  // The default expands only this original's text. Metadata can be selected independently.
+  const chosen = { ...options, select: options.select || '/text' };
+  const { textWindow, actualSha256 } = await readEvidenceOriginal(
+    root,
+    task.plan.id,
+    evidence,
+    chosen,
+  );
   const source = {
     entry: evidence,
     integrity:
@@ -211,14 +253,12 @@ export async function readTask(
           ? 'verified'
           : 'mismatch',
     actualSha256,
-    text,
+    text: '',
   };
-  // The default expands only this original's text. Metadata can be selected independently.
-  const chosen = { ...options, select: options.select || '/text' };
   return {
     integrity: source.integrity,
     ...(evidence.sha256 === undefined ? {} : { expectedSha256: evidence.sha256 }),
     actualSha256,
-    ...readPage(source, chosen, command),
+    ...readPage(source, chosen, command, textWindow),
   };
 }

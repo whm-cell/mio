@@ -14,7 +14,7 @@ import { authDatabase } from '../support/auth-database.ts';
 import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
 
 it.each([false, true])(
-  'closes the provider pool despite conversation teardown/startup failure (startup=%s)',
+  'releases the conversation and provider pools after plugin teardown (startup failure=%s)',
   async (startup) => {
     const database = await authDatabase();
     const root = await mkdtemp(join(tmpdir(), 'mio-w2-cleanup-'));
@@ -44,26 +44,21 @@ it.each([false, true])(
         );
         expect(result.status, result.stderr).toBe(0);
       }
-      if (startup) ctx.llm.registerAdapter(['onelink-openai'], new ScriptedModel([]));
-      else {
-        const original = Engines.createDshConversationEngine;
-        vi.spyOn(Engines, 'createDshConversationEngine').mockImplementation((...args) => {
-          const engine = original(...args);
-          return {
-            ...engine,
-            close: async () => {
-              await engine.close();
-              throw new Error('synthetic close failure');
-            },
-          };
+      const startupError = new Error('synthetic conversation startup failure');
+      if (startup)
+        vi.spyOn(Engines, 'createDshConversationEngine').mockImplementation(() => {
+          throw startupError;
         });
-      }
       const plugin = ctx.plugin(Mio, { tokenEnv: 'MIO_API_TOKEN', allowedOrigins: [] });
-      if (startup) await Promise.resolve(plugin).catch(() => {});
-      else await plugin;
-      await plugin.dispose().catch(() => {});
+      if (startup) await expect(Promise.resolve(plugin)).rejects.toBe(startupError);
+      else {
+        await plugin;
+        expect(conversationClosed).not.toHaveBeenCalled();
+        expect(providerClosed).not.toHaveBeenCalled();
+      }
+      await plugin.dispose();
       expect(conversationClosed).toHaveBeenCalled();
-      expect(providerClosed).toHaveBeenCalled();
+      expect(providerClosed).toHaveBeenCalledTimes(1);
       const provider = providerClosed.mock.contexts[0] as ProviderStore;
       await expect(provider.current('no-owner')).rejects.toThrow();
     } finally {
@@ -77,18 +72,24 @@ it.each([false, true])(
   30000,
 );
 
-it('drains conversation teardown before closing compute store and preserves AggregateError', async () => {
+it('drains the conversation before closing compute and reports both failures in order', async () => {
   const database = await authDatabase();
   const root = await mkdtemp(join(tmpdir(), 'mio-compute-cleanup-'));
   const ctx = await kernelRuntime(root, new ScriptedModel([]));
   const events: string[] = [];
+  const drainStarted = Promise.withResolvers<void>();
+  const releaseDrain = Promise.withResolvers<void>();
+  const conversationError = new Error('synthetic conversation close failure');
+  const computeError = new Error('synthetic compute close failure');
   const originalComputeClose = ComputeStore.prototype.close;
   const computeClosed = vi
     .spyOn(ComputeStore.prototype, 'close')
     .mockImplementation(async function (this: ComputeStore) {
       events.push('compute-close');
-      return originalComputeClose.call(this);
+      await originalComputeClose.call(this);
+      throw computeError;
     });
+  const report = vi.spyOn(ctx.logger, 'error');
   try {
     await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
     const env = {
@@ -127,19 +128,37 @@ it('drains conversation teardown before closing compute store and preserves Aggr
       return {
         ...engine,
         close: async () => {
+          drainStarted.resolve();
+          await releaseDrain.promise;
           await engine.close();
           events.push('conversation-close');
-          throw new Error('synthetic conversation close failure');
+          throw conversationError;
         },
       };
     });
     const plugin = ctx.plugin(Mio, { tokenEnv: 'MIO_API_TOKEN', allowedOrigins: [] });
     await plugin;
-    await plugin.dispose().catch(() => {});
+    expect(events).toEqual([]);
+    const disposed = plugin.dispose();
+    try {
+      await drainStarted.promise;
+      expect(computeClosed).not.toHaveBeenCalled();
+    } finally {
+      releaseDrain.resolve();
+      await disposed;
+    }
     expect(computeClosed).toHaveBeenCalledTimes(1);
-    expect(events.indexOf('conversation-close')).toBeGreaterThanOrEqual(0);
-    expect(events.indexOf('conversation-close')).toBeLessThan(events.indexOf('compute-close'));
+    expect(events).toEqual(['conversation-close', 'compute-close']);
+    const cleanupError = report.mock.calls
+      .map(([error]) => error)
+      .find(
+        (error): error is AggregateError =>
+          error instanceof AggregateError && error.errors.includes(computeError),
+      );
+    expect(cleanupError?.message).toBe('Mio resource cleanup failed');
+    expect(cleanupError?.errors).toEqual([conversationError, computeError]);
   } finally {
+    releaseDrain.resolve();
     await ctx.fiber.dispose().catch(() => {});
     vi.restoreAllMocks();
     vi.unstubAllEnvs();

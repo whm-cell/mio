@@ -247,6 +247,37 @@ it('allows a waiting competitor to retry after preflight failure', async () => {
   expect(vision.prepareRequest).toHaveBeenCalledTimes(2);
 });
 
+it('reuses the owned preflight row and rechecks a new active request at final reception', async () => {
+  const id = await conversation();
+  const owned = vi.spyOn(store, 'owned');
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async (_owner, assetId) => {
+    entered.resolve();
+    await release.promise;
+    return { reference: makeRef(assetId), previewBytes: 3 };
+  });
+  const sending = service.send(actor, id, 'image', 'hello', [randomUUID()]);
+  const outcome = sending.catch((error: unknown) => error);
+  try {
+    await entered.promise;
+    expect(owned).toHaveBeenCalledOnce();
+    await store.receive(actor, id, 'winner', 'winner-digest', async () => undefined);
+    release.resolve();
+    expect(await outcome).toMatchObject({ code: 'CONVERSATION_BUSY' });
+    expect(engine.run).not.toHaveBeenCalled();
+    await expect(store.request(actor, id, 'image')).rejects.toMatchObject({
+      code: 'REQUEST_NOT_FOUND',
+    });
+    expect(await store.snapshot(actor, id)).toMatchObject({ activeRequestId: 'winner' });
+  } finally {
+    release.resolve();
+    await outcome;
+    owned.mockRestore();
+    await store.finish(id, 'winner', 'cancelled').catch(() => {});
+  }
+});
+
 it('returns one receipt to concurrent identical image sends after a single preflight', async () => {
   const id = await conversation();
   const asset = randomUUID();

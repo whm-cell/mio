@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { expect, it, onTestFinished } from 'vitest';
+import { expect, it, onTestFinished, vi } from 'vitest';
 import { materialFixture, envelope } from './fixture.ts';
 import { createMaterialHandler } from '../../src/materials/http.ts';
 
@@ -8,16 +8,14 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
   const f = await materialFixture();
   onTestFinished(() => f.close());
   const origin = 'https://client.example';
-  const handler = createMaterialHandler(
-    f.service,
-    async (headers) =>
-      headers.get('cookie') === 'session=owner'
-        ? f.actor
-        : headers.get('cookie') === 'session=other'
-          ? { userId: 'other', sessionId: 'other' }
-          : null,
-    [origin],
+  const identity = vi.fn(async (headers: Headers) =>
+    headers.get('cookie') === 'session=owner'
+      ? f.actor
+      : headers.get('cookie') === 'session=other'
+        ? { userId: 'other', sessionId: 'other' }
+        : null,
   );
+  const handler = createMaterialHandler(f.service, identity, [origin]);
   const server = createServer((req, res) => void handler(req, res));
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   onTestFinished(() => new Promise<void>((resolve) => server.close(() => resolve())));
@@ -40,6 +38,37 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
       },
       ...(value !== undefined ? { body: JSON.stringify(value) } : {}),
     });
+  const groupPath = `/groups/${randomUUID()}`;
+  const methods = [
+    ['/groups', 'GET, POST, OPTIONS'],
+    [groupPath, 'GET, PATCH, OPTIONS'],
+    [`${groupPath}/materials`, 'GET, POST, OPTIONS'],
+    [`${groupPath}/sync`, 'POST, OPTIONS'],
+  ] as const;
+  for (const [path, allowed] of methods) {
+    const preflight = await call(path, 'OPTIONS', undefined, { cookie: '' });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-methods')).toBe(allowed);
+    expect(preflight.headers.get('access-control-allow-headers')).toBe('Content-Type');
+    expect(preflight.headers.get('access-control-allow-credentials')).toBe('true');
+    const deniedMethod = await call(path, 'PUT', undefined, { cookie: '' });
+    expect(deniedMethod.status).toBe(405);
+    expect(deniedMethod.headers.get('allow')).toBe(allowed);
+  }
+  expect((await fetch(`${base}/groups`, { method: 'OPTIONS' })).status).toBe(403);
+  expect((await call('/groups/malformed/materials', 'OPTIONS')).status).toBe(404);
+  expect((await call('/auth-sessions', 'OPTIONS')).status).toBe(404);
+  expect((await call(`/auth-sessions/${randomUUID()}/refresh`, 'OPTIONS')).status).toBe(404);
+  expect(identity).not.toHaveBeenCalled();
+  identity.mockResolvedValueOnce(f.actor).mockResolvedValueOnce(null);
+  const revoked = await call('/groups', 'POST', {
+    requestId: randomUUID(),
+    type: 'aigc',
+    name: 'Revoked',
+  });
+  expect(revoked.status).toBe(401);
+  expect(identity).toHaveBeenCalledTimes(2);
+  expect(f.transport).not.toHaveBeenCalled();
   expect(
     (await call('/groups', 'GET', undefined, { cookie: '', authorization: 'Bearer service-token' }))
       .status,
@@ -80,6 +109,27 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
     /upstream|apiKey|ciphertext|nonce|synthetic-material-private-key/,
   );
   const id = result.group.groupId;
+  const older = await f.create('Older Group');
+  await f.pool.query(
+    `UPDATE mio_material_groups SET created_at=
+      CASE WHEN id=$1 THEN '2026-11-20T00:00:00.123456Z' ELSE '2026-11-20T00:00:00.123455Z' END::timestamptz
+      WHERE id IN ($1,$2)`,
+    [id, older.groupId],
+  );
+  const firstPage = await call('/groups?limit=1');
+  expect(firstPage.status).toBe(200);
+  const first = (await firstPage.json()) as Awaited<ReturnType<typeof f.service.groups>>;
+  expect(first.items).toEqual([result.group]);
+  expect(JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString())).toEqual({
+    createdAt: '2026-11-20T00:00:00.123456Z',
+    id,
+  });
+  const nextPage = await call(`/groups?limit=1&cursor=${first.nextCursor}`);
+  expect(nextPage.status).toBe(200);
+  expect(await nextPage.json()).toMatchObject({
+    items: [{ groupId: older.groupId }],
+    nextCursor: null,
+  });
   expect((await call(`/groups/${id}`, 'GET', undefined, { cookie: 'session=other' })).status).toBe(
     404,
   );
@@ -200,7 +250,7 @@ it('pages equal-microsecond rows without dropping records or exposing database c
   const ids: string[] = [];
   do {
     const result = await f.service.materials(f.actor, group.groupId, 2, cursor);
-    ids.push(...result.items.map((row) => (row as { materialId: string }).materialId));
+    ids.push(...result.items.map((row) => row.materialId));
     cursor = result.nextCursor ?? undefined;
   } while (cursor);
   expect(ids).toHaveLength(5);
@@ -214,9 +264,8 @@ it('pages equal-microsecond rows without dropping records or exposing database c
   const distinct: string[] = [];
   do {
     const result = await f.service.materials(f.actor, group.groupId, 2, cursor);
-    distinct.push(...result.items.map((row) => (row as { materialId: string }).materialId));
+    distinct.push(...result.items.map((row) => row.name));
     cursor = result.nextCursor ?? undefined;
   } while (cursor);
-  expect(distinct).toHaveLength(5);
-  expect(new Set(distinct).size).toBe(5);
+  expect(distinct).toEqual(['Item 5', 'Item 4', 'Item 3', 'Item 2', 'Item 1']);
 });

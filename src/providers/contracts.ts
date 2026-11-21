@@ -202,25 +202,10 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;
 }
-/** Request-owned memory only. Never serialize this object into logs, receipts or storage. */
-export interface ImageRuntimeSnapshot {
-  readonly modelId: string;
-  readonly modelKey: string;
-  readonly vendor: string;
-  readonly profile: ImageDriver;
-  readonly route: ImageRouteConfig;
-  readonly defaultImageWatermark: boolean;
-  readonly capabilityMetadata: AdaptationCapabilityMetadata;
-  readonly providerRevision: number;
+/** Account resources have no model/catalog dependency. Open only for one controlled outbound request. */
+export interface AccountCredentialSnapshot {
   readonly providerConfigId: string;
   readonly credentialVersion: number;
-  readonly catalogVersion: number;
-  readonly adaptationVersion: number;
-  readonly apiKey: string;
-}
-
-/** Durable admission keeps encrypted provider bytes; only an outbound action opens them. */
-export interface ImageAdmissionSnapshot extends Omit<ImageRuntimeSnapshot, 'apiKey'> {
   readonly credential: {
     readonly cipherFormat: number;
     readonly masterKeyId: string;
@@ -230,9 +215,16 @@ export interface ImageAdmissionSnapshot extends Omit<ImageRuntimeSnapshot, 'apiK
   };
 }
 
-/** Account resources have no model/catalog dependency. Open only for one controlled outbound request. */
-export interface AccountCredentialSnapshot {
-  readonly providerConfigId: string;
-  readonly credentialVersion: number;
-  readonly credential: ImageAdmissionSnapshot['credential'];
+/** Durable admission keeps encrypted provider bytes; only an outbound action opens them. */
+export interface ImageAdmissionSnapshot extends AccountCredentialSnapshot {
+  readonly modelId: string;
+  readonly modelKey: string;
+  readonly vendor: string;
+  readonly profile: ImageDriver;
+  readonly route: ImageRouteConfig;
+  readonly defaultImageWatermark: boolean;
+  readonly capabilityMetadata: AdaptationCapabilityMetadata;
+  readonly providerRevision: number;
+  readonly catalogVersion: number;
+  readonly adaptationVersion: number;
 }

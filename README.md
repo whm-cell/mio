@@ -60,14 +60,19 @@ pnpm test tests/integrations/redis.test.ts
 
 开发与人工测试使用两套常驻持久化 Docker PostgreSQL 18.6 / Redis 8.2.11 / RabbitMQ 4.4.0。私有 `.env`、`.env.test` 由初始化命令分别生成，已有秘密保留；数据、密钥、Profile、会话、A 图片恢复目录和 Worker 目录按环境隔离。完整配置、恢复及自动化回归隔离见[常驻环境](docs/local-environments.md)。
 
+启用转码时，先启动所选环境的中间件，再按[本地 Broker 预置](docs/integrations/rabbitmq.md#预置本地-broker)配置 A/B 用户、权限和容量策略。运行 `broker:init` 补齐拓扑，缺项按命令列出的清单处理。
+
 ```sh
 pnpm env:init
 pnpm infra:up:dev
 pnpm regression:init:dev
 pnpm build
+# 完成对应环境的 Broker 预置后运行。
 pnpm broker:init:dev
 pnpm migrate:dev --apply
-# 按需启用第二套人工测试环境：pnpm infra:up:test && pnpm regression:init:test && pnpm broker:init:test && pnpm migrate:test --apply
+# 按需启用人工测试环境。
+# pnpm infra:up:test && pnpm regression:init:test
+# 完成该环境的 Broker 预置后运行 pnpm broker:init:test && pnpm migrate:test --apply。
 # 分别在独立终端运行；pnpm start 默认为开发。
 pnpm start:dev
 ```

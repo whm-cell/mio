@@ -20,7 +20,11 @@
 
 ## 初始化与日常入口
 
-`pnpm env:init` 生成两份 mode 600 的配置及各自随机秘密；旧版缺少 MQ/Worker 配置或缺少回归库配置的文件只无损追加缺失组设置，已有数据库和认证秘密保留。部分缺失的 MQ/Worker 或回归库配置拒绝自动补密钥，须恢复原配置；缺少 A 图片目录时只追加本环境的 `MIO_GENERATIONS_DATA_DIR`，不自动启用生成；完整文件重复初始化不变。公开格式见 [模板](../.env.example)，实际配置和 `.runtime/` 不入库。文件丢失时先恢复原配置，不能对已有卷换一套随机密码后期待账号自动更新。
+`pnpm env:init` 生成两份 mode 600 的配置及各自随机秘密。同一文件的初始化串行执行，每次取得写权限后读取现有配置。旧版配置会保留已有内容和权限，并原子补齐全部缺失设置。部分缺失的 MQ/Worker 或回归库配置拒绝自动补密钥，须恢复原配置；缺少 A 图片目录时只追加本环境的 `MIO_GENERATIONS_DATA_DIR`，不自动启用生成；完整文件重复初始化不变。公开格式见 [模板](../.env.example)，实际配置和 `.runtime/` 不入库。文件丢失时先恢复原配置，不能对已有卷换一套随机密码后期待账号自动更新。
+
+收到 `LOCAL_ENV_BUSY` 时先确认另一初始化进程是否仍在运行。进程被强杀且已无初始化写入时，可移除错误中标出的空占用目录并重新初始化。
+
+转码使用的 A/B 用户、权限及容量策略由部署者在中间件启动后[预置](integrations/rabbitmq.md#预置本地-broker)。完成后运行对应的 `broker:init`。
 
 ```sh
 pnpm env:init
@@ -29,6 +33,7 @@ pnpm regression:init:dev
 pnpm infra:up:test
 pnpm regression:init:test
 pnpm build
+# 完成各自的 Broker 预置后运行。
 pnpm broker:init:dev
 pnpm broker:init:test
 pnpm migrate:dev --apply
@@ -42,7 +47,7 @@ pnpm start:test
 
 手机号短信默认关闭。需要使用时，仅在选定环境的私有配置文件中按[模板](../.env.example)填写该环境授权的腾讯短信应用、签名、模板和凭据，再设 `MIO_AUTH_SMS_ENABLED=true`；另一个环境不会继承这些设置。应用启动不发送短信，实际调用会产生外部费用；模板须有验证码与有效分钟数两个参数。认证结构仍需先预览并显式迁移，详见[认证底座](auth.md#配置与迁移)。
 
-`broker:init:dev/test` 只准备本地重媒体命令、结果及各自 DLQ/DLX，先核对已有资源和受限 A/B 权限；任何不匹配报 `LOCAL_BROKER_CONFLICT`，不覆盖、不清队列、不轮换密码。旧图片队列及权限不被初始化静默收缩，须先按下面的切换步骤对账后单独退役。仅启用图片生成时无需运行 broker 初始化或启动 B。
+`broker:init:dev/test` 核对所选 vhost、A/B 用户、权限与容量策略，补齐前置已满足的重媒体拓扑。`LOCAL_BROKER_PREPROVISION_REQUIRED` 列出部署者应补的资源，预置完按原命令重跑。已有配置冲突报 `LOCAL_BROKER_CONFLICT` 并保留现场和已有消息。旧图片队列和权限按下面的切换步骤单独对账及退役。仅启用图片生成时可跳过 Broker 初始化和 B。
 
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。
 
@@ -134,7 +139,9 @@ DSH 在所选 home 内启动，避免其内置 dotenv 层再次读取仓库根�
 
 本地测试分别探测 PostgreSQL 和 Redis 的专用回归通道，每项优先选 `mio-dev`，其次 `mio-test`。缺少对应通道的配置或找不到可达端口时，由用例为该服务启动独立临时进程。选定通道后发生的登录、初始化或权限错误按实际失败报告。测试进程只从 `.env`／`.env.test` 提取专用回归通道配置。入口与显式环境选择见[测试导航](engineering/testing.md#按变更定位测试)。
 
-Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号；本轮独占 TCP 转发追踪实际 EVAL 键与连接，结束后清理本轮已观察键，释放断言只统计本轮连接。共享回归账号无 `SCAN`／`CLIENT LIST` 权限。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。RabbitMQ 集成测试动态创建并清理独立临时 vhost 与账号。
+Redis 常规限流回归复用仅授权 `~mio:regtest-*:*` 前缀的 `mio_regression` ACL 账号；本轮独占 TCP 转发追踪实际 EVAL 键与连接，结束后清理本轮已观察键，释放断言只统计本轮连接。共享回归账号无 `SCAN`／`CLIENT LIST` 权限。全局 OOM 或停进程的 Redis 故障用例使用独立临时进程，可自动识别 `.runtime/redis-build/redis-8.2.11/src/redis-server`。
+
+`pnpm test tests/integrations/rabbitmq-protocol.test.ts` 使用健康的 `mio-dev-rabbitmq-1` 和本机 Docker Unix socket。容器内的管理 CLI 只为本轮随机 `mio-regtest-*` vhost 及 A/B 账号准备拓扑与权限，验证后凭本轮所有权标记与临时密码删除对象，并逐个确认消失。创建回执未知时也核对实际对象；清理失败使测试失败。该用例只连接回环 AMQP，夹具无需读取私有环境文件或人工管理密码。未启动容器时先运行 `pnpm infra:up:dev`。GitHub Actions 使用自己的 RabbitMQ 服务容器。RabbitMQ 生命周期与 Worker 协议替身仍可独立运行。
 
 区分**常规自动化回归**、**开发推进／协议摸底与本地真实业务验收**和**破坏性故障演练**：
 
@@ -154,7 +161,7 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 
 ## 图片生成迁移与切换
 
-先暂停新的图片提交但继续历史查询。对媒体库执行增量迁移，再运行 `node scripts/service/local.ts dev generations-preflight`（或 test）；默认只读，不发送供应商生成请求。它核对旧 PG 状态/outbox、旧图片命令和 DLQ 的消息与消费者、B journal 的未完成项及未确认上传身份，并检查 A 目录。目录缺失先创建权限为 700 的专属目录；不自动删除现有内容。
+先暂停新的图片提交但继续历史查询。对媒体库执行增量迁移，再运行 `node scripts/service/local.ts dev generations-preflight`（或 test）；默认只读，不发送供应商生成请求。它核对旧 PG 状态/outbox、旧图片命令和 DLQ 的消息与消费者、B journal 的未完成项及未确认上传身份，并确认 A 目录可读、可写、可进入且磁盘有可用空间。目录检查不创建文件。目录缺失先创建权限为 700 的专属目录；不自动删除现有内容。
 
 旧 B 的 `partial` 要与 journal 完成记录中的任务、命令和请求数量对账，并逐项核对 PG 已登记产物的原序号、对象键、类型和大小。早期数组载荷需要至少一项能与 PG 核对的实际产物，且所有产物都要一致。journal 缺失、缺少对应终态记录或证据不符时，预检报告 `LEGACY_IMAGE_PARTIALS_UNRECONCILED` 并停止切换。已对账的旧部分结果保留 `partial` 状态，未确认上传仍单独阻断。仅有已确认的完整旧历史或 A 自有任务时，继续核对其余门禁。
 

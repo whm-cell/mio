@@ -139,13 +139,12 @@ export function createConversationService(
         const images: ConversationImageReference[] = [];
         let preflight: ChatRuntimeSnapshot | undefined;
         if (ids.length) {
-          const old = await store.existing(actor, id, requestId, digest);
-          if (old) return old;
+          const { row, replay } = await store.existing(actor, id, requestId, digest);
+          if (replay) return replay;
           if (preparingImages >= IMAGE_PREPARATION_CONCURRENCY)
             throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
           preparingImages++;
           try {
-            const row = await store.owned(actor, id);
             if (row.state !== 'ready')
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
             if (row.active_request)

@@ -18,7 +18,6 @@ import { deliver } from './delivery.ts';
 import { normsCriterion, normsIssues } from './norms-review.ts';
 import { checkManualOriginal, manualEvidenceResult } from './manual-evidence.ts';
 import { inventory, loadConfig } from '../inventory.ts';
-import { inspectTaskDocuments } from '../task-documents.ts';
 import { checkDocuments } from '../check-documents.ts';
 import { finiteOutput, readPage } from './output.ts';
 import { readOptions } from './read-options.ts';
@@ -26,10 +25,10 @@ import { readStatus } from './read-status.ts';
 import { assessmentOutput, inspectionOutput, readTask } from './read-task.ts';
 import { readPublicResult } from './public-read.ts';
 import { changeCommand } from './change-read.ts';
-import { bookPaths, readBook } from './reports.ts';
 import { runCommand, withTaskCommand } from './command.ts';
 import { conditions } from './verification-environment.ts';
 import { coverageEvidenceResult, resultMarker } from './evidence.ts';
+import { originalDigest, withArtifact } from './original.ts';
 import { requirementIssues } from './requirements.ts';
 import type { CommandActivity } from './command.ts';
 import {
@@ -99,11 +98,10 @@ async function main(activity?: CommandActivity) {
     if (positionals.length) throw new Error(help);
     const config = await loadConfig(root);
     const scan = await inventory(root, config);
-    const registry = await inspectTaskDocuments(root, config);
-    const checked = await checkDocuments(root, scan.files, config);
-    const issues = [...new Set([...scan.errors, ...registry.errors, ...checked.errors])];
+    const checked = await checkDocuments(root, scan.files, config, !scan.errors.length);
+    const issues = [...new Set([...scan.errors, ...checked.errors])];
     const source = {
-      documents: registry.documents.map((entry) => ({
+      documents: checked.documents.map((entry) => ({
         kind: entry.kind,
         identity: entry.identity,
         currentPath: entry.path,
@@ -112,30 +110,7 @@ async function main(activity?: CommandActivity) {
       })),
       results: issues.some((issue) => !issue.startsWith('WORK_REPORT_DRIFT:'))
         ? []
-        : await Promise.all(
-            registry.documents
-              .filter((entry) => entry.kind === 'prd')
-              .map(async (entry) => {
-                const catalog = {
-                  config,
-                  documents: registry.documents,
-                  registries: registry.registries,
-                };
-                const paths = bookPaths(entry.identity, catalog);
-                const { book, source, recordsSource } = await readBook(
-                  root,
-                  entry.identity,
-                  catalog,
-                );
-                return {
-                  prd: entry.identity,
-                  report: source === null ? null : paths.report,
-                  records: recordsSource === null ? null : paths.records,
-                  keys: book.results.map((result) => result.key),
-                  read: ['read-result', entry.identity],
-                };
-              }),
-          ),
+        : checked.results,
       issues,
     };
     console.log(
@@ -419,7 +394,13 @@ async function main(activity?: CommandActivity) {
       method: 'automated',
       result: changed || outcome.unsettled ? 'pending' : passed ? 'pass' : 'fail',
       artifact: relative,
-      ...(outcome.unsettled ? {} : { sha256: digest(await readFile(path)) }),
+      ...(outcome.unsettled
+        ? {}
+        : {
+            sha256: await withArtifact(root, task.plan.id, relative, (file, stat) =>
+              originalDigest(file, stat.size),
+            ),
+          }),
       candidate,
       summary: `exit ${outcome.status}; cancelled=${outcome.cancelled}; unsettled=${outcome.unsettled}; contextChanged=${changed}; coverage=${completeCheck ? 'complete' : 'supplement'}${contextError ? `; ${contextError}` : ''}`,
       environment: json(executionEnvironment).trim(),

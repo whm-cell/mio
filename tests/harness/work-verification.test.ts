@@ -1,14 +1,18 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { link, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
-import { digest } from '../../scripts/harness/work/records.ts';
+import { resultMarker } from '../../scripts/harness/work/evidence.ts';
+import { contractPlan, digest, json } from '../../scripts/harness/work/records.ts';
 import type { Candidate } from '../../scripts/harness/work/records.ts';
+import { writeTaskDocuments } from './fixtures/task-documents-fixture.ts';
 import {
   check,
   cloneFixture,
   commit,
   create,
   fixture,
+  fullCommand,
   git,
   invoke,
   ok,
@@ -206,6 +210,106 @@ it('does not bind an ignored declared source that is absent from the clean commi
   expect((await state(root, id)).checkpoint).toBeNull();
 });
 
+it('preserves the first declared input error between Git and local checks', async () => {
+  const root = await fixture();
+  const ignored = 'docs/ignored.md';
+  await writeFile(join(root, '.gitignore'), `.work/\n${ignored}\n`);
+  commit(root, 'Ignore the candidate-only fixture path');
+  await writeFile(join(root, ignored), '# Worktree file\n');
+  const id = create(root);
+  const task = await state(root, id);
+  for (const [local, diagnostic] of [
+    ['docs/missing.md', 'WORK_INPUT_MISSING: docs/missing.md'],
+    ['.work/private.md', 'WORK_PRIVATE: .work/private.md'],
+    ['docs/tasks/fixture/complete/records.json#result=', 'WORK_REPORT_SELECTOR:'],
+  ] as const) {
+    for (const [sources, first] of [
+      [[ignored, local], `WORK_INPUT_UNCOMMITTED: ${ignored}`],
+      [[local, ignored], diagnostic],
+    ] as const) {
+      // Set a malformed local fixture directly to exercise sync's first failing declaration.
+      task.plan.sources = [...sources];
+      await writeFile(join(root, `.work/tasks/${id}/state.json`), JSON.stringify(task));
+      const result = invoke(root, ['sync', id, 'Check declaration order.']);
+      expect(result.status, result.output).toBe(1);
+      expect(result.output.startsWith(first), result.output).toBe(true);
+    }
+  }
+  expect((await state(root, id)).checkpoint).toBeNull();
+});
+
+it('binds a directory and input names containing whitespace to the same clean commit', async () => {
+  const root = await fixture();
+  const paths = [
+    'src/file with spaces.ts',
+    ...(process.platform === 'win32' ? [] : ['src/file with a newline\n.ts']),
+  ];
+  for (const path of paths) await writeFile(join(root, path), 'export const fixture = true;\n');
+  const commitId = commit(root, 'Add whitespace paths');
+  const id = create(root);
+  const task = await state(root, id);
+  ok(root, ['update', id, '--stdin'], {
+    revision: task.revision,
+    reason: 'Declare committed files and directories.',
+    plan: { inputs: [...paths, 'src', '.'] },
+  });
+  ok(root, ['sync', id, 'Bind the declared paths to the candidate.']);
+  expect((await state(root, id)).checkpoint?.candidate).toMatchObject({ commit: commitId });
+});
+
+it.skipIf(process.platform === 'win32')(
+  'rejects an earlier uncommitted source before opening a later result selector',
+  async () => {
+    const root = await fixture();
+    const ignored = 'docs/ignored.md';
+    const prd = 'docs/tasks/product/prd.md';
+    const records = 'docs/tasks/product/complete/records.json';
+    await writeFile(join(root, '.gitignore'), `.work/\n${ignored}\n${records}\n`);
+    await writeTaskDocuments(root, [{ kind: 'prd', identity: prd, path: prd }]);
+    await writeFile(join(root, prd), '# Fixture PRD\n');
+    commit(root, 'Register a result fixture with ignored observations');
+    await writeFile(join(root, ignored), '# Ignored\n');
+    await mkdir(dirname(join(root, records)), { recursive: true });
+    await writeFile(
+      join(root, records),
+      JSON.stringify({
+        version: 5,
+        prd,
+        results: [
+          {
+            key: 'fixture',
+            title: 'Fixture',
+            outcomes: 'Fixture.',
+            locations: [{ path: prd, purpose: 'Fixture requirement.' }],
+            verification: 'Fixture.',
+            limitations: 'Synthetic.',
+            acceptance: { candidate: 'history', statement: 'Synthetic.', reference: 'Fixture.' },
+          },
+        ],
+      }),
+    );
+    const id = create(root);
+    const task = await state(root, id);
+    ok(root, ['update', id, '--stdin'], {
+      revision: task.revision,
+      reason: 'Declare a later result input.',
+      plan: { sources: [ignored], inputs: [`${records}#result=fixture`] },
+    });
+    expect(git(root, ['status', '--porcelain', '-z', '--untracked-files=all'])).toBe('');
+    await rm(join(root, records));
+    expect(spawnSync('mkfifo', [records], { cwd: root }).status).toBe(0);
+    const result = spawnSync(
+      process.execPath,
+      [resolve('scripts/harness/work/cli.ts'), 'sync', id, 'Check the earlier source.'],
+      { cwd: root, encoding: 'utf8', timeout: 2000 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr.trim()).toBe(`WORK_INPUT_UNCOMMITTED: ${ignored}`);
+    expect((await state(root, id)).checkpoint).toBeNull();
+  },
+);
+
 it('keeps historical strings and originals without treating an old head as a current candidate', async () => {
   const root = await fixture();
   const id = create(root);
@@ -316,4 +420,142 @@ it('records the actual command, contract, environment and settled outcome', asyn
   expect(log).toContain('"exitCode": 0');
   expect(log).toContain('"cancelled": false');
   expect(checks(root, id)).toMatchObject({ result: 'pass', basis: 'execution', executionCount: 1 });
+});
+
+it('verifies large command frames and reads codepoints across chunk boundaries', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const chunk = 64 * 1024;
+  const header = {
+    candidate: entry.candidate,
+    contract: contractPlan(task),
+    argv: fullCommand,
+    detail: '',
+  };
+  const emptyHeaderEnd = Buffer.byteLength(json(header)) - 3;
+  header.detail = 'h'.repeat(2 * chunk - 1 - emptyHeaderEnd);
+  const beforeOutput = json(header) + resultMarker + json({ exitCode: 7 });
+  const prefix = beforeOutput.padEnd(3 * chunk - 1, 'a');
+  const beforeResult = (prefix + '𠮷汉').padEnd(4 * chunk - 6, 'b');
+  const original =
+    beforeResult + resultMarker + json({ exitCode: 0, signal: null, detail: '尾'.repeat(chunk) });
+  entry.sha256 = digest(original);
+  await writeFile(target, original);
+  await writeFile(ledger, json(task));
+
+  expect(checks(root, id)).toMatchObject({ result: 'pass', basis: 'execution', executionCount: 1 });
+  const read = ['read', id, 'evidence', '0'];
+  const page = JSON.parse(ok(root, [...read, '--offset', String(prefix.length), '--limit', '2']));
+  expect(page).toMatchObject({
+    integrity: 'verified',
+    actualSha256: entry.sha256,
+    text: '𠮷汉',
+    page: { total: [...original].length, offset: prefix.length, count: 2 },
+  });
+  expect(JSON.parse(ok(root, page.page.next.argv)).text).toBe('bb');
+  expect(JSON.parse(ok(root, [...read, '--select', '/entry/sha256'])).text).toBe(entry.sha256);
+
+  const damaged = Buffer.from(original);
+  damaged[Buffer.byteLength(prefix) - 1] = 'z'.charCodeAt(0);
+  await writeFile(target, damaged);
+  expect(checks(root, id).result).toBe('corrupt');
+  expect(JSON.parse(ok(root, [...read, '--limit', '2']))).toMatchObject({
+    integrity: 'mismatch',
+    text: '{\n',
+  });
+
+  damaged[Buffer.byteLength(prefix) + 1] = 0xff;
+  await writeFile(target, damaged);
+  for (const options of [[], ['--select', '/entry']]) {
+    const invalid = invoke(root, [...read, ...options]);
+    expect(invalid.status).toBe(1);
+    expect(invalid.output).toContain('WORK_READ_ENCODING');
+  }
+});
+
+it('distinguishes missing, malformed and unfinalized command originals', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const original = await readFile(target, 'utf8');
+  const read = ['read', id, 'evidence', '0'];
+
+  const marker = original.lastIndexOf(resultMarker);
+  const incomplete = original.slice(0, marker);
+  const longOutput = 'x'.repeat(256 * 1024);
+  for (const malformed of [
+    original + resultMarker + '{',
+    'Missing header\n' + original.slice(marker),
+    incomplete,
+    incomplete + resultMarker + 'Unframed output' + longOutput,
+    incomplete + resultMarker + '{"unexpected":?' + longOutput,
+    incomplete + resultMarker + '{"detail":"' + longOutput,
+    '{\n"unexpected":?' + longOutput + '\n}\n' + original.slice(marker),
+  ]) {
+    await writeFile(target, malformed);
+    entry.sha256 = digest(malformed);
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('invalid');
+  }
+
+  await rm(target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('ENOENT');
+
+  const alias = join(dirname(target), 'aliased.log');
+  await writeFile(alias, original);
+  await symlink(alias, target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('WORK_SYMLINK');
+  await rm(target);
+  await link(alias, target);
+  expect(checks(root, id).result).toBe('missing');
+  expect(invoke(root, read).output).toContain('WORK_ARTIFACT');
+  await rm(target);
+
+  await writeFile(target, incomplete);
+  entry.result = 'pending';
+  delete entry.sha256;
+  await writeFile(ledger, json(task));
+  expect(checks(root, id).result).toBe('pending');
+  expect(JSON.parse(ok(root, read))).toMatchObject({ integrity: 'pending', actualSha256: null });
+});
+
+it('accepts complete historical non-object outcomes for failed observations only', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const original = await readFile(target, 'utf8');
+  const prefix = original.slice(0, original.lastIndexOf(resultMarker)) + resultMarker;
+  const field = '历'.repeat(96 * 1024);
+
+  for (const recorded of [field, [field]]) {
+    const log = prefix + json(recorded);
+    await writeFile(target, log);
+    entry.sha256 = digest(log);
+
+    entry.result = 'pass';
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('invalid');
+
+    entry.result = 'fail';
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('fail');
+  }
 });

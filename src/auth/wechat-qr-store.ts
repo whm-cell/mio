@@ -1,5 +1,6 @@
 import { createId } from '@mio/foundation/identifiers';
-import type { Pool, PoolClient } from 'pg';
+import type { Pool } from 'pg';
+import { withAuthTransaction } from './transaction.ts';
 
 export const wechatQRSchema = {
   mioWechatQR: {
@@ -24,26 +25,14 @@ interface QRRow {
   expiresAt: Date;
 }
 
-async function transaction<T>(pool: Pool, action: (client: PoolClient) => Promise<T>) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query("SET LOCAL lock_timeout = '3s'");
-    await client.query("SET LOCAL statement_timeout = '5s'");
-    const result = await action(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+interface SessionIdentity {
+  userId: string;
+  sessionId: string;
 }
 
 /** Retain expired rows for ten minutes so expiry stays observable and old OAuth cannot bypass QR. */
 export function reserveWechatQR(pool: Pool, cookieHash: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     await client.query(
       `DELETE FROM "mioWechatQR" WHERE id IN
        (SELECT id FROM "mioWechatQR" WHERE "expiresAt" <= clock_timestamp() - interval '10 minutes'
@@ -60,7 +49,7 @@ export function reserveWechatQR(pool: Pool, cookieHash: string) {
 }
 
 export function correlateWechatQR(pool: Pool, id: string, stateHash: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const result = await client.query(
       `UPDATE "mioWechatQR" SET "stateHash" = $2
        WHERE id = $1 AND status = 'pending' AND "expiresAt" > clock_timestamp()`,
@@ -72,7 +61,7 @@ export function correlateWechatQR(pool: Pool, id: string, stateHash: string) {
 
 /** Called only after the existing signed-state check and atomic OAuth replay reservation. */
 export function admitWechatQR(pool: Pool, stateHash: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const row = (
       await client.query<QRRow>('SELECT * FROM "mioWechatQR" WHERE "stateHash" = $1 FOR UPDATE', [
         stateHash,
@@ -90,7 +79,7 @@ export function admitWechatQR(pool: Pool, stateHash: string) {
 }
 
 export function finishWechatQR(pool: Pool, id: string, userId?: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     await client.query(
       `UPDATE "mioWechatQR" SET status = $2, "userId" = $3,
        "confirmedAt" = CASE WHEN $3::text IS NOT NULL THEN clock_timestamp() ELSE NULL END,
@@ -101,23 +90,76 @@ export function finishWechatQR(pool: Pool, id: string, userId?: string) {
   });
 }
 
-/** The QR row lock makes the first matching browser consume the success exactly once. */
-export function pollWechatQR(pool: Pool, id: string, cookieHash: string, userId?: string) {
-  return transaction(pool, async (client) => {
-    const row = (
-      await client.query<QRRow>('SELECT * FROM "mioWechatQR" WHERE id = $1 FOR UPDATE', [id])
+async function readWechatQRPoll(pool: Pool, id: string) {
+  const query = {
+    text: `SELECT "cookieHash",status,"userId","expiresAt"<=statement_timestamp() AS expired
+           FROM "mioWechatQR" WHERE id=$1`,
+    values: [id],
+    query_timeout: 5000,
+  };
+  return (
+    await pool.query<Pick<QRRow, 'cookieHash' | 'status' | 'userId'> & { expired: boolean }>(query)
+  ).rows[0];
+}
+
+function claimWechatQR(pool: Pool, id: string, cookieHash: string, identity: SessionIdentity) {
+  const match = `id=$1 AND "cookieHash"=$2 AND "userId"=$3 AND status='confirmed'`;
+  return withAuthTransaction(pool, async (client) => {
+    // Lock the session before the QR row. The claim shares its ordering with other QR claims.
+    const session = await client.query(
+      'SELECT 1 FROM "session" WHERE id=$1 AND "userId"=$2 FOR SHARE',
+      [identity.sessionId, identity.userId],
+    );
+    if (!session.rowCount) return;
+    const values = [id, cookieHash, identity.userId];
+    const locked = await client.query(
+      `SELECT 1 FROM "mioWechatQR" WHERE ${match} FOR UPDATE`,
+      values,
+    );
+    if (!locked.rowCount) return;
+    const saved = (
+      await client.query<{ status: 'expired' | 'consumed' }>(
+        `UPDATE "mioWechatQR"
+         SET status=CASE WHEN "expiresAt"<=statement_timestamp() THEN 'expired' ELSE 'consumed' END
+         WHERE ${match} AND EXISTS (
+           SELECT 1 FROM "session"
+           WHERE id=$4 AND "userId"=$3 AND "expiresAt">statement_timestamp()
+         ) RETURNING status`,
+        [...values, identity.sessionId],
+      )
     ).rows[0];
-    if (!row) return { error: 'NOT_FOUND' } as const;
-    if (row.cookieHash !== cookieHash) return { error: 'STATE_MISMATCH' } as const;
-    const now = (await client.query<{ now: Date }>('SELECT clock_timestamp() AS now')).rows[0]!.now;
-    if (row.expiresAt <= now) {
-      await client.query('UPDATE "mioWechatQR" SET status = \'expired\' WHERE id = $1', [id]);
-      return { status: 'expired' } as const;
-    }
-    if (row.status === 'confirmed') {
-      if (!userId || userId !== row.userId) return { error: 'UNAUTHORIZED' } as const;
-      await client.query('UPDATE "mioWechatQR" SET status = \'consumed\' WHERE id = $1', [id]);
-    }
-    return { status: row.status };
+    if (saved) return { status: saved.status === 'consumed' ? 'confirmed' : 'expired' } as const;
   });
+}
+
+export async function pollWechatQR(
+  pool: Pool,
+  id: string,
+  cookieHash: string,
+  loadIdentity: () => Promise<SessionIdentity | undefined>,
+) {
+  let row = await readWechatQRPoll(pool, id);
+  if (row?.cookieHash === cookieHash && !row.expired && row.status === 'confirmed') {
+    const identity = await loadIdentity();
+    if (identity && identity.userId === row.userId) {
+      const claimed = await claimWechatQR(pool, id, cookieHash, identity);
+      if (claimed) return claimed;
+    }
+    row = await readWechatQRPoll(pool, id);
+  }
+  if (!row) return { error: 'NOT_FOUND' } as const;
+  if (row.cookieHash !== cookieHash) return { error: 'STATE_MISMATCH' } as const;
+  if (row.expired) {
+    if (row.status !== 'expired')
+      await withAuthTransaction(pool, (client) =>
+        client.query(
+          `UPDATE "mioWechatQR" SET status='expired'
+           WHERE id=$1 AND "cookieHash"=$2 AND status<>'expired' AND "expiresAt"<=clock_timestamp()`,
+          [id, cookieHash],
+        ),
+      );
+    return { status: 'expired' } as const;
+  }
+  if (row.status === 'confirmed') return { error: 'UNAUTHORIZED' } as const;
+  return { status: row.status };
 }

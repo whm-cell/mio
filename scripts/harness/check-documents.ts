@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { access, readFile, realpath } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { lstat, readFile, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { beneath } from './inventory.ts';
 import type { HarnessConfig } from './inventory.ts';
 import { checkReports } from './work/reports.ts';
@@ -10,18 +10,32 @@ import { checkApiDocuments } from './check-api-documents.ts';
 import { inspectTaskDocuments, resultDocument, taskNavigation } from './task-documents.ts';
 import { changeIndex, changeIndexPath, readChanges, renderChangeIndex } from './task-changes.ts';
 
+function privateLink(path: string, config: HarnessConfig) {
+  return (
+    path === '..' ||
+    path.startsWith('../') ||
+    isAbsolute(path) ||
+    config.privateRoots.some((base) => beneath(path, base)) ||
+    (path !== '.env.example' && /(?:^|\/)\.env(?:\.|$)/.test(path))
+  );
+}
+
 /** CommonMark paths/privacy for all documents; current anchors/discovery only for active pages. */
 export async function checkDocuments(
   root: string,
   files: readonly string[],
   config: HarnessConfig,
+  listResults = false,
 ) {
   const errors: string[] = [];
+  const canonicalRoot = await realpath(root);
   const registry = await inspectTaskDocuments(root, config);
   errors.push(...registry.errors);
   const aliases = new Set(registry.documents.flatMap((entry) => entry.aliases ?? []));
   const documents = new Map<string, MarkdownNode>();
   const edges = new Map<string, string[]>();
+  const resolvedLinks = new Map<string, Promise<string>>();
+  const anchors = new Map<string, Set<string>>();
   for (const file of files.filter((path) => path.endsWith('.md'))) {
     const source = await readFile(join(root, file), 'utf8');
     if (/\/(?:Users|Volumes|home)\//.test(source)) errors.push(`PERSONAL_PATH ${file}`);
@@ -44,29 +58,33 @@ export async function checkDocuments(
       }
       const path = target ? resolve(dirname(join(root, file)), target) : join(root, file);
       let local = relative(root, path).replaceAll('\\', '/');
-      if (
-        local.startsWith('../') ||
-        config.privateRoots.some((base) => beneath(local, base)) ||
-        (local !== '.env.example' && /(?:^|\/)\.env(?:\.|$)/.test(local))
-      ) {
+      if (privateLink(local, config)) {
         errors.push(`LINK_PRIVATE ${file}: ${url}`);
         continue;
       }
       try {
-        await access(path);
-        local = relative(root, await realpath(path)).replaceAll('\\', '/');
-        if (
-          local.startsWith('../') ||
-          config.privateRoots.some((base) => beneath(local, base)) ||
-          (local !== '.env.example' && /(?:^|\/)\.env(?:\.|$)/.test(local))
-        ) {
+        let resolved = resolvedLinks.get(path);
+        if (!resolved) {
+          resolved = realpath(path).then((target) =>
+            relative(canonicalRoot, target).replaceAll('\\', '/'),
+          );
+          resolvedLinks.set(path, resolved);
+        }
+        local = await resolved;
+        if (privateLink(local, config)) {
           errors.push(`LINK_PRIVATE ${file}: ${url}`);
           continue;
         }
         if (navigation.has(url)) edges.get(file)!.push(local);
         const destination = documents.get(local);
-        if (anchor && destination && !headingAnchors(destination).has(anchor))
-          errors.push(`LINK_ANCHOR ${file}: ${url}`);
+        if (anchor && destination) {
+          let destinationAnchors = anchors.get(local);
+          if (!destinationAnchors) {
+            destinationAnchors = headingAnchors(destination);
+            anchors.set(local, destinationAnchors);
+          }
+          if (!destinationAnchors.has(anchor)) errors.push(`LINK_ANCHOR ${file}: ${url}`);
+        }
       } catch {
         errors.push(`LINK_MISSING ${file}: ${url}`);
       }
@@ -130,21 +148,42 @@ export async function checkDocuments(
     }
   }
   errors.push(...checkApiDocuments(documents, edges));
-  const index = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' });
-  const indexChecked = index.status === 0;
-  if (indexChecked) {
-    for (const file of index.stdout.split('\0').filter(Boolean)) {
-      if (
-        [...config.privateRoots, 'node_modules', 'dist', 'coverage'].some((base) =>
-          beneath(file, base),
-        ) ||
-        (/(?:^|\/)\.env(?:\.|$)/.test(file) && file !== '.env.example') ||
-        file.endsWith('.tgz')
-      ) {
-        errors.push(`INDEX_PRIVATE ${file}`);
-      }
-    }
+  const indexChecked = await checkIndex(root, config, errors);
+  const reportFiles = files.filter(resultDocument);
+  // The listing includes registered PRDs even when none has published files.
+  const reports =
+    !registry.errors.length && (reportFiles.length || (listResults && !errors.length))
+      ? await checkReports(root, reportFiles, { config, ...registry })
+      : undefined;
+  if (reports) errors.push(...reports.errors);
+  else if (reportFiles.length) errors.push(registry.errors.join('\n'));
+  return { errors, indexChecked, documents: registry.documents, results: reports?.results ?? [] };
+}
+
+async function checkIndex(root: string, config: HarnessConfig, errors: string[]) {
+  try {
+    // A normal checkout has a directory, and a linked worktree has a gitfile.
+    // An export has neither, even when extracted beneath another checkout.
+    await lstat(join(root, '.git'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+      errors.push(`INDEX_READ ${String(error)}`);
+    return false;
   }
-  errors.push(...(await checkReports(root, files)));
-  return { errors, indexChecked };
+  const index = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' });
+  if (index.status !== 0 || index.error) {
+    const detail = index.error?.message ?? (index.stderr.trim() || index.signal || index.status);
+    errors.push(`INDEX_READ ${detail}`);
+    return false;
+  }
+  const excluded = [...config.privateRoots, ...config.generatedRoots];
+  for (const file of index.stdout.split('\0').filter(Boolean)) {
+    if (
+      excluded.some((base) => beneath(file, base)) ||
+      (/(?:^|\/)\.env(?:\.|$)/.test(file) && file !== '.env.example') ||
+      file.endsWith('.tgz')
+    )
+      errors.push(`INDEX_PRIVATE ${file}`);
+  }
+  return true;
 }

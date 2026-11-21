@@ -10,6 +10,8 @@ export interface ReadReference {
   argv: string[];
 }
 export const outputBytes = 24576;
+export const defaultTextLimit = 1024;
+export const maxTextLimit = 2048;
 const size = (value: unknown) => Buffer.byteLength(json(value));
 const token = (key: string) => key.replaceAll('~', '~0').replaceAll('/', '~1');
 
@@ -34,7 +36,7 @@ export function selectValue(source: unknown, pointer: string): unknown {
 }
 
 /** Code point boundaries preserve UTF-8 text, including a single very long log line. */
-function textSlice(source: string, offset: number, limit: number, bytes = Infinity) {
+export function textSlice(source: string, offset: number, limit: number, bytes = Infinity) {
   let total = 0;
   let used = 0;
   let text = '';
@@ -112,16 +114,21 @@ export function hasReadReference(value: unknown): boolean {
 }
 
 /** One shared page format for task fields, assessments, guides and public result readers. */
-export function readPage(source: unknown, options: ReadOptions, command: string[]) {
+export function readPage(
+  source: unknown,
+  options: ReadOptions,
+  command: string[],
+  textWindow?: { text: string; total: number },
+) {
   const selected = selectValue(source, options.select);
   const isText = typeof selected === 'string';
-  const limit = options.limit ?? (isText ? 1024 : 10);
+  const limit = options.limit ?? (isText ? defaultTextLimit : 10);
   if (
     !Number.isSafeInteger(options.offset) ||
     !Number.isSafeInteger(limit) ||
     options.offset < 0 ||
     limit < 1 ||
-    limit > (isText ? 2048 : 20)
+    limit > (isText ? maxTextLimit : 20)
   )
     throw new Error('WORK_READ_OPTIONS: limit is 1..20 items or 1..2048 codepoints');
   const reference = (pointer: string): ReadReference => ({
@@ -139,7 +146,7 @@ export function readPage(source: unknown, options: ReadOptions, command: string[
         ? 'fields'
         : 'value';
   if (isText) {
-    const slice = textSlice(selected, options.offset, limit);
+    const slice = textWindow ?? textSlice(selected, options.offset, limit);
     total = slice.total;
     count = Math.min(limit, Math.max(0, total - options.offset));
     body = { text: slice.text };

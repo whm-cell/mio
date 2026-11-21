@@ -2,22 +2,17 @@ import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { createId } from '@mio/foundation/identifiers';
 import type { Pool, PoolClient } from 'pg';
+import { reserveSmsBudget } from './phone-budget.ts';
+import type { PhoneLimits } from './phone-budget.ts';
+import type { SmsBudgetTables } from './phone-budget-schema.ts';
+import { withAuthTransaction } from './transaction.ts';
 
 export type PhonePurpose = 'login' | 'bind';
-export interface PhoneLimits {
-  phoneHour: number;
-  phoneDay: number;
-  ipHour: number;
-  ipDay: number;
-  globalDay: number;
-}
 export interface BindingIdentity {
   userId: string;
   sessionId: string;
 }
 
-const hour = 60 * 60 * 1000;
-const day = 24 * hour;
 const challengeKey = (purpose: PhonePurpose, phone: string) => sha256Utf8(`${purpose}\0${phone}`);
 const codeDigest = (
   secret: string,
@@ -32,28 +27,6 @@ const codeDigest = (
       `${id}\0${purpose}\0${phone}\0${binding?.userId ?? ''}\0${binding?.sessionId ?? ''}\0${code}`,
     )
     .digest('hex');
-
-async function transaction<T>(pool: Pool, action: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query("SET LOCAL lock_timeout = '3s'");
-    await client.query("SET LOCAL statement_timeout = '5s'");
-    const result = await action(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-interface BudgetRow {
-  id: string;
-  events: string;
-}
 
 async function bindingSessionIsActive(client: PoolClient, binding: BindingIdentity) {
   const locked = await client.query(
@@ -72,6 +45,7 @@ async function bindingSessionIsActive(client: PoolClient, binding: BindingIdenti
 /** Reserve every budget and replace the matching challenge in one PG transaction. */
 export async function reservePhoneChallenge(
   pool: Pool,
+  tables: SmsBudgetTables,
   secret: string,
   limits: PhoneLimits,
   purpose: PhonePurpose,
@@ -81,55 +55,8 @@ export async function reservePhoneChallenge(
 ) {
   const id = createId();
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-  return transaction(pool, async (client) => {
-    const keys = [
-      {
-        id: `phone:${sha256Utf8(phone)}`,
-        hour: limits.phoneHour,
-        day: limits.phoneDay,
-        cooldown: true,
-      },
-      { id: `ip:${sha256Utf8(ip)}`, hour: limits.ipHour, day: limits.ipDay, cooldown: false },
-      { id: 'global', hour: Infinity, day: limits.globalDay, cooldown: false },
-    ].sort((a, b) => a.id.localeCompare(b.id));
-    const rows: BudgetRow[] = [];
-    for (const key of keys) {
-      await client.query(
-        'INSERT INTO "mioSmsBudget" (id, events, "updatedAt") VALUES ($1, $2, clock_timestamp()) ON CONFLICT (id) DO NOTHING',
-        [key.id, '[]'],
-      );
-      rows.push(
-        (
-          await client.query<BudgetRow>(
-            'SELECT id, events FROM "mioSmsBudget" WHERE id = $1 FOR UPDATE',
-            [key.id],
-          )
-        ).rows[0]!,
-      );
-    }
-    const now = (await client.query<{ now: Date }>('SELECT clock_timestamp() AS now')).rows[0]!.now;
-    const timestamp = now.getTime();
-    for (const [index, key] of keys.entries()) {
-      const row = rows[index]!;
-      const parsed: unknown = JSON.parse(row.events);
-      if (
-        !Array.isArray(parsed) ||
-        parsed.some((entry) => !Number.isSafeInteger(entry) || entry > timestamp)
-      )
-        throw new Error('SMS_BUDGET_INVALID');
-      const events = (parsed as number[]).filter((entry) => entry > timestamp - day);
-      if (
-        events.length >= key.day ||
-        events.filter((entry) => entry > timestamp - hour).length >= key.hour ||
-        (key.cooldown && events.some((entry) => entry > timestamp - 60_000))
-      )
-        throw new Error('SMS_RATE_LIMITED');
-      await client.query('UPDATE "mioSmsBudget" SET events = $2, "updatedAt" = $3 WHERE id = $1', [
-        key.id,
-        JSON.stringify([...events, timestamp]),
-        now,
-      ]);
-    }
+  return withAuthTransaction(pool, async (client) => {
+    const timestamp = await reserveSmsBudget(client, tables, limits, phone, ip);
     await client.query(
       `INSERT INTO "mioPhoneChallenge" (id, "challengeKey", "codeHash", purpose, "userId", "sessionId", status, attempts, "expiresAt")
        VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7)
@@ -153,8 +80,8 @@ export async function reservePhoneChallenge(
        (SELECT id FROM "mioPhoneChallenge" WHERE "expiresAt" <= clock_timestamp() LIMIT 100 FOR UPDATE SKIP LOCKED)`,
     );
     await client.query(
-      `DELETE FROM "mioSmsBudget" WHERE id IN
-       (SELECT id FROM "mioSmsBudget" WHERE "updatedAt" <= clock_timestamp() - interval '1 day' LIMIT 100 FOR UPDATE SKIP LOCKED)`,
+      `DELETE FROM ${tables.budget} WHERE id IN
+       (SELECT id FROM ${tables.budget} WHERE "updatedAt" <= clock_timestamp() - interval '24 hours' LIMIT 100 FOR UPDATE SKIP LOCKED)`,
     );
     return { id, code };
   });
@@ -162,7 +89,7 @@ export async function reservePhoneChallenge(
 
 /** A late success cannot activate a replacement challenge. */
 export async function activatePhoneChallenge(pool: Pool, id: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const locked = await client.query(
       'SELECT id FROM "mioPhoneChallenge" WHERE id = $1 FOR UPDATE',
       [id],
@@ -196,7 +123,7 @@ export async function consumePhoneChallenge(
   code: string,
   binding?: BindingIdentity,
 ): Promise<'ok' | 'invalid' | 'conflict' | 'session'> {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const result = await client.query<ChallengeRow>(
       'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE',
       [challengeKey(purpose, phone)],

@@ -1,34 +1,52 @@
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MaterialError } from './contracts.ts';
-import type { MaterialAuthRow } from './auth-contracts.ts';
+import type { MaterialAuthRow, MaterialAuthStatusRow } from './auth-contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
 import type { CredentialEnvelope } from '../providers/credentials.ts';
 
-const clear = 'cipher_format=NULL,master_key_id=NULL,nonce=NULL,ciphertext=NULL,auth_tag=NULL';
+const envelopeFields = ['cipher_format', 'master_key_id', 'nonce', 'ciphertext', 'auth_tag'];
+const clear = envelopeFields.map((column) => `${column}=NULL`).join(',');
+const pastDeadline = 'expires_at<=statement_timestamp()';
+const clearExpired = envelopeFields
+  .map((column) => `${column}=CASE WHEN ${pastDeadline} THEN NULL ELSE ${column} END`)
+  .join(',');
+const needsSettlement = `((state NOT IN ('completed','expired') AND ${pastDeadline})
+  OR (state IN ('creating','verifying') AND lease_until<=statement_timestamp()))`;
+const statusFields =
+  'id,state,expires_at,group_id,error_code,ciphertext IS NOT NULL AS has_ciphertext';
+const sessionMatch = 'id=$1 AND ($2::text IS NULL OR owner_id=$2)';
+const creationFields = 'id,owner_id,input_hash,lease_id';
+type CreationClaim = Pick<MaterialAuthRow, 'id' | 'owner_id' | 'input_hash' | 'lease_id'>;
 const superseded = () => new MaterialError(409, 'MATERIAL_AUTH_SUPERSEDED');
+
+export async function withMaterialTransaction<T>(
+  pool: Pool,
+  action: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await action(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error instanceof MaterialError) throw error;
+    if ((error as { code?: string }).code === '23505')
+      throw new MaterialError(HTTP_STATUS.CONFLICT, 'UPSTREAM_RESOURCE_COLLISION');
+    throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
+  } finally {
+    client.release();
+  }
+}
+
 /** Owns only auth session facts; shares its domain pool, never auth/provider pools. */
 export class MaterialAuthStore {
   private readonly pool: Pool;
   constructor(pool: Pool) {
     this.pool = pool;
-  }
-  private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await action(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      if (error instanceof MaterialError) throw error;
-      if ((error as { code?: string }).code === '23505')
-        throw new MaterialError(409, 'UPSTREAM_RESOURCE_COLLISION');
-      throw new MaterialError(503, 'MATERIAL_UNAVAILABLE');
-    } finally {
-      client.release();
-    }
   }
   async expire(id?: string): Promise<void> {
     await this.pool.query(
@@ -38,50 +56,95 @@ export class MaterialAuthStore {
     );
   }
   async get(id: string, owner?: string): Promise<MaterialAuthRow> {
-    await this.expire(id);
     const row = (
-      await this.pool.query<MaterialAuthRow>(
-        `UPDATE mio_material_auth_sessions SET state='unknown',lease_id=NULL,lease_until=NULL,error_code='UPSTREAM_RESULT_UNKNOWN',updated_at=now()
-      WHERE id=$1 AND ($2::text IS NULL OR owner_id=$2) AND state IN ('creating','verifying') AND lease_until<=clock_timestamp() RETURNING *`,
+      await this.pool.query<MaterialAuthRow & { unsettled: boolean }>(
+        `SELECT *,${needsSettlement} AS unsettled FROM mio_material_auth_sessions WHERE ${sessionMatch}`,
         [id, owner ?? null],
       )
     ).rows[0];
-    if (row) return row;
-    const stored = (
-      await this.pool.query<MaterialAuthRow>(
-        'SELECT * FROM mio_material_auth_sessions WHERE id=$1 AND ($2::text IS NULL OR owner_id=$2)',
-        [id, owner ?? null],
-      )
-    ).rows[0];
+    const stored = row?.unsettled ? await this.settle<MaterialAuthRow>(id, owner, '*') : row;
     if (!stored) throw new MaterialError(404, 'MATERIAL_NOT_FOUND');
     return stored;
   }
+
+  private async settle<Row extends MaterialAuthRow | MaterialAuthStatusRow>(
+    id: string,
+    owner: string | undefined,
+    fields: '*' | typeof statusFields,
+  ): Promise<Row | undefined> {
+    return withMaterialTransaction(this.pool, async (client) => {
+      const values = [id, owner ?? null];
+      const locked = await client.query(
+        `SELECT 1 FROM mio_material_auth_sessions WHERE ${sessionMatch} FOR UPDATE`,
+        values,
+      );
+      if (!locked.rowCount) return;
+      // The UPDATE's statement timestamp is sampled after any wait for the session lock.
+      const updated = await client.query<Row>(
+        `UPDATE mio_material_auth_sessions SET
+          state=CASE WHEN ${pastDeadline} THEN 'expired' ELSE 'unknown' END,
+          error_code=CASE WHEN ${pastDeadline} THEN 'AUTH_EXPIRED' ELSE 'UPSTREAM_RESULT_UNKNOWN' END,
+          ${clearExpired},lease_id=NULL,lease_until=NULL,updated_at=statement_timestamp()
+         WHERE ${sessionMatch} AND ${needsSettlement} RETURNING ${fields}`,
+        values,
+      );
+      return (
+        updated.rows[0] ??
+        (
+          await client.query<Row>(
+            `SELECT ${fields} FROM mio_material_auth_sessions WHERE ${sessionMatch}`,
+            values,
+          )
+        ).rows[0]
+      );
+    });
+  }
+
+  private async readStatus(
+    owner: string,
+    key: string,
+    requestHash?: string,
+  ): Promise<MaterialAuthStatusRow | undefined> {
+    const byRequest = requestHash !== undefined;
+    const row = (
+      await this.pool.query<MaterialAuthStatusRow & { unsettled: boolean; input_hash?: string }>(
+        `SELECT ${statusFields},${needsSettlement} AS unsettled${byRequest ? ',input_hash' : ''}
+         FROM mio_material_auth_sessions WHERE owner_id=$1 AND ${byRequest ? 'request_id' : 'id'}=$2`,
+        [owner, key],
+      )
+    ).rows[0];
+    if (!row) return;
+    if (byRequest && row.input_hash !== requestHash)
+      throw new MaterialError(409, 'IDEMPOTENCY_CONFLICT');
+    if (!row.unsettled) return row;
+    return this.settle<MaterialAuthStatusRow>(row.id, owner, statusFields);
+  }
+
+  async status(owner: string, id: string): Promise<MaterialAuthStatusRow> {
+    const row = await this.readStatus(owner, id);
+    if (!row) throw new MaterialError(404, 'MATERIAL_NOT_FOUND');
+    return row;
+  }
+
   async previous(
     owner: string,
     request: string,
     inputHash: string,
-  ): Promise<MaterialAuthRow | undefined> {
-    const row = (
-      await this.pool.query<MaterialAuthRow>(
-        'SELECT * FROM mio_material_auth_sessions WHERE owner_id=$1 AND request_id=$2',
-        [owner, request],
-      )
-    ).rows[0];
-    if (row && row.input_hash !== inputHash) throw new MaterialError(409, 'IDEMPOTENCY_CONFLICT');
-    return row ? this.get(row.id, owner) : undefined;
+  ): Promise<MaterialAuthStatusRow | undefined> {
+    return this.readStatus(owner, request, inputHash);
   }
   async begin(
     owner: string,
     request: string,
     inputHash: string,
     credential: AccountCredentialSnapshot,
-  ): Promise<{ session: MaterialAuthRow; fresh: boolean }> {
-    return this.transaction(async (client) => {
+  ): Promise<{ session: CreationClaim; fresh: boolean }> {
+    return withMaterialTransaction(this.pool, async (client) => {
       const session = (
-        await client.query<MaterialAuthRow>(
+        await client.query<CreationClaim>(
           `INSERT INTO mio_material_auth_sessions(id,owner_id,provider_type,provider_config_id,credential_version,request_id,input_hash,state,protocol_snapshot,return_target,lease_id,lease_until,expires_at)
         VALUES($1,$2,'onelink',$3,$4,$5,$6,'creating','{"version":1}','materials',$7,clock_timestamp()+interval '60 seconds',now()+interval '20 minutes')
-        ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING *`,
+        ON CONFLICT(owner_id,request_id) DO NOTHING RETURNING ${creationFields}`,
           [
             createId(),
             owner,
@@ -95,8 +158,8 @@ export class MaterialAuthStore {
       ).rows[0];
       if (session) return { session, fresh: true };
       const old = (
-        await client.query<MaterialAuthRow>(
-          'SELECT * FROM mio_material_auth_sessions WHERE owner_id=$1 AND request_id=$2',
+        await client.query<CreationClaim>(
+          `SELECT ${creationFields} FROM mio_material_auth_sessions WHERE owner_id=$1 AND request_id=$2`,
           [owner, request],
         )
       ).rows[0]!;
@@ -105,7 +168,7 @@ export class MaterialAuthStore {
     });
   }
   async created(
-    row: MaterialAuthRow,
+    row: CreationClaim,
     envelope: CredentialEnvelope,
     digest: string,
     requestId: string | null,
@@ -130,7 +193,7 @@ export class MaterialAuthStore {
     if (result.rowCount !== 1) throw superseded();
   }
   async createFailed(
-    row: MaterialAuthRow,
+    row: CreationClaim,
     uncertain: boolean,
     code: string,
     requestId: string | null,
@@ -187,7 +250,7 @@ export class MaterialAuthStore {
     resultRequestId: string | null,
     groupRequestId: string | null,
   ): Promise<MaterialAuthRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = (
         await client.query<MaterialAuthRow>(
           "SELECT * FROM mio_material_auth_sessions WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND lease_until>clock_timestamp() AND expires_at>clock_timestamp() AND token_digest=$4 FOR UPDATE",

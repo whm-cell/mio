@@ -41,9 +41,9 @@ export interface GroupRow {
   created_at: Date;
   updated_at: Date;
   deleted_at: Date | null;
-  material_count?: number;
   sync_expired?: boolean;
 }
+export type CountedGroupRow = GroupRow & { material_count: number };
 export interface MaterialRow {
   id: string;
   owner_id: string;
@@ -177,7 +177,7 @@ export interface MaterialUpstream {
   ): Promise<UpstreamMaterial>;
   deleteMaterial(key: string, id: string, signal: AbortSignal): Promise<void>;
 }
-export function groupView(row: GroupRow): GroupView {
+export function groupView(row: CountedGroupRow): GroupView {
   const expired =
     row.sync_expired || (row.state === 'deleted' && row.last_sync_status === 'running');
   return {
@@ -187,7 +187,7 @@ export function groupView(row: GroupRow): GroupView {
     authStatus: row.auth_status,
     state: row.state,
     revision: row.revision,
-    materialCount: row.material_count ?? 0,
+    materialCount: row.material_count,
     lastSyncedAt: row.last_synced_at?.toISOString() ?? null,
     lastSyncStatus: expired ? 'failed' : row.last_sync_status,
     lastSyncErrorCode: expired ? MATERIAL_SYNC_LEASE_EXPIRED : row.last_sync_error_code,

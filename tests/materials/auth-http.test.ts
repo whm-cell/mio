@@ -39,7 +39,7 @@ async function fixture() {
       ...(value ? { body: JSON.stringify(value) } : {}),
       redirect: 'manual',
     });
-  return { ...f, base, request };
+  return { ...f, base, desktopOrigin: origin, request };
 }
 it('exposes the exact launch publicly while authenticated routes preserve Cookie/Origin/strict input', async () => {
   const f = await fixture();
@@ -63,6 +63,16 @@ it('exposes the exact launch publicly while authenticated routes preserve Cookie
   const view = (await created.json()) as { sessionId: string; launchUrl: string };
   const id = view.sessionId,
     token = [...f.tokens.keys()][0]!;
+  const refresh = `${f.base}/api/v1/materials/auth-sessions/${id}/refresh`;
+  const preflight = await fetch(refresh, {
+    method: 'OPTIONS',
+    headers: { origin: f.desktopOrigin },
+  });
+  expect(preflight.status).toBe(204);
+  expect(preflight.headers.get('access-control-allow-methods')).toBe('POST, OPTIONS');
+  const getRefresh = await fetch(refresh);
+  expect(getRefresh.status).toBe(405);
+  expect(getRefresh.headers.get('allow')).toBe('POST, OPTIONS');
   expect(
     (await f.request(`/api/v1/materials/auth-sessions/${id}`, undefined, { cookie: '' })).status,
   ).toBe(401);

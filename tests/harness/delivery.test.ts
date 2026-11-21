@@ -1,5 +1,15 @@
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -263,25 +273,110 @@ async function completeRequest(root: string, id = 'probe') {
   };
 }
 
-function interruptAfterRecords(root: string, request: unknown) {
+type PublicationFault =
+  | { target: string; action: 'fail' | 'interrupt' | 'deny-probe' }
+  | {
+      target: string;
+      action: 'edit' | 'edit-and-interrupt' | 'create' | 'in-place' | 'after-exchange';
+      bytes: string;
+      editTarget?: string;
+      duringRestore?: string;
+    }
+  | { action: 'unsupported' };
+
+function runWithPublicationFault(root: string, request: unknown, fault: PublicationFault) {
   const deliveryModule = join(project, 'scripts/harness/work/delivery.ts');
   const script = `
     import fs from 'node:fs';
+    import { spawnSync } from 'node:child_process';
     import { syncBuiltinESMExports } from 'node:module';
-    const rename = fs.promises.rename;
-    fs.promises.rename = async (before, after) => {
-      if (String(after).endsWith('/complete/report.md')) throw new Error('INJECTED_REPORT_FAILURE');
-      return rename(before, after);
+    import { basename, dirname } from 'node:path';
+    import koffi from ${JSON.stringify(import.meta.resolve('koffi'))};
+    const fault = ${JSON.stringify(fault)};
+    const editorFd = fault.action === 'in-place' ? fs.openSync(fault.target, 'r+') : undefined;
+    function saveAsEditor(target, bytes, descriptor) {
+      const edit = spawnSync(process.execPath, ['--input-type=module', '-e', \`
+        import { ftruncateSync, writeFileSync, renameSync } from 'node:fs';
+        const [target, bytes, mode] = process.argv.slice(1);
+        const contents = Buffer.from(bytes, 'base64');
+        if (mode === 'in-place') {
+          ftruncateSync(3, 0);
+          writeFileSync(3, contents);
+        } else {
+          const source = target + '.editor';
+          writeFileSync(source, contents, { flag: 'wx' });
+          renameSync(source, target);
+        }
+      \`, target, bytes, descriptor === undefined ? 'rename' : 'in-place'], {
+        encoding: 'utf8',
+        stdio: descriptor === undefined ? 'pipe' : ['ignore', 'pipe', 'pipe', descriptor],
+      });
+      if (edit.status !== 0) throw new Error('FIXTURE_EDITOR_FAILED: ' + edit.stderr);
+    }
+    const load = koffi.load;
+    let attempts = 0;
+    koffi.load = (...args) => {
+      if (fault.action === 'unsupported') throw new Error('FIXTURE_UNSUPPORTED');
+      const lib = load(...args);
+      return {
+        func(...signature) {
+          const exchange = lib.func(...signature);
+          return (...parameters) => {
+            const paths = parameters.filter((value) => typeof value === 'string');
+            const target = paths[1];
+            if (target !== fault.target) return exchange(...parameters);
+            attempts++;
+            if (fault.action === 'fail') throw new Error('INJECTED_REPORT_FAILURE');
+            if (attempts === 1 && fault.bytes && fault.action !== 'after-exchange')
+              saveAsEditor(target, fault.bytes, editorFd);
+            if (attempts === 2 && fault.duringRestore) saveAsEditor(target, fault.duringRestore);
+            const result = exchange(...parameters);
+            if (result === 0 && attempts === 1 && fault.action === 'after-exchange')
+              saveAsEditor(fault.editTarget ?? target, fault.bytes);
+            if (result === 0 && (fault.action === 'interrupt' || fault.action === 'edit-and-interrupt'))
+              process.kill(process.pid, 'SIGKILL');
+            return result;
+          };
+        },
+      };
     };
+    if (fault.action === 'create') {
+      const link = fs.promises.link;
+      fs.promises.link = async (before, after) => {
+        if (after === fault.target) {
+          const proposal = JSON.parse(fs.readFileSync(before, 'utf8'));
+          if (!proposal.results.some((entry) => entry.key === 'probe'))
+            throw new Error('FIXTURE_PARTIAL_PUBLICATION');
+          saveAsEditor(after, fault.bytes);
+        }
+        return link(before, after);
+      };
+    }
+    if (fault.action === 'deny-probe') {
+      const open = fs.promises.open;
+      fs.promises.open = async (path, ...args) => {
+        if (dirname(path) === fault.target && basename(path).startsWith('.mio-publication-'))
+          throw Object.assign(new Error('FIXTURE_PARENT_WRITE_DENIED'), { code: 'EACCES' });
+        return open(path, ...args);
+      };
+    }
     syncBuiltinESMExports();
     const { deliver } = await import(${JSON.stringify(deliveryModule)});
     try { await deliver(${JSON.stringify(root)}, 'probe', ${JSON.stringify(json(request))}); }
     catch (error) { console.error(error.message); process.exitCode = 7; }
+    finally { if (editorFd !== undefined) fs.closeSync(editorFd); }
   `;
-  const interrupted = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+  return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     cwd: project,
     encoding: 'utf8',
     timeout: 10000,
+  });
+}
+
+function interruptAfterRecords(root: string, request: unknown) {
+  const interrupted = runWithPublicationFault(root, request, {
+    target: join(root, 'docs/tasks/product/complete/report.md'),
+    action: 'fail',
   });
   expect(interrupted.status, interrupted.stderr).toBe(7);
   expect(interrupted.stderr).toContain('INJECTED_REPORT_FAILURE');
@@ -452,6 +547,231 @@ it('recovers an actual failure after records publication without replaying a jou
   );
 });
 
+const productReport = 'docs/tasks/product/complete/report.md';
+
+it.each([recordsPath(prd), productReport])(
+  'preserves a last-moment independent editor save of %s and keeps acceptance pending',
+  async (path) => {
+    const root = await fixture();
+    await setup(root);
+    await prepare(root);
+    const request = await completeRequest(root);
+    const target = join(root, path);
+    const original = await readFile(target);
+    const edited = Buffer.concat([original, Buffer.from('\r\n  \r\n')]);
+    const outcome = runWithPublicationFault(root, request, {
+      target,
+      action: 'edit',
+      bytes: edited.toString('base64'),
+    });
+    expect(outcome.status, outcome.stderr).toBe(7);
+    expect(outcome.stderr).toContain(`WORK_DELIVERY_CONFLICT: ${path}`);
+    expect((await readFile(target)).equals(edited)).toBe(true);
+    const book = (await readBook(root, prd)).book;
+    expect(book.results.find((entry) => entry.key === 'sibling')).toEqual(sibling);
+    const recordsPublished = path === productReport;
+    expect(book.results.some((entry) => entry.key === 'probe')).toBe(recordsPublished);
+    expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+
+    // Reconcile the editor's changes before legitimately resuming the same draft.
+    await writeFile(target, original);
+    expect(await deliver(root, 'probe', json(request))).toMatchObject({
+      completed: true,
+      replayed: recordsPublished,
+    });
+    expect((await readBook(root, prd)).book.results).toHaveLength(2);
+  },
+);
+
+it('preserves an in-place save through a file descriptor opened before publication', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const path = recordsPath(prd);
+  const target = join(root, path);
+  const inode = (await stat(target)).ino;
+  const original = await readFile(target);
+  const edited = Buffer.concat([original, Buffer.from('\r\n\t\r\n')]);
+  const outcome = runWithPublicationFault(root, request, {
+    target,
+    action: 'in-place',
+    bytes: edited.toString('base64'),
+  });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain(`WORK_DELIVERY_CONFLICT: ${path}`);
+  expect((await readFile(target)).equals(edited)).toBe(true);
+  expect((await stat(target)).ino).toBe(inode);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+});
+
+it.each([
+  ['records after their exchange', recordsPath(prd), recordsPath(prd), false],
+  ['report after its exchange', productReport, productReport, false],
+  ['records during report replay', productReport, recordsPath(prd), true],
+] as const)(
+  'keeps acceptance pending when an editor saves %s',
+  async (_case, trigger, editedPath, replay) => {
+    const root = await fixture();
+    await setup(root);
+    await prepare(root);
+    const request = await completeRequest(root);
+    const editedTarget = join(root, editedPath);
+    const original = await readFile(editedTarget);
+    const edited =
+      editedPath === productReport
+        ? Buffer.concat([original, Buffer.from('\nIndependent report edit.\n')])
+        : original;
+    if (replay) interruptAfterRecords(root, request);
+    const outcome = runWithPublicationFault(root, request, {
+      target: join(root, trigger),
+      action: 'after-exchange',
+      editTarget: editedTarget,
+      bytes: edited.toString('base64'),
+    });
+    expect(outcome.status, outcome.stderr).toBe(7);
+    expect(outcome.stderr).toContain(`WORK_DELIVERY_CONFLICT: ${editedPath}`);
+    expect((await readFile(editedTarget)).equals(edited)).toBe(true);
+    const { task } = await loadTask(root, 'probe');
+    expect(task.stage).toBe('C1_EVIDENCE_PENDING');
+    expect(task.delivery?.accepted).toBeUndefined();
+  },
+);
+
+it('preserves another independent save made during conflict restoration', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const target = join(root, recordsPath(prd));
+  const original = await readFile(target);
+  const first = Buffer.concat([original, Buffer.from('\n\t\n')]);
+  const second = Buffer.concat([original, Buffer.from('\r\n\t\r\n')]);
+  const outcome = runWithPublicationFault(root, request, {
+    target,
+    action: 'edit',
+    bytes: first.toString('base64'),
+    duringRestore: second.toString('base64'),
+  });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain('WORK_DELIVERY_CONFLICT');
+  const directory = join(root, '.work/publication');
+  const recoveries = (await readdir(directory)).filter((name) => name.endsWith('.swap'));
+  expect(recoveries).toHaveLength(1);
+  const recovery = join(directory, recoveries[0]!);
+  expect(outcome.stderr).toContain(recovery);
+  expect((await readFile(target)).equals(first)).toBe(true);
+  expect((await readFile(recovery)).equals(second)).toBe(true);
+  await expect(deliver(root, 'probe', json(request))).rejects.toThrow(recovery);
+  expect((await readFile(recovery)).equals(second)).toBe(true);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+});
+
+it.each(['interrupt', 'edit-and-interrupt'] as const)(
+  'reconciles an exchange after a real process kill (%s) before accepting the same draft',
+  async (action) => {
+    const root = await fixture();
+    await setup(root);
+    await prepare(root);
+    const request = await completeRequest(root);
+    const path = recordsPath(prd);
+    const target = join(root, path);
+    const original = await readFile(target);
+    const edited = Buffer.concat([original, Buffer.from('\n  \r\n')]);
+    const outcome = runWithPublicationFault(
+      root,
+      request,
+      action === 'interrupt'
+        ? { target, action }
+        : { target, action, bytes: edited.toString('base64') },
+    );
+    expect(outcome.signal, outcome.stderr).toBe('SIGKILL');
+    expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+    await expect(deliver(root, 'probe', json(request))).rejects.toThrow('WORK_PUBLISH_BUSY');
+
+    const directory = join(root, '.work/publication');
+    const recoveries = (await readdir(directory)).filter((name) => name.endsWith('.swap'));
+    expect(recoveries).toHaveLength(1);
+    const captured = await readFile(join(directory, recoveries[0]!));
+    expect(captured.equals(action === 'interrupt' ? original : edited)).toBe(true);
+    await rm(join(directory, `${digest(path)}.lock`));
+    if (action === 'edit-and-interrupt') {
+      await expect(deliver(root, 'probe', json(request))).rejects.toThrow('WORK_DELIVERY_CONFLICT');
+      expect((await readFile(target)).equals(edited)).toBe(true);
+      expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+      await writeFile(target, original);
+    }
+    expect(await deliver(root, 'probe', json(request))).toMatchObject({
+      completed: true,
+      replayed: action === 'interrupt',
+    });
+    const { book } = await readBook(root, prd);
+    expect(book.results.find((entry) => entry.key === 'sibling')).toEqual(sibling);
+    expect(book.results.filter((entry) => entry.key === 'probe')).toHaveLength(1);
+  },
+);
+
+it('publishes the first complete record exclusively against a concurrent creator', async () => {
+  const root = await fixture(false);
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const target = join(root, recordsPath(prd));
+  const edited = json({ version: 5, prd, results: [sibling] });
+  const outcome = runWithPublicationFault(root, request, {
+    target,
+    action: 'create',
+    bytes: Buffer.from(edited).toString('base64'),
+  });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain('WORK_DELIVERY_CONFLICT');
+  expect(await readFile(target, 'utf8')).toBe(edited);
+  expect((await readBook(root, prd)).book.results).toEqual([sibling]);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+});
+
+it('refuses public replacement before either file changes when exchange is unavailable', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const targets = [join(root, recordsPath(prd)), join(root, productReport)];
+  const before = await Promise.all(targets.map((target) => readFile(target, 'utf8')));
+  const outcome = runWithPublicationFault(root, request, { action: 'unsupported' });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain('WORK_PUBLISH_ATOMIC');
+  expect(await Promise.all(targets.map((target) => readFile(target, 'utf8')))).toEqual(before);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+
+  const fresh = await fixture(false);
+  await setup(fresh);
+  await prepare(fresh);
+  const first = runWithPublicationFault(fresh, await completeRequest(fresh), {
+    action: 'unsupported',
+  });
+  expect(first.status, first.stderr).toBe(0);
+  expect((await readBook(fresh, prd)).book.results.map((entry) => entry.key)).toEqual(['probe']);
+});
+
+it('preserves both public files and cleans up when the target directory cannot host an exchange', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const targets = [join(root, recordsPath(prd)), join(root, productReport)];
+  const parent = dirname(targets[0]!);
+  const before = await Promise.all(targets.map((target) => readFile(target)));
+  const listings = await readdir(parent);
+  const outcome = runWithPublicationFault(root, request, { action: 'deny-probe', target: parent });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain('WORK_PUBLISH_ATOMIC');
+  expect(outcome.stderr).toContain('FIXTURE_PARENT_WRITE_DENIED');
+  expect(await Promise.all(targets.map((target) => readFile(target)))).toEqual(before);
+  expect(await readdir(parent)).toEqual(listings);
+  expect(await readdir(join(root, '.work/publication'))).toEqual([]);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+});
+
 it('does not apply an old accepted draft to a changed task contract after interruption', async () => {
   const root = await fixture();
   await setup(root);
@@ -609,6 +929,56 @@ it('does not prepare when a later supplemental check failed', async () => {
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
 });
 
+it('freezes the assessed originals in criterion and ledger order', async () => {
+  const root = await fixture();
+  const candidate = await setup(root);
+  const { task, raw } = await loadTask(root, 'probe');
+  const [checks, quality, norms] = task.evidence;
+  const artifact = '.work/tasks/probe/evidence/supplemental-pass.log';
+  const content =
+    json({ candidate, contract: contractPlan(task), argv: ['node', '-v'] }) +
+    resultMarker +
+    json({ exitCode: 0, signal: null, cancelled: false, unsettled: false, contextChanged: false });
+  await put(root, artifact, content);
+  const supplemental = { ...checks!, artifact, sha256: digest(content) };
+  task.evidence.push(supplemental, {
+    ...quality!,
+    method: 'behavior',
+    artifact: '.work/tasks/probe/evidence/wrong-method.md',
+  });
+  await saveTask(root, task, raw);
+  const prepared = await prepare(root);
+  expect(prepared).toMatchObject({
+    draft: { evidence: [checks, supplemental, quality, norms] },
+    readyForAcceptance: true,
+  });
+});
+
+it('rechecks the middle of a large command original before completing its prepared result', async () => {
+  const root = await fixture();
+  await setup(root);
+  const { task, raw } = await loadTask(root, 'probe');
+  const entry = task.evidence.find(({ criterion }) => criterion === 'checks')!;
+  const old = await readFile(join(root, entry.artifact), 'utf8');
+  const marker = old.lastIndexOf(resultMarker);
+  const payload = 'x'.repeat(256 * 1024);
+  const body = old.slice(0, marker) + payload + old.slice(marker);
+  entry.sha256 = digest(body);
+  await put(root, entry.artifact, body);
+  await saveTask(root, task, raw);
+
+  await prepare(root);
+  const request = await completeRequest(root);
+  const changed = marker + payload.length / 2;
+  await put(root, entry.artifact, body.slice(0, changed) + 'y' + body.slice(changed + 1));
+  await expect(deliver(root, 'probe', json(request))).rejects.toThrow('WORK_DELIVERY_EVIDENCE');
+  expect((await readBook(root, prd)).book.results).toEqual([sibling]);
+
+  await put(root, entry.artifact, body);
+  await deliver(root, 'probe', json(request));
+  expect((await readBook(root, prd)).book.results.map(({ key }) => key)).toContain('probe');
+});
+
 it('rejects fresh publication with staged or untracked changes even when the draft was reviewed', async () => {
   const root = await fixture();
   await setup(root);
@@ -629,16 +999,18 @@ it('reads records without a report, while guard checks its derivation and PRD ow
   await rm(join(root, paths.report));
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
   expect(await readPublicResult(root, [prd, 'sibling'])).toBeTruthy();
-  expect((await checkReports(root, [paths.records]))[0]).toContain('WORK_REPORT_DRIFT');
+  expect((await checkReports(root, [paths.records], catalog)).errors[0]).toContain(
+    'WORK_REPORT_DRIFT',
+  );
   await put(root, paths.report, 'stale');
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
-  expect((await checkReports(root, [paths.report, paths.records]))[0]).toContain(
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors[0]).toContain(
     'WORK_REPORT_DRIFT',
   );
   await rm(join(root, paths.report));
   await symlink('unexpected-target.md', join(root, paths.report));
   expect((await readBook(root, prd)).book.results).toEqual([sibling]);
-  expect((await checkReports(root, [paths.report, paths.records]))[0]).toContain(
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors[0]).toContain(
     'WORK_REPORT_DRIFT',
   );
   await rm(join(root, paths.report));
@@ -671,11 +1043,12 @@ it('uses a stable PRD identity, rejects orphan results and leaves the static ind
   const book = (await readBook(root, prd)).book;
   expect(book.prd).toBe(identity);
   expect(await readFile(join(root, taskIndexPath), 'utf8')).toBe(before);
-  const paths = bookPaths(prd, await documentCatalog(root));
-  expect(await checkReports(root, [paths.report, paths.records])).toEqual([]);
+  const catalog = await documentCatalog(root);
+  const paths = bookPaths(prd, catalog);
+  expect((await checkReports(root, [paths.report, paths.records], catalog)).errors).toEqual([]);
   const orphan = 'docs/tasks/product/complete/extra.md';
   await put(root, orphan, '# Orphan\n');
-  expect(await checkReports(root, [paths.report, paths.records, orphan])).toEqual([
-    `WORK_REPORT_ORPHAN: ${orphan}`,
-  ]);
+  expect((await checkReports(root, [paths.report, paths.records, orphan], catalog)).errors).toEqual(
+    [`WORK_REPORT_ORPHAN: ${orphan}`],
+  );
 });

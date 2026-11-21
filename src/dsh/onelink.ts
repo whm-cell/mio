@@ -1,3 +1,4 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { Context } from '@deepseek-ai/cordis';
 import {
   IMAGE_OFFLOAD_REQUIRED_CODE,
@@ -42,7 +43,6 @@ const chatProfiles = {
     api: openAICompletionsApi,
     apiId: 'openai-completions',
     path: '/v1/chat/completions',
-    baseUrl: `${ONELINK_ORIGIN}/v1`,
     compat: { maxTokensField: 'max_tokens', supportsStore: false },
   },
   'anthropic-messages': {
@@ -50,7 +50,6 @@ const chatProfiles = {
     api: anthropicMessagesApi,
     apiId: 'anthropic-messages',
     path: '/v1/messages',
-    baseUrl: ONELINK_ORIGIN,
     // Disable SDK strict-tool downgrade/repost; Mio owns every visible attempt.
     compat: { supportsStrictTools: false },
   },
@@ -91,6 +90,25 @@ function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
   if (submitPath !== '/v1/messages')
     throw new LlmError('OneLink submitPath is invalid', 'BINDING_REQUIRED');
   return { protocol, submitPath, baseUrl: ONELINK_ORIGIN };
+}
+
+function chatFailureCode(aborted: boolean, status: number | undefined, fallback: string): string {
+  if (aborted) return 'ABORTED';
+  switch (status) {
+    case HTTP_STATUS.UNAUTHORIZED:
+    case HTTP_STATUS.FORBIDDEN:
+      return 'AUTH';
+    case 402:
+      return 'QUOTA_EXCEEDED';
+    case HTTP_STATUS.TOO_MANY_REQUESTS:
+      return 'RATE_LIMIT';
+    case HTTP_STATUS.REQUEST_TIMEOUT:
+    case 504:
+      return 'TIMEOUT';
+  }
+  if (status !== undefined && status >= 500) return 'SERVER';
+  if (status !== undefined && status >= HTTP_STATUS.BAD_REQUEST) return 'INVALID_REQUEST';
+  return fallback;
 }
 
 function metadata(
@@ -330,40 +348,24 @@ export class OneLinkAdapter extends LlmAdapter {
       for await (const chunk of stream(projected)) {
         if (chunk.type === 'usage') usage = chunk.usage;
         if (chunk.type === 'finish') {
+          let safe = chunk;
           if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-            failureCode = signal.aborted
-              ? 'ABORTED'
-              : facts.status === 401 || facts.status === 403
-                ? 'AUTH'
-                : facts.status === 402
-                  ? 'QUOTA_EXCEEDED'
-                  : facts.status === 429
-                    ? 'RATE_LIMIT'
-                    : facts.status === 408 || facts.status === 504
-                      ? 'TIMEOUT'
-                      : facts.status && facts.status >= 500
-                        ? 'SERVER'
-                        : facts.status && facts.status >= 400
-                          ? 'INVALID_REQUEST'
-                          : chunk.reason.failure.code;
+            failureCode = chatFailureCode(signal.aborted, facts.status, chunk.reason.failure.code);
+            safe = {
+              type: 'finish',
+              reason: {
+                kind: signal.aborted ? 'aborted' : 'error',
+                failure: {
+                  code: failureCode,
+                  message: 'OneLink model request did not complete',
+                  ...(facts.providerRequestId
+                    ? { requestId: facts.providerRequestId as never }
+                    : {}),
+                  ...(facts.status ? { status: facts.status } : {}),
+                },
+              },
+            };
           }
-          const safe: StreamChunk =
-            chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted'
-              ? {
-                  type: 'finish',
-                  reason: {
-                    kind: signal.aborted ? 'aborted' : 'error',
-                    failure: {
-                      code: failureCode!,
-                      message: 'OneLink model request did not complete',
-                      ...(facts.providerRequestId
-                        ? { requestId: facts.providerRequestId as never }
-                        : {}),
-                      ...(facts.status ? { status: facts.status } : {}),
-                    },
-                  },
-                }
-              : chunk;
           if (execution.started) {
             observed = true;
             await run.observe(observation(safe.reason.kind));

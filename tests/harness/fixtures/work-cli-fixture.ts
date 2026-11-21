@@ -99,7 +99,11 @@ export function invoke(root: string, args: string[], input?: unknown) {
     timeout: 10000,
     ...(input === undefined ? {} : { input: JSON.stringify(input) }),
   });
-  return { status: result.status, output: `${result.stdout}\n${result.stderr}`.trim() };
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    output: `${result.stdout}\n${result.stderr}`.trim(),
+  };
 }
 
 export const statePath = (root: string, id = 'probe') => join(root, `.work/tasks/${id}/state.json`);

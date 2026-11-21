@@ -13,6 +13,7 @@ try {
     try {
       await client.query('BEGIN');
       await client.query(generationSchemaSQL);
+      await checkGenerationSchema(client);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -20,7 +21,6 @@ try {
     } finally {
       client.release();
     }
-    await checkGenerationSchema(pool);
     console.log('Generation metadata schema is current.');
   } else console.log(generationSchemaSQL);
 } finally {

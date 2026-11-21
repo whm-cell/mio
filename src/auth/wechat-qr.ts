@@ -81,18 +81,17 @@ export function wechatQRPlugin(baseURL: string, pool: Pool): BetterAuthPlugin {
           if (!isUuidV4(id)) return fail('NOT_FOUND');
           const cookie = ctx.context.createAuthCookie('wechat_qr');
           const cookieValue = ctx.getCookie(cookie.name);
-          const identity = await getSession()({
-            context: ctx.context,
-            headers: ctx.headers ?? new Headers(),
-            query: { disableCookieCache: true, disableRefresh: true },
-            asResponse: false,
+          const result = await pollWechatQR(pool, id, sha256Utf8(cookieValue ?? ''), async () => {
+            const identity = await getSession()({
+              context: ctx.context,
+              headers: ctx.headers ?? new Headers(),
+              query: { disableCookieCache: true, disableRefresh: true },
+              asResponse: false,
+            });
+            return identity
+              ? { userId: identity.user.id, sessionId: identity.session.id }
+              : undefined;
           }).catch(wechatUnavailable);
-          const result = await pollWechatQR(
-            pool,
-            id,
-            sha256Utf8(cookieValue ?? ''),
-            identity?.user.id,
-          ).catch(wechatUnavailable);
           if ('error' in result) return fail(result.error);
           return ctx.json(result);
         },

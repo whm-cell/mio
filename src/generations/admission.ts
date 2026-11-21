@@ -26,7 +26,7 @@ import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 import type { GenerationRequest } from './execution.ts';
-import type { GenerationStore, ImageRequestRecord } from './store.ts';
+import type { GenerationStore, ImageInputAsset, ImageRequestRecord } from './store.ts';
 import type { GenerationFiles } from './files.ts';
 import { GenerationError } from './errors.ts';
 
@@ -214,14 +214,11 @@ function capability(
 }
 
 async function inputAsset(
-  store: GenerationStore,
   head: AssetObjectStore['head'],
-  owner: string,
   id: string,
+  asset: ImageInputAsset | undefined,
   mask = false,
 ): Promise<ImageAssetRef> {
-  if (!isUuidV4(id)) inputError();
-  const asset = await store.imageInput(owner, id);
   if (
     !asset ||
     !asset.raw_key.startsWith(
@@ -324,11 +321,13 @@ export function createGenerationAdmission(
         parameters.aspect_ratio !== undefined
       )
         inputError();
-      const images = await Promise.all(ids.map((id) => inputAsset(store, head, actor.userId, id)));
+      if (ids.some((id) => !isUuidV4(id))) inputError();
+      const maskId = parameters.maskAssetId;
+      const assetIds = maskId === undefined || ids.includes(maskId) ? ids : [...ids, maskId];
+      const assets = await store.imageInputs(actor.userId, assetIds);
+      const images = await Promise.all(ids.map((id) => inputAsset(head, id, assets.get(id))));
       const mask =
-        parameters.maskAssetId !== undefined
-          ? await inputAsset(store, head, actor.userId, parameters.maskAssetId, true)
-          : undefined;
+        maskId === undefined ? undefined : await inputAsset(head, maskId, assets.get(maskId), true);
       const {
         imageAssetId,
         imageAssetIds: _imageAssetIds,

@@ -64,6 +64,10 @@ it('preserves all four terminal receipts and the next busy request after a late 
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   const actor = { userId: randomUUID(), sessionId: randomUUID() };
+  const resolveLegacy = async () => undefined;
+  const rejectFreshResolution = async () => {
+    throw new Error('Unexpected fresh model resolution');
+  };
   let store: Awaited<ReturnType<typeof createConversationStore>> | undefined;
   try {
     await pool.query(conversationSchemaSQL);
@@ -77,7 +81,7 @@ it('preserves all four terminal receipts and the next busy request after a late 
       const id = randomUUID();
       await store.create(actor, id);
       await store.setReady(id, true);
-      await store.receive(actor, id, 'first', 'first-digest', true);
+      await store.receive(actor, id, 'first', 'first-digest', resolveLegacy);
       const original = await store.finish(id, 'first', status, error);
       expect(original).toEqual({
         conversationId: id,
@@ -85,15 +89,28 @@ it('preserves all four terminal receipts and the next busy request after a late 
         status,
         ...(error ? { error } : {}),
       });
-      await store.receive(actor, id, 'next', 'next-digest', true);
+      await store.receive(actor, id, 'next', 'next-digest', resolveLegacy);
       expect(await store.finish(id, 'first', 'unknown', 'EXECUTION_UNKNOWN')).toEqual(original);
       expect(await store.reconcileExecution(actor, id, 'first')).toEqual(original);
       expect(await store.request(actor, id, 'first')).toEqual(original);
+      await expect(
+        store.receive(actor, id, 'first', 'first-digest', rejectFreshResolution),
+      ).resolves.toMatchObject({
+        fresh: false,
+        receipt: original,
+      });
+      await expect(
+        store.receive(actor, id, 'first', 'wrong-digest', rejectFreshResolution),
+      ).rejects.toMatchObject({
+        code: 'REQUEST_ID_CONFLICT',
+      });
       expect(await store.snapshot(actor, id)).toMatchObject({
         activeRequestId: 'next',
         receipt: { requestId: 'next', status: 'accepted' },
       });
-      await expect(store.receive(actor, id, 'third', 'third-digest', true)).rejects.toMatchObject({
+      await expect(
+        store.receive(actor, id, 'third', 'third-digest', rejectFreshResolution),
+      ).rejects.toMatchObject({
         code: 'CONVERSATION_BUSY',
       });
     }

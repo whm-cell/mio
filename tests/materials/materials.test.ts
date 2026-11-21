@@ -70,7 +70,7 @@ it('deduplicates same request and input, rejects different input and never disco
   await expect(f.service.createGroup(f.actor, request, 'Different')).rejects.toMatchObject({
     code: 'IDEMPOTENCY_CONFLICT',
   });
-  const existing = (await f.service.groups(f.actor, undefined, 20)).items[0] as { groupId: string };
+  const existing = (await f.service.groups(f.actor, undefined, 20)).items[0]!;
   const upstream = (await f.store.ownedGroup(f.actor.userId, existing.groupId)).upstream_group_id;
   const other = { userId: randomUUID(), sessionId: 'other' };
   await f.provider.save(other, 0, 'other-synthetic-key');
@@ -172,18 +172,23 @@ it('syncs only one owned group and one bounded page, preserves missing-page reco
   const group = await f.create();
   for (let i = 1; i <= 101; i++) f.add(group.upstreamId, i);
   const first = await f.service.sync(f.actor, group.groupId);
-  expect(first).toMatchObject({ syncedCount: 100, nextCursor: '2' });
+  expect(first).toMatchObject({
+    group: { materialCount: 100 },
+    syncedCount: 100,
+    nextCursor: '2',
+  });
   const list = f.transport.mock.calls.find(([url]) => String(url).includes('Action=ListAssets'))!;
   expect(JSON.parse(String(list[1]?.body))).toEqual({
     Filter: { GroupIds: [group.upstreamId] },
     PageNumber: 1,
     PageSize: 100,
   });
-  await f.service.sync(f.actor, group.groupId, '2');
-  const all = (await f.service.materials(f.actor, group.groupId, 100)).items as {
-    materialId: string;
-    revision: number;
-  }[];
+  expect(await f.service.sync(f.actor, group.groupId, '2')).toMatchObject({
+    group: { materialCount: 101 },
+    syncedCount: 1,
+    nextCursor: null,
+  });
+  const all = (await f.service.materials(f.actor, group.groupId, 100)).items;
   expect(all).toHaveLength(100);
   await f.service.remove(
     f.actor,
@@ -193,17 +198,16 @@ it('syncs only one owned group and one bounded page, preserves missing-page reco
     all[0]!.revision,
     'local',
   );
-  await f.service.sync(f.actor, group.groupId);
-  expect(
-    Number(
-      (
-        await f.pool.query(
-          "SELECT count(*) FROM mio_materials WHERE group_id=$1 AND state<>'deleted'",
-          [group.groupId],
-        )
-      ).rows[0].count,
-    ),
-  ).toBe(100);
+  expect(await f.service.sync(f.actor, group.groupId)).toMatchObject({
+    group: { materialCount: 100 },
+  });
+  expect(await f.service.group(f.actor, group.groupId)).toMatchObject({ materialCount: 100 });
+  expect((await f.service.groups(f.actor, undefined, 20)).items).toMatchObject([
+    { materialCount: 100 },
+  ]);
+  expect(await f.service.rename(f.actor, group.groupId, group.revision, 'Renamed')).toMatchObject({
+    materialCount: 100,
+  });
   await expect(f.service.material(f.actor, all[0]!.materialId)).rejects.toMatchObject({
     code: 'MATERIAL_NOT_FOUND',
   });
@@ -220,12 +224,15 @@ it('syncs only one owned group and one bounded page, preserves missing-page reco
   expect(f.transport).toHaveBeenCalledTimes(before);
 });
 
-it('rejects cross-group items atomically and protects a globally colliding material owned by another user', async () => {
+it('rejects a wrong group and rolls back mixed writes on an upstream ID collision', async () => {
   const f = await fixture();
   const one = await f.create();
   const two = await f.create();
   const upstream = f.add(one.upstreamId);
   await f.service.sync(f.actor, one.groupId);
+  const existing = f.add(two.upstreamId, 2);
+  await f.service.sync(f.actor, two.groupId);
+  const before = await f.store.materials(f.actor.userId, two.groupId, 20);
   f.override(async (action) =>
     action === 'ListAssets'
       ? envelope(action, {
@@ -252,6 +259,17 @@ it('rejects cross-group items atomically and protects a globally colliding mater
       ? envelope(action, {
           Items: [
             {
+              ...f.items.get(existing)!,
+              Name: 'Would have been updated',
+            },
+            {
+              Id: 'asset-00000000000000-abcde',
+              GroupId: two.upstreamId,
+              Name: 'Would have been inserted',
+              AssetType: 'Image',
+              Status: 'Active',
+            },
+            {
               Id: upstream,
               GroupId: two.upstreamId,
               Name: 'Collision',
@@ -261,15 +279,68 @@ it('rejects cross-group items atomically and protects a globally colliding mater
           ],
           PageNumber: 1,
           PageSize: 100,
-          TotalCount: 1,
+          TotalCount: 3,
         })
       : undefined,
   );
   await expect(f.service.sync(f.actor, two.groupId)).rejects.toMatchObject({
     code: 'UPSTREAM_RESOURCE_COLLISION',
   });
-  expect((await f.service.materials(f.actor, two.groupId, 20)).items).toEqual([]);
+  expect(await f.store.materials(f.actor.userId, two.groupId, 20)).toEqual(before);
   expect((await f.service.materials(f.actor, one.groupId, 20)).items).toHaveLength(1);
+});
+
+it('commits an upstream identity to only one owner when two groups sync it concurrently', async () => {
+  const f = await fixture();
+  const one = await f.create();
+  const other = { userId: randomUUID(), sessionId: 'other' };
+  await f.provider.save(other, 0, 'synthetic-material-other-key');
+  const two = (await f.service.createGroup(other, randomUUID(), 'Other group')).group!;
+  const upstream = 'asset-00000000000001-abcde';
+  const listReady = Promise.withResolvers<void>();
+  let listing = 0;
+  f.override(async (action, body) => {
+    if (action !== 'ListAssets') return;
+    const { GroupIds } = body.Filter as { GroupIds: string[] };
+    if (++listing === 2) listReady.resolve();
+    await listReady.promise;
+    return envelope(action, {
+      Items: [
+        {
+          Id: upstream,
+          GroupId: GroupIds[0],
+          Name: 'Contended',
+          AssetType: 'Image',
+          Status: 'Active',
+        },
+      ],
+      PageNumber: 1,
+      PageSize: 100,
+      TotalCount: 1,
+    });
+  });
+  const outcomes = await Promise.allSettled([
+    f.service.sync(f.actor, one.groupId).finally(listReady.resolve),
+    f.service.sync(other, two.groupId).finally(listReady.resolve),
+  ]);
+  expect(listing).toBe(2);
+  const winner = outcomes.findIndex((outcome) => outcome.status === 'fulfilled');
+  expect(winner).toBeGreaterThanOrEqual(0);
+  expect(outcomes[1 - winner]).toMatchObject({
+    status: 'rejected',
+    reason: { code: 'UPSTREAM_RESOURCE_COLLISION' },
+  });
+  expect(
+    (
+      await f.pool.query('SELECT owner_id,group_id FROM mio_materials WHERE upstream_asset_id=$1', [
+        upstream,
+      ])
+    ).rows,
+  ).toEqual([
+    winner === 0
+      ? { owner_id: f.actor.userId, group_id: one.groupId }
+      : { owner_id: other.userId, group_id: two.groupId },
+  ]);
 });
 
 it('validates a late sync lease in the same transaction as all writes and does not resurrect local removal', async () => {
@@ -299,6 +370,7 @@ it('validates a late sync lease in the same transaction as all writes and does n
   ).toMatchObject({
     group: {
       state: 'deleted',
+      materialCount: 0,
       lastSyncStatus: 'failed',
       lastSyncErrorCode: 'MATERIAL_SYNC_LEASE_EXPIRED',
     },
@@ -777,6 +849,11 @@ it('persists unknown remote deletion and recovers by exact resource query withou
   expect(deleting).toMatchObject({ operation: { state: 'unknown' } });
   if (!('operation' in deleting)) throw new Error();
   f.override(undefined);
+  const pending = await f.store.ownedMaterial(f.actor.userId, row.id);
+  f.add(group.upstreamId); // A stale list observation cannot supersede the unknown removal.
+  await f.service.sync(f.actor, group.groupId);
+  expect(await f.store.ownedMaterial(f.actor.userId, row.id)).toEqual(pending);
+  f.items.delete(upstream);
   const recovered = await f.service.operation(f.actor, deleting.operation.operationId);
   expect(recovered.state).toBe('succeeded');
   expect(

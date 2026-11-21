@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
 import { captureLiveArtifacts } from './live-image-loop.ts';
@@ -18,6 +18,31 @@ const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+const artifactFixture = {
+  'tests/compute/live-image-loop.ts': 'export {};\n',
+  'tests/compute/live-image-audit.ts': 'export {};\n',
+  'scripts/service/generation-cutover.ts': 'export {};\n',
+  'scripts/service/migrate-generations.ts': 'export {};\n',
+  'src/generations/execution.ts': 'export {};\n',
+  'src/integrations/onelink/router.ts': 'export {};\n',
+  'src/providers/credentials.ts': 'export {};\n',
+  'package.json': '{"type":"module"}\n',
+  'pnpm-lock.yaml': "lockfileVersion: '9.0'\n",
+  'dist/plugin.js': 'export {};\n',
+  'packages/foundation/dist/index.js': 'export {};\n',
+};
+
+function createArtifactProject(parent = tmpdir()) {
+  const project = realpathSync(mkdtempSync(join(parent, 'mio-live-setup-')));
+  roots.push(project);
+  for (const [relative, contents] of Object.entries(artifactFixture)) {
+    const file = join(project, relative);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, contents);
+  }
+  return project;
+}
 
 it.each(['prepare', 'execute'])(
   'rejects retired %s before creating a run or opening legacy infrastructure',
@@ -62,30 +87,34 @@ it('does not start the A live chain without explicit opt-in', () => {
   expect(existsSync(run)).toBe(false);
 });
 
+it('collects the required files and entries within source and build directories', () => {
+  const project = createArtifactProject();
+  const artifact = captureLiveArtifacts(project);
+  expect(artifact.files.map(({ path }) => path)).toEqual(Object.keys(artifactFixture).sort());
+});
+
+it.each(['scripts/service/migrate-generations.ts', 'packages/foundation/dist'])(
+  'rejects a missing required artifact at %s',
+  (relative) => {
+    const project = createArtifactProject();
+    const path = join(project, relative);
+    rmSync(path, { recursive: true });
+    expect(() => captureLiveArtifacts(project)).toThrow(
+      expect.objectContaining({ code: 'ENOENT', path }),
+    );
+  },
+);
+
+it('rejects an empty required source directory', () => {
+  const project = createArtifactProject();
+  rmSync(join(project, 'src/generations/execution.ts'));
+  expect(() => captureLiveArtifacts(project)).toThrow('LIVE_ARTIFACT_PATH');
+});
+
 it('uses the real readiness policy and route-import contract before live admission', () => {
-  mkdirSync(resolve('.runtime'), { recursive: true });
-  const root = realpathSync(mkdtempSync(join(resolve('.runtime'), 'mio-live-setup-')));
-  roots.push(root);
-  const project = join(root, 'project');
-  mkdirSync(project);
-  for (let remaining = 100; ; remaining--) {
-    try {
-      captureLiveArtifacts(project);
-      break;
-    } catch (error) {
-      const missing = error as NodeJS.ErrnoException;
-      if (!remaining || missing.code !== 'ENOENT' || !missing.path?.startsWith(project + sep))
-        throw error;
-      if (basename(missing.path) === 'dist') {
-        mkdirSync(missing.path, { recursive: true });
-        writeFileSync(join(missing.path, 'fixture.js'), 'synthetic');
-      } else {
-        mkdirSync(dirname(missing.path), { recursive: true });
-        writeFileSync(missing.path, 'synthetic');
-      }
-    }
-  }
-  writeFileSync(join(project, 'package.json'), '{"type":"module"}\n');
+  const runtimeParent = resolve('.runtime');
+  mkdirSync(runtimeParent, { recursive: true });
+  const project = createArtifactProject(runtimeParent);
   writeFileSync(join(project, '.gitignore'), '.work/\n.runtime/\ndist/\n');
   const git = (...args: string[]) => {
     const result = spawnSync('git', args, { cwd: project, encoding: 'utf8' });

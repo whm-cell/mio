@@ -36,6 +36,9 @@ interface RequestRow {
   truncation_reason: string | null;
 }
 type ReceiptRow = Omit<RequestRow, 'digest'>;
+const receiptColumns = 'conversation_id, request_id, status, error_code, truncation_reason';
+const replayRequest = `SELECT ${receiptColumns}, digest
+  FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2`;
 const receipt = (row: ReceiptRow): Receipt => ({
   conversationId: row.conversation_id,
   requestId: row.request_id,
@@ -157,8 +160,8 @@ export class ConversationStore {
   async request(actor: Principal, id: string, requestId: string): Promise<Receipt> {
     await this.owned(actor, id);
     const row = (
-      await this.pool.query<RequestRow>(
-        'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+      await this.pool.query<ReceiptRow>(
+        `SELECT ${receiptColumns} FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2`,
         [id, requestId],
       )
     ).rows[0];
@@ -171,18 +174,12 @@ export class ConversationStore {
     id: string,
     requestId: string,
     digest: string,
-  ): Promise<Receipt | undefined> {
-    await this.owned(actor, id);
-    const old = (
-      await this.pool.query<RequestRow>(
-        'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
-        [id, requestId],
-      )
-    ).rows[0];
-    if (!old) return undefined;
-    if (old.digest !== digest)
+  ): Promise<{ row: ConversationRow; replay?: Receipt }> {
+    const row = await this.owned(actor, id);
+    const old = (await this.pool.query<RequestRow>(replayRequest, [id, requestId])).rows[0];
+    if (old && old.digest !== digest)
       throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
-    return receipt(old);
+    return { row, ...(old ? { replay: receipt(old) } : {}) };
   }
   async snapshot(actor: Principal, id: string): Promise<ConversationSnapshot> {
     this.assertActive();
@@ -191,7 +188,7 @@ export class ConversationStore {
         `SELECT c.active_request, row_to_json(r) AS latest
          FROM mio_conversations c
          LEFT JOIN LATERAL (
-           SELECT conversation_id, request_id, status, error_code, truncation_reason
+           SELECT ${receiptColumns}
            FROM mio_conversation_requests WHERE conversation_id=c.id
            ORDER BY created_at DESC, request_id DESC LIMIT 1
          ) r ON true
@@ -226,12 +223,7 @@ export class ConversationStore {
         )
       ).rows[0];
       if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'CONVERSATION_NOT_FOUND');
-      const old = (
-        await client.query<RequestRow>(
-          'SELECT * FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
-          [id, requestId],
-        )
-      ).rows[0];
+      const old = (await client.query<RequestRow>(replayRequest, [id, requestId])).rows[0];
       if (old && old.digest !== digest)
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
       if (old) {
@@ -263,8 +255,9 @@ export class ConversationStore {
           }
         : null;
       const accepted = (
-        await client.query<RequestRow>(
-          `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding) VALUES($1,$2,$3,'accepted',$4::jsonb) RETURNING *`,
+        await client.query<ReceiptRow>(
+          `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding)
+           VALUES($1,$2,$3,'accepted',$4::jsonb) RETURNING ${receiptColumns}`,
           [id, requestId, digest, binding ? JSON.stringify(binding) : null],
         )
       ).rows[0]!;
@@ -347,7 +340,7 @@ export class ConversationStore {
         await client.query<ReceiptRow>(
           `UPDATE mio_conversation_requests SET status=$3,error_code=$4,truncation_reason=$5,updated_at=now()
            WHERE conversation_id=$1 AND request_id=$2 AND status IN ('accepted','input-persisted')
-           RETURNING conversation_id,request_id,status,error_code,truncation_reason`,
+           RETURNING ${receiptColumns}`,
           [id, requestId, status, error ?? null, truncationReason ?? null],
         )
       ).rows[0];
@@ -360,7 +353,7 @@ export class ConversationStore {
         changed ??
         (
           await client.query<ReceiptRow>(
-            'SELECT conversation_id,request_id,status,error_code,truncation_reason FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+            `SELECT ${receiptColumns} FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2`,
             [id, requestId],
           )
         ).rows[0];

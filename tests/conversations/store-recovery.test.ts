@@ -89,6 +89,15 @@ it('preserves all four terminal receipts and the next busy request after a late 
       expect(await store.finish(id, 'first', 'unknown', 'EXECUTION_UNKNOWN')).toEqual(original);
       expect(await store.reconcileExecution(actor, id, 'first')).toEqual(original);
       expect(await store.request(actor, id, 'first')).toEqual(original);
+      await expect(store.receive(actor, id, 'first', 'first-digest', false)).resolves.toMatchObject(
+        {
+          fresh: false,
+          receipt: original,
+        },
+      );
+      await expect(store.receive(actor, id, 'first', 'wrong-digest', true)).rejects.toMatchObject({
+        code: 'REQUEST_ID_CONFLICT',
+      });
       expect(await store.snapshot(actor, id)).toMatchObject({
         activeRequestId: 'next',
         receipt: { requestId: 'next', status: 'accepted' },

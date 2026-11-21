@@ -42,6 +42,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
 
+原生日志证明轮次达到输出上限时，轮次末尾的 status 项为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。同轮助手项按原顺序返回已保存正文。跨页时使用返回的 cursor 继续读到轮次末尾。
+
 错误：损坏/不可读日志返回脱敏 503，不伪装空历史；其余见本域共同约定。
 
 副作用：live 读取执行原生 flush；离线读取不启动 Agent 或模型，也不改写日志。底层仍可能完整读取/验证单会话日志。客户端断开或服务关闭会取消本次日志打开、读取和后续历史投影，并关闭本次读句柄；其他读者和已受理的模型轮次独立继续。
@@ -52,7 +54,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{requestId,text,imageAssetIds?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
 
-成功：202 原接收回执 `{conversationId,requestId,status,error?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
+成功：202 原接收回执 `{conversationId,requestId,status,error?,truncation?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
 
 错误：409 CONVERSATION_BUSY/REQUEST_ID_CONFLICT/CONVERSATION_UNKNOWN/CONVERSATION_MODEL_REQUIRED/MODEL_MODALITY_UNSUPPORTED/MODEL_VISION_CHANGED，以及共同约定的 BYOK 资格/解密错误；无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码/格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。每服务同时最多准备两个新的带图请求，满载立即返回 503 IMAGE_UNAVAILABLE，不排入图片准备等待队列，不读取本次原图、不新增 fresh 接收；同 ID 既有回执优先返回。拒绝时不新增 fresh 接收。已有同 ID 原回执早于当前目录、启停、默认、解密和资产检查；摘要不含可变化的凭据/目录/适配版本。接收 ACK/存储未知不重发，按原 ID 查询。
 
@@ -80,6 +82,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 成功：200 原回执，status 为 accepted/input-persisted/completed/cancelled/failed/unknown；error 只有服务定义脱敏码。
 
+输出截断的已结算回执为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。该标记仅来自实际原生轮次终态及持久化确认，正文可从历史读取。普通结算及旧回执省略该字段。
+
 错误：404 REQUEST_NOT_FOUND 不代表可以重发未知外部动作；数据库不可查时 503，其余见本域共同约定。
 
 副作用：只读，不重新启动模型；重启后未完成接收保持 unknown。
@@ -91,6 +95,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
 成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+
+截断轮次完成后，state 中的回执带 `truncation`。如果该请求是订阅建立时的最近回执，snapshot 中也包含同一标记。已发送的 text 原样保留。
 
 错误：响应前遵循本域错误体，限额为 429 `SSE_LIMITED`，初次鉴权错误或超时为 503 `AUTH_UNAVAILABLE`。建流后会话失效或身份变化发 `UNAUTHORIZED`，鉴权错误或超时发 `AUTH_UNAVAILABLE`，随后关闭；其他错误只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
 

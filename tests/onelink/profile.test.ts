@@ -276,23 +276,168 @@ it('reads unbound old history, requires an explicit owner binding once, and keep
   }
 });
 
-it('settles an observation persistence failure unknown without repeating the model request', async () => {
-  const id = await create();
+it('reads cache-only, partial and zero accounting from real PostgreSQL after fixed Messages decoding', async () => {
+  const id = await create(0, 'onelink:chat:claude-sonnet-4.5-20250929');
   const count = (await runtime.onelinkRequests()).length;
-  await observer.query(
-    `CREATE FUNCTION w2_fail_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.model_observations IS DISTINCT FROM OLD.model_observations THEN RAISE EXCEPTION 'fixture observation failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER w2_fail_observation BEFORE UPDATE ON mio_conversation_requests FOR EACH ROW EXECUTE FUNCTION w2_fail_observation()`,
-  );
-  try {
-    expect((await send(id, 'observation-failed', 'one call')).status).toBe(202);
-    expect(await terminal(id, 'observation-failed')).toBe('unknown');
-    expect((await send(id, 'observation-failed', 'one call')).status).toBe(202);
-    expect((await runtime.onelinkRequests()).length).toBe(count + 1);
-  } finally {
-    await observer.query(
-      'DROP TRIGGER w2_fail_observation ON mio_conversation_requests; DROP FUNCTION w2_fail_observation()',
-    );
+  const cases = [
+    {
+      requestId: 'cache-read',
+      input: 'FIXTURE_CACHE_READ',
+      status: 'completed',
+      finish: 'stop',
+      usageStatus: 'reported',
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 48, totalTokens: 48 },
+    },
+    {
+      requestId: 'cache-write',
+      input: 'FIXTURE_CACHE_WRITE',
+      status: 'completed',
+      finish: 'stop',
+      usageStatus: 'reported',
+      usage: { inputTokens: 0, outputTokens: 0, cacheWriteTokens: 14, totalTokens: 14 },
+    },
+    {
+      requestId: 'cache-partial',
+      input: 'FIXTURE_CACHE_PARTIAL',
+      status: 'failed',
+      finish: 'error',
+      usageStatus: 'partial',
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 31,
+        cacheWriteTokens: 12,
+        totalTokens: 43,
+      },
+    },
+    {
+      requestId: 'cache-zero',
+      input: 'FIXTURE_CACHE_ZERO',
+      status: 'completed',
+      finish: 'stop',
+      usageStatus: 'unknown',
+      usage: undefined,
+    },
+  ];
+  for (const test of cases) {
+    expect((await send(id, test.requestId, test.input)).status).toBe(202);
+    expect(await terminal(id, test.requestId)).toBe(test.status);
+    const receipt = await (
+      await call(`/api/v1/conversations/${id}/requests/${test.requestId}`)
+    ).json();
+    expect(receipt).not.toHaveProperty('usage');
+    expect(receipt).not.toHaveProperty('truncation');
+    const stored = (
+      await observer.query<{ model_observations: Record<string, unknown>[] }>(
+        'SELECT model_observations FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+        [id, test.requestId],
+      )
+    ).rows[0]!.model_observations;
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({
+      status: 200,
+      providerRequestId: 'fixture-request-id',
+      finish: test.finish,
+      usageStatus: test.usageStatus,
+    });
+    if (test.usage) expect(stored[0]!.usage).toEqual(test.usage);
+    else expect(stored[0]).not.toHaveProperty('usage');
+    expect((await send(id, test.requestId, test.input)).status).toBe(202);
   }
+  expect((await runtime.onelinkRequests()).length).toBe(count + cases.length);
 });
+
+it('preserves both wire protocols’ capped text and settled receipts after a real Profile restart', async () => {
+  const count = (await runtime.onelinkRequests()).length;
+  const openai = await create();
+  const messages = await create(0, 'onelink:chat:claude-sonnet-4.5-20250929');
+  const truncation = { reason: 'max-tokens', message: '已达输出上限' };
+  for (const id of [openai, messages]) {
+    expect((await send(id, 'limited', 'FIXTURE_OUTPUT_LIMIT')).status).toBe(202);
+    expect(await terminal(id, 'limited')).toBe('completed');
+    const stored = (
+      await observer.query<{
+        truncation_reason: string;
+        model_observations: Record<string, unknown>[];
+      }>(
+        'SELECT truncation_reason,model_observations FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+        [id, 'limited'],
+      )
+    ).rows[0]!;
+    expect(stored.truncation_reason).toBe('max-tokens');
+    expect(stored.model_observations).toHaveLength(1);
+    expect(stored.model_observations[0]).toMatchObject({
+      finish: 'max-tokens',
+      usageStatus: 'reported',
+    });
+  }
+  expect((await runtime.onelinkRequests()).length).toBe(count + 2);
+  await runtime.stop();
+  await runtime.start('database');
+  for (const id of [openai, messages]) {
+    const requestPath = `/api/v1/conversations/${id}/requests/limited`;
+    const settled = { conversationId: id, requestId: 'limited', status: 'completed', truncation };
+    expect(await (await call(requestPath)).json()).toEqual(settled);
+    expect(await (await send(id, 'limited', 'FIXTURE_OUTPUT_LIMIT')).json()).toEqual(settled);
+    const history = await (await call(`/api/v1/conversations/${id}/history`)).json();
+    expect(history.items).toMatchObject([
+      { role: 'user', text: 'FIXTURE_OUTPUT_LIMIT' },
+      { role: 'assistant', text: '保留已生成的正文' },
+      { role: 'status', status: 'completed', truncation },
+    ]);
+  }
+  expect((await runtime.onelinkRequests()).length).toBe(count + 2);
+
+  // The old adapter wrote failed for the same native max-tokens end. History can prove the
+  // old output limit from JSONL while the read-only receipt still reflects the old PG row.
+  await observer.query(
+    "UPDATE mio_conversation_requests SET status='failed',error_code='MODEL_FAILED',truncation_reason=NULL WHERE conversation_id=$1 AND request_id='limited'",
+    [openai],
+  );
+  expect(await (await call(`/api/v1/conversations/${openai}/requests/limited`)).json()).toEqual({
+    conversationId: openai,
+    requestId: 'limited',
+    status: 'failed',
+    error: 'MODEL_FAILED',
+  });
+  const historical = await (await call(`/api/v1/conversations/${openai}/history`)).json();
+  expect(historical.items.at(-1)).toMatchObject({
+    role: 'status',
+    status: 'completed',
+    truncation,
+  });
+  expect((await runtime.onelinkRequests()).length).toBe(count + 2);
+});
+
+it.each(['one call', 'FIXTURE_OUTPUT_LIMIT'])(
+  'settles an observation persistence failure unknown without repeating %s',
+  async (text) => {
+    const id = await create();
+    const count = (await runtime.onelinkRequests()).length;
+    await observer.query(
+      `CREATE FUNCTION w2_fail_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.model_observations IS DISTINCT FROM OLD.model_observations THEN RAISE EXCEPTION 'fixture observation failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER w2_fail_observation BEFORE UPDATE ON mio_conversation_requests FOR EACH ROW EXECUTE FUNCTION w2_fail_observation()`,
+    );
+    try {
+      expect((await send(id, 'observation-failed', text)).status).toBe(202);
+      expect(await terminal(id, 'observation-failed')).toBe('unknown');
+      expect(await (await send(id, 'observation-failed', text)).json()).toMatchObject({
+        status: 'unknown',
+      });
+      const receipt = await (
+        await call(`/api/v1/conversations/${id}/requests/observation-failed`)
+      ).json();
+      expect(receipt).not.toHaveProperty('truncation');
+      const history = await (await call(`/api/v1/conversations/${id}/history`)).json();
+      expect(history.items.at(-1)).toMatchObject({ role: 'status', status: 'failed' });
+      expect(history.items.at(-1)).not.toHaveProperty('truncation');
+      expect((await runtime.onelinkRequests()).length).toBe(count + 1);
+    } finally {
+      await observer.query(
+        'DROP TRIGGER w2_fail_observation ON mio_conversation_requests; DROP FUNCTION w2_fail_observation()',
+      );
+    }
+  },
+);
 
 it('freezes accepted credentials through a pause after prepare and before actual fetch', async () => {
   const owner = 2;

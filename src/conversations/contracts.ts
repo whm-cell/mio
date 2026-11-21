@@ -12,6 +12,10 @@ export interface Principal {
 }
 export type RequestStatus =
   'accepted' | 'input-persisted' | 'completed' | 'cancelled' | 'failed' | 'unknown';
+export type TerminalRequestStatus = Exclude<RequestStatus, 'accepted' | 'input-persisted'>;
+export const isInFlightRequest = (status: RequestStatus) =>
+  status === 'accepted' || status === 'input-persisted';
+export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
 export interface Conversation {
   id: string;
   createdAt: string;
@@ -21,7 +25,14 @@ export interface Conversation {
 export interface ModelObservation {
   readonly status?: number;
   readonly providerRequestId?: string;
-  readonly usage?: { inputTokens: number; outputTokens: number; totalTokens?: number };
+  readonly usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
   readonly usageStatus?: 'reported' | 'partial' | 'unknown';
   readonly finish: string;
   readonly failureCode?: string;
@@ -40,6 +51,7 @@ export interface Receipt {
   requestId: string;
   status: RequestStatus;
   error?: string;
+  truncation?: typeof outputTruncation;
 }
 export interface ConversationSnapshot {
   conversationId: string;
@@ -155,6 +167,7 @@ export type HistoryItem =
       seq: number;
       role: 'status';
       status: 'completed' | 'cancelled' | 'failed' | 'interrupted' | 'unknown';
+      truncation?: typeof outputTruncation;
     };
 export interface HistoryPage {
   items: HistoryItem[];
@@ -183,7 +196,7 @@ export interface ConversationEngine {
     emit: (event: ConversationEvent) => void,
     binding?: ConversationRun,
     images?: readonly ConversationImageReference[],
-  ): Promise<'completed' | 'cancelled' | 'failed' | 'unknown'>;
+  ): Promise<TerminalRequestStatus | typeof outputTruncation.reason>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;
 }

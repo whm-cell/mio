@@ -74,7 +74,7 @@ async function terminal(id: string, requestId: string): Promise<Receipt> {
   );
   return receipt!;
 }
-function controlled(text = 'visible partial') {
+function controlled(text = 'visible partial', finish: 'stop' | 'max-tokens' = 'stop') {
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const response: ModelScript = async function* (options) {
@@ -90,7 +90,7 @@ function controlled(text = 'visible partial') {
       }),
     ]);
     yield { type: 'block-end', index: 0, block: { type: 'text', text } };
-    yield { type: 'finish', reason: { kind: 'stop' } };
+    yield { type: 'finish', reason: { kind: finish } };
   };
   return { entered: entered.promise, release: () => release.resolve(), response };
 }
@@ -105,6 +105,7 @@ async function events(id: string, cookie = ownerCookie) {
     await (response.status === 200 ? Promise.resolve('') : response.text()),
   ).toBe(200);
   const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
   const received: Record<string, unknown>[] = [];
   let done = false;
   let buffer = '';
@@ -113,7 +114,7 @@ async function events(id: string, cookie = ownerCookie) {
       for (;;) {
         const next = await reader.read();
         if (next.done) break;
-        buffer += new TextDecoder().decode(next.value);
+        buffer += decoder.decode(next.value, { stream: true });
         let split: number;
         while ((split = buffer.indexOf('\n\n')) !== -1) {
           const frame = buffer.slice(0, split);
@@ -789,6 +790,166 @@ it('reconciles a lost completion acknowledgment and a discarded HTTP receipt by 
     expect(model.requests.length - initial).toBe(1);
   } finally {
     spy.mockRestore();
+  }
+});
+
+it('publishes the committed unknown receipt when the fallback write acknowledgement is lost', async () => {
+  const id = await create();
+  const initial = model.requests.length;
+  const stream = await events(id);
+  const write = store.finish.bind(store);
+  const input = vi
+    .spyOn(store, 'inputPersisted')
+    .mockRejectedValueOnce(new Error('TEST_INPUT_ACK'));
+  const finish = vi.spyOn(store, 'finish').mockImplementationOnce(async (...args) => {
+    await write(...args);
+    throw new Error('TEST_UNKNOWN_ACK_LOST');
+  });
+  script.push('hold');
+  const settled = {
+    conversationId: id,
+    requestId: 'unknown-ack',
+    status: 'unknown',
+    error: 'EXECUTION_UNKNOWN',
+  };
+  try {
+    expect((await send(id, 'unknown-ack', 'send at most once')).status).toBe(202);
+    await stream.wait(
+      (event) =>
+        event.type === 'error' ||
+        (event.type === 'state' && (event.receipt as Receipt).status === 'unknown'),
+    );
+    expect(stream.received).toContainEqual({ type: 'state', receipt: settled });
+    expect(await terminal(id, 'unknown-ack')).toEqual(settled);
+    expect(await (await send(id, 'unknown-ack', 'send at most once')).json()).toEqual(settled);
+    expect(finish).toHaveBeenCalledOnce();
+    expect(model.requests.length - initial).toBeLessThanOrEqual(1);
+  } finally {
+    input.mockRestore();
+    finish.mockRestore();
+    await stream.close();
+  }
+});
+
+it('keeps output-limited text and the same marker in hot history, paged history, SSE and the receipt', async () => {
+  const id = await create();
+  const dshId = SessionId(`mio-${id}`);
+  const truncatedText = '保留截至这里的正文';
+  const truncation = { reason: 'max-tokens', message: '已达输出上限' };
+  const limited = controlled(truncatedText, 'max-tokens');
+  const finalFlush = Promise.withResolvers<void>();
+  let endSeen = false;
+  let checkpointHeld = false;
+  const observeEnd = ctx.on('session/event', (session, event) => {
+    if (
+      session.id === dshId &&
+      event.type === 'turn/end' &&
+      event.data.reason.kind === 'max-tokens'
+    )
+      endSeen = true;
+  });
+  const nativeFlush = ctx.mioKernel.flush.bind(ctx.mioKernel);
+  const flush = vi.spyOn(ctx.mioKernel, 'flush').mockImplementation(async (session) => {
+    await nativeFlush(session);
+    if (session.id === dshId && endSeen && !checkpointHeld) {
+      checkpointHeld = true;
+      await finalFlush.promise;
+    }
+  });
+  const stream = await events(id);
+  const initial = model.requests.length;
+  const receiptPath = path(id, 'requests/cutoff');
+  const historyPath = path(id, 'history');
+  const settled = { conversationId: id, requestId: 'cutoff', status: 'completed', truncation };
+  script.push(limited.response);
+  try {
+    expect((await send(id, 'cutoff', 'generate once')).status).toBe(202);
+    await limited.entered;
+    await vi.waitFor(async () =>
+      expect(await (await call(receiptPath)).json()).toMatchObject({ status: 'input-persisted' }),
+    );
+    await stream.wait((event) => event.type === 'text' && event.text === truncatedText);
+    limited.release();
+    await vi.waitFor(() => expect(checkpointHeld).toBe(true));
+    expect(ctx.sessions.get(dshId)).toBeDefined();
+    expect(await (await call(receiptPath)).json()).toMatchObject({ status: 'input-persisted' });
+    const hot = await (await call(`${historyPath}?limit=2`)).json();
+    expect(hot).toMatchObject({
+      items: [
+        { role: 'user', text: 'generate once' },
+        { role: 'assistant', text: truncatedText },
+      ],
+      hasMore: true,
+    });
+    const status = await (await call(`${historyPath}?afterSeq=${hot.nextAfterSeq}`)).json();
+    expect(status).toMatchObject({ items: [{ role: 'status', status: 'completed', truncation }] });
+    finalFlush.resolve();
+    await stream.wait(
+      (event) => event.type === 'state' && (event.receipt as Receipt).status === 'completed',
+    );
+    expect(stream.received).toContainEqual({ type: 'state', receipt: settled });
+    expect(await terminal(id, 'cutoff')).toEqual(settled);
+    expect(await (await send(id, 'cutoff', 'generate once')).json()).toEqual(settled);
+    expect(model.requests.length - initial).toBe(1);
+    expect(ctx.sessions.get(dshId)).toBeUndefined();
+    expect((await (await call(historyPath)).json()).items).toEqual([...hot.items, ...status.items]);
+    const reconnected = await events(id);
+    try {
+      await reconnected.wait((event) => event.type === 'snapshot');
+      expect(reconnected.received).toContainEqual({
+        type: 'snapshot',
+        conversationId: id,
+        activeRequestId: null,
+        receipt: settled,
+      });
+    } finally {
+      await reconnected.close();
+    }
+  } finally {
+    limited.release();
+    finalFlush.resolve();
+    observeEnd();
+    flush.mockRestore();
+    await stream.close();
+  }
+});
+
+it('keeps a user cancellation authoritative after a model step hits its limit', async () => {
+  const id = await create();
+  const stopping = Promise.withResolvers<AbortSignal>();
+  const release = Promise.withResolvers<void>();
+  const detach = ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
+    if (agent.id !== `mio-${id}`) return;
+    stopping.resolve(signal);
+    await release.promise;
+  });
+  const text = 'a persisted prefix before cancellation';
+  script.push([
+    ...textResponse(text).slice(0, -1),
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]);
+  try {
+    expect((await send(id, 'cancel-after-limit', 'one turn')).status).toBe(202);
+    const signal = await stopping.promise;
+    const cancelling = call(path(id, 'cancel'), {});
+    await vi.waitFor(() => expect(signal.aborted).toBe(true));
+    release.resolve();
+    expect((await cancelling).status).toBe(202);
+    expect(await terminal(id, 'cancel-after-limit')).toEqual({
+      conversationId: id,
+      requestId: 'cancel-after-limit',
+      status: 'cancelled',
+    });
+    const history = await (await call(path(id, 'history'))).json();
+    expect(history.items).toMatchObject([
+      { role: 'user' },
+      { role: 'assistant', text },
+      { role: 'status', status: 'cancelled' },
+    ]);
+    expect(history.items.at(-1)).not.toHaveProperty('truncation');
+  } finally {
+    release.resolve();
+    detach();
   }
 });
 

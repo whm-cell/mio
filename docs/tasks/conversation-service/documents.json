@@ -20,6 +20,11 @@
       "identity": "docs/tasks/conversation-service/changes/conversation-sse-subscriptions/change.md",
       "kind": "change",
       "path": "docs/tasks/conversation-service/changes/conversation-sse-subscriptions/change.md"
+    },
+    {
+      "identity": "docs/tasks/conversation-service/changes/conversation-output-limit/change.md",
+      "kind": "change",
+      "path": "docs/tasks/conversation-service/changes/conversation-output-limit/change.md"
     }
   ]
 }

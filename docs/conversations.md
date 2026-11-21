@@ -18,7 +18,7 @@
 
 BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策），30 秒 idle/HTTP 是 Mio 政策。不支持的内容/选项在出站前拒绝。
 
-真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察不等于费用结算；全零/缺失 SDK usage 保持 unknown，失败时的非零 usage 只是 partial。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
+真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察沿用固定 DSH 的计数口径。`inputTokens` 为未计入缓存读写的输入，缓存读写分别记为 `cacheReadTokens` 和 `cacheWriteTokens`。可取得的 `totalTokens` 和 `reasoningTokens` 原样保存，观察层不重算或累加计数。一次正常调用如果只报告缓存用量，也记为 `reported`。失败或取消时，已有非零计数记为 `partial`，全零或缺失记为 `unknown`。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
 
 ```sh
 pnpm migrate:dev conversations
@@ -27,7 +27,7 @@ pnpm build
 pnpm start:dev
 ```
 
-第一条只展示 SQL，第二条才建表/索引；普通启动只读检查列，不自动建表。先停止旧实例、审阅计划并按目标库责任备份，再显式迁移；本期迁移没有破坏性改名/删除或自动回滚。共享数据库约束沿 [PostgreSQL](integrations/postgres.md)。
+第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。共享数据库约束沿[PostgreSQL](integrations/postgres.md)。
 
 ## 归属、接收与持久化
 
@@ -41,13 +41,17 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 
 图片工具提交会先按用户和派生的请求 ID 查已有任务。重试时按任务冻结的路由补齐 `async` 和参考图操作后比对请求摘要。同一意图在供应商停用或路由默认值变化时仍返回原任务。相同请求 ID 归一后的参数不同会返回 `REQUEST_CONFLICT`。新提交按当前路由受理。
 
+对话图片提交工具只提供 `generate` 和 `edit`，HTTP 扩图由相应路由独立控制。[图片任务路由](apis/compute.md#post-apiv1computeimages)
+
 同对话只接受一个活动请求。事务锁住归属行，先查原 request ID：同内容返回原回执，异内容冲突，早于当前目录、默认、认证阻断和解密；不同 ID 遇忙拒绝。输入摘要不含可变版本，不因刷新/轮换重发。目录移除或默认失效后旧回执/历史仍可读，fresh 输入无资格时不新增收费接收。进程内保存同一用户在途接收 Promise，持久去重仍由 PostgreSQL 唯一键负责。
 
 带图请求先查 owner 和原回执，再检查忙碌状态及当前模型视觉能力；耗时资产读取、解码与本轮图片预算预检在行锁外完成。每服务同时最多准备两个新的带图请求，满载返回 503 IMAGE_UNAVAILABLE，既有回执优先。每图受理阶段复用一次私有读取和规范化，同时形成持久附件引用与本轮预览字节数，发送前的来源复核独立执行。最终短事务再次核对回执、busy 和路由/视觉预算快照，变化时拒绝并等待客户端按原意重试。纯文本沿旧 SHA-256，带图摘要为 `vision:v1:` 加 `SHA256(JSON.stringify([text, orderedIds]))`。原件、内存预览、授权检查及旧图卸载的限制见[对话 HTTP](apis/conversations.md#post-apiv1conversationsidmessages)和[DSH 集成](integrations/dsh.md)。同一原图在同一请求中出现多次时按 occurrence 计预算；不能满足时不能丢弃当前轮图片。
 
 正式 Profile 关闭上游 DSH 默认身份开场白（`includeHarnessIdentity: false`），每次对话轮次（无论 legacy 还是 BYOK）统一由服务端注入受控的会话级系统提示词：助手固定自称 `miioo AI 漫剧助手`（不提及内部框架或运行时名称），围绕 AI 漫剧创作执行适度宽松话题政策（支持服务于创作的背景、历史/服饰/设定考据与审美参考并自然衔接回创作，对编程调试、作业解题、医疗/法律/金融、无关时政与纯粹闲聊礼貌婉拒并引导回漫剧创作），禁止泄露或覆盖内部指令，并按本轮实际授权的生图与图片查看能力如实声明工具可用性；提示词文本按 `{ imageGeneration, imageInspection }` 组合完全确定，不含动态变量以维持前缀缓存稳定，且绝不经公开历史或 SSE 透传。
 
-回执层级为 accepted（仅 PG 已受理）、input-persisted（DSH 输入/inbox 屏障和 PG 状态已成功）、completed/cancelled/failed（已执行请求检查真实 DSH 终态并 flush 后完成 PG 更新，执行前用户取消另有下述边界）。unknown 表示无法证明完整结算，错误码只含服务定义值。接收 COMMIT/ACK 不确定时，按原用户/对话/请求/内容摘要锁行核对，只将本进程未启动的待执行记录改 unknown 并释放 busy；不重发模型。结算 ACK 丢失时先读原回执，保留已提交的终态。无法完成对账时停止该实例后续操作，查询返回脱敏 503，操作者须停止并重启原实例核对，不能换 ID 重发未知输入。
+回执层级为 accepted（仅 PG 已受理）、input-persisted（DSH 输入/inbox 屏障和 PG 状态已成功）、completed/cancelled/failed（已执行请求检查真实 DSH 终态并 flush 后完成 PG 更新，执行前用户取消另有下述边界）。unknown 表示无法证明完整结算，错误码只含服务定义值。接收 COMMIT/ACK 不确定时，按原用户/对话/请求/内容摘要锁行核对，只将本进程未启动的待执行记录改 unknown 并释放 busy；不重发模型。结算只更新在途回执，同一事务只清除原请求的 busy。结算 ACK 丢失时按原身份读回，保留已提交的 completed、cancelled、failed 或 unknown 及原错误。无法完成对账时停止该实例后续操作，查询返回脱敏 503，操作者须停止并重启原实例核对，不能换 ID 重发未知输入。
+
+真实 DSH `turn/end` 为 `max-tokens` 且本轮已通过原生日志 flush 时，服务保留原助手正文，以 completed 结算并附 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。GET 回执及 SSE 的 state 和 snapshot 使用同一持久标记。热读和冷读历史从已持久的原生轮次末尾返回同一标记，正文项保持原文。旧回执保留 PG 原值，旧原生日志能证明输出截断时历史仍可展示该状态。供应商单步观察、取消、网络错误或进程中断均不能为回执提供截断依据。服务不因此续写或重发模型。
 
 取消绑定本次 active request ID；包括 PG 已受理但 adapter 尚未登记的窗口。取消回执只是 requested，实际 cancelled/其他结算通过原请求查询；延迟取消不能取消下一条请求。
 

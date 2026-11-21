@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS mio_conversation_requests (
 );
 ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS model_binding jsonb;
 ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS model_binding jsonb;
-ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS model_observations jsonb NOT NULL DEFAULT '[]'::jsonb;`;
+ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS model_observations jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS truncation_reason text
+  CHECK (truncation_reason IS NULL OR (status='completed' AND truncation_reason='max-tokens'));`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
 export async function checkConversationSchema(pool: Pool): Promise<void> {
@@ -29,8 +31,8 @@ export async function checkConversationSchema(pool: Pool): Promise<void> {
     ],
     [
       'mio_conversation_requests',
-      'conversation_id,request_id,digest,status,error_code,created_at,updated_at,model_binding,model_observations',
-      [2950, 25, 25, 25, 25, 1184, 1184, 3802, 3802],
+      'conversation_id,request_id,digest,status,error_code,created_at,updated_at,model_binding,model_observations,truncation_reason',
+      [2950, 25, 25, 25, 25, 1184, 1184, 3802, 3802, 25],
     ],
   ] as const) {
     const result = await pool.query(`SELECT ${columns} FROM ${table} LIMIT 0`);

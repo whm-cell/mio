@@ -1,15 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import {
-  link,
-  lstat,
-  mkdir,
-  mkdtemp,
-  open,
-  readdir,
-  readFile,
-  rm,
-  writeFile,
-} from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { checkedPath, digest, json } from './records.ts';
 import { optionalText } from './report-format.ts';
@@ -124,28 +114,57 @@ async function prepareExchange(root: string, existing: PublicationFile[]) {
   if (existing.length === 0) return null;
   const exchange = await loadPublicationExchange();
   const directory = await checkedPath(root, publicationDirectory);
-  const device = (await lstat(directory)).dev;
+  const checkedParents = new Set<string>();
   for (const { path } of existing) {
     const target = await checkedPath(root, path);
     const stat = await lstat(target).catch((cause: unknown) => {
       throw publicationConflict(path, undefined, cause);
     });
     if (!stat.isFile()) throw publicationConflict(path);
-    if (stat.dev !== device)
-      throw new Error(
-        `WORK_PUBLISH_ATOMIC: ${path} and its recovery directory must share a volume`,
+    const parent = dirname(target);
+    try {
+      // A file can itself be a mount point even where its parent supports exchange.
+      if (
+        process.platform === 'linux' &&
+        (await linuxMountId(target)) !== (await linuxMountId(parent))
+      )
+        throw new Error('the target file is itself a mount point');
+      if (checkedParents.has(parent)) continue;
+      // A bind mount can share st_dev yet reject an exchange across mount boundaries.
+      await withProbeFile(directory, (first) =>
+        withProbeFile(parent, (second) => exchange(first, second)),
       );
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(`WORK_PUBLISH_ATOMIC: cannot exchange files for ${path} (${reason})`, {
+        cause,
+      });
+    }
+    checkedParents.add(parent);
   }
-  const probe = await mkdtemp(join(directory, 'exchange-'));
+  return exchange;
+}
+
+async function linuxMountId(path: string) {
+  const handle = await open(path, 'r');
   try {
-    const first = join(probe, 'first');
-    const second = join(probe, 'second');
-    await writeFile(first, '');
-    await writeFile(second, '');
-    exchange(first, second);
-    return exchange;
+    const info = await readFile(`/proc/self/fdinfo/${handle.fd}`, 'utf8');
+    const mount = /^mnt_id:[\t ]+(\d+)$/m.exec(info)?.[1];
+    if (!mount) throw new Error('mount ID unavailable in /proc/self/fdinfo');
+    return mount;
   } finally {
-    await rm(probe, { recursive: true, force: true });
+    await handle.close();
+  }
+}
+
+async function withProbeFile(directory: string, action: (path: string) => void | Promise<void>) {
+  const probe = join(directory, `.mio-publication-${randomUUID()}.tmp`);
+  const handle = await open(probe, 'wx', 0o600);
+  try {
+    await handle.close();
+    await action(probe);
+  } finally {
+    await rm(probe, { force: true });
   }
 }
 

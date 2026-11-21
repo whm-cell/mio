@@ -273,7 +273,7 @@ async function completeRequest(root: string, id = 'probe') {
 }
 
 type PublicationFault =
-  | { target: string; action: 'fail' | 'interrupt' }
+  | { target: string; action: 'fail' | 'interrupt' | 'deny-probe' }
   | {
       target: string;
       action: 'edit' | 'edit-and-interrupt' | 'create';
@@ -288,6 +288,7 @@ function runWithPublicationFault(root: string, request: unknown, fault: Publicat
     import fs from 'node:fs';
     import { spawnSync } from 'node:child_process';
     import { syncBuiltinESMExports } from 'node:module';
+    import { basename, dirname } from 'node:path';
     import koffi from ${JSON.stringify(import.meta.resolve('koffi'))};
     const fault = ${JSON.stringify(fault)};
     function saveAsEditor(target, bytes) {
@@ -334,6 +335,14 @@ function runWithPublicationFault(root: string, request: unknown, fault: Publicat
           saveAsEditor(after, fault.bytes);
         }
         return link(before, after);
+      };
+    }
+    if (fault.action === 'deny-probe') {
+      const open = fs.promises.open;
+      fs.promises.open = async (path, ...args) => {
+        if (dirname(path) === fault.target && basename(path).startsWith('.mio-publication-'))
+          throw Object.assign(new Error('FIXTURE_PARENT_WRITE_DENIED'), { code: 'EACCES' });
+        return open(path, ...args);
       };
     }
     syncBuiltinESMExports();
@@ -671,6 +680,25 @@ it('refuses public replacement before either file changes when exchange is unava
   });
   expect(first.status, first.stderr).toBe(0);
   expect((await readBook(fresh, prd)).book.results.map((entry) => entry.key)).toEqual(['probe']);
+});
+
+it('preserves both public files and cleans up when the target directory cannot host an exchange', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const targets = [join(root, recordsPath(prd)), join(root, productReport)];
+  const parent = dirname(targets[0]!);
+  const before = await Promise.all(targets.map((target) => readFile(target)));
+  const listings = await readdir(parent);
+  const outcome = runWithPublicationFault(root, request, { action: 'deny-probe', target: parent });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain('WORK_PUBLISH_ATOMIC');
+  expect(outcome.stderr).toContain('FIXTURE_PARENT_WRITE_DENIED');
+  expect(await Promise.all(targets.map((target) => readFile(target)))).toEqual(before);
+  expect(await readdir(parent)).toEqual(listings);
+  expect(await readdir(join(root, '.work/publication'))).toEqual([]);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
 });
 
 it('does not apply an old accepted draft to a changed task contract after interruption', async () => {

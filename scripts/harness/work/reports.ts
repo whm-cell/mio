@@ -208,14 +208,16 @@ export async function checkReports(root: string, reportFiles: readonly string[],
         entry.identity,
         catalog,
       );
-      if (
-        reportError !== null ||
-        (recordsSource === null) !== (source === null) ||
-        (recordsSource !== null &&
-          (source === null || !(await sameMarkdown(source, renderBook(book, paths.currentPath)))))
-      )
-        errors.push(`WORK_REPORT_DRIFT: derive ${paths.report} from records`);
-      for (const result of book.results) await validateLocations(root, result, catalog);
+      if (reportFiles.length) {
+        if (
+          reportError !== null ||
+          (recordsSource === null) !== (source === null) ||
+          (recordsSource !== null &&
+            (source === null || !(await sameMarkdown(source, renderBook(book, paths.currentPath)))))
+        )
+          errors.push(`WORK_REPORT_DRIFT: derive ${paths.report} from records`);
+        for (const result of book.results) await validateLocations(root, result, catalog);
+      }
       results.push({
         prd: entry.identity,
         report: source === null ? null : paths.report,
@@ -224,6 +226,7 @@ export async function checkReports(root: string, reportFiles: readonly string[],
         read: ['read-result', entry.identity],
       });
     } catch (error) {
+      if (!reportFiles.length) throw error;
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }

@@ -152,7 +152,7 @@ export async function checkDocuments(
   const reportFiles = files.filter(resultDocument);
   // The listing includes registered PRDs even when none has published files.
   const reports =
-    !registry.errors.length && (reportFiles.length || listResults)
+    !registry.errors.length && (reportFiles.length || (listResults && !errors.length))
       ? await checkReports(root, reportFiles, { config, ...registry })
       : undefined;
   if (reports) errors.push(...reports.errors);

@@ -331,6 +331,42 @@ it('reports each reference to the same missing or private link target', async ()
   expect(checked.output).not.toContain('PRIVATE_LINK_FIXTURE');
 });
 
+it.skipIf(process.platform === 'win32')(
+  'returns inventory issues without opening unsupported unpublished results',
+  async () => {
+    const { root } = await fixture(['bug']);
+    expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+    const records = 'docs/tasks/product/complete/records.json';
+    await mkdir(dirname(join(root, records)), { recursive: true });
+    expect(spawnSync('mkfifo', [records], { cwd: root }).status).toBe(0);
+    const checked = spawnSync(process.execPath, [cli, 'documents'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    expect(checked.status, checked.stderr).toBe(1);
+    expect(JSON.parse(checked.stdout)).toMatchObject({
+      results: [],
+      issues: [`INVENTORY_UNSUPPORTED ${records}`],
+    });
+  },
+);
+
+it('keeps document diagnostics ahead of listing unpublished results', async () => {
+  const { root } = await fixture(['bug']);
+  expect(invoke(root, ['changes', prd, '--write-index']).status).toBe(0);
+  const records = 'docs/tasks/product/complete/records.json';
+  await mkdir(join(root, records), { recursive: true });
+  const readme = join(root, 'README.md');
+  await writeFile(readme, (await readFile(readme, 'utf8')) + '\n[Missing](docs/missing.md)\n');
+  const checked = invoke(root, ['documents']);
+  expect(checked.status, checked.output).toBe(1);
+  expect(checked.value()).toMatchObject({
+    results: [],
+    issues: ['LINK_MISSING README.md: docs/missing.md'],
+  });
+});
+
 it('pages selected summaries or one body with explicit offsets', async () => {
   const ids = Array.from({ length: 13 }, (_, index) => `bug-${String(index).padStart(2, '0')}`);
   const { root } = await fixture(ids);

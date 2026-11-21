@@ -97,7 +97,7 @@ async function main(activity?: CommandActivity) {
     if (positionals.length) throw new Error(help);
     const config = await loadConfig(root);
     const scan = await inventory(root, config);
-    const checked = await checkDocuments(root, scan.files, config, true);
+    const checked = await checkDocuments(root, scan.files, config, !scan.errors.length);
     const issues = [...new Set([...scan.errors, ...checked.errors])];
     const source = {
       documents: checked.documents.map((entry) => ({

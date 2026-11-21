@@ -1,7 +1,7 @@
 import { ApplicationError } from '@mio/foundation/errors';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { IMAGE_DRIVERS, IMAGE_OPERATIONS } from '../generations/contracts.ts';
+import { IMAGE_DRIVERS } from '../generations/contracts.ts';
 import type { ImageRequestParameters } from '../generations/contracts.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
@@ -17,6 +17,7 @@ import type {
 
 const CLIENT_OPERATION_KEY_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const ERROR_CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
+const TOOL_IMAGE_OPERATIONS = ['generate', 'edit'] as const;
 const IMAGE_JOB_STATES = new Set([
   'accepted',
   'submitted',
@@ -94,7 +95,7 @@ const imageModelSummarySchema = {
     driver: { type: 'string', enum: IMAGE_DRIVERS, required: true },
     supportedOperations: {
       type: 'array',
-      items: { type: 'string', enum: IMAGE_OPERATIONS },
+      items: { type: 'string', enum: TOOL_IMAGE_OPERATIONS },
       required: true,
     },
     requiresAsync: { type: 'boolean', required: true },
@@ -294,7 +295,14 @@ export function registerConversationImageTools(
           exec.signal.throwIfAborted();
           try {
             const models = await bridge.listModels(actor);
-            return { models };
+            return {
+              models: models.map((model) => ({
+                ...model,
+                supportedOperations: TOOL_IMAGE_OPERATIONS.filter((operation) =>
+                  model.supportedOperations.includes(operation),
+                ),
+              })),
+            };
           } catch (error) {
             return toSanitizedToolError(error);
           }
@@ -327,8 +335,8 @@ export function registerConversationImageTools(
           },
           operation: {
             type: 'string',
-            enum: IMAGE_OPERATIONS,
-            description: 'Optional operation mode matching the model route capabilities.',
+            enum: TOOL_IMAGE_OPERATIONS,
+            description: 'Optional generate or edit mode supported by the selected model route.',
           },
           imageAssetIds: {
             type: 'array',
@@ -349,7 +357,8 @@ export function registerConversationImageTools(
           },
           aspect_ratio: {
             type: 'string',
-            description: 'Requested aspect ratio allowed by the model route.',
+            description:
+              'Requested aspect ratio allowed by the route. For OpenAI image editing, use size.',
           },
           quality: {
             type: 'string',

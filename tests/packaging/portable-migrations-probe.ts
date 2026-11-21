@@ -1,17 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Pool } from 'pg';
 import { authDatabase } from '../support/auth-database.ts';
+import { portableComponent, portableRoot } from './portable-root.ts';
 
-const argument = process.argv[2];
-if (!argument) throw new Error('PORTABLE_ARTIFACT_ROOT_REQUIRED');
-const root = realpathSync(argument);
-const workspace = realpathSync('.');
-if (root === workspace || root.startsWith(`${workspace}${sep}`))
-  throw new Error('PORTABLE_ROOT_MUST_BE_OUTSIDE_WORKSPACE');
+const root = portableRoot(process.argv[2]);
+const a = portableComponent(root, 'a');
 const database = await authDatabase();
 const pool = new Pool({ connectionString: database.observerURL });
 const env: NodeJS.ProcessEnv = {
@@ -27,7 +23,7 @@ const env: NodeJS.ProcessEnv = {
 const migrate = (name: string) => {
   const result = spawnSync(
     process.execPath,
-    [join(root, 'a/dist/tools/scripts/service', `migrate-${name}.js`), '--apply'],
+    [join(a, 'dist/tools/scripts/service', `migrate-${name}.js`), '--apply'],
     { cwd: root, env, encoding: 'utf8', timeout: 30000 },
   );
   if (result.status !== 0) throw new Error(`PORTABLE_MIGRATION_FAILED:${name}`);

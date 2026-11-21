@@ -4,7 +4,7 @@ import { createTencentSmsSender } from '../integrations/tencent-sms.ts';
 import type { SmsSender, TencentSmsConfig } from '../integrations/tencent-sms.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
 import { phonePlugin } from './phone.ts';
-import type { PhoneLimits } from './phone-store.ts';
+import type { PhoneLimits } from './phone-budget.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
 import { AuthPostgresDialect } from './database.ts';

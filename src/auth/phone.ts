@@ -15,7 +15,8 @@ import {
   consumePhoneChallenge,
   reservePhoneChallenge,
 } from './phone-store.ts';
-import type { BindingIdentity, PhoneLimits, PhonePurpose } from './phone-store.ts';
+import type { BindingIdentity, PhonePurpose } from './phone-store.ts';
+import type { PhoneLimits } from './phone-budget.ts';
 
 const schema = {
   user: {
@@ -36,6 +37,7 @@ const schema = {
       expiresAt: { type: 'date', index: true },
     },
   },
+  // The legacy field remains a schema-compatible write fence after the event cutover.
   mioSmsBudget: {
     fields: {
       events: { type: 'string' },

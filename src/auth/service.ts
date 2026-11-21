@@ -4,6 +4,7 @@ import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { authOptions } from './config.ts';
 import type { AuthConfig } from './config.ts';
+import { readSmsBudgetSchema } from './phone-budget-schema.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
 import type { SmsSender } from '../integrations/tencent-sms.ts';
 
@@ -33,6 +34,9 @@ export async function createAuthentication(
       migration.schemaProblems.length
     )
       throw new Error('AUTH_SCHEMA: run auth:migrate before enabling authentication');
+    const smsBudget = await readSmsBudgetSchema(pool);
+    if (smsBudget === 'empty' || ((config.sms || sender) && smsBudget !== 'indexed'))
+      throw new Error('AUTH_SCHEMA: run auth:migrate --apply before enabling SMS');
     if (config.wechat) {
       const namespace = `${JSON.stringify([config.wechat.appId]).slice(0, -1)},`;
       const mismatched = await pool.query(

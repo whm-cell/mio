@@ -214,27 +214,28 @@ export class GenerationStore {
         id: string;
         state: string;
         error_code: string | null;
-        command: GenerationRequest;
-      }>('SELECT id,state,error_code,command FROM mio_image_jobs WHERE owner_id=$1 AND id=$2', [
-        owner,
-        id,
-      ])
+        requested_count: number;
+        outputs: { index: number; assetId: string }[];
+      }>(
+        `SELECT j.id,j.state,j.error_code,
+          COALESCE((j.command#>>'{input,n}')::integer,1) AS requested_count,
+          COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('index',o.output_index,'assetId',o.asset_id)
+              ORDER BY o.output_index)
+            FROM mio_image_outputs o WHERE o.job_id=j.id
+          ),'[]'::jsonb) AS outputs
+         FROM mio_image_jobs j WHERE j.owner_id=$1 AND j.id=$2`,
+        [owner, id],
+      )
     ).rows[0];
     if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
-    const outputs = await this.pool.query<{ output_index: number; asset_id: string }>(
-      'SELECT output_index,asset_id FROM mio_image_outputs WHERE job_id=$1 ORDER BY output_index',
-      [id],
-    );
     return {
       jobId: row.id,
       status: row.state,
-      requestedCount: row.command.input.n ?? 1,
+      requestedCount: row.requested_count,
       errorCode: row.error_code,
-      assetIds: outputs.rows.map((output) => output.asset_id),
-      outputs: outputs.rows.map((output) => ({
-        index: output.output_index,
-        assetId: output.asset_id,
-      })),
+      assetIds: row.outputs.map((output) => output.assetId),
+      outputs: row.outputs,
     };
   }
 

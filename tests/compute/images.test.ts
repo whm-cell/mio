@@ -4,6 +4,7 @@ import { checkGenerationSchema, generationSchemaSQL } from '../../src/generation
 import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
 import { createGenerationAdmission } from '../../src/generations/admission.ts';
 import { imageOutputKey } from '../../src/generations/contracts.ts';
+import { GenerationStore } from '../../src/generations/store.ts';
 import { generationFixture } from '../generations/fixture.ts';
 
 it('migrates existing media tables incrementally and reads historical B jobs without claiming them', async () => {
@@ -12,6 +13,7 @@ it('migrates existing media tables incrementally and reads historical B jobs wit
     await f.pool.query(computeSchemaSQL);
     const job = await f.admit();
     const before = await f.store.imageGet(f.actor.userId, job.jobId);
+    expect(before).toMatchObject({ requestedCount: 1, assetIds: [], outputs: [] });
     await f.pool.query('DELETE FROM mio_image_executions WHERE job_id=$1', [job.jobId]);
     await f.pool.query(generationSchemaSQL);
     await expect(checkGenerationSchema(f.pool)).resolves.toBeUndefined();
@@ -25,6 +27,70 @@ it('migrates existing media tables incrementally and reads historical B jobs wit
       code: 'RESULT_CONFLICT',
     });
   } finally {
+    await f.close();
+  }
+});
+
+it('reads the job state and sparse outputs on the same side of a PostgreSQL commit', async () => {
+  const f = await generationFixture();
+  const writer = await f.pool.connect();
+  const reader = new GenerationStore(f.pool);
+  try {
+    const { jobId } = await f.admit(undefined, 'sparse outputs', { n: 3 });
+    const later = await f.addImageSource();
+    const earlier = await f.addImageSource();
+    await f.pool.query("UPDATE mio_image_jobs SET state='materializing' WHERE id=$1", [jobId]);
+    await f.pool.query(
+      'INSERT INTO mio_image_outputs(job_id,output_index,asset_id) VALUES($1,2,$2)',
+      [jobId, later.assetId],
+    );
+
+    await writer.query('BEGIN');
+    await writer.query(
+      'INSERT INTO mio_image_outputs(job_id,output_index,asset_id) VALUES($1,1,$2)',
+      [jobId, earlier.assetId],
+    );
+    await writer.query("UPDATE mio_image_jobs SET state='partial' WHERE id=$1", [jobId]);
+    const query = f.pool.query.bind(f.pool);
+    let columns: string[] = [];
+    const read = vi.spyOn(f.pool, 'query').mockImplementationOnce(async (sql, values) => {
+      // Commit after PostgreSQL answers the first SELECT and before the reader can issue another.
+      const result = await query(sql, values);
+      columns = result.fields.map((field) => field.name);
+      await writer.query('COMMIT');
+      return result;
+    });
+    try {
+      expect(await reader.imageGet(f.actor.userId, jobId)).toEqual({
+        jobId,
+        requestedCount: 3,
+        status: 'materializing',
+        errorCode: null,
+        assetIds: [later.assetId],
+        outputs: [{ index: 2, assetId: later.assetId }],
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(columns).toEqual(['id', 'state', 'error_code', 'requested_count', 'outputs']);
+    } finally {
+      read.mockRestore();
+    }
+    expect(await reader.imageGet(f.actor.userId, jobId)).toEqual({
+      jobId,
+      requestedCount: 3,
+      status: 'partial',
+      errorCode: null,
+      assetIds: [earlier.assetId, later.assetId],
+      outputs: [
+        { index: 1, assetId: earlier.assetId },
+        { index: 2, assetId: later.assetId },
+      ],
+    });
+    await expect(reader.imageGet('other-owner', jobId)).rejects.toMatchObject({
+      code: 'JOB_NOT_FOUND',
+      status: 404,
+    });
+  } finally {
+    await writer.query('ROLLBACK').finally(() => writer.release());
     await f.close();
   }
 });

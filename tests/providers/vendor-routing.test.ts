@@ -255,7 +255,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           code: 'MODEL_NOT_FOUND',
         });
         await expect(
-          service.resolveImage(userB, 'onelink:image:doubao-seedream-5.0-lite'),
+          service.snapshotImage(userB, 'onelink:image:doubao-seedream-5.0-lite'),
         ).rejects.toMatchObject({ code: 'MODEL_NOT_FOUND' });
 
         const deepseekRef = view.items[0]!.modelRef;
@@ -306,7 +306,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         const imageRefB = viewB.items.find(
           (i) => i.modelId === 'doubao-seedream-5.0-lite',
         )!.modelRef;
-        const imgSnapB = await service.resolveImage(userB, imageRefB);
+        const imgSnapB = await service.snapshotImage(userB, imageRefB);
         expect(imgSnapB.vendor).toBe('volcengine');
         await service.recordVerification(
           userB,
@@ -831,12 +831,12 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           const gptItem = catalog.items.find((i) => i.modelId === 'custom-gpt-sync')!;
           const volcItem = catalog.items.find((i) => i.modelId === 'custom-volc-ref')!;
 
-          const resolvedGpt = await providerService.resolveImage(actor, gptItem.modelRef);
+          const resolvedGpt = await providerService.snapshotImage(actor, gptItem.modelRef);
           expect(validateImageRouteConfig(resolvedGpt.route)).toBe(true);
           expect(resolvedGpt.route.paramSpec.async).toBeNull();
           expect(resolvedGpt.route.paramSpec.supportedOperations).toEqual(['generate']);
 
-          const resolvedVolc = await providerService.resolveImage(actor, volcItem.modelRef);
+          const resolvedVolc = await providerService.snapshotImage(actor, volcItem.modelRef);
           expect(validateImageRouteConfig(resolvedVolc.route)).toBe(true);
           expect(resolvedVolc.route.paramSpec.allowGenerateReferences).toBe(true);
           expect(resolvedVolc.route.requestDefaults.defaultSize).toBeUndefined();

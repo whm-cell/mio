@@ -58,9 +58,13 @@ function binding(
   };
 }
 
-it.each([false, true])(
-  'runs two rounds through official loop and public PiAi protocol (Messages=%s)',
-  async (anthropic) => {
+it.each([
+  ['OpenAI default', false, undefined, '/v1/chat/completions'],
+  ['OpenAI prefixed', false, '/v1/fixture/chat/completions', '/v1/fixture/chat/completions'],
+  ['Anthropic', true, undefined, '/v1/messages'],
+] as const)(
+  'runs two rounds through the official loop and public PiAi protocol (%s)',
+  async (_name, anthropic, submitPath, expectedPath) => {
     const root = await mkdtemp(join(tmpdir(), 'mio-onelink-adapter-'));
     const ctx = await kernelRuntime(root, new ScriptedModel([]));
     const requests: { request: Request; body: Record<string, unknown> }[] = [];
@@ -72,7 +76,10 @@ it.each([false, true])(
     const engine = createDshConversationEngine(ctx, { databaseURL: 'unused', byok: true });
     const observations: ModelObservation[] = [];
     try {
-      const selected = snapshot(anthropic);
+      const selected = {
+        ...snapshot(anthropic),
+        ...(submitPath === undefined ? {} : { submitPath }),
+      };
       await engine.create('one', selected);
       for (const [requestId, text] of [
         ['first', 'remember this'],
@@ -84,7 +91,7 @@ it.each([false, true])(
           text!,
           async () => {},
           () => {},
-          { ...binding('one', observations, anthropic), requestId: requestId! },
+          { ...binding('one', observations, anthropic), snapshot: selected, requestId: requestId! },
         );
         expect(result, JSON.stringify({ observations, requests: requests.length })).toBe(
           'completed',
@@ -92,9 +99,10 @@ it.each([false, true])(
       }
       expect(requests).toHaveLength(2);
       expect(requests.map(({ body }) => body.model)).toEqual([selected.modelId, selected.modelId]);
-      expect(requests.map(({ request }) => new URL(request.url).pathname)).toEqual(
-        Array(2).fill(anthropic ? '/v1/messages' : '/v1/chat/completions'),
-      );
+      expect(requests.map(({ request }) => new URL(request.url).pathname)).toEqual([
+        expectedPath,
+        expectedPath,
+      ]);
       expect(requests[0]!.request.headers.get('authorization')).toBe('Bearer synthetic-owner-key');
       expect(requests[0]!.request.headers.has('x-api-key')).toBe(false);
       expect(requests[0]!.request.redirect).toBe('error');
@@ -237,50 +245,62 @@ it('rejects absent, mismatched and auxiliary bindings before network or credenti
 });
 
 it.each([
-  [401, 'AUTH'],
-  [403, 'AUTH'],
-  [402, 'QUOTA_EXCEEDED'],
-  [408, 'TIMEOUT'],
-  [429, 'RATE_LIMIT'],
-  [500, 'SERVER'],
-  [504, 'TIMEOUT'],
-])('classifies HTTP %s without retry or leaking the error body', async (status, failureCode) => {
-  const adapter = new OneLinkAdapter();
-  const observations: ModelObservation[] = [];
-  const controller = new AbortController();
-  adapter.bind(controller.signal, binding('one', observations));
-  const transport = vi.fn(
-    async () =>
-      new Response(JSON.stringify({ error: { message: 'synthetic-owner-key private text' } }), {
-        status: status as number,
+  [401, 'AUTH', false],
+  [403, 'AUTH', false],
+  [402, 'QUOTA_EXCEEDED', false],
+  [408, 'TIMEOUT', false],
+  [429, 'RATE_LIMIT', false],
+  [499, 'INVALID_REQUEST', false],
+  [500, 'SERVER', false],
+  [504, 'TIMEOUT', false],
+  [undefined, 'TRANSPORT', false],
+  [401, 'ABORTED', true],
+] as const)(
+  'classifies HTTP %s as %s without retry or leaking the source',
+  async (status, failureCode, cancelled) => {
+    const adapter = new OneLinkAdapter();
+    const observations: ModelObservation[] = [];
+    const controller = new AbortController();
+    adapter.bind(controller.signal, binding('one', observations));
+    const transport = vi.fn(async () => {
+      const message = 'synthetic-owner-key private text';
+      if (status === undefined) throw new Error(message);
+      if (cancelled) controller.abort();
+      return new Response(JSON.stringify({ error: { message } }), { status });
+    });
+    vi.stubGlobal('fetch', transport);
+    const prepared = await adapter.prepareCall(
+      'onelink-openai',
+      'future-text:route-Q',
+      controller.signal,
+    );
+    const chunks: StreamChunk[] = await collect(
+      prepared.stream({
+        provider: 'onelink-openai',
+        model: 'future-text:route-Q',
+        maxTokens: 1024,
+        messages: [],
+        signal: controller.signal,
+        sessionId: 'one' as never,
       }),
-  );
-  vi.stubGlobal('fetch', transport);
-  const prepared = await adapter.prepareCall(
-    'onelink-openai',
-    'future-text:route-Q',
-    controller.signal,
-  );
-  const chunks: StreamChunk[] = await collect(
-    prepared.stream({
-      provider: 'onelink-openai',
-      model: 'future-text:route-Q',
-      maxTokens: 1024,
-      messages: [],
-      signal: controller.signal,
-      sessionId: 'one' as never,
-    }),
-  );
-  expect(transport).toHaveBeenCalledTimes(1);
-  expect(JSON.stringify(chunks)).not.toContain('synthetic-owner-key');
-  expect(chunks.at(-1)).toMatchObject({
-    type: 'finish',
-    reason: { kind: 'error', failure: { code: failureCode } },
-  });
-  expect(observations[0]).toMatchObject({ status, failureCode, usageStatus: 'unknown' });
-  expect(observations[0]).not.toHaveProperty('usage');
-  expect(JSON.stringify(observations)).not.toContain('synthetic-owner-key');
-});
+    );
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(chunks)).not.toContain('synthetic-owner-key');
+    expect(chunks.at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: cancelled ? 'aborted' : 'error', failure: { code: failureCode } },
+    });
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      ...(status === undefined ? {} : { status }),
+      failureCode,
+      usageStatus: 'unknown',
+    });
+    if (status === undefined) expect(observations[0]).not.toHaveProperty('status');
+    expect(observations[0]).not.toHaveProperty('usage');
+    expect(JSON.stringify(observations)).not.toContain('synthetic-owner-key');
+  },
+);
 
 it.each([false, true])(
   'preserves tool calls/results and replay through both public codecs (Messages=%s)',

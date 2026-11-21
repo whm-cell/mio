@@ -208,8 +208,7 @@ export class ConversationStore {
     id: string,
     requestId: string,
     digest: string,
-    resolveFresh:
-      boolean | ((row: Readonly<ConversationRow>) => Promise<ChatRuntimeSnapshot | undefined>),
+    resolveFresh: (row: Readonly<ConversationRow>) => Promise<ChatRuntimeSnapshot | undefined>,
   ) {
     this.assertActive();
     const client = await this.pool.connect();
@@ -239,9 +238,7 @@ export class ConversationStore {
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
       if (row.active_request)
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
-      const snapshot = typeof resolveFresh === 'function' ? await resolveFresh(row) : undefined;
-      if (resolveFresh === false)
-        throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+      const snapshot = await resolveFresh(row);
       // Only explicit non-secret fields may cross the persistence boundary.
       const binding = snapshot
         ? {

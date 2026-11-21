@@ -1,6 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { ProviderError } from './contracts.ts';
+import type { AccountCredentialSnapshot } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 
 export interface CredentialBinding {
@@ -62,6 +63,42 @@ export function decryptCredential(
   } catch {
     throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_CREDENTIAL_UNAVAILABLE');
   }
+}
+
+/** Persist the existing v1 credential envelope as base64 JSON for an outbound snapshot. */
+export function serializeCredentialSnapshot(
+  row: CredentialEnvelope & { id: string; credential_version: number },
+): AccountCredentialSnapshot {
+  return {
+    providerConfigId: row.id,
+    credentialVersion: row.credential_version,
+    credential: {
+      cipherFormat: row.cipher_format,
+      masterKeyId: row.master_key_id,
+      nonce: row.nonce.toString('base64'),
+      ciphertext: row.ciphertext.toString('base64'),
+      authTag: row.auth_tag.toString('base64'),
+    },
+  };
+}
+
+export function decryptCredentialSnapshot(
+  ownerId: string,
+  snapshot: AccountCredentialSnapshot,
+  config: ProviderConfig,
+): string {
+  const { credential, providerConfigId, credentialVersion } = snapshot;
+  return decryptCredential(
+    {
+      cipher_format: credential.cipherFormat,
+      master_key_id: credential.masterKeyId,
+      nonce: Buffer.from(credential.nonce, 'base64'),
+      ciphertext: Buffer.from(credential.ciphertext, 'base64'),
+      auth_tag: Buffer.from(credential.authTag, 'base64'),
+    },
+    { ownerId, providerId: providerConfigId, credentialVersion },
+    config,
+  );
 }
 
 /** Same deployment key/envelope, a distinct purpose binding. Credential AAD above is unchanged. */

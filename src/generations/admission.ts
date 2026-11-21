@@ -317,6 +317,13 @@ export function createGenerationAdmission(
         : intent;
       const { operation, ids } = httpReferences ?? references(parameters);
       const route = capability(snapshot, parameters, operation, ids.length);
+      // Apply the multipart restriction to new admissions. Frozen jobs retain their wire behavior.
+      if (
+        route.driver === 'openai-images' &&
+        operation !== 'generate' &&
+        parameters.aspect_ratio !== undefined
+      )
+        inputError();
       const images = await Promise.all(ids.map((id) => inputAsset(store, head, actor.userId, id)));
       const mask =
         parameters.maskAssetId !== undefined

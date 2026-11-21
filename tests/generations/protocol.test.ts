@@ -873,13 +873,16 @@ describe('Routed vendor image protocols', () => {
       read,
     );
     const parameters = { ...input, operation: 'edit', image, mask, n: 1, quality: 'high' } as const;
-    await expect(protocol.submit({ ...parameters, aspect_ratio: '3:2' }, key)).resolves.toEqual({
+    await expect(protocol.submit({ ...parameters, aspect_ratio: '9:16' }, key)).resolves.toEqual({
       state: 'rejected',
       code: 'IMAGE_INPUT_INVALID',
     });
     expect(read).not.toHaveBeenCalled();
     expect(transport).not.toHaveBeenCalled();
-    const result = await protocol.submit({ ...parameters, size: '1536x1024' }, key);
+    const result = await protocol.submit(
+      { ...parameters, aspect_ratio: '3:2', size: '1536x1024' },
+      key,
+    );
     expect(result).toEqual({ state: 'returned', images: [{ base64: 'YWJj' }] });
     expect(read).toHaveBeenCalledTimes(2);
     expect(transport).toHaveBeenCalledOnce();

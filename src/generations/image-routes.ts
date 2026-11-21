@@ -552,8 +552,7 @@ export function validateImageInputByRoute(input: ImageInput, route: ImageRouteCo
   }
   if (
     input.aspect_ratio !== undefined &&
-    ((route.driver === 'openai-images' && operation !== 'generate') ||
-      typeof input.aspect_ratio !== 'string' ||
+    (typeof input.aspect_ratio !== 'string' ||
       !spec.allowedAspectRatios.includes(input.aspect_ratio))
   )
     return false;

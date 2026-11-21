@@ -36,7 +36,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 参考图和 PNG 蒙版每次出现的冻结长度各不得超过 16 MiB（16 × 1024² 字节），单任务合计不得超过 32 MiB，均含边界。同一资产同时作为参考图和蒙版时计两次。新 HTTP／工具准入在归属、对象快照与路由结构核对后、创建任务前以 413 `IMAGE_REFERENCE_LIMIT` 拒绝超限输入；已受理的同 requestId 请求仍先重放原任务。历史 `ready` 执行若超限，在读取任何参考对象、写提交意图或调用上游前进入 `rejected`，`errorCode=IMAGE_REFERENCE_LIMIT`，内部执行终结且不再重试。该预算只约束新准入和未提交任务，已提交查询、unknown 判定及已保存结果的恢复沿原身份继续。原始资产上传上限和原图字节、顺序不变；这些固定限制是单 A 的保守资源边界，不代表已测得生产容量。
 
-`openai-images` 的 JSON `generate` 仅发送模型、提示词及驱动支持的生成选项。兼容网关使用的 `aspect_ratio` 由 JSON 生成按路由 `allowedAspectRatios` 发送。Multipart 编辑（含获路由授权的 `outpaint`）以 `size` 指定尺寸，传入 `aspect_ratio` 在受理前返回 `IMAGE_INPUT_INVALID`。编辑单图用 `image`，多图逐份使用 `image[]` 并保留提交顺序。可选 PNG 遮罩使用独立的 `mask` 字段。新导入的 OpenAI 路由不得为 `generate` 声明参考图能力。已保存的路由仍可用于纯文本生成和编辑。新 OpenAI 参考图 `generate` 请求返回 `IMAGE_OPERATION_UNSUPPORTED`，已冻结的同类任务在写提交意图与调用上游之前以 `IMAGE_INPUT_INVALID` 终止。其他驱动按各自声明支持参考图生成。
+`openai-images` 的 JSON `generate` 仅发送模型、提示词及驱动支持的生成选项。兼容网关使用的 `aspect_ratio` 由 JSON 生成按路由 `allowedAspectRatios` 发送。Multipart 编辑（含获路由授权的 `outpaint`）以 `size` 指定尺寸。新请求携带 `aspect_ratio` 时，在受理前返回 `IMAGE_INPUT_INVALID`。已受理且冻结该字段的历史任务按原路由校验和执行，multipart 继续省略该字段。编辑单图用 `image`，多图逐份使用 `image[]` 并保留提交顺序。可选 PNG 遮罩使用独立的 `mask` 字段。新导入的 OpenAI 路由不得为 `generate` 声明参考图能力。已保存的路由仍可用于纯文本生成和编辑。新 OpenAI 参考图 `generate` 请求返回 `IMAGE_OPERATION_UNSUPPORTED`，已冻结的同类任务在写提交意图与调用上游之前以 `IMAGE_INPUT_INVALID` 终止。其他驱动按各自声明支持参考图生成。
 
 首次异步查询尽快执行；供应商仍在处理时，使用剩余查询次数和截止时间均匀安排后续查询。实际截止为路由异步时限与任务凭据有效期中较早者；超期、缺少截止或耗尽次数时停止查询并保留上游任务身份，不重新提交生成。
 

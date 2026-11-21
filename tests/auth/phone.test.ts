@@ -368,27 +368,34 @@ it('rejects a bound number belonging to another user and a revoked binding sessi
   ).toBe(401);
 });
 
-async function waitForExpiryWhileBlocked(lockerPid: number, statement: string, expiresAt: Date) {
-  const waiters = async () =>
-    (
-      await pool.query<{ pid: number; expired: boolean }>(
-        `SELECT pid, clock_timestamp() >= $3::timestamptz AS expired
-         FROM pg_stat_activity
-         WHERE datname = current_database() AND application_name = $4
-           AND wait_event_type = 'Lock' AND query = $2 AND $1::int = ANY(pg_blocking_pids(pid))`,
-        [lockerPid, statement, expiresAt, database.applicationName],
-      )
-    ).rows;
-  const polling = { timeout: 2000, interval: 10 };
-  const waiter = await vi.waitFor(async () => {
-    const rows = await waiters();
-    expect(rows).toHaveLength(1);
-    return rows[0]!;
-  }, polling);
-  expect(waiter.expired).toBe(false);
-  await vi.waitFor(async () => {
-    expect(await waiters()).toEqual([{ pid: waiter.pid, expired: true }]);
-  }, polling);
+async function observeBlockedVerifier(
+  lockerPid: number,
+  statement: string,
+  expiry: { at: Date; crossed: boolean; waiterPid?: number },
+) {
+  return vi.waitFor(
+    async () => {
+      const { rows } = await pool.query<{
+        pid: number;
+        startedBeforeExpiry: boolean;
+        expired: boolean;
+      }>(
+        `SELECT pid, query_start < $3::timestamptz AS "startedBeforeExpiry",
+              clock_timestamp() >= $3::timestamptz AS expired
+       FROM pg_stat_activity
+       WHERE datname = current_database() AND application_name = $4
+         AND wait_event_type = 'Lock' AND query = $2 AND $1::int = ANY(pg_blocking_pids(pid))`,
+        [lockerPid, statement, expiry.at, database.applicationName],
+      );
+      expect(rows).toHaveLength(1);
+      const waiter = rows[0]!;
+      expect(waiter.startedBeforeExpiry).toBe(true);
+      expect(waiter.expired).toBe(expiry.crossed);
+      if (expiry.waiterPid !== undefined) expect(waiter.pid).toBe(expiry.waiterPid);
+      return waiter.pid;
+    },
+    { timeout: 2000, interval: 10 },
+  );
 }
 
 it('checks expiry after waiting for the challenge row lock', async () => {
@@ -400,19 +407,31 @@ it('checks expiry after waiting for the challenge row lock', async () => {
   try {
     await locker.query('BEGIN');
     const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
-      `UPDATE "mioPhoneChallenge"
-       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '1500 milliseconds'
-       WHERE "challengeKey" = $1 RETURNING pg_backend_pid() AS pid, "expiresAt"`,
+      `SELECT pg_backend_pid() AS pid, "expiresAt"
+       FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE`,
       [challengeKey],
     );
     expect(rows).toHaveLength(1);
+    const { pid, expiresAt } = rows[0]!;
+    const statement = 'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE';
     waiting = call('/api/auth/phone-number/verify', { phoneNumber, code });
     void waiting.catch(() => {});
-    await waitForExpiryWhileBlocked(
-      rows[0]!.pid,
-      'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE',
-      rows[0]!.expiresAt,
+    const waiterPid = await observeBlockedVerifier(pid, statement, {
+      at: expiresAt,
+      crossed: false,
+    });
+    // Set the new deadline only after the verifying statement is already waiting.
+    const updated = await locker.query<{ expiresAt: Date }>(
+      `UPDATE "mioPhoneChallenge"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '25 milliseconds'
+       WHERE "challengeKey" = $1 RETURNING "expiresAt"`,
+      [challengeKey],
     );
+    await observeBlockedVerifier(pid, statement, {
+      at: updated.rows[0]!.expiresAt,
+      crossed: true,
+      waiterPid,
+    });
     await locker.query('COMMIT');
     const response = await waiting;
     expect(response.status).toBe(400);
@@ -441,19 +460,30 @@ it('rechecks binding session expiry after its row lock is released', async () =>
   try {
     await locker.query('BEGIN');
     const { rows } = await locker.query<{ pid: number; expiresAt: Date }>(
-      `UPDATE "session"
-       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '1500 milliseconds'
-       WHERE id = $1 AND "userId" = $2 RETURNING pg_backend_pid() AS pid, "expiresAt"`,
+      `SELECT pg_backend_pid() AS pid, "expiresAt"
+       FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE`,
       [sessionId, userId],
     );
     expect(rows).toHaveLength(1);
+    const { pid, expiresAt } = rows[0]!;
+    const statement = 'SELECT id FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE';
     waiting = call('/api/auth/phone-binding/confirm', { phoneNumber, code }, owner);
     void waiting.catch(() => {});
-    await waitForExpiryWhileBlocked(
-      rows[0]!.pid,
-      'SELECT id FROM "session" WHERE id = $1 AND "userId" = $2 FOR UPDATE',
-      rows[0]!.expiresAt,
+    const waiterPid = await observeBlockedVerifier(pid, statement, {
+      at: expiresAt,
+      crossed: false,
+    });
+    const updated = await locker.query<{ expiresAt: Date }>(
+      `UPDATE "session"
+       SET "expiresAt" = date_trunc('milliseconds', clock_timestamp()) + interval '25 milliseconds'
+       WHERE id = $1 AND "userId" = $2 RETURNING "expiresAt"`,
+      [sessionId, userId],
     );
+    await observeBlockedVerifier(pid, statement, {
+      at: updated.rows[0]!.expiresAt,
+      crossed: true,
+      waiterPid,
+    });
     await locker.query('COMMIT');
     const response = await waiting;
     expect(response.status).toBe(401);

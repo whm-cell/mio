@@ -34,21 +34,21 @@ function listCursor(value?: string): MaterialCursor | undefined {
     const decoded: unknown = JSON.parse(Buffer.from(value, 'base64url').toString());
     if (!decoded || typeof decoded !== 'object' || !('createdAt' in decoded) || !('id' in decoded))
       throw new Error();
-    const { createdAt, id } = decoded;
+    const row = decoded as MaterialCursor;
     if (
-      typeof createdAt !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(createdAt) ||
-      new Date(createdAt).toISOString() !== createdAt.replace(/(\.\d{3})\d{3}Z$/, '$1Z') ||
-      typeof id !== 'string' ||
-      !isUuidV4(id)
+      typeof row.createdAt !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(row.createdAt) ||
+      new Date(row.createdAt).toISOString() !== row.createdAt.replace(/(\.\d{3})\d{3}Z$/, '$1Z') ||
+      typeof row.id !== 'string' ||
+      !isUuidV4(row.id)
     )
       throw new Error();
-    return { createdAt, id };
+    return row;
   } catch {
     throw new MaterialError(HTTP_STATUS.BAD_REQUEST, 'CURSOR_INVALID');
   }
 }
-function page<T extends { id: string; cursor_time: string }, View>(
+function page<T extends { id: string; created_at: Date; cursor_time?: string }, View>(
   rows: T[],
   limit: number,
   view: (row: T) => View,
@@ -61,7 +61,7 @@ function page<T extends { id: string; cursor_time: string }, View>(
       rows.length > limit && last
         ? Buffer.from(
             JSON.stringify({
-              createdAt: last.cursor_time,
+              createdAt: last.cursor_time ?? last.created_at.toISOString(),
               id: last.id,
             }),
           ).toString('base64url')

@@ -65,9 +65,9 @@ it('routes an A command and B result, honors both ACKs, and refuses each role th
       try {
         await worker.consume(
           async (value, ack) => {
+            await worker.publish(result);
             ack();
             receivedCommand(value);
-            await worker.publish(result);
           },
           failed,
           () => true,

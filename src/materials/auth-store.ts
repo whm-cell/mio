@@ -1,13 +1,35 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MaterialError } from './contracts.ts';
 import type { MaterialAuthRow } from './auth-contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
 import type { CredentialEnvelope } from '../providers/credentials.ts';
-import { withMaterialTransaction } from './transaction.ts';
 
 const clear = 'cipher_format=NULL,master_key_id=NULL,nonce=NULL,ciphertext=NULL,auth_tag=NULL';
 const superseded = () => new MaterialError(409, 'MATERIAL_AUTH_SUPERSEDED');
+
+export async function withMaterialTransaction<T>(
+  pool: Pool,
+  action: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await action(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error instanceof MaterialError) throw error;
+    if ((error as { code?: string }).code === '23505')
+      throw new MaterialError(HTTP_STATUS.CONFLICT, 'UPSTREAM_RESOURCE_COLLISION');
+    throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
+  } finally {
+    client.release();
+  }
+}
+
 /** Owns only auth session facts; shares its domain pool, never auth/provider pools. */
 export class MaterialAuthStore {
   private readonly pool: Pool;

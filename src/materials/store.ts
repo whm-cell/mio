@@ -13,10 +13,9 @@ import type {
   MaterialSourceSnapshot,
 } from './contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
-import { MaterialAuthStore } from './auth-store.ts';
+import { MaterialAuthStore, withMaterialTransaction } from './auth-store.ts';
 import { checkMaterialAuthSchema } from './auth-schema.ts';
 import { checkMaterialSchema } from './schema.ts';
-import { withMaterialTransaction } from './transaction.ts';
 
 const log = createLogger('app', 'material-store');
 const missing = () => new MaterialError(HTTP_STATUS.NOT_FOUND, 'MATERIAL_NOT_FOUND');

@@ -434,13 +434,23 @@ export function draft(root: string, actor: string, id: string, goal: string): Ta
   };
 }
 
-export async function loadTask(root: string, id: string) {
-  const path = await checkedPath(root, `.work/tasks/${identifier(id)}/state.json`);
-  const raw = await readFile(path, 'utf8');
-  const task = parseTask(raw);
-  if (task.plan.id !== id || task.workspace !== root || task.member !== (await member(root)))
+export function loadTask(root: string, id: string) {
+  return createTaskLoader(root)(id);
+}
+
+/** Reuse a member read within one command, after validating the task record. */
+export function createTaskLoader(root: string) {
+  let workspaceMember: Promise<string> | undefined;
+  return async (id: string) => {
+    const path = await checkedPath(root, `.work/tasks/${identifier(id)}/state.json`);
+    const raw = await readFile(path, 'utf8');
+    const task = parseTask(raw);
+    if (task.plan.id === id && task.workspace === root) {
+      workspaceMember ??= member(root);
+      if (task.member === (await workspaceMember)) return { task, raw, path };
+    }
     throw new Error('WORK_OWNER: task, member or workspace mismatch; receive a handoff');
-  return { task, raw, path };
+  };
 }
 
 /** One writer per task. Refuse changes made while a command was running; keep raw evidence. */

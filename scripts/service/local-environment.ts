@@ -1,6 +1,17 @@
-import { randomBytes } from 'node:crypto';
-import { lstat, readFile, writeFile } from 'node:fs/promises';
+import { randomBytes, randomUUID } from 'node:crypto';
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  writeFile,
+} from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { parseEnv } from 'node:util';
 import {
   localComputeKeys,
@@ -14,10 +25,8 @@ function fileName(name: LocalEnvironment): string {
   return name === 'dev' ? '.env' : '.env.test';
 }
 
-function localRegressionSettings(
-  postgresPort: string,
-  regressionPassword = randomBytes(32).toString('hex'),
-) {
+function localRegressionSettings(postgresPort: string) {
+  const regressionPassword = randomBytes(32).toString('hex');
   return {
     MIO_LOCAL_REGRESSION_PASSWORD: regressionPassword,
     MIO_TEST_DATABASE_URL: `postgresql://mio_regression:${regressionPassword}@127.0.0.1:${postgresPort}/mio_regression_test`,
@@ -50,13 +59,16 @@ export function localHostEnvironment(inherited: NodeJS.ProcessEnv = process.env)
   );
 }
 
-/** One-time creation only: existing database passwords and signing secrets must survive. */
-export async function createLocalEnvironment(name: LocalEnvironment, root = resolve('.')) {
-  const file = resolve(root, fileName(name));
+function formatSettings(values: Record<string, string>) {
+  return Object.entries(values)
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n');
+}
+
+function newLocalEnvironment(name: LocalEnvironment) {
   const secret = () => randomBytes(32).toString('hex');
   const databasePassword = secret();
   const redisPassword = secret();
-  const regressionPassword = secret();
   const appPort = name === 'dev' ? '4310' : '4311';
   const postgresPort = name === 'dev' ? '55432' : '55433';
   const redisPort = name === 'dev' ? '56379' : '56380';
@@ -82,71 +94,104 @@ export async function createLocalEnvironment(name: LocalEnvironment, root = reso
     MIO_LOCAL_DATABASE_PASSWORD: databasePassword,
     MIO_LOCAL_REDIS_PASSWORD: redisPassword,
     ...localComputeSettings(name),
-    ...localRegressionSettings(postgresPort, regressionPassword),
+    ...localRegressionSettings(postgresPort),
   };
-  try {
-    await writeFile(
-      file,
-      `# Private ${name} environment. Keep secrets and Docker volumes together.\n${Object.entries(
-        values,
-      )
-        .map(([key, value]) => `${key}=${value}`)
-        .join('\n')}\n`,
-      { flag: 'wx', mode: 0o600 },
+  return `# Private ${name} environment. Keep secrets and Docker volumes together.\n${formatSettings(values)}\n`;
+}
+
+function environmentAdditions(name: LocalEnvironment, existing: NodeJS.ProcessEnv) {
+  const chunks: string[] = [];
+  if (existing.MIO_GENERATIONS_DATA_DIR === undefined)
+    chunks.push(
+      `\n# A image recovery directory; enable explicitly after cutover checks.\nMIO_GENERATIONS_DATA_DIR=.runtime/${name}/generations\n`,
     );
-    return 'created';
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    const stat = await lstat(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
+  const computePresent = localComputeKeys.filter((key) => existing[key] !== undefined);
+  if (computePresent.length === 0) {
+    // Upgrade only pre-MQ files. Never invent a replacement password/instance for a partial config.
+    chunks.push(
+      `\n# Persistent RabbitMQ and Worker identity.\n${formatSettings(localComputeSettings(name))}\n`,
+    );
+  } else if (computePresent.length !== localComputeKeys.length) {
+    throw new Error(
+      'LOCAL_COMPUTE_PARTIAL: restore missing MQ/Worker settings from the original configuration',
+    );
+  }
+  const regressionKeys = ['MIO_LOCAL_REGRESSION_PASSWORD', 'MIO_TEST_DATABASE_URL'] as const;
+  const regressionPresent = regressionKeys.filter((key) => existing[key] !== undefined);
+  if (regressionPresent.length === 0) {
+    const existingPort = Number(existing.MIO_LOCAL_POSTGRES_PORT);
+    if (!Number.isInteger(existingPort) || existingPort < 1024 || existingPort > 65535)
+      throw new Error('LOCAL_ENV_PORT: invalid MIO_LOCAL_POSTGRES_PORT');
+    const regressionAdditions = localRegressionSettings(String(existingPort));
+    chunks.push(
+      `\n# Isolated local regression database (no access to mio_${name}).\n${formatSettings(regressionAdditions)}\n`,
+    );
+  } else if (regressionPresent.length !== regressionKeys.length) {
+    throw new Error(
+      'LOCAL_REGRESSION_PARTIAL: restore missing regression database settings from the original configuration',
+    );
+  }
+  return chunks.join('');
+}
+
+async function storeLocalEnvironment(
+  file: string,
+  contents: string | Buffer,
+  mode: number,
+  exists: boolean,
+) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, contents, { flag: 'wx', mode: 0o600 });
+    await chmod(temporary, mode);
+    if (exists) await rename(temporary, file);
+    else await link(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+/** Serialize initializers per file, then read its latest complete settings. */
+export async function createLocalEnvironment(name: LocalEnvironment, root = resolve('.')) {
+  const file = resolve(root, fileName(name));
+  const lock = `${file}.init.lock`;
+  const deadline = performance.now() + 5000;
+  for (;;) {
+    try {
+      await mkdir(lock, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (performance.now() >= deadline)
+        throw new Error(`LOCAL_ENV_BUSY: inspect the active or interrupted initializer at ${lock}`);
+      await delay(25);
+    }
+  }
+  try {
+    const stat = await lstat(file).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+      return null;
+    });
+    if (stat === null) {
+      await storeLocalEnvironment(file, newLocalEnvironment(name), 0o600, false);
+      return 'created';
+    }
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0)
       throw new Error('LOCAL_ENV_FILE: existing configuration must be a private regular file');
-    const contents = await readFile(file, 'utf8');
-    const existing = parseEnv(contents);
+    const contents = await readFile(file);
+    const existing = parseEnv(contents.toString('utf8'));
     if (existing.MIO_ENVIRONMENT !== name) throw new Error('LOCAL_ENV_IDENTITY');
-    const chunks: string[] = [];
-    if (existing.MIO_GENERATIONS_DATA_DIR === undefined)
-      chunks.push(
-        `\n# A image recovery directory; enable explicitly after cutover checks.\nMIO_GENERATIONS_DATA_DIR=.runtime/${name}/generations\n`,
-      );
-    const computeAdditions = localComputeSettings(name);
-    const computeKeys = Object.keys(computeAdditions);
-    const computePresent = computeKeys.filter((key) => existing[key] !== undefined);
-    if (computePresent.length === 0) {
-      // Upgrade only pre-MQ files. Never invent a replacement password/instance for a partial config.
-      chunks.push(
-        `\n# Persistent RabbitMQ and Worker identity.\n${Object.entries(computeAdditions)
-          .map(([key, value]) => `${key}=${value}`)
-          .join('\n')}\n`,
-      );
-    } else if (computePresent.length !== computeKeys.length) {
-      throw new Error(
-        'LOCAL_COMPUTE_PARTIAL: restore missing MQ/Worker settings from the original configuration',
-      );
-    }
-    const regressionKeys = ['MIO_LOCAL_REGRESSION_PASSWORD', 'MIO_TEST_DATABASE_URL'] as const;
-    const regressionPresent = regressionKeys.filter((key) => existing[key] !== undefined);
-    if (regressionPresent.length === 0) {
-      const existingPort = Number(existing.MIO_LOCAL_POSTGRES_PORT);
-      if (!Number.isInteger(existingPort) || existingPort < 1024 || existingPort > 65535)
-        throw new Error('LOCAL_ENV_PORT: invalid MIO_LOCAL_POSTGRES_PORT');
-      const regressionAdditions = localRegressionSettings(String(existingPort));
-      chunks.push(
-        `\n# Isolated local regression database (no access to mio_${name}).\n${Object.entries(
-          regressionAdditions,
-        )
-          .map(([key, value]) => `${key}=${value}`)
-          .join('\n')}\n`,
-      );
-    } else if (regressionPresent.length !== regressionKeys.length) {
-      throw new Error(
-        'LOCAL_REGRESSION_PARTIAL: restore missing regression database settings from the original configuration',
-      );
-    }
-    if (chunks.length > 0) {
-      await writeFile(file, chunks.join(''), { flag: 'a' });
-      return 'upgraded';
-    }
-    return 'preserved';
+    const additions = environmentAdditions(name, existing);
+    if (!additions) return 'preserved';
+    await storeLocalEnvironment(
+      file,
+      Buffer.concat([contents, Buffer.from(additions)]),
+      stat.mode & 0o777,
+      true,
+    );
+    return 'upgraded';
+  } finally {
+    await rmdir(lock);
   }
 }
 

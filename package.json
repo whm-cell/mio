@@ -137,6 +137,7 @@
     "typescript": "6.0.3",
     "typescript-eslint": "8.72.1",
     "unified": "11.0.5",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "yaml": "2.9.1"
   }
 }

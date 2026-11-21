@@ -216,8 +216,8 @@ function startInitializer(root: string, pauseAtRead: boolean) {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   let output = '';
-  child.stdout.on('data', (chunk) => (output += String(chunk)));
-  child.stderr.on('data', (chunk) => (output += String(chunk)));
+  child.stdout!.on('data', (chunk) => (output += String(chunk)));
+  child.stderr!.on('data', (chunk) => (output += String(chunk)));
   const outcome = once(child, 'close').then(([code]) => ({ code, output }));
   return {
     child,

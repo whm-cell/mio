@@ -265,6 +265,80 @@ it('claims one execution atomically and ignores stale output commits without dup
   }
 });
 
+it('keeps saved indices and rolls back the output batch on identity or database conflicts', async () => {
+  const f = await generationFixture();
+  try {
+    const { jobId } = await f.admit(undefined, 'three outputs', { n: 3 });
+    const initial = (await f.store.claim())!;
+    const { ref } = await f.files.receive(
+      jobId,
+      initial.command.messageId,
+      3,
+      [{ base64: f.bytes.toString('base64') }],
+      'png',
+    );
+    const output = (index: number) => ({
+      key: imageOutputKey(jobId, index, randomUUID(), 'png'),
+      sizeBytes: f.bytes.length,
+      sha256: createHash('sha256').update(f.bytes).digest('hex'),
+      etag: 'etag',
+      contentType: 'image/png',
+    });
+    const first = output(0);
+    const second = output(1);
+    const saved = output(2);
+    expect(await f.store.acceptOutputs(initial, [saved], 'materializing', ref)).toBe(true);
+    const before = await f.store.imageGet(f.actor.userId, jobId);
+    const row = (await f.store.claim())!;
+    for (const changed of [
+      [first, output(0)],
+      [first, { ...saved, contentType: 'image/jpeg' }],
+      [first, output(2)],
+      [first, { ...saved, sizeBytes: saved.sizeBytes + 1 }],
+    ]) {
+      await expect(f.store.acceptOutputs(row, changed, 'materializing', ref)).rejects.toMatchObject(
+        { code: 'RESULT_CONFLICT' },
+      );
+    }
+    await f.pool.query(
+      'ALTER TABLE mio_image_outputs ADD CONSTRAINT fixture_reject_index CHECK (output_index<>1)',
+    );
+    await expect(
+      f.store.acceptOutputs(row, [first, second, saved], 'completed', ref),
+    ).rejects.toMatchObject({ code: '23514' });
+    expect(await f.store.imageGet(f.actor.userId, jobId)).toEqual(before);
+    expect((await f.pool.query('SELECT raw_key FROM mio_assets')).rows).toEqual([
+      { raw_key: saved.key },
+    ]);
+    await f.pool.query('ALTER TABLE mio_image_outputs DROP CONSTRAINT fixture_reject_index');
+    const commits = await Promise.all(
+      [1, 2].map(() => f.store.acceptOutputs(row, [first, second, saved], 'completed', ref)),
+    );
+    expect(commits.sort()).toEqual([false, true]);
+
+    const final = await f.store.imageGet(f.actor.userId, jobId);
+    expect(final.status).toBe('completed');
+    expect(final.outputs.map(({ index }) => index)).toEqual([0, 1, 2]);
+    expect(final.outputs[2]).toEqual(before.outputs[0]);
+    const assets = await f.pool.query(
+      'SELECT id,owner_id,raw_key,content_type,size_bytes,state,asset_kind FROM mio_assets ORDER BY filename',
+    );
+    expect(assets.rows).toEqual(
+      [first, second, saved].map((item, index) => ({
+        id: final.outputs[index]!.assetId,
+        owner_id: f.actor.userId,
+        raw_key: item.key,
+        content_type: item.contentType,
+        size_bytes: String(item.sizeBytes),
+        state: 'ready',
+        asset_kind: 'derived',
+      })),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 it('keeps a later valid output at its original index and never labels partial results complete', async () => {
   const f = await generationFixture();
   try {

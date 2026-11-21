@@ -57,7 +57,7 @@ it('preserves HTTP paths, closed input, origin checks, preflight and session rec
     revoked = false;
     const readPrevious = vi.spyOn(f.store, 'imageRequest');
     const readRoute = vi.spyOn(f.provider, 'snapshotImage');
-    const readAsset = vi.spyOn(f.store, 'imageInput');
+    const readAsset = vi.spyOn(f.store, 'imageInputs');
     const invalidShapes = [
       { n: { count: 1 } },
       { size: ['1024x1024'] },

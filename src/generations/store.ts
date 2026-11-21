@@ -32,6 +32,14 @@ export interface ImageRequestRecord {
   allowGenerateReferences: boolean | null;
 }
 
+export interface ImageInputAsset {
+  id: string;
+  raw_key: string;
+  content_type: string;
+  size_bytes: string;
+  asset_kind: string;
+}
+
 async function findImageRequest(
   db: Pool | PoolClient,
   owner: string,
@@ -249,20 +257,15 @@ export class GenerationStore {
     };
   }
 
-  async imageInput(owner: string, assetId: string) {
-    return (
-      await this.pool.query<{
-        raw_key: string;
-        content_type: string;
-        size_bytes: string;
-        asset_kind: string;
-      }>(
-        `SELECT raw_key,content_type,size_bytes,asset_kind FROM mio_assets
-         WHERE id=$1 AND owner_id=$2 AND state='ready'
-         AND content_type IN ('image/png','image/jpeg','image/webp')`,
-        [assetId, owner],
-      )
-    ).rows[0];
+  async imageInputs(owner: string, assetIds: string[]): Promise<Map<string, ImageInputAsset>> {
+    if (!assetIds.length) return new Map();
+    const { rows } = await this.pool.query<ImageInputAsset>(
+      `SELECT id,raw_key,content_type,size_bytes,asset_kind FROM mio_assets
+       WHERE owner_id=$1 AND id=ANY($2::uuid[]) AND state='ready'
+       AND content_type IN ('image/png','image/jpeg','image/webp')`,
+      [owner, assetIds],
+    );
+    return new Map(rows.map((asset) => [asset.id, asset]));
   }
 
   async claim(): Promise<GenerationExecution | undefined> {
@@ -427,13 +430,14 @@ export class GenerationStore {
       )
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
       let previousIndex = -1;
-      for (const output of outputs) {
+      const indexed = outputs.map((output) => {
         const index = imageOutputIndex(row.id, output.key, output.contentType);
         if (index === null || index >= requested || index <= previousIndex)
           throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         previousIndex = index;
-        await this.acceptOutput(client, row, index, output);
-      }
+        return { index, output };
+      });
+      await this.acceptOutputBatch(client, row, indexed);
       await client.query(
         'UPDATE mio_image_jobs SET state=$2,error_code=NULL,next_query_at=NULL WHERE id=$1',
         [row.id, state],
@@ -451,36 +455,56 @@ export class GenerationStore {
     });
   }
 
-  private async acceptOutput(
+  private async acceptOutputBatch(
     client: PoolClient,
     row: GenerationExecution,
-    index: number,
-    output: GeneratedObject,
+    outputs: { index: number; output: GeneratedObject }[],
   ) {
-    const existing = (
-      await client.query<{ raw_key: string; size_bytes: string; content_type: string }>(
-        'SELECT a.raw_key,a.size_bytes,a.content_type FROM mio_image_outputs o JOIN mio_assets a ON a.id=o.asset_id WHERE o.job_id=$1 AND o.output_index=$2',
-        [row.id, index],
-      )
-    ).rows[0];
-    if (existing) {
+    if (!outputs.length) return;
+    const { rows } = await client.query<{
+      output_index: number;
+      raw_key: string;
+      size_bytes: string;
+      content_type: string;
+    }>(
+      `SELECT o.output_index,a.raw_key,a.size_bytes,a.content_type
+       FROM mio_image_outputs o JOIN mio_assets a ON a.id=o.asset_id
+       WHERE o.job_id=$1 AND o.output_index=ANY($2::integer[])`,
+      [row.id, outputs.map(({ index }) => index)],
+    );
+    const byIndex = new Map(rows.map((asset) => [asset.output_index, asset]));
+    const pending = outputs.filter(({ index, output }) => {
+      const existing = byIndex.get(index);
+      if (!existing) return true;
       if (
         existing.raw_key !== output.key ||
         Number(existing.size_bytes) !== output.sizeBytes ||
         existing.content_type !== output.contentType
       )
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
-      return;
-    }
-    const id = createId();
+      return false;
+    });
+    if (!pending.length) return;
+    const ids = pending.map(() => createId());
+    const indexes = pending.map(({ index }) => index);
     await client.query(
       `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,expires_at,staging_deleted_at,asset_kind)
-       VALUES($1,$2,$3,$4,$5,NULL,$6,'ready',now(),now(),'derived')`,
-      [id, row.owner_id, 'image-' + index, output.contentType, output.sizeBytes, output.key],
+       SELECT a.id,$1,'image-'||a.output_index,a.content_type,a.size_bytes,NULL,a.raw_key,'ready',now(),now(),'derived'
+       FROM unnest($2::uuid[],$3::integer[],$4::text[],$5::bigint[],$6::text[])
+       AS a(id,output_index,content_type,size_bytes,raw_key)`,
+      [
+        row.owner_id,
+        ids,
+        indexes,
+        pending.map(({ output }) => output.contentType),
+        pending.map(({ output }) => output.sizeBytes),
+        pending.map(({ output }) => output.key),
+      ],
     );
     await client.query(
-      'INSERT INTO mio_image_outputs(job_id,output_index,asset_id) VALUES($1,$2,$3)',
-      [row.id, index, id],
+      `INSERT INTO mio_image_outputs(job_id,output_index,asset_id)
+       SELECT $1,o.output_index,o.asset_id FROM unnest($2::integer[],$3::uuid[]) AS o(output_index,asset_id)`,
+      [row.id, indexes, ids],
     );
   }
 

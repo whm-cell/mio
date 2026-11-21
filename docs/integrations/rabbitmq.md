@@ -20,6 +20,8 @@ A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute
 
 `broker:init:dev/test` 先核对当前重媒体拓扑、角色权限与全部已有资源，再仅创建缺失项。已有权限必须与当前边界一致；旧图片资源和双命令队列 B 权限先沿[图片切换步骤](../local-environments.md#图片生成迁移与切换)排空对账并显式退役或调整，初始化不会自动收缩权限或删除队列。任何权限、队列、交换机或策略不匹配立即停止并报 `LOCAL_BROKER_CONFLICT`；重复执行不覆盖用户密码、策略或队列，不清消息。密码通过真实 AMQP 登录核对。中途失败或请求结果未知时保留现场，恢复同一配置后核对并重试，不能用重建队列绕过冲突。普通 `infra:up` 只启动容器并检查节点/端口及资源告警，拓扑初始化仍是显式步骤。
 
+一次性部署的准备脚本检查运行 vhost 策略的作用对象，并以四条 quorum 队列实际应用的策略和生效定义验证 1 GiB 消息体上限及 `reject-publish`。策略优先级和定义合并遵循 [RabbitMQ 4.4 策略](https://www.rabbitmq.com/docs/4.4/policies)。
+
 部署维护回归见 [local-broker 单测](../../tests/environment/local-broker.test.ts)、[配置测试](../../tests/environment/local-environment.test.ts) 和显式 [MQ 现场探针](../../tests/environment/local-brokers-live.ts)。现场探针核对角色权限、消息隔离、已确认消息重启保留、另一环境可用，以及空闲 Worker journal/进程接线；完整云端转码、负载和服务器验收另按需求取证。普通检查不访问这两套人工队列或历史 broker。
 
 上游依据：[HTTP API](https://www.rabbitmq.com/docs/http-api-reference)、[访问控制](https://www.rabbitmq.com/docs/access-control)、[vhost](https://www.rabbitmq.com/docs/vhosts)、[告警](https://www.rabbitmq.com/docs/alarms)。公共参数、权限、持久化或恢复变化须沿实际 A/B 消费者回归；纯部署环境扩展不改变消息业务协议。

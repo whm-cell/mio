@@ -5,8 +5,8 @@
  * Optional: OBSERVE_QPS (default 5), OBSERVE_WARMUP_SECONDS (60),
  * OBSERVE_DURATION_SECONDS (600), OBSERVE_B_PID (omit if B is absent),
  * OBSERVE_BASELINE_SUMMARY for other scenarios.
- * The output directory must be a new child of .runtime. A duration other than
- * 600 seconds is recorded as a short observation and is ineligible for P5.
+ * The output directory must be a new child of .runtime. Formal P5 eligibility
+ * requires 60 seconds of warmup and 600 seconds of measurement.
  * Run only after the owner has established and documented the chosen scenario.
  */
 import { execFile } from 'node:child_process';
@@ -18,6 +18,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import pg from 'pg';
+import { readComputeBrokerEnvironment } from './compute-broker-env.ts';
 
 type Route = 'health' | 'ready' | 'me' | 'asset' | 'job';
 type Scenario = 'baseline' | 'saturated' | 'offline' | 'backlog';
@@ -42,6 +43,8 @@ type PhaseTiming = {
 type Baseline = {
   scenario: string;
   profileDigest: string;
+  warmupSeconds: number;
+  durationSeconds: number;
   eligible: boolean;
   measurement: Record<string, Stats>;
   monitoringErrors: number;
@@ -63,6 +66,8 @@ type Observation = {
 
 const run = promisify(execFile);
 const routes: Route[] = ['health', 'ready', 'me', 'asset', 'job'];
+const formalWarmupSeconds = 60;
+const formalDurationSeconds = 600;
 const required = (key: string): string => {
   const value = process.env[key];
   if (!value) throw new Error(`MISSING_${key}`);
@@ -80,17 +85,8 @@ function localUrl(value: string, protocols: string[]): URL {
     throw new Error('LOCAL_LOOPBACK_REQUIRED');
   return url;
 }
-function parseEnv(text: string): Record<string, string> {
-  return Object.fromEntries(
-    text
-      .split('\n')
-      .filter((line) => line && !line.startsWith('#'))
-      .map((line) => {
-        const index = line.indexOf('=');
-        if (index < 1) throw new Error('MQ_ENV_INVALID');
-        return [line.slice(0, index), line.slice(index + 1)];
-      }),
-  );
+function formalWindow(warmupSeconds: number, durationSeconds: number): boolean {
+  return warmupSeconds === formalWarmupSeconds && durationSeconds === formalDurationSeconds;
 }
 function stats(samples: Sample[]): Stats {
   const sorted = samples
@@ -115,7 +111,8 @@ export function compareMeasurements(
   const keys = ['all', ...routes];
   if (
     !eligible ||
-    !baseline.eligible ||
+    baseline.eligible !== true ||
+    !formalWindow(baseline.warmupSeconds, baseline.durationSeconds) ||
     baseline.monitoringErrors !== 0 ||
     !keys.every(
       (key) =>
@@ -224,7 +221,7 @@ async function brokerStats(container: string): Promise<Observation['broker']> {
   return { cpuPercent, memoryBytes: byteSize(result.MemUsage.split('/')[0]!) };
 }
 
-async function main(): Promise<void> {
+export async function observeCompute(): Promise<void> {
   const base = localUrl(required('OBSERVE_BASE_URL'), ['http:']);
   if (base.username || base.password || base.pathname !== '/' || base.search || base.hash)
     throw new Error('BASE_URL_INVALID');
@@ -234,20 +231,9 @@ async function main(): Promise<void> {
   if (![asset, job].every((value) => /^[a-f0-9-]{36}$/.test(value)))
     throw new Error('IDENTIFIER_INVALID');
   const databaseUrl = localUrl(required('OBSERVE_PG_URL'), ['postgres:', 'postgresql:']);
-  const mq = parseEnv(await readFile(required('OBSERVE_MQ_ENV'), 'utf8'));
-  const management = localUrl(mq.RABBITMQ_MANAGEMENT_URL ?? '', ['http:']);
-  if (
-    management.username ||
-    management.password ||
-    management.pathname !== '/' ||
-    management.search ||
-    management.hash
-  )
-    throw new Error('MQ_URL_INVALID');
-  const vhost = mq.RABBITMQ_DEFAULT_VHOST;
-  const mqUser = mq.RABBITMQ_DEFAULT_USER;
-  const mqPassword = mq.RABBITMQ_DEFAULT_PASS;
-  if (!vhost || !mqUser || !mqPassword) throw new Error('MQ_ENV_MISSING');
+  const { management, vhost, user, password } = readComputeBrokerEnvironment(
+    await readFile(required('OBSERVE_MQ_ENV'), 'utf8'),
+  );
   const container = required('OBSERVE_MQ_CONTAINER');
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(container)) throw new Error('CONTAINER_INVALID');
   const aPid = integer('OBSERVE_A_PID', 0, 1, 99999999);
@@ -256,8 +242,13 @@ async function main(): Promise<void> {
   if (!['baseline', 'saturated', 'offline', 'backlog'].includes(scenario))
     throw new Error('SCENARIO_INVALID');
   const qps = integer('OBSERVE_QPS', 5, 1, 50);
-  const warmup = integer('OBSERVE_WARMUP_SECONDS', 60, 1, 300);
-  const duration = integer('OBSERVE_DURATION_SECONDS', 600, 1, 600);
+  const warmup = integer('OBSERVE_WARMUP_SECONDS', formalWarmupSeconds, 1, 300);
+  const duration = integer(
+    'OBSERVE_DURATION_SECONDS',
+    formalDurationSeconds,
+    1,
+    formalDurationSeconds,
+  );
   const runtime = await realpath('.runtime');
   const output = resolve(required('OBSERVE_OUTPUT_DIR'));
   const parent = await realpath(dirname(output));
@@ -304,7 +295,7 @@ async function main(): Promise<void> {
     connectionTimeoutMillis: 3000,
     options: '-c default_transaction_read_only=on -c statement_timeout=3000',
   });
-  const auth = Buffer.from(`${mqUser}:${mqPassword}`).toString('base64');
+  const auth = Buffer.from(`${user}:${password}`).toString('base64');
   const queueNames = [
     'mio.compute.commands.v1',
     'mio.compute.results.v1',
@@ -408,10 +399,14 @@ async function main(): Promise<void> {
         queueNames.map(async (name) => {
           const response = await fetch(
             new URL(
-              `/api/queues/${encodeURIComponent(vhost!)}/${encodeURIComponent(name)}`,
+              `/api/queues/${encodeURIComponent(vhost)}/${encodeURIComponent(name)}`,
               management,
             ),
-            { headers: { authorization: `Basic ${auth}` }, signal: AbortSignal.timeout(5000) },
+            {
+              headers: { authorization: `Basic ${auth}` },
+              redirect: 'error',
+              signal: AbortSignal.timeout(5000),
+            },
           );
           if (!response.ok) throw new Error('QUEUE_READ_FAILED');
           const body = (await response.json()) as {
@@ -488,7 +483,10 @@ async function main(): Promise<void> {
     for (const route of routes)
       measurement[route] = stats(samples.filter((sample) => sample.route === route));
     const eligible =
-      duration === 600 && samples.length === duration * qps && monitoringErrors === 0 && !fileError;
+      formalWindow(warmup, duration) &&
+      samples.length === duration * qps &&
+      monitoringErrors === 0 &&
+      !fileError;
     const { comparison, conclusion } = compareMeasurements(measurement, baseline, eligible);
     const summary = {
       scenario,
@@ -507,7 +505,7 @@ async function main(): Promise<void> {
       conclusion,
       scenarioVerification: 'pending_manual_review',
       notes:
-        'CPU/RSS include process descendants; ps CPU uses platform process statistics, not a 10-second delta. Docker CPU has its own sampling interval. FFmpeg presence is sampled, not continuous proof. Short observations are ineligible for P5.',
+        'CPU/RSS include process descendants. ps CPU uses platform process statistics. Docker CPU has its own sampling interval. FFmpeg presence is sampled. P5 requires 60 seconds of warmup and 600 seconds of measurement.',
     };
     append({ type: 'finish', at: new Date().toISOString(), conclusion });
     await new Promise<void>((resolveEnd, reject) =>
@@ -528,7 +526,7 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => {
+  observeCompute().catch(() => {
     process.stderr.write(
       'Observation failed; inspect private partial evidence and local inputs.\n',
     );

@@ -263,11 +263,8 @@ it('clears an expired session at the database time after the settlement lock', a
   const f = await fixture();
   const p = await pending(f);
   await f.pool.query(
-    `WITH t AS (SELECT clock_timestamp() AS sampled)
-     UPDATE mio_material_auth_sessions SET state='verifying',lease_id=$2,
-       lease_until=t.sampled-interval '1 second',created_at=t.sampled-interval '1198 seconds',
-       expires_at=t.sampled+interval '2 seconds'
-     FROM t WHERE id=$1`,
+    `UPDATE mio_material_auth_sessions SET state='verifying',lease_id=$2,
+       lease_until=clock_timestamp()-interval '1 second' WHERE id=$1`,
     [p.row.id, randomUUID()],
   );
   const blocker = await f.pool.connect();
@@ -296,18 +293,27 @@ it('clears an expired session at the database time after the settlement lock', a
         { timeout: 1500 },
       )
       .toBe(true);
-    await blocker.query(
-      `SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM expires_at-clock_timestamp()))+0.01)
-       FROM mio_material_auth_sessions WHERE id=$1`,
+    const expired = await blocker.query(
+      `WITH t AS (SELECT clock_timestamp() AS sampled)
+       UPDATE mio_material_auth_sessions SET created_at=t.sampled-interval '20 minutes',
+         expires_at=t.sampled
+       FROM t WHERE id=$1 AND lease_until<=t.sampled AND expires_at>t.sampled`,
       [p.row.id],
     );
+    // The application is already waiting, and the deadline was still in the future.
+    expect(expired.rowCount).toBe(1);
+    await blocker.query('COMMIT');
+  } catch (error) {
+    await blocker.query('ROLLBACK').catch(() => {});
+    throw error;
   } finally {
-    await blocker.query('ROLLBACK');
     blocker.release();
     await status?.catch(() => {});
   }
   expect(await status).toMatchObject({ state: 'expired', errorCode: 'AUTH_EXPIRED' });
-  expect(await f.store.authentication.get(p.row.id, f.actor.userId)).toMatchObject({
+  const settled = await f.store.authentication.get(p.row.id, f.actor.userId);
+  expect(settled.updated_at.getTime()).toBeGreaterThanOrEqual(settled.expires_at.getTime());
+  expect(settled).toMatchObject({
     state: 'expired',
     lease_id: null,
     lease_until: null,

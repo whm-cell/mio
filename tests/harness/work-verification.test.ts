@@ -1,9 +1,11 @@
+import { spawnSync } from 'node:child_process';
 import { link, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { resultMarker } from '../../scripts/harness/work/evidence.ts';
 import { contractPlan, digest, json } from '../../scripts/harness/work/records.ts';
 import type { Candidate } from '../../scripts/harness/work/records.ts';
+import { writeTaskDocuments } from './fixtures/task-documents-fixture.ts';
 import {
   check,
   cloneFixture,
@@ -254,6 +256,59 @@ it('binds a directory and input names containing whitespace to the same clean co
   ok(root, ['sync', id, 'Bind the declared paths to the candidate.']);
   expect((await state(root, id)).checkpoint?.candidate).toMatchObject({ commit: commitId });
 });
+
+it.skipIf(process.platform === 'win32')(
+  'rejects an earlier uncommitted source before opening a later result selector',
+  async () => {
+    const root = await fixture();
+    const ignored = 'docs/ignored.md';
+    const prd = 'docs/tasks/product/prd.md';
+    const records = 'docs/tasks/product/complete/records.json';
+    await writeFile(join(root, '.gitignore'), `.work/\n${ignored}\n${records}\n`);
+    await writeTaskDocuments(root, [{ kind: 'prd', identity: prd, path: prd }]);
+    await writeFile(join(root, prd), '# Fixture PRD\n');
+    commit(root, 'Register a result fixture with ignored observations');
+    await writeFile(join(root, ignored), '# Ignored\n');
+    await mkdir(dirname(join(root, records)), { recursive: true });
+    await writeFile(
+      join(root, records),
+      JSON.stringify({
+        version: 5,
+        prd,
+        results: [
+          {
+            key: 'fixture',
+            title: 'Fixture',
+            outcomes: 'Fixture.',
+            locations: [{ path: prd, purpose: 'Fixture requirement.' }],
+            verification: 'Fixture.',
+            limitations: 'Synthetic.',
+            acceptance: { candidate: 'history', statement: 'Synthetic.', reference: 'Fixture.' },
+          },
+        ],
+      }),
+    );
+    const id = create(root);
+    const task = await state(root, id);
+    ok(root, ['update', id, '--stdin'], {
+      revision: task.revision,
+      reason: 'Declare a later result input.',
+      plan: { sources: [ignored], inputs: [`${records}#result=fixture`] },
+    });
+    expect(git(root, ['status', '--porcelain', '-z', '--untracked-files=all'])).toBe('');
+    await rm(join(root, records));
+    expect(spawnSync('mkfifo', [records], { cwd: root }).status).toBe(0);
+    const result = spawnSync(
+      process.execPath,
+      [resolve('scripts/harness/work/cli.ts'), 'sync', id, 'Check the earlier source.'],
+      { cwd: root, encoding: 'utf8', timeout: 2000 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr.trim()).toBe(`WORK_INPUT_UNCOMMITTED: ${ignored}`);
+    expect((await state(root, id)).checkpoint).toBeNull();
+  },
+);
 
 it('keeps historical strings and originals without treating an old head as a current candidate', async () => {
   const root = await fixture();

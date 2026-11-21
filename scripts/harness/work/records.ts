@@ -149,8 +149,7 @@ export function identifier(value: string): string {
   return value;
 }
 
-/** All paths are workspace-relative; existing symlinks are never traversed. */
-export async function checkedPath(root: string, relative: string): Promise<string> {
+export function assertRelativePath(relative: string) {
   if (
     !relative ||
     isAbsolute(relative) ||
@@ -159,6 +158,11 @@ export async function checkedPath(root: string, relative: string): Promise<strin
     relative.split('/').some((part) => !part || part === '.' || part === '..')
   )
     throw new Error(`WORK_PATH: invalid relative path ${relative}`);
+}
+
+/** All paths are workspace-relative; existing symlinks are never traversed. */
+export async function checkedPath(root: string, relative: string): Promise<string> {
+  assertRelativePath(relative);
   let path = root;
   for (const part of relative.split('/')) {
     path = join(path, part);

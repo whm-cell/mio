@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { format } from 'prettier';
-import { assessWithEvidence, firstUncommittedPath, requireCandidate } from './context.ts';
+import { assessWithEvidence, committedPaths, requireCandidate } from './context.ts';
 import {
   contractRevision,
   json,
@@ -110,11 +110,9 @@ async function prepare(root: string, task: Task, raw: string, request: Record<st
     limitations: request.limitations,
   });
   await validateLocations(root, result, catalog);
-  const missing = firstUncommittedPath(
-    root,
-    candidate.commit,
-    result.locations.map(({ path }) => path),
-  );
+  const requested = result.locations.map(({ path }) => path);
+  const committed = committedPaths(root, candidate.commit, requested);
+  const missing = requested.find((path) => !committed.has(path));
   if (missing)
     throw new Error(`WORK_REPORT_LOCATION: location is absent from the candidate: ${missing}`);
   const draft: ResultDraft = {

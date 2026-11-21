@@ -1,7 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import { lstat } from 'node:fs/promises';
 import { beneath, loadConfig } from '../inventory.ts';
-import { checkedPath, contractPlan, contractRevision, digest, sameCandidate } from './records.ts';
+import type { HarnessConfig } from '../inventory.ts';
+import {
+  assertRelativePath,
+  checkedPath,
+  contractPlan,
+  contractRevision,
+  digest,
+  sameCandidate,
+} from './records.ts';
 import type { Candidate, Evidence, Task } from './records.ts';
 import { deliveryOutput, readDraft, readResultInput } from './reports.ts';
 import { hasResultSelector, parseSelector } from './compact-store.ts';
@@ -15,9 +23,10 @@ export { runtimeEnvironment as environment } from './verification-environment.ts
 
 export { artifact } from './evidence.ts';
 
-export function firstUncommittedPath(root: string, commit: string, paths: readonly string[]) {
+export function committedPaths(root: string, commit: string, paths: readonly string[]) {
   const requested = [...new Set(paths)];
-  if (!requested.length) return undefined;
+  const confirmed = new Set<string>();
+  if (!requested.length) return confirmed;
 
   const input = requested.map((path) => `${commit}:${path}\0`).join('');
   const batch = spawnSync('git', ['cat-file', '--batch-check=present', '-z'], {
@@ -27,84 +36,114 @@ export function firstUncommittedPath(root: string, commit: string, paths: readon
     input,
     maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(input) + requested.length * 16),
   });
-  if (batch.error) return requested[0];
+  if (batch.error) return confirmed;
 
   // Requests use NUL separators. Each successful reply is the same line, even for paths with LF.
   const present = 'present\n';
   const output = batch.stdout ?? '';
   let offset = 0;
   for (const path of requested) {
-    if (!output.startsWith(present, offset)) return path;
+    if (!output.startsWith(present, offset)) return confirmed;
+    confirmed.add(path);
     offset += present.length;
   }
-  return batch.status === 0 && offset === output.length ? undefined : requested[0];
+  if (batch.status !== 0 || offset !== output.length) confirmed.clear();
+  return confirmed;
+}
+
+type Catalog = Awaited<ReturnType<typeof documentCatalog>>;
+
+function inputPath(reference: string, kind: 'source' | 'input' | 'scope', catalog: Catalog) {
+  return kind === 'source' ? resolveDocument(reference, catalog).currentPath : reference;
+}
+
+function assertPublicInput(path: string, config: HarnessConfig) {
+  if (
+    [...config.privateRoots, ...config.generatedRoots].some((base) => beneath(path, base)) ||
+    (path !== '.env.example' && path.split('/').some((part) => /^\.env(?:\.|$)/.test(part)))
+  )
+    throw new Error(`WORK_PRIVATE: ${path}`);
+}
+
+function candidateQueries(task: Task, sources: readonly string[], catalog: Catalog) {
+  const paths: string[] = [];
+  // Collect public path expressions without touching working-tree files. The
+  // ordered validation reports errors when it reaches each actual reference.
+  try {
+    for (const [kind, references] of [
+      ['source', sources],
+      ['input', task.plan.inputs],
+    ] as const) {
+      for (const reference of references) {
+        if (hasResultSelector(reference)) {
+          if (kind !== 'input' || deliveryOutput(task, reference, catalog)) return paths;
+          paths.push(parseSelector(reference).path);
+        } else {
+          const path = inputPath(reference, kind, catalog);
+          if (path === '.') continue;
+          assertRelativePath(path);
+          assertPublicInput(path, catalog.config);
+          if (kind === 'source' && deliveryOutput(task, path, catalog)) return paths;
+          paths.push(path);
+        }
+      }
+    }
+  } catch {
+    return paths;
+  }
+  return paths;
 }
 
 /** Validate declared ownership and paths without computing a tree of file contents. */
 export async function validateInputs(root: string, task: Task, commit?: string): Promise<void> {
   const config = await loadConfig(root);
   const catalog = await documentCatalog(root, config);
-  const candidatePaths: string[] = [];
-  let localFailure: { error: unknown } | undefined;
-  try {
-    for (const [kind, paths] of [
-      [
-        'source',
-        [
-          ...task.plan.sources,
-          ...(task.plan.requirement ? [task.plan.requirement.source] : []),
-          ...(task.plan.result ? [task.plan.result.prd] : []),
-          ...(task.plan.norms?.paths ?? []),
-        ],
-      ],
-      ['input', task.plan.inputs],
-      ['scope', task.plan.scope],
-    ] as const) {
-      for (const reference of paths) {
-        if (hasResultSelector(reference)) {
-          const selector = parseSelector(reference);
-          await checkedPath(root, selector.path);
-          if (kind !== 'input')
-            throw new Error('WORK_REPORT_SELECTOR: use selectors only in inputs');
-          if (deliveryOutput(task, reference, catalog))
-            throw new Error('WORK_DELIVERY_INPUT: own result cannot be an input');
-          await readResultInput(root, reference, catalog);
-          if (commit) candidatePaths.push(selector.path);
-          continue;
+  const sources = [
+    ...task.plan.sources,
+    ...(task.plan.requirement ? [task.plan.requirement.source] : []),
+    ...(task.plan.result ? [task.plan.result.prd] : []),
+    ...(task.plan.norms?.paths ?? []),
+  ];
+  const committed = commit
+    ? committedPaths(root, commit, candidateQueries(task, sources, catalog))
+    : undefined;
+  for (const [kind, paths] of [
+    ['source', sources],
+    ['input', task.plan.inputs],
+    ['scope', task.plan.scope],
+  ] as const) {
+    for (const reference of paths) {
+      if (hasResultSelector(reference)) {
+        const selector = parseSelector(reference);
+        await checkedPath(root, selector.path);
+        if (kind !== 'input') throw new Error('WORK_REPORT_SELECTOR: use selectors only in inputs');
+        if (deliveryOutput(task, reference, catalog))
+          throw new Error('WORK_DELIVERY_INPUT: own result cannot be an input');
+        await readResultInput(root, reference, catalog);
+        if (committed && !committed.has(selector.path))
+          throw new Error(`WORK_INPUT_UNCOMMITTED: ${selector.path}`);
+        continue;
+      }
+      const path = inputPath(reference, kind, catalog);
+      if (path !== '.') await checkedPath(root, path);
+      assertPublicInput(path, config);
+      if (deliveryOutput(task, path, catalog) && kind === 'source')
+        throw new Error('WORK_DELIVERY_INPUT: own delivery output cannot be a requirement/source');
+      if (kind !== 'scope') {
+        let stat;
+        try {
+          stat = await lstat(path === '.' ? root : await checkedPath(root, path));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          throw new Error(`WORK_INPUT_MISSING: ${path}`);
         }
-        const path =
-          kind === 'source' ? resolveDocument(reference, catalog).currentPath : reference;
-        if (path !== '.') await checkedPath(root, path);
-        if (
-          [...config.privateRoots, ...config.generatedRoots].some((base) => beneath(path, base)) ||
-          (path !== '.env.example' && path.split('/').some((part) => /^\.env(?:\.|$)/.test(part)))
-        )
-          throw new Error(`WORK_PRIVATE: ${path}`);
-        if (deliveryOutput(task, path, catalog) && kind === 'source')
-          throw new Error(
-            'WORK_DELIVERY_INPUT: own delivery output cannot be a requirement/source',
-          );
-        if (kind !== 'scope') {
-          let stat;
-          try {
-            stat = await lstat(path === '.' ? root : await checkedPath(root, path));
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-            throw new Error(`WORK_INPUT_MISSING: ${path}`);
-          }
-          if (kind === 'source' && (!path.endsWith('.md') || !stat.isFile()))
-            throw new Error(`WORK_SOURCE: name an existing public Markdown file: ${path}`);
-          if (commit && path !== '.') candidatePaths.push(path);
-        }
+        if (kind === 'source' && (!path.endsWith('.md') || !stat.isFile()))
+          throw new Error(`WORK_SOURCE: name an existing public Markdown file: ${path}`);
+        if (committed && path !== '.' && !committed.has(path))
+          throw new Error(`WORK_INPUT_UNCOMMITTED: ${path}`);
       }
     }
-  } catch (error) {
-    localFailure = { error };
   }
-  // Check earlier paths before returning a later local error, as with one lookup per path.
-  const missing = commit && firstUncommittedPath(root, commit, candidatePaths);
-  if (missing) throw new Error(`WORK_INPUT_UNCOMMITTED: ${missing}`);
-  if (localFailure) throw localFailure.error;
 }
 
 /** Git determines whether a committed candidate exists; ignored process records are outside it. */

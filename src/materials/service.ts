@@ -47,10 +47,10 @@ function listCursor(value?: string): MaterialCursor | undefined {
     throw new MaterialError(HTTP_STATUS.BAD_REQUEST, 'CURSOR_INVALID');
   }
 }
-function page<T extends { id: string; created_at: Date; cursor_time?: string }>(
+function page<T extends { id: string; created_at: Date; cursor_time?: string }, View>(
   rows: T[],
   limit: number,
-  view: (row: T) => unknown,
+  view: (row: T) => View,
 ) {
   const selected = rows.slice(0, limit);
   const last = selected.at(-1);

@@ -5,6 +5,7 @@ import type { Pool, PoolClient } from 'pg';
 import { reserveSmsBudget } from './phone-budget.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import type { SmsBudgetTables } from './phone-budget-schema.ts';
+import { withAuthTransaction } from './transaction.ts';
 
 export type PhonePurpose = 'login' | 'bind';
 export interface BindingIdentity {
@@ -26,23 +27,6 @@ const codeDigest = (
       `${id}\0${purpose}\0${phone}\0${binding?.userId ?? ''}\0${binding?.sessionId ?? ''}\0${code}`,
     )
     .digest('hex');
-
-async function transaction<T>(pool: Pool, action: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query("SET LOCAL lock_timeout = '3s'");
-    await client.query("SET LOCAL statement_timeout = '5s'");
-    const result = await action(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
 
 async function bindingSessionIsActive(client: PoolClient, binding: BindingIdentity) {
   const locked = await client.query(
@@ -71,7 +55,7 @@ export async function reservePhoneChallenge(
 ) {
   const id = createId();
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const timestamp = await reserveSmsBudget(client, tables, limits, phone, ip);
     await client.query(
       `INSERT INTO "mioPhoneChallenge" (id, "challengeKey", "codeHash", purpose, "userId", "sessionId", status, attempts, "expiresAt")
@@ -105,7 +89,7 @@ export async function reservePhoneChallenge(
 
 /** A late success cannot activate a replacement challenge. */
 export async function activatePhoneChallenge(pool: Pool, id: string) {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const locked = await client.query(
       'SELECT id FROM "mioPhoneChallenge" WHERE id = $1 FOR UPDATE',
       [id],
@@ -139,7 +123,7 @@ export async function consumePhoneChallenge(
   code: string,
   binding?: BindingIdentity,
 ): Promise<'ok' | 'invalid' | 'conflict' | 'session'> {
-  return transaction(pool, async (client) => {
+  return withAuthTransaction(pool, async (client) => {
     const result = await client.query<ChallengeRow>(
       'SELECT * FROM "mioPhoneChallenge" WHERE "challengeKey" = $1 FOR UPDATE',
       [challengeKey(purpose, phone)],

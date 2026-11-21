@@ -262,7 +262,7 @@ it('reuses the owned preflight row and rechecks a new active request at final re
   try {
     await entered.promise;
     expect(owned).toHaveBeenCalledOnce();
-    await store.receive(actor, id, 'winner', 'winner-digest', true);
+    await store.receive(actor, id, 'winner', 'winner-digest', async () => undefined);
     release.resolve();
     expect(await outcome).toMatchObject({ code: 'CONVERSATION_BUSY' });
     expect(engine.run).not.toHaveBeenCalled();

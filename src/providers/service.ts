@@ -7,14 +7,19 @@ import type {
   ProviderPrincipal,
   ChatSelection,
   ChatRuntimeSnapshot,
-  ImageRuntimeSnapshot,
   ImageAdmissionSnapshot,
   VerificationSnapshot,
   AccountCredentialSnapshot,
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
-import { decryptCredential, encryptMaterialAuth, decryptMaterialAuth } from './credentials.ts';
+import {
+  decryptCredential,
+  decryptCredentialSnapshot,
+  decryptMaterialAuth,
+  encryptMaterialAuth,
+  serializeCredentialSnapshot,
+} from './credentials.ts';
 import {
   catalogView,
   findModel,
@@ -127,49 +132,6 @@ export function createProviderService(
       throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
     return { row, model: model!, adaptation };
   };
-  const snapshotImage = async (
-    actor: Pick<ProviderPrincipal, 'userId'>,
-    modelRef: string,
-  ): Promise<ImageAdmissionSnapshot> => {
-    const { row, model, adaptation } = await imageState(actor, modelRef);
-    return {
-      modelId: model.raw_model_id!,
-      modelKey: model.model_key,
-      vendor: adaptation.vendor,
-      profile: adaptation.profile,
-      route: adaptation.route,
-      defaultImageWatermark: row.default_image_watermark,
-      capabilityMetadata: adaptation.capabilityMetadata,
-      providerRevision: row.revision,
-      providerConfigId: row.id,
-      credentialVersion: row.credential_version,
-      catalogVersion: row.catalog_version!,
-      adaptationVersion: adaptation.declarationVersion,
-      credential: {
-        cipherFormat: row.cipher_format,
-        masterKeyId: row.master_key_id,
-        nonce: row.nonce.toString('base64'),
-        ciphertext: row.ciphertext.toString('base64'),
-        authTag: row.auth_tag.toString('base64'),
-      },
-    };
-  };
-  const openImageSnapshot = (ownerId: string, snapshot: ImageAdmissionSnapshot): string =>
-    decryptCredential(
-      {
-        cipher_format: snapshot.credential.cipherFormat,
-        master_key_id: snapshot.credential.masterKeyId,
-        nonce: Buffer.from(snapshot.credential.nonce, 'base64'),
-        ciphertext: Buffer.from(snapshot.credential.ciphertext, 'base64'),
-        auth_tag: Buffer.from(snapshot.credential.authTag, 'base64'),
-      },
-      {
-        ownerId,
-        providerId: snapshot.providerConfigId,
-        credentialVersion: snapshot.credentialVersion,
-      },
-      config,
-    );
   return {
     sealMaterialAuth(
       ownerId: string,
@@ -193,40 +155,34 @@ export function createProviderService(
       assertOpen();
       if (!row || !row.enabled || row.credential_auth_state === 'rejected')
         throw new ProviderError(HTTP_STATUS.CONFLICT, 'PROVIDER_UNAVAILABLE');
-      return {
-        providerConfigId: row.id,
-        credentialVersion: row.credential_version,
-        credential: {
-          cipherFormat: row.cipher_format,
-          masterKeyId: row.master_key_id,
-          nonce: row.nonce.toString('base64'),
-          ciphertext: row.ciphertext.toString('base64'),
-          authTag: row.auth_tag.toString('base64'),
-        },
-      };
+      return serializeCredentialSnapshot(row);
     },
     openAccountSnapshot(ownerId: string, snapshot: AccountCredentialSnapshot): string {
       assertOpen();
-      return decryptCredential(
-        {
-          cipher_format: snapshot.credential.cipherFormat,
-          master_key_id: snapshot.credential.masterKeyId,
-          nonce: Buffer.from(snapshot.credential.nonce, 'base64'),
-          ciphertext: Buffer.from(snapshot.credential.ciphertext, 'base64'),
-          auth_tag: Buffer.from(snapshot.credential.authTag, 'base64'),
-        },
-        {
-          ownerId,
-          providerId: snapshot.providerConfigId,
-          credentialVersion: snapshot.credentialVersion,
-        },
-        config,
-      );
+      return decryptCredentialSnapshot(ownerId, snapshot, config);
     },
-    snapshotImage,
-    openImageSnapshot(ownerId: string, snapshot: ImageAdmissionSnapshot) {
+    async snapshotImage(
+      actor: Pick<ProviderPrincipal, 'userId'>,
+      modelRef: string,
+    ): Promise<ImageAdmissionSnapshot> {
+      const { row, model, adaptation } = await imageState(actor, modelRef);
+      return {
+        ...serializeCredentialSnapshot(row),
+        modelId: model.raw_model_id!,
+        modelKey: model.model_key,
+        vendor: adaptation.vendor,
+        profile: adaptation.profile,
+        route: adaptation.route,
+        defaultImageWatermark: row.default_image_watermark,
+        capabilityMetadata: adaptation.capabilityMetadata,
+        providerRevision: row.revision,
+        catalogVersion: row.catalog_version!,
+        adaptationVersion: adaptation.declarationVersion,
+      };
+    },
+    openImageSnapshot(ownerId: string, snapshot: ImageAdmissionSnapshot): string {
       assertOpen();
-      return openImageSnapshot(ownerId, snapshot);
+      return decryptCredentialSnapshot(ownerId, snapshot, config);
     },
     /** Resolve only the current owner's credential for an already admitted task. */
     async resolveImageTaskCredential(ownerId: string) {
@@ -283,15 +239,6 @@ export function createProviderService(
         });
       }
       return models;
-    },
-    async resolveImage(
-      actor: { readonly userId: string; readonly sessionId?: string },
-      modelRef: string,
-    ): Promise<ImageRuntimeSnapshot> {
-      const frozen = await snapshotImage(actor, modelRef);
-      const { credential: _credential, ...snapshot } = frozen;
-      void _credential;
-      return { ...snapshot, apiKey: openImageSnapshot(actor.userId, frozen) };
     },
     async selectChat(actor: ProviderPrincipal, modelRef?: string): Promise<ChatSelection> {
       return (await chatState(actor, modelRef)).selection;

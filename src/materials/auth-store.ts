@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MaterialError } from './contracts.ts';
 import type { MaterialAuthRow, MaterialAuthStatusRow } from './auth-contracts.ts';
 import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
@@ -19,28 +20,33 @@ const sessionMatch = 'id=$1 AND ($2::text IS NULL OR owner_id=$2)';
 const creationFields = 'id,owner_id,input_hash,lease_id';
 type CreationClaim = Pick<MaterialAuthRow, 'id' | 'owner_id' | 'input_hash' | 'lease_id'>;
 const superseded = () => new MaterialError(409, 'MATERIAL_AUTH_SUPERSEDED');
+
+export async function withMaterialTransaction<T>(
+  pool: Pool,
+  action: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await action(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error instanceof MaterialError) throw error;
+    if ((error as { code?: string }).code === '23505')
+      throw new MaterialError(HTTP_STATUS.CONFLICT, 'UPSTREAM_RESOURCE_COLLISION');
+    throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
+  } finally {
+    client.release();
+  }
+}
+
 /** Owns only auth session facts; shares its domain pool, never auth/provider pools. */
 export class MaterialAuthStore {
   private readonly pool: Pool;
   constructor(pool: Pool) {
     this.pool = pool;
-  }
-  private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await action(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      if (error instanceof MaterialError) throw error;
-      if ((error as { code?: string }).code === '23505')
-        throw new MaterialError(409, 'UPSTREAM_RESOURCE_COLLISION');
-      throw new MaterialError(503, 'MATERIAL_UNAVAILABLE');
-    } finally {
-      client.release();
-    }
   }
   async expire(id?: string): Promise<void> {
     await this.pool.query(
@@ -66,7 +72,7 @@ export class MaterialAuthStore {
     owner: string | undefined,
     fields: '*' | typeof statusFields,
   ): Promise<Row | undefined> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const values = [id, owner ?? null];
       const locked = await client.query(
         `SELECT 1 FROM mio_material_auth_sessions WHERE ${sessionMatch} FOR UPDATE`,
@@ -133,7 +139,7 @@ export class MaterialAuthStore {
     inputHash: string,
     credential: AccountCredentialSnapshot,
   ): Promise<{ session: CreationClaim; fresh: boolean }> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const session = (
         await client.query<CreationClaim>(
           `INSERT INTO mio_material_auth_sessions(id,owner_id,provider_type,provider_config_id,credential_version,request_id,input_hash,state,protocol_snapshot,return_target,lease_id,lease_until,expires_at)
@@ -244,7 +250,7 @@ export class MaterialAuthStore {
     resultRequestId: string | null,
     groupRequestId: string | null,
   ): Promise<MaterialAuthRow> {
-    return this.transaction(async (client) => {
+    return withMaterialTransaction(this.pool, async (client) => {
       const current = (
         await client.query<MaterialAuthRow>(
           "SELECT * FROM mio_material_auth_sessions WHERE owner_id=$1 AND id=$2 AND state='verifying' AND lease_id=$3 AND lease_until>clock_timestamp() AND expires_at>clock_timestamp() AND token_digest=$4 FOR UPDATE",

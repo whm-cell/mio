@@ -910,13 +910,19 @@ it('redacts QR authorization refusal while leaving ordinary OAuth redirects unch
   expect(exchanges).toBe(0);
 });
 
-it('rolls back an unsuccessful QR claim and permits the first successful claim after DB recovery', async () => {
+it('applies login transaction timeouts and rolls back an unsuccessful QR claim', async () => {
   const qr = await startQR();
   fixtures.set('qr-rollback', { openid: 'qr-rollback-owner' });
   const completed = await callback(qr, 'qr-rollback');
   const session = cookies(completed);
   await pool.query(`CREATE FUNCTION reject_qr_claim() RETURNS trigger LANGUAGE plpgsql AS $$
-    BEGIN IF NEW.status='consumed' THEN RAISE EXCEPTION 'private-fixture-database-detail'; END IF; RETURN NEW; END $$`);
+    BEGIN
+      IF NEW.status='consumed' AND current_setting('lock_timeout')='3s'
+        AND current_setting('statement_timeout')='5s' THEN
+        RAISE EXCEPTION 'private-fixture-database-detail';
+      END IF;
+      RETURN NEW;
+    END $$`);
   await pool.query(`CREATE TRIGGER reject_qr_claim BEFORE UPDATE ON "mioWechatQR"
     FOR EACH ROW EXECUTE FUNCTION reject_qr_claim()`);
   try {

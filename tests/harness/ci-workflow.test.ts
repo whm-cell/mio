@@ -9,6 +9,7 @@ interface WorkflowStep {
   if?: string;
   uses?: string;
   run?: string;
+  env?: Record<string, string | number>;
   with?: Record<string, string | number>;
 }
 
@@ -138,7 +139,8 @@ describe('Foundation checks CI workflow contract', () => {
       "${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.mode != 'harness') }}",
     );
     expect(String(service.env?.VITEST_MAX_WORKERS)).toBe('4');
-    expect(Object.keys(service.services ?? {})).toEqual(['postgres']);
+    expect(Object.keys(service.services ?? {})).toEqual(['postgres', 'rabbitmq']);
+    expect(service.services?.rabbitmq?.image).toMatch(/^rabbitmq:4\.4\.0-management@sha256:/);
     expect(service.services?.postgres?.image).toBe(harness.services?.postgres?.image);
 
     const prepackIndex = service.steps.findIndex((step) =>
@@ -152,6 +154,9 @@ describe('Foundation checks CI workflow contract', () => {
     );
     expect(prepackIndex).toBeGreaterThan(-1);
     expect(testIndex).toBeGreaterThan(prepackIndex);
+    expect(service.steps[testIndex]?.env?.MIO_TEST_RABBITMQ_CONTAINER_ID).toBe(
+      '${{ job.services.rabbitmq.id }}',
+    );
     expect(smokeIndex).toBeGreaterThan(testIndex);
     expect(service.steps[prepackIndex]!.run).toContain('pnpm build');
     expect(service.steps[prepackIndex]!.run).toContain('npm pack --ignore-scripts');

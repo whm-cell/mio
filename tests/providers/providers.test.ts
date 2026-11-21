@@ -830,7 +830,7 @@ it('rejects a missing route primary key during startup check until providerSchem
     expect(target.image.runnable).toBe(false);
     expect(target.image.unavailableReason).toBe('ADAPTER_PENDING');
     await upgradedStore.importRoutes([findFixtureRoute('image-kling-v3', 'image.generate')]);
-    const resolved = await isolatedService.resolveImage(actor, target.modelRef);
+    const resolved = await isolatedService.snapshotImage(actor, target.modelRef);
     expect(resolved).toMatchObject({
       modelId: 'image-kling-v3',
       vendor: 'kling',

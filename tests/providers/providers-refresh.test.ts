@@ -86,7 +86,7 @@ it('omits verification aggregation only for fresh runtime snapshots and retains 
   try {
     const selected = await f.service.selectChat(f.actor, chatRef);
     const chat = await f.service.resolveChat(f.actor, selected);
-    expect((await f.service.resolveImage(f.actor, imageRef)).modelId).toBe('image-vidu-q2');
+    expect((await f.service.snapshotImage(f.actor, imageRef)).modelId).toBe('image-vidu-q2');
     expect(states.mock.calls).toEqual(Array.from({ length: 3 }, () => [f.actor.userId, false]));
     for (const result of states.mock.results)
       expect(await result.value).not.toHaveProperty('verifications');
@@ -406,7 +406,7 @@ it('shows image route and eligibility separately while preserving the chat view'
       unavailableReason: null,
     },
   });
-  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+  expect(await f.service.snapshotImage(f.actor, ref)).toMatchObject({
     modelId: 'gpt-image-2-elig',
     vendor: 'openai',
     profile: 'openai-images',
@@ -455,7 +455,7 @@ it('requires an enabled async route for Vidu without inferring it from a discove
     (await f.service.catalog(f.actor)).items.find((item) => item.modelRef === supported.modelRef)
       ?.image.runnable,
   ).toBe(true);
-  expect(await f.service.resolveImage(f.actor, supported.modelRef)).toMatchObject({
+  expect(await f.service.snapshotImage(f.actor, supported.modelRef)).toMatchObject({
     modelId: 'fixture-vidu-alt',
     vendor: 'vidu',
     profile: 'vidu-images',
@@ -466,7 +466,7 @@ it('requires an explicit Volcengine route and freezes the image driver without g
   const f = await fixture(async () => metadata(['doubao-seedream-4.0-freeze']));
   await f.service.discover(f.actor);
   const ref = (await f.service.catalog(f.actor)).items[0]!.modelRef;
-  await expect(f.service.resolveImage(f.actor, ref)).rejects.toThrow('ADAPTER_PENDING');
+  await expect(f.service.snapshotImage(f.actor, ref)).rejects.toThrow('ADAPTER_PENDING');
   const volcFixture = findFixtureRoute('doubao-seedream-4.0', 'image.generate');
   await f.store.importRoutes([{ ...volcFixture, rawModelId: 'doubao-seedream-4.0-freeze' }]);
   const item = (await f.service.catalog(f.actor)).items[0]!;
@@ -474,7 +474,7 @@ it('requires an explicit Volcengine route and freezes the image driver without g
     runnable: true,
     adaptation: { vendor: 'volcengine', profile: 'volcengine-ark-images' },
   });
-  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+  expect(await f.service.snapshotImage(f.actor, ref)).toMatchObject({
     modelId: 'doubao-seedream-4.0-freeze',
     vendor: 'volcengine',
     profile: 'volcengine-ark-images',
@@ -521,7 +521,7 @@ it('derives explicit multi-reference and geometry capability metadata from route
       },
     },
   ]);
-  expect(await f.service.resolveImage(f.actor, ref)).toMatchObject({
+  expect(await f.service.snapshotImage(f.actor, ref)).toMatchObject({
     capabilityMetadata: {
       image: {
         modes: ['generate', 'edit', 'outpaint'],

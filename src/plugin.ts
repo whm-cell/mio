@@ -64,6 +64,18 @@ export const Config = z.object({
   allowedOrigins: z.array(z.string()).default([]),
 });
 
+async function closeMioResources(...steps: Array<() => Promise<void> | undefined>): Promise<void> {
+  const failures: unknown[] = [];
+  for (const close of steps) {
+    try {
+      await close();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
+}
+
 /** Mount foundation and configured account routes. No global model-facing tool is authorized. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // Deny before awaiting optional dependencies, including when authentication startup fails.
@@ -150,25 +162,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         vision = createConversationVision((owner, id, expected, signal) =>
           acquired.readVisionSource(owner, id, expected, signal),
         );
-        ctx.effect(() => async () => {
-          const failures: unknown[] = [];
-          try {
-            await conversations?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await materials?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await acquired.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
-        });
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => conversations?.close(),
+              () => materials?.close(),
+              () => acquired.close(),
+            ),
+        );
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -191,21 +192,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           createCosStorage(assetConfig),
           computeConfig,
         ));
-        ctx.effect(() => async () => {
-          // Parent/child effects may unload concurrently: drain conversations before closing compute.
-          const failures: unknown[] = [];
-          try {
-            await conversations?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await acquired.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
-        });
+        // Parent/child effects may unload concurrently: drain conversations before closing compute.
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => conversations?.close(),
+              () => acquired.close(),
+            ),
+        );
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -223,31 +217,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       providers = createProviderService(store, providerConfig);
       const ownedProviders = providers;
       try {
-        ctx.effect(() => async () => {
-          // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
-          const failures: unknown[] = [];
-          try {
-            await conversations?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await generations?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await materials?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await ownedProviders.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
-        });
+        // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => conversations?.close(),
+              () => generations?.close(),
+              () => materials?.close(),
+              () => ownedProviders.close(),
+            ),
+        );
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -330,20 +309,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               generationConfig,
               () => providers,
             ));
-        ctx.effect(() => async () => {
-          const failures: unknown[] = [];
-          try {
-            await conversations?.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          try {
-            await acquired.close();
-          } catch (error) {
-            failures.push(error);
-          }
-          if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
-        });
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => conversations?.close(),
+              () => acquired.close(),
+            ),
+        );
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',

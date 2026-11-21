@@ -62,6 +62,10 @@ it('preserves HTTP paths, closed input, origin checks, preflight and session rec
       { n: { count: 1 } },
       { size: ['1024x1024'] },
       { imageAssetIds: [[randomUUID()]] },
+      { imageAssetIds: null },
+      { operation: null, imageAssetIds: null },
+      { operation: 'generate', imageAssetIds: null, imageAssetId: randomUUID() },
+      { operation: null, imageAssetIds: ['invalid-asset-id'] },
       {
         imageAssetId: randomUUID(),
         geometry: { left: { pixels: 16 }, top: 0, right: 0, bottom: 0 },

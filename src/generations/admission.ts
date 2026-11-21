@@ -65,9 +65,18 @@ function validateRequest(requestId: string, modelRef: string, parameters: ImageR
     inputError();
   // Check the input shape before hashing. Routing and asset checks still run
   // only after looking for an already admitted request.
+  let replayOnly = false;
   for (const [key, value] of Object.entries(parameters)) {
     if (!Object.hasOwn(parameterKinds, key)) inputError();
     if (value === undefined) continue;
+    // Prior releases could save these null values in the request hash.
+    if (
+      value === null &&
+      (key === 'operation' || (key === 'imageAssetIds' && parameters.operation === 'generate'))
+    ) {
+      replayOnly = true;
+      continue;
+    }
     const kind = parameterKinds[key as keyof ImageRequestParameters];
     if (kind === 'geometry') {
       if (!validImageGeometry(value)) inputError();
@@ -76,6 +85,7 @@ function validateRequest(requestId: string, modelRef: string, parameters: ImageR
         inputError();
     } else if (typeof value !== kind) inputError();
   }
+  return replayOnly;
 }
 
 function requestHash(modelRef: string, parameters: ImageRequestParameters): string {
@@ -260,8 +270,9 @@ export function createGenerationAdmission(
     intent: ImageRequestParameters,
     tool?: { signal: AbortSignal },
   ) => {
-    validateRequest(requestId, modelRef, intent);
+    const replayOnly = validateRequest(requestId, modelRef, intent);
     tool?.signal.throwIfAborted();
+    if (replayOnly && references(intent).ids.some((id) => !isUuidV4(id))) inputError();
     const httpHash = tool ? undefined : requestHash(modelRef, intent);
     // Tool retries use the winning job's defaults, including jobs admitted before this lookup.
     const existingRequest = {
@@ -285,6 +296,7 @@ export function createGenerationAdmission(
     };
     const previous = await replay();
     if (previous) return previous;
+    if (replayOnly) inputError();
     try {
       if (await store.storageBlocked())
         throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');

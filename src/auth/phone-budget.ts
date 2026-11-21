@@ -1,6 +1,7 @@
 import { sha256Utf8 } from '@mio/foundation/hash';
 import type { PoolClient } from 'pg';
 import { smsBudgetDayMs } from './phone-budget-schema.ts';
+import type { SmsBudgetTables } from './phone-budget-schema.ts';
 
 const hour = 60 * 60 * 1000;
 
@@ -15,6 +16,7 @@ export interface PhoneLimits {
 /** The caller owns the transaction and commits this debit with the pending challenge. */
 export async function reserveSmsBudget(
   client: PoolClient,
+  tables: SmsBudgetTables,
   limits: PhoneLimits,
   phone: string,
   ip: string,
@@ -32,11 +34,11 @@ export async function reserveSmsBudget(
   ];
   for (const { id } of keys) {
     await client.query(
-      `INSERT INTO "mioSmsBudget" (id, events, "updatedAt")
+      `INSERT INTO ${tables.budget} (id, events, "updatedAt")
        VALUES ($1, '[]', clock_timestamp()) ON CONFLICT (id) DO NOTHING`,
       [id],
     );
-    await client.query('SELECT id FROM "mioSmsBudget" WHERE id = $1 FOR UPDATE', [id]);
+    await client.query(`SELECT id FROM ${tables.budget} WHERE id = $1 FOR UPDATE`, [id]);
   }
   const ids = keys.map(({ id }) => id);
   const { rows } = await client.query<{
@@ -53,7 +55,7 @@ export async function reserveSmsBudget(
        SELECT count(*)::int AS day,
               (count(*) FILTER (WHERE "occurredAtMs" > budget_time.ms - $3::bigint))::int AS hour,
               max("occurredAtMs") AS latest
-       FROM "mioSmsBudgetEvent"
+       FROM ${tables.event}
        WHERE "budgetId" = bucket.id AND "occurredAtMs" > budget_time.ms - $2::bigint
      ) AS usage
      ORDER BY bucket.position`,
@@ -73,12 +75,12 @@ export async function reserveSmsBudget(
       throw new Error('SMS_RATE_LIMITED');
   }
   await client.query(
-    `WITH touched AS (UPDATE "mioSmsBudget" SET "updatedAt" = $2 WHERE id = ANY($1::text[]) RETURNING id)
-     INSERT INTO "mioSmsBudgetEvent" ("budgetId", "occurredAtMs") SELECT id, $3 FROM touched`,
+    `WITH touched AS (UPDATE ${tables.budget} SET "updatedAt" = $2 WHERE id = ANY($1::text[]) RETURNING id)
+     INSERT INTO ${tables.event} ("budgetId", "occurredAtMs") SELECT id, $3 FROM touched`,
     [ids, now, timestamp],
   );
   await client.query(
-    `DELETE FROM "mioSmsBudgetEvent" WHERE "budgetId" = ANY($1::text[]) AND "occurredAtMs" <= $2`,
+    `DELETE FROM ${tables.event} WHERE "budgetId" = ANY($1::text[]) AND "occurredAtMs" <= $2`,
     [ids, timestamp - smsBudgetDayMs],
   );
   return timestamp;

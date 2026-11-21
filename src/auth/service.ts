@@ -6,6 +6,7 @@ import { authOptions } from './config.ts';
 import type { AuthConfig } from './config.ts';
 import { readSmsBudgetSchema } from './phone-budget-schema.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
+import { createTencentSmsSender } from '../integrations/tencent-sms.ts';
 import type { SmsSender } from '../integrations/tencent-sms.ts';
 
 const log = createLogger('app', 'auth');
@@ -24,7 +25,12 @@ export async function createAuthentication(
   });
   pool.on('error', () => log.error('AUTH_DATABASE_CONNECTION_ERROR'));
   try {
-    const options = authOptions(config, pool, sender);
+    const smsBudget = await readSmsBudgetSchema(pool);
+    if (smsBudget.layout === 'empty' || ((config.sms || sender) && smsBudget.layout !== 'indexed'))
+      throw new Error('AUTH_SCHEMA: run auth:migrate --apply before enabling authentication');
+    const smsSender = sender ?? (config.sms ? createTencentSmsSender(config.sms) : undefined);
+    const sms = smsSender ? { sender: smsSender, tables: smsBudget.tables } : undefined;
+    const options = authOptions(config, pool, sms);
     if (rateLimit) options.rateLimit = { ...options.rateLimit, customStorage: rateLimit };
     const migration = await getMigrations(options);
     if (
@@ -34,9 +40,6 @@ export async function createAuthentication(
       migration.schemaProblems.length
     )
       throw new Error('AUTH_SCHEMA: run auth:migrate before enabling authentication');
-    const smsBudget = await readSmsBudgetSchema(pool);
-    if (smsBudget === 'empty' || ((config.sms || sender) && smsBudget !== 'indexed'))
-      throw new Error('AUTH_SCHEMA: run auth:migrate --apply before enabling SMS');
     if (config.wechat) {
       const namespace = `${JSON.stringify([config.wechat.appId]).slice(0, -1)},`;
       const mismatched = await pool.query(

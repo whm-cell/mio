@@ -13,12 +13,12 @@ let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
 const services: Awaited<ReturnType<typeof createAuthentication>>[] = [];
 
-const configEnv = () => ({
+const configEnv = (databaseURL = database.url) => ({
   MIO_AUTH_BASE_URL: origin,
   MIO_AUTH_SECRET: secret,
-  MIO_AUTH_DATABASE_URL: database.url,
+  MIO_AUTH_DATABASE_URL: databaseURL,
 });
-const config = () => readAuthConfig(configEnv())!;
+const config = (databaseURL?: string) => readAuthConfig(configEnv(databaseURL))!;
 
 beforeEach(async () => {
   database = await authDatabase();
@@ -37,16 +37,16 @@ afterEach(async () => {
   }
 });
 
-function runMigration(...args: string[]) {
+function runMigration(args: string[], databaseURL = database.url) {
   return spawnSync(process.execPath, ['scripts/service/migrate-auth.ts', ...args], {
-    env: configEnv(),
+    env: configEnv(databaseURL),
     encoding: 'utf8',
     timeout: 15_000,
   });
 }
 
-function migrate(...args: string[]) {
-  const result = runMigration(...args);
+function migrate(args: string[] = [], databaseURL = database.url) {
+  const result = runMigration(args, databaseURL);
   expect(result.status, result.error?.message ?? result.stderr).toBe(0);
   return result.stdout;
 }
@@ -73,8 +73,8 @@ async function schemaVersion() {
   return rows[0];
 }
 
-async function eventRows() {
-  const { rows } = await pool.query<{ budgetId: string; occurredAtMs: string }>(
+async function eventRows(observer = pool) {
+  const { rows } = await observer.query<{ budgetId: string; occurredAtMs: string }>(
     `SELECT "budgetId", "occurredAtMs" FROM "mioSmsBudgetEvent" ORDER BY "budgetId", "occurredAtMs"`,
   );
   return rows.map(({ budgetId, occurredAtMs }) => [budgetId, Number(occurredAtMs)]);
@@ -98,7 +98,7 @@ it('only applies SMS tables from the explicit command on a fresh database', asyn
   await expect(createAuthentication(config())).rejects.toThrow('AUTH_SCHEMA');
   expect(migrate()).toContain('SMS budget migration will switch to indexed events');
   expect(await schemaVersion()).toEqual({ budget: null, event: null, fence: false });
-  expect(migrate('--apply')).toContain('Authentication schema migration completed.');
+  expect(migrate(['--apply'])).toContain('Authentication schema migration completed.');
   expect(await schemaVersion()).toEqual({
     budget: '"mioSmsBudget"',
     event: '"mioSmsBudgetEvent"',
@@ -155,7 +155,7 @@ it('copies the last 24 hours without deduplicating and restores events written a
     ['global', duplicate],
     [historicalKey, duplicate],
   ]);
-  migrate('--apply');
+  migrate(['--apply']);
   const converted = [
     ['global', duplicate],
     ['global', duplicate],
@@ -163,7 +163,7 @@ it('copies the last 24 hours without deduplicating and restores events written a
   ];
   expect(await eventRows()).toEqual(converted);
   expect(await legacyRows()).toEqual([]);
-  migrate('--apply');
+  migrate(['--apply']);
   expect(await eventRows()).toEqual(converted);
 
   // The earlier writer updates its array before calling the provider.
@@ -184,14 +184,14 @@ it('copies the last 24 hours without deduplicating and restores events written a
   const withNewEvents = await eventRows();
   expect(withNewEvents).toHaveLength(6);
   expect(withNewEvents).toEqual(expect.arrayContaining(converted));
-  expect(migrate('--rollback-sms-budget')).toContain('restore all current-window events');
+  expect(migrate(['--rollback-sms-budget'])).toContain('restore all current-window events');
   expect(await eventRows()).toEqual(withNewEvents);
   expect(await legacyRows()).toEqual([]);
 
-  migrate('--rollback-sms-budget', '--apply');
+  migrate(['--rollback-sms-budget', '--apply']);
   expect(await schemaVersion()).toEqual({ budget: '"mioSmsBudget"', event: null, fence: false });
   expect(await legacyRows()).toEqual(withNewEvents);
-  expect(migrate('--apply', '--rollback-sms-budget')).toContain(
+  expect(migrate(['--apply', '--rollback-sms-budget'])).toContain(
     'already uses the earlier writer layout',
   );
   expect(await legacyRows()).toEqual(withNewEvents);
@@ -204,7 +204,7 @@ it('copies the last 24 hours without deduplicating and restores events written a
   expect(await disabled.identity(new Headers({ cookie: session }))).toEqual(principal);
   await expect(createAuthentication(config(), undefined, sender)).rejects.toThrow('AUTH_SCHEMA');
 
-  migrate('--apply');
+  migrate(['--apply']);
   expect(await eventRows()).toEqual(withNewEvents);
 }, 20_000);
 
@@ -217,7 +217,7 @@ it.each(['{"unexpected":"private-fixture"}', '[1.25]', '[9007199254740991]'])(
       events,
     ]);
     for (const args of [[], ['--apply']]) {
-      const result = runMigration(...args);
+      const result = runMigration(args);
       expect(result.status).toBe(1);
       expect(result.stderr).toContain('AUTH_SCHEMA: invalid legacy SMS budget events');
       expect(result.stderr).not.toContain(events);
@@ -247,7 +247,7 @@ it('rolls back both layout changes if the rewrite is interrupted and resumes on 
     BEFORE UPDATE ON "mioSmsBudget" FOR EACH STATEMENT EXECUTE FUNCTION reject_budget_migration()`);
   const dropTrigger = () => pool.query('DROP TRIGGER reject_budget_migration ON "mioSmsBudget"');
   await addTrigger();
-  const failedForward = runMigration('--apply');
+  const failedForward = runMigration(['--apply']);
   expect(failedForward.status).toBe(1);
   expect(failedForward.stderr).toContain('fixture interruption after DDL');
   expect(await schemaVersion()).toEqual({ budget: '"mioSmsBudget"', event: null, fence: false });
@@ -256,7 +256,7 @@ it('rolls back both layout changes if the rewrite is interrupted and resumes on 
     ['global', stamp],
   ]);
   await dropTrigger();
-  migrate('--apply');
+  migrate(['--apply']);
   const converted = await eventRows();
   expect(converted).toEqual([
     ['global', stamp],
@@ -264,7 +264,7 @@ it('rolls back both layout changes if the rewrite is interrupted and resumes on 
   ]);
 
   await addTrigger();
-  const failedRollback = runMigration('--rollback-sms-budget', '--apply');
+  const failedRollback = runMigration(['--rollback-sms-budget', '--apply']);
   expect(failedRollback.status).toBe(1);
   expect(failedRollback.stderr).toContain('fixture interruption after DDL');
   expect(await schemaVersion()).toEqual({
@@ -275,16 +275,16 @@ it('rolls back both layout changes if the rewrite is interrupted and resumes on 
   expect(await eventRows()).toEqual(converted);
   expect(await legacyRows()).toEqual([]);
   await dropTrigger();
-  migrate('--rollback-sms-budget', '--apply');
+  migrate(['--rollback-sms-budget', '--apply']);
   expect(await legacyRows()).toEqual(converted);
 }, 20_000);
 
 it('does not admit or repair a partial layout during startup or migration', async () => {
-  migrate('--apply');
+  migrate(['--apply']);
   await pool.query('DROP INDEX "mioSmsBudgetEvent_budget_time"');
   await expect(createAuthentication(config())).rejects.toThrow('AUTH_SCHEMA');
   for (const args of [[], ['--apply'], ['--rollback-sms-budget', '--apply']]) {
-    const result = runMigration(...args);
+    const result = runMigration(args);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('AUTH_SCHEMA: incomplete or invalid indexed SMS budget layout');
   }
@@ -293,4 +293,89 @@ it('does not admit or repair a partial layout during startup or migration', asyn
     event: '"mioSmsBudgetEvent"',
     fence: true,
   });
+}, 20_000);
+
+it('keeps both budget relations in the owning schema through cutover and rollback', async () => {
+  const fallback = await authDatabase();
+  const fallbackPool = new Pool({ connectionString: fallback.observerURL });
+  let fallbackAuth: Awaited<ReturnType<typeof createAuthentication>> | undefined;
+  try {
+    migrate(['--apply'], fallback.url);
+    const phoneNumber = '13800138104';
+    const smsPath = 'phone-number/send-otp';
+    fallbackAuth = await createAuthentication(config(fallback.url), undefined, async () => {});
+    expect((await fallbackAuth.handler(request(smsPath, { phoneNumber }))).status).toBe(200);
+    await fallbackPool.query(
+      'UPDATE "mioSmsBudgetEvent" SET "occurredAtMs" = "occurredAtMs" - 120000',
+    );
+    const fallbackState = async () => ({
+      events: await eventRows(fallbackPool),
+      keys: (await fallbackPool.query('SELECT * FROM "mioSmsBudget" ORDER BY id')).rows,
+      challenges: (await fallbackPool.query('SELECT id, status FROM "mioPhoneChallenge"')).rows,
+    });
+    const fallbackBefore = await fallbackState();
+    expect(fallbackBefore.events).toHaveLength(3);
+
+    await legacySchema();
+    const combined = new URL(database.url);
+    combined.searchParams.set(
+      'options',
+      `-csearch_path=${database.applicationName},${fallback.applicationName}`,
+    );
+    const selected = combined.toString();
+    const disabled = await createAuthentication(config(selected));
+    services.push(disabled);
+    const signedUp = await disabled.handler(
+      request('sign-up/email', {
+        name: 'Selected schema owner',
+        email: 'selected@example.test',
+        password: 'selected-schema-fixture-password',
+      }),
+    );
+    expect(signedUp.status).toBe(200);
+    const session = signedUp.headers
+      .getSetCookie()
+      .map((value) => value.split(';')[0])
+      .join('; ');
+    const principal = await disabled.identity(new Headers({ cookie: session }));
+    expect(principal?.userId).toBeTruthy();
+
+    expect(migrate([], selected)).toContain('switch to indexed events');
+    migrate(['--apply'], selected);
+    let sends = 0;
+    const auth = await createAuthentication(config(selected), undefined, async () => {
+      sends++;
+    });
+    services.push(auth);
+    expect((await auth.handler(request(smsPath, { phoneNumber: '13800138105' }))).status).toBe(200);
+    expect(sends).toBe(1);
+    const selectedEvents = await eventRows();
+    expect(selectedEvents).toHaveLength(3);
+    expect(await fallbackState()).toEqual(fallbackBefore);
+
+    expect(migrate(['--rollback-sms-budget'], selected)).toContain(
+      'restore all current-window events',
+    );
+    migrate(['--rollback-sms-budget', '--apply'], selected);
+    expect((await schemaVersion()).event).toBeNull();
+    expect(await legacyRows()).toEqual(selectedEvents);
+    expect((await auth.handler(request(smsPath, { phoneNumber }))).status).toBe(503);
+    expect(sends).toBe(1);
+    expect(await legacyRows()).toEqual(selectedEvents);
+    const restarted = await createAuthentication(config(selected));
+    services.push(restarted);
+    expect(await restarted.identity(new Headers({ cookie: session }))).toEqual(principal);
+    expect((await restarted.handler(request(smsPath, { phoneNumber }))).status).toBe(503);
+    expect(await fallbackState()).toEqual(fallbackBefore);
+  } finally {
+    try {
+      await fallbackAuth?.close();
+    } finally {
+      try {
+        await fallbackPool.end();
+      } finally {
+        await fallback.close();
+      }
+    }
+  }
 }, 20_000);

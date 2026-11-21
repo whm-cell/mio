@@ -1,9 +1,9 @@
 import type { BetterAuthOptions } from 'better-auth';
 import type { Pool } from 'pg';
-import { createTencentSmsSender } from '../integrations/tencent-sms.ts';
-import type { SmsSender, TencentSmsConfig } from '../integrations/tencent-sms.ts';
+import type { TencentSmsConfig } from '../integrations/tencent-sms.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
 import { phonePlugin } from './phone.ts';
+import type { PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
@@ -139,7 +139,11 @@ export function readAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
 }
 
 /** Shared by runtime and the explicit migration command so their schemas cannot diverge. */
-export function authOptions(config: AuthConfig, pool: Pool, sender?: SmsSender): BetterAuthOptions {
+export function authOptions(
+  config: AuthConfig,
+  pool: Pool,
+  sms?: PhoneSmsRuntime,
+): BetterAuthOptions {
   return {
     appName: 'Mio',
     baseURL: config.baseURL,
@@ -148,12 +152,7 @@ export function authOptions(config: AuthConfig, pool: Pool, sender?: SmsSender):
     database: { dialect: new AuthPostgresDialect({ pool }), type: 'postgres', transaction: true },
     trustedOrigins: [...config.origins],
     plugins: [
-      phonePlugin(
-        config,
-        pool,
-        sender ?? (config.sms ? createTencentSmsSender(config.sms) : undefined),
-        AUTH_PLACEHOLDER_EMAIL_DOMAIN,
-      ),
+      phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN),
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
     ],

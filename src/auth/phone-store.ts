@@ -4,6 +4,7 @@ import { createId } from '@mio/foundation/identifiers';
 import type { Pool, PoolClient } from 'pg';
 import { reserveSmsBudget } from './phone-budget.ts';
 import type { PhoneLimits } from './phone-budget.ts';
+import type { SmsBudgetTables } from './phone-budget-schema.ts';
 
 export type PhonePurpose = 'login' | 'bind';
 export interface BindingIdentity {
@@ -60,6 +61,7 @@ async function bindingSessionIsActive(client: PoolClient, binding: BindingIdenti
 /** Reserve every budget and replace the matching challenge in one PG transaction. */
 export async function reservePhoneChallenge(
   pool: Pool,
+  tables: SmsBudgetTables,
   secret: string,
   limits: PhoneLimits,
   purpose: PhonePurpose,
@@ -70,7 +72,7 @@ export async function reservePhoneChallenge(
   const id = createId();
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
   return transaction(pool, async (client) => {
-    const timestamp = await reserveSmsBudget(client, limits, phone, ip);
+    const timestamp = await reserveSmsBudget(client, tables, limits, phone, ip);
     await client.query(
       `INSERT INTO "mioPhoneChallenge" (id, "challengeKey", "codeHash", purpose, "userId", "sessionId", status, attempts, "expiresAt")
        VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7)
@@ -94,8 +96,8 @@ export async function reservePhoneChallenge(
        (SELECT id FROM "mioPhoneChallenge" WHERE "expiresAt" <= clock_timestamp() LIMIT 100 FOR UPDATE SKIP LOCKED)`,
     );
     await client.query(
-      `DELETE FROM "mioSmsBudget" WHERE id IN
-       (SELECT id FROM "mioSmsBudget" WHERE "updatedAt" <= clock_timestamp() - interval '24 hours' LIMIT 100 FOR UPDATE SKIP LOCKED)`,
+      `DELETE FROM ${tables.budget} WHERE id IN
+       (SELECT id FROM ${tables.budget} WHERE "updatedAt" <= clock_timestamp() - interval '24 hours' LIMIT 100 FOR UPDATE SKIP LOCKED)`,
     );
     return { id, code };
   });

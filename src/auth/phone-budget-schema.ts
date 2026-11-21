@@ -2,9 +2,17 @@ import type { Pool } from 'pg';
 
 export const smsBudgetDayMs = 24 * 60 * 60 * 1000;
 
+/** PostgreSQL-quoted names bound to the same schema. */
+export interface SmsBudgetTables {
+  budget: string;
+  event: string;
+}
+
 /** Inspect the current SMS storage layout without reading or writing budget contents. */
 export async function readSmsBudgetSchema(db: Pick<Pool, 'query'>, migrationTarget = false) {
   const { rows } = await db.query<{
+    budgetName: string;
+    eventName: string;
     hasBudget: boolean;
     hasEvent: boolean;
     hasFence: boolean;
@@ -12,18 +20,27 @@ export async function readSmsBudgetSchema(db: Pick<Pool, 'query'>, migrationTarg
     validEvent: boolean;
     validFence: boolean;
   }>(
-    `WITH names AS (
-       SELECT CASE WHEN $1 THEN format('%I.', current_schema()) ELSE '' END AS prefix
+    `WITH target AS (
+       SELECT COALESCE(CASE WHEN NOT $1 THEN (
+         SELECT ns.nspname FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+         WHERE c.oid = pg_catalog.to_regclass('"mioSmsBudget"')
+       ) END, pg_catalog.current_schema()) AS schema_name
+     ), names AS (
+       SELECT pg_catalog.format('%I.%I', schema_name, 'mioSmsBudget') AS budget_name,
+              pg_catalog.format('%I.%I', schema_name, 'mioSmsBudgetEvent') AS event_name
+       FROM target
      ), relations AS (
-       SELECT to_regclass(prefix || '"mioSmsBudget"') AS budget,
-              to_regclass(prefix || '"mioSmsBudgetEvent"') AS event
+       SELECT budget_name, event_name, pg_catalog.to_regclass(budget_name) AS budget,
+              pg_catalog.to_regclass(event_name) AS event
        FROM names
      ), columns AS (
        SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.attnotnull
        FROM pg_catalog.pg_attribute a, relations r
        WHERE a.attrelid IN (r.budget, r.event) AND a.attnum > 0 AND NOT a.attisdropped
      )
-     SELECT b.oid IS NOT NULL AS "hasBudget", e.oid IS NOT NULL AS "hasEvent",
+     SELECT r.budget_name AS "budgetName", r.event_name AS "eventName",
+       b.oid IS NOT NULL AS "hasBudget", e.oid IS NOT NULL AS "hasEvent",
        fence.oid IS NOT NULL AS "hasFence",
        b.relkind = 'r' AND b.relpersistence = 'p' AND
        (SELECT count(*) FROM columns c WHERE c.attrelid = b.oid AND c.attnotnull AND (
@@ -61,10 +78,11 @@ export async function readSmsBudgetSchema(db: Pick<Pool, 'query'>, migrationTarg
     [migrationTarget, "(events = '[]'::text)"],
   );
   const shape = rows[0]!;
-  if (!shape.hasBudget && !shape.hasEvent) return 'empty';
+  const tables: SmsBudgetTables = { budget: shape.budgetName, event: shape.eventName };
+  if (!shape.hasBudget && !shape.hasEvent) return { layout: 'empty', tables } as const;
   if (!shape.validBudget) throw new Error('AUTH_SCHEMA: invalid SMS budget key table');
-  if (!shape.hasEvent && !shape.hasFence) return 'legacy';
+  if (!shape.hasEvent && !shape.hasFence) return { layout: 'legacy', tables } as const;
   if (!shape.validEvent || !shape.validFence)
     throw new Error('AUTH_SCHEMA: incomplete or invalid indexed SMS budget layout');
-  return 'indexed';
+  return { layout: 'indexed', tables } as const;
 }

@@ -603,7 +603,10 @@ it('admits only one of two different phones queued for the last global slot', as
         const { rows } = await pool.query<{ pid: number; blockers: number[] }>(
           `SELECT pid, pg_blocking_pids(pid) AS blockers FROM pg_stat_activity
          WHERE application_name = $1 AND query = $2 AND wait_event_type = 'Lock'`,
-          [database.applicationName, 'SELECT id FROM "mioSmsBudget" WHERE id = $1 FOR UPDATE'],
+          [
+            database.applicationName,
+            `SELECT id FROM ${database.applicationName}."mioSmsBudget" WHERE id = $1 FOR UPDATE`,
+          ],
         );
         expect(rows).toHaveLength(2);
         expect(rows.some(({ blockers }) => blockers.includes(lockerPid))).toBe(true);
@@ -670,7 +673,7 @@ it('uses the budget time after the global lock and drops just-expired entries', 
        FROM "mioSmsBudget" WHERE id = 'global' FOR UPDATE`,
     );
     const { pid, expiresAt } = gate.rows[0]!;
-    const statement = 'SELECT id FROM "mioSmsBudget" WHERE id = $1 FOR UPDATE';
+    const statement = `SELECT id FROM ${database.applicationName}."mioSmsBudget" WHERE id = $1 FOR UPDATE`;
     const phoneNumber = '13800138027';
     waiting = call('/api/auth/phone-number/send-otp', { phoneNumber });
     void waiting.catch(() => {});

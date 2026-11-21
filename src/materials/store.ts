@@ -23,6 +23,7 @@ const conflict = (code = 'REVISION_CONFLICT') => new MaterialError(HTTP_STATUS.C
 const syncExpired = `(last_sync_status IS NOT DISTINCT FROM 'running' AND
   (sync_lease_until IS NULL OR sync_lease_until<=statement_timestamp())) AS sync_expired`;
 type Query = Pick<Pool, 'query'> | PoolClient;
+type CursorRow<Row> = Row & { cursor_time: string };
 export interface MaterialCursor {
   createdAt: string;
   id: string;
@@ -120,9 +121,9 @@ export class MaterialStore {
     type: string | undefined,
     limit: number,
     cursor?: MaterialCursor,
-  ): Promise<GroupRow[]> {
+  ): Promise<CursorRow<GroupRow>[]> {
     return (
-      await this.pool.query<GroupRow>(
+      await this.pool.query<CursorRow<GroupRow>>(
         `SELECT g.*, ${syncExpired}, to_char(g.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time, (SELECT count(*)::int FROM mio_materials m WHERE m.owner_id=g.owner_id AND m.group_id=g.id AND m.state<>'deleted') AS material_count
       FROM mio_material_groups g WHERE g.owner_id=$1 AND g.state<>'deleted' AND ($2::text IS NULL OR g.group_type=$2)
       AND ($3::timestamptz IS NULL OR (g.created_at,g.id)<($3::timestamptz,$4::uuid))
@@ -137,10 +138,10 @@ export class MaterialStore {
     groupId: string,
     limit: number,
     cursor?: MaterialCursor,
-  ): Promise<MaterialRow[]> {
+  ): Promise<CursorRow<MaterialRow>[]> {
     await this.ownedGroup(owner, groupId);
     return (
-      await this.pool.query<MaterialRow>(
+      await this.pool.query<CursorRow<MaterialRow>>(
         `SELECT *, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time FROM mio_materials WHERE owner_id=$1 AND group_id=$2 AND state<>'deleted'
       AND ($3::timestamptz IS NULL OR (created_at,id)<($3::timestamptz,$4::uuid))
       ORDER BY created_at DESC,id DESC LIMIT $5`,

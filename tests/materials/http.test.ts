@@ -80,6 +80,27 @@ it('enforces Cookie/Origin/JSON/strict fields, owner filtering, pagination and f
     /upstream|apiKey|ciphertext|nonce|synthetic-material-private-key/,
   );
   const id = result.group.groupId;
+  const older = await f.create('Older Group');
+  await f.pool.query(
+    `UPDATE mio_material_groups SET created_at=
+      CASE WHEN id=$1 THEN '2026-11-20T00:00:00.123456Z' ELSE '2026-11-20T00:00:00.123455Z' END::timestamptz
+      WHERE id IN ($1,$2)`,
+    [id, older.groupId],
+  );
+  const firstPage = await call('/groups?limit=1');
+  expect(firstPage.status).toBe(200);
+  const first = (await firstPage.json()) as Awaited<ReturnType<typeof f.service.groups>>;
+  expect(first.items).toEqual([result.group]);
+  expect(JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString())).toEqual({
+    createdAt: '2026-11-20T00:00:00.123456Z',
+    id,
+  });
+  const nextPage = await call(`/groups?limit=1&cursor=${first.nextCursor}`);
+  expect(nextPage.status).toBe(200);
+  expect(await nextPage.json()).toMatchObject({
+    items: [{ groupId: older.groupId }],
+    nextCursor: null,
+  });
   expect((await call(`/groups/${id}`, 'GET', undefined, { cookie: 'session=other' })).status).toBe(
     404,
   );
@@ -200,7 +221,7 @@ it('pages equal-microsecond rows without dropping records or exposing database c
   const ids: string[] = [];
   do {
     const result = await f.service.materials(f.actor, group.groupId, 2, cursor);
-    ids.push(...result.items.map((row) => (row as { materialId: string }).materialId));
+    ids.push(...result.items.map((row) => row.materialId));
     cursor = result.nextCursor ?? undefined;
   } while (cursor);
   expect(ids).toHaveLength(5);
@@ -214,9 +235,8 @@ it('pages equal-microsecond rows without dropping records or exposing database c
   const distinct: string[] = [];
   do {
     const result = await f.service.materials(f.actor, group.groupId, 2, cursor);
-    distinct.push(...result.items.map((row) => (row as { materialId: string }).materialId));
+    distinct.push(...result.items.map((row) => row.name));
     cursor = result.nextCursor ?? undefined;
   } while (cursor);
-  expect(distinct).toHaveLength(5);
-  expect(new Set(distinct).size).toBe(5);
+  expect(distinct).toEqual(['Item 5', 'Item 4', 'Item 3', 'Item 2', 'Item 1']);
 });

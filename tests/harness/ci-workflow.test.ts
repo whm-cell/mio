@@ -319,8 +319,12 @@ describe('Foundation checks CI workflow contract', () => {
       "${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.mode != 'harness') }}",
     );
     expect(service.env.VITEST_MAX_WORKERS).toBe('4');
-    expect(Object.keys(service.services)).toEqual(['postgres']);
+    expect(Object.keys(service.services)).toEqual(['postgres', 'rabbitmq']);
     expect(service.services.postgres?.image).toBe(harness.services.postgres?.image);
+    expect(service.services.rabbitmq?.image).toMatch(/^rabbitmq:4\.4\.0-management@sha256:/);
+    expect(workflowYaml).toContain(
+      'MIO_TEST_RABBITMQ_CONTAINER_ID: ${{ job.services.rabbitmq.id }}',
+    );
 
     const prepackIndex = service.steps.findIndex((step) =>
       step.run?.includes('MIO_TEST_PACKED_ARCHIVE='),

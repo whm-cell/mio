@@ -70,6 +70,10 @@ jobs:
           POSTGRES_DB: mio_auth_test
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4.4.0-management@sha256:af6f50d38098d8bd52fef7f3fa85015dd8b2bf6def58e995bf584ae9ba0f6407
+        ports: ['127.0.0.1::5672']
+        options: --label mio.test.rabbitmq=true --health-cmd "rabbitmq-diagnostics -q check_port_connectivity" --health-interval 5s --health-timeout 5s --health-retries 12
     env:
       MIO_TEST_DATABASE_URL: postgresql://mio_test:mio_fixture_only@127.0.0.1:5432/mio_auth_test
       VITEST_MAX_WORKERS: '4'
@@ -156,6 +160,8 @@ jobs:
           fi
           echo "MIO_TEST_PACKED_ARCHIVE=${ARCHIVES[0]}" >> "$GITHUB_ENV"
       - name: Run service and worker tests
+        env:
+          MIO_TEST_RABBITMQ_CONTAINER_ID: ${{ job.services.rabbitmq.id }}
         run: |
           node -e 'console.log({node: process.version, availableParallelism: require("node:os").availableParallelism(), vitestMaxWorkers: process.env.VITEST_MAX_WORKERS})'
           node scripts/harness/validation-entry.ts ci-group service

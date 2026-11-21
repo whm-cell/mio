@@ -6,6 +6,7 @@ import {
   readdir,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises';
@@ -276,8 +277,9 @@ type PublicationFault =
   | { target: string; action: 'fail' | 'interrupt' | 'deny-probe' }
   | {
       target: string;
-      action: 'edit' | 'edit-and-interrupt' | 'create';
+      action: 'edit' | 'edit-and-interrupt' | 'create' | 'in-place' | 'after-exchange';
       bytes: string;
+      editTarget?: string;
       duringRestore?: string;
     }
   | { action: 'unsupported' };
@@ -291,14 +293,24 @@ function runWithPublicationFault(root: string, request: unknown, fault: Publicat
     import { basename, dirname } from 'node:path';
     import koffi from ${JSON.stringify(import.meta.resolve('koffi'))};
     const fault = ${JSON.stringify(fault)};
-    function saveAsEditor(target, bytes) {
+    const editorFd = fault.action === 'in-place' ? fs.openSync(fault.target, 'r+') : undefined;
+    function saveAsEditor(target, bytes, descriptor) {
       const edit = spawnSync(process.execPath, ['--input-type=module', '-e', \`
-        import { writeFileSync, renameSync } from 'node:fs';
-        const [target, bytes] = process.argv.slice(1);
-        const source = target + '.editor';
-        writeFileSync(source, Buffer.from(bytes, 'base64'), { flag: 'wx' });
-        renameSync(source, target);
-      \`, target, bytes], { encoding: 'utf8' });
+        import { ftruncateSync, writeFileSync, renameSync } from 'node:fs';
+        const [target, bytes, mode] = process.argv.slice(1);
+        const contents = Buffer.from(bytes, 'base64');
+        if (mode === 'in-place') {
+          ftruncateSync(3, 0);
+          writeFileSync(3, contents);
+        } else {
+          const source = target + '.editor';
+          writeFileSync(source, contents, { flag: 'wx' });
+          renameSync(source, target);
+        }
+      \`, target, bytes, descriptor === undefined ? 'rename' : 'in-place'], {
+        encoding: 'utf8',
+        stdio: descriptor === undefined ? 'pipe' : ['ignore', 'pipe', 'pipe', descriptor],
+      });
       if (edit.status !== 0) throw new Error('FIXTURE_EDITOR_FAILED: ' + edit.stderr);
     }
     const load = koffi.load;
@@ -315,9 +327,12 @@ function runWithPublicationFault(root: string, request: unknown, fault: Publicat
             if (target !== fault.target) return exchange(...parameters);
             attempts++;
             if (fault.action === 'fail') throw new Error('INJECTED_REPORT_FAILURE');
-            if (attempts === 1 && fault.bytes) saveAsEditor(target, fault.bytes);
+            if (attempts === 1 && fault.bytes && fault.action !== 'after-exchange')
+              saveAsEditor(target, fault.bytes, editorFd);
             if (attempts === 2 && fault.duringRestore) saveAsEditor(target, fault.duringRestore);
             const result = exchange(...parameters);
+            if (result === 0 && attempts === 1 && fault.action === 'after-exchange')
+              saveAsEditor(fault.editTarget ?? target, fault.bytes);
             if (result === 0 && (fault.action === 'interrupt' || fault.action === 'edit-and-interrupt'))
               process.kill(process.pid, 'SIGKILL');
             return result;
@@ -349,6 +364,7 @@ function runWithPublicationFault(root: string, request: unknown, fault: Publicat
     const { deliver } = await import(${JSON.stringify(deliveryModule)});
     try { await deliver(${JSON.stringify(root)}, 'probe', ${JSON.stringify(json(request))}); }
     catch (error) { console.error(error.message); process.exitCode = 7; }
+    finally { if (editorFd !== undefined) fs.closeSync(editorFd); }
   `;
   return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     cwd: project,
@@ -564,6 +580,61 @@ it.each([recordsPath(prd), productReport])(
       replayed: recordsPublished,
     });
     expect((await readBook(root, prd)).book.results).toHaveLength(2);
+  },
+);
+
+it('preserves an in-place save through a file descriptor opened before publication', async () => {
+  const root = await fixture();
+  await setup(root);
+  await prepare(root);
+  const request = await completeRequest(root);
+  const path = recordsPath(prd);
+  const target = join(root, path);
+  const inode = (await stat(target)).ino;
+  const original = await readFile(target);
+  const edited = Buffer.concat([original, Buffer.from('\r\n\t\r\n')]);
+  const outcome = runWithPublicationFault(root, request, {
+    target,
+    action: 'in-place',
+    bytes: edited.toString('base64'),
+  });
+  expect(outcome.status, outcome.stderr).toBe(7);
+  expect(outcome.stderr).toContain(`WORK_DELIVERY_CONFLICT: ${path}`);
+  expect((await readFile(target)).equals(edited)).toBe(true);
+  expect((await stat(target)).ino).toBe(inode);
+  expect((await loadTask(root, 'probe')).task.stage).toBe('C1_EVIDENCE_PENDING');
+});
+
+it.each([
+  ['records after their exchange', recordsPath(prd), recordsPath(prd), false],
+  ['report after its exchange', productReport, productReport, false],
+  ['records during report replay', productReport, recordsPath(prd), true],
+] as const)(
+  'keeps acceptance pending when an editor saves %s',
+  async (_case, trigger, editedPath, replay) => {
+    const root = await fixture();
+    await setup(root);
+    await prepare(root);
+    const request = await completeRequest(root);
+    const editedTarget = join(root, editedPath);
+    const original = await readFile(editedTarget);
+    const edited =
+      editedPath === productReport
+        ? Buffer.concat([original, Buffer.from('\nIndependent report edit.\n')])
+        : original;
+    if (replay) interruptAfterRecords(root, request);
+    const outcome = runWithPublicationFault(root, request, {
+      target: join(root, trigger),
+      action: 'after-exchange',
+      editTarget: editedTarget,
+      bytes: edited.toString('base64'),
+    });
+    expect(outcome.status, outcome.stderr).toBe(7);
+    expect(outcome.stderr).toContain(`WORK_DELIVERY_CONFLICT: ${editedPath}`);
+    expect((await readFile(editedTarget)).equals(edited)).toBe(true);
+    const { task } = await loadTask(root, 'probe');
+    expect(task.stage).toBe('C1_EVIDENCE_PENDING');
+    expect(task.delivery?.accepted).toBeUndefined();
   },
 );
 

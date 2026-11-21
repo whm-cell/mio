@@ -218,4 +218,15 @@ export async function publishFiles(root: string, files: PublicationFile[]) {
     files.filter(({ expected, content }) => expected !== null && expected !== content),
   );
   for (const file of files) await replacePublication(root, file, exchange);
+  // A subsequent editor save can supersede an earlier exchange while publishing the pair.
+  await Promise.all(
+    files.map(async ({ path, content }) => {
+      const actual = await checkedPath(root, path)
+        .then(regularFileDigest)
+        .catch((cause: unknown) => {
+          throw publicationConflict(path, undefined, cause);
+        });
+      if (actual !== digest(content)) throw publicationConflict(path);
+    }),
+  );
 }

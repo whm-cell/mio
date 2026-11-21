@@ -227,14 +227,17 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
     const candidateReport = committedReport(root, ref.candidate, paths.report);
     if (reportBefore !== null && reportBefore !== candidateReport && reportBefore !== source)
       throw new Error(`WORK_DELIVERY_CONFLICT: ${paths.report}`);
-    const files = [{ path: paths.report, expected: reportBefore, content: source }];
+    const records = replayed
+      ? recordsSource!
+      : publicText(await format(json(book), { parser: 'json', printWidth: 100 }));
     if (!replayed) {
-      const bytes = publicText(await format(json(book), { parser: 'json', printWidth: 100 }));
-      parseRecords(bytes);
+      parseRecords(records);
       await requireCandidate(root, task);
-      files.unshift({ path: paths.records, expected: recordsSource, content: bytes });
     }
-    await publishFiles(root, files);
+    await publishFiles(root, [
+      { path: paths.records, expected: recordsSource, content: records },
+      { path: paths.report, expected: reportBefore, content: source },
+    ]);
     if (!alreadyReleased) {
       task.delivery!.accepted = accepted;
       task.stage = 'C1_RELEASED';

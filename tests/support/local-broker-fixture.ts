@@ -1,142 +1,223 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
-import { parseEnv } from 'node:util';
+import { promisify } from 'node:util';
 import {
   computeCapacity,
   computePermissions,
   computeTopology,
 } from '../../scripts/service/compute-broker-topology.ts';
 
-type EphemeralLocalBroker = {
-  environment: 'dev' | 'test';
-  vhost: string;
+const run = promisify(execFile);
+const image =
+  'rabbitmq:4.4.0-management@sha256:af6f50d38098d8bd52fef7f3fa85015dd8b2bf6def58e995bf584ae9ba0f6407';
+
+type TestBroker = {
   appBrokerUrl: string;
   workerBrokerUrl: string;
   userA: string;
   userB: string;
-  close(): Promise<void>;
 };
 
-type BrokerAdminTarget = {
-  environment: 'dev' | 'test';
-  mgmtBase: string;
-  amqpPort: string;
-  adminAuth: string;
-};
-
-async function findReachableLocalBroker(): Promise<BrokerAdminTarget> {
-  let foundConfig = false;
-  for (const [file, environment] of [
-    ['.env', 'dev'],
-    ['.env.test', 'test'],
-  ] as const) {
-    let info;
-    try {
-      info = await lstat(resolve(file));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw error;
-    }
-    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) continue;
-    const values = parseEnv(await readFile(resolve(file), 'utf8'));
-    const mgmtPort = values.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT;
-    const amqpPort = values.MIO_LOCAL_RABBITMQ_PORT;
-    const adminPass = values.MIO_LOCAL_RABBITMQ_PASSWORD;
-    assert(mgmtPort && amqpPort && adminPass, 'LOCAL_RABBITMQ_ENV_REQUIRED');
-    foundConfig = true;
-    const mgmtBase = `http://127.0.0.1:${mgmtPort}/api/`;
-    const adminAuth = Buffer.from(`mio-${environment}-admin:${adminPass}`).toString('base64');
-    try {
-      const probe = await fetch(new URL('health/checks/ready-to-serve-clients', mgmtBase), {
-        headers: { authorization: `Basic ${adminAuth}` },
-        signal: AbortSignal.timeout(2_000),
-      });
-      if (probe.ok) return { environment, mgmtBase, amqpPort, adminAuth };
-    } catch {
-      // Try the next configured local broker before failing closed.
-    }
+async function docker(args: string[], operation: string, input?: string) {
+  const pending = run('docker', args, { timeout: 12_000 });
+  // A failing CLI can close stdin before receiving the input. Its exit is reported below.
+  pending.child.stdin?.on('error', () => {});
+  pending.child.stdin?.end(input);
+  try {
+    return (await pending).stdout.trim();
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { signal?: string };
+    // CLI diagnostics can include Erlang authentication details. Keep only the exit and operation.
+    throw new Error(`RABBITMQ_TEST_CONTROL ${operation}: ${failure.signal ?? failure.code}`);
   }
-  throw new Error(
-    foundConfig
-      ? 'LOCAL_RABBITMQ_UNREACHABLE: start local RabbitMQ with pnpm infra:up:dev (or pnpm infra:up:test)'
-      : 'LOCAL_RABBITMQ_REQUIRED: initialize local middleware with pnpm env:init && pnpm infra:up:dev',
-  );
 }
 
-/** Creates an isolated ephemeral vhost and A/B users on the running local RabbitMQ (dev or test). */
-export async function provisionLocalTestBroker(
-  prefix: string,
-): Promise<EphemeralLocalBroker | null> {
-  if (process.env.GITHUB_ACTIONS === 'true') return null;
-  const target = await findReachableLocalBroker();
-  const token = randomBytes(6).toString('hex');
-  const vhost = `${prefix}-${token}`;
-  const userA = `mio-a-${token}`;
-  const passA = randomBytes(24).toString('base64url');
-  const userB = `mio-b-${token}`;
-  const passB = randomBytes(24).toString('base64url');
+async function testBrokerTarget() {
+  const host =
+    (!process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST) ||
+    (await docker(['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], 'context'));
+  assert(host.startsWith('unix:///'), 'RABBITMQ_TEST_TARGET: a local Docker socket is required');
 
-  const mgmtApi = async (method: string, path: string, body?: Record<string, unknown>) => {
-    const res = await fetch(new URL(path, target.mgmtBase), {
-      method,
-      headers: {
-        authorization: `Basic ${target.adminAuth}`,
-        ...(body ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok && !(method === 'DELETE' && res.status === 404)) {
-      throw new Error(`RABBITMQ_MGMT_${res.status}:${method}:${path}`);
-    }
+  const ci = process.env.GITHUB_ACTIONS === 'true';
+  const target = ci ? process.env.MIO_TEST_RABBITMQ_CONTAINER_ID : 'mio-dev-rabbitmq-1';
+  assert(
+    target && (!ci || /^[a-f0-9]{64}$/.test(target)),
+    'RABBITMQ_TEST_TARGET: CI must supply its RabbitMQ service container ID',
+  );
+  const dockerArgs = ['--host', host];
+  const inspectFields = [
+    '{{json .Id}}',
+    '{{json .Config.Image}}',
+    '{{json (index .Config.Labels "mio.test.rabbitmq")}}',
+    '{{json (index .Config.Labels "com.docker.compose.project")}}',
+    '{{json (index .Config.Labels "com.docker.compose.service")}}',
+    '{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}}',
+    '{{json (index .NetworkSettings.Ports "5672/tcp")}}',
+  ];
+  const raw = await docker(
+    [...dockerArgs, 'container', 'inspect', '--format', `[${inspectFields.join(',')}]`, target],
+    ci ? 'inspect CI RabbitMQ service' : 'inspect mio-dev-rabbitmq-1 (pnpm infra:up:dev)',
+  );
+  const [id, configuredImage, regressionLabel, project, service, health, bindings] = JSON.parse(
+    raw,
+  ) as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string | null,
+    { HostIp: string; HostPort: string }[] | null,
+  ];
+  assert.equal(configuredImage, image, 'RABBITMQ_TEST_TARGET: unexpected RabbitMQ image');
+  assert(
+    ci
+      ? id === target && regressionLabel === 'true'
+      : project === 'mio-dev' && service === 'rabbitmq',
+    'RABBITMQ_TEST_TARGET: container does not belong to the expected environment',
+  );
+  assert.equal(health, 'healthy', 'RABBITMQ_TEST_TARGET: RabbitMQ container must be healthy');
+  const [binding, ...otherBindings] = bindings ?? [];
+  assert(
+    binding?.HostIp === '127.0.0.1' && otherBindings.length === 0 && /^\d+$/.test(binding.HostPort),
+    'RABBITMQ_TEST_TARGET: expected one loopback AMQP port mapping',
+  );
+  return {
+    port: binding.HostPort,
+    ctl: (args: string[], input?: string) =>
+      docker(
+        [...dockerArgs, 'exec', '-i', id, 'rabbitmqctl', '-q', ...args],
+        args.join(' '),
+        input,
+      ),
   };
+}
 
-  const encVhost = encodeURIComponent(vhost);
-  await mgmtApi('PUT', `vhosts/${encVhost}`, {});
-  try {
-    await mgmtApi('PUT', `operator-policies/${encVhost}/mio-capacity`, {
-      pattern: '.*',
-      definition: computeCapacity,
-      priority: 0,
-      'apply-to': 'queues',
-    });
-    for (const item of computeTopology(vhost)) {
-      await mgmtApi(item.method, item.path, item.body);
+function testDefinitions(vhost: string, users: readonly { role: 'a' | 'b'; name: string }[]) {
+  const exchanges = [];
+  const queues = [];
+  const bindings = [];
+  for (const { path, body } of computeTopology(vhost)) {
+    const [kind, scope, name, source, destinationType, destination] = path.split('/');
+    assert.equal(scope, vhost);
+    if (kind === 'exchanges') exchanges.push({ ...body, vhost, name });
+    else if (kind === 'queues') queues.push({ ...body, vhost, name });
+    else {
+      assert(kind === 'bindings' && name === 'e' && destinationType === 'q');
+      bindings.push({ ...body, vhost, source, destination, destination_type: 'queue' });
     }
-    for (const [role, username, password] of [
-      ['a', userA, passA],
-      ['b', userB, passB],
-    ] as const) {
-      await mgmtApi('PUT', `users/${encodeURIComponent(username)}`, {
-        password,
-        tags: '',
-      });
-      await mgmtApi(
-        'PUT',
-        `permissions/${encVhost}/${encodeURIComponent(username)}`,
-        computePermissions(role),
+  }
+  return JSON.stringify({
+    exchanges,
+    queues,
+    bindings,
+    permissions: users.map(({ role, name }) => ({
+      vhost,
+      user: name,
+      ...computePermissions(role),
+    })),
+  });
+}
+
+export async function withLocalTestBroker<T>(
+  exercise: (broker: TestBroker) => Promise<T>,
+): Promise<T> {
+  const { port, ctl } = await testBrokerTarget();
+  const token = randomBytes(16).toString('hex');
+  const vhost = `mio-regtest-${token}`;
+  const description = `Mio RabbitMQ protocol regression ${token}`;
+  const a = {
+    role: 'a',
+    name: `${vhost}-a`,
+    password: randomBytes(24).toString('base64url'),
+  } as const;
+  const b = {
+    role: 'b',
+    name: `${vhost}-b`,
+    password: randomBytes(24).toString('base64url'),
+  } as const;
+  const users = [a, b];
+  const amqpUrl = ({ name, password }: (typeof users)[number]) =>
+    `amqp://${name}:${password}@127.0.0.1:${port}/${vhost}`;
+  const listVhosts = async () =>
+    JSON.parse(await ctl(['--formatter=json', 'list_vhosts', 'name', 'description'])) as {
+      name: string;
+      description: string;
+    }[];
+  const listUsers = async () =>
+    JSON.parse(await ctl(['--formatter=json', 'list_users'])) as { user: string }[];
+  const assertAbsent = async () => {
+    const [vhosts, brokerUsers] = await Promise.all([listVhosts(), listUsers()]);
+    assert(!vhosts.some((item) => item.name === vhost), `RABBITMQ_TEST_VHOST_PRESENT: ${vhost}`);
+    for (const { name } of users) {
+      assert(
+        !brokerUsers.some((item) => item.user === name),
+        `RABBITMQ_TEST_USER_PRESENT: ${name}`,
       );
     }
+  };
+
+  await assertAbsent();
+  const ownedUsers: string[] = [];
+  const cleanup = async () => {
+    const failures: unknown[] = [];
+    try {
+      const entry = (await listVhosts()).find((item) => item.name === vhost);
+      if (entry?.description === description) await ctl(['delete_vhost', vhost]);
+    } catch (error) {
+      failures.push(error);
+    }
+    for (const name of ownedUsers) {
+      try {
+        await ctl(['delete_user', name]);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    try {
+      await assertAbsent();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length) throw new AggregateError(failures, `RABBITMQ_TEST_CLEANUP: ${vhost}`);
+  };
+
+  let result: T;
+  try {
+    await ctl(['add_vhost', vhost, '--description', description]);
+    const entry = (await listVhosts()).find((item) => item.name === vhost);
+    assert.equal(entry?.description, description, `RABBITMQ_TEST_VHOST_OWNERSHIP: ${vhost}`);
+    for (const { name, password } of users) {
+      await ctl(['add_user', name], `${password}\n`);
+      ownedUsers.push(name);
+    }
+    await ctl([
+      'set_operator_policy',
+      '--vhost',
+      vhost,
+      '--apply-to',
+      'queues',
+      'mio-capacity',
+      '.*',
+      JSON.stringify(computeCapacity),
+    ]);
+    // The import only contains queues, exchanges, bindings and permissions in the owned vhost.
+    await ctl(['import_definitions', '/dev/stdin'], testDefinitions(vhost, users));
+    result = await exercise({
+      appBrokerUrl: amqpUrl(a),
+      workerBrokerUrl: amqpUrl(b),
+      userA: a.name,
+      userB: b.name,
+    });
   } catch (error) {
-    await mgmtApi('DELETE', `vhosts/${encVhost}`).catch(() => {});
-    await mgmtApi('DELETE', `users/${encodeURIComponent(userA)}`).catch(() => {});
-    await mgmtApi('DELETE', `users/${encodeURIComponent(userB)}`).catch(() => {});
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `RABBITMQ_TEST_FAILURE: ${vhost}`);
+    }
     throw error;
   }
-
-  return {
-    environment: target.environment,
-    vhost,
-    appBrokerUrl: `amqp://${encodeURIComponent(userA)}:${encodeURIComponent(passA)}@127.0.0.1:${target.amqpPort}/${encVhost}`,
-    workerBrokerUrl: `amqp://${encodeURIComponent(userB)}:${encodeURIComponent(passB)}@127.0.0.1:${target.amqpPort}/${encVhost}`,
-    userA,
-    userB,
-    async close() {
-      await mgmtApi('DELETE', `vhosts/${encVhost}`).catch(() => {});
-      await mgmtApi('DELETE', `users/${encodeURIComponent(userA)}`).catch(() => {});
-      await mgmtApi('DELETE', `users/${encodeURIComponent(userB)}`).catch(() => {});
-    },
-  };
+  await cleanup();
+  return result;
 }

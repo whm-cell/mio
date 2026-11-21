@@ -18,9 +18,9 @@ A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute
 
 ## 初始化与验证
 
-`broker:init:dev/test` 只读核对 vhost、A/B 用户、权限和容量策略，再补齐可声明的重媒体拓扑。缺少预置项时报告 `LOCAL_BROKER_PREPROVISION_REQUIRED`，集中列出缺项和已完成的声明。已有 vhost 时可补交换机，队列和绑定还须有匹配的容量策略。通过全部预检及真实 AMQP 登录核对后才报告就绪。
+`broker:init:dev/test` 只读核对 vhost、A/B 用户、权限和容量策略，再补齐可声明的重媒体拓扑。缺少预置项时报告 `LOCAL_BROKER_PREPROVISION_REQUIRED`，集中列出该次检查发现的缺项和已完成的声明。已有 vhost 时可补交换机，队列和绑定还须有匹配的容量策略。报告就绪前先验证真实 AMQP 登录，再重读预置项，发现缺项或冲突时报告实际观察。
 
-已有权限、队列、交换机或策略不匹配时，在声明前报告 `LOCAL_BROKER_CONFLICT`，保留现场与消息。重复执行只补齐缺失拓扑。请求结果未知时停止并核对实际资源，按同一配置恢复后重跑。旧图片资源及双命令队列 B 权限按[图片切换步骤](../local-environments.md#图片生成迁移与切换)排空对账后由运维显式退役或调整。
+预检发现已有权限、队列、交换机或策略不匹配时，在声明前报告 `LOCAL_BROKER_CONFLICT`，保留现场与消息。声明期间独立保存的配置仍由管理者保管，重新读取时若发现变化则以当次观察报告。请求结果未知时停止并核对实际资源，按同一配置恢复后重跑。旧图片资源及双命令队列 B 权限按[图片切换步骤](../local-environments.md#图片生成迁移与切换)排空对账后由运维显式退役或调整。
 
 ### 预置本地 Broker
 
@@ -39,7 +39,7 @@ A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute
 | A 权限          | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.commands\.v1$`，Read `^mio\.compute\.results\.v1$`。                                                          |
 | B 权限          | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.results\.v1$`，Read `^mio\.compute\.commands\.v1$`。                                                          |
 
-部署者按清单创建缺项后重跑 `pnpm broker:init:dev` 或 `pnpm broker:init:test`。已有冲突须先对账原配置和业务数据，再决定如何纠正。预置值与[共享拓扑定义](../../scripts/service/compute-broker-topology.ts)对应。
+部署者先将清单与当前资源对账，补齐仍缺的项目，再重跑 `pnpm broker:init:dev` 或 `pnpm broker:init:test`。清单内已有资源可直接重跑核对，出现冲突时先保留现有值与业务数据，再决定如何纠正。预置值与[共享拓扑定义](../../scripts/service/compute-broker-topology.ts)对应。
 
 一次性部署的准备脚本检查运行 vhost 策略的作用对象，并以四条 quorum 队列实际应用的策略和生效定义验证 1 GiB 消息体上限及 `reject-publish`。策略优先级和定义合并遵循 [RabbitMQ 4.4 策略](https://www.rabbitmq.com/docs/4.4/policies)。
 

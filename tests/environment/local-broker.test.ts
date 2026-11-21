@@ -108,6 +108,13 @@ function brokerFixture(beforeWrite?: () => Promise<void>) {
   return { values, writes };
 }
 
+function provisionTestRoles(values: Map<string, unknown>) {
+  for (const role of ['a', 'b'] as const) {
+    values.set(`users/mio-test-${role}`, userMetadata);
+    values.set(`permissions/mio-test/mio-test-${role}`, computePermissions(role));
+  }
+}
+
 it('lists a missing vhost and scoped prerequisites without making declarations in it', async () => {
   const { values, writes } = brokerFixture();
   values.set('users/mio-test-a', userMetadata);
@@ -138,10 +145,7 @@ it('declares exchanges before provisioning and completes queues and bindings onc
   expect(writes).toEqual(topology.map(({ path }) => path));
   expect(connect).not.toHaveBeenCalled();
 
-  for (const role of ['a', 'b'] as const) {
-    values.set(`users/mio-test-${role}`, userMetadata);
-    values.set(`permissions/mio-test/mio-test-${role}`, computePermissions(role));
-  }
+  provisionTestRoles(values);
   await prepareLocalBroker('test', testEnv);
   expect(writes).toEqual(topology.map(({ path }) => path));
   expect(connect).toHaveBeenCalledTimes(2);
@@ -194,6 +198,52 @@ it('allows the independent administrator to provision every protected resource b
     'LOCAL_BROKER_CONFLICT: operator-policies/mio-test/mio-capacity',
   );
   expect(writes).toHaveLength(8);
+});
+
+it('reports permission drift observed after declarations even when both role logins succeed', async () => {
+  const path = 'permissions/mio-test/mio-test-b';
+  const saved = { ...computePermissions('b'), read: '^mio\\.compute\\..*$' };
+  const { values, writes } = brokerFixture(async () => {
+    if (writes.length === 1) values.set(path, saved);
+  });
+  values.set('vhosts/mio-test', {});
+  values.set(policyPath, testPolicy);
+  provisionTestRoles(values);
+  const connect = vi.spyOn(ComputeBroker, 'connect').mockResolvedValue({
+    close: async () => {},
+  } as ComputeBroker);
+  const ready = vi.spyOn(console, 'log');
+
+  await expect(prepareLocalBroker('test', testEnv)).rejects.toThrow(
+    `LOCAL_BROKER_CONFLICT: ${path}`,
+  );
+  expect(connect).toHaveBeenCalledTimes(2);
+  expect(values.get(path)).toEqual(saved);
+  expect(writes).toEqual(computeTopology('mio-test').map(({ path }) => path));
+  expect(ready).not.toHaveBeenCalled();
+});
+
+it('lists prerequisites removed during declarations when a role login also fails', async () => {
+  const path = 'permissions/mio-test/mio-test-b';
+  const { values, writes } = brokerFixture(async () => {
+    if (writes.length === 1) {
+      values.delete(policyPath);
+      values.delete(path);
+    }
+  });
+  values.set('vhosts/mio-test', {});
+  values.set(policyPath, testPolicy);
+  provisionTestRoles(values);
+  vi.spyOn(ComputeBroker, 'connect')
+    .mockResolvedValueOnce({ close: async () => {} } as ComputeBroker)
+    .mockRejectedValueOnce(new Error('role cannot enter vhost'));
+
+  await expect(prepareLocalBroker('test', testEnv)).rejects.toThrow(
+    `LOCAL_BROKER_PREPROVISION_REQUIRED: ${policyPath}, ${path}`,
+  );
+  expect(values.has(policyPath)).toBe(false);
+  expect(values.has(path)).toBe(false);
+  expect(writes).toEqual(computeTopology('mio-test').map(({ path }) => path));
 });
 
 it('preserves retired image resources and only prepares the heavy-media topology', async () => {

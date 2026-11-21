@@ -81,11 +81,14 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
       expected: computePermissions(role),
     });
   }
-  const missingPrerequisites = new Set<string>();
-  for (const { path, expected } of prerequisites) {
-    if (await absent(path, expected)) missingPrerequisites.add(path);
+  async function readPrerequisiteGaps() {
+    const missing = new Set<string>();
+    for (const { path, expected } of prerequisites) {
+      if (await absent(path, expected)) missing.add(path);
+    }
+    return missing;
   }
-
+  const missingPrerequisites = await readPrerequisiteGaps();
   const topology = computeTopology(vhost);
   const missingTopology: typeof topology = [];
   // Preflight everything before the first write. A failed/unknown write leaves resources for rerun.
@@ -100,12 +103,16 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     ? missingTopology.filter(({ path }) => path.startsWith('exchanges/'))
     : missingTopology;
   for (const resource of declarations) await api(resource.method, resource.path, resource.body);
-  if (missingPrerequisites.size)
-    throw new Error(
-      `LOCAL_BROKER_PREPROVISION_REQUIRED: ${[...missingPrerequisites].join(', ')}\n` +
-        `Safe topology declarations completed: ${declarations.length}. See docs/integrations/rabbitmq.md#预置本地-broker and rerun pnpm broker:init:${name}.`,
-    );
+  function requireProvisioned(missing: Set<string>) {
+    if (missing.size)
+      throw new Error(
+        `LOCAL_BROKER_PREPROVISION_REQUIRED: ${[...missing].join(', ')}\n` +
+          `Safe topology declarations completed: ${declarations.length}. Check current resources before provisioning. See docs/integrations/rabbitmq.md#预置本地-broker and rerun pnpm broker:init:${name}.`,
+      );
+  }
+  requireProvisioned(missingPrerequisites);
 
+  let failedLogin: string | undefined;
   for (const role of roles) {
     const url = new URL(values.RABBITMQ_URL!);
     url.username = `mio-${name}-${role}`;
@@ -119,11 +126,16 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
       );
       await broker.close();
     } catch {
-      throw new Error(
-        `LOCAL_BROKER_LOGIN_FAILED: mio-${name}-${role}; restore the original credentials, do not reset users`,
-      );
+      failedLogin = url.username;
+      break;
     }
   }
+  // Login alone cannot verify that an administrator kept the same permission or policy.
+  requireProvisioned(await readPrerequisiteGaps());
+  if (failedLogin)
+    throw new Error(
+      `LOCAL_BROKER_LOGIN_FAILED: ${failedLogin}; restore the original credentials, do not reset users`,
+    );
   console.log(
     `${name}: RabbitMQ topology and A/B permissions ready (${declarations.length} declarations applied)`,
   );

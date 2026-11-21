@@ -531,3 +531,31 @@ it('distinguishes missing, malformed and unfinalized command originals', async (
   expect(checks(root, id).result).toBe('pending');
   expect(JSON.parse(ok(root, read))).toMatchObject({ integrity: 'pending', actualSha256: null });
 });
+
+it('accepts complete historical non-object outcomes for failed observations only', async () => {
+  const root = await fixture();
+  const id = create(root);
+  verifyReady(root, id);
+  ok(root, ['run', id, 'checks']);
+  const task = await state(root, id);
+  const entry = task.evidence.at(-1)!;
+  const target = join(root, entry.artifact);
+  const ledger = join(root, '.work/tasks', id, 'state.json');
+  const original = await readFile(target, 'utf8');
+  const prefix = original.slice(0, original.lastIndexOf(resultMarker)) + resultMarker;
+  const field = '历'.repeat(96 * 1024);
+
+  for (const recorded of [field, [field]]) {
+    const log = prefix + json(recorded);
+    await writeFile(target, log);
+    entry.sha256 = digest(log);
+
+    entry.result = 'pass';
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('invalid');
+
+    entry.result = 'fail';
+    await writeFile(ledger, json(task));
+    expect(checks(root, id).result).toBe('fail');
+  }
+});

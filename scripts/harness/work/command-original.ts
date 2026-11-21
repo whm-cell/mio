@@ -7,28 +7,42 @@ export const resultMarker = '\n--- mio-command-result ---\n';
 const headerEnd = Buffer.from('\n}\n');
 const resultStart = Buffer.from(resultMarker);
 
-async function jsonRange(file: FileHandle, start: number, end: number) {
+function requireObjectPrefix(source: string) {
+  if (!source.trimStart().startsWith('{')) throw new SyntaxError('Expected JSON object');
+}
+
+async function jsonRange(file: FileHandle, start: number, end: number, use: 'object' | 'syntax') {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const syntax = new JsonSyntax();
   let position = start;
   let contentStart: number | undefined;
   let contentEnd = start;
   const inspect = (part: string) => {
-    syntax.push(part);
-    const tail = part.trimEnd();
-    if (tail.length > 0) {
-      contentStart ??= position + tail.length - tail.trimStart().length;
-      contentEnd = position + Buffer.byteLength(tail);
+    if (use === 'object') {
+      const tail = part.trimEnd();
+      if (tail.length > 0) {
+        if (contentStart === undefined) {
+          requireObjectPrefix(tail);
+          contentStart = position + tail.length - tail.trimStart().length;
+        }
+        contentEnd = position + Buffer.byteLength(tail);
+      }
+      position += Buffer.byteLength(part);
     }
-    position += Buffer.byteLength(part);
+    syntax.push(part);
   };
 
   for await (const bytes of originalChunks(file, start, end)) {
-    if (bytes.length === end - start) return JSON.parse(decoder.decode(bytes));
+    if (use === 'object' && bytes.length === end - start) {
+      const source = decoder.decode(bytes);
+      requireObjectPrefix(source);
+      return JSON.parse(source);
+    }
     inspect(decoder.decode(bytes, { stream: true }));
   }
   inspect(decoder.decode());
   syntax.finish();
+  if (use === 'syntax') return;
 
   // A false delimiter can make command output resemble a large metadata record. Materialize only
   // verified JSON, excluding leading and trailing whitespace. The same descriptor is used throughout.
@@ -68,8 +82,13 @@ export async function readCommandOriginal(root: string, id: string, entry: Evide
 
     // Read only the two JSON records after checking the full original, including command output.
     try {
-      const header = await jsonRange(file, 0, endOfHeader);
-      const outcome = await jsonRange(file, lastMarker + resultStart.length, stat.size);
+      const header = await jsonRange(file, 0, endOfHeader, 'object');
+      const outcome = await jsonRange(
+        file,
+        lastMarker + resultStart.length,
+        stat.size,
+        entry.result === 'pass' ? 'object' : 'syntax',
+      );
       const current = await file.stat();
       if (
         current.size !== stat.size ||

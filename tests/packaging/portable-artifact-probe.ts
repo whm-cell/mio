@@ -1,39 +1,17 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { closeSync, openSync, readdirSync, realpathSync } from 'node:fs';
+import { closeSync, openSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+import { portableComponent, portableRoot } from './portable-root.ts';
 
-const argument = process.argv[2];
-if (!argument) throw new Error('PORTABLE_ARTIFACT_ROOT_REQUIRED');
-const root = realpathSync(argument);
-const workspace = realpathSync('.');
-if (root === workspace || root.startsWith(`${workspace}${sep}`))
-  throw new Error('PORTABLE_ROOT_MUST_BE_OUTSIDE_WORKSPACE');
-for (const name of ['a', 'b', 'host']) {
-  const artifact = realpathSync(join(root, name));
-  const pending = [artifact];
-  let count = 0;
-  while (pending.length) {
-    const directory = pending.pop()!;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) pending.push(path);
-      else if (entry.isSymbolicLink()) {
-        const target = realpathSync(path);
-        if (target !== artifact && !target.startsWith(`${artifact}${sep}`))
-          throw new Error('ARTIFACT_EXTERNAL_LINK');
-        count++;
-      }
-    }
-  }
-  console.log(`PORTABLE_ARTIFACT_LINKS_OK ${name} count=${count}`);
-}
-const a = join(root, 'a'),
-  b = join(root, 'b'),
-  host = join(root, 'host');
+const root = portableRoot(process.argv[2]);
+const a = portableComponent(root, 'a');
+const b = portableComponent(root, 'b');
+const host = portableComponent(root, 'host');
 for (const artifact of [a, b]) {
   const script = `for (const entry of ['logging','errors','http-status','time','identifiers','hash']) {
     const loaded = await import('@mio/foundation/' + entry);
@@ -113,11 +91,17 @@ try {
 } finally {
   closeSync(log);
 }
-const wait = (milliseconds: number) =>
-  new Promise<void>((resolveWait) => setTimeout(resolveWait, milliseconds));
+const exited = new Promise<void>((resolveExit) => child.once('close', () => resolveExit()));
+let childError: Error | undefined;
+child.on('error', (error) => {
+  childError ??= error;
+});
+let probeError: unknown;
+let shutdownTimedOut = false;
 try {
   let ready = false;
   for (let i = 0; i < 120; i++) {
+    if (childError) throw childError;
     if (child.exitCode !== null || child.signalCode !== null)
       throw new Error('PORTABLE_DSH_EXITED');
     try {
@@ -130,23 +114,39 @@ try {
     } catch {
       /* Waiting for the isolated listener. */
     }
-    await wait(100);
+    await delay(100);
   }
   if (!ready) throw new Error('PORTABLE_DSH_NOT_READY');
-  const capabilities = await fetch(`http://127.0.0.1:${port}/api/v1/capabilities`, {
+  const capabilitiesURL = `http://127.0.0.1:${port}/api/v1/capabilities`;
+  const capabilities = await fetch(capabilitiesURL, {
     headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(3000),
   });
   assert.equal(capabilities.status, 200);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/v1/capabilities`)).status, 401);
-  console.log('PORTABLE_DSH_PLUGIN_AND_WORKER_INIT_OK');
+  const unauthorized = await fetch(capabilitiesURL, { signal: AbortSignal.timeout(3000) });
+  assert.equal(unauthorized.status, 401);
+} catch (error) {
+  probeError = error;
 } finally {
-  if (child.exitCode === null && child.signalCode === null) {
+  if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
     child.kill('SIGTERM');
-    await Promise.race([
-      new Promise<void>((resolveExit) => child.once('exit', () => resolveExit())),
-      wait(10000),
-    ]);
-    if (child.exitCode === null && child.signalCode === null)
-      throw new Error('PORTABLE_DSH_STILL_STOPPING');
+    const deadline = new AbortController();
+    try {
+      const stopped = await Promise.race([
+        exited.then(() => true),
+        delay(10000, false, { signal: deadline.signal }),
+      ]);
+      if (!stopped) {
+        shutdownTimedOut = true;
+        child.kill('SIGKILL');
+      }
+    } finally {
+      deadline.abort();
+    }
   }
+  await exited;
 }
+if (shutdownTimedOut) throw new Error('PORTABLE_DSH_STILL_STOPPING', { cause: probeError });
+if (probeError !== undefined) throw probeError;
+if (childError) throw childError;
+console.log('PORTABLE_DSH_PLUGIN_AND_WORKER_INIT_OK');

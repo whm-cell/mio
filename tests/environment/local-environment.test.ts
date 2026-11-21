@@ -1,5 +1,6 @@
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -171,6 +172,142 @@ it('only appends missing groups or the generation directory and preserves partia
     'LOCAL_REGRESSION_PARTIAL',
   );
 });
+
+function startInitializer(root: string, pauseAt: 'read' | 'publish' | null) {
+  const entry = pathToFileURL(resolve('scripts/service/local.ts')).href;
+  const script = `
+    import fs from 'node:fs';
+    import { createHash } from 'node:crypto';
+    import { once } from 'node:events';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { resolve } from 'node:path';
+    const { link, mkdir, readFile } = fs.promises;
+    const target = resolve('.env');
+    const lock = resolve('.env.init.lock');
+    const pauseAt = ${JSON.stringify(pauseAt)};
+    async function notify(point) {
+      const proceed = pauseAt === point ? once(process, 'message') : undefined;
+      process.send(point);
+      await proceed;
+    }
+    let reportedWait = false;
+    fs.promises.mkdir = async (path, ...args) => {
+      try { return await mkdir(path, ...args); }
+      catch (error) {
+        if (!reportedWait && path === lock && error.code === 'EEXIST') {
+          reportedWait = true;
+          process.send('waiting');
+        }
+        throw error;
+      }
+    };
+    fs.promises.readFile = async (path, ...args) => {
+      const bytes = await readFile(path, ...args);
+      if (path === target) await notify('read');
+      return bytes;
+    };
+    fs.promises.link = async (before, after) => {
+      if (after === target) await notify('publish');
+      return link(before, after);
+    };
+    syncBuiltinESMExports();
+    process.argv = [process.execPath, ${JSON.stringify(entry)}, 'dev', 'init'];
+    await import(${JSON.stringify(entry)});
+    process.send({ digest: createHash('sha256').update(await readFile(target)).digest('hex') });
+    process.disconnect();
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: root,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let output = '';
+  let observedDigest: unknown;
+  child.on('message', (message) => {
+    if (typeof message === 'object' && message && 'digest' in message)
+      observedDigest = message.digest;
+  });
+  child.stdout!.on('data', (chunk) => (output += String(chunk)));
+  child.stderr!.on('data', (chunk) => (output += String(chunk)));
+  const outcome = once(child, 'close').then(([code]) => ({ code, output, observedDigest }));
+  return {
+    child,
+    firstMessage: Promise.race([
+      once(child, 'message').then(([message]) => message),
+      outcome.then(({ code, output }) => {
+        throw new Error(`Initializer exited before handshake (${code}): ${output}`);
+      }),
+    ]),
+    outcome,
+  };
+}
+
+it.each(['legacy', 'fresh'] as const)(
+  'serializes two env init processes for a %s file',
+  async (mode) => {
+    const root = await fixture();
+    const path = join(root, '.env');
+    const added = [
+      ...localComputeKeys,
+      'MIO_GENERATIONS_DATA_DIR',
+      'MIO_LOCAL_REGRESSION_PASSWORD',
+      'MIO_TEST_DATABASE_URL',
+    ];
+    const original = await readFile(path, 'utf8');
+    const legacy = Buffer.from(
+      [
+        ...original.split('\n').filter((line) => !added.includes(line.split('=', 1)[0]!)),
+        '# Private legacy comment with café\r\n',
+      ].join('\n'),
+    );
+    if (mode === 'legacy') {
+      await writeFile(path, legacy);
+      await chmod(path, 0o700);
+    } else {
+      await rm(path);
+    }
+    const pauseAt = mode === 'legacy' ? 'read' : 'publish';
+    const owner = startInitializer(root, pauseAt);
+    const children = [owner];
+    let digests: unknown[];
+    try {
+      expect(await owner.firstMessage).toBe(pauseAt);
+      const waiter = startInitializer(root, null);
+      children.push(waiter);
+      expect(await waiter.firstMessage).toBe('waiting');
+      if (mode === 'legacy') expect((await readFile(path)).equals(legacy)).toBe(true);
+      else await expect(readFile(path)).rejects.toHaveProperty('code', 'ENOENT');
+      owner.child.send('continue');
+      const [first, second] = await Promise.all([owner.outcome, waiter.outcome]);
+      expect(first).toMatchObject({
+        code: 0,
+        output: `dev: private configuration ${mode === 'legacy' ? 'upgraded' : 'created'}\n`,
+      });
+      expect(second).toMatchObject({
+        code: 0,
+        output: 'dev: private configuration preserved\n',
+      });
+      digests = [first.observedDigest, second.observedDigest];
+    } finally {
+      for (const { child } of children) child.kill();
+      await Promise.allSettled(children.map(({ outcome }) => outcome));
+    }
+
+    const bytes = await readFile(path);
+    const expectedDigest = createHash('sha256').update(bytes).digest('hex');
+    expect(digests).toEqual([expectedDigest, expectedDigest]);
+    const contents = bytes.toString('utf8');
+    const keys = mode === 'legacy' ? added : Object.keys(parseEnv(contents));
+    for (const key of keys)
+      expect(contents.split('\n').filter((line) => line.startsWith(`${key}=`))).toHaveLength(1);
+    const parsed = await readLocalEnvironment('dev', root, {});
+    expect(parsed.values.MIO_AUTH_SECRET).toMatch(/^[a-f0-9]{64}$/);
+    if (mode === 'legacy') {
+      expect(bytes.subarray(0, legacy.length).equals(legacy)).toBe(true);
+      expect(parsed.values.MIO_AUTH_SECRET).toEqual(parseEnv(original).MIO_AUTH_SECRET);
+    }
+    expect((await stat(path)).mode & 0o777).toBe(mode === 'legacy' ? 0o700 : 0o600);
+  },
+);
 
 it('shares local COS settings while keeping B broker, journal and other credentials scoped', async () => {
   const root = await fixture();

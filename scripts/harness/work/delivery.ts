@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { format } from 'prettier';
-import { assess, requireCandidate } from './context.ts';
+import { assessWithEvidence, committedPaths, requireCandidate } from './context.ts';
 import {
   contractRevision,
   json,
@@ -12,17 +12,15 @@ import {
   taskRevision,
 } from './records.ts';
 import type { Candidate, ResultDraft, Task } from './records.ts';
-import { replacePublication, withPublication } from './delivery-store.ts';
+import {
+  publicationRecoveries,
+  publishFiles,
+  settlePublication,
+  withPublication,
+} from './delivery-store.ts';
 import { normsIssues } from './norms-review.ts';
 import { documentCatalog, resolvePrd } from '../task-documents.ts';
-import {
-  bookPaths,
-  matchingEvidence,
-  readBook,
-  readDraft,
-  renderBook,
-  validateLocations,
-} from './reports.ts';
+import { bookPaths, readBook, readDraft, renderBook, validateLocations } from './reports.ts';
 import { parseAcceptance, parseDetails, parseRecords } from './compact-store.ts';
 import { fields, publicText, record, textField } from './report-format.ts';
 
@@ -58,13 +56,15 @@ async function verified(root: string, task: Task, expected?: Candidate) {
   const candidate = await requireCandidate(root, task);
   if (expected && !sameCandidate(expected, candidate))
     throw new Error('WORK_DELIVERY_STALE: candidate changed');
-  const assessment = await assess(root, task, { inspectDelivery: false });
+  const { assessment, selectedEvidence } = await assessWithEvidence(root, task, {
+    inspectDelivery: false,
+  });
   if (!assessment.ready) throw new Error(assessment.errors.join('\n'));
   const normsErrors = await normsIssues(root, task.plan, true);
   if (normsErrors.length) throw new Error(normsErrors.join('\n'));
   if (assessment.evidence.some((entry) => entry.result !== 'pass'))
     throw new Error('WORK_DELIVERY_EVIDENCE: all criteria need matching passing originals');
-  return candidate;
+  return { candidate, selectedEvidence };
 }
 
 export async function deliver(root: string, id: string, rawRequest: string) {
@@ -99,7 +99,7 @@ async function prepare(root: string, task: Task, raw: string, request: Record<st
   if (task.archived) throw new Error('WORK_ARCHIVED: reopen before delivery');
   if (task.stage !== 'C1_EVIDENCE_PENDING' || task.reviewDecision !== 'PENDING')
     throw new Error('WORK_DELIVERY_STAGE: verify before preparing for human acceptance');
-  const candidate = await verified(root, task);
+  const { candidate, selectedEvidence } = await verified(root, task);
   const catalog = await documentCatalog(root);
   const result = parseDetails({
     key: task.plan.result!.key,
@@ -110,20 +110,17 @@ async function prepare(root: string, task: Task, raw: string, request: Record<st
     limitations: request.limitations,
   });
   await validateLocations(root, result, catalog);
-  for (const { path } of result.locations) {
-    const check = spawnSync('git', ['cat-file', '-e', `${candidate.commit}:${path}`], {
-      cwd: root,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-    });
-    if (check.status !== 0)
-      throw new Error(`WORK_REPORT_LOCATION: location is absent from the candidate: ${path}`);
-  }
+  const requested = result.locations.map(({ path }) => path);
+  const committed = committedPaths(root, candidate.commit, requested);
+  const missing = requested.find((path) => !committed.has(path));
+  if (missing)
+    throw new Error(`WORK_REPORT_LOCATION: location is absent from the candidate: ${missing}`);
   const draft: ResultDraft = {
     id: randomUUID(),
     prd: task.plan.result!.prd,
     candidate,
     result,
-    evidence: await matchingEvidence(root, task, candidate),
+    evidence: selectedEvidence,
   };
   task.delivery!.draft = draft;
   task.reviewDecision = 'PENDING';
@@ -174,13 +171,18 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
   )
     throw new Error('WORK_DELIVERY_STAGE: verify before recording human acceptance');
 
-  // Expensive assessment happens before the short PRD publication lock.
-  const beforeLock = (await readBook(root, ref.prd, catalog)).book;
-  const wasPublished = isDeepStrictEqual(
-    beforeLock.results.find((entry) => entry.key === result.key),
-    result,
-  );
-  if (!wasPublished) {
+  // Fresh publication verifies outside the lock. An interrupted exchange must
+  // settle under the lock before its public bytes can prove a replay.
+  const publicationPaths = [paths.records, paths.report];
+  const interrupted = (await publicationRecoveries(root, publicationPaths)).length > 0;
+  const beforeLock = interrupted ? null : (await readBook(root, ref.prd, catalog)).book;
+  const wasPublished =
+    beforeLock !== null &&
+    isDeepStrictEqual(
+      beforeLock.results.find((entry) => entry.key === result.key),
+      result,
+    );
+  if (beforeLock && !wasPublished) {
     if (alreadyReleased) throw new Error('WORK_DELIVERY_CONFLICT: accepted result changed');
     await verified(root, task, ref.candidate);
     await validateLocations(root, ref.result, catalog);
@@ -189,6 +191,7 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
   // A matching published result is the recovery proof even if the two outputs now make
   // the checkout dirty. New publication still requires a clean candidate.
   return withPublication(root, paths.records, async () => {
+    await settlePublication(root, publicationPaths);
     const {
       book,
       source: reportBefore,
@@ -203,6 +206,10 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
     if (!replayed) {
       if (alreadyReleased || wasPublished)
         throw new Error('WORK_DELIVERY_CONFLICT: accepted result changed');
+      if (interrupted) {
+        await verified(root, task, ref.candidate);
+        await validateLocations(root, ref.result, catalog);
+      }
       book.results = book.results
         .filter((entry) => entry.key !== result.key)
         .concat(result)
@@ -212,14 +219,17 @@ async function complete(root: string, task: Task, raw: string, request: Record<s
     const candidateReport = committedReport(root, ref.candidate, paths.report);
     if (reportBefore !== null && reportBefore !== candidateReport && reportBefore !== source)
       throw new Error(`WORK_DELIVERY_CONFLICT: ${paths.report}`);
+    const records = replayed
+      ? recordsSource!
+      : publicText(await format(json(book), { parser: 'json', printWidth: 100 }));
     if (!replayed) {
-      const bytes = publicText(await format(json(book), { parser: 'json', printWidth: 100 }));
-      parseRecords(bytes);
+      parseRecords(records);
       await requireCandidate(root, task);
-      // The records rename is the publication point. Everything after it is recoverable.
-      await replacePublication(root, paths.records, recordsSource, bytes);
     }
-    await replacePublication(root, paths.report, reportBefore, source);
+    await publishFiles(root, [
+      { path: paths.records, expected: recordsSource, content: records },
+      { path: paths.report, expected: reportBefore, content: source },
+    ]);
     if (!alreadyReleased) {
       task.delivery!.accepted = accepted;
       task.stage = 'C1_RELEASED';

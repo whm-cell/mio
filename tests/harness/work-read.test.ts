@@ -1,9 +1,9 @@
 import { writeTaskDocuments } from './fixtures/task-documents-fixture.ts';
 import { spawnSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { expect, it } from 'vitest';
+import { fixture, invoke as invokeCli, state, statePath } from './fixtures/work-cli-fixture.ts';
 import { digest, draft, json } from '../../scripts/harness/work/records.ts';
 import type { Task } from '../../scripts/harness/work/records.ts';
 import {
@@ -13,63 +13,15 @@ import {
   selectValue,
 } from '../../scripts/harness/work/output.ts';
 
-const project = resolve('.');
-const cli = join(project, 'scripts/harness/work/cli.ts');
-const scratch: string[] = [];
-afterEach(async () => {
-  await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
 function invoke(root: string, args: string[], input?: unknown) {
-  const result = spawnSync(process.execPath, [cli, ...args], {
-    cwd: root,
-    encoding: 'utf8',
-    env: { PATH: process.env.PATH ?? '' },
-    timeout: 10000,
-    ...(input === undefined ? {} : { input: JSON.stringify(input) }),
-  });
-  const output = `${result.stdout}\n${result.stderr}`.trim();
-  expect(Buffer.byteLength(output)).toBeLessThanOrEqual(outputBytes);
-  return { status: result.status, output, value: () => JSON.parse(result.stdout) };
+  const result = invokeCli(root, args, input);
+  expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(outputBytes);
+  return { ...result, value: () => JSON.parse(result.stdout) };
 }
-async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'mio-work-read-')));
-  scratch.push(root);
-  const config = JSON.parse(await readFile(join(project, 'harness.config.json'), 'utf8'));
-  const files = {
-    'harness.config.json': json(config),
-    'package.json': '{"type":"module"}\n',
-    '.gitignore': '.work/\n',
-    'AGENTS.md': '# Development\n',
-    'docs/api.md': '# API\n',
-    'src/value.ts': 'export const value = 1;\n',
-  };
-  for (const [file, content] of Object.entries(files)) {
-    await mkdir(dirname(join(root, file)), { recursive: true });
-    await writeFile(join(root, file), content);
-  }
-  for (const file of [
-    'docs/coordination.md',
-    'docs/work-records.md',
-    'docs/engineering/testing.md',
-  ]) {
-    await mkdir(dirname(join(root, file)), { recursive: true });
-    await cp(join(project, file), join(root, file));
-  }
-  expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root }).status).toBe(0);
-  for (const args of [
-    ['config', 'user.name', 'Fixture'],
-    ['config', 'user.email', 'fixture@example.test'],
-    ['add', '-A'],
-    ['commit', '-q', '-m', 'Initial fixture'],
-  ])
-    expect(spawnSync('git', args, { cwd: root }).status).toBe(0);
-  expect(invoke(root, ['init', 'alice']).status).toBe(0);
-  return root;
-}
-const path = (root: string, id: string) => join(root, `.work/tasks/${id}/state.json`);
+
 async function save(root: string, task: Task) {
-  await mkdir(dirname(path(root, task.plan.id)), { recursive: true });
-  await writeFile(path(root, task.plan.id), json(task));
+  await mkdir(dirname(statePath(root, task.plan.id)), { recursive: true });
+  await writeFile(statePath(root, task.plan.id), json(task));
 }
 async function ready(root: string, authorization = 'Fixture user authorizes this local probe.') {
   const ensured = invoke(root, ['ensure', '--stdin'], {
@@ -133,7 +85,7 @@ it('keeps 27, 47 and 227 task listings bounded, searchable and explicitly unasse
     'C1_IMPLEMENTATION',
   ]).value();
   expect(found.tasks.map((item: { id: string }) => item.id)).toEqual(['task-226']);
-  const task = JSON.parse(await readFile(path(root, 'task-226'), 'utf8')) as Task;
+  const task = await state(root, 'task-226');
   task.archived = true;
   await save(root, task);
   expect(invoke(root, ['status', '--query', 'needle']).value().tasks).toEqual([]);
@@ -141,6 +93,31 @@ it('keeps 27, 47 and 227 task listings bounded, searchable and explicitly unasse
     invoke(root, ['status', '--query', 'needle', '--archived', 'all']).value().tasks[0].recorded
       .archived,
   ).toBe(true);
+
+  task.member = 'bob';
+  await save(root, task);
+  const mismatched = invoke(root, ['status', '--query', 'needle']);
+  expect(mismatched.status).toBe(1);
+  expect(mismatched.output).toContain('WORK_OWNER');
+});
+
+it('reads the workspace member only after a matching task record', async () => {
+  const root = await fixture();
+  await rm(join(root, '.work/member.json'));
+  await mkdir(join(root, '.work/tasks'), { recursive: true });
+  expect(invoke(root, ['status']).value().tasks).toEqual([]);
+
+  const task = draft(join(root, 'different-workspace'), 'alice', 'probe', 'Probe');
+  await save(root, task);
+  const mismatched = invoke(root, ['status']);
+  expect(mismatched.status).toBe(1);
+  expect(mismatched.output).toContain('WORK_OWNER');
+
+  task.workspace = root;
+  await save(root, task);
+  const missingMember = invoke(root, ['status']);
+  expect(missingMember.status).toBe(1);
+  expect(missingMember.output).toMatch(/ENOENT.*member\.json/);
 });
 
 it('locates a long task field with bounded pages and rejects oversized selectors', async () => {
@@ -168,7 +145,7 @@ it('locates a long task field with bounded pages and rejects oversized selectors
 it('exposes a committed candidate through bounded task field reads', async () => {
   const root = await fixture();
   const { id } = await ready(root);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   const candidate = task.checkpoint!.candidate;
   expect(candidate).toEqual({
     commit: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim(),
@@ -217,7 +194,7 @@ it('separates omitted authority from readiness while still blocking late OPEN de
     plan: { nextAction: 'Check the actual blocker.' },
   });
   expect(verification.status, verification.output).toBe(0);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   task.plan.decisions = Array.from({ length: 1000 }, (_, index) => ({
     status: index === 999 ? 'OPEN' : 'CONFIRMED',
     text: `Decision ${index}`,
@@ -241,7 +218,7 @@ it('separates omitted authority from readiness while still blocking late OPEN de
 it('paginates a large decision collection while preserving an actual blocker', async () => {
   const root = await fixture();
   const { id } = await ready(root);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   task.plan.decisions = Array.from({ length: 1000 }, (_, index) => ({
     status: index === 999 ? 'OPEN' : 'CONFIRMED',
     text: `Decision ${index}`,
@@ -269,7 +246,7 @@ it('paginates a large decision collection while preserving an actual blocker', a
 it('keeps a recorded request for changes distinct from a valid execution assessment', async () => {
   const root = await fixture();
   const { id } = await ready(root);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   task.reviewDecision = 'REQUEST_CHANGES';
   await save(root, task);
   const current = invoke(root, ['context', id, 'resume']).value();
@@ -304,13 +281,13 @@ it('keeps readiness stable across scope pagination without recording reading sta
     expect(assessment.reading.omitted).toEqual(['scope']);
     expect(Object.values(assessment.blocking).every((value) => !value)).toBe(true);
   }
-  const beforeReading = await readFile(path(root, id), 'utf8');
+  const beforeReading = await readFile(statePath(root, id), 'utf8');
   expect(synced.requiredContext.scope.total).toBe(7);
   expect(invoke(root, checked.requiredContext.scope.$read.argv).value().items).toEqual(
     scope.slice(0, 1),
   );
   expect(invoke(root, ['check', id]).value().ready).toBe(true);
-  expect(await readFile(path(root, id), 'utf8')).toBe(beforeReading);
+  expect(await readFile(statePath(root, id), 'utf8')).toBe(beforeReading);
 });
 
 it('shows explicit maintenance without inventing a development result', async () => {
@@ -336,14 +313,14 @@ it('shows explicit maintenance without inventing a development result', async ()
   expect(current.task.result).toBeNull();
   expect(current.task.nextAction).toContain('declares no development result');
   expect(current.task.nextAction).toContain('return verified maintenance');
-  const saved = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const saved = await state(root, id);
   expect(saved.plan.result).toBeNull();
 });
 
 it('keeps the result declaration visible when the whole task view exceeds its budget', async () => {
   const root = await fixture();
   const { id } = await ready(root);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   const prd = 'docs/tasks/probe/prd.md';
   await mkdir(join(root, 'docs/tasks/probe'), { recursive: true });
   await writeFile(join(root, prd), '# Probe PRD\n');
@@ -393,7 +370,7 @@ it.each([0, 7])(
       const run = invoke(root, ['run', id, 'checks', '--', process.execPath, '-e', script]);
       expect(run.status).toBe(exit === 0 ? 0 : 1);
     }
-    const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+    const task = await state(root, id);
     expect(task.evidence).toHaveLength(2);
     expect(task.evidence[1]!.summary.split('; coverage=')[0]).toBe(
       task.evidence[0]!.summary.split('; coverage=')[0],
@@ -441,7 +418,7 @@ it('reads one ledger-bound failed original in exact Unicode segments and reports
     'console.log("𠮷".repeat(100000));console.error("original failure");process.exit(7)',
   ]);
   expect(failed.status).toBe(1);
-  const task = JSON.parse(await readFile(path(root, id), 'utf8')) as Task;
+  const task = await state(root, id);
   expect(task.evidence[0]!.result).toBe('fail');
   const original = await readFile(join(root, task.evidence[0]!.artifact), 'utf8');
   const first = invoke(root, ['read', id, 'evidence', '0']).value();
@@ -490,7 +467,7 @@ it('offers testing navigation without prose or records, and shares it with task 
   const { id } = await ready(root);
   const ref = 'docs/engineering/testing.md#按变更定位测试';
   const source = await readFile(join(root, 'docs/engineering/testing.md'), 'utf8');
-  const stateBefore = await readFile(path(root, id), 'utf8');
+  const stateBefore = await readFile(statePath(root, id), 'utf8');
   for (const args of [
     ['guide', 'verify'],
     ['context', id, 'verify'],
@@ -506,7 +483,7 @@ it('offers testing navigation without prose or records, and shares it with task 
     ]);
     expect(result.output).not.toContain('CLI 由子进程执行');
   }
-  expect(await readFile(path(root, id), 'utf8')).toBe(stateBefore);
+  expect(await readFile(statePath(root, id), 'utf8')).toBe(stateBefore);
   await rm(join(root, '.work'), { recursive: true });
   const first = invoke(root, ['guide', 'verify', '--section', ref, '--limit', '1']).value();
   expect(first.ref).toBe(ref);
@@ -536,7 +513,7 @@ it('reports an invalid testing navigation target without breaking unrelated guid
 it('bounds rejected request errors without echoing a huge path or mutating the record', async () => {
   const root = await fixture();
   const { id, result } = await ready(root);
-  const before = await readFile(path(root, id), 'utf8');
+  const before = await readFile(statePath(root, id), 'utf8');
   const rejected = invoke(root, ['update', id, '--stdin'], {
     revision: result.revision,
     reason: 'Invalid fixture input must not change this task.',
@@ -548,7 +525,7 @@ it('bounds rejected request errors without echoing a huge path or mutating the r
   expect(rejected.output).toContain('WORK_REQUEST');
   expect(rejected.output).toContain('"incomplete": true');
   expect(JSON.parse(rejected.output).detail).toContain('not persisted');
-  expect(await readFile(path(root, id), 'utf8')).toBe(before);
+  expect(await readFile(statePath(root, id), 'utf8')).toBe(before);
   const receive = invoke(root, ['receive', `${'../'.repeat(20000)}private.md`]);
   expect(receive.status).toBe(1);
   expect(receive.output).toContain('WORK_HANDOFF_PATH');

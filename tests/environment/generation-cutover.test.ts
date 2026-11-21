@@ -1,4 +1,6 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, lstat, mkdtemp, readdir, rm, statfs, writeFile } from 'node:fs/promises';
+import type * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -10,6 +12,11 @@ import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
 import { inspectGenerationCutover } from '../../scripts/service/generation-cutover.ts';
 import { authDatabase } from '../support/auth-database.ts';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof fsPromises>();
+  return { ...fs, access: vi.fn(fs.access), statfs: vi.fn(fs.statfs) };
+});
 
 const probeUrl = 'https://cos.invalid/preflight';
 const probeEtag = 'test-etag';
@@ -542,4 +549,36 @@ it('does not require a legacy journal for a fresh A site, complete history, or A
     readyForCutover: true,
     rollbackRequiresAReconciliation: true,
   });
+});
+
+it('requires directory traversal and available blocks without testing writes during default preflight', async () => {
+  const { pool, directory } = await fixture();
+  const fetch = vi.fn();
+  vi.stubGlobal('fetch', fetch);
+  const original = await lstat(directory, { bigint: true });
+  const options = { dataDirectory: directory, env: {} };
+
+  expect(await inspectGenerationCutover(pool, options)).toMatchObject({
+    directory: 'writable',
+    blockers: ['A_COS_ACCESS_UNVERIFIED'],
+    readyForCutover: false,
+  });
+
+  vi.mocked(access).mockImplementationOnce(async (_path, mode) => {
+    if ((mode ?? 0) & constants.X_OK) throw new Error('EACCES');
+  });
+  const blocked = {
+    directory: 'unavailable',
+    blockers: ['A_GENERATION_DIRECTORY_UNAVAILABLE', 'A_COS_ACCESS_UNVERIFIED'],
+    readyForCutover: false,
+  };
+  expect(await inspectGenerationCutover(pool, options)).toMatchObject(blocked);
+
+  const disk = await statfs(directory, { bigint: true });
+  vi.mocked(statfs).mockResolvedValueOnce({ ...disk, bavail: 0n, bfree: 1n });
+  expect(await inspectGenerationCutover(pool, options)).toMatchObject(blocked);
+
+  expect(await readdir(directory)).toEqual([]);
+  expect((await lstat(directory, { bigint: true })).mtimeNs).toBe(original.mtimeNs);
+  expect(fetch).not.toHaveBeenCalled();
 });

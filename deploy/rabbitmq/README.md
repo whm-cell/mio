@@ -24,15 +24,21 @@ docker compose --env-file "$RABBITMQ_ENV_FILE" -p mio-compute -f deploy/rabbitmq
 本机测试可在共享协议包构建后使用一次性 bootstrap：
 
 ```sh
+(
+  umask 077
+  mkdir -p .runtime/compute-environment
+)
 node scripts/service/prepare-compute-broker.ts "$RABBITMQ_ENV_FILE" .runtime/compute-environment/broker-p3
 ```
 
-输出目录必须是 `.runtime` 下尚不存在的目录。脚本只连接 `127.0.0.1` 的管理接口，检查 `stream_queue` feature flag 和原 vhost 的 1 GiB operator policy，再记录计划并将随机 A/B 凭据写入 0600 文件。发现同名当前拓扑资源时停止。脚本在业务 vhost 和两个独立测试 vhost 中各建立四条持久 quorum 队列：
+输出目录必须是 `.runtime` 下尚不存在的目录。准备和观测脚本按 Node dotenv 规则读取同一份环境文件。默认从 `RABBITMQ_MANAGEMENT_PORT` 推导 `http://127.0.0.1:<port>`，也兼容显式 `RABBITMQ_MANAGEMENT_URL`。管理地址须使用 HTTP 和 `127.0.0.1`，省略用户信息、路径、查询和片段。
+
+准备脚本先验证 `stream_queue` feature flag 和原 vhost 中能匹配 quorum 队列的 1 GiB operator policy，发现同名当前拓扑资源时停止。脚本记录计划，将随机 A/B 凭据写入 0600 文件，再在业务 vhost 和两个独立测试 vhost 中各建立四条持久 quorum 队列。
 
 - 视频命令队列 `mio.compute.commands.v1` 与对应死信队列 `mio.compute.commands.dlq.v1`
 - 视频结果队列 `mio.compute.results.v1` 与对应死信队列 `mio.compute.results.dlq.v1`
 
-交换机和 routing key 见[计算协议](../../docs/tasks/compute-service/protocol.md#路由回执与状态)。源队列配置 `dead-letter-strategy=at-least-once`，四条队列均设置 `overflow=reject-publish` 和 `delivery-limit=-1`。网络请求结果未知时停止，查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源后再决定如何恢复。重试须保留已有业务队列和消息。
+交换机和 routing key 见[计算协议](../../docs/tasks/compute-service/protocol.md#路由回执与状态)。源队列配置 `dead-letter-strategy=at-least-once`，四条队列均设置 `overflow=reject-publish` 和 `delivery-limit=-1`。初始化完成前逐队列核对实际匹配的 `mio-capacity` 及合并生效的 1 GiB 消息体上限和 `reject-publish`。出现策略冲突或网络请求结果未知时，查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源后再决定如何恢复。重试须保留已有业务队列和消息。
 
 `runtime-a.env` 和 `runtime-b.env` 提供业务 vhost 的不同账户配置。`worker-test-a.env` 与 `worker-test-b.env` 指向 Worker 测试 vhost，`probe-a.env` 与 `probe-b.env` 指向环境探针 vhost。各文件提供 `RABBITMQ_URL`、`MIO_COMPUTE_BROKER_USER` 和对应的 `MIO_COMPUTE_EXPECTED_RESULT_USER` 或 `MIO_COMPUTE_EXPECTED_COMMAND_USER`。A 启用转码时还需设置 `MIO_COMPUTE_ENABLED=true`。A 仅写命令交换机、读结果队列，B 仅写结果交换机、读视频命令队列。两者均无管理或 impersonator 标签，也没有 configure 权限。运行时不声明拓扑。消息发布方设置自身 `userId`，消费者核对预期身份。
 

@@ -106,6 +106,34 @@ it('allows the public root env template link but rejects private env links and t
   expect(await errors(root)).toContain('LINK_PRIVATE README.md: .env.example');
 });
 
+it('rejects links to the exact parent through relative paths and filesystem aliases', async () => {
+  const root = await fixture({
+    'docs/guide.md': '[Root](..) [Parent](../%2E%2E)\n\n## API 使用\n## API 使用\n',
+  });
+  const outside = process.platform === 'win32' ? (root.startsWith('C:') ? 'D:/' : 'C:/') : '/';
+  await writeFile(
+    join(root, 'README.md'),
+    `[资料](docs/index.md) [Root](.) [Parent](..) [Alias](docs/parent) [Outside](${outside})\n`,
+  );
+  await symlink(dirname(root), join(root, 'docs', 'parent'), 'dir');
+  expect((await errors(root)).filter((error) => error.startsWith('LINK_')).sort()).toEqual(
+    [
+      'LINK_PRIVATE README.md: ..',
+      'LINK_PRIVATE README.md: docs/parent',
+      `LINK_PRIVATE README.md: ${outside}`,
+      'LINK_PRIVATE docs/guide.md: ../%2E%2E',
+    ].sort(),
+  );
+});
+
+it('resolves valid internal links when the checkout root is reached through a symlink', async () => {
+  const root = await fixture();
+  const alias = `${root}-alias`;
+  roots.push(alias);
+  await symlink(root, alias, 'dir');
+  expect(await errors(alias)).toEqual([]);
+});
+
 it('recognizes real compatibility anchors without accepting tags inside HTML comments or scripts', async () => {
   const root = await fixture({
     'docs/index.md': '[API](apis/index.md) [Guide](guide.md#real-anchor)\n',

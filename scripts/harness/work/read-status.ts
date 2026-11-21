@@ -1,6 +1,6 @@
 import { readdir } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
-import { checkedPath, json, loadTask, stages } from './records.ts';
+import { checkedPath, createTaskLoader, json, stages } from './records.ts';
 import { readPage } from './output.ts';
 import type { ReadOptions } from './output.ts';
 
@@ -22,11 +22,12 @@ export async function readStatus(
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     entries = [];
   }
+  const load = createTaskLoader(root);
   const tasks = [];
   const query = flags.query?.toLocaleLowerCase();
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    const { task } = await loadTask(root, entry.name);
+    const { task } = await load(entry.name);
     if (archived !== 'all' && task.archived !== (archived === 'archived')) continue;
     if (flags.stage && (task.stage ?? 'draft') !== flags.stage) continue;
     if (

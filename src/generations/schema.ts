@@ -44,16 +44,16 @@ CREATE INDEX IF NOT EXISTS mio_image_executions_cleanup ON mio_image_executions(
   WHERE phase='done' AND checkpoint IS NOT NULL
     AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb;`;
 
-export async function checkGenerationSchema(pool: Pool): Promise<void> {
-  await pool.query('SELECT asset_kind FROM mio_assets LIMIT 0');
-  await pool.query(
+export async function checkGenerationSchema(database: Pick<Pool, 'query'>): Promise<void> {
+  await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
+  await database.query(
     'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,state,created_at,active_recovery_id,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,route_snapshot FROM mio_image_jobs LIMIT 0',
   );
-  await pool.query('SELECT job_id,output_index,asset_id FROM mio_image_outputs LIMIT 0');
-  await pool.query(
+  await database.query('SELECT job_id,output_index,asset_id FROM mio_image_outputs LIMIT 0');
+  await database.query(
     'SELECT job_id,phase,claim_id,snapshot,checkpoint,updated_at,storage_failed FROM mio_image_executions LIMIT 0',
   );
-  const constraint = await pool.query<{ definition: string }>(
+  const constraint = await database.query<{ definition: string }>(
     "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='mio_image_jobs'::regclass AND conname='mio_image_jobs_state_check' AND contype='c' AND convalidated",
   );
   if (

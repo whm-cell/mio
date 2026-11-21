@@ -18,7 +18,30 @@ A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute
 
 ## 初始化与验证
 
-`broker:init:dev/test` 先核对当前重媒体拓扑、角色权限与全部已有资源，再仅创建缺失项。已有权限必须与当前边界一致；旧图片资源和双命令队列 B 权限先沿[图片切换步骤](../local-environments.md#图片生成迁移与切换)排空对账并显式退役或调整，初始化不会自动收缩权限或删除队列。任何权限、队列、交换机或策略不匹配立即停止并报 `LOCAL_BROKER_CONFLICT`；重复执行不覆盖用户密码、策略或队列，不清消息。密码通过真实 AMQP 登录核对。中途失败或请求结果未知时保留现场，恢复同一配置后核对并重试，不能用重建队列绕过冲突。普通 `infra:up` 只启动容器并检查节点/端口及资源告警，拓扑初始化仍是显式步骤。
+`broker:init:dev/test` 只读核对 vhost、A/B 用户、权限和容量策略，再补齐可声明的重媒体拓扑。缺少预置项时报告 `LOCAL_BROKER_PREPROVISION_REQUIRED`，集中列出该次检查发现的缺项和已完成的声明。已有 vhost 时可补交换机，队列和绑定还须有匹配的容量策略。报告就绪前先验证真实 AMQP 登录，再重读预置项，发现缺项或冲突时报告实际观察。
+
+预检发现已有权限、队列、交换机或策略不匹配时，在声明前报告 `LOCAL_BROKER_CONFLICT`，保留现场与消息。声明期间独立保存的配置仍由管理者保管，重新读取时若发现变化则以当次观察报告。请求结果未知时停止并核对实际资源，按同一配置恢复后重跑。旧图片资源及双命令队列 B 权限按[图片切换步骤](../local-environments.md#图片生成迁移与切换)排空对账后由运维显式退役或调整。
+
+### 预置本地 Broker
+
+启动 `infra:up:dev/test` 后，用选定环境的回环管理端和对应管理员登录。开发读取私有 `.env`，人工测试读取 `.env.test`。管理端口取 `MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT`，管理员为 `mio-dev-admin` 或 `mio-test-admin`，密码取 `MIO_LOCAL_RABBITMQ_PASSWORD`。在管理界面直接输入密码，保留私有配置。
+
+下面的 `<env>` 取 `dev` 或 `test`。按 vhost、策略、用户、授权的顺序预置缺项。旧卷缺少 vhost 时，先核对实际卷与身份，再恢复所选环境的同名 vhost。正常空卷的 vhost 已由 [Compose](../../deploy/local/compose.yaml) 创建。
+
+若由另一位管理员恢复 vhost，在该 vhost 的权限页为运行初始化的 `mio-<env>-admin` 恢复 Compose 默认权限，Configure、Write 和 Read 均填 `.*`。RabbitMQ 会给创建者授予权限，初始化仍使用选定文件里的项目管理员。A/B 按下表单独授予受限权限。
+
+| 项目            | 预置值                                                                                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| vhost           | `mio-<env>`                                                                                                                                                         |
+| operator policy | vhost 内命名 `mio-capacity`，Pattern `.*`，Priority `0`，Apply to `queues`（Queues）。Definition 为 `{"max-length-bytes":1073741824,"overflow":"reject-publish"}`。 |
+| A 用户          | `mio-<env>-a`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_A_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                          |
+| B 用户          | `mio-<env>-b`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_B_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                          |
+| A 权限          | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.commands\.v1$`，Read `^mio\.compute\.results\.v1$`。                                                          |
+| B 权限          | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.results\.v1$`，Read `^mio\.compute\.commands\.v1$`。                                                          |
+
+部署者先将清单与当前资源对账，补齐仍缺的项目，再重跑 `pnpm broker:init:dev` 或 `pnpm broker:init:test`。清单内已有资源可直接重跑核对，出现冲突时先保留现有值与业务数据，再决定如何纠正。预置值与[共享拓扑定义](../../scripts/service/compute-broker-topology.ts)对应。
+
+一次性部署的准备脚本检查运行 vhost 策略的作用对象，并以四条 quorum 队列实际应用的策略和生效定义验证 1 GiB 消息体上限及 `reject-publish`。策略优先级和定义合并遵循 [RabbitMQ 4.4 策略](https://www.rabbitmq.com/docs/4.4/policies)。
 
 部署维护回归见 [local-broker 单测](../../tests/environment/local-broker.test.ts)、[配置测试](../../tests/environment/local-environment.test.ts) 和显式 [MQ 现场探针](../../tests/environment/local-brokers-live.ts)。现场探针核对角色权限、消息隔离、已确认消息重启保留、另一环境可用，以及空闲 Worker journal/进程接线；完整云端转码、负载和服务器验收另按需求取证。普通检查不访问这两套人工队列或历史 broker。
 

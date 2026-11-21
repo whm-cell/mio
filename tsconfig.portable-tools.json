@@ -10,6 +10,7 @@
     "scripts/service/migrate-assets.ts",
     "scripts/service/migrate-materials.ts",
     "scripts/service/migrate-compute.ts",
+    "scripts/service/migrate-conversations.ts",
     "scripts/service/migrate-generations.ts",
     "scripts/service/migrate-providers.ts",
     "scripts/service/import-provider-route.ts",

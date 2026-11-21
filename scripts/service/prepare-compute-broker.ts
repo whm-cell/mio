@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, realpath } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { readComputeBrokerEnvironment } from './compute-broker-env.ts';
 import {
   computeCapacity,
   computeExchanges as exchanges,
@@ -19,24 +21,6 @@ if (!adminFile || !outputPath || extra.length)
     'Usage: node scripts/service/prepare-compute-broker.ts <admin-env> <new-private-output-dir>',
   );
 
-function readEnv(text: string): Record<string, string> {
-  return Object.fromEntries(
-    text
-      .split('\n')
-      .filter((line) => line && !line.startsWith('#'))
-      .map((line) => {
-        const separator = line.indexOf('=');
-        if (separator < 1) throw new Error('BROKER_ENV_INVALID');
-        return [line.slice(0, separator), line.slice(separator + 1)];
-      }),
-  );
-}
-
-function required(value: string | undefined): string {
-  if (!value) throw new Error('BROKER_ENV_MISSING');
-  return value;
-}
-
 function object(value: unknown): Json {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('BROKER_RESPONSE_INVALID');
@@ -53,25 +37,16 @@ async function privateFile(path: string, contents: string): Promise<void> {
   }
 }
 
-const env = readEnv(await readFile(adminFile, 'utf8'));
-const management = new URL(required(env.RABBITMQ_MANAGEMENT_URL));
-if (
-  management.protocol !== 'http:' ||
-  management.hostname !== '127.0.0.1' ||
-  management.username ||
-  management.password ||
-  management.pathname !== '/' ||
-  management.search ||
-  management.hash
-)
-  throw new Error('BROKER_LOCAL_MANAGEMENT_REQUIRED');
-const amqpPort = required(env.RABBITMQ_AMQP_PORT);
-if (!/^\d{1,5}$/.test(amqpPort) || Number(amqpPort) < 1 || Number(amqpPort) > 65535)
+const {
+  management,
+  user,
+  password,
+  vhost: originalVhost,
+  amqpPort,
+} = readComputeBrokerEnvironment(await readFile(adminFile, 'utf8'));
+if (!amqpPort || !/^\d{1,5}$/.test(amqpPort) || Number(amqpPort) < 1 || Number(amqpPort) > 65535)
   throw new Error('BROKER_AMQP_PORT_INVALID');
-const originalVhost = required(env.RABBITMQ_DEFAULT_VHOST);
-const adminAuth = Buffer.from(
-  `${required(env.RABBITMQ_DEFAULT_USER)}:${required(env.RABBITMQ_DEFAULT_PASS)}`,
-).toString('base64');
+const adminAuth = Buffer.from(`${user}:${password}`).toString('base64');
 const base = await realpath('.runtime');
 const output = resolve(outputPath);
 const parent = await realpath(dirname(output));
@@ -93,6 +68,7 @@ async function api(method: string, path: string, body?: Json): Promise<Reply> {
       ...(body ? { 'content-type': 'application/json' } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
+    redirect: 'error',
     signal: AbortSignal.timeout(15_000),
   });
   const text = await response.text();
@@ -120,13 +96,14 @@ if (
 )
   throw new Error('BROKER_STREAM_FEATURE_REQUIRED');
 const capacity = await api('GET', `operator-policies/${encoded(originalVhost)}/mio-capacity`);
+if (capacity.status !== 200) throw new Error('BROKER_OPERATOR_POLICY_MISMATCH');
 const cap = object(capacity.value);
 const definition = object(cap.definition);
 if (
-  capacity.status !== 200 ||
   cap.pattern !== '.*' ||
-  definition['max-length-bytes'] !== 1073741824 ||
-  definition.overflow !== 'reject-publish'
+  !['all', 'queues', 'quorum_queues'].some((target) => cap['apply-to'] === target) ||
+  definition['max-length-bytes'] !== computeCapacity['max-length-bytes'] ||
+  definition.overflow !== computeCapacity.overflow
 )
   throw new Error('BROKER_OPERATOR_POLICY_MISMATCH');
 for (const role of Object.values(roles)) await absent(`users/${encoded(role.user)}`);
@@ -220,11 +197,23 @@ try {
         throw new Error('BROKER_RUNTIME_PERMISSION_MISMATCH');
     }
   }
+  // Management adds effective policy to the first statistics sample after declaration.
+  const policyStatsDeadline = performance.now() + 10_000;
   for (const vhost of vhosts) {
     for (const [index, queue] of queues.entries()) {
-      const response = await api('GET', `queues/${encoded(vhost)}/${encoded(queue)}`);
-      const q = object(response.value),
-        args = object(q.arguments);
+      const path = `queues/${encoded(vhost)}/${encoded(queue)}`;
+      let response = await api('GET', path);
+      let q = object(response.value);
+      while (
+        response.status === 200 &&
+        q.effective_policy_definition === undefined &&
+        performance.now() < policyStatsDeadline
+      ) {
+        await sleep(250);
+        response = await api('GET', path);
+        q = object(response.value);
+      }
+      const args = object(q.arguments);
       if (
         response.status !== 200 ||
         q.type !== 'quorum' ||
@@ -233,6 +222,15 @@ try {
         args['x-overflow'] !== 'reject-publish'
       )
         throw new Error('BROKER_QUEUE_MISMATCH');
+      const effective = q.effective_policy_definition;
+      if (
+        q.operator_policy !== 'mio-capacity' ||
+        !effective ||
+        typeof effective !== 'object' ||
+        (effective as Json)['max-length-bytes'] !== computeCapacity['max-length-bytes'] ||
+        (effective as Json).overflow !== computeCapacity.overflow
+      )
+        throw new Error(`BROKER_QUEUE_CAPACITY_MISMATCH ${vhost}/${queue}`);
       if (
         index < 2 &&
         (args['x-dead-letter-strategy'] !== 'at-least-once' ||

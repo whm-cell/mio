@@ -29,13 +29,13 @@ CREATE TABLE IF NOT EXISTS mio_compute_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );`;
 
-export async function checkComputeSchema(pool: Pool): Promise<void> {
-  await pool.query('SELECT asset_kind FROM mio_assets LIMIT 0');
-  await pool.query(
+export async function checkComputeSchema(database: Pick<Pool, 'query'>): Promise<void> {
+  await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
+  await database.query(
     'SELECT id,owner_id,request_id,input_asset_id,input_key,input_size,input_etag,state,attempt,attempt_id,command_id,result_asset_id,error_code,created_at,updated_at FROM mio_compute_jobs LIMIT 0',
   );
-  await pool.query(
+  await database.query(
     'SELECT id,job_id,command,lease_id,lease_until,sent_at,created_at FROM mio_compute_outbox LIMIT 0',
   );
-  await pool.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
+  await database.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
 }

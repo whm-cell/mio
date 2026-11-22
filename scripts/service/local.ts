@@ -72,6 +72,11 @@ async function main(name: 'dev' | 'test') {
     await prepareLocalBroker(name, values);
     return;
   }
+  if (action === 'monitor-init' && args.length === 0) {
+    const { prepareAdminMonitors } = await import('./init-admin-monitors.ts');
+    await prepareAdminMonitors(name);
+    return;
+  }
   if (action === 'compute' && args.length === 1 && ['init', 'start'].includes(args[0]!)) {
     const worker = localWorkerEnvironment(name, values, host);
     if (args[0] === 'start') {
@@ -135,6 +140,7 @@ async function main(name: 'dev' | 'test') {
         'compute',
         'generations',
         'materials',
+        'admin',
       ].includes(domain) ||
       args.some(
         (arg) => !['--apply', '--with-conversations', '--rollback-sms-budget'].includes(arg),
@@ -143,7 +149,7 @@ async function main(name: 'dev' | 'test') {
       (domain !== 'auth' && args.includes('--rollback-sms-budget'))
     )
       throw new Error(
-        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials] [--apply] [--rollback-sms-budget for auth]',
+        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials|admin] [--apply] [--rollback-sms-budget for auth]',
       );
     console.log(`${name}: ${domain} migration ${args.includes('--apply') ? 'apply' : 'preview'}`);
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);
@@ -157,8 +163,12 @@ async function main(name: 'dev' | 'test') {
     await run(process.execPath, ['scripts/service/import-provider-route.ts', args[0]!], runtime);
     return;
   }
+  if (action === 'admin-bootstrap' && args.length >= 2) {
+    await run(process.execPath, ['scripts/service/bootstrap-admin.ts', ...args], runtime);
+    return;
+  }
   throw new Error(
-    'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, compute init|start, generations-preflight, start, migrate, route or check',
+    'LOCAL_ACTION: expected init, infra up|stop|status, regression-init, broker-init, monitor-init, compute init|start, generations-preflight, start, migrate, route, admin-bootstrap or check',
   );
 }
 

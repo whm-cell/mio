@@ -3,12 +3,18 @@ import type {
   Category,
   ModelRecord,
   ModelPreference,
+  PlatformCatalogModelRecord,
   PlatformRouteRecord,
   VerificationRecord,
 } from './contracts.ts';
 import type { ProviderRow, ProviderState } from './state.ts';
 import { providerView } from './state.ts';
-import { resolveChatRoute, resolveImageRoute, resolveVerificationView } from './onelink/router.ts';
+import {
+  deriveImageParameterView,
+  resolveChatRoute,
+  resolveImageRoute,
+  resolveVerificationView,
+} from './onelink/router.ts';
 import type { ResolvedChatRoute, ResolvedImageRoute } from './onelink/router.ts';
 
 export const modelReference = (key: string) => `onelink:model:${key}`;
@@ -27,19 +33,42 @@ export function findModel(models: ModelRecord[], ref: string): ModelRecord | und
   );
 }
 
-export function membershipError(row: ProviderRow, model?: ModelRecord): string | null {
+export function findCatalogModel(
+  catalogModels: readonly PlatformCatalogModelRecord[] | undefined,
+  rawModelId: string | null | undefined,
+): PlatformCatalogModelRecord | undefined {
+  if (!rawModelId || !catalogModels?.length) return undefined;
+  return catalogModels.find((item) => item.raw_model_id === rawModelId);
+}
+
+export function membershipError(
+  row: ProviderRow & {
+    catalog_models?: readonly PlatformCatalogModelRecord[];
+  },
+  model?: ModelRecord,
+  whitelist = false,
+): string | null {
   if (!row.enabled) return 'PROVIDER_DISABLED';
   if (row.credential_auth_state === 'rejected') return 'PROVIDER_AUTH_REJECTED';
   if (row.catalog_version === null || row.catalog_credential_version !== row.credential_version)
     return 'MODEL_CATALOG_NOT_DISCOVERED';
   if (!model) return 'MODEL_NOT_FOUND';
+  const catalogModel = findCatalogModel(row.catalog_models, model.raw_model_id);
+  if (whitelist) {
+    if (!catalogModel || !catalogModel.user_visible) return 'MODEL_HIDDEN';
+  } else if (catalogModel && !catalogModel.user_visible) {
+    return 'MODEL_HIDDEN';
+  }
   if (model.unavailable_reason) return model.unavailable_reason;
-  if (
-    model.membership_state !== 'current' ||
-    model.credential_version !== row.credential_version ||
-    model.catalog_version !== row.catalog_version
-  )
-    return 'MODEL_REMOVED';
+  const discoveredCurrent =
+    model.membership_state === 'current' &&
+    model.credential_version === row.credential_version &&
+    model.catalog_version === row.catalog_version;
+  const curatedAllowed =
+    model.metadata_source === 'admin-curated-hidden' &&
+    Boolean(catalogModel?.allow_undiscovered) &&
+    Boolean(catalogModel?.user_visible);
+  if (!discoveredCurrent && !curatedAllowed) return 'MODEL_REMOVED';
   return null;
 }
 
@@ -109,7 +138,7 @@ function buildAdaptationView(
 }
 
 /** O(models + routes + preferences + verifications); no supplier I/O, decryption or bundled product model list. */
-export function catalogView(state: ProviderState | null, category?: Category) {
+export function catalogView(state: ProviderState | null, category?: Category, whitelist = false) {
   const chatByRawId = new Map<string, ResolvedChatRoute>();
   const imageByRawId = indexEffectiveImageRoutes(state?.routes);
   for (const route of state?.routes ?? []) {
@@ -129,6 +158,11 @@ export function catalogView(state: ProviderState | null, category?: Category) {
     verifications.set(`${item.model_key}\0${item.operation}`, item);
   }
 
+  const catalogByRawId = new Map<string, PlatformCatalogModelRecord>();
+  for (const item of state?.catalog_models ?? []) {
+    catalogByRawId.set(item.raw_model_id, item);
+  }
+
   const effectiveChatByKey = new Map<string, ResolvedChatRoute>();
   for (const model of state?.models ?? []) {
     const resolved = model.raw_model_id ? chatByRawId.get(model.raw_model_id) : undefined;
@@ -136,84 +170,116 @@ export function catalogView(state: ProviderState | null, category?: Category) {
   }
 
   const items = (state?.models ?? [])
+    .filter((model) => {
+      const cat = model.raw_model_id ? catalogByRawId.get(model.raw_model_id) : undefined;
+      if (whitelist) {
+        if (!cat || !cat.user_visible) return false;
+      } else if (cat && !cat.user_visible) {
+        return false;
+      }
+      const allowUndiscovered = Boolean(cat?.allow_undiscovered);
+      if (model.metadata_source === 'admin-curated-hidden' && !allowUndiscovered) {
+        return prefs.has(model.model_key);
+      }
+      return true;
+    })
     .map((model) => {
+      const cat = model.raw_model_id ? catalogByRawId.get(model.raw_model_id) : undefined;
       const chatRoute = model.raw_model_id ? chatByRawId.get(model.raw_model_id) : undefined;
       const imageRoute = model.raw_model_id ? imageByRawId.get(model.raw_model_id) : undefined;
       const matchedRoute = chatRoute ?? imageRoute;
-      const effectiveCategory = model.classification ?? matchedRoute?.classification ?? null;
-      const effectiveClassificationSource = model.classification
-        ? model.classification_source
-        : matchedRoute
-          ? `route:${matchedRoute.source}@${matchedRoute.sourceVersion}`
-          : model.classification_source;
-      return { model, chatRoute, imageRoute, effectiveCategory, effectiveClassificationSource };
+      const effectiveCategory = matchedRoute?.classification ?? cat?.category ?? null;
+      const effectiveClassificationSource = matchedRoute
+        ? `route:${matchedRoute.source}@${matchedRoute.sourceVersion}`
+        : cat?.category
+          ? `catalog:${cat.origin_source}`
+          : null;
+      return {
+        model,
+        cat,
+        chatRoute,
+        imageRoute,
+        effectiveCategory,
+        effectiveClassificationSource,
+      };
     })
     .filter((entry) => !category || entry.effectiveCategory === category)
-    .map(({ model, chatRoute, imageRoute, effectiveCategory, effectiveClassificationSource }) => {
-      const preferences = (prefs.get(model.model_key) ?? []).map((pref) => ({
-        usage: pref.usage,
-        enabled: pref.enabled,
-        isDefault: pref.is_default,
-        effectiveDefault:
-          pref.is_default &&
-          pref.enabled &&
-          !membershipError(state!, model) &&
-          pref.usage === 'chat' &&
-          !!chatRoute,
-      }));
-      const chat = preferences.find((pref) => pref.usage === 'chat');
-      const image = preferences.find((pref) => pref.usage === 'image');
-      const imageReason =
-        membershipError(state!, model) ??
-        (!imageRoute || !imageRoute.asyncReady
-          ? 'ADAPTER_PENDING'
-          : image?.enabled === false
-            ? 'MODEL_DISABLED'
-            : null);
-      const reason =
-        membershipError(state!, model) ??
-        (!chatRoute ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);
-      return {
-        modelRef: modelReference(model.model_key),
-        modelKey: model.model_key,
-        modelId: model.raw_model_id,
-        name: model.display_name ?? model.raw_model_id,
-        description:
-          model.description_override ??
-          (typeof model.supplier_metadata.description === 'string'
-            ? model.supplier_metadata.description
-            : null),
-        nameOverride: model.display_name,
-        descriptionOverride: model.description_override,
-        category: effectiveCategory,
-        classificationSource: effectiveClassificationSource,
-        supplierMetadata: model.supplier_metadata,
-        supplierMetadataSource: model.metadata_source,
-        membership: model.membership_state,
-        credentialVersion: model.credential_version,
-        catalogVersion: model.catalog_version,
-        firstSeenAt: model.first_seen_at,
-        lastSeenAt: model.last_seen_at,
-        legacyRef: model.legacy_ref,
-        discovered:
+    .map(
+      ({ model, cat, chatRoute, imageRoute, effectiveCategory, effectiveClassificationSource }) => {
+        const displayLabel = cat?.display_label ?? null;
+        const callNotes = cat?.call_notes ?? null;
+        const allowUndiscovered = Boolean(cat?.allow_undiscovered);
+        const preferences = (prefs.get(model.model_key) ?? []).map((pref) => ({
+          usage: pref.usage,
+          enabled: pref.enabled,
+          isDefault: pref.is_default,
+          effectiveDefault:
+            pref.is_default &&
+            pref.enabled &&
+            !membershipError(state!, model, whitelist) &&
+            pref.usage === 'chat' &&
+            !!chatRoute,
+        }));
+        const chat = preferences.find((pref) => pref.usage === 'chat');
+        const image = preferences.find((pref) => pref.usage === 'image');
+        const imageReason =
+          membershipError(state!, model, whitelist) ??
+          (!imageRoute || !imageRoute.asyncReady
+            ? 'ADAPTER_PENDING'
+            : image?.enabled === false
+              ? 'MODEL_DISABLED'
+              : null);
+        const reason =
+          membershipError(state!, model, whitelist) ??
+          (!chatRoute ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);
+        const discovered =
           model.membership_state === 'current' &&
           model.credential_version === state!.credential_version &&
-          model.catalog_version === state!.catalog_version,
-        adaptation: buildAdaptationView(state!, verifications, model.model_key, chatRoute),
-        image: {
-          adaptation: buildAdaptationView(state!, verifications, model.model_key, imageRoute),
-          enabled: image?.enabled ?? true,
-          runnable: imageReason === null,
-          unavailableReason: imageReason,
-        },
-        preferences,
-        enabled: chat?.enabled ?? true,
-        isDefault: chat?.isDefault ?? false,
-        protocol: chatRoute?.profile ?? null,
-        runnable: reason === null,
-        unavailableReason: reason,
-      };
-    });
+          model.catalog_version === state!.catalog_version;
+        return {
+          modelRef: modelReference(model.model_key),
+          modelKey: model.model_key,
+          modelId: model.raw_model_id,
+          name: model.display_name ?? displayLabel ?? model.raw_model_id,
+          description:
+            model.description_override ??
+            cat?.description ??
+            (typeof model.supplier_metadata.description === 'string' &&
+            model.supplier_metadata.description
+              ? model.supplier_metadata.description
+              : displayLabel),
+          nameOverride: model.display_name,
+          descriptionOverride: model.description_override,
+          category: effectiveCategory,
+          classificationSource: effectiveClassificationSource,
+          supplierMetadata: model.supplier_metadata,
+          supplierMetadataSource: model.metadata_source,
+          membership: model.membership_state,
+          credentialVersion: model.credential_version,
+          catalogVersion: model.catalog_version,
+          firstSeenAt: model.first_seen_at,
+          lastSeenAt: model.last_seen_at,
+          legacyRef: model.legacy_ref,
+          discovered,
+          curated: Boolean(allowUndiscovered && !discovered),
+          callNotes,
+          adaptation: buildAdaptationView(state!, verifications, model.model_key, chatRoute),
+          image: {
+            adaptation: buildAdaptationView(state!, verifications, model.model_key, imageRoute),
+            parameters: imageRoute?.asyncReady ? deriveImageParameterView(imageRoute.route) : null,
+            enabled: image?.enabled ?? true,
+            runnable: imageReason === null,
+            unavailableReason: imageReason,
+          },
+          preferences,
+          enabled: chat?.enabled ?? true,
+          isDefault: chat?.isDefault ?? false,
+          protocol: chatRoute?.profile ?? null,
+          runnable: reason === null,
+          unavailableReason: reason,
+        };
+      },
+    );
   return {
     provider: state ? providerView(state) : null,
     items,
@@ -223,7 +289,7 @@ export function catalogView(state: ProviderState | null, category?: Category) {
         preference && state?.models.find((item) => item.model_key === preference.model_key);
       const reason = !preference
         ? 'MODEL_DEFAULT_NOT_SET'
-        : (membershipError(state!, model) ??
+        : (membershipError(state!, model, whitelist) ??
           (!preference.enabled
             ? 'MODEL_DISABLED'
             : usage !== 'chat'

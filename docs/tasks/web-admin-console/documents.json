@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/web-admin-console/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/web-admin-console/prd.md"
+    },
+    {
+      "identity": "docs/tasks/web-admin-console/design.md",
+      "kind": "design",
+      "path": "docs/tasks/web-admin-console/design.md"
+    }
+  ]
+}

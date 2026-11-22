@@ -74,16 +74,18 @@ it('recognizes a pi-ai type alias and rejects business imports of the local DSH 
   await writeFile(join(root, 'src/dsh/pi.ts'), 'export interface Value { id: string }');
   expect(check(root).output).toContain('DSH_BOUNDARY');
 });
-it.each(['src/materials/service.ts', 'src/materials/http.ts'])(
-  'keeps materials outside framework adapters: %s',
-  async (file) => {
-    const root = await fixture({
-      'src/dsh/vision.ts': 'export const value=1;',
-      [file]: "export {value} from '../dsh/vision.ts';",
-    });
-    expect(check(root).output).toContain('DSH_BOUNDARY');
-  },
-);
+it.each([
+  'src/materials/service.ts',
+  'src/materials/http.ts',
+  'src/admin/service.ts',
+  'src/admin/http.ts',
+])('keeps materials outside framework adapters: %s', async (file) => {
+  const root = await fixture({
+    'src/dsh/vision.ts': 'export const value=1;',
+    [file]: "export {value} from '../dsh/vision.ts';",
+  });
+  expect(check(root).output).toContain('DSH_BOUNDARY');
+});
 afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
@@ -169,6 +171,9 @@ it.each([
   ['src/generations/schema.ts', 0],
   ['src/generations/service.ts', 1],
   ['src/generations-extra/store.ts', 1],
+  ['src/admin/store.ts', 0],
+  ['src/admin/schema.ts', 0],
+  ['src/admin/service.ts', 1],
 ] as const)(
   'limits business PostgreSQL imports to reviewed conversation/provider adapters: %s',
   async (file, status) => {
@@ -196,6 +201,10 @@ it.each([
   ['src/generations/schema.ts', 'database-alias', 'pg', 0],
   ['src/generations/service.ts', 'database-alias', 'pg', 1],
   ['src/generations/store.ts', 'pg', 'better-auth', 1],
+  ['src/admin/store.ts', 'database-alias', 'pg', 0],
+  ['src/admin/schema.ts', 'database-alias', 'pg', 0],
+  ['src/admin/service.ts', 'database-alias', 'pg', 1],
+  ['src/admin/store.ts', 'pg', 'better-auth', 1],
 ] as const)(
   'keeps package identity checks behind database aliases: %s, %s -> %s',
   async (file, alias, target, status) => {

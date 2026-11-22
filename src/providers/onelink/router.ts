@@ -25,6 +25,7 @@ import type {
   Category,
   ChatProfile,
   ImageCapabilityMetadata,
+  ImageParameterView,
   ChatImageBudget,
   PlatformRouteRecord,
   VerificationRecord,
@@ -69,6 +70,32 @@ export function deriveImageCapabilityMetadata(
           },
         }
       : {}),
+  };
+}
+
+export function deriveImageParameterView(route: ImageRouteConfig): ImageParameterView {
+  const { paramSpec, requestDefaults, outputSpec, requiresAsync } = route;
+  return {
+    supportedOperations: [...paramSpec.supportedOperations],
+    requiresAsync,
+    maxN: paramSpec.maxN,
+    allowExplicitN: paramSpec.allowExplicitN !== false,
+    allowedSizes: paramSpec.allowedSizes ? [...paramSpec.allowedSizes] : null,
+    defaultSize: requestDefaults.defaultSize ?? null,
+    allowCustomDimensions: paramSpec.allowCustomDimensions,
+    allowedAspectRatios: [...paramSpec.allowedAspectRatios],
+    maxReferenceImages: paramSpec.maxReferenceImages,
+    allowGenerateReferences: paramSpec.allowGenerateReferences,
+    allowMaskPng: paramSpec.allowMaskPng,
+    allowOutpaintGeometry: paramSpec.allowOutpaintGeometry,
+    allowedQualities: [...paramSpec.allowedQualities],
+    allowedBackgrounds: [...paramSpec.allowedBackgrounds],
+    allowedModerations: [...paramSpec.allowedModerations],
+    allowedOutputFormats: [...paramSpec.allowedOutputFormats],
+    fixedOutputFormat: outputSpec.fixedOutputFormat ?? null,
+    allowOutputCompression: Boolean(paramSpec.allowOutputCompression),
+    allowWatermarkOverride: paramSpec.allowWatermarkOverride,
+    defaultWatermark: requestDefaults.watermark ?? null,
   };
 }
 
@@ -396,6 +423,39 @@ export function canonicalRouteComparable(entry: ValidatedModelRoute | PlatformRo
           enabled: entry.enabled,
         };
   return JSON.stringify(canonicalSort(normalized));
+}
+
+export function serializeRouteInputSnapshot(
+  entry: ValidatedModelRoute | PlatformRouteRecord,
+): Record<string, unknown> {
+  const isValidated = 'rawModelId' in entry;
+  const operation = entry.operation;
+  const base: Record<string, unknown> = {
+    providerType: isValidated ? entry.providerType : entry.provider_type,
+    rawModelId: isValidated ? entry.rawModelId : entry.raw_model_id,
+    operation,
+    vendor: entry.vendor,
+    driver: entry.driver,
+    classification: entry.classification,
+    submitPath: isValidated ? entry.submitPath : entry.submit_path,
+    sourceKind: isValidated ? entry.sourceKind : entry.source_kind,
+    source: entry.source,
+    sourceVersion: isValidated ? entry.sourceVersion : entry.source_version,
+    enabled: entry.enabled,
+  };
+  if (operation === 'chat') {
+    const capabilityMetadata = isValidated ? entry.capabilityMetadata : entry.capability_metadata;
+    if (Object.keys(capabilityMetadata).length > 0) base.capabilityMetadata = capabilityMetadata;
+    return canonicalSort(base) as Record<string, unknown>;
+  }
+  const editPath = isValidated ? entry.editPath : entry.edit_path;
+  const queryPathTemplate = isValidated ? entry.queryPathTemplate : entry.query_path_template;
+  if (editPath !== null) base.editPath = editPath;
+  if (queryPathTemplate !== null) base.queryPathTemplate = queryPathTemplate;
+  base.paramSpec = isValidated ? entry.paramSpec : entry.param_spec;
+  base.requestDefaults = isValidated ? entry.requestDefaults : entry.request_defaults;
+  base.outputSpec = isValidated ? entry.outputSpec : entry.output_spec;
+  return canonicalSort(base) as Record<string, unknown>;
 }
 
 export interface ResolvedChatRoute {

@@ -8,6 +8,7 @@
 | [foundation/](foundation/)       | 共享运行时原语、HTTP 身份复验、插件装载、Profile 准备与 DSH 内核              |
 | [auth/](auth/)                   | 认证与 Redis 限流消费者                                                       |
 | [providers/](providers/)         | 供应商配置、目录、刷新、迁移；领域参考数据在 `providers/fixtures/`            |
+| [admin/](admin/)                 | 独立管理员会话、基准探测、隐藏与补录策略、路由回滚与运行监控                  |
 | [onelink/](onelink/)             | OneLink 适配、传输、生命周期及专用模型夹具                                    |
 | [conversations/](conversations/) | 对话 HTTP、执行引擎、Profile 与模型夹具                                       |
 | [materials/](materials/)         | 素材组/素材、账号级凭据、同步隔离、迁移、HTTP 与操作恢复                      |

@@ -4,6 +4,7 @@ import type {
   ProviderView,
   ModelRecord,
   ModelPreference,
+  PlatformCatalogModelRecord,
   PlatformRouteRecord,
   VerificationRecord,
 } from './contracts.ts';
@@ -33,6 +34,7 @@ export interface ProviderState extends ProviderRow {
   models: ModelRecord[];
   preferences: ModelPreference[];
   routes?: PlatformRouteRecord[];
+  catalog_models?: PlatformCatalogModelRecord[];
   verifications?: VerificationRecord[];
 }
 export const providerStateSQL = (includeVerifications = true) => `SELECT c.*,
@@ -45,7 +47,14 @@ export const providerStateSQL = (includeVerifications = true) => `SELECT c.*,
       AND EXISTS (
         SELECT 1 FROM mio_provider_models m
         WHERE m.provider_id=c.id AND m.raw_model_id=r.raw_model_id COLLATE "C"
-      )),'[]') AS routes${
+      )),'[]') AS routes,
+  COALESCE((SELECT jsonb_agg(cat ORDER BY cat.raw_model_id COLLATE "C")
+    FROM mio_provider_catalog_models cat
+    WHERE cat.provider_type=c.provider_type
+      AND EXISTS (
+        SELECT 1 FROM mio_provider_models m
+        WHERE m.provider_id=c.id AND m.raw_model_id=cat.raw_model_id COLLATE "C"
+      )),'[]') AS catalog_models${
         includeVerifications
           ? `,
   COALESCE((SELECT jsonb_agg(v) FROM mio_provider_model_verifications v WHERE v.provider_id=c.id),'[]') AS verifications`

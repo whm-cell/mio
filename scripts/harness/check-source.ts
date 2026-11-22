@@ -448,6 +448,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/compute/schema.ts',
         'src/generations/store.ts',
         'src/generations/schema.ts',
+        'src/admin/store.ts',
+        'src/admin/schema.ts',
       ].includes(file);
       if (
         ((authPackage || specifier.startsWith('@better-auth/')) && !beneath(file, 'src/auth')) ||
@@ -496,7 +498,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
           if (
             (beneath(file, 'src/providers') ||
               beneath(file, 'src/conversations') ||
-              beneath(file, 'src/materials')) &&
+              beneath(file, 'src/materials') ||
+              beneath(file, 'src/admin')) &&
             beneath(localTarget, 'src/dsh')
           )
             errors.push(`DSH_BOUNDARY ${file}: business modules must not import src/dsh`);

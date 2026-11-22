@@ -8,6 +8,7 @@ import type {
   ChatSelection,
   ChatRuntimeSnapshot,
   ImageAdmissionSnapshot,
+  RouteRevisionActor,
   VerificationSnapshot,
   AccountCredentialSnapshot,
 } from './contracts.ts';
@@ -22,6 +23,7 @@ import {
 } from './credentials.ts';
 import {
   catalogView,
+  findCatalogModel,
   findModel,
   indexEffectiveImageRoutes,
   membershipError,
@@ -30,6 +32,7 @@ import {
   modelReference,
   legacyReference,
 } from './catalog.ts';
+import { deriveImageParameterView } from './onelink/router.ts';
 import { discoverModels, DiscoveryError } from '../integrations/onelink/models.ts';
 import type { ModelTransport, DiscoveredModel } from '../integrations/onelink/models.ts';
 
@@ -46,6 +49,7 @@ export function createProviderService(
     if (cancellation.signal.aborted)
       throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
   };
+  const whitelist = Boolean(config.catalogWhitelist);
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
     const row = await store.state(actor.userId, false);
@@ -54,9 +58,9 @@ export function createProviderService(
     const preference = row.preferences.find((pref) => pref.usage === 'chat' && pref.is_default);
     const ref = modelRef ?? (preference && modelReference(preference.model_key));
     const model = ref ? findModel(row.models, ref) : undefined;
-    const reason = membershipError(row, model);
+    const reason = membershipError(row, model, whitelist);
     // Auth and snapshot errors remain distinguishable even when selecting a default.
-    if (reason && !['MODEL_NOT_FOUND', 'MODEL_REMOVED'].includes(reason))
+    if (reason && !['MODEL_NOT_FOUND', 'MODEL_REMOVED', 'MODEL_HIDDEN'].includes(reason))
       throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
     if (!ref) throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DEFAULT_NOT_SET');
     if (reason)
@@ -120,7 +124,7 @@ export function createProviderService(
     assertOpen();
     if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const model = findModel(row.models, modelRef);
-    const reason = membershipError(row, model);
+    const reason = membershipError(row, model, whitelist);
     if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
     const adaptation = resolveEffectiveImage(row, model!);
     if (!adaptation) throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
@@ -201,7 +205,7 @@ export function createProviderService(
       const row = await store.state(actor.userId, false);
       assertOpen();
       if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
-      const providerReason = membershipError(row, undefined);
+      const providerReason = membershipError(row, undefined, whitelist);
       if (providerReason && providerReason !== 'MODEL_NOT_FOUND')
         throw new ProviderError(HTTP_STATUS.CONFLICT, providerReason);
       const indexedRoutes = indexEffectiveImageRoutes(row.routes);
@@ -212,30 +216,34 @@ export function createProviderService(
       );
       const models = [];
       for (const model of row.models) {
-        if (membershipError(row, model) !== null || disabledKeys.has(model.model_key)) continue;
+        if (membershipError(row, model, whitelist) !== null || disabledKeys.has(model.model_key))
+          continue;
         const adaptation = resolveEffectiveImage(row, model, indexedRoutes);
         if (!adaptation || !adaptation.asyncReady) continue;
-        const { paramSpec, requestDefaults, requiresAsync } = adaptation.route;
+        const parameters = deriveImageParameterView(adaptation.route);
         models.push({
           modelRef: modelReference(model.model_key),
           modelId: model.raw_model_id!,
-          name: model.display_name ?? model.raw_model_id!,
+          name:
+            model.display_name ??
+            findCatalogModel(row.catalog_models, model.raw_model_id)?.display_label ??
+            model.raw_model_id!,
           vendor: adaptation.vendor,
           driver: adaptation.profile,
-          supportedOperations: [...paramSpec.supportedOperations],
-          requiresAsync,
-          maxN: paramSpec.maxN,
-          allowExplicitN: paramSpec.allowExplicitN !== false,
-          allowedSizes: paramSpec.allowedSizes ? [...paramSpec.allowedSizes] : null,
-          defaultSize: requestDefaults.defaultSize ?? null,
-          allowCustomDimensions: paramSpec.allowCustomDimensions,
-          allowedAspectRatios: [...paramSpec.allowedAspectRatios],
-          maxReferenceImages: paramSpec.maxReferenceImages,
-          allowGenerateReferences: paramSpec.allowGenerateReferences,
-          allowMaskPng: paramSpec.allowMaskPng,
-          allowedQualities: [...paramSpec.allowedQualities],
-          allowedBackgrounds: [...paramSpec.allowedBackgrounds],
-          allowedOutputFormats: [...paramSpec.allowedOutputFormats],
+          supportedOperations: parameters.supportedOperations,
+          requiresAsync: parameters.requiresAsync,
+          maxN: parameters.maxN,
+          allowExplicitN: parameters.allowExplicitN,
+          allowedSizes: parameters.allowedSizes,
+          defaultSize: parameters.defaultSize,
+          allowCustomDimensions: parameters.allowCustomDimensions,
+          allowedAspectRatios: parameters.allowedAspectRatios,
+          maxReferenceImages: parameters.maxReferenceImages,
+          allowGenerateReferences: parameters.allowGenerateReferences,
+          allowMaskPng: parameters.allowMaskPng,
+          allowedQualities: parameters.allowedQualities,
+          allowedBackgrounds: parameters.allowedBackgrounds,
+          allowedOutputFormats: parameters.allowedOutputFormats,
         });
       }
       return models;
@@ -286,6 +294,18 @@ export function createProviderService(
       assertOpen();
       await store.recordVerification(actor.userId, snapshot, evidence);
     },
+    importRoutes(input: unknown, actor?: RouteRevisionActor) {
+      assertOpen();
+      return store.importRoutes(input, actor);
+    },
+    deleteRoutes(
+      rawModelId: string,
+      actor: RouteRevisionActor,
+      operation?: 'chat' | 'image.generate',
+    ) {
+      assertOpen();
+      return store.deleteRoutes(rawModelId, actor, operation);
+    },
     get(actor: ProviderPrincipal) {
       assertOpen();
       return store.get(actor.userId);
@@ -316,7 +336,11 @@ export function createProviderService(
       assertOpen();
       if (category !== undefined && !categories.includes(category as Category))
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
-      return catalogView(await store.state(actor.userId), category as Category | undefined);
+      return catalogView(
+        await store.state(actor.userId),
+        category as Category | undefined,
+        whitelist,
+      );
     },
     async discover(actor: ProviderPrincipal) {
       assertOpen();

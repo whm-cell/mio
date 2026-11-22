@@ -584,7 +584,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
     const pool = new Pool({ connectionString: database.url });
     try {
       await pool.query(providerSchemaSQL);
-      // Simulate pre-existing legacy mio_provider_model_adaptations + adaptation_origin column
+      // Simulate pre-existing legacy adaptations/policies tables, adaptation_origin, and classification* columns
       await pool.query(`
         CREATE TABLE mio_provider_model_adaptations (
           provider_id uuid NOT NULL,
@@ -598,7 +598,22 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           tested_tuple jsonb,
           PRIMARY KEY(provider_id, model_key, operation)
         );
+        CREATE TABLE mio_provider_model_policies (
+          provider_type text NOT NULL DEFAULT 'onelink',
+          raw_model_id text COLLATE "C" NOT NULL,
+          user_visible boolean NOT NULL DEFAULT true,
+          allow_undiscovered boolean NOT NULL DEFAULT false,
+          display_label text,
+          call_notes text,
+          updated_by text,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (provider_type, raw_model_id)
+        );
         ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text DEFAULT 'owner';
+        ALTER TABLE mio_provider_models
+          ADD COLUMN classification text,
+          ADD COLUMN classification_source text;
       `);
 
       const providerId = randomUUID();
@@ -628,6 +643,10 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
            ($1::uuid,$2::uuid,'chat','openai-chat',1,'verified',now(),'legacy-chat-0','{"adaptationOrigin":"owner","modelId":"deepseek-v4.1-flash"}'::jsonb),
            ($1::uuid,$3::uuid,'image.generate','kling-image-v1',1,'verified',now(),'legacy-img-0','{"modelId":"image-kling-v2-1"}'::jsonb)`,
         [providerId, chatModelKey, unmappedImageKey],
+      );
+      await pool.query(
+        `INSERT INTO mio_provider_model_policies(provider_type,raw_model_id,user_visible,allow_undiscovered,display_label,call_notes,updated_by)
+           VALUES('onelink','legacy-hidden-policy',false,true,'Legacy Hidden','Keep note','ops')`,
       );
 
       await pool.query(assetSchemaSQL);
@@ -695,11 +714,42 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
       await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
       await expect(checkGenerationSchema(pool)).resolves.toBeUndefined();
 
-      // Legacy table is preserved non-destructively; matching chat row migrated; unmapped legacy profile skipped
+      // Backfills matching chat verified row & legacy policy row, then drops retired tables & dead columns
       expect(
         (await pool.query("SELECT to_regclass('mio_provider_model_adaptations') AS name")).rows[0]
           .name,
-      ).toBe('mio_provider_model_adaptations');
+      ).toBeNull();
+      expect(
+        (await pool.query("SELECT to_regclass('mio_provider_model_policies') AS name")).rows[0]
+          .name,
+      ).toBeNull();
+      expect(
+        (
+          await pool.query(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'mio_provider_models'
+               AND column_name IN ('classification', 'classification_source')`,
+          )
+        ).rows,
+      ).toEqual([]);
+      expect(
+        (
+          await pool.query(
+            `SELECT raw_model_id, display_label, user_visible, allow_undiscovered, call_notes, origin_source
+             FROM mio_provider_catalog_models WHERE raw_model_id='legacy-hidden-policy'`,
+          )
+        ).rows,
+      ).toEqual([
+        {
+          raw_model_id: 'legacy-hidden-policy',
+          display_label: 'Legacy Hidden',
+          user_visible: false,
+          allow_undiscovered: true,
+          call_notes: 'Keep note',
+          origin_source: 'admin-manual',
+        },
+      ]);
       const backfilled = (
         await pool.query(
           'SELECT driver, verification_status, tested_tuple FROM mio_provider_model_verifications WHERE provider_id=$1',

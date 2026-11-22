@@ -10,7 +10,16 @@ import { AUTH_BASE_PATH, readAuthConfig, readAuthRateLimitBackend } from './auth
 import { createAuthentication } from './auth/service.ts';
 import { createAuthHandler } from './auth/http.ts';
 import { createRedisRateLimit } from './auth/rate-limit.ts';
-import { createRedisResource, readRedisConfig } from './integrations/redis.ts';
+import {
+  createRedisResource,
+  probeRedisMetrics,
+  readRedisConfig,
+  readRedisMonitorConfig,
+} from './integrations/redis.ts';
+import {
+  probeRabbitmqMetrics,
+  readRabbitmqMonitorConfig,
+} from './integrations/rabbitmq-monitor.ts';
 import { denyModelTools } from './dsh/policy.ts';
 import { readConversationConfig } from './conversations/config.ts';
 import { createConversationStore } from './conversations/store.ts';
@@ -50,6 +59,11 @@ import { createGenerationStore } from './generations/store.ts';
 import { createGenerationService } from './generations/service.ts';
 import type { GenerationService } from './generations/service.ts';
 import { createGenerationHandler } from './generations/http.ts';
+import { readAdminConfig } from './admin/config.ts';
+import { createAdminStore } from './admin/store.ts';
+import { createAdminService } from './admin/service.ts';
+import type { AdminService } from './admin/service.ts';
+import { createAdminHandler } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
@@ -103,7 +117,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const computeConfig = readComputeConfig();
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
   const generationConfig = readGenerationConfig();
+  const adminConfig = readAdminConfig(process.env, authConfig?.origins);
+  const rabbitmqMonitorConfig = adminConfig ? readRabbitmqMonitorConfig() : undefined;
+  const redisMonitorConfig = adminConfig ? readRedisMonitorConfig() : undefined;
   const imageEnabled = Boolean(generationConfig);
+  if (adminConfig && (!authConfig || !providerConfig))
+    throw new Error('ADMIN_CONFIG: authentication and providers required');
   if (materialConfig && (!authConfig || !providerConfig))
     throw new Error('MATERIAL_CONFIG: authentication and providers required');
   if (generationConfig && (!authConfig || !assetConfig || !providerConfig))
@@ -183,6 +202,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
+    let admin: AdminService | undefined;
     if (computeConfig && assetConfig) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
@@ -221,6 +241,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ctx.effect(
           () => () =>
             closeMioResources(
+              () => admin?.close(),
               () => conversations?.close(),
               () => generations?.close(),
               () => materials?.close(),
@@ -236,6 +257,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       } catch (error) {
         await ownedProviders.close();
+        throw error;
+      }
+    }
+    if (adminConfig && providers && providerConfig) {
+      const store = await createAdminStore(adminConfig);
+      let ownedAdmin: AdminService | undefined;
+      try {
+        const acquired =
+          (admin =
+          ownedAdmin =
+            createAdminService(store, providers, providerConfig, undefined, {
+              probeRabbitmq: () => probeRabbitmqMetrics(rabbitmqMonitorConfig),
+              probeRedis: () => probeRedisMetrics(redisMonitorConfig),
+            }));
+        ctx.effect(() => () => acquired.close());
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/admin',
+            handler: createAdminHandler(acquired, adminConfig.allowedOrigins),
+          }),
+        );
+      } catch (error) {
+        await (ownedAdmin ? ownedAdmin.close() : store.close());
         throw error;
       }
     }

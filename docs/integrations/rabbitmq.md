@@ -14,7 +14,7 @@
 
 拓扑采用持久 direct exchange、quorum queue 和各自持久 DLQ，保留 at-least-once 死信、reject-publish、禁用隐式投递次数上限及每队列 1 GiB 消息体 operator policy。命令交换机 `mio.compute.commands.v1` 将 `transcode.v1` 路由至重媒体命令队列 `mio.compute.commands.v1`（死信交换机 `mio.compute.commands.dlx.v1` / 死信队列 `mio.compute.commands.dlq.v1` / `transcode.dead.v1`）。云端图片生成、查询和物化恢复在 A 的 PG/持久目录中执行，不使用 MQ；旧 `mio.compute.image.commands.v1`、DLQ/DLX 和旧 B 权限只供切换前排空对账，初始化不自动删除或改写它们；结果采用 `mio.compute.results.v1`（`transcode.result.v1` 及对应 DLX/DLQ `transcode.result.dead.v1`），A 结果消费通道使用 `prefetch=4` 并在关闭时排空全部在途结果处理后再释放连接。A 建链到通道初始化共用 5 秒启动期限，消费注册受连接取消控制；停机最多等待 5 秒排空，届期通过底层 TCP/TLS 取消终止传输，未完成结果不提前确认。B 每轮重连注销该轮停机订阅，继续响应进程停机。消费确认超时、资源预算与容器日志限制沿[部署说明](../../deploy/rabbitmq/README.md)，不得因本地隔离改弱保护。发布方必须使用自身 `userId`、持久消息、mandatory 和 publisher confirm；消费者核对预期发送身份。队列容量拒绝和未知结果不得冒充成功。
 
-A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute.results.v1`；B 仅读重媒体命令队列 `mio.compute.commands.v1`、写结果交换机 `mio.compute.results.v1`。两者独立密码、无管理标签、无 configure 权限；管理密码只用于部署入口，不传给 A/B。Worker 启动只接收 B 的 MQ 和本环境 COS 配置，不能继承 A 的数据库、认证秘密或管理配置。
+A 仅写命令交换机 `mio.compute.commands.v1`、读结果队列 `mio.compute.results.v1`；B 仅读重媒体命令队列 `mio.compute.commands.v1`、写结果交换机 `mio.compute.results.v1`。两者独立密码、无管理标签、无 configure 权限；管理密码只用于部署入口，不传给 A/B。[管理后台 RabbitMQ 只读监控](../../src/integrations/rabbitmq-monitor.ts)可选通过 `MIO_ADMIN_RABBITMQ_MONITOR_URL` 使用独立 `mio-<env>-monitor` 账号（`tags="monitoring"`，对 `mio-<env>` 的 `configure/write/read` 均为 `^$`，无权收发消息或修改拓扑）只读采集 Management HTTP 概览、节点告警与队列/死信积压指标。Worker 启动只接收 B 的 MQ 和本环境 COS 配置，不能继承 A 的数据库、认证秘密或管理配置。
 
 ## 初始化与验证
 

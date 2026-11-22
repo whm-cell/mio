@@ -4,6 +4,7 @@ import { IMAGE_DRIVERS } from '../../src/generations/contracts.ts';
 import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
 import {
   deriveImageCapabilityMetadata,
+  deriveImageParameterView,
   resolveChatRoute,
   resolveImageRoute,
   validateModelRouteEntry,
@@ -344,9 +345,7 @@ it('validates schema tables, image drivers, and keeps incomplete async routes AD
         legacy_ref: null,
         unavailable_reason: null,
         supplier_metadata: {},
-        classification: 'image' as const,
         metadata_source: 'onelink-v1-models',
-        classification_source: 'route:https://docs.onelinkai.cloud/8653497m0@2026-09-08',
         credential_version: 1,
         catalog_version: 1,
         first_seen_at: now.toISOString(),
@@ -386,9 +385,11 @@ it('validates schema tables, image drivers, and keeps incomplete async routes AD
     ],
   });
   expect(incompleteView.items[0]?.image).toMatchObject({
+    parameters: null,
     runnable: false,
     unavailableReason: 'ADAPTER_PENDING',
   });
+  expect(incompleteView.items[0]?.image.parameters).toBeNull();
 
   const completeView = catalogView({
     ...baseState,
@@ -436,15 +437,128 @@ it('validates schema tables, image drivers, and keeps incomplete async routes AD
       },
     ],
   });
-  expect(completeView.items[0]?.image).toMatchObject({
-    runnable: true,
-    unavailableReason: null,
-    adaptation: {
-      vendor: 'kling',
-      profile: 'kling-images',
-      declarationVersion: 2,
-      verification: { status: 'verified' },
+  const klingRouteConfig = findFixtureImageRouteConfig('image-kling-v3');
+  const expectedKlingParams = deriveImageParameterView(klingRouteConfig);
+  expect(completeView.items[0]).toMatchObject({
+    category: 'image',
+    classificationSource: `route:${klingEntry.source}@${klingEntry.sourceVersion}`,
+    image: {
+      parameters: expectedKlingParams,
+      runnable: true,
+      unavailableReason: null,
+      adaptation: {
+        vendor: 'kling',
+        profile: 'kling-images',
+        declarationVersion: 2,
+        verification: { status: 'verified' },
+      },
     },
   });
+  expect(completeView.items[0]?.image.parameters).toEqual(expectedKlingParams);
+  // Mutating returned arrays must not affect subsequent derivations
+  expectedKlingParams.allowedAspectRatios.push('99:1');
+  expect(deriveImageParameterView(klingRouteConfig).allowedAspectRatios).not.toContain('99:1');
   expect('origin' in (completeView.items[0]?.image?.adaptation ?? {})).toBe(false);
+
+  // Restricted image route exposes exact admin-configured parameter bounds; chat-only model returns parameters: null
+  const seedreamBase = findFixtureRoute('doubao-seedream-4.5', 'image.generate');
+  const restrictedEntry = validateModelRouteEntry({
+    ...seedreamBase,
+    paramSpec: {
+      ...seedreamBase.paramSpec!,
+      allowedSizes: ['2K'],
+      allowCustomDimensions: false,
+      allowedAspectRatios: ['16:9'],
+      maxN: 2,
+    },
+    requestDefaults: {
+      ...seedreamBase.requestDefaults!,
+      defaultSize: '2K',
+    },
+  });
+  const chatEntry = validateModelRouteEntry(findFixtureRoute('deepseek-v4.1-flash', 'chat'));
+  const chatModelKey = '00000000-0000-4000-8000-000000000098';
+  const restrictedModelKey = '00000000-0000-4000-8000-000000000097';
+  const restrictedView = catalogView({
+    ...baseState,
+    models: [
+      {
+        ...baseState.models[0]!,
+        model_key: restrictedModelKey,
+        raw_model_id: 'doubao-seedream-4.5',
+      },
+      {
+        ...baseState.models[0]!,
+        model_key: chatModelKey,
+        raw_model_id: 'deepseek-v4.1-flash',
+      },
+    ],
+    routes: [
+      {
+        provider_type: 'onelink',
+        raw_model_id: restrictedEntry.rawModelId,
+        operation: restrictedEntry.operation,
+        vendor: restrictedEntry.vendor,
+        driver: restrictedEntry.driver,
+        classification: restrictedEntry.classification,
+        submit_path: restrictedEntry.submitPath,
+        edit_path: restrictedEntry.editPath,
+        query_path_template: restrictedEntry.queryPathTemplate,
+        param_spec: restrictedEntry.paramSpec,
+        request_defaults: restrictedEntry.requestDefaults,
+        output_spec: restrictedEntry.outputSpec,
+        capability_metadata: restrictedEntry.capabilityMetadata,
+        source_kind: restrictedEntry.sourceKind,
+        source: restrictedEntry.source,
+        source_version: restrictedEntry.sourceVersion,
+        declaration_version: 1,
+        enabled: true,
+      },
+      {
+        provider_type: 'onelink',
+        raw_model_id: chatEntry.rawModelId,
+        operation: chatEntry.operation,
+        vendor: chatEntry.vendor,
+        driver: chatEntry.driver,
+        classification: chatEntry.classification,
+        submit_path: chatEntry.submitPath,
+        edit_path: chatEntry.editPath,
+        query_path_template: chatEntry.queryPathTemplate,
+        param_spec: chatEntry.paramSpec,
+        request_defaults: chatEntry.requestDefaults,
+        output_spec: chatEntry.outputSpec,
+        capability_metadata: chatEntry.capabilityMetadata,
+        source_kind: chatEntry.sourceKind,
+        source: chatEntry.source,
+        source_version: chatEntry.sourceVersion,
+        declaration_version: 1,
+        enabled: true,
+      },
+    ],
+  });
+  const restrictedItem = restrictedView.items.find((i) => i.modelId === 'doubao-seedream-4.5');
+  const chatOnlyItem = restrictedView.items.find((i) => i.modelId === 'deepseek-v4.1-flash');
+  expect(restrictedItem?.image.parameters).toEqual({
+    supportedOperations: ['generate'],
+    requiresAsync: false,
+    maxN: 2,
+    allowExplicitN: true,
+    allowedSizes: ['2K'],
+    defaultSize: '2K',
+    allowCustomDimensions: false,
+    allowedAspectRatios: ['16:9'],
+    maxReferenceImages: 14,
+    allowGenerateReferences: true,
+    allowMaskPng: false,
+    allowOutpaintGeometry: false,
+    allowedQualities: [],
+    allowedBackgrounds: [],
+    allowedModerations: [],
+    allowedOutputFormats: [],
+    fixedOutputFormat: 'jpeg',
+    allowOutputCompression: false,
+    allowWatermarkOverride: true,
+    defaultWatermark: false,
+  });
+  expect(chatOnlyItem?.image.parameters).toBeNull();
 });

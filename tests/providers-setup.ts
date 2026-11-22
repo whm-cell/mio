@@ -4,6 +4,11 @@ const keys = [
   'MIO_PROVIDERS_DATABASE_URL',
   'MIO_PROVIDERS_MASTER_KEY',
   'MIO_PROVIDERS_MASTER_KEY_ID',
+  'MIO_PROVIDERS_CATALOG_WHITELIST',
+  'MIO_ADMIN_ENABLED',
+  'MIO_ADMIN_ALLOWED_ORIGINS',
+  'MIO_ADMIN_RABBITMQ_MONITOR_URL',
+  'MIO_ADMIN_REDIS_MONITOR_URL',
 ] as const;
 export const inheritedProviderVariableCount = keys.filter(
   (key) => process.env[key] !== undefined,

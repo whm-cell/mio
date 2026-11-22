@@ -1,4 +1,4 @@
-import { monotonicMs } from '@mio/foundation/time';
+import { epochMs, monotonicMs, utcISOString } from '@mio/foundation/time';
 import { createClient, ErrorReply } from '@redis/client';
 
 export interface RedisConfig {
@@ -150,3 +150,242 @@ export async function createRedisResource(
 }
 
 export type RedisResource = Awaited<ReturnType<typeof createRedisResource>>;
+
+export interface RedisMonitorConfig {
+  readonly url: string;
+}
+
+export interface RedisMonitorSnapshot {
+  readonly configured: boolean;
+  readonly status: 'up' | 'down' | 'unconfigured';
+  readonly checkedAt: string;
+  readonly latencyMs: number | null;
+  readonly errorCode: string | null;
+  readonly redisVersion: string | null;
+  readonly uptimeSeconds: number | null;
+  readonly clockDriftMs: number | null;
+  readonly clockHealthy: boolean | null;
+  readonly dbsize: number | null;
+  readonly memory: {
+    readonly usedBytes: number;
+    readonly usedHuman: string;
+    readonly peakBytes: number;
+    readonly peakHuman: string;
+    readonly maxBytes: number;
+    readonly maxHuman: string;
+    readonly policy: string;
+    readonly usageRatio: number | null;
+    readonly fragmentationRatio: number | null;
+    readonly oomRisk: boolean;
+  } | null;
+  readonly clients: {
+    readonly connected: number;
+    readonly blocked: number;
+    readonly rejectedConnections: number;
+  } | null;
+  readonly stats: {
+    readonly instantaneousOpsPerSec: number;
+    readonly totalCommandsProcessed: number;
+    readonly evictedKeys: number;
+    readonly keyspaceHits: number;
+    readonly keyspaceMisses: number;
+  } | null;
+  readonly persistence: {
+    readonly aofEnabled: boolean;
+    readonly aofLastWriteStatus: string;
+    readonly rdbLastBgsaveStatus: string;
+  } | null;
+}
+
+export function readRedisMonitorConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): RedisMonitorConfig | undefined {
+  const raw = env.MIO_ADMIN_REDIS_MONITOR_URL?.trim();
+  if (!raw) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('REDIS_MONITOR_CONFIG: valid MIO_ADMIN_REDIS_MONITOR_URL is required');
+  }
+  if (
+    !['redis:', 'rediss:'].includes(url.protocol) ||
+    !url.hostname ||
+    url.hash ||
+    url.search ||
+    (url.protocol === 'redis:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+  ) {
+    throw new Error('REDIS_MONITOR_CONFIG: use TLS remotely and omit query/fragment');
+  }
+  return { url: raw };
+}
+
+function parseRedisInfo(raw: string): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || line.startsWith('#')) continue;
+    const colon = line.indexOf(':');
+    if (colon <= 0) continue;
+    map.set(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+  }
+  return map;
+}
+
+/** Isolated zero-key-access probe connection; failures never affect the auth rate-limit resource. */
+export async function probeRedisMetrics(
+  config: RedisMonitorConfig | undefined,
+  timeoutMs = 3000,
+): Promise<RedisMonitorSnapshot> {
+  const checkedAt = utcISOString();
+  if (!config) {
+    return {
+      configured: false,
+      status: 'unconfigured',
+      checkedAt,
+      latencyMs: null,
+      errorCode: null,
+      redisVersion: null,
+      uptimeSeconds: null,
+      clockDriftMs: null,
+      clockHealthy: null,
+      dbsize: null,
+      memory: null,
+      clients: null,
+      stats: null,
+      persistence: null,
+    };
+  }
+  const lifetime = new AbortController();
+  const client = createClient({
+    url: config.url,
+    socket: { connectTimeout: timeoutMs, reconnectStrategy: false, signal: lifetime.signal },
+    disableOfflineQueue: true,
+    commandsQueueMaxLength: 16,
+  });
+  const closeClient = () => {
+    lifetime.abort();
+    if (client.isOpen) client.destroy();
+  };
+  client.on('error', () => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const startedAt = monotonicMs();
+  try {
+    const result = await Promise.race([
+      (async () => {
+        await client.connect();
+        const pingStart = monotonicMs();
+        await client.sendCommand(['PING']);
+        const latencyMs = Math.max(0, Math.round((monotonicMs() - pingStart) * 10) / 10);
+        const [timeReply, dbsizeReply, infoReply] = await Promise.all([
+          client.sendCommand(['TIME']),
+          client.sendCommand(['DBSIZE']),
+          client.sendCommand([
+            'INFO',
+            'server',
+            'memory',
+            'clients',
+            'stats',
+            'persistence',
+            'keyspace',
+          ]),
+        ]);
+        const localMs = epochMs();
+        let clockDriftMs: number | null = null;
+        if (Array.isArray(timeReply) && timeReply.length >= 2) {
+          const sec = Number(timeReply[0]);
+          const usec = Number(timeReply[1]);
+          if (Number.isFinite(sec) && Number.isFinite(usec)) {
+            const redisMs = sec * 1000 + Math.round(usec / 1000);
+            clockDriftMs = redisMs - localMs;
+          }
+        }
+        const dbsize = Number.isFinite(Number(dbsizeReply)) ? Number(dbsizeReply) : 0;
+        const info = parseRedisInfo(typeof infoReply === 'string' ? infoReply : '');
+        const intVal = (key: string) => {
+          const n = Number(info.get(key) ?? 0);
+          return Number.isFinite(n) ? n : 0;
+        };
+        const usedBytes = intVal('used_memory');
+        const maxBytes = intVal('maxmemory');
+        const policy = info.get('maxmemory_policy') ?? 'unknown';
+        const usageRatio = maxBytes > 0 ? Math.round((usedBytes / maxBytes) * 10000) / 10000 : null;
+        const fragRaw = Number(info.get('mem_fragmentation_ratio') ?? '');
+        return {
+          configured: true,
+          status: 'up' as const,
+          checkedAt: utcISOString(),
+          latencyMs,
+          errorCode: null,
+          redisVersion: info.get('redis_version') ?? null,
+          uptimeSeconds: intVal('uptime_in_seconds'),
+          clockDriftMs,
+          clockHealthy: clockDriftMs !== null ? Math.abs(clockDriftMs) < 2000 : null,
+          dbsize,
+          memory: {
+            usedBytes,
+            usedHuman: info.get('used_memory_human') ?? `${usedBytes}B`,
+            peakBytes: intVal('used_memory_peak'),
+            peakHuman: info.get('used_memory_peak_human') ?? '0B',
+            maxBytes,
+            maxHuman: info.get('maxmemory_human') ?? (maxBytes > 0 ? `${maxBytes}B` : 'unlimited'),
+            policy,
+            usageRatio,
+            fragmentationRatio: Number.isFinite(fragRaw) ? fragRaw : null,
+            oomRisk: policy === 'noeviction' && usageRatio !== null && usageRatio >= 0.85,
+          },
+          clients: {
+            connected: intVal('connected_clients'),
+            blocked: intVal('blocked_clients'),
+            rejectedConnections: intVal('rejected_connections'),
+          },
+          stats: {
+            instantaneousOpsPerSec: intVal('instantaneous_ops_per_sec'),
+            totalCommandsProcessed: intVal('total_commands_processed'),
+            evictedKeys: intVal('evicted_keys'),
+            keyspaceHits: intVal('keyspace_hits'),
+            keyspaceMisses: intVal('keyspace_misses'),
+          },
+          persistence: {
+            aofEnabled: (info.get('aof_enabled') ?? '0') === '1',
+            aofLastWriteStatus: info.get('aof_last_write_status') ?? 'unknown',
+            rdbLastBgsaveStatus: info.get('rdb_last_bgsave_status') ?? 'unknown',
+          },
+        };
+      })(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('REDIS_MONITOR_TIMEOUT')), timeoutMs);
+      }),
+    ]);
+    return result;
+  } catch (error) {
+    const code =
+      error instanceof ErrorReply
+        ? error.message.startsWith('WRONGPASS') || error.message.startsWith('NOAUTH')
+          ? 'REDIS_AUTH_FAILED'
+          : error.message.startsWith('NOPERM')
+            ? 'REDIS_ACL_DENIED'
+            : 'REDIS_COMMAND_ERROR'
+        : error instanceof Error && error.message === 'REDIS_MONITOR_TIMEOUT'
+          ? 'REDIS_MONITOR_TIMEOUT'
+          : 'REDIS_UNREACHABLE';
+    return {
+      configured: true,
+      status: 'down',
+      checkedAt: utcISOString(),
+      latencyMs: Math.max(0, Math.round((monotonicMs() - startedAt) * 10) / 10),
+      errorCode: code,
+      redisVersion: null,
+      uptimeSeconds: null,
+      clockDriftMs: null,
+      clockHealthy: null,
+      dbsize: null,
+      memory: null,
+      clients: null,
+      stats: null,
+      persistence: null,
+    };
+  } finally {
+    clearTimeout(timer);
+    closeClient();
+  }
+}

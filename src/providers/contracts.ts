@@ -73,6 +73,28 @@ export interface ImageCapabilityMetadata {
     maxAgeSeconds: number;
   };
 }
+export interface ImageParameterView {
+  readonly supportedOperations: ImageOperation[];
+  readonly requiresAsync: boolean;
+  readonly maxN: number;
+  readonly allowExplicitN: boolean;
+  readonly allowedSizes: string[] | null;
+  readonly defaultSize: string | null;
+  readonly allowCustomDimensions: boolean;
+  readonly allowedAspectRatios: string[];
+  readonly maxReferenceImages: number;
+  readonly allowGenerateReferences: boolean;
+  readonly allowMaskPng: boolean;
+  readonly allowOutpaintGeometry: boolean;
+  readonly allowedQualities: ('high' | 'medium' | 'low' | 'auto')[];
+  readonly allowedBackgrounds: ('transparent' | 'opaque' | 'auto')[];
+  readonly allowedModerations: ('low' | 'auto')[];
+  readonly allowedOutputFormats: ('png' | 'jpeg' | 'webp')[];
+  readonly fixedOutputFormat: 'png' | 'jpeg' | 'webp' | null;
+  readonly allowOutputCompression: boolean;
+  readonly allowWatermarkOverride: boolean;
+  readonly defaultWatermark: boolean | null;
+}
 export interface AdaptationCapabilityMetadata {
   contextWindow?: number;
   maxOutputTokens?: number;
@@ -105,8 +127,6 @@ export interface ModelRecord {
   supplier_metadata: Record<string, unknown>;
   display_name: string | null;
   description_override: string | null;
-  classification: Category | null;
-  classification_source: string | null;
   metadata_source: string | null;
   credential_version: number | null;
   catalog_version: number | null;
@@ -144,6 +164,52 @@ export interface VerificationRecord {
   verified_at: string | null;
   verification_evidence: string | null;
   tested_tuple: Record<string, unknown> | null;
+}
+
+export type PlatformModelOriginSource = 'onelink-import' | 'admin-manual' | 'route-import';
+
+export interface PlatformCatalogModelRecord {
+  provider_type: 'onelink';
+  raw_model_id: string;
+  display_label: string | null;
+  vendor_label: string | null;
+  category: Category | null;
+  description: string | null;
+  supplier_metadata: Record<string, unknown>;
+  user_visible: boolean;
+  allow_undiscovered: boolean;
+  call_notes: string | null;
+  origin_source: PlatformModelOriginSource;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type RouteRevisionAction =
+  'create' | 'update' | 'enable' | 'disable' | 'delete' | 'rollback' | 'cli-import';
+
+export interface RouteRevisionActor {
+  readonly actorType: 'admin' | 'cli';
+  readonly actorId?: string | null;
+  readonly actorName: string;
+  readonly summary?: string | null;
+  readonly actionOverride?: 'rollback' | 'cli-import';
+}
+
+export interface PlatformRouteRevisionRecord {
+  id: string;
+  provider_type: 'onelink';
+  raw_model_id: string;
+  operation: 'chat' | 'image.generate';
+  declaration_version: number;
+  action: RouteRevisionAction;
+  actor_type: 'admin' | 'cli';
+  actor_id: string | null;
+  actor_name: string;
+  summary: string | null;
+  before_route: Record<string, unknown> | null;
+  after_route: Record<string, unknown> | null;
+  created_at: string;
 }
 
 export interface ModelRouteInput {

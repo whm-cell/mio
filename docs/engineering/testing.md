@@ -32,6 +32,7 @@ MIO_TEST_PACKED_ARCHIVE="$PWD/.work/packed-test/mio-plugin-0.1.0.tgz" pnpm test 
 - **插件、Profile 与内核**：[插件](../../tests/foundation/plugin.test.ts)、[内核](../../tests/foundation/kernel.test.ts)、[Profile 准备](../../tests/foundation/prepare-profile.test.ts)；装载、关闭与工具拒绝沿 [DSH 集成](../integrations/dsh.md)核对，产物 smoke 另由 `pnpm test:smoke` 执行。
 - **认证、限流与 Redis**：`tests/auth/*.test.ts`、[Redis 公共能力](../../tests/integrations/redis.test.ts)、[认证普通回归](../../tests/auth/auth-redis.test.ts)与[独立 Profile 切换/恢复演练](../../tests/auth/auth-redis-rehearsal.test.ts)。普通回归和三次真实等待各 65 秒的长演练可分别选择，完整检查包含两者；超时、关闭或错误语义变化追查 HTTP、失败无写入与恢复。环境沿 [Redis](../integrations/redis.md#验证入口与变更影响)／[PostgreSQL](../integrations/postgres.md#验证入口与变更影响)契约准备。
 - **供应商与 OneLink**：`tests/providers/*.test.ts`、`tests/onelink/*.test.ts`；共享模型绑定追查对话消费者，领域要求见[供应商规范](../providers.md)／[OneLink 集成](../integrations/onelink.md)。
+- **平台管理后台**：`tests/admin/*.test.ts` 覆盖独立管理员登录与改名/改密、OneLink 内存及加密探测 Key、隐藏屏蔽与未列出隐藏型号补录双向策略、路由修订回滚及跨库脱敏监控；契约见[管理后台 HTTP](../apis/admin.md)。
 - **对话**：`tests/conversations/*.test.ts`；沿[对话规范](../conversations.md)追查 HTTP、执行引擎、Profile、持久化与恢复。
 - **私有素材与 COS**：`tests/assets/*.test.ts`；资源归属、存储和计算输入的消费者见[素材 API](../apis/assets.md)／[COS 集成](../integrations/cos.md)。
 - **素材库**：`tests/materials/*.test.ts` 覆盖账号级凭据、三表迁移、共享池隔离、组内有界同步、墓碑、租约、明确删除与未知结果恢复，协议替身保持离线；现行行为见[素材 HTTP](../apis/materials.md)。

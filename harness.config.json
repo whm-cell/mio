@@ -32,7 +32,14 @@
       "src/providers/schema.ts",
       "src/providers/store.ts",
       "src/providers/contracts.ts",
-      "src/integrations/cos.ts"
+      "src/auth/admin-password.ts",
+      "src/admin/config.ts",
+      "src/admin/contracts.ts",
+      "src/admin/schema.ts",
+      "src/admin/store.ts",
+      "src/integrations/cos.ts",
+      "src/integrations/redis.ts",
+      "src/integrations/rabbitmq-monitor.ts"
     ]
   },
   "documentRoots": [

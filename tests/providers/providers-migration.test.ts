@@ -176,10 +176,10 @@ it('rolls back a failed upgrade entirely and rejects cross-configuration referen
     ).rejects.toThrow();
   }));
 
-it('upgrades an existing catalog non-destructively, drops legacy adaptation_origin, and checks metadata constraints', async () =>
+it('upgrades an existing catalog, retires legacy adaptations/policies tables and classification columns, and checks metadata constraints', async () =>
   databaseTest(async (pool) => {
     await pool.query(providerSchemaSQL);
-    // Simulate pre-existing legacy mio_provider_model_adaptations table and legacy adaptation_origin column
+    // Simulate pre-existing legacy adaptations/policies tables, adaptation_origin, and classification* columns
     await pool.query(`
       CREATE TABLE mio_provider_model_adaptations (
         provider_id uuid NOT NULL,
@@ -193,12 +193,27 @@ it('upgrades an existing catalog non-destructively, drops legacy adaptation_orig
         tested_tuple jsonb,
         PRIMARY KEY(provider_id, model_key, operation)
       );
+      CREATE TABLE mio_provider_model_policies (
+        provider_type text NOT NULL DEFAULT 'onelink',
+        raw_model_id text COLLATE "C" NOT NULL,
+        user_visible boolean NOT NULL DEFAULT true,
+        allow_undiscovered boolean NOT NULL DEFAULT false,
+        display_label text,
+        call_notes text,
+        updated_by text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (provider_type, raw_model_id)
+      );
       ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text DEFAULT 'platform';
+      ALTER TABLE mio_provider_models
+        ADD COLUMN classification text,
+        ADD COLUMN classification_source text;
     `);
     const id = await seed(pool, null);
     await pool.query(
-      `INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata)
-       VALUES($1,'old-exact-ID','{"description":"supplier"}')`,
+      `INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata,classification,classification_source)
+       VALUES($1,'old-exact-ID','{"description":"supplier"}','chat','manual')`,
       [id],
     );
     const modelKey = (
@@ -218,23 +233,79 @@ it('upgrades an existing catalog non-destructively, drops legacy adaptation_orig
        ) VALUES($1,$2,'chat','openai-chat',1,'verified',now(),'legacy-evidence-1','{"adaptationOrigin":"owner","modelId":"old-exact-ID"}'::jsonb)`,
       [id, modelKey],
     );
+    await pool.query(
+      `INSERT INTO mio_provider_catalog_models(
+         provider_type,raw_model_id,display_label,user_visible,allow_undiscovered,call_notes,origin_source,updated_by
+       ) VALUES('onelink','existing-catalog-model','Catalog Label',true,false,'Catalog Note','onelink-import','admin')`,
+    );
+    await pool.query(
+      `INSERT INTO mio_provider_model_policies(
+         provider_type,raw_model_id,user_visible,allow_undiscovered,display_label,call_notes,updated_by
+       ) VALUES
+       ('onelink','legacy-policy-only',false,true,'Legacy Policy Label','Legacy call note','ops'),
+       ('onelink','existing-catalog-model',false,true,'Old Policy Label','Old note','ops')`,
+    );
 
     await pool.query(
       'ALTER TABLE mio_provider_models DROP COLUMN display_name, DROP COLUMN description_override',
     );
-    const before = (await pool.query('SELECT * FROM mio_provider_models')).rows[0];
+    const before = (await pool.query('SELECT * FROM mio_provider_models')).rows[0] as Record<
+      string,
+      unknown
+    >;
     await expect(checkProviderSchema(pool)).rejects.toThrow();
     await pool.query('BEGIN');
     await pool.query(providerSchemaSQL);
     await checkProviderSchema(pool);
     await pool.query('COMMIT');
 
-    // Non-destructive: mio_provider_model_adaptations is preserved, adaptation_origin column is dropped,
-    // and matching verified row is migrated idempotently without adaptationOrigin in tested_tuple.
+    // Backfills matching verified adaptation & legacy policies, then drops retired tables & dead columns.
     expect(
       (await pool.query("SELECT to_regclass('mio_provider_model_adaptations') AS name")).rows[0]
         .name,
-    ).toBe('mio_provider_model_adaptations');
+    ).toBeNull();
+    expect(
+      (await pool.query("SELECT to_regclass('mio_provider_model_policies') AS name")).rows[0].name,
+    ).toBeNull();
+    const deadCols = (
+      await pool.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'mio_provider_models'
+           AND column_name IN ('classification', 'classification_source')`,
+      )
+    ).rows;
+    expect(deadCols).toEqual([]);
+
+    const migratedPolicies = (
+      await pool.query(
+        `SELECT raw_model_id, display_label, user_visible, allow_undiscovered, call_notes, origin_source, updated_by
+         FROM mio_provider_catalog_models
+         WHERE raw_model_id IN ('legacy-policy-only', 'existing-catalog-model')
+         ORDER BY raw_model_id COLLATE "C"`,
+      )
+    ).rows;
+    expect(migratedPolicies).toEqual([
+      {
+        raw_model_id: 'existing-catalog-model',
+        display_label: 'Catalog Label',
+        user_visible: true,
+        allow_undiscovered: false,
+        call_notes: 'Catalog Note',
+        origin_source: 'onelink-import',
+        updated_by: 'admin',
+      },
+      {
+        raw_model_id: 'legacy-policy-only',
+        display_label: 'Legacy Policy Label',
+        user_visible: false,
+        allow_undiscovered: true,
+        call_notes: 'Legacy call note',
+        origin_source: 'admin-manual',
+        updated_by: 'ops',
+      },
+    ]);
+
     const verifications = (
       await pool.query(
         'SELECT driver, declaration_version, verification_status, verification_evidence, tested_tuple FROM mio_provider_model_verifications WHERE provider_id=$1',
@@ -251,8 +322,15 @@ it('upgrades an existing catalog non-destructively, drops legacy adaptation_orig
       },
     ]);
 
+    const {
+      classification: _droppedClass,
+      classification_source: _droppedSource,
+      ...beforeKept
+    } = before;
+    void _droppedClass;
+    void _droppedSource;
     const migrated = (await pool.query('SELECT * FROM mio_provider_models')).rows[0];
-    expect(migrated).toEqual({ ...before, display_name: null, description_override: null });
+    expect(migrated).toEqual({ ...beforeKept, display_name: null, description_override: null });
     expect(migrated).toMatchObject({
       first_seen_at: null,
       last_seen_at: null,

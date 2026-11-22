@@ -33,9 +33,8 @@ CREATE TABLE IF NOT EXISTS mio_provider_models (
   model_key uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   provider_id uuid NOT NULL REFERENCES mio_provider_configs(id),
   raw_model_id text COLLATE "C", legacy_ref text, unavailable_reason text,
-  supplier_metadata jsonb NOT NULL DEFAULT '{}', classification text
-    CHECK(classification IN ('chat','image','video','voice','music')),
-  metadata_source text, classification_source text, credential_version integer, catalog_version integer,
+  supplier_metadata jsonb NOT NULL DEFAULT '{}',
+  metadata_source text, credential_version integer, catalog_version integer,
   first_seen_at timestamptz, last_seen_at timestamptz,
   membership_state text NOT NULL DEFAULT 'historical' CHECK(membership_state IN ('current','removed','historical')),
   UNIQUE(provider_id,model_key), UNIQUE(provider_id,raw_model_id), UNIQUE(provider_id,legacy_ref),
@@ -48,6 +47,9 @@ CREATE TABLE IF NOT EXISTS mio_provider_models (
 ALTER TABLE mio_provider_models
   ADD COLUMN IF NOT EXISTS display_name text,
   ADD COLUMN IF NOT EXISTS description_override text;
+ALTER TABLE mio_provider_models
+  DROP COLUMN IF EXISTS classification,
+  DROP COLUMN IF EXISTS classification_source;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
     AND conname='mio_provider_models_display_name_length') THEN
@@ -175,6 +177,7 @@ DO $$ BEGIN
      AND r.enabled = true
     WHERE a.verification_status = 'verified'
     ON CONFLICT (provider_id, model_key, operation) DO NOTHING;
+    DROP TABLE mio_provider_model_adaptations;
   END IF;
 END $$;
 ${legacyProviderUpgradeSQL}
@@ -188,6 +191,105 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_preferences (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS mio_provider_usage_default
   ON mio_provider_model_preferences(provider_id,usage) WHERE is_default;
+CREATE TABLE IF NOT EXISTS mio_provider_catalog_models (
+  provider_type text NOT NULL DEFAULT 'onelink'
+    CHECK (provider_type = 'onelink'),
+  raw_model_id text COLLATE "C" NOT NULL
+    CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
+  display_label text
+    CHECK (display_label IS NULL OR char_length(display_label) <= 100),
+  vendor_label text
+    CHECK (vendor_label IS NULL OR char_length(vendor_label) <= 64),
+  category text
+    CHECK (category IS NULL OR category IN ('chat', 'image', 'video', 'voice', 'music')),
+  description text
+    CHECK (description IS NULL OR char_length(description) <= 1000),
+  supplier_metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(supplier_metadata) = 'object'),
+  user_visible boolean NOT NULL DEFAULT true,
+  allow_undiscovered boolean NOT NULL DEFAULT false,
+  call_notes text
+    CHECK (call_notes IS NULL OR char_length(call_notes) <= 2000),
+  origin_source text NOT NULL DEFAULT 'admin-manual'
+    CHECK (origin_source IN ('onelink-import', 'admin-manual', 'route-import')),
+  updated_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_type, raw_model_id)
+);
+CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
+  id uuid PRIMARY KEY,
+  provider_type text NOT NULL DEFAULT 'onelink'
+    CHECK (provider_type = 'onelink'),
+  raw_model_id text COLLATE "C" NOT NULL
+    CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
+  operation text NOT NULL
+    CHECK (operation IN ('chat', 'image.generate')),
+  declaration_version integer NOT NULL
+    CHECK (declaration_version >= 1),
+  action text NOT NULL
+    CHECK (action IN ('create', 'update', 'enable', 'disable', 'delete', 'rollback', 'cli-import')),
+  actor_type text NOT NULL
+    CHECK (actor_type IN ('admin', 'cli')),
+  actor_id text,
+  actor_name text NOT NULL
+    CHECK (char_length(btrim(actor_name)) BETWEEN 1 AND 128),
+  summary text
+    CHECK (summary IS NULL OR char_length(summary) <= 500),
+  before_route jsonb
+    CHECK (before_route IS NULL OR jsonb_typeof(before_route) = 'object'),
+  after_route jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT mio_provider_model_route_revisions_after_route_check CHECK (
+    (action = 'delete' AND after_route IS NULL)
+    OR (action <> 'delete' AND after_route IS NOT NULL AND jsonb_typeof(after_route) = 'object')
+  )
+);
+ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
+DO $$
+DECLARE
+  rec record;
+BEGIN
+  FOR rec IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = 'mio_provider_model_route_revisions'::regclass
+      AND contype = 'c'
+      AND (
+        pg_get_constraintdef(oid) LIKE '%cli-import%'
+        OR conname = 'mio_provider_model_route_revisions_after_route_check'
+      )
+  LOOP
+    EXECUTE format('ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT %I', rec.conname);
+  END LOOP;
+  ALTER TABLE mio_provider_model_route_revisions
+    ADD CONSTRAINT mio_provider_model_route_revisions_action_check
+      CHECK (action IN ('create', 'update', 'enable', 'disable', 'delete', 'rollback', 'cli-import')),
+    ADD CONSTRAINT mio_provider_model_route_revisions_after_route_check
+      CHECK (
+        (action = 'delete' AND after_route IS NULL)
+        OR (action <> 'delete' AND after_route IS NOT NULL AND jsonb_typeof(after_route) = 'object')
+      );
+  IF to_regclass('mio_provider_model_policies') IS NOT NULL THEN
+    INSERT INTO mio_provider_catalog_models (
+      provider_type, raw_model_id, display_label, user_visible, allow_undiscovered, call_notes, origin_source, updated_by, created_at, updated_at
+    )
+    SELECT
+      provider_type, raw_model_id, display_label, user_visible, allow_undiscovered, call_notes, 'admin-manual', updated_by, created_at, updated_at
+    FROM mio_provider_model_policies
+    ON CONFLICT (provider_type, raw_model_id) DO NOTHING;
+    DROP TABLE mio_provider_model_policies;
+  END IF;
+  INSERT INTO mio_provider_catalog_models (
+    provider_type, raw_model_id, vendor_label, category, origin_source, created_at, updated_at
+  )
+  SELECT DISTINCT ON (provider_type, raw_model_id)
+    provider_type, raw_model_id, vendor, classification, 'route-import', created_at, updated_at
+  FROM mio_provider_model_routes
+  ORDER BY provider_type, raw_model_id, updated_at DESC
+  ON CONFLICT (provider_type, raw_model_id) DO NOTHING;
+END $$;
+CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_lookup
+  ON mio_provider_model_route_revisions (provider_type, raw_model_id, operation, created_at DESC);
 `;
 
 export async function checkProviderSchema(
@@ -201,8 +303,8 @@ export async function checkProviderSchema(
       [2950, 23, 23, 23, 1184, 23, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
-      'SELECT model_key,provider_id,raw_model_id,supplier_metadata,classification,metadata_source,credential_version,catalog_version,first_seen_at,last_seen_at,membership_state,display_name,description_override FROM mio_provider_models LIMIT 0',
-      [2950, 2950, 25, 3802, 25, 25, 23, 23, 1184, 1184, 25, 25, 25],
+      'SELECT model_key,provider_id,raw_model_id,supplier_metadata,metadata_source,credential_version,catalog_version,first_seen_at,last_seen_at,membership_state,display_name,description_override FROM mio_provider_models LIMIT 0',
+      [2950, 2950, 25, 3802, 25, 23, 23, 1184, 1184, 25, 25, 25],
     ],
     [
       'SELECT provider_type,raw_model_id,operation,vendor,driver,classification,submit_path,edit_path,query_path_template,param_spec,request_defaults,output_spec,capability_metadata,source_kind,source,source_version,declaration_version,enabled,created_at,updated_at FROM mio_provider_model_routes LIMIT 0',
@@ -215,6 +317,14 @@ export async function checkProviderSchema(
     [
       'SELECT provider_id,model_key,usage,enabled,is_default,updated_at FROM mio_provider_model_preferences LIMIT 0',
       [2950, 2950, 25, 16, 16, 1184],
+    ],
+    [
+      'SELECT provider_type,raw_model_id,display_label,vendor_label,category,description,supplier_metadata,user_visible,allow_undiscovered,call_notes,origin_source,updated_by,created_at,updated_at FROM mio_provider_catalog_models LIMIT 0',
+      [25, 25, 25, 25, 25, 25, 3802, 16, 16, 25, 25, 25, 1184, 1184],
+    ],
+    [
+      'SELECT id,provider_type,raw_model_id,operation,declaration_version,action,actor_type,actor_id,actor_name,summary,before_route,after_route,created_at FROM mio_provider_model_route_revisions LIMIT 0',
+      [2950, 25, 25, 25, 23, 25, 25, 25, 25, 25, 3802, 3802, 1184],
     ],
   ] as const) {
     const result = await pool.query(sql);
@@ -239,6 +349,8 @@ export async function checkProviderSchema(
   for (const [table, pkColumns] of [
     ['mio_provider_model_routes', ['provider_type', 'raw_model_id', 'operation']],
     ['mio_provider_model_verifications', ['provider_id', 'model_key', 'operation']],
+    ['mio_provider_catalog_models', ['provider_type', 'raw_model_id']],
+    ['mio_provider_model_route_revisions', ['id']],
   ] as const) {
     const pk = await pool.query<{
       unique: boolean;

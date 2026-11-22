@@ -2,6 +2,7 @@ export interface ProviderConfig {
   databaseURL: string;
   masterKey: Buffer;
   masterKeyId: string;
+  catalogWhitelist?: boolean;
 }
 
 /** Explicit opt-in, with a dedicated key. There is no credential or database fallback. */
@@ -19,7 +20,11 @@ export function readProviderConfig(
     const masterKey = Buffer.from(encoded, 'base64');
     if (masterKey.length !== 32 || masterKey.toString('base64') !== encoded) throw new Error();
     if (!masterKeyId || !/^[A-Za-z0-9_-]{1,64}$/.test(masterKeyId)) throw new Error();
-    return { databaseURL, masterKey, masterKeyId };
+    const whitelistFlag = env.MIO_PROVIDERS_CATALOG_WHITELIST;
+    if (whitelistFlag !== undefined && whitelistFlag !== 'true' && whitelistFlag !== 'false')
+      throw new Error();
+    const catalogWhitelist = whitelistFlag === 'true' || env.MIO_ADMIN_ENABLED === 'true';
+    return { databaseURL, masterKey, masterKeyId, catalogWhitelist };
   } catch {
     throw new Error(
       'PROVIDER_CONFIG: explicit PostgreSQL URL, 32-byte base64 master key and key ID required',

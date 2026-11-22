@@ -4,7 +4,7 @@
 
 实现采用 Better Auth 1.7.18 与 PostgreSQL，驱动版本和数据库公共约束见 [PostgreSQL 使用契约](integrations/postgres.md)。复用库的密码派生、签名 cookie、会话过期和撤销，不自行设计密码学或 JWT。认证表由固定版本的库模型定义；升级须审阅迁移和公开接口并重跑真实 DB、DSH 与打包产物验证。
 
-[用户万联配置](providers.md)通过装配注入的 `Authentication.identity` 消费同一可信身份，独立检查 owner；不复用认证池或 secret 加密供应商 Key，不增加管理员/团队角色。其迁移、凭据生命周期与外部目录请求按本域规范维护。
+[用户万联配置](providers.md)通过装配注入的 `Authentication.identity` 消费同一可信身份，独立检查 owner；不复用认证池或 secret 加密供应商 Key，C 端认证表不增加管理员/团队角色。平台管理后台使用独立的管理员账号与会话表（复用 `better-auth/crypto` 的密码派生与校验能力），与普通用户会话完全隔离，见[管理后台 HTTP](apis/admin.md)。其迁移、凭据生命周期与外部目录请求按本域规范维护。
 
 ## 配置与迁移
 

@@ -50,7 +50,7 @@
 | 新增 `GET /canvases/{id}`、`PATCH /canvases/{id}`、`DELETE /canvases/{id}`                      | 详情返回 `id, projectId, title, revision, document`。PATCH 传 `requestId, baseRevision` 和文档或标题，返回已保存版本。过期写入返回 409，告知当前版本。归档最后一张活动画布由服务端拒绝。 |
 | 复用 Mio 登录、`GET /api/auth/get-session`、`GET /me`                                           | 没有会话时进入已启用的登录方式，例如 `POST /api/auth/sign-in/email`。登录后带 Cookie 访问画布。get-session 可刷新会话，me 返回可信 `userId, sessionId`。账户资料面板另沿账号域适配。     |
 
-**C1 与前端**　先接 `CanvasProjects.js`、`UseCanvasProjects.js` 和 `CanvasPage.jsx` 的正式登录、建项目、打开入口，再接 `api/canvas.js`、`CanvasSaveSession.js` 的保存队列。由画布请求层把 camelCase 转为页面使用的字段，并读取 Mio 的错误体。替换 token/refresh 前置判断。把旧 `client_save_id/base_revision` 映射为稳定的 `requestId/baseRevision`。账号切换清理旧缓存和订阅。服务端校验节点唯一、父组存在且无环、有序来源指向本画布节点。以节点有序来源及槽位为准，按序列化规则校核重复表达的 `businessBindings`，不一致时保留原稿并报错。拖动、框选、连线、折叠与撤销沿已有本地交互，保存时统一提交。[前端保存队列](https://github.com/miioo-aigc/miioo/blob/1c1b36339afb1f0db026d0809a3c688d285200c2/frontend/src/components/canvas/CanvasSaveSession.js)
+**C1 与前端**　先接 `CanvasProjects.js`、`UseCanvasProjects.js` 和 `CanvasPage.jsx` 的正式登录、建项目、打开入口，再接 `api/canvas.js`、`CanvasSaveSession.js` 的保存队列。由画布请求层把 camelCase 转为页面使用的字段，并读取 Mio 的错误体。替换 token/refresh 前置判断。把旧 `client_save_id/base_revision` 映射为稳定的 `requestId/baseRevision`。账号切换清理旧缓存和订阅。服务端校验节点唯一、父组存在且无环、有序来源指向本画布节点。新建文档为空。第 1 期保存仅接受已开放的字段，提前传入资产或结果引用时拒绝整次写入。第 2 期开放后按引用归属校验。以节点有序来源及槽位为准，按序列化规则校核重复表达的 `businessBindings`，不一致时保留原稿并报错。拖动、框选、连线、折叠与撤销沿已有本地交互，保存时统一提交。[前端保存队列](https://github.com/miioo-aigc/miioo/blob/1c1b36339afb1f0db026d0809a3c688d285200c2/frontend/src/components/canvas/CanvasSaveSession.js)
 
 **验收**　登录后建项目并模拟丢失创建响应，同键重试只得到原项目和首张画布。添加第二张，移动节点、连线、分组、缩放，关页重开后逐项一致。两个标签页从同一版本保存不同修改，后到者看到冲突并保留本地草稿。两个并发归档请求不能删空活动项目。验证确立的大小边界，超出时返回 413，原版仍能打开。另一账号读取或修改该画布不能取得内容。
 
@@ -65,9 +65,9 @@
 | 新增 `GET /canvases/{id}/nodes/{nodeId}/results`、`POST /canvases/{id}/nodes/{nodeId}/results` | GET 返回批次、分页游标、当前结果和 `outputVersion`。POST 传 `requestId, expectedOutputVersion`，登记手工文本或本人 ready 的同类型资产，可在同次提交中选为当前输出。成功返回结果 ID 和版本。                                                                              |
 | 新增 `PUT /canvases/{id}/nodes/{nodeId}/current-result`                                        | 接收 `requestId, expectedOutputVersion, resultId`，只允许选择本节点已有结果。旧版本返回 409。                                                                                                                                                                            |
 
-**C1 与前端**　先替换 `canvasAssets.js` 的旧媒体中转上传，再调整 `CanvasAssetResolver.js` 和资产选择器，展示优先用预览地址，到期按 ID 重取。接入手工正文和选图动作后，`CanvasResultMutations.js` 依据服务端结果更新视图。文档写入剥离签名地址、任务身份和客户端自报的生成历史。新建节点从空结果开始，旧 `migrate-legacy` 调用退出新建路径。[媒体解析](https://github.com/miioo-aigc/miioo/blob/1c1b36339afb1f0db026d0809a3c688d285200c2/frontend/src/components/canvas/CanvasAssetResolver.js) · [已有素材登记契约](../../apis/materials.md)
+**C1 与前端**　先替换 `canvasAssets.js` 的旧媒体中转上传，再调整 `CanvasAssetResolver.js` 和资产选择器，展示优先用预览地址，到期按 ID 重取。接入手工正文和选图动作后，`CanvasResultMutations.js` 依据服务端结果更新视图。文档写入剥离签名地址、任务身份和客户端自报的生成历史。对允许持久化的引用，创建和 PATCH 在写入前核实每个资产属于本人、每个结果属于该画布内声明的来源节点。任一校验失败时整次写入被拒绝，原文档和 revision 保持可读。新建节点从空结果开始，旧 `migrate-legacy` 调用退出新建路径。[媒体解析](https://github.com/miioo-aigc/miioo/blob/1c1b36339afb1f0db026d0809a3c688d285200c2/frontend/src/components/canvas/CanvasAssetResolver.js) · [已有素材登记契约](../../apis/materials.md)
 
-**验收**　用户直传一张图，确认后等待预览地址失效或用受控时钟模拟，重开仍显示同一 `assetId`。登记 A、B 两个文本结果并选 A，刷新后保留 A，旧标签页的选择请求收到 409。批量读取混入无权 ID 时，其余本人结果仍可展示。暂时读取失败可重试，原文档引用仍在。通过正常保存入口提交伪造的生成成功信息不能产生可信结果。同一手工写入重放只生成一条。
+**验收**　用户直传一张图，确认后等待预览地址失效或用受控时钟模拟，重开仍显示同一 `assetId`。登记 A、B 两个文本结果并选 A，刷新后保留 A，旧标签页的选择请求收到 409。批量读取混入无权 ID 时，其余本人结果仍可展示。暂时读取失败可重试，原文档引用仍在。用 A 的会话保存含 B 的资产或结果 ID 的文档，再用 A 的同画布其他节点结果冒充指定来源，两种请求均被拒绝。重新 GET 的 revision 和正文与请求前一致。通过保存入口自报生成成功不能产生可信结果。同一手工写入重放只生成一条。
 
 ## 第 3 期 · 图片节点执行与恢复
 

@@ -262,7 +262,7 @@ it('bounds already executed but unanswered consumption, ignores late replies and
     (error: unknown) => error,
   );
   await vi.waitFor(async () => expect(await server.client.keys(`${prefix}*`)).toHaveLength(1));
-  expect(relay.heldBytes).toBeGreaterThan(0);
+  await vi.waitFor(() => expect(relay.heldBytes).toBeGreaterThan(0));
   expect(await result).toMatchObject({ kind: 'unknown' });
   const elapsed = performance.now() - started;
   expect(elapsed).toBeGreaterThanOrEqual(980);

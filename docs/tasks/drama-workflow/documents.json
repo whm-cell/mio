@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/drama-workflow/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/drama-workflow/prd.md"
+    }
+  ]
+}

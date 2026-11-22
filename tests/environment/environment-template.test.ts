@@ -127,12 +127,14 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
     ...assetSettings,
     ...adminSettings,
     ...enableSwitches,
+    MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
     MIO_MATERIALS_PUBLIC_BASE_URL: 'https://materials.example.com',
   };
   const template = await readTemplate(templatePath);
   const { optional } = assignmentKeys(template);
   expect(optional).toEqual(Object.keys(optIns).sort());
   const examples = parseEnv(template.replace(assignmentPrefix, '$2='));
+  expect(examples.MIO_AUTH_EMAIL_PASSWORD_ENABLED).toBe('false');
   const invalidSwitches = Object.entries(enableSwitches)
     .filter(([key, value]) => examples[key] !== value)
     .map(([key]) => key);
@@ -141,6 +143,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   const runtime = (await initialize('test')).runtime;
   const configured = { ...runtime, ...optIns };
   const auth = readAuthConfig(configured);
+  expect(auth?.emailPasswordEnabled === false, 'MIO_AUTH_EMAIL_PASSWORD_ENABLED').toBe(true);
   expect(auth?.sms !== undefined, 'MIO_AUTH_SMS_ENABLED').toBe(true);
   expect(auth?.wechat !== undefined, 'MIO_AUTH_WECHAT_ENABLED').toBe(true);
   const providers = readProviderConfig(configured);
@@ -201,6 +204,24 @@ it('keeps optional domains off after initialization and preserves switch semanti
     expect(readAuthConfig({ ...runtime, [key]: 'false' })?.[field] === undefined, key).toBe(true);
     expect(() => readAuthConfig({ ...runtime, [key]: '' }), key).toThrow('AUTH_CONFIG');
   }
+  expect(
+    readAuthConfig(runtime)?.emailPasswordEnabled === true,
+    'MIO_AUTH_EMAIL_PASSWORD_ENABLED',
+  ).toBe(true);
+  expect(
+    readAuthConfig({ ...runtime, MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false' })
+      ?.emailPasswordEnabled === false,
+    'MIO_AUTH_EMAIL_PASSWORD_ENABLED',
+  ).toBe(true);
+  expect(
+    readAuthConfig({ ...runtime, MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true' })
+      ?.emailPasswordEnabled === true,
+    'MIO_AUTH_EMAIL_PASSWORD_ENABLED',
+  ).toBe(true);
+  expect(
+    () => readAuthConfig({ ...runtime, MIO_AUTH_EMAIL_PASSWORD_ENABLED: '' }),
+    'MIO_AUTH_EMAIL_PASSWORD_ENABLED',
+  ).toThrow('AUTH_CONFIG');
   expect(
     readAdminConfig({ ...runtime, MIO_ADMIN_ENABLED: 'false' }, ['http://localhost:4310']) ===
       undefined,

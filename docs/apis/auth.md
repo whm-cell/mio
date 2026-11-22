@@ -4,9 +4,11 @@
 
 ## 本域共同约定
 
-只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST 必须携带允许的 Origin 和 JSON，正文最多 16 KiB、读取超时 10 秒。浏览器请求使用 `credentials: 'include'`。
+只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST 与 PATCH 必须携带允许的 Origin 和 JSON，正文最多 16 KiB、读取超时 10 秒。浏览器请求使用 `credentials: 'include'`。
 
-OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST 与预检才返回 403。
+OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH 与预检才返回 403。
+
+当 `MIO_AUTH_EMAIL_PASSWORD_ENABLED=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
@@ -103,7 +105,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。当请求携带 `Sec-Fetch-Dest: iframe`、未携带 `mio_bridge`、缺少对应协议的 state Cookie（HTTPS 为 `__Secure-mio.state`，回环 HTTP 为 `mio.state`）且 `state` 为非空且不超过 512 字符的字符串时，适配器在完成 Origin、方法与微信启用检查后不进入认证库，直接返回 200 `text/html; charset=utf-8` 固定同源桥接页（无动态插值，内联脚本仅为当前 URL 添加 `mio_bridge=1` 并执行 `location.replace`），保留 `X-Request-Id`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`，并设置 `X-Frame-Options: SAMEORIGIN`、`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; frame-ancestors 'self'` 与 `Referrer-Policy: no-referrer`；浏览器在同源 iframe 内发起第二跳并附带 state Cookie 后，适配器移除 `mio_bridge` 并交由认证库完成校验与 302 重定向。
 
-错误：缺少或错误 state Cookie、重复 state 为 400；已携带 `mio_bridge` 的第二跳若仍缺少或错配 state Cookie，直接交由认证库返回 400 `STATE_MISMATCH` 且不再返回桥接页（零循环）。非 iframe 请求、缺少或超长 `state` 不触发桥接；微信未启用时即使携带 `Sec-Fetch-Dest: iframe` 仍返回 503 `WECHAT_UNAVAILABLE`。库拒绝过期 state、供应商失败、被占用微信或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
+错误：缺少或错误 state Cookie、重复 state 为 400；已携带 `mio_bridge` 的第二跳若仍缺少或错配 state Cookie，直接交由认证库返回 400 `STATE_MISMATCH` 且不再返回桥接页（零循环）。非 iframe 请求、缺少或超长 `state` 不触发桥接；微信未启用时即使携带 `Sec-Fetch-Dest: iframe` 仍返回 503 `WECHAT_UNAVAILABLE`。库拒绝过期 state、供应商失败、被占用微信、已禁用账号（`ACCOUNT_DISABLED`）或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
 
 副作用：第一跳 iframe 桥接不调用认证库，不消费 `/callback/wechat` 限流额度，也不触碰数据库或微信接口。进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
 
@@ -129,7 +131,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：返回 `{status:true}` 并设置会话 Cookie，已有号码登录其所属用户，新号码自助注册。
 
-错误：输入、验证码或用途无效为 400，短信未启用为 503。
+错误：输入、验证码或用途无效为 400，账号已禁用为 403 `ACCOUNT_DISABLED`，短信未启用为 503。
 
 副作用：原子消费验证码，再创建或查询用户并创建库会话；后续失败不恢复该码，需重新请求。
 
@@ -165,9 +167,9 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：成功建立账号和会话，`emailVerified=false`。
 
-错误：重复邮箱或无效输入按固定库响应失败；客户端不能自授验证状态。
+错误：重复邮箱、无效输入或伪造受保护字段（如 `displayId`、`avatarAssetId`、`disabledAt`）按固定库响应返回 400；邮箱密码开关关闭时返回 503 `EMAIL_PASSWORD_UNAVAILABLE`；客户端不能自授验证或禁用状态。
 
-副作用：创建持久账号及会话，签发 cookie；首期不验证邮箱。
+副作用：创建持久账号（自动分配唯一 `displayId`）及会话，签发 cookie；首期不验证邮箱。
 
 ## POST /api/auth/sign-in/email
 
@@ -177,7 +179,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：成功签发会话 cookie。
 
-错误：错误凭据返回 401；其他错误按本域共同约定。
+错误：错误凭据返回 401；凭据正确但账号已禁用返回 403 `ACCOUNT_DISABLED` 且不签发 cookie；邮箱密码开关关闭返回 503 `EMAIL_PASSWORD_UNAVAILABLE`；其他错误按本域共同约定。
 
 副作用：建立持久会话与 cookie。
 
@@ -187,11 +189,11 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：无正文。
 
-成功：返回会话和用户，无有效会话时返回 `null`。
+成功：返回会话和用户，无有效会话或账号已禁用时返回 `null`。
 
 错误：按本域共同约定，不能把无会话的 null 当作 /me 的 401。
 
-副作用：按刷新条件续期数据库会话及 cookie；客户端通过本入口刷新 cookie。
+副作用：按刷新条件续期数据库会话及 cookie；客户端通过本入口刷新 cookie。若发现账号已禁用，删除对应遗留会话行与 cookie 并返回 `null`。
 
 ## POST /api/auth/sign-out
 
@@ -213,7 +215,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：验证旧密码后修改密码，沿固定库响应。
 
-错误：旧密码或输入不合法按库响应失败；其他错误见共同约定。
+错误：旧密码或输入不合法按库响应失败；账号已禁用返回 401；邮箱密码开关关闭返回 503 `EMAIL_PASSWORD_UNAVAILABLE`；其他错误见共同约定。
 
 副作用：修改密码；最后一项为 true 时撤销其他会话。
 
@@ -267,12 +269,36 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 ## GET /api/v1/me
 
-身份：Cookie 经数据库校验后的可信身份；服务 token 不能替代。
+身份：Cookie 经数据库校验后的未禁用可信身份；服务 token 不能替代。
 
 输入：无正文。
 
 成功：返回 `{userId,sessionId}`。
 
-错误：无效、过期、撤销或仅有服务 token 时返回 401；其他错误见共同约定。
+错误：无效、过期、撤销、账号已禁用或仅有服务 token 时返回 401；其他错误见共同约定。
 
 副作用：只校验身份，不刷新会话或 cookie，也不授予项目/资产访问权。
+
+## GET /api/v1/me/profile
+
+身份：Cookie 经数据库校验后的未禁用可信身份；服务 token 不能替代。
+
+输入：无正文。Origin 可省略，提供时必须在允许列表内。
+
+成功：200 和 `{userId,displayId,name,avatarAssetId,phoneNumber,phoneNumberVerified,wechatBound}`；`displayId`、`avatarAssetId` 与 `phoneNumber` 可为 `null`，不返回密码哈希、邮箱占位、供应商 token 或头像签名 URL。
+
+错误：未登录、会话失效或账号已禁用返回 401 `UNAUTHORIZED`；来源或方法错误与数据库故障沿共同约定。
+
+副作用：只读取当前用户资料与微信绑定状态，不刷新会话或写入数据。
+
+## PATCH /api/v1/me/profile
+
+身份：Cookie 经数据库校验后的未禁用可信身份；读取正文后重新核对身份。
+
+输入：JSON 对象，至少包含 `name` 或 `avatarAssetId` 之一，拒绝任何其他字段（包括 `displayId`、`disabled`、`email`、`phoneNumber`）。`name` 为去首尾空白后 1–50 个 Unicode 字符且不含控制字符的字符串；`avatarAssetId` 为小写 UUID v4 或 `null`。来源、JSON、16 KiB 与 10 秒读取期限沿共同约定。
+
+成功：200，返回更新后的完整用户资料对象（结构同 `GET /api/v1/me/profile`）。
+
+错误：字段非法或头像资产非 `image/jpeg`、`image/png`、`image/webp` 返回 400 `INVALID_INPUT`；未登录或账号已禁用返回 401 `UNAUTHORIZED`；头像资产不存在或不属于当前用户返回 404 `ASSET_NOT_FOUND`；头像资产非 `ready` 返回 409 `ASSET_NOT_READY`；资产服务未装配或不可用时设置非空头像返回 503 `ASSET_UNAVAILABLE`；正文与来源错误沿共同约定。
+
+副作用：设置非空 `avatarAssetId` 前经装配注入的资产服务核验归属、就绪状态与图片 MIME；在单事务内更新当前未禁用用户的对应字段与 `updatedAt`，不修改 `displayId` 或登录凭据。

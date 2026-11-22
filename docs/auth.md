@@ -19,6 +19,7 @@
 | `MIO_AUTH_DATABASE_URL`                                                                                                                                                   | 专用 PostgreSQL 数据库连接，凭据只在服务端持有                                                   |
 | `MIO_AUTH_ALLOWED_ORIGINS`                                                                                                                                                | 额外精确 origin 的 JSON 数组，默认 `[]`；BASE_URL 自身自动包含，禁止通配符                       |
 | `MIO_AUTH_RATE_LIMIT_BACKEND`                                                                                                                                             | `database`（缺省）或显式 `redis`；Redis 资源配置见[公共契约](integrations/redis.md)              |
+| `MIO_AUTH_EMAIL_PASSWORD_ENABLED`                                                                                                                                         | 默认 `true`；设为 `false` 时关闭邮箱密码注册、登录与改密，仅影响邮箱入口，不影响短信与微信       |
 | `MIO_AUTH_SMS_ENABLED`                                                                                                                                                    | 默认 `false`；设为 `true` 时须完整配置腾讯短信，见[短信契约](integrations/tencent-sms.md)        |
 | `MIO_TENCENT_SMS_SECRET_ID`、`MIO_TENCENT_SMS_SECRET_KEY`、`MIO_TENCENT_SMS_APP_ID`、`MIO_TENCENT_SMS_SIGN_NAME`、`MIO_TENCENT_SMS_TEMPLATE_ID`、`MIO_TENCENT_SMS_REGION` | 启用短信时全部必填；模板须接受验证码和有效分钟数两个参数                                         |
 | `MIO_AUTH_SMS_PHONE_HOUR_LIMIT`、`MIO_AUTH_SMS_PHONE_DAY_LIMIT`、`MIO_AUTH_SMS_IP_HOUR_LIMIT`、`MIO_AUTH_SMS_IP_DAY_LIMIT`、`MIO_AUTH_SMS_GLOBAL_DAY_LIMIT`               | 可选正整数，只允许收紧默认额度，依次最多 5、10、20、100、1000                                    |
@@ -39,7 +40,11 @@ pnpm start:dev
 
 探测返回真实列顺序、类型、nullable、default、注释和序列归属，并保留内部迁移表选项、Better Auth 表／列差异、额外无默认必填列检查及启动／迁移的必需索引检查。运行时结构检查不代表持续索引巡检。配置显式保留 `transaction:true`；注册事务、认证池所有者及关闭责任不变，不自动修改目标结构。
 
-认证基础 schema 包括可空且唯一的手机号、验证码挑战、短信预算键表及账号复合唯一索引。运行与显式迁移都检查基础结构；短信事件表的迁移和启用条件见[发送预算切换与回退](#发送预算切换与回退)。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更。启用供应商但配置不全会拒绝装载；未启用时相应入口返回不可用，不影响邮箱入口。
+认证基础 schema 包括可空且唯一的手机号与 `displayId`、账号禁用列 `disabled`（默认 `false`）与 `disabledAt`、头像资产引用 `avatarAssetId`、验证码挑战、短信预算键表及账号复合唯一索引。运行与显式迁移都检查基础结构；短信事件表的迁移和启用条件见[发送预算切换与回退](#发送预算切换与回退)。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更；对已有用户表执行 `auth:migrate --apply` 时，`disabled` 按列默认值回填为 `false`，`displayId` 与 `avatarAssetId` 保持可空兼容。启用供应商但配置不全会拒绝装载；未启用或关闭配置开关时相应入口返回不可用，不影响其余已启用入口。
+
+新注册用户（邮箱、手机或微信）在创建事务内自动分配唯一 `displayId`（`miioo_` 加 6 位数字）；客户端注册输入不可伪造 `displayId`、`avatarAssetId`、`disabled` 或 `disabledAt`。通过事务性服务方法 `Authentication.setUserDisabled(userId, disabled)` 禁用账号时，在同一 PostgreSQL 事务内写入禁用状态并删除该用户全部活动会话；禁用账号无法通过邮箱、短信验证码、微信 OAuth 或微信 QR 签发新会话，若存在并发或遗留会话行，`/api/v1/me`、`/api/v1/me/profile`、`Authentication.identity`、`/api/auth/get-session` 及受会话保护的认证入口均将其视为无效并清理会话。重新启用后恢复登录能力，不恢复已撤销会话。
+
+用户资料通过 `GET /api/v1/me/profile` 与 `PATCH /api/v1/me/profile` 读写，仅允许修改昵称（`name`）与头像资产（`avatarAssetId`）；非空 `avatarAssetId` 须经装配注入的资产核验回调确认属于本人、状态 `ready` 且 MIME 为 `image/jpeg`、`image/png` 或 `image/webp`，不在认证表持久化签名 URL。`src/auth` 不直接导入 `src/assets`。
 
 微信 QR polling 使用同一认证库中的 `mioWechatQR` 模型，包含不透明 ID、唯一且可空的 OAuth state 摘要、QR Cookie 摘要、带索引的状态与过期时间，以及可空的确认用户、确认时间和失败原因码。模型通过 `authOptions` 的插件 schema 进入现有显式迁移与启动检查；即使微信关闭，升级后也须先显式迁移 QR 结构才能启用认证。QR 表不保存 state、Cookie、Session secret 或供应商 token 明文；Better Auth 自身的数据库 OAuth state 仍沿用原策略，不受这条 QR 表存储规则替代。
 
@@ -101,7 +106,7 @@ pnpm auth:migrate --rollback-sms-budget --apply
 ## 职责与限制
 
 - [认证配置](../src/auth/config.ts)的 `readAuthConfig` 与 `authOptions` 由装配、运行时和显式迁移按职责复用；`AUTH_BASE_PATH` 是库选项、插件前缀注册和认证 HTTP 路径截取的同一权威值。`service.ts` 持有认证库与 DB 池，`http.ts` 负责白名单、来源和响应适配，并使用 A 内共同有界读取取得原始正文；`plugin.ts` 仅装配与释放。响应头、包装错误与读取入口见 [API 领域导航](apis/index.md#运行时公共能力)，库原始响应仍由认证适配器转发。
-- [认证服务](../src/auth/service.ts)的 `Authentication.identity(headers)` 返回经数据库验证的 `{userId,sessionId}` 或 `null`；`/api/v1/me` 和[对话 HTTP](../src/conversations/http.ts)是实际消费者，调用时禁止刷新会话。装配入口注入身份解析能力，再把可信主体传给[对话应用服务](../src/conversations/service.ts)检查资源归属；应用服务不依赖 Node HTTP、DSH 或认证驱动，也不信任请求体 userId 或服务 token。长流失效与已受理轮次的关系按[对话规范](conversations.md)执行。项目 CRUD 尚未实现。
+- [认证服务](../src/auth/service.ts)的 `Authentication.identity(headers)` 返回经数据库验证且未禁用账号的 `{userId,sessionId}` 或 `null`；`/api/v1/me`、`/api/v1/me/profile` 和[对话 HTTP](../src/conversations/http.ts)等业务适配器是实际消费者，调用时禁止刷新会话。`Authentication.profile`、`updateProfile` 与 `setUserDisabled` 分别承载当前用户资料读写及事务性账号禁启用与会话撤销。装配入口注入身份解析能力及窄头像资产核验回调，再把可信主体传给[对话应用服务](../src/conversations/service.ts)等业务服务检查资源归属；应用服务不依赖 Node HTTP、DSH 或认证驱动，也不信任请求体 userId 或服务 token。长流失效与已受理轮次的关系按[对话规范](conversations.md)执行。项目 CRUD 尚未实现。
 - 首期邮箱未验证，不能凭同邮箱自动合并第三方账号，也不能用于团队邀请信任或邮件找回；微信显式绑定依靠当前会话与微信授权。邮箱验证、邮件找回、MFA、团队与生成分别按后续契约接入；未开放的入口返回 404。
 - 数据库凭据与错误脱敏按 [PostgreSQL 使用契约](integrations/postgres.md#必须遵守的约束)执行；密码、cookie、会话 token 和部署秘密不写入公共日志或报告。
 

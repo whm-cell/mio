@@ -4,6 +4,7 @@ import type { BetterAuthPlugin } from 'better-auth';
 import { APIError, createAuthEndpoint, getSession, signInSocial } from 'better-auth/api';
 import { randomBytes } from 'node:crypto';
 import type { Pool } from 'pg';
+import { isUserDisabled } from './account.ts';
 import { wechatCallbackURL } from './wechat-input.ts';
 import {
   correlateWechatQR,
@@ -88,7 +89,7 @@ export function wechatQRPlugin(baseURL: string, pool: Pool): BetterAuthPlugin {
               query: { disableCookieCache: true, disableRefresh: true },
               asResponse: false,
             });
-            return identity
+            return identity && !isUserDisabled(identity.user)
               ? { userId: identity.user.id, sessionId: identity.session.id }
               : undefined;
           }).catch(wechatUnavailable);

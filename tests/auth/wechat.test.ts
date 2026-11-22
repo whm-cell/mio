@@ -1139,6 +1139,7 @@ it('prevents iframe bridge loops, enforces non-iframe and cookie guards, and str
         secret,
         databaseURL: database.url,
         origins: ['http://localhost'],
+        emailPasswordEnabled: true,
         smsLimits: { phoneHour: 5, phoneDay: 10, ipHour: 20, ipDay: 100, globalDay: 1000 },
         wechat: { appId, appSecret: 'fixture-secret' },
       },

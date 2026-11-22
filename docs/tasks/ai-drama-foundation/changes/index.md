@@ -1,7 +1,8 @@
 # 轻量变更索引
 
-| ID                                  | 类型       | 标题                         | 父 PRD 章节      | 详情                                                    |
-| ----------------------------------- | ---------- | ---------------------------- | ---------------- | ------------------------------------------------------- |
-| auth-schema-introspection-isolation | adjustment | 认证元数据探测的 schema 隔离 | 架构前提与未决项 | [详情](./auth-schema-introspection-isolation/change.md) |
-| phone-wechat-auth                   | feature    | 手机号与微信认证扩展         | 架构前提与未决项 | [详情](./phone-wechat-auth/change.md)                   |
-| wechat-qr-polling                   | feature    | 微信 QR polling 登录扩展     | 架构前提与未决项 | [详情](./wechat-qr-polling/change.md)                   |
+| ID                                  | 类型       | 标题                                     | 父 PRD 章节      | 详情                                                    |
+| ----------------------------------- | ---------- | ---------------------------------------- | ---------------- | ------------------------------------------------------- |
+| auth-account-controls-and-profile   | feature    | 邮箱密码配置开关、账号禁用与用户资料扩展 | 架构前提与未决项 | [详情](./auth-account-controls-and-profile/change.md)   |
+| auth-schema-introspection-isolation | adjustment | 认证元数据探测的 schema 隔离             | 架构前提与未决项 | [详情](./auth-schema-introspection-isolation/change.md) |
+| phone-wechat-auth                   | feature    | 手机号与微信认证扩展                     | 架构前提与未决项 | [详情](./phone-wechat-auth/change.md)                   |
+| wechat-qr-polling                   | feature    | 微信 QR polling 登录扩展                 | 架构前提与未决项 | [详情](./wechat-qr-polling/change.md)                   |

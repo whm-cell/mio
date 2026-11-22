@@ -4,6 +4,8 @@ import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { authOptions } from './config.ts';
 import type { AuthConfig } from './config.ts';
+import { isUserDisabled, readUserProfile, setUserDisabled, updateUserProfile } from './account.ts';
+import type { UserProfilePatch } from './account.ts';
 import { readSmsBudgetSchema } from './phone-budget-schema.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
 import { createTencentSmsSender } from '../integrations/tencent-sms.ts';
@@ -56,8 +58,14 @@ export async function createAuthentication(
       /** Business services receive this verified identity, never a userId supplied in a body. */
       async identity(headers: Headers) {
         const session = await auth.api.getSession({ headers, query: { disableRefresh: true } });
-        return session ? { userId: session.user.id, sessionId: session.session.id } : null;
+        if (!session || isUserDisabled(session.user)) return null;
+        return { userId: session.user.id, sessionId: session.session.id };
       },
+      profile: (userId: string) => readUserProfile(pool, userId),
+      updateProfile: (userId: string, patch: UserProfilePatch) =>
+        updateUserProfile(pool, userId, patch),
+      setUserDisabled: (userId: string, disabled: boolean) =>
+        setUserDisabled(pool, userId, disabled),
       close: () => pool.end(),
     };
   } catch (error) {

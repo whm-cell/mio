@@ -71,6 +71,8 @@ function parseInput(body: unknown, needsCode: boolean) {
 }
 
 function failure(code: string): never {
+  if (code === 'ACCOUNT_DISABLED')
+    throw new APIError('FORBIDDEN', { code, message: 'Account is disabled' });
   if (code === 'SMS_RATE_LIMITED')
     throw new APIError('TOO_MANY_REQUESTS', { code, message: 'SMS rate limit reached' });
   if (code === 'PHONE_CONFLICT')
@@ -167,8 +169,10 @@ export function phonePlugin(
           createdAt: Date;
           updatedAt: Date;
           phoneNumberVerified?: boolean | null;
+          disabled?: boolean | null;
         }>({ model: 'user', where: [{ field: 'phoneNumber', value: phone }] });
         if (user && !user.phoneNumberVerified) return failure('INVALID_OTP');
+        if (user && user.disabled) return failure('ACCOUNT_DISABLED');
         if (!user)
           user = await ctx.context.internalAdapter.createUser(
             {

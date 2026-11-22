@@ -24,6 +24,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   MODEL_NOT_FOUND: 'Target model was not found in platform catalog',
   TEMPLATE_KEY_TAKEN: 'Template key already exists',
   TEMPLATE_NOT_FOUND: 'Target route template was not found',
+  SETTINGS_CONFLICT: 'Global settings were modified concurrently; reload and retry',
   PROBE_KEY_REQUIRED: 'Provide an API key or save a probe key first',
   PROBE_CREDENTIAL_UNAVAILABLE: 'Saved probe credential cannot be decrypted',
   PROVIDER_KEY_INVALID: 'OneLink API key format is invalid',
@@ -130,6 +131,7 @@ const KNOWN_ROUTES: Record<string, readonly string[]> = {
   '/templates': ['GET', 'POST', 'PUT', 'DELETE'],
   '/revisions': ['GET'],
   '/monitoring': ['GET'],
+  '/settings/global': ['GET', 'PATCH'],
 };
 
 interface RouteContext {
@@ -330,6 +332,17 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
       HTTP_STATUS.OK,
       await service.readMonitoring(url.searchParams.get('window') ?? undefined),
     );
+  },
+
+  'GET /settings/global': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getGlobalSettings());
+  },
+
+  'PATCH /settings/global': async ({ response, service, readAuthJson }) => {
+    const { principal, body } = await readAuthJson(['auth', 'expectedRevision']);
+    sendJson(response, HTTP_STATUS.OK, await service.updateGlobalSettings(principal, body));
   },
 };
 

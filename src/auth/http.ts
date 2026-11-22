@@ -5,7 +5,7 @@ import { readBody, readJsonBody } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { parseProfilePatch } from './account.ts';
 import { AUTH_BASE_PATH } from './config.ts';
-import type { AuthConfig } from './config.ts';
+import type { AuthConfig, AuthPolicyReader } from './config.ts';
 import type { Authentication } from './service.ts';
 import { wechatCallbackURL } from './wechat-input.ts';
 
@@ -139,8 +139,16 @@ export function createAuthHandler(
   config: AuthConfig,
   auth: Authentication,
   verifyAvatarAsset?: AvatarAssetVerifier,
+  getPolicy?: AuthPolicyReader,
 ) {
   const allowed = new Set(config.origins);
+  const readPolicy: AuthPolicyReader =
+    getPolicy ??
+    (() => ({
+      emailPasswordEnabled: config.emailPasswordEnabled,
+      smsMode: 'live',
+      smsBypassCode: null,
+    }));
   const stateCookieName = config.baseURL.startsWith('https:') ? '__Secure-mio.state' : 'mio.state';
   const wechatCallbackPath = `${AUTH_BASE_PATH}/callback/wechat`;
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -190,7 +198,7 @@ export function createAuthHandler(
     if (isMutation && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
     if (isMutation && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
       return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
-    if (emailPasswordPaths.has(pathname) && !config.emailPasswordEnabled)
+    if (emailPasswordPaths.has(pathname) && !readPolicy().emailPasswordEnabled)
       return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'EMAIL_PASSWORD_UNAVAILABLE');
     if (wechatRoute && !config.wechat)
       return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'WECHAT_UNAVAILABLE');

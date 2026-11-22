@@ -1,5 +1,6 @@
 import { createId } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
+import { timingSafeEqual } from 'node:crypto';
 import type { BetterAuthPlugin } from 'better-auth';
 import {
   APIError,
@@ -19,10 +20,19 @@ import type { BindingIdentity, PhonePurpose } from './phone-store.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import type { SmsBudgetTables } from './phone-budget-schema.ts';
 
+export type AuthSmsMode = 'live' | 'bypass' | 'disabled';
+
+export interface PhoneSmsPolicy {
+  readonly smsMode: AuthSmsMode;
+  readonly smsBypassCode: string | null;
+}
+
 export interface PhoneSmsRuntime {
   sender: SmsSender;
   tables: SmsBudgetTables;
 }
+
+const SIX_DIGIT_CODE = /^\d{6}$/;
 
 const schema = {
   user: {
@@ -93,13 +103,25 @@ export function phonePlugin(
   pool: Pool,
   sms: PhoneSmsRuntime | undefined,
   domain: string,
+  getPolicy?: () => PhoneSmsPolicy,
 ) {
+  const readPolicy: () => PhoneSmsPolicy =
+    getPolicy ?? (() => ({ smsMode: 'live', smsBypassCode: null }));
   const send = (purpose: PhonePurpose) =>
     createAuthEndpoint(
       purpose === 'login' ? '/phone-number/send-otp' : '/phone-binding/send-otp',
       { method: 'POST' },
       async (ctx) => {
         const { phone } = parseInput(ctx.body, false);
+        const policy = readPolicy();
+        if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
+        if (purpose === 'login' && policy.smsMode === 'bypass') {
+          if (!policy.smsBypassCode || !SIX_DIGIT_CODE.test(policy.smsBypassCode))
+            return failure('SMS_UNAVAILABLE');
+          const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
+          if (!ip) return failure('SMS_UNAVAILABLE');
+          return ctx.json({ status: true });
+        }
         if (!sms) return failure('SMS_UNAVAILABLE');
         let binding: BindingIdentity | undefined;
         if (purpose === 'bind') {
@@ -136,31 +158,40 @@ export function phonePlugin(
       { method: 'POST' },
       async (ctx) => {
         const { phone, code } = parseInput(ctx.body, true);
-        if (!sms) return failure('SMS_UNAVAILABLE');
-        let binding: BindingIdentity | undefined;
-        if (purpose === 'bind') {
-          const session = await getAuthoritativeSessionFromCtx(ctx);
-          if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
-            return failure('SESSION_REQUIRED');
-          binding = { userId: session.user.id, sessionId: session.session.id };
-        }
-        const consumed = await consumePhoneChallenge(
-          pool,
-          config.secret,
-          purpose,
-          phone,
-          code,
-          binding,
-        );
-        if (consumed !== 'ok')
-          return failure(
-            consumed === 'conflict'
-              ? 'PHONE_CONFLICT'
-              : consumed === 'session'
-                ? 'SESSION_REQUIRED'
-                : 'INVALID_OTP',
+        const policy = readPolicy();
+        if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
+        if (purpose === 'login' && policy.smsMode === 'bypass') {
+          const expected = policy.smsBypassCode;
+          if (!expected || !SIX_DIGIT_CODE.test(expected)) return failure('SMS_UNAVAILABLE');
+          if (!timingSafeEqual(Buffer.from(code, 'utf8'), Buffer.from(expected, 'utf8')))
+            return failure('INVALID_OTP');
+        } else {
+          if (!sms) return failure('SMS_UNAVAILABLE');
+          let binding: BindingIdentity | undefined;
+          if (purpose === 'bind') {
+            const session = await getAuthoritativeSessionFromCtx(ctx);
+            if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
+              return failure('SESSION_REQUIRED');
+            binding = { userId: session.user.id, sessionId: session.session.id };
+          }
+          const consumed = await consumePhoneChallenge(
+            pool,
+            config.secret,
+            purpose,
+            phone,
+            code,
+            binding,
           );
-        if (binding) return ctx.json({ status: true });
+          if (consumed !== 'ok')
+            return failure(
+              consumed === 'conflict'
+                ? 'PHONE_CONFLICT'
+                : consumed === 'session'
+                  ? 'SESSION_REQUIRED'
+                  : 'INVALID_OTP',
+            );
+          if (binding) return ctx.json({ status: true });
+        }
         let user = await ctx.context.adapter.findOne<{
           id: string;
           email: string;

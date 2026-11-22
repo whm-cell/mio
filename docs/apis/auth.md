@@ -8,7 +8,7 @@
 
 OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH 与预检才返回 403。
 
-当 `MIO_AUTH_EMAIL_PASSWORD_ENABLED=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
+邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
@@ -117,23 +117,23 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：`phoneNumber`，接受 11 位大陆号码或其 `+86` 格式；未声明字段拒绝。
 
-成功：200 和 `{status:true}` 表示供应商已受理，不证明送达。
+成功：200 和 `{status:true}`；`smsMode='live'` 下表示供应商已受理（不证明送达），`smsMode='bypass'` 下在校验号码、已配置合法 6 位固定测试码与直连客户端 IP 后直接返回 `{status:true}`（无需配置腾讯短信）。
 
-错误：输入无效为 400，短信预算耗尽为 429，未启用或供应商拒绝／结果未知为 503；预算 429 不承诺返回重试秒数。
+错误：输入无效为 400，短信预算耗尽为 429，运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用短信、`smsMode='bypass'` 下未配置合法 6 位固定测试码或供应商拒绝／结果未知为 503 `SMS_UNAVAILABLE`；预算 429 不承诺返回重试秒数。
 
-副作用：先占用持久短信预算并建立短期挑战，再调用[腾讯短信](../integrations/tencent-sms.md)；失败和未知不返预算、不自动重发。
+副作用：`smsMode='live'` 下先占用持久短信预算并建立短期挑战，再调用[腾讯短信](../integrations/tencent-sms.md)（失败和未知不返预算、不自动重发）；`smsMode='bypass'` 下不调用短信供应商、不占用短信预算，但仍受认证路由限流约束；`smsMode='disabled'` 下无发送与预算副作用。
 
 ## POST /api/auth/phone-number/verify
 
-身份：持有此号码的登录用途验证码。
+身份：持有此号码的登录用途验证码（`smsMode='bypass'` 下为后台配置的 6 位固定测试验证码）。
 
 输入：`phoneNumber,code`；验证码为 6 位字符串，未声明字段拒绝。
 
-成功：返回 `{status:true}` 并设置会话 Cookie，已有号码登录其所属用户，新号码自助注册。
+成功：返回 `{status:true}` 并设置会话 Cookie，已有号码登录其所属用户，新号码自助注册并分配唯一 `displayId`。
 
-错误：输入、验证码或用途无效为 400，账号已禁用为 403 `ACCOUNT_DISABLED`，短信未启用为 503。
+错误：输入、验证码或用途无效（含 `bypass` 模式下验证码不匹配）为 400 `INVALID_OTP`，账号已禁用为 403 `ACCOUNT_DISABLED`，运行时策略 `smsMode='disabled'`、`smsMode='live'` 下短信未启用或 `smsMode='bypass'` 未配置合法 6 位固定验证码为 503 `SMS_UNAVAILABLE`。
 
-副作用：原子消费验证码，再创建或查询用户并创建库会话；后续失败不恢复该码，需重新请求。
+副作用：`smsMode='live'` 下原子消费验证码后创建或查询用户并创建库会话（后续失败不恢复该码）；`smsMode='bypass'` 下无需提前调用 `send-otp` 且不依赖腾讯短信运行时，以恒定时间比对固定测试码后执行相同的用户校验（含未验证号码与禁用账号拦截）、自动建号与签发会话流程，并保持路由限流生效。
 
 ## POST /api/auth/phone-binding/send-otp
 
@@ -143,7 +143,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：200 和 `{status:true}` 表示供应商已受理，不证明送达。
 
-错误：输入无效为 400，无近期会话为 401，预算耗尽为 429，未启用或供应商拒绝／结果未知为 503。
+错误：输入无效为 400，无近期会话为 401，预算耗尽为 429，运行时策略 `smsMode='disabled'`、未启用真实短信供应商或供应商拒绝／结果未知为 503 `SMS_UNAVAILABLE`。本入口**不跟随** `smsMode='bypass'`。
 
 副作用：占用短信预算并发送绑定用途验证码，绑定原用户、会话和号码；失败和未知不返预算、不自动重发。
 
@@ -155,7 +155,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：返回 `{status:true}`，在当前用户首次绑定空闲号码，userId 不变。
 
-错误：输入、验证码、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，短信未启用为 503。
+错误：输入、验证码、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，运行时策略 `smsMode='disabled'` 或未启用真实短信供应商为 503 `SMS_UNAVAILABLE`。本入口**不跟随** `smsMode='bypass'`。
 
 副作用：消费验证码并在事务中检查原会话、更新当前用户；不转移或合并账号。持久预算及恢复边界见[认证底座](../auth.md#手机验证码与发送预算)。
 

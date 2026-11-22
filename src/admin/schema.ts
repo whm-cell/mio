@@ -476,6 +476,17 @@ CREATE TABLE IF NOT EXISTS mio_admin_audit_logs (
 );
 CREATE INDEX IF NOT EXISTS mio_admin_audit_logs_created_idx
   ON mio_admin_audit_logs (created_at DESC);
+CREATE TABLE IF NOT EXISTS mio_admin_global_settings (
+  setting_key text PRIMARY KEY
+    CHECK (setting_key = 'auth'),
+  value jsonb NOT NULL
+    CHECK (jsonb_typeof(value) = 'object'),
+  revision integer NOT NULL DEFAULT 1
+    CHECK (revision >= 1),
+  updated_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM mio_admin_seed_history WHERE seed_key = 'route_templates_v1') THEN
@@ -553,6 +564,10 @@ export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void>
     [
       'SELECT id,actor_id,actor_name,action,target_id,summary,before_state,after_state,created_at FROM mio_admin_audit_logs LIMIT 0',
       [2950, 25, 25, 25, 25, 25, 3802, 3802, 1184],
+    ],
+    [
+      'SELECT setting_key,value,revision,updated_by,created_at,updated_at FROM mio_admin_global_settings LIMIT 0',
+      [25, 3802, 23, 25, 1184, 1184],
     ],
   ] as const) {
     const result = await pool.query(sql);

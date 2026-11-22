@@ -3,7 +3,7 @@ import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { authOptions } from './config.ts';
-import type { AuthConfig } from './config.ts';
+import type { AuthConfig, AuthPolicyReader } from './config.ts';
 import { isUserDisabled, readUserProfile, setUserDisabled, updateUserProfile } from './account.ts';
 import type { UserProfilePatch } from './account.ts';
 import { readSmsBudgetSchema } from './phone-budget-schema.ts';
@@ -18,6 +18,7 @@ export async function createAuthentication(
   config: AuthConfig,
   rateLimit?: AuthRateLimitStorage,
   sender?: SmsSender,
+  getPolicy?: AuthPolicyReader,
 ) {
   const pool = new Pool({
     connectionString: config.databaseURL,
@@ -32,7 +33,7 @@ export async function createAuthentication(
       throw new Error('AUTH_SCHEMA: run auth:migrate --apply before enabling authentication');
     const smsSender = sender ?? (config.sms ? createTencentSmsSender(config.sms) : undefined);
     const sms = smsSender ? { sender: smsSender, tables: smsBudget.tables } : undefined;
-    const options = authOptions(config, pool, sms);
+    const options = authOptions(config, pool, sms, getPolicy);
     if (rateLimit) options.rateLimit = { ...options.rateLimit, customStorage: rateLimit };
     const migration = await getMigrations(options);
     if (

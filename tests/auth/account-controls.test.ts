@@ -9,11 +9,15 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
+import { adminSchemaSQL } from '../../src/admin/schema.ts';
+import { hashAdminPassword } from '../../src/auth/admin-password.ts';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
+import type { AuthRuntimePolicy } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import type { AvatarAssetStatus } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
+import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import * as Mio from '../../src/plugin.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
@@ -776,3 +780,486 @@ it('migrates an existing populated auth user table cleanly and wires /api/v1/me/
     await upgradeDb.close();
   }
 }, 30_000);
+
+it('enforces runtime smsMode bypass/disabled with a real SMS sender wired while keeping phone-binding on real SMS', async () => {
+  const srv = createServer();
+  srv.listen(0, '127.0.0.1');
+  await once(srv, 'listening');
+  const addr = srv.address();
+  if (!addr || typeof addr === 'string') throw new Error('missing address');
+  const baseOrigin = `http://127.0.0.1:${addr.port}`;
+
+  let policy: AuthRuntimePolicy = {
+    emailPasswordEnabled: true,
+    smsMode: 'disabled',
+    smsBypassCode: '654321',
+  };
+  let smsSendCalls = 0;
+  const sentCodes = new Map<string, string>();
+  const fakeSender = async (phone: string, code: string) => {
+    smsSendCalls += 1;
+    sentCodes.set(phone, code);
+  };
+
+  const config = readAuthConfig({
+    MIO_AUTH_BASE_URL: baseOrigin,
+    MIO_AUTH_SECRET: secret,
+    MIO_AUTH_DATABASE_URL: database.url,
+    MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
+  })!;
+  const policyAuth = await createAuthentication(config, undefined, fakeSender, () => policy);
+  srv.on(
+    'request',
+    createAuthHandler(config, policyAuth, undefined, () => policy),
+  );
+
+  const req = (path: string, body?: unknown, cookie?: string) =>
+    originalFetch(`${baseOrigin}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        origin: baseOrigin,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(cookie ? { cookie } : {}),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+
+  try {
+    // Email/password works immediately even though config.emailPasswordEnabled=false because policy overrides to true!
+    const emailUp = await req('/api/auth/sign-up/email', {
+      name: 'Binder',
+      email: `binder-${randomUUID()}@example.test`,
+      password,
+    });
+    expect(emailUp.status).toBe(200);
+    const binderCookie = cookies(emailUp);
+
+    // 1. smsMode === 'disabled': all 4 phone endpoints return 503 SMS_UNAVAILABLE and never invoke sender.
+    for (const [path, body, cookie] of [
+      ['/api/auth/phone-number/send-otp', { phoneNumber: '13800138081' }, undefined],
+      ['/api/auth/phone-number/verify', { phoneNumber: '13800138081', code: '654321' }, undefined],
+      ['/api/auth/phone-binding/send-otp', { phoneNumber: '13800138082' }, binderCookie],
+      [
+        '/api/auth/phone-binding/confirm',
+        { phoneNumber: '13800138082', code: '654321' },
+        binderCookie,
+      ],
+    ] as const) {
+      const res = await req(path, body, cookie);
+      expect(res.status, path).toBe(503);
+      expect(((await res.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+    }
+    expect(smsSendCalls).toBe(0);
+
+    // 2. smsMode === 'bypass': login send-otp skips sender & budget; verify accepts fixed code without send-otp.
+    policy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '654321' };
+    const bypassSend = await req('/api/auth/phone-number/send-otp', { phoneNumber: '13800138083' });
+    expect(bypassSend.status).toBe(200);
+    expect(await bypassSend.json()).toEqual({ status: true });
+    expect(smsSendCalls).toBe(0);
+    expect((await pool.query('SELECT count(*)::int AS c FROM "mioSmsBudget"')).rows[0].c).toBe(0);
+
+    // Invalid bypass code -> 400 INVALID_OTP
+    const wrongVerify = await req('/api/auth/phone-number/verify', {
+      phoneNumber: '13800138084',
+      code: '000000',
+    });
+    expect(wrongVerify.status).toBe(400);
+    expect(((await wrongVerify.json()) as { code: string }).code).toBe('INVALID_OTP');
+
+    // Valid bypass code without prior send-otp -> 200 & displayId assigned
+    const okVerify = await req('/api/auth/phone-number/verify', {
+      phoneNumber: '13800138084',
+      code: '654321',
+    });
+    expect(okVerify.status).toBe(200);
+    const bypassCookie = cookies(okVerify);
+    const bypassProfile = (await (
+      await req('/api/v1/me/profile', undefined, bypassCookie)
+    ).json()) as {
+      displayId: string;
+      phoneNumber: string;
+      phoneNumberVerified: boolean;
+    };
+    expect(bypassProfile.displayId).toMatch(/^miioo_\d{6}$/);
+    expect(bypassProfile.phoneNumber).toBe('+8613800138084');
+    expect(bypassProfile.phoneNumberVerified).toBe(true);
+    expect(smsSendCalls).toBe(0);
+
+    // Missing/malformed smsBypassCode under bypass -> fail closed 503 SMS_UNAVAILABLE on both send-otp and verify
+    policy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: null };
+    const missingCodeSendRes = await req('/api/auth/phone-number/send-otp', {
+      phoneNumber: '13800138084',
+    });
+    expect(missingCodeSendRes.status).toBe(503);
+    expect(((await missingCodeSendRes.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+    const missingCodeRes = await req('/api/auth/phone-number/verify', {
+      phoneNumber: '13800138084',
+      code: '654321',
+    });
+    expect(missingCodeRes.status).toBe(503);
+    expect(((await missingCodeRes.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+
+    // Unverified phone user cannot sign in via bypass -> 400 INVALID_OTP
+    policy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '654321' };
+    await pool.query(
+      `INSERT INTO "user" (id, name, email, "emailVerified", "phoneNumber", "phoneNumberVerified", "createdAt", "updatedAt")
+       VALUES ($1, 'Unverified', $2, false, '+8613800138085', false, now(), now())`,
+      [randomUUID(), `unverified-${randomUUID()}@example.test`],
+    );
+    const unverifiedRes = await req('/api/auth/phone-number/verify', {
+      phoneNumber: '13800138085',
+      code: '654321',
+    });
+    expect(unverifiedRes.status).toBe(400);
+    expect(((await unverifiedRes.json()) as { code: string }).code).toBe('INVALID_OTP');
+
+    // Phone binding does NOT follow bypass: uses real sender and rejects fixed bypass code
+    const bindSend = await req(
+      '/api/auth/phone-binding/send-otp',
+      { phoneNumber: '13800138086' },
+      binderCookie,
+    );
+    expect(bindSend.status).toBe(200);
+    expect(smsSendCalls).toBe(1);
+    const realBindCode = sentCodes.get('+8613800138086')!;
+    expect(realBindCode).toMatch(/^\d{6}$/);
+
+    const bindWithBypassCode = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138086', code: realBindCode === '654321' ? '123456' : '654321' },
+      binderCookie,
+    );
+    expect(bindWithBypassCode.status).toBe(400);
+
+    const bindWithRealCode = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138086', code: realBindCode },
+      binderCookie,
+    );
+    expect(bindWithRealCode.status).toBe(200);
+  } finally {
+    srv.closeAllConnections();
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    await policyAuth.close();
+  }
+}, 30_000);
+
+it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, and falls back when admin is disabled', async () => {
+  const pluginDb = await authDatabase();
+  const pluginPool = new Pool({ connectionString: pluginDb.observerURL });
+  let ctx: Context | undefined;
+  try {
+    await pluginPool.query(providerSchemaSQL);
+    await pluginPool.query(adminSchemaSQL);
+
+    ctx = new Context();
+    await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
+    await ctx.plugin(Tools);
+    await ctx.plugin(SystemPrompt);
+    const pluginOrigin = ctx.webServer.getOrigin();
+
+    const migrated = spawnSync(process.execPath, ['scripts/service/migrate-auth.ts', '--apply'], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: {
+        MIO_AUTH_BASE_URL: pluginOrigin,
+        MIO_AUTH_SECRET: secret,
+        MIO_AUTH_DATABASE_URL: pluginDb.url,
+      },
+    });
+    expect(migrated.status, migrated.stderr).toBe(0);
+
+    // Seed super admin account directly in admin table
+    const adminPassHash = await hashAdminPassword('global_admin_pass');
+    await pluginPool.query(
+      `INSERT INTO mio_admin_accounts (id, username, password_hash, is_super_admin)
+       VALUES ($1, 'miioo_admin', $2, true)`,
+      [randomUUID(), adminPassHash],
+    );
+
+    const setPluginEnv = (overrides: Record<string, string | undefined> = {}) => {
+      vi.unstubAllEnvs();
+      const baseEnv: Record<string, string | undefined> = {
+        MIO_AUTH_TEST_TOKEN: randomBytes(24).toString('hex'),
+        MIO_AUTH_BASE_URL: pluginOrigin,
+        MIO_AUTH_SECRET: secret,
+        MIO_AUTH_DATABASE_URL: pluginDb.url,
+        MIO_AUTH_ALLOWED_ORIGINS: '[]',
+        MIO_AUTH_RATE_LIMIT_BACKEND: 'database',
+        MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true',
+        MIO_AUTH_SMS_ENABLED: 'false',
+        MIO_PROVIDERS_DATABASE_URL: pluginDb.url,
+        MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+        MIO_PROVIDERS_MASTER_KEY_ID: 'global-settings-test-v1',
+        MIO_ADMIN_ENABLED: 'true',
+        ...overrides,
+      };
+      for (const [key, value] of Object.entries(baseEnv)) {
+        if (value !== undefined) vi.stubEnv(key, value);
+      }
+    };
+
+    const req = (path: string, method = 'GET', body?: unknown, cookie?: string) =>
+      originalFetch(`${pluginOrigin}${path}`, {
+        method,
+        headers: {
+          origin: pluginOrigin,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(cookie ? { cookie } : {}),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+
+    // 1. Mount plugin with MIO_ADMIN_ENABLED=true, MIO_AUTH_SMS_ENABLED=false
+    setPluginEnv();
+    let mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+    await mounted;
+
+    // No C-end /api/auth/methods endpoint exists
+    expect((await req('/api/auth/methods')).status).toBe(404);
+
+    // Admin login
+    const adminLogin = await req('/api/v1/admin/auth/login', 'POST', {
+      username: 'miioo_admin',
+      password: 'global_admin_pass',
+    });
+    expect(adminLogin.status).toBe(200);
+    const adminCookie = cookies(adminLogin);
+
+    const initSettings = (await (
+      await req('/api/v1/admin/settings/global', 'GET', undefined, adminCookie)
+    ).json()) as {
+      settings: { revision: number };
+      runtime: { envEmailPasswordDefault: boolean; smsProviderConfigured: boolean };
+    };
+    expect(initSettings.settings.revision).toBe(0);
+    expect(initSettings.runtime).toEqual({
+      envEmailPasswordDefault: true,
+      smsProviderConfigured: false,
+    });
+
+    // Sign up email user while email/password is enabled
+    const emailAddr = 'hot-toggle@example.test';
+    const signUp = await req('/api/auth/sign-up/email', 'POST', {
+      name: 'Hot Toggle User',
+      email: emailAddr,
+      password,
+    });
+    expect(signUp.status).toBe(200);
+    const emailUserCookie = cookies(signUp);
+
+    // Hot-toggle email/password OFF (rev 0 -> 1) without restarting
+    const toggleOff = await req(
+      '/api/v1/admin/settings/global',
+      'PATCH',
+      {
+        expectedRevision: 0,
+        auth: { emailPasswordEnabled: false, smsMode: 'live', smsBypassCode: null },
+      },
+      adminCookie,
+    );
+    expect(toggleOff.status).toBe(200);
+
+    const blockedSignIn = await req('/api/auth/sign-in/email', 'POST', {
+      email: emailAddr,
+      password,
+    });
+    expect(blockedSignIn.status).toBe(503);
+    expect(((await blockedSignIn.json()) as { error: { code: string } }).error.code).toBe(
+      'EMAIL_PASSWORD_UNAVAILABLE',
+    );
+    // Existing session still works while email/password is disabled
+    expect((await req('/api/v1/me', 'GET', undefined, emailUserCookie)).status).toBe(200);
+
+    // Hot-toggle email/password ON + SMS bypass (rev 1 -> 2) without restarting
+    const toggleBypass = await req(
+      '/api/v1/admin/settings/global',
+      'PATCH',
+      {
+        expectedRevision: 1,
+        auth: { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '246810' },
+      },
+      adminCookie,
+    );
+    expect(toggleBypass.status).toBe(200);
+
+    // Email sign-in works again
+    expect(
+      (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,
+    ).toBe(200);
+
+    // SMS bypass works with MIO_AUTH_SMS_ENABLED=false
+    const sendBypass = await req('/api/auth/phone-number/send-otp', 'POST', {
+      phoneNumber: '13900139001',
+    });
+    expect(sendBypass.status).toBe(200);
+    expect(await sendBypass.json()).toEqual({ status: true });
+    expect(
+      (await pluginPool.query('SELECT count(*)::int AS c FROM "mioSmsBudget"')).rows[0].c,
+    ).toBe(0);
+
+    const badBypass = await req('/api/auth/phone-number/verify', 'POST', {
+      phoneNumber: '13900139002',
+      code: '111111',
+    });
+    expect(badBypass.status).toBe(400);
+    expect(((await badBypass.json()) as { code: string }).code).toBe('INVALID_OTP');
+
+    // Verify WITHOUT calling send-otp first
+    const okBypass = await req('/api/auth/phone-number/verify', 'POST', {
+      phoneNumber: '13900139002',
+      code: '246810',
+    });
+    expect(okBypass.status).toBe(200);
+    expect(await okBypass.json()).toEqual({ status: true });
+    const phoneCookie = cookies(okBypass);
+    expect(phoneCookie).toContain('mio.session_token=');
+    const phoneProfile = (await (
+      await req('/api/v1/me/profile', 'GET', undefined, phoneCookie)
+    ).json()) as { userId: string; displayId: string; phoneNumber: string };
+    expect(phoneProfile.displayId).toMatch(/^miioo_\d{6}$/);
+    expect(phoneProfile.phoneNumber).toBe('+8613900139002');
+
+    // Disabled account trying bypass login -> 403 ACCOUNT_DISABLED
+    await pluginPool.query(
+      'UPDATE "user" SET disabled = true, "disabledAt" = now() WHERE id = $1',
+      [phoneProfile.userId],
+    );
+    const disabledBypass = await req('/api/auth/phone-number/verify', 'POST', {
+      phoneNumber: '13900139002',
+      code: '246810',
+    });
+    expect(disabledBypass.status).toBe(403);
+    expect(((await disabledBypass.json()) as { code: string }).code).toBe('ACCOUNT_DISABLED');
+    expect(disabledBypass.headers.getSetCookie()).toEqual([]);
+
+    // Phone binding does NOT follow bypass -> 503 SMS_UNAVAILABLE without SMS provider
+    const bindSend = await req(
+      '/api/auth/phone-binding/send-otp',
+      'POST',
+      { phoneNumber: '13900139003' },
+      emailUserCookie,
+    );
+    expect(bindSend.status).toBe(503);
+    expect(((await bindSend.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+
+    const bindConfirm = await req(
+      '/api/auth/phone-binding/confirm',
+      'POST',
+      { phoneNumber: '13900139003', code: '246810' },
+      emailUserCookie,
+    );
+    expect(bindConfirm.status).toBe(503);
+    expect(((await bindConfirm.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+
+    // Hot-toggle smsMode to 'disabled' (rev 2 -> 3) -> all 4 phone endpoints return 503
+    const toggleDisabled = await req(
+      '/api/v1/admin/settings/global',
+      'PATCH',
+      {
+        expectedRevision: 2,
+        auth: { emailPasswordEnabled: true, smsMode: 'disabled', smsBypassCode: '246810' },
+      },
+      adminCookie,
+    );
+    expect(toggleDisabled.status).toBe(200);
+    for (const [path, body, cookie] of [
+      ['/api/auth/phone-number/send-otp', { phoneNumber: '13900139004' }, undefined],
+      ['/api/auth/phone-number/verify', { phoneNumber: '13900139004', code: '246810' }, undefined],
+      ['/api/auth/phone-binding/send-otp', { phoneNumber: '13900139004' }, emailUserCookie],
+      [
+        '/api/auth/phone-binding/confirm',
+        { phoneNumber: '13900139004', code: '246810' },
+        emailUserCookie,
+      ],
+    ] as const) {
+      const res = await req(path, 'POST', body, cookie);
+      expect(res.status, path).toBe(503);
+      expect(((await res.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+    }
+
+    // 2. Save emailPasswordEnabled=false + bypass '135790' (rev 3 -> 4), then restart plugin to verify immediate DB hydration
+    const saveBeforeRestart = await req(
+      '/api/v1/admin/settings/global',
+      'PATCH',
+      {
+        expectedRevision: 3,
+        auth: { emailPasswordEnabled: false, smsMode: 'bypass', smsBypassCode: '135790' },
+      },
+      adminCookie,
+    );
+    expect(saveBeforeRestart.status).toBe(200);
+
+    await mounted.dispose();
+    setPluginEnv({ MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true', MIO_ADMIN_ENABLED: 'true' });
+    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+    await mounted;
+
+    // Immediately after restart (without hitting any admin API), DB global settings are active!
+    const emailAfterRestart = await req('/api/auth/sign-in/email', 'POST', {
+      email: emailAddr,
+      password,
+    });
+    expect(emailAfterRestart.status).toBe(503);
+    expect(((await emailAfterRestart.json()) as { error: { code: string } }).error.code).toBe(
+      'EMAIL_PASSWORD_UNAVAILABLE',
+    );
+    const bypassAfterRestart = await req('/api/auth/phone-number/verify', 'POST', {
+      phoneNumber: '13900139005',
+      code: '135790',
+    });
+    expect(bypassAfterRestart.status).toBe(200);
+
+    // 3. Without MIO_ADMIN_ENABLED, auth falls back to MIO_AUTH_EMAIL_PASSWORD_ENABLED and smsMode='live'
+    await mounted.dispose();
+    setPluginEnv({
+      MIO_ADMIN_ENABLED: 'false',
+      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
+      MIO_PROVIDERS_DATABASE_URL: undefined,
+      MIO_PROVIDERS_MASTER_KEY: undefined,
+      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
+    });
+    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+    await mounted;
+
+    expect(
+      (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,
+    ).toBe(503);
+    expect(
+      (
+        await req('/api/auth/phone-number/verify', 'POST', {
+          phoneNumber: '13900139005',
+          code: '135790',
+        })
+      ).status,
+    ).toBe(503);
+
+    await mounted.dispose();
+    setPluginEnv({
+      MIO_ADMIN_ENABLED: 'false',
+      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true',
+      MIO_PROVIDERS_DATABASE_URL: undefined,
+      MIO_PROVIDERS_MASTER_KEY: undefined,
+      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
+    });
+    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+    await mounted;
+
+    expect(
+      (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,
+    ).toBe(200);
+    expect(
+      (
+        await req('/api/auth/phone-number/send-otp', 'POST', {
+          phoneNumber: '13900139005',
+        })
+      ).status,
+    ).toBe(503);
+  } finally {
+    vi.unstubAllEnvs();
+    if (ctx) await ctx.fiber.dispose();
+    await pluginPool.end();
+    await pluginDb.close();
+  }
+}, 45_000);

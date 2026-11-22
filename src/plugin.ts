@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { createHandler } from './http.ts';
 import { AUTH_BASE_PATH, readAuthConfig, readAuthRateLimitBackend } from './auth/config.ts';
+import type { AuthRuntimePolicy } from './auth/config.ts';
 import { createAuthentication } from './auth/service.ts';
 import { createAuthHandler } from './auth/http.ts';
 import { createRedisRateLimit } from './auth/rate-limit.ts';
@@ -148,6 +149,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (backend === 'redis' && !authConfig)
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
+    let admin: AdminService | undefined;
+    const getAuthPolicy = (): AuthRuntimePolicy =>
+      admin?.getAuthPolicy() ?? {
+        emailPasswordEnabled: authConfig.emailPasswordEnabled,
+        smsMode: 'live',
+        smsBypassCode: null,
+      };
     const redisConfig = backend === 'redis' ? readRedisConfig() : undefined;
     const deadline = monotonicMs() + 5000;
     const redis = redisConfig ? await createRedisResource(redisConfig, deadline) : undefined;
@@ -155,7 +163,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     try {
       const rateLimit =
         redis && (await createRedisRateLimit(redis, redisConfig!.namespace, deadline));
-      auth = await createAuthentication(authConfig, rateLimit);
+      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy);
       const acquired = auth;
       ctx.effect(() => async () => {
         await Promise.all([acquired.close(), redis?.close()]);
@@ -186,14 +194,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         return 'unavailable';
       }
     };
-    const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset);
-    ctx.effect(() =>
-      ctx.webServer.register({
-        kind: 'prefix',
-        path: AUTH_BASE_PATH,
-        handler: authHandler,
-      }),
-    );
+    const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
       try {
@@ -222,7 +223,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
-    let admin: AdminService | undefined;
     if (computeConfig && assetConfig) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
@@ -287,10 +287,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const acquired =
           (admin =
           ownedAdmin =
-            createAdminService(store, providers, providerConfig, undefined, {
-              probeRabbitmq: () => probeRabbitmqMetrics(rabbitmqMonitorConfig),
-              probeRedis: () => probeRedisMetrics(redisMonitorConfig),
-            }));
+            createAdminService(
+              store,
+              providers,
+              providerConfig,
+              undefined,
+              {
+                probeRabbitmq: () => probeRabbitmqMetrics(rabbitmqMonitorConfig),
+                probeRedis: () => probeRedisMetrics(redisMonitorConfig),
+              },
+              {
+                emailPasswordEnabled: authConfig.emailPasswordEnabled,
+                smsProviderConfigured: Boolean(authConfig.sms),
+              },
+            ));
         ctx.effect(() => () => acquired.close());
         ctx.effect(() =>
           ctx.webServer.register({
@@ -490,6 +500,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         },
       });
     }
+    ctx.effect(() =>
+      ctx.webServer.register({
+        kind: 'prefix',
+        path: AUTH_BASE_PATH,
+        handler: authHandler,
+      }),
+    );
     ctx.effect(() =>
       ctx.webServer.register({
         kind: 'exact',

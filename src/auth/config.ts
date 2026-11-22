@@ -4,7 +4,7 @@ import type { TencentSmsConfig } from '../integrations/tencent-sms.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
 import { accountPlugin, isUserDisabled } from './account.ts';
 import { phonePlugin } from './phone.ts';
-import type { PhoneSmsRuntime } from './phone.ts';
+import type { AuthSmsMode, PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
@@ -12,6 +12,14 @@ import { AuthPostgresDialect } from './database.ts';
 
 export const AUTH_BASE_PATH = '/api/auth';
 export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
+
+export type { AuthSmsMode };
+
+export interface AuthRuntimePolicy extends PhoneSmsPolicy {
+  readonly emailPasswordEnabled: boolean;
+}
+
+export type AuthPolicyReader = () => AuthRuntimePolicy;
 
 export interface AuthConfig {
   baseURL: string;
@@ -155,6 +163,7 @@ export function authOptions(
   config: AuthConfig,
   pool: Pool,
   sms?: PhoneSmsRuntime,
+  getPolicy?: AuthPolicyReader,
 ): BetterAuthOptions {
   return {
     appName: 'Mio',
@@ -165,7 +174,7 @@ export function authOptions(
     trustedOrigins: [...config.origins],
     plugins: [
       accountPlugin(),
-      phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN),
+      phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
     ],
@@ -191,7 +200,7 @@ export function authOptions(
         }
       : {}),
     emailAndPassword: {
-      enabled: config.emailPasswordEnabled,
+      enabled: true,
       requireEmailVerification: false,
       minPasswordLength: 12,
       maxPasswordLength: 128,

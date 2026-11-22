@@ -8,10 +8,13 @@ import {
   readLocalEnvironment,
 } from '../../scripts/service/local-environment.ts';
 import type { LocalEnvironment } from '../../scripts/service/local-environment.ts';
+import { readAdminConfig } from '../../src/admin/config.ts';
 import { readAssetConfig } from '../../src/assets/config.ts';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { readComputeConfig } from '../../src/compute/config.ts';
 import { readConversationConfig } from '../../src/conversations/config.ts';
+import { readRabbitmqMonitorConfig } from '../../src/integrations/rabbitmq-monitor.ts';
+import { readRedisMonitorConfig } from '../../src/integrations/redis.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from '../../src/materials/config.ts';
 import { readGenerationConfig } from '../../src/generations/config.ts';
 import { readProviderConfig } from '../../src/providers/config.ts';
@@ -54,12 +57,19 @@ const assetSettings = {
   MIO_COS_SECRET_KEY: 'fixture-key',
   MIO_COS_SESSION_TOKEN: 'fixture-token',
 };
+const adminSettings = {
+  MIO_ADMIN_ALLOWED_ORIGINS: '["http://localhost:4330"]',
+  MIO_ADMIN_RABBITMQ_MONITOR_URL: 'http://mio-dev-monitor:fixture-monitor@127.0.0.1:15680/mio-dev',
+  MIO_ADMIN_REDIS_MONITOR_URL: 'redis://mio_monitor:fixture-monitor@127.0.0.1:56379',
+};
 const enableSwitches = {
+  MIO_ADMIN_ENABLED: 'true',
   MIO_AUTH_SMS_ENABLED: 'true',
   MIO_AUTH_WECHAT_ENABLED: 'true',
   MIO_COMPUTE_ENABLED: 'true',
   MIO_GENERATIONS_ENABLED: 'true',
   MIO_MATERIALS_ENABLED: 'true',
+  MIO_PROVIDERS_CATALOG_WHITELIST: 'true',
 };
 
 async function temporaryDirectory() {
@@ -115,6 +125,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
     ...fixedRoute,
     ...officialKey,
     ...assetSettings,
+    ...adminSettings,
     ...enableSwitches,
     MIO_MATERIALS_PUBLIC_BASE_URL: 'https://materials.example.com',
   };
@@ -132,7 +143,9 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   const auth = readAuthConfig(configured);
   expect(auth?.sms !== undefined, 'MIO_AUTH_SMS_ENABLED').toBe(true);
   expect(auth?.wechat !== undefined, 'MIO_AUTH_WECHAT_ENABLED').toBe(true);
-  expect(readProviderConfig(configured) !== undefined, 'MIO_PROVIDERS_DATABASE_URL').toBe(true);
+  const providers = readProviderConfig(configured);
+  expect(providers !== undefined, 'MIO_PROVIDERS_DATABASE_URL').toBe(true);
+  expect(providers?.catalogWhitelist === true, 'MIO_PROVIDERS_CATALOG_WHITELIST').toBe(true);
   expect(
     readConversationConfig(configured, true) !== undefined,
     'MIO_CONVERSATIONS_DATABASE_URL',
@@ -146,6 +159,18 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(readMaterialAuthConfig(configured)).toEqual({
     publicOrigin: 'https://materials.example.com',
   });
+  const admin = readAdminConfig(configured, auth!.origins);
+  expect(admin !== undefined, 'MIO_ADMIN_ENABLED').toBe(true);
+  expect(admin?.allowedOrigins.includes('http://localhost:4330'), 'MIO_ADMIN_ALLOWED_ORIGINS').toBe(
+    true,
+  );
+  expect(
+    readRabbitmqMonitorConfig(configured) !== undefined,
+    'MIO_ADMIN_RABBITMQ_MONITOR_URL',
+  ).toBe(true);
+  expect(readRedisMonitorConfig(configured) !== undefined, 'MIO_ADMIN_REDIS_MONITOR_URL').toBe(
+    true,
+  );
 });
 
 it('keeps optional domains off after initialization and preserves switch semantics', async () => {
@@ -159,6 +184,14 @@ it('keeps optional domains off after initialization and preserves switch semanti
   expect(readAssetConfig(runtime) === undefined, 'MIO_ASSETS_DATABASE_URL').toBe(true);
   expect(readComputeConfig(runtime) === undefined, 'MIO_COMPUTE_ENABLED').toBe(true);
   expect(readGenerationConfig(runtime) === undefined, 'MIO_GENERATIONS_ENABLED').toBe(true);
+  expect(
+    readAdminConfig(runtime, ['http://localhost:4310']) === undefined,
+    'MIO_ADMIN_ENABLED',
+  ).toBe(true);
+  expect(readRabbitmqMonitorConfig(runtime) === undefined, 'MIO_ADMIN_RABBITMQ_MONITOR_URL').toBe(
+    true,
+  );
+  expect(readRedisMonitorConfig(runtime) === undefined, 'MIO_ADMIN_REDIS_MONITOR_URL').toBe(true);
 
   for (const [key, field] of [
     ['MIO_AUTH_SMS_ENABLED', 'sms'],
@@ -168,6 +201,36 @@ it('keeps optional domains off after initialization and preserves switch semanti
     expect(readAuthConfig({ ...runtime, [key]: 'false' })?.[field] === undefined, key).toBe(true);
     expect(() => readAuthConfig({ ...runtime, [key]: '' }), key).toThrow('AUTH_CONFIG');
   }
+  expect(
+    readAdminConfig({ ...runtime, MIO_ADMIN_ENABLED: 'false' }, ['http://localhost:4310']) ===
+      undefined,
+    'MIO_ADMIN_ENABLED',
+  ).toBe(true);
+  expect(
+    () => readAdminConfig({ ...runtime, MIO_ADMIN_ENABLED: '' }, ['http://localhost:4310']),
+    'MIO_ADMIN_ENABLED',
+  ).toThrow('ADMIN_CONFIG');
+  expect(
+    readProviderConfig({ ...runtime, ...providerSettings })?.catalogWhitelist === false,
+    'MIO_PROVIDERS_CATALOG_WHITELIST',
+  ).toBe(true);
+  expect(
+    readProviderConfig({
+      ...runtime,
+      ...providerSettings,
+      MIO_PROVIDERS_CATALOG_WHITELIST: 'false',
+    })?.catalogWhitelist === false,
+    'MIO_PROVIDERS_CATALOG_WHITELIST',
+  ).toBe(true);
+  expect(
+    () =>
+      readProviderConfig({
+        ...runtime,
+        ...providerSettings,
+        MIO_PROVIDERS_CATALOG_WHITELIST: '',
+      }),
+    'MIO_PROVIDERS_CATALOG_WHITELIST',
+  ).toThrow('PROVIDER_CONFIG');
   for (const value of ['false', '']) {
     expect(() => readComputeConfig({ ...runtime, MIO_COMPUTE_ENABLED: value })).toThrow(
       'COMPUTE_CONFIG',

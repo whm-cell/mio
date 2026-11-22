@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { afterEach, expect, it } from 'vitest';
 import { legacyBuild, legacyHarness, legacyTypecheck } from './fixtures/guardrail-fixture.ts';
+import { runGuardrails } from '../../scripts/harness/check-guardrails.ts';
 import { loadConfig } from '../../scripts/harness/inventory.ts';
 
 const project = resolve('.');
@@ -23,7 +24,7 @@ it.each([
       'src/plugin.ts': 'export const apply = 1;',
       [file]: `export { apply } from '${target}';`,
     });
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain(`ADAPTER_DIRECTION ${file}`);
   },
@@ -37,7 +38,7 @@ it.each(['src/other.ts', 'src/conversations/indirect.ts', 'src/dsh/indirect.ts']
       'src/profile.ts': "export { apply } from './plugin.ts';",
       [file]: `export { apply } from '${target}';`,
     });
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(1);
     expect(result.output).toContain(`ADAPTER_DIRECTION ${file}: src/profile.ts`);
   },
@@ -54,7 +55,7 @@ it.each([
   ] as const) {
     const root = await fixture({ [file]: `export type * from '${entry}';` });
     await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('DSH_BOUNDARY');
   }
@@ -68,11 +69,11 @@ it('recognizes a pi-ai type alias and rejects business imports of the local DSH 
     'pi-alias': [fileURLToPath(import.meta.resolve('@earendil-works/pi-ai/models'))],
   };
   await writeFile(path, JSON.stringify(config));
-  expect(check(root).output).toContain('DSH_BOUNDARY');
+  expect((await check(root)).output).toContain('DSH_BOUNDARY');
   await writeFile(join(root, 'src/providers/alias.ts'), "export type * from '../dsh/pi.ts';");
   await mkdir(join(root, 'src/dsh'), { recursive: true });
   await writeFile(join(root, 'src/dsh/pi.ts'), 'export interface Value { id: string }');
-  expect(check(root).output).toContain('DSH_BOUNDARY');
+  expect((await check(root)).output).toContain('DSH_BOUNDARY');
 });
 it.each([
   'src/materials/service.ts',
@@ -84,7 +85,7 @@ it.each([
     'src/dsh/vision.ts': 'export const value=1;',
     [file]: "export {value} from '../dsh/vision.ts';",
   });
-  expect(check(root).output).toContain('DSH_BOUNDARY');
+  expect((await check(root)).output).toContain('DSH_BOUNDARY');
 });
 afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -97,7 +98,7 @@ it.each([
 ] as const)('limits COS package imports, including type-only imports: %s', async (file, status) => {
   const root = await fixture({ [file]: "export type * from 'cos-nodejs-sdk-v5';" });
   await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
-  const result = check(root);
+  const result = await check(root);
   expect(result.status, result.output).toBe(status);
   if (status) expect(result.output).toContain('COS_ADAPTER');
 });
@@ -111,7 +112,7 @@ it('rejects the COS package under a business import alias', async () => {
     'storage-alias': [createRequire(import.meta.url).resolve('cos-nodejs-sdk-v5')],
   };
   await writeFile(path, JSON.stringify(config));
-  expect(check(root).output).toContain('COS_ADAPTER');
+  expect((await check(root)).output).toContain('COS_ADAPTER');
 });
 
 it.each([
@@ -137,7 +138,7 @@ it.each([
     const config = JSON.parse(await readFile(path, 'utf8'));
     config.compilerOptions.paths = { 'deployment-target': [join(root, target)] };
     await writeFile(path, JSON.stringify(config));
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('DEVELOPMENT_DEPENDENCY');
   },
@@ -179,7 +180,7 @@ it.each([
   async (file, status) => {
     const root = await fixture({ [file]: "export type { PoolConfig } from 'pg';" });
     await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('AUTH_ADAPTER');
   },
@@ -216,7 +217,7 @@ it.each([
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     config.compilerOptions.paths = { [alias]: [createRequire(import.meta.url).resolve(target)] };
     await writeFile(configPath, JSON.stringify(config));
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('AUTH_ADAPTER');
   },
@@ -239,7 +240,7 @@ async function fixture(extra: Record<string, string>) {
   return root;
 }
 
-function check(root: string, env = process.env) {
+function checkCli(root: string, env: NodeJS.ProcessEnv = process.env) {
   const result = spawnSync(
     process.execPath,
     [join(project, 'scripts/harness/check-guardrails.ts'), root],
@@ -249,6 +250,11 @@ function check(root: string, env = process.env) {
     },
   );
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+}
+
+async function check(root: string, env?: NodeJS.ProcessEnv) {
+  if (env !== undefined) return checkCli(root, env);
+  return runGuardrails(root);
 }
 
 it.each([
@@ -269,7 +275,7 @@ it.each([
   'confines A durable filesystem access to the exact adapter: %s %s',
   async (file, code, status) => {
     const root = await fixture({ [file]: code });
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain(`RUNTIME_CAPABILITY ${file}`);
   },
@@ -285,7 +291,7 @@ it('builds a self-contained legacy fixture independent of the host project decla
   expect(
     Object.keys(config.sourceRoots).filter((root) => config.sourceRoots[root] === 'production'),
   ).toEqual(['src']);
-  const result = check(root);
+  const result = await check(root);
   expect(result.status, result.output).toBe(0);
 });
 
@@ -300,7 +306,7 @@ it.each([
   async (file, status) => {
     const root = await fixture({ [file]: "export { createClient } from '@redis/client';" });
     await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('REDIS_ADAPTER');
   },
@@ -319,7 +325,7 @@ it.each(['src/auth/limit.ts', 'scripts/service/redis-helper.ts'])(
       'driver-alias': [createRequire(import.meta.url).resolve('@redis/client')],
     };
     await writeFile(configPath, JSON.stringify(config));
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(1);
     expect(result.output).toContain('REDIS_ADAPTER');
   },
@@ -332,7 +338,7 @@ it.each(['src/auth/value.ts', 'tests/value.ts', 'scripts/service/value.ts'])(
       [target]: 'export interface Value { id: string }',
       'src/integrations/redis.ts': `export type { Value } from '../../${target}';`,
     });
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(1);
     expect(result.output).toContain('REDIS_DIRECTION');
   },
@@ -344,13 +350,13 @@ it('allows plugin/auth consumers of public Redis but denies migration tools', as
     'src/plugin.ts': "export type { Resource } from './integrations/redis.ts';",
     'src/auth/limit.ts': "export type { Resource } from '../integrations/redis.ts';",
   });
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
   await mkdir(join(root, 'scripts/service'), { recursive: true });
   await writeFile(
     join(root, 'scripts/service/migrate.ts'),
     "export type { Resource } from '../../src/integrations/redis.ts';",
   );
-  const result = check(root);
+  const result = await check(root);
   expect(result.status, result.output).toBe(1);
   expect(result.output).toContain('DEVELOPMENT_DEPENDENCY');
 });
@@ -361,7 +367,7 @@ it('works without personal records; reports a long, low-branch function without 
     'src/new-file.ts': "import { value } from './value.ts';\nexport const next = value + 1;\n",
     '.work/unselected.md': '[ignored](absent-file)\n',
   });
-  const result = check(root);
+  const result = await check(root);
   expect(result.output).toContain('longestFunction=324');
   expect(result.output).toContain('decisionNodes=0');
   expect(result.status, result.output).toBe(0);
@@ -413,7 +419,7 @@ it.each([
     'IMPORT_CYCLE',
   ],
 ] as const)('rejects %s with an actionable nonzero result', async (_name, files, diagnostic) => {
-  const result = check(await fixture(files));
+  const result = await check(await fixture(files));
   expect(result.status, result.output).toBe(1);
   expect(result.output).toContain(diagnostic);
 });
@@ -446,7 +452,7 @@ export const documentation = "import '@deepseek-ai/not-a-package'";`,
     expect(
       diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')),
     ).toEqual([]);
-    const result = check(root);
+    const result = await check(root);
     const allowed = file === 'src/plugin.ts' || file === 'src/dsh/kernel.ts';
     expect(result.status, result.output).toBe(allowed ? 0 : 1);
     if (!allowed) expect(result.output).toContain(`DSH_BOUNDARY ${file}`);
@@ -501,7 +507,7 @@ it.each([
     expect(
       diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')),
     ).toEqual([]);
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(name.startsWith('@deepseek-ai/') ? 1 : 0);
     if (name.startsWith('@deepseek-ai/'))
       expect(result.output).toContain('DSH_BOUNDARY src/other.ts');
@@ -565,7 +571,7 @@ it.each([
     expect(
       diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')),
     ).toEqual([]);
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(expectedStatus);
     if (expectedStatus === 1) expect(result.output).toContain('DSH_BOUNDARY src/other.ts');
   },
@@ -577,15 +583,15 @@ it('accepts same-module development imports and rejects harness/service/type-exp
     'scripts/harness/use.ts': "export { value } from './value.ts';",
     'scripts/service/value.ts': 'export interface Config { port: number }',
   });
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
   await writeFile(
     join(root, 'scripts/harness/use.ts'),
     "export type { Config } from '../service/value.ts';",
   );
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(join(root, 'scripts/harness/use.ts'), "export { value } from './value.ts';");
   await writeFile(join(root, 'scripts/service/use.ts'), "import '../harness/value.ts';");
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
 });
 
 it('checks aliases and dynamic targets across development boundaries, and includes development cycles', async () => {
@@ -599,26 +605,26 @@ it('checks aliases and dynamic targets across development boundaries, and includ
   const config = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'));
   config.compilerOptions.paths = { '@service/*': ['./scripts/service/*'] };
   await writeFile(path, JSON.stringify(config));
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(
     join(root, 'scripts/harness/a.ts'),
     'const target = "../service/value.ts"; void import(target);',
   );
-  expect(check(root).output).toContain('DYNAMIC_IMPORT');
+  expect((await check(root)).output).toContain('DYNAMIC_IMPORT');
   await writeFile(join(root, 'scripts/harness/a.ts'), "import './b.ts';");
   await writeFile(join(root, 'scripts/harness/b.ts'), "export * from './a.ts';");
-  expect(check(root).output).toContain('IMPORT_CYCLE');
+  expect((await check(root)).output).toContain('IMPORT_CYCLE');
 });
 
 it('refuses an undeclared script location and a development root with no dependency rules', async () => {
   const root = await fixture({ 'scripts/loose.ts': 'export const value = 1;' });
-  expect(check(root).output).toContain('FILE_UNCLASSIFIED');
+  expect((await check(root)).output).toContain('FILE_UNCLASSIFIED');
   await rm(join(root, 'scripts/loose.ts'));
   const path = join(root, 'harness.config.json');
   const config = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'));
   delete config.developmentDependencies;
   await writeFile(path, JSON.stringify(config));
-  expect(check(root).output).toContain('DEVELOPMENT_RULE_MISSING');
+  expect((await check(root)).output).toContain('DEVELOPMENT_RULE_MISSING');
 });
 
 it('resolves conditional package aliases in the actual import or require mode', async () => {
@@ -636,16 +642,16 @@ it('resolves conditional package aliases in the actual import or require mode', 
     'scripts/service/value.ts': 'export const value = 2;',
     'scripts/harness/use.ts': "import { value } from '#tool'; export { value };",
   });
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(
     join(root, 'scripts/harness/use.ts'),
     "export type Value = typeof import('#tool');",
   );
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(join(root, 'scripts/harness/use.ts'), "void import('#tool');");
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(join(root, 'scripts/harness/use.ts'), "export const value = require('#tool');");
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
   await writeFile(
     join(root, 'package.json'),
     JSON.stringify({
@@ -658,12 +664,12 @@ it('resolves conditional package aliases in the actual import or require mode', 
       },
     }),
   );
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(
     join(root, 'scripts/harness/use.ts'),
     "import { value } from '#tool'; export { value }; ",
   );
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
 });
 
 function git(root: string, ...args: string[]) {
@@ -687,7 +693,7 @@ it('reports tracked private and configured generated files, including nested pac
   await writeFile(join(root, 'harness.config.json'), JSON.stringify(config));
   git(root, 'init', '-q');
   git(root, 'add', '-f', ...excluded, '.env.example');
-  const result = check(root);
+  const result = await check(root);
   expect(result.status).toBe(1);
   expect(result.output).toContain('Git index: checked');
   expect(result.output.match(/INDEX_PRIVATE [^\n]+/g)?.sort()).toEqual(
@@ -699,7 +705,7 @@ it('reports tracked private and configured generated files, including nested pac
 it('passes a source export and fails an unreadable index in regular and linked worktrees', async () => {
   const root = await fixture({});
   const noGit = { ...process.env, PATH: join(root, 'missing-directory') };
-  const exported = check(root, noGit);
+  const exported = await check(root, noGit);
   expect(exported.status, exported.output).toBe(0);
   expect(exported.output).toContain('Git index: unavailable (not verified)');
 
@@ -720,15 +726,15 @@ it('passes a source export and fails an unreadable index in regular and linked w
   git(root, 'worktree', 'add', '-q', '--detach', worktree);
   expect((await readFile(join(worktree, '.git'), 'utf8')).startsWith('gitdir: ')).toBe(true);
   for (const checkout of [root, worktree]) {
-    const available = check(checkout);
+    const available = await check(checkout);
     expect(available.status, available.output).toBe(0);
     expect(available.output).toContain('Git index: checked');
-    const missingExecutable = check(checkout, noGit);
+    const missingExecutable = await check(checkout, noGit);
     expect(missingExecutable.status, missingExecutable.output).toBe(1);
     expect(missingExecutable.output).toContain('INDEX_READ');
     const index = resolve(checkout, git(checkout, 'rev-parse', '--git-path', 'index'));
     await writeFile(index, 'Corrupted Git index fixture\n');
-    const corruptIndex = check(checkout);
+    const corruptIndex = await check(checkout);
     expect(corruptIndex.status, corruptIndex.output).toBe(1);
     expect(corruptIndex.output).toContain('INDEX_READ');
   }
@@ -741,7 +747,7 @@ it('requires projects when a second production root is classified', async () => 
   ) as { sourceRoots: Record<string, string> };
   configuration.sourceRoots.worker = 'production';
   await writeFile(join(root, 'harness.config.json'), JSON.stringify(configuration));
-  const result = check(root);
+  const result = await check(root);
   expect(result.status, result.output).toBe(1);
   expect(result.output).toContain('PROJECTS_REQUIRED');
 });
@@ -754,7 +760,7 @@ it('rejects a legacy build that suppresses executable output', async () => {
   };
   config.compilerOptions.noEmit = true;
   await writeFile(path, JSON.stringify(config));
-  expect(check(root).output).toContain('PROJECT_BUILD_EMIT root');
+  expect((await check(root)).output).toContain('PROJECT_BUILD_EMIT root');
 });
 
 it('allows only the explicit service migration config edge and isolates auth packages', async () => {
@@ -764,20 +770,20 @@ it('allows only the explicit service migration config edge and isolates auth pac
     'scripts/service/migrate.ts':
       "import { value } from '../../src/auth/config.ts'; export { value };",
   });
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
   await writeFile(
     join(root, 'scripts/service/migrate.ts'),
     "export { service } from '../../src/auth/service.ts';",
   );
-  expect(check(root).output).toContain('DEVELOPMENT_DEPENDENCY');
+  expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
   await writeFile(join(root, 'scripts/service/migrate.ts'), 'export {};');
   await writeFile(join(root, 'src/bypass.ts'), "import { Pool } from 'pg'; export { Pool };");
-  expect(check(root).output).toContain('AUTH_ADAPTER');
+  expect((await check(root)).output).toContain('AUTH_ADAPTER');
   await rm(join(root, 'src/bypass.ts'));
   await writeFile(join(root, 'src/auth/service.ts'), "import { Pool } from 'pg'; export { Pool };");
-  expect(check(root).status).toBe(0);
+  expect((await check(root)).status).toBe(0);
   await writeFile(join(root, 'src/bypass.ts'), "export { authOptions } from 'better-auth';");
-  expect(check(root).output).toContain('AUTH_ADAPTER');
+  expect((await check(root)).output).toContain('AUTH_ADAPTER');
 });
 
 it.each([
@@ -800,7 +806,7 @@ export function start(response: ServerResponse): ApiError { return { error: { co
       'src/assets/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
       'src/compute/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
     });
-    expect(check(root).status).toBe(0);
+    expect((await check(root)).status).toBe(0);
     const configPath = join(root, 'tsconfig.json');
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     config.compilerOptions.paths = {
@@ -816,7 +822,7 @@ export function start(response: ServerResponse): ApiError { return { error: { co
     ];
     for (const source of allowed) {
       await writeFile(helper, source);
-      const result = check(root);
+      const result = await check(root);
       expect(result.status, source + result.output).toBe(0);
     }
     const rejected = [
@@ -834,14 +840,14 @@ export function start(response: ServerResponse): ApiError { return { error: { co
     ];
     for (const source of rejected) {
       await writeFile(helper, source);
-      const result = check(root);
+      const result = await check(root);
       expect(result.status, source + result.output).toBe(1);
       expect(result.output, source).toContain(`${diagnostic} ${file}`);
     }
     config.compilerOptions.paths['node:http'] = ['./src/auth/value.ts'];
     await writeFile(configPath, JSON.stringify(config));
     await writeFile(helper, "export type { IncomingMessage } from 'node:http';");
-    const disguised = check(root);
+    const disguised = await check(root);
     expect(disguised.status, disguised.output).toBe(1);
     expect(disguised.output).toContain(`${diagnostic} ${file}`);
   },
@@ -871,8 +877,18 @@ it.each(['src/plugin.ts', 'src/auth/query.ts'])(
     expect(
       diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')),
     ).toEqual([]);
-    const result = check(root);
+    const result = await check(root);
     expect(result.status, result.output).toBe(file.startsWith('src/auth/') ? 0 : 1);
     if (file === 'src/plugin.ts') expect(result.output.match(/AUTH_ADAPTER/g)).toHaveLength(2);
   },
 );
+
+it('exits 0 on pass and 1 on failure when invoked directly through the CLI entrypoint', async () => {
+  const passing = checkCli(await fixture({}));
+  expect(passing.status, passing.output).toBe(0);
+  expect(passing.output).toContain('Guardrails passed for the declared scope.');
+
+  const failing = checkCli(await fixture({ 'src/worker.py': 'print(1)' }));
+  expect(failing.status, failing.output).toBe(1);
+  expect(failing.output).toContain('SOURCE_UNSUPPORTED');
+});

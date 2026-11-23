@@ -501,8 +501,11 @@ it('reconciles a reception committed before acknowledgment failure without block
 
 it('bounds request bodies and closes excessive stream frames while accepted execution completes', async () => {
   const id = await create();
+  script.push(textResponse('script accepted'));
+  expect((await send(id, 'above-old-limit', 'x'.repeat(16 * 1024))).status).toBe(202);
+  expect((await terminal(id, 'above-old-limit')).status).toBe('completed');
   expect(
-    (await call(path(id, 'messages'), { requestId: 'too-large', text: 'x'.repeat(16 * 1024) }))
+    (await call(path(id, 'messages'), { requestId: 'too-large', text: 'x'.repeat(256 * 1024) }))
       .status,
   ).toBe(413);
   expect(

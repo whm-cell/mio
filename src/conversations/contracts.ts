@@ -16,11 +16,18 @@ export type TerminalRequestStatus = Exclude<RequestStatus, 'accepted' | 'input-p
 export const isInFlightRequest = (status: RequestStatus) =>
   status === 'accepted' || status === 'input-persisted';
 export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
+export const MAX_CONVERSATION_TITLE_BYTES = 120;
 export interface Conversation {
   id: string;
   createdAt: string;
+  updatedAt: string;
+  title: string | null;
   state: 'creating' | 'ready' | 'unknown';
   modelRef?: string | null;
+}
+export interface ConversationArchive {
+  id: string;
+  archivedAt: string;
 }
 export interface ModelObservation {
   readonly status?: number;
@@ -187,6 +194,7 @@ export type ConversationEvent =
 export interface ConversationEngine {
   readonly available: boolean;
   create(id: string, selection?: ChatSelection): Promise<void>;
+  rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
   run(
     id: string,
@@ -196,6 +204,7 @@ export interface ConversationEngine {
     emit: (event: ConversationEvent) => void,
     binding?: ConversationRun,
     images?: readonly ConversationImageReference[],
+    admitted?: (eventTimeMs: number, autoTitle?: string) => Promise<void>,
   ): Promise<TerminalRequestStatus | typeof outputTruncation.reason>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;

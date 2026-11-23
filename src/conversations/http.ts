@@ -1,14 +1,16 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { parseJsonBody, readBody, readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
-import { ConversationError } from './contracts.ts';
+import { ConversationError, MAX_CONVERSATION_TITLE_BYTES } from './contracts.ts';
 import type { Principal, ConversationEvent, ConversationSnapshot, Receipt } from './contracts.ts';
+import { parseConversationCursor } from './cursor.ts';
 import type { ConversationService } from './service.ts';
 import { createSseRegistry } from './sse-registry.ts';
 
-const MAX_BODY = 16 * 1024;
+const MAX_CONTROL_BODY = 16 * 1024;
+const MAX_MESSAGE_BODY = 256 * 1024;
 const MAX_STREAM_BUFFER = 64 * 1024;
 const requestIdPattern = /^[A-Za-z0-9_-]{1,80}$/;
 type Identity = (headers: Headers) => Promise<Principal | null>;
@@ -196,51 +198,43 @@ export function createConversationHandler(
       const id = parts[0];
       const action = parts[1];
       const receiptId = parts[2];
-      let method: string | undefined;
-      if (base) method = request.method === 'POST' ? 'POST' : 'GET';
-      else if (id && isUuidV4(id) && parts.length === 2 && action === 'model') method = 'PUT';
+      const validId = id !== undefined && isUuidV4(id);
+      let methods: string[] | undefined;
+      if (base) methods = ['GET', 'POST'];
+      else if (validId && parts.length === 1) methods = ['PATCH', 'DELETE'];
+      else if (validId && parts.length === 2 && action === 'model') methods = ['PUT'];
+      else if (validId && parts.length === 2 && ['history', 'events'].includes(action ?? ''))
+        methods = ['GET'];
+      else if (validId && parts.length === 2 && ['messages', 'cancel'].includes(action ?? ''))
+        methods = ['POST'];
       else if (
-        id &&
-        isUuidV4(id) &&
-        parts.length === 2 &&
-        ['history', 'events'].includes(action ?? '')
-      )
-        method = 'GET';
-      else if (
-        id &&
-        isUuidV4(id) &&
-        parts.length === 2 &&
-        ['messages', 'cancel'].includes(action ?? '')
-      )
-        method = 'POST';
-      else if (
-        id &&
-        isUuidV4(id) &&
+        validId &&
         action === 'requests' &&
         receiptId &&
         requestIdPattern.test(receiptId) &&
         parts.length === 3
       )
-        method = 'GET';
-      if (!method) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      if (request.method === 'OPTIONS') {
+        methods = ['GET'];
+      if (!methods) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      const method = request.method ?? '';
+      const allow = [...methods, 'OPTIONS'].join(', ');
+      if (method === 'OPTIONS') {
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
         response.writeHead(HTTP_STATUS.NO_CONTENT, {
-          'access-control-allow-methods': base ? 'GET, POST, OPTIONS' : `${method}, OPTIONS`,
+          'access-control-allow-methods': allow,
           'access-control-allow-headers': 'Content-Type',
         });
         response.end();
         return;
       }
-      if (request.method !== method) {
-        response.setHeader('allow', base ? 'GET, POST, OPTIONS' : `${method}, OPTIONS`);
+      if (!methods.includes(method)) {
+        response.setHeader('allow', allow);
         return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
       }
-      if (method !== 'GET' && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-      if (
-        method !== 'GET' &&
-        request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
-      )
+      const writing = method !== 'GET';
+      const json = request.headers['content-type']?.split(';')[0]?.trim() === 'application/json';
+      if (writing && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+      if (writing && method !== 'DELETE' && !json)
         return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
       const headers = new Headers();
       if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
@@ -259,8 +253,20 @@ export function createConversationHandler(
       }
       let actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
-      const value = method !== 'GET' ? await readJsonBody(request, MAX_BODY) : {};
-      if (method !== 'GET') {
+      let value: Record<string, unknown> = {};
+      if (writing) {
+        if (method === 'DELETE') {
+          const bytes = await readBody(request, MAX_CONTROL_BODY);
+          if (bytes.length) {
+            if (!json) return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
+            value = parseJsonBody(bytes);
+          }
+        } else {
+          value = await readJsonBody(
+            request,
+            action === 'messages' ? MAX_MESSAGE_BODY : MAX_CONTROL_BODY,
+          );
+        }
         actor = await identity(headers);
         if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       }
@@ -269,7 +275,9 @@ export function createConversationHandler(
           ? ['requestId', 'text', 'imageAssetIds']
           : (base && method === 'POST') || action === 'model'
             ? ['modelRef']
-            : [];
+            : method === 'PATCH'
+              ? ['title']
+              : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (status: number, value: unknown) => {
@@ -294,10 +302,19 @@ export function createConversationHandler(
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(HTTP_STATUS.OK, await service.bind(actor, id!, value.modelRef));
       }
+      if (method === 'PATCH') {
+        if (
+          typeof value.title !== 'string' ||
+          !value.title.isWellFormed() ||
+          !value.title.trim() ||
+          Buffer.byteLength(value.title) > MAX_CONVERSATION_TITLE_BYTES
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        return send(HTTP_STATUS.OK, await service.rename(actor, id!, value.title));
+      }
+      if (method === 'DELETE') return send(HTTP_STATUS.OK, await service.archive(actor, id!));
       if (base) {
-        const after = url.searchParams.get('after') ?? undefined;
-        if (after !== undefined && !isUuidV4(after))
-          return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
+        const after = parseConversationCursor(url.searchParams.get('after') ?? undefined);
         return send(
           HTTP_STATUS.OK,
           await service.list(actor, after, integer(url.searchParams.get('limit'), 20, 1, 100)),
@@ -333,7 +350,6 @@ export function createConversationHandler(
           !requestIdPattern.test(value.requestId) ||
           typeof value.text !== 'string' ||
           !value.text.trim() ||
-          Buffer.byteLength(value.text) > MAX_BODY ||
           (value.imageAssetIds !== undefined &&
             (!Array.isArray(value.imageAssetIds) ||
               value.imageAssetIds.length > 4 ||
@@ -343,6 +359,8 @@ export function createConversationHandler(
               new Set(value.imageAssetIds).size !== value.imageAssetIds.length))
         )
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        if (Buffer.byteLength(value.text) > MAX_MESSAGE_BODY)
+          return fail(HTTP_STATUS.PAYLOAD_TOO_LARGE, 'BODY_TOO_LARGE');
         return send(
           HTTP_STATUS.ACCEPTED,
           await service.send(

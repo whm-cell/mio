@@ -12,6 +12,8 @@
 
 素材认证在同一媒体域池增量建立 `mio_material_auth_sessions`，仅会话表承担创建/验证意图、独立用途密文、20 分钟 TTL、token digest、租约及最多 8 次查询计数，不双写 operation。`upstream_create_request_id`、`upstream_result_request_id`、`upstream_group_request_id` 分别保存创建、查结果、验组三个动作最近一次取得的有效 RequestId，来源为通过校验的成功或明确拒绝信封，每项最多 256 个字符。显式迁移保留旧行并将新增列置空；收到有效值后随原会话状态提交，仅供内部审计。owner/group 复合 FK 只在媒体库内；source/密钥/认证库无跨库 FK。公开认证启用时启动只读检查当前结构。有会话表的素材服务在启动及运行期间按到期索引每批最多清理 100 条，包括关闭认证入口时；完成实体/会话终态/清密文同事务，网络不持事务。
 
+对话通过 `pnpm conversations:migrate --apply` 增量登记标题、固定状态、活跃时间与归档时间。既有会话的活跃时间从创建时间回填，原回执和摘要继续可读。创建部分索引 `(owner_id, updated_at DESC, id DESC) WHERE archived_at IS NULL` 供默认分页，旧 UUID 分页继续复用 owner/id 索引。比较和编码游标保留 PostgreSQL 微秒精度。归档、改名和请求受理使用同一归属行锁，真正落盘的用户消息推进活跃度。标题和归档规则见[对话服务](../conversations.md#标题活跃度与归档)。
+
 ## 必须遵守的约束
 
 - 持有连接资源的实现负责释放。现行认证服务在创建失败时关闭数据库池，正常关闭由插件调用；启动过程中卸载后取得的认证服务也会被释放。[显式迁移工具](../../scripts/service/migrate-auth.ts)在 `finally` 中关闭自己创建的池。

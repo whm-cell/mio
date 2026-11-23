@@ -42,7 +42,7 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-it('drains the service and releases the projection even when both close paths fail', async () => {
+it('drains the service and releases conversation plugins even when both close paths fail', async () => {
   const root = await mkdtemp(join(tmpdir(), 'mio-vision-close-fail-'));
   const ctx = await kernelRuntime(root, new ScriptedModel([]));
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
@@ -58,12 +58,16 @@ it('drains the service and releases the projection even when both close paths fa
     throw new Error('synthetic service close failure');
   });
   try {
+    expect(ctx.get('sessionTitle')).toBeUndefined();
     const fiber = await ctx.plugin(Mio, { tokenEnv: 'MIO_FIXTURE_TOKEN', allowedOrigins: [] });
+    const titleService = ctx.sessionTitle;
+    expect(titleService).toBeDefined();
     expect(ctx.sessions.messageProjections.some((item) => item.type === 'image/offload')).toBe(
       true,
     );
     const disposing = fiber.dispose();
     await entered.promise;
+    expect(ctx.get('sessionTitle')).toBeDefined();
     expect(ctx.sessions.messageProjections.some((item) => item.type === 'image/offload')).toBe(
       true,
     );
@@ -71,6 +75,7 @@ it('drains the service and releases the projection even when both close paths fa
     await disposing;
     expect(fixture.closeHttp).toHaveBeenCalledOnce();
     expect(fixture.closeService).toHaveBeenCalledOnce();
+    expect(ctx.get('sessionTitle')).toBeUndefined();
     expect(ctx.sessions.messageProjections.some((item) => item.type === 'image/offload')).toBe(
       false,
     );
@@ -81,7 +86,7 @@ it('drains the service and releases the projection even when both close paths fa
   }
 }, 30000);
 
-it('releases the projection when conversation store startup fails', async () => {
+it('releases conversation plugins when conversation store startup fails', async () => {
   const root = await mkdtemp(join(tmpdir(), 'mio-vision-start-fail-'));
   const ctx = await kernelRuntime(root, new ScriptedModel([]));
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
@@ -91,6 +96,7 @@ it('releases the projection when conversation store startup fails', async () => 
     await expect(
       ctx.plugin(Mio, { tokenEnv: 'MIO_FIXTURE_TOKEN', allowedOrigins: [] }).await(),
     ).rejects.toThrow('synthetic store startup failure');
+    expect(ctx.get('sessionTitle')).toBeUndefined();
     expect(ctx.sessions.messageProjections.some((item) => item.type === 'image/offload')).toBe(
       false,
     );

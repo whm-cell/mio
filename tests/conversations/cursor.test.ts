@@ -4,7 +4,7 @@ import { expect, it, vi } from 'vitest';
 import { createConversationHandler } from '../../src/conversations/http.ts';
 import type { ConversationService } from '../../src/conversations/service.ts';
 
-it('rejects present empty or malformed cursors before list while allowing missing and UUID cursors', async () => {
+it('rejects invalid cursors before list and passes validated legacy and activity positions', async () => {
   const actor = { userId: 'cursor-owner', sessionId: 'cursor-session' };
   const list = vi
     .fn<ConversationService['list']>()
@@ -20,7 +20,18 @@ it('rejects present empty or malformed cursors before list while allowing missin
   if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
   const url = `http://127.0.0.1:${address.port}/api/v1/conversations`;
   try {
-    for (const cursor of ['', 'malformed']) {
+    const id = randomUUID();
+    const updatedAt = '2026-11-23T00:00:00.123456Z';
+    const encode = (value: { v: number; updatedAt: string; id: string }) =>
+      Buffer.from(JSON.stringify(value)).toString('base64url');
+    for (const cursor of [
+      '',
+      'malformed',
+      encode({ v: 2, updatedAt, id }),
+      encode({ v: 1, updatedAt, id: 'invalid-uuid' }),
+      encode({ v: 1, updatedAt: '2026-02-30T00:00:00.123456Z', id }),
+      encode({ v: 1, updatedAt: '0000-01-01T00:00:00.123456Z', id }),
+    ]) {
       const response = await fetch(`${url}?after=${cursor}`);
       expect(response.status).toBe(400);
       expect(await response.json()).toMatchObject({ error: { code: 'QUERY_INVALID' } });
@@ -28,9 +39,11 @@ it('rejects present empty or malformed cursors before list while allowing missin
     expect(list).not.toHaveBeenCalled();
     expect((await fetch(url)).status).toBe(200);
     expect(list).toHaveBeenLastCalledWith(actor, undefined, 20);
-    const cursor = randomUUID();
-    expect((await fetch(`${url}?after=${cursor}&limit=5`)).status).toBe(200);
-    expect(list).toHaveBeenLastCalledWith(actor, cursor, 5);
+    expect((await fetch(`${url}?after=${id}&limit=5`)).status).toBe(200);
+    expect(list).toHaveBeenLastCalledWith(actor, { kind: 'legacy', id }, 5);
+    const activity = encode({ v: 1, updatedAt, id });
+    expect((await fetch(`${url}?after=${activity}`)).status).toBe(200);
+    expect(list).toHaveBeenLastCalledWith(actor, { kind: 'activity', updatedAt, id }, 20);
   } finally {
     await endpoint.close();
     server.closeAllConnections();

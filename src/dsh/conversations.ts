@@ -3,10 +3,17 @@ import { setImmediate as yieldToIO } from 'node:timers/promises';
 import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
-import type { TurnEndReason } from '@deepseek-ai/dsh-session';
+import type { UserMessage } from '@deepseek-ai/dsh-llm';
+import type { Session, TurnEndReason } from '@deepseek-ai/dsh-session';
+import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title';
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { ConversationConfig } from '../conversations/config.ts';
-import { outputTruncation } from '../conversations/contracts.ts';
+import {
+  ConversationError,
+  MAX_CONVERSATION_TITLE_BYTES,
+  outputTruncation,
+} from '../conversations/contracts.ts';
 import type {
   ConversationEngine,
   ConversationImageTools,
@@ -23,6 +30,12 @@ import { registerVisionTool } from './vision-tool.ts';
 import type { ChatRuntimeSnapshot, ChatSelection } from '../providers/contracts.ts';
 
 const MAX_TURN_STEPS = 8;
+interface ActiveRequest {
+  opening: Promise<AgentHandle>;
+  disposing?: true;
+  stop?: 'user' | 'disposed';
+  requestId: string;
+}
 
 /** Narrow bridge: DSH values stop here; only public text/tool-card/status values leave it. */
 export function createDshConversationEngine(
@@ -31,10 +44,8 @@ export function createDshConversationEngine(
   imageTools?: ConversationImageTools,
   vision?: ConversationVision,
 ): ConversationEngine {
-  const active = new Map<
-    string,
-    { opening: Promise<AgentHandle>; stop?: 'user' | 'disposed'; requestId: string }
-  >();
+  const active = new Map<string, ActiveRequest>();
+  const sessionActions = new Map<string, Promise<unknown>>();
   const tasks = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
   const onelink = config.byok ? registerOneLink(ctx, vision) : undefined;
@@ -54,6 +65,38 @@ export function createDshConversationEngine(
               : 1024,
         }
       : options;
+
+  // A rename can borrow the turn's handle. Order native opens, writes and
+  // disposals per session without holding this queue over a model turn or PG.
+  function inSessionOrder<T>(id: string, action: () => Promise<T>): Promise<T> {
+    const previous = sessionActions.get(id) ?? Promise.resolve();
+    const pending = previous.then(action, action);
+    sessionActions.set(id, pending);
+    const done = () => {
+      if (sessionActions.get(id) === pending) sessionActions.delete(id);
+    };
+    void pending.then(done, done);
+    return pending;
+  }
+
+  function titleService() {
+    // The service is a retained child of the conversation plugin.
+    const titles = ctx.get('sessionTitle');
+    if (!titles) throw new Error('MIO_SESSION_TITLE_UNAVAILABLE');
+    return titles;
+  }
+
+  async function renameSession(session: Session, normalized: string): Promise<string> {
+    const titles = titleService();
+    const current = titles.get(session);
+    const accepted =
+      current?.source.kind === 'user' && current.title === normalized
+        ? current
+        : titles.rename(session, normalized);
+    await ctx.mioKernel.flush(session);
+    return accepted.title;
+  }
+
   return {
     get available() {
       return (
@@ -65,12 +108,30 @@ export function createDshConversationEngine(
     },
     async create(id, selection) {
       if (closing) throw new Error('MIO_ENGINE_CLOSED');
-      const handle = await ctx.mioKernel.create(id, selectedOptions(selection));
-      try {
-        await ctx.mioKernel.flush(handle.agent.session);
-      } finally {
-        await handle.dispose();
-      }
+      await inSessionOrder(id, async () => {
+        const handle = await ctx.mioKernel.create(id, selectedOptions(selection));
+        try {
+          await ctx.mioKernel.flush(handle.agent.session);
+        } finally {
+          await handle.dispose();
+        }
+      });
+    },
+    async rename(id, title) {
+      if (closing) throw new Error('MIO_ENGINE_CLOSED');
+      const normalized = normalizeSessionTitle(title.toWellFormed(), MAX_CONVERSATION_TITLE_BYTES);
+      if (!normalized) throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      const running = active.get(id);
+      const liveOpening = running?.disposing ? undefined : running?.opening;
+      return inSessionOrder(id, async () => {
+        if (liveOpening) return renameSession((await liveOpening).agent.session, normalized);
+        const handle = await ctx.mioKernel.resume(id, {});
+        try {
+          return await renameSession(handle.agent.session, normalized);
+        } finally {
+          await handle.dispose();
+        }
+      });
     },
     async history(id, afterSeq, limit, signal) {
       const { events } = await ctx.mioKernel.history(id, signal);
@@ -143,7 +204,7 @@ export function createDshConversationEngine(
         hasMore: items.length > limit,
       };
     },
-    run(id, requestId, text, durable, emit, binding, images = []) {
+    run(id, requestId, text, durable, emit, binding, images = [], admitted) {
       if (closing || active.has(id)) return Promise.reject(new Error('MIO_ENGINE_BUSY'));
       if (
         config.byok &&
@@ -170,12 +231,10 @@ export function createDshConversationEngine(
         : undefined;
       let end: TurnEndReason | undefined;
       let revokeImageTools: (() => void) | undefined;
-      const entry: {
-        opening: Promise<AgentHandle>;
-        stop?: 'user' | 'disposed';
-        requestId: string;
-      } = {
-        opening: ctx.mioKernel.resume(id, runOptions, (agentCtx, agent) => {
+      const humanInput = Promise.withResolvers<number>();
+      let submittedId: UserMessage['id'] | undefined;
+      const resume = () =>
+        ctx.mioKernel.resume(id, runOptions, (agentCtx, agent) => {
           const oldNodes = new Set(agent.session.surface.nodes);
           oldImageCount = () => {
             let count = 0;
@@ -258,6 +317,12 @@ export function createDshConversationEngine(
           });
           agentCtx.on('session/event', (session, event) => {
             if (session !== agent.session) return;
+            if (
+              event.type === 'user/message' &&
+              event.data.source.kind === 'user' &&
+              event.data.id === submittedId
+            )
+              humanInput.resolve(event.time);
             if (event.type === 'tool/result' && !event.data.message.isError) {
               const projected = parseImageJobPresentationMeta(event.data.meta);
               if (projected) {
@@ -266,7 +331,9 @@ export function createDshConversationEngine(
             }
             if (event.type === 'turn/end') end = event.data.reason;
           });
-        }),
+        });
+      const entry: ActiveRequest = {
+        opening: inSessionOrder(id, resume),
         requestId,
       };
       active.set(id, entry);
@@ -275,21 +342,37 @@ export function createDshConversationEngine(
         try {
           if (entry.stop)
             return entry.stop === 'user' ? ('cancelled' as const) : ('unknown' as const);
-          handle.agent.followup(
-            createUserMessage({
-              content: [
-                { type: 'text', text },
-                ...images.map((image) => ({
-                  type: 'image' as const,
-                  attachment: { ...image, attachmentId: AttachmentId(image.attachmentId) },
-                })),
-              ],
-              source: { kind: 'user' },
-            }),
-          );
+          const message = createUserMessage({
+            content: [
+              { type: 'text', text },
+              ...images.map((image) => ({
+                type: 'image' as const,
+                attachment: { ...image, attachmentId: AttachmentId(image.attachmentId) },
+              })),
+            ],
+            source: { kind: 'user' },
+          });
+          submittedId = message.id;
+          handle.agent.followup(message);
           await ctx.mioKernel.flush(handle.agent.session);
           await durable();
-          await handle.agent.whenIdle();
+          const idle = handle.agent.whenIdle();
+          if (admitted) {
+            const time = await Promise.race([humanInput.promise, idle]);
+            if (time !== undefined) {
+              const session = handle.agent.session;
+              // The same refresh API can unpin a manual title. Only call it
+              // while the log lacks any accepted title.
+              const titles = titleService();
+              const title = titles.get(session) ?? (await titles.refresh(session));
+              await ctx.mioKernel.flush(session);
+              await admitted(
+                time,
+                title?.source.kind === 'fallback' ? title.title.toWellFormed() : undefined,
+              );
+            }
+          }
+          await idle;
           revokeImageTools?.();
           await ctx.mioKernel.flush(handle.agent.session);
           if (observationFailed) return 'unknown' as const;
@@ -301,8 +384,9 @@ export function createDshConversationEngine(
           if (end.kind === 'aborted' && end.reason.kind === 'disposed') return 'unknown' as const;
           return 'failed' as const;
         } finally {
+          entry.disposing = true;
           try {
-            await handle.dispose();
+            await inSessionOrder(id, () => handle.dispose());
           } finally {
             revokeImageTools?.();
             for (const release of releases.values()) release();
@@ -335,7 +419,7 @@ export function createDshConversationEngine(
             handle.agent.cancel({ kind: entry.stop });
           }),
         );
-        const settled = await Promise.allSettled(tasks);
+        const settled = await Promise.allSettled([...tasks, ...sessionActions.values()]);
         const failures = [...cancellations, ...settled].filter(
           (result) => result.status === 'rejected',
         );

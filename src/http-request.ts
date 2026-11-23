@@ -47,7 +47,10 @@ export async function readJsonBody(
   request: IncomingMessage,
   limit = 8192,
 ): Promise<Record<string, unknown>> {
-  const bytes = await readBody(request, limit);
+  return parseJsonBody(await readBody(request, limit));
+}
+
+export function parseJsonBody(bytes: Buffer): Record<string, unknown> {
   try {
     const value: unknown = JSON.parse(bytes.toString('utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();

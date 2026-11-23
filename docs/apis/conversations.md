@@ -116,13 +116,17 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 ## POST /api/v1/conversations/:id/forks
 
-当前登录用户须拥有源会话。正文为 `{requestId,turnEndSeq?}`。`turnEndSeq` 为非负安全整数，须匹配源历史中已持久、真实结算的 `turn/end` 序号。省略取最新可分叉轮次。归档或有活动请求的源会话仍可选择其已结算前缀。
+身份：当前登录用户须拥有源会话。
 
-完成创建返回 201，之后相同请求返回 200。响应形状与列表项相同，包含 `forkedFromConversationId` 和 `forkedUntilSeq`。新会话的公开历史保留截止点内的原序号和内容。初始标题、用途、默认推理档及逻辑模型绑定取首次预约时源会话的值，活跃时间从新会话的创建时间开始。源已从模型 A 切到 B 时，从 A 轮次分叉可保留其历史，子会话当前绑定为 B。后续执行按子会话 ID 重新核对项目关联、模型资格和权限。
+输入：`{requestId,turnEndSeq?}`。`turnEndSeq` 为非负安全整数，须匹配源历史中已持久、真实结算的 `turn/end` 序号。省略取最新可分叉轮次。归档或有活动请求的源会话仍可选择其已结算前缀。
 
-分叉请求按 owner、源会话与 requestId 去重。首次确定的目标 ID 与截止点固定。源后来增加新轮或换模，同输入重放仍定位同一子会话。省略序号与显式指定同一序号属于不同输入。形状错误返回 400 BODY_INVALID，合法序号无法证明为已结算边界或没有可分叉轮次时返回 409 CONVERSATION_FORK_BOUNDARY_INVALID，同 ID 异输入返回 409 REQUEST_ID_CONFLICT。写入未确认时可用相同 ID 和原输入重试。
+成功：完成创建返回 201，之后相同请求返回 200。响应形状与列表项相同，包含 `forkedFromConversationId` 和 `forkedUntilSeq`。新会话的公开历史保留截止点内的原序号和内容。初始标题、用途、默认推理档及逻辑模型绑定取首次预约时源会话的值，活跃时间从新会话的创建时间开始。源已从模型 A 切到 B 时，从 A 轮次分叉可保留其历史，子会话当前绑定为 B。后续执行按子会话 ID 重新核对项目关联、模型资格和权限。
 
-分叉只复制截止点内的原生事件。源日志、源回执及资产归属保持原样。该操作不产生模型或工具调用。
+分叉请求按 owner、源会话与 requestId 去重。首次确定的目标 ID 与截止点固定。源后来增加新轮或换模，同输入重放仍定位同一子会话。省略序号与显式指定同一序号属于不同输入。
+
+错误：形状错误返回 400 BODY_INVALID，合法序号无法证明为已结算边界或没有可分叉轮次时返回 409 CONVERSATION_FORK_BOUNDARY_INVALID，同 ID 异输入返回 409 REQUEST_ID_CONFLICT。写入未确认时可用相同 ID 和原输入重试。
+
+副作用：分叉只复制截止点内的原生事件。源日志、源回执及资产归属保持原样。该操作不产生模型或工具调用。
 
 ## GET /api/v1/conversations/:id/requests/:requestId
 

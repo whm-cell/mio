@@ -4,6 +4,7 @@ import { lstat, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/prom
 import { basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { Pool, PoolClient } from 'pg';
+import type { AssetRow } from '../../src/assets/store.ts';
 import { AssetStore } from '../../src/assets/store.ts';
 import { selectAudioModel } from '../../src/providers/audio-admission.ts';
 import { providerStateSQL } from '../../src/providers/state.ts';
@@ -14,6 +15,7 @@ const SOURCE_MANIFEST_LIMIT = 2 * 1024 * 1024;
 const STAGED_MANIFEST_LIMIT = 4 * 1024 * 1024;
 const PREVIEW_BYTES_LIMIT = 20 * 1024 * 1024;
 const PREVIEW_DURATION_LIMIT_MS = 300_000;
+const PREVIEW_ASSET_FILENAME = 'voice-preview.mp3';
 
 export interface StagedVoicePreview {
   upstreamId: string;
@@ -254,8 +256,9 @@ export async function stageVoicePreviews(options: {
       throw new Error('VOICE_PREVIEW_SOURCE_INVALID');
     const bytes = await readFile(sourcePath);
     if (bytes.length !== sourceInfo.size) throw new Error('VOICE_PREVIEW_SOURCE_CHANGED');
-    const durationMs = await inspect(sourcePath);
-    await atomicWrite(resolve(filesDirectory, entry.file), bytes);
+    const targetPath = resolve(filesDirectory, entry.file);
+    await atomicWrite(targetPath, bytes);
+    const durationMs = await inspect(targetPath);
     return {
       ...entry,
       sizeBytes: bytes.length,
@@ -368,7 +371,7 @@ export async function planVoicePreviewMigration(
       voiceRef: voice.voice_ref,
       providerId: target.providerId,
       assetId,
-      objectKey: `mio/raw/${assetId}/voice-preview.mp3`,
+      objectKey: `mio/raw/${assetId}/${PREVIEW_ASSET_FILENAME}`,
       alreadyBound: voice.preview_asset_id !== null,
     };
   });
@@ -385,6 +388,17 @@ export async function planVoicePreviewMigration(
 function objectMissing(error: unknown): boolean {
   const value = error as { statusCode?: number; code?: string };
   return value.statusCode === 404 || value.code === 'NoSuchKey' || value.code === 'NotFound';
+}
+
+function assertPreviewAsset(asset: AssetRow, entry: PlannedVoicePreview, etag: string) {
+  if (
+    asset.state !== 'ready' ||
+    asset.content_type !== 'audio/mpeg' ||
+    asset.raw_key !== entry.objectKey ||
+    asset.source_etag !== etag ||
+    Number(asset.size_bytes) !== entry.sizeBytes
+  )
+    throw new Error('VOICE_PREVIEW_ASSET_CONFLICT');
 }
 
 async function bindPreviewVoice(
@@ -462,20 +476,10 @@ export async function applyVoicePreviewMigration(
       signal.throwIfAborted();
       if (entry.alreadyBound) {
         const asset = await assets.owned(entry.assetId, plan.ownerId);
-        if (
-          asset.state !== 'ready' ||
-          asset.content_type !== 'audio/mpeg' ||
-          asset.raw_key !== entry.objectKey ||
-          Number(asset.size_bytes) !== entry.sizeBytes
-        )
-          throw new Error('VOICE_PREVIEW_ASSET_CONFLICT');
         const head = await objects.head(entry.objectKey);
-        if (
-          head.size !== entry.sizeBytes ||
-          head.etag !== asset.source_etag ||
-          head.sha256 !== entry.sha256
-        )
+        if (head.size !== entry.sizeBytes || head.sha256 !== entry.sha256 || !head.etag)
           throw new Error('VOICE_PREVIEW_OBJECT_CONFLICT');
+        assertPreviewAsset(asset, entry, head.etag);
         return { status: 'existing' as const };
       }
       const bytes = await readFile(resolve(options.stagingDirectory, 'files', entry.file));
@@ -492,15 +496,22 @@ export async function applyVoicePreviewMigration(
       }
       if (head.size !== entry.sizeBytes || head.sha256 !== entry.sha256 || !head.etag)
         throw new Error('VOICE_PREVIEW_OBJECT_CONFLICT');
-      await assets.publishAudio({
-        assetId: entry.assetId,
-        ownerId: plan.ownerId,
-        filename: entry.file,
-        contentType: 'audio/mpeg',
-        sizeBytes: entry.sizeBytes,
-        key: entry.objectKey,
-        etag: head.etag,
-      });
+      try {
+        await assets.publishAudio({
+          assetId: entry.assetId,
+          ownerId: plan.ownerId,
+          filename: PREVIEW_ASSET_FILENAME,
+          contentType: 'audio/mpeg',
+          sizeBytes: entry.sizeBytes,
+          key: entry.objectKey,
+          etag: head.etag,
+        });
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ASSET_SOURCE_CHANGED'))
+          throw error;
+        // An older preview may have been recorded under its source filename before it was bound.
+        assertPreviewAsset(await assets.owned(entry.assetId, plan.ownerId), entry, head.etag);
+      }
       const providerClient = await providerPool.connect();
       try {
         return { status: await bindPreviewVoice(providerClient, plan, entry), uploaded };

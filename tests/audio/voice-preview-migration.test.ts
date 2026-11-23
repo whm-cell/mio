@@ -18,12 +18,16 @@ import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
+let assetDatabase: Awaited<ReturnType<typeof authDatabase>>;
+let assets: Pool;
 const temporaryDirectories: string[] = [];
 
 beforeAll(async () => {
   database = await authDatabase();
   pool = new Pool({ connectionString: database.url });
-  await pool.query(assetSchemaSQL);
+  assetDatabase = await authDatabase();
+  assets = new Pool({ connectionString: assetDatabase.url });
+  await assets.query(assetSchemaSQL);
   await pool.query(providerSchemaSQL);
 }, 30_000);
 
@@ -32,8 +36,8 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await pool?.end();
-  await database?.close();
+  await Promise.all([pool?.end(), assets?.end()]);
+  await Promise.all([database?.close(), assetDatabase?.close()]);
 });
 
 async function temporaryRoot(): Promise<string> {
@@ -171,7 +175,7 @@ it('keeps preview mode read-only, applies ready assets for the owner, and reruns
     stagingDirectory: fixture.staging,
   });
   expect(plan.entries).toHaveLength(2);
-  expect((await pool.query('SELECT * FROM mio_assets')).rowCount).toBe(0);
+  expect((await assets.query('SELECT * FROM mio_assets')).rowCount).toBe(0);
   expect(
     (
       await pool.query<{ count: string }>(
@@ -183,12 +187,12 @@ it('keeps preview mode read-only, applies ready assets for the owner, and reruns
 
   const objects = new FakeObjects();
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, plan, {
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
       stagingDirectory: fixture.staging,
       concurrency: 2,
     }),
   ).resolves.toEqual({ bound: 2, existing: 0, uploaded: 2, reconciled: 0, failed: 0 });
-  expect((await pool.query("SELECT * FROM mio_assets WHERE state='ready'")).rowCount).toBe(2);
+  expect((await assets.query("SELECT * FROM mio_assets WHERE state='ready'")).rowCount).toBe(2);
   expect(
     (
       await pool.query<{ count: string }>(
@@ -205,7 +209,7 @@ it('keeps preview mode read-only, applies ready assets for the owner, and reruns
   });
   expect(rerun.entries.every((entry) => entry.alreadyBound)).toBe(true);
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, rerun, {
+    applyVoicePreviewMigration(pool, assets, objects, rerun, {
       stagingDirectory: fixture.staging,
     }),
   ).resolves.toEqual({ bound: 0, existing: 2, uploaded: 0, reconciled: 0, failed: 0 });
@@ -233,7 +237,7 @@ it('reconciles an existing matching object and resumes only failed entries', asy
   });
   objects.failOnce.add(plan.entries[1]!.objectKey);
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, plan, {
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
       stagingDirectory: fixture.staging,
       concurrency: 1,
     }),
@@ -245,7 +249,7 @@ it('reconciles an existing matching object and resumes only failed entries', asy
     stagingDirectory: fixture.staging,
   });
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, retry, {
+    applyVoicePreviewMigration(pool, assets, objects, retry, {
       stagingDirectory: fixture.staging,
       concurrency: 1,
     }),
@@ -270,13 +274,13 @@ it('refuses to bind a COS object whose length or digest conflicts with staging',
     etag: 'wrong-etag',
   });
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, plan, {
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
       stagingDirectory: fixture.staging,
     }),
   ).resolves.toEqual({ bound: 0, existing: 0, uploaded: 0, reconciled: 0, failed: 1 });
-  expect((await pool.query('SELECT * FROM mio_assets WHERE owner_id=$1', [ownerId])).rowCount).toBe(
-    0,
-  );
+  expect(
+    (await assets.query('SELECT * FROM mio_assets WHERE owner_id=$1', [ownerId])).rowCount,
+  ).toBe(0);
 });
 
 it('resumes provider binding after the ready Asset checkpoint committed', async () => {
@@ -294,13 +298,13 @@ it('resumes provider binding after the ready Asset checkpoint committed', async 
   await pool.query('DELETE FROM mio_provider_voices WHERE id=$1', [entry.voiceRef]);
   const objects = new FakeObjects();
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, plan, {
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
       stagingDirectory: fixture.staging,
     }),
   ).resolves.toEqual({ bound: 0, existing: 0, uploaded: 1, reconciled: 0, failed: 1 });
-  expect((await pool.query('SELECT * FROM mio_assets WHERE id=$1', [entry.assetId])).rowCount).toBe(
-    1,
-  );
+  expect(
+    (await assets.query('SELECT * FROM mio_assets WHERE id=$1', [entry.assetId])).rowCount,
+  ).toBe(1);
   expect(objects.uploads).toEqual([entry.objectKey]);
 
   await pool.query(
@@ -310,9 +314,105 @@ it('resumes provider binding after the ready Asset checkpoint committed', async 
     [entry.voiceRef, providerId, entry.upstreamId],
   );
   await expect(
-    applyVoicePreviewMigration(pool, pool, objects, plan, {
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
       stagingDirectory: fixture.staging,
     }),
   ).resolves.toEqual({ bound: 1, existing: 0, uploaded: 0, reconciled: 1, failed: 0 });
   expect(objects.uploads).toEqual([entry.objectKey]);
+});
+
+it('shares a deterministic ready preview for identical MP3 bytes under distinct source names', async () => {
+  const fixture = await stageFixture({ voiceA: 'original-a.mp3', voiceB: 'original-b.mp3' });
+  await writeFile(
+    join(fixture.source, 'original-b.mp3'),
+    await readFile(join(fixture.source, 'original-a.mp3')),
+  );
+  await fixture.stage();
+  const ownerId = randomUUID();
+  const modelId = `speech-shared-preview-${randomUUID()}`;
+  const providerId = await createTarget(ownerId, modelId, ['voiceA', 'voiceB']);
+  const plan = await planVoicePreviewMigration(pool, {
+    ownerId,
+    modelId,
+    stagingDirectory: fixture.staging,
+  });
+  const [first, second] = plan.entries;
+  expect(first!.assetId).toBe(second!.assetId);
+  const objects = new FakeObjects();
+  await expect(
+    applyVoicePreviewMigration(pool, assets, objects, plan, {
+      stagingDirectory: fixture.staging,
+      concurrency: 1,
+    }),
+  ).resolves.toEqual({ bound: 2, existing: 0, uploaded: 1, reconciled: 1, failed: 0 });
+  const asset = await assets.query('SELECT owner_id,filename,state FROM mio_assets WHERE id=$1', [
+    first!.assetId,
+  ]);
+  expect(asset.rows).toEqual([
+    { owner_id: ownerId, filename: 'voice-preview.mp3', state: 'ready' },
+  ]);
+  const voices = await pool.query(
+    'SELECT preview_asset_id FROM mio_provider_voices WHERE provider_id=$1',
+    [providerId],
+  );
+  expect(voices.rows).toEqual([
+    { preview_asset_id: first!.assetId },
+    { preview_asset_id: first!.assetId },
+  ]);
+  const rerun = await planVoicePreviewMigration(pool, {
+    ownerId,
+    modelId,
+    stagingDirectory: fixture.staging,
+  });
+  await expect(
+    applyVoicePreviewMigration(pool, assets, objects, rerun, { stagingDirectory: fixture.staging }),
+  ).resolves.toEqual({ bound: 0, existing: 2, uploaded: 0, reconciled: 0, failed: 0 });
+});
+
+it('recovers a legacy filename only after confirming owner, ready asset identity and COS digest', async () => {
+  const fixture = await stageFixture({ voiceA: 'new-source.mp3' });
+  await fixture.stage();
+  const ownerId = randomUUID();
+  const modelId = `speech-legacy-preview-${randomUUID()}`;
+  await createTarget(ownerId, modelId, ['voiceA']);
+  const plan = await planVoicePreviewMigration(pool, {
+    ownerId,
+    modelId,
+    stagingDirectory: fixture.staging,
+  });
+  const entry = plan.entries[0]!;
+  const objects = new FakeObjects();
+  const bytes = await readFile(join(fixture.staging, 'files', entry.file));
+  const etag = 'legacy-preview-etag';
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag });
+  await assets.query(
+    `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
+    VALUES($1,$2,'old-source.mp3','audio/mpeg',$3,$4,$4,'ready',$5,now(),now())`,
+    [entry.assetId, randomUUID(), entry.sizeBytes, entry.objectKey, etag],
+  );
+  const apply = () =>
+    applyVoicePreviewMigration(pool, assets, objects, plan, { stagingDirectory: fixture.staging });
+  await expect(apply()).resolves.toMatchObject({ failed: 1, bound: 0 });
+  await assets.query('UPDATE mio_assets SET owner_id=$2 WHERE id=$1', [entry.assetId, ownerId]);
+  objects.objects.set(entry.objectKey, { bytes, sha256: '0'.repeat(64), etag });
+  await expect(apply()).resolves.toMatchObject({ failed: 1, bound: 0 });
+  expect(
+    (
+      await pool.query('SELECT preview_asset_id FROM mio_provider_voices WHERE id=$1', [
+        entry.voiceRef,
+      ])
+    ).rows,
+  ).toEqual([{ preview_asset_id: null }]);
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag });
+  await expect(apply()).resolves.toEqual({
+    failed: 0,
+    bound: 1,
+    existing: 0,
+    uploaded: 0,
+    reconciled: 1,
+  });
+  expect(
+    (await assets.query('SELECT filename,source_etag FROM mio_assets WHERE id=$1', [entry.assetId]))
+      .rows,
+  ).toEqual([{ filename: 'old-source.mp3', source_etag: etag }]);
 });

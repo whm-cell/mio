@@ -127,7 +127,7 @@ pnpm audio:voices:import --owner-id <id> --model-ref <ref> --voice-id <id> --nam
 
 登记限定为本人配置、一个上游音色和已发现的 TTS 模型。同身份重放保留 `voiceRef`、收藏和试听。换 Key 后保留目录条目和收藏，重新发现且路由仍启用时恢复相应系统音色的使用资格。复刻音色需属于本人有效凭据或已有的当前目录快照。用户刷新只读取本地音色。
 
-有授权试听文件时，使用 `pnpm audio:previews:import --stage --source-manifest <file> --source-directory <dir>` 准备清单与 MP3 文件，再用 `pnpm audio:previews:import --owner-id <id> --model-id <exact-id>` 查看计划。核对后加 `--apply`，脚本复用私有资产登记并绑定对应音色。发布后校验所有者、对象和文件摘要。重跑可补齐已登记资产但绑定失败的步骤。[音频 API](apis/audio.md)
+有授权试听文件时，使用 `pnpm audio:previews:import --stage --source-manifest <file> --source-directory <dir>` 准备清单与 MP3 文件，再用 `pnpm audio:previews:import --owner-id <id> --model-id <exact-id>` 查看计划。核对后加 `--apply`，脚本复用私有资产登记并绑定对应音色。试听资产按本人配置和文件摘要使用固定文件名。重跑可补齐已登记资产但绑定失败的步骤。旧试听名称在所有者、就绪状态、对象标识、大小、类型、ETag 和内容摘要一致时可继续使用。[音频 API](apis/audio.md)
 
 ### 模型扩展边界
 

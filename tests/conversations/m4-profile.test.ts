@@ -299,6 +299,21 @@ it('uses the latest private project context on normal messages across a packed P
     secondText,
     thirdText,
   ]);
+  const page = await json<HistoryPage>(await call(`${path}/history?limit=3`), 200);
+  expect(page).toEqual({
+    items: history.items.slice(0, 3),
+    nextAfterSeq: history.items[2]!.seq,
+    hasMore: true,
+  });
+  const nextPage = await json<HistoryPage>(
+    await call(`${path}/history?limit=2&afterSeq=${page.nextAfterSeq}`),
+    200,
+  );
+  expect(nextPage).toEqual({
+    items: history.items.slice(3, 5),
+    nextAfterSeq: history.items[4]!.seq,
+    hasMore: true,
+  });
   const finalMetadata = await json<{ items: Conversation[] }>(await call(base), 200);
   expect(finalMetadata.items.find((item) => item.id === id)?.title).toBe(firstText);
   const persisted = await observer.query(

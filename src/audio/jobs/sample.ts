@@ -97,7 +97,8 @@ export async function readCloneSample(
   const id = job.input.sampleAssetId;
   if (!sample || !id || job.input.sampleAuthorization !== true)
     throw new AudioError(400, 'AUDIO_SAMPLE_AUTHORIZATION_REQUIRED');
-  if (!objects.readAudio) throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
+  if (!objects.readAudio || !objects.ensureAudioPrivate)
+    throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
   const caps = job.admission.capabilities;
   const info = await media
     .inspect(
@@ -146,5 +147,14 @@ export async function readCloneSample(
     createHash('sha256').update(bytes).digest('hex') !== info.sha256
   )
     throw new AudioError(409, 'AUDIO_SAMPLE_CHANGED');
+  // Legacy copies can lack SHA-256 metadata. Full inspection and the
+  // conditional byte read above prove their contents before narrowing the ACL.
+  await objects
+    .ensureAudioPrivate(sample.key, { sizeBytes: sample.sizeBytes, etag: sample.etag }, signal)
+    .catch((error: unknown) => {
+      if ((error as { statusCode?: number } | null)?.statusCode === 412)
+        throw new AudioError(409, 'AUDIO_SAMPLE_CHANGED');
+      throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
+    });
   return { bytes, filename: sample.filename, contentType: sample.contentType };
 }

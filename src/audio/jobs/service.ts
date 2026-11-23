@@ -6,11 +6,10 @@ import { AudioError, audioText, audioParameters, AUDIO_SAMPLE_BYTES } from '../c
 import type { AudioContext, AudioJobView, AudioOperation } from '../contracts.ts';
 import type { ProviderService } from '../../providers/service.ts';
 import type { AssetObjectStore } from '../../assets/contracts.ts';
-import type { AssetStore } from '../../assets/store.ts';
 import type { AudioStore, AudioJobViewRow } from './store.ts';
 import type { submitAudio, downloadAudio } from '../../integrations/onelink/audio.ts';
 import { createAudioExecution } from './execution.ts';
-import type { AudioInspector } from './execution.ts';
+import type { AudioAssets, AudioInspector } from './execution.ts';
 import { audioSampleFingerprint, freezeAudioSample } from './sample.ts';
 
 const log = createLogger('app', 'audio-jobs');
@@ -115,7 +114,7 @@ export function createAudioJobService(
   providers: ProviderService,
   objects: AssetObjectStore,
   media: AudioInspector,
-  assets: Pick<AssetStore, 'owned' | 'publishAudio'>,
+  assets: AudioAssets,
   dependencies: {
     submit?: typeof submitAudio;
     download?: typeof downloadAudio;

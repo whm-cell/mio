@@ -112,6 +112,10 @@ class MissingObjectError extends Error {
 class FakeObjects implements PreviewObjectStore {
   readonly objects = new Map<string, { bytes: Buffer; sha256: string; etag: string }>();
   readonly uploads: string[] = [];
+  readonly aclCalls: string[] = [];
+  readonly aclWrites: string[] = [];
+  readonly privateKeys = new Set<string>();
+  readonly failAclOnce = new Set<string>();
   readonly failOnce = new Set<string>();
 
   async head(key: string) {
@@ -133,7 +137,26 @@ class FakeObjects implements PreviewObjectStore {
     const etag = `etag-${digest.slice(0, 12)}`;
     this.objects.set(key, { bytes: body, sha256: digest, etag });
     this.uploads.push(key);
+    this.privateKeys.add(key);
     return { key, sizeBytes: body.length, sha256: digest, etag };
+  }
+  async ensureAudioPrivate(
+    key: string,
+    expected: { sizeBytes: number; sha256?: string; etag: string },
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    this.aclCalls.push(key);
+    const head = await this.head(key);
+    expect(head).toEqual({
+      size: expected.sizeBytes,
+      sha256: expected.sha256,
+      etag: expected.etag,
+    });
+    if (this.privateKeys.has(key)) return;
+    if (this.failAclOnce.delete(key)) throw new Error('synthetic ACL failure');
+    this.privateKeys.add(key);
+    this.aclWrites.push(key);
   }
 }
 
@@ -403,6 +426,7 @@ it('recovers a legacy filename only after confirming owner, ready asset identity
       ])
     ).rows,
   ).toEqual([{ preview_asset_id: null }]);
+  expect(objects.aclCalls).toEqual([]);
   objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag });
   await expect(apply()).resolves.toEqual({
     failed: 0,
@@ -415,4 +439,112 @@ it('recovers a legacy filename only after confirming owner, ready asset identity
     (await assets.query('SELECT filename,source_etag FROM mio_assets WHERE id=$1', [entry.assetId]))
       .rows,
   ).toEqual([{ filename: 'old-source.mp3', source_etag: etag }]);
+  expect(objects.aclWrites).toEqual([entry.objectKey]);
+});
+
+it('repairs the ACL of an old bound preview only after rechecking its current binding and identity', async () => {
+  const fixture = await stageFixture({ voiceA: 'old-bound.mp3' });
+  await fixture.stage();
+  const ownerId = randomUUID();
+  const modelId = `speech-bound-acl-${randomUUID()}`;
+  await createTarget(ownerId, modelId, ['voiceA']);
+  const planOptions = { ownerId, modelId, stagingDirectory: fixture.staging };
+  const entry = (await planVoicePreviewMigration(pool, planOptions)).entries[0]!;
+  const objects = new FakeObjects();
+  const bytes = await readFile(join(fixture.staging, 'files', entry.file));
+  const etag = 'prior-preview-etag';
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag });
+  await assets.query(
+    `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
+    VALUES($1,$2,'old-bound.mp3','audio/mpeg',$3,$4,$4,'ready',$5,now(),now())`,
+    [entry.assetId, ownerId, entry.sizeBytes, entry.objectKey, etag],
+  );
+  await pool.query('UPDATE mio_provider_voices SET preview_asset_id=$2 WHERE id=$1', [
+    entry.voiceRef,
+    entry.assetId,
+  ]);
+  const planned = await planVoicePreviewMigration(pool, planOptions);
+  expect(planned.entries[0]!.alreadyBound).toBe(true);
+  const apply = () =>
+    applyVoicePreviewMigration(pool, assets, objects, planned, {
+      stagingDirectory: fixture.staging,
+    });
+  const binding = async () =>
+    (
+      await pool.query('SELECT preview_asset_id FROM mio_provider_voices WHERE id=$1', [
+        entry.voiceRef,
+      ])
+    ).rows;
+
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag: 'other-object' });
+  await expect(apply()).resolves.toMatchObject({ failed: 1, existing: 0 });
+  expect(objects.aclCalls).toEqual([]);
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag });
+  await pool.query('UPDATE mio_provider_voices SET preview_asset_id=NULL WHERE id=$1', [
+    entry.voiceRef,
+  ]);
+  await expect(apply()).resolves.toMatchObject({ failed: 1, existing: 0 });
+  expect(objects.aclCalls).toEqual([]);
+
+  await pool.query('UPDATE mio_provider_voices SET preview_asset_id=$2 WHERE id=$1', [
+    entry.voiceRef,
+    entry.assetId,
+  ]);
+  objects.failAclOnce.add(entry.objectKey);
+  await expect(apply()).resolves.toMatchObject({ failed: 1, existing: 0 });
+  expect(objects.aclWrites).toEqual([]);
+  expect(await binding()).toEqual([{ preview_asset_id: entry.assetId }]);
+  await expect(apply()).resolves.toMatchObject({ failed: 0, existing: 1 });
+  await expect(apply()).resolves.toMatchObject({ failed: 0, existing: 1 });
+  expect(objects.aclWrites).toEqual([entry.objectKey]);
+  expect(objects.uploads).toEqual([]);
+  expect(await binding()).toEqual([{ preview_asset_id: entry.assetId }]);
+});
+
+it('keeps a recovered old object unbound until its private ACL has been verified', async () => {
+  const fixture = await stageFixture({ voiceA: 'orphaned-preview.mp3' });
+  await fixture.stage();
+  const ownerId = randomUUID();
+  const modelId = `speech-orphaned-preview-${randomUUID()}`;
+  await createTarget(ownerId, modelId, ['voiceA']);
+  const planned = await planVoicePreviewMigration(pool, {
+    ownerId,
+    modelId,
+    stagingDirectory: fixture.staging,
+  });
+  const entry = planned.entries[0]!;
+  const objects = new FakeObjects();
+  const bytes = await readFile(join(fixture.staging, 'files', entry.file));
+  objects.objects.set(entry.objectKey, { bytes, sha256: entry.sha256, etag: 'orphaned-preview' });
+  objects.failAclOnce.add(entry.objectKey);
+  const apply = () =>
+    applyVoicePreviewMigration(pool, assets, objects, planned, {
+      stagingDirectory: fixture.staging,
+    });
+  await expect(apply()).resolves.toEqual({
+    failed: 1,
+    bound: 0,
+    existing: 0,
+    uploaded: 0,
+    reconciled: 0,
+  });
+  expect(
+    (await assets.query('SELECT owner_id,state FROM mio_assets WHERE id=$1', [entry.assetId])).rows,
+  ).toEqual([{ owner_id: ownerId, state: 'ready' }]);
+  expect(
+    (
+      await pool.query('SELECT preview_asset_id FROM mio_provider_voices WHERE id=$1', [
+        entry.voiceRef,
+      ])
+    ).rows,
+  ).toEqual([{ preview_asset_id: null }]);
+  await expect(apply()).resolves.toEqual({
+    failed: 0,
+    bound: 1,
+    existing: 0,
+    uploaded: 0,
+    reconciled: 1,
+  });
+  expect(objects.aclWrites).toEqual([entry.objectKey]);
+  expect(objects.uploads).toEqual([]);
 });

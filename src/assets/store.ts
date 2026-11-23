@@ -23,6 +23,16 @@ export interface AssetRow {
   upload_expired?: boolean;
 }
 
+interface AudioPublication {
+  assetId: string;
+  ownerId: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  key: string;
+  etag: string;
+}
+
 export class AssetStore {
   private readonly pool: Pool;
 
@@ -51,16 +61,27 @@ export class AssetStore {
     return row;
   }
 
+  /** Check both unique identities before changing permissions on a recovered object. */
+  async checkAudioPublicationIdentity(input: AudioPublication): Promise<void> {
+    const conflict = await this.pool.query(
+      `SELECT id FROM mio_assets WHERE (id=$1 OR raw_key=$2) AND
+         (id=$1 AND raw_key=$2 AND owner_id=$3 AND state='ready' AND source_etag=$4
+           AND size_bytes=$5 AND content_type=$6 AND filename=$7) IS NOT TRUE LIMIT 1`,
+      [
+        input.assetId,
+        input.key,
+        input.ownerId,
+        input.etag,
+        input.sizeBytes,
+        input.contentType,
+        input.filename,
+      ],
+    );
+    if (conflict.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+  }
+
   /** The job owns the output ID; replay accepts only the same ready asset. */
-  async publishAudio(input: {
-    assetId: string;
-    ownerId: string;
-    filename: string;
-    contentType: string;
-    sizeBytes: number;
-    key: string;
-    etag: string;
-  }): Promise<void> {
+  async publishAudio(input: AudioPublication): Promise<void> {
     const result = await this.pool.query(
       `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
        VALUES($1,$2,$3,$4,$5,$6,$6,'ready',$7,now(),now())

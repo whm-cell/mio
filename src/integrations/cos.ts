@@ -119,6 +119,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       ContentLength: body.length,
       ContentType: contentType,
       'x-cos-meta-sha256': sha256,
+      ...(label === 'AUDIO' ? { ACL: 'private' } : {}),
       Headers: {
         'x-cos-forbid-overwrite': 'true',
         'Content-MD5': createHash('md5').update(body).digest('base64'),
@@ -134,8 +135,16 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       contentType,
     };
   };
+  const head: AssetObjectStore['head'] = async (Key) => {
+    const object = await cos.headObject({ Bucket, Region, Key });
+    const size = Number(object.headers?.['content-length']);
+    if (!Number.isSafeInteger(size) || size < 0 || !object.ETag)
+      throw new Error('COS_INVALID_HEAD');
+    const sha256 = object.headers?.['x-cos-meta-sha256'];
+    return { size, etag: object.ETag, ...(typeof sha256 === 'string' ? { sha256 } : {}) };
+  };
   return {
-    uploadUrl(Key, size) {
+    uploadUrl(Key, size, acl) {
       return encodeUrlToken(
         cos.getObjectUrl({
           Bucket,
@@ -143,7 +152,10 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
           Key,
           Method: 'PUT',
           Expires: 300,
-          Headers: { 'content-length': String(size) },
+          Headers: {
+            'content-length': String(size),
+            ...(acl ? { 'x-cos-acl': acl } : {}),
+          },
         }),
       );
     },
@@ -177,14 +189,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     materialUrl(Key) {
       return encodeUrlToken(cos.getObjectUrl({ Bucket, Region, Key, Method: 'GET', Expires: 600 }));
     },
-    async head(Key) {
-      const object = await cos.headObject({ Bucket, Region, Key });
-      const size = Number(object.headers?.['content-length']);
-      if (!Number.isSafeInteger(size) || size < 0 || !object.ETag)
-        throw new Error('COS_INVALID_HEAD');
-      const sha256 = object.headers?.['x-cos-meta-sha256'];
-      return { size, etag: object.ETag, ...(typeof sha256 === 'string' ? { sha256 } : {}) };
-    },
+    head,
     readImage: readObject,
     readAudio: readObject,
     putImage(Key, bytes, format, sha256, signal) {
@@ -196,7 +201,25 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       const contentType = format === 'mp3' ? 'audio/mpeg' : 'audio/' + format;
       return putObject(Key, bytes, contentType, sha256, signal, 'AUDIO');
     },
-    async copy(source, target, etag) {
+    async ensureAudioPrivate(Key, expected, signal) {
+      signal.throwIfAborted();
+      const current = await head(Key);
+      if (
+        current.size !== expected.sizeBytes ||
+        current.etag !== expected.etag ||
+        (expected.sha256 !== undefined && current.sha256 !== expected.sha256)
+      )
+        throw Object.assign(new Error('COS_AUDIO_OBJECT_CHANGED'), { statusCode: 412 });
+      const scope = { Bucket, Region, Key };
+      const permissions = await cos.getObjectAcl(scope);
+      signal.throwIfAborted();
+      if (permissions.ACL === 'private') return;
+      await cos.putObjectAcl({ ...scope, ACL: 'private' });
+      signal.throwIfAborted();
+      if ((await cos.getObjectAcl(scope)).ACL !== 'private')
+        throw new Error('COS_AUDIO_ACL_NOT_PRIVATE');
+    },
+    async copy(source, target, etag, acl) {
       await cos.putObjectCopy({
         Bucket,
         Region,
@@ -205,6 +228,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         CopySourceIfMatch: etag,
         MetadataDirective: 'Replaced',
         ContentType: 'application/octet-stream',
+        ...(acl ? { ACL: acl } : {}),
         Headers: { 'x-cos-forbid-overwrite': 'true' },
       });
     },

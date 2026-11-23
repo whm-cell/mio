@@ -360,7 +360,9 @@ export function createConversationService(
       purpose?: 'audio',
     ) => {
       check();
-      return store.list(actor, after, limit, purpose);
+      return purpose === 'audio'
+        ? store.list(actor, after, limit, purpose)
+        : store.list(actor, after, limit);
     },
     rename: (actor: Principal, id: string, title: string) =>
       admit(() => store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title))),

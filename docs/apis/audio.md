@@ -94,7 +94,7 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 
 错误：共同错误。未授权为 400 AUDIO_SAMPLE_AUTHORIZATION_REQUIRED，样本格式或时长无效为 400 AUDIO_SAMPLE_FORMAT_INVALID/AUDIO_SAMPLE_DURATION_INVALID，样本变化为 409 AUDIO_SAMPLE_CHANGED，供应商确认后缺少试听为 409 AUDIO_AUDITION_MISSING。上游被拒为 AUDIO_UPSTREAM_REJECTED，提交结果未知为 AUDIO_SUBMIT_UNKNOWN。
 
-副作用：检测后条件读取样本并核对 SHA-256，再向 OneLink 提交一次复刻请求。上传、检测或落库失败只恢复后续步骤，不重复复刻供应商调用。
+副作用：检测后条件读取本人样本并核对 SHA-256，确保同一已验证原件为私有，再向 OneLink 提交一次复刻请求。上传、检测或落库失败只恢复后续步骤，不重复复刻供应商调用。
 
 ## GET /api/v1/audio/jobs/{jobId}
 
@@ -158,6 +158,6 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 
 ### 执行和恢复
 
-供应商截止 180 秒，处理租期 30 分钟。输出最多 100 MiB，实测最多 3600 秒。成功发布后清除 PG 内的输出字节或临时地址。检查点短暂失败时可重试本地保存，提交意图始终对应一次供应商 POST。submitted 过期转 unknown，queued 和 materializing 可以收回过期租期并按原身份继续。关闭时等待准入、调度和执行收束，再关闭媒体与数据库连接。
+供应商截止 180 秒，处理租期 30 分钟。输出最多 100 MiB，实测最多 3600 秒。 上传样本随签发响应发送 private ACL 头。新成品和试听显式写入 private ACL。恢复时仅对任务生成的固定对象键，以及归属、内容、大小和 ETag 均匹配的同一文件补齐私有权限。成功发布后清除 PG 内的输出字节或临时地址。检查点短暂失败时可重试本地保存，提交意图始终对应一次供应商 POST。submitted 过期转 unknown，queued 和 materializing 可以收回过期租期并按原身份继续。关闭时等待准入、调度和执行收束，再关闭媒体与数据库连接。
 
 输入错误包括AUDIO_TEXT_INVALID、AUDIO_PARAMETERS_INVALID、AUDIO_FORMAT_INVALID、AUDIO_SAMPLE_INVALID、AUDIO_SAMPLE_FORMAT_INVALID、AUDIO_SAMPLE_DURATION_INVALID、AUDIO_SAMPLE_AUTHORIZATION_REQUIRED。样本变化为409 AUDIO_SAMPLE_CHANGED。供应商拒绝为AUDIO_UPSTREAM_REJECTED，提交不确定为AUDIO_SUBMIT_UNKNOWN。媒体/存储错误保持脱敏与recoverable事实，未验证不发布ready。隔离测试与真实供应商验收分别报告。

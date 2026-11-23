@@ -44,6 +44,17 @@ it('rejects invalid cursors before list and passes validated legacy and activity
     const activity = encode({ v: 1, updatedAt, id });
     expect((await fetch(`${url}?after=${activity}`)).status).toBe(200);
     expect(list).toHaveBeenLastCalledWith(actor, { kind: 'activity', updatedAt, id }, 20);
+    expect((await fetch(`${url}?purpose=audio`)).status).toBe(200);
+    expect(list).toHaveBeenLastCalledWith(actor, undefined, 20, 'audio');
+    expect((await fetch(`${url}?purpose=audio&after=${activity}&limit=5`)).status).toBe(200);
+    expect(list).toHaveBeenLastCalledWith(actor, { kind: 'activity', updatedAt, id }, 5, 'audio');
+    list.mockClear();
+    for (const query of ['purpose=general', 'purpose=audio&purpose=audio', 'purpose=']) {
+      const response = await fetch(`${url}?${query}`);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: 'QUERY_INVALID' } });
+    }
+    expect(list).not.toHaveBeenCalled();
   } finally {
     await endpoint.close();
     server.closeAllConnections();

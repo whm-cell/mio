@@ -39,7 +39,7 @@ function view(row: AssetRow, objects: AssetObjectStore) {
     size: Number(row.size_bytes),
     createdAt: row.created_at.toISOString(),
     ...(rawKey ? { downloadUrl: objects.downloadUrl(rawKey) } : {}),
-    ...(rawKey && objects.audioPlaybackUrl && playableAudio.has(row.content_type)
+    ...(rawKey && objects.audioPlaybackUrl && playableAudio.has(row.content_type.toLowerCase())
       ? { playbackUrl: objects.audioPlaybackUrl(rawKey, row.content_type) }
       : {}),
   };
@@ -224,10 +224,15 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
         if (stop.signal.aborted)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+        const audio = playableAudio.has(contentType.toLowerCase());
+        const stagingKey = `mio/staging/${id}`;
         return {
           assetId: id,
-          uploadUrl: objects.uploadUrl(`mio/staging/${id}`, size),
+          uploadUrl: audio
+            ? objects.uploadUrl(stagingKey, size, 'private')
+            : objects.uploadUrl(stagingKey, size),
           expiresIn: 300,
+          ...(audio ? { uploadHeaders: { 'x-cos-acl': 'private' as const } } : {}),
         };
       });
     },
@@ -330,7 +335,17 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         }
         const rawKey = `mio/raw/${id}/${createId()}`;
         try {
-          await waitObject(() => objects.copy(stagingKey, rawKey, head.etag));
+          if (playableAudio.has(claimed.content_type.toLowerCase())) {
+            const ensurePrivate = objects.ensureAudioPrivate;
+            if (!ensurePrivate)
+              throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
+            await waitObject(() =>
+              ensurePrivate(stagingKey, { sizeBytes: head.size, etag: head.etag }, stop.signal),
+            );
+            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag, 'private'));
+          } else {
+            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag));
+          }
         } catch (error) {
           await store.release(id, lease).catch(() => {});
           if (statusCode(error) === 412)

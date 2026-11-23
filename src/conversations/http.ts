@@ -372,15 +372,12 @@ export function createConversationHandler(
         )
           return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
         const after = parseConversationCursor(url.searchParams.get('after') ?? undefined);
-        return send(
-          HTTP_STATUS.OK,
-          await service.list(
-            actor,
-            after,
-            integer(url.searchParams.get('limit'), 20, 1, 100),
-            purpose ?? undefined,
-          ),
-        );
+        const limit = integer(url.searchParams.get('limit'), 20, 1, 100);
+        const page =
+          purpose === 'audio'
+            ? await service.list(actor, after, limit, purpose)
+            : await service.list(actor, after, limit);
+        return send(HTTP_STATUS.OK, page);
       }
       if (action === 'history') {
         const stop = new AbortController();

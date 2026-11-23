@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createLogger } from '@mio/foundation/logging';
+import { isUuidV4 } from '@mio/foundation/identifiers';
 import { AUDIO_INSPECTION_LIMITS } from '@mio/compute-contracts';
 import type { AudioInspection, AudioInspectionInput } from '@mio/compute-contracts';
 import type { ProviderService } from '../../providers/service.ts';
@@ -18,18 +19,28 @@ export interface AudioInspector {
   close(): Promise<void>;
 }
 
-type Assets = Pick<AssetStore, 'owned' | 'publishAudio'>;
+export type AudioAssets = Pick<
+  AssetStore,
+  'owned' | 'publishAudio' | 'checkAudioPublicationIdentity'
+>;
 
 async function materialize(
   job: AudioJobRow,
   store: AudioStore,
   objects: AssetObjectStore,
   media: AudioInspector,
-  assets: Assets,
+  assets: AudioAssets,
   download: typeof downloadAudio,
   signal: AbortSignal,
 ) {
   const limit = AUDIO_INSPECTION_LIMITS.output;
+  const keyPrefix = `mio/raw/${job.output_asset_id}/`;
+  if (
+    !isUuidV4(job.output_asset_id) ||
+    !job.output_key.startsWith(keyPrefix) ||
+    !isUuidV4(job.output_key.slice(keyPrefix.length))
+  )
+    throw new AudioError(409, 'AUDIO_OUTPUT_MISMATCH');
   let bytes: Uint8Array | null = job.output_bytes;
   if (!bytes && job.output_url) {
     bytes = await download(job.output_url, signal);
@@ -49,6 +60,7 @@ async function materialize(
     if ((error as { statusCode?: number } | null)?.statusCode === 404) return;
     throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
   });
+  const reused = head !== undefined;
   if (!head) {
     const format = job.input.parameters?.format ?? 'mp3';
     await objects.putAudio(job.output_key, bytes, format, sha256, signal);
@@ -84,19 +96,33 @@ async function materialize(
   // The two databases commit separately. After an interrupted publication,
   // registering the already verified file under its fixed ID is safe to repeat.
   signal.throwIfAborted();
-  await assets
-    .publishAudio({
-      assetId: job.output_asset_id,
-      ownerId: job.owner_id,
-      filename: `audio-${job.id}.${inspection.format}`,
-      contentType: inspection.mimeType,
-      sizeBytes,
-      key: job.output_key,
-      etag: head.etag,
-    })
-    .catch(() => {
-      throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
-    });
+  const publication = {
+    assetId: job.output_asset_id,
+    ownerId: job.owner_id,
+    filename: `audio-${job.id}.${inspection.format}`,
+    contentType: inspection.mimeType,
+    sizeBytes,
+    key: job.output_key,
+    etag: head.etag,
+  };
+  try {
+    if (reused) {
+      // A recovered object from before explicit ACLs may inherit its parent ACL.
+      // Confirm ownership and inspected bytes before changing that exact key.
+      await assets.checkAudioPublicationIdentity(publication);
+      if (!objects.ensureAudioPrivate) throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
+      await objects.ensureAudioPrivate(
+        job.output_key,
+        { sizeBytes, etag: head.etag, sha256 },
+        signal,
+      );
+    }
+    await assets.publishAudio(publication);
+  } catch (error) {
+    if ((error as { statusCode?: number } | null)?.statusCode === 412)
+      throw new AudioError(409, 'AUDIO_OUTPUT_MISMATCH');
+    throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
+  }
   await store.publish(job, inspection);
 }
 
@@ -123,7 +149,7 @@ export function createAudioExecution(
   providers: ProviderService,
   objects: AssetObjectStore,
   media: AudioInspector,
-  assets: Assets,
+  assets: AudioAssets,
   stop: AbortSignal,
   submit = submitAudio,
   download = downloadAudio,

@@ -60,6 +60,11 @@ export interface VoicePreviewPlan {
 
 export interface PreviewObjectStore {
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
+  ensureAudioPrivate?(
+    key: string,
+    expected: { sizeBytes: number; etag: string; sha256?: string },
+    signal: AbortSignal,
+  ): Promise<void>;
   putAudio?(
     key: string,
     bytes: Uint8Array,
@@ -371,7 +376,7 @@ export async function planVoicePreviewMigration(
       voiceRef: voice.voice_ref,
       providerId: target.providerId,
       assetId,
-      objectKey: `mio/raw/${assetId}/${PREVIEW_ASSET_FILENAME}`,
+      objectKey: previewObjectKey(assetId),
       alreadyBound: voice.preview_asset_id !== null,
     };
   });
@@ -383,6 +388,18 @@ export async function planVoicePreviewMigration(
     entries,
     totalBytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0),
   };
+}
+
+function previewObjectKey(assetId: string) {
+  return `mio/raw/${assetId}/${PREVIEW_ASSET_FILENAME}`;
+}
+
+function assertPreviewObject(
+  head: Awaited<ReturnType<PreviewObjectStore['head']>>,
+  entry: PlannedVoicePreview,
+) {
+  if (head.size !== entry.sizeBytes || head.sha256 !== entry.sha256 || !head.etag)
+    throw new Error('VOICE_PREVIEW_OBJECT_CONFLICT');
 }
 
 function objectMissing(error: unknown): boolean {
@@ -399,6 +416,31 @@ function assertPreviewAsset(asset: AssetRow, entry: PlannedVoicePreview, etag: s
     Number(asset.size_bytes) !== entry.sizeBytes
   )
     throw new Error('VOICE_PREVIEW_ASSET_CONFLICT');
+}
+
+async function plannedVoice(
+  database: Pick<Pool, 'query'>,
+  plan: VoicePreviewPlan,
+  entry: PlannedVoicePreview,
+  locking = false,
+) {
+  const voice = (
+    await database.query<VoiceRow>(
+      `SELECT v.id AS voice_ref,v.upstream_id,v.preview_asset_id
+       FROM mio_provider_voices v JOIN mio_provider_configs c ON c.id=v.provider_id
+       WHERE c.owner_id=$1 AND v.provider_id=$2 AND v.id=$3 AND v.source='system'
+        AND v.upstream_id=$4 AND v.present
+        AND (v.registration_model_key IS NULL OR v.registration_model_key=$5)${locking ? ' FOR UPDATE OF v' : ''}`,
+      [plan.ownerId, plan.providerId, entry.voiceRef, entry.upstreamId, plan.modelKey],
+    )
+  ).rows[0];
+  if (!voice) throw new Error('VOICE_PREVIEW_VOICE_CHANGED');
+  if (
+    (entry.alreadyBound || voice.preview_asset_id !== null) &&
+    voice.preview_asset_id !== entry.assetId
+  )
+    throw new Error('VOICE_PREVIEW_BINDING_CHANGED');
+  return voice;
 }
 
 async function bindPreviewVoice(
@@ -421,20 +463,8 @@ async function bindPreviewVoice(
       target.adaptationVersion !== plan.adaptationVersion
     )
       throw new Error('VOICE_PREVIEW_MODEL_CHANGED');
-    const voice = (
-      await client.query<VoiceRow>(
-        `SELECT v.id AS voice_ref,v.upstream_id,v.preview_asset_id
-         FROM mio_provider_voices v JOIN mio_provider_configs c ON c.id=v.provider_id
-         WHERE c.owner_id=$1 AND v.provider_id=$2 AND v.id=$3 AND v.source='system'
-          AND v.upstream_id=$4 AND v.present
-          AND (v.registration_model_key IS NULL OR v.registration_model_key=$5) FOR UPDATE OF v`,
-        [plan.ownerId, plan.providerId, entry.voiceRef, entry.upstreamId, plan.modelKey],
-      )
-    ).rows[0];
-    if (!voice) throw new Error('VOICE_PREVIEW_VOICE_CHANGED');
+    const voice = await plannedVoice(client, plan, entry, true);
     if (voice.preview_asset_id) {
-      if (voice.preview_asset_id !== entry.assetId)
-        throw new Error('VOICE_PREVIEW_BINDING_CHANGED');
       await client.query('COMMIT');
       return 'existing';
     }
@@ -464,22 +494,37 @@ export async function applyVoicePreviewMigration(
   reconciled: number;
   failed: number;
 }> {
-  if (!objects.putAudio) throw new Error('VOICE_PREVIEW_COS_WRITE_UNAVAILABLE');
+  if (!objects.putAudio || !objects.ensureAudioPrivate)
+    throw new Error('VOICE_PREVIEW_COS_WRITE_UNAVAILABLE');
   const concurrency = options.concurrency ?? 4;
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)
     throw new Error('VOICE_PREVIEW_CONCURRENCY_INVALID');
   const signal = options.signal ?? new AbortController().signal;
   const assets = new AssetStore(assetPool);
+  const ensurePrivate = (entry: PlannedVoicePreview, etag: string) =>
+    objects.ensureAudioPrivate!(
+      entry.objectKey,
+      { sizeBytes: entry.sizeBytes, sha256: entry.sha256, etag },
+      signal,
+    );
   const results = await mapConcurrent(plan.entries, concurrency, async (entry) => {
     let uploaded = false;
     try {
       signal.throwIfAborted();
+      if (
+        entry.providerId !== plan.providerId ||
+        entry.objectKey !== previewObjectKey(entry.assetId) ||
+        (!entry.alreadyBound &&
+          entry.assetId !== deterministicAssetId(plan.providerId, entry.sha256))
+      )
+        throw new Error('VOICE_PREVIEW_ASSET_CONFLICT');
       if (entry.alreadyBound) {
+        await plannedVoice(providerPool, plan, entry);
         const asset = await assets.owned(entry.assetId, plan.ownerId);
         const head = await objects.head(entry.objectKey);
-        if (head.size !== entry.sizeBytes || head.sha256 !== entry.sha256 || !head.etag)
-          throw new Error('VOICE_PREVIEW_OBJECT_CONFLICT');
+        assertPreviewObject(head, entry);
         assertPreviewAsset(asset, entry, head.etag);
+        await ensurePrivate(entry, head.etag);
         return { status: 'existing' as const };
       }
       const bytes = await readFile(resolve(options.stagingDirectory, 'files', entry.file));
@@ -494,8 +539,8 @@ export async function applyVoicePreviewMigration(
         uploaded = true;
         head = await objects.head(entry.objectKey);
       }
-      if (head.size !== entry.sizeBytes || head.sha256 !== entry.sha256 || !head.etag)
-        throw new Error('VOICE_PREVIEW_OBJECT_CONFLICT');
+      assertPreviewObject(head, entry);
+      if (!uploaded) await plannedVoice(providerPool, plan, entry);
       try {
         await assets.publishAudio({
           assetId: entry.assetId,
@@ -512,6 +557,7 @@ export async function applyVoicePreviewMigration(
         // An older preview may have been recorded under its source filename before it was bound.
         assertPreviewAsset(await assets.owned(entry.assetId, plan.ownerId), entry, head.etag);
       }
+      if (!uploaded) await ensurePrivate(entry, head.etag);
       const providerClient = await providerPool.connect();
       try {
         return { status: await bindPreviewVoice(providerClient, plan, entry), uploaded };

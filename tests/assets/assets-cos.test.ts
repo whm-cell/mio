@@ -536,3 +536,179 @@ it('signs a separate600-second supplier GET without attachment and preserves ses
     signer.mockRestore();
   }
 });
+
+it('signs the required private ACL for audio staging and applies it to audio copies and output PUTs', async () => {
+  const storage = createCosStorage({
+    databaseURL: 'postgresql://example.invalid/media',
+    bucket: 'mio-test-1234567890',
+    region: 'ap-shanghai',
+    secretId: 'isolated-fixture',
+    secretKey: 'isolated-secret',
+  });
+  const bytes = Buffer.from('fixture audio');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const put = vi
+    .spyOn(COS.prototype, 'putObject')
+    .mockResolvedValue({ ETag: '"audio"', Location: '' });
+  const copy = vi.spyOn(COS.prototype, 'putObjectCopy').mockResolvedValue({
+    ETag: '"audio"',
+    CRC64: '',
+    LastModified: '',
+    VersionId: '',
+    Location: '',
+  });
+  try {
+    const plain = new URL(storage.uploadUrl('mio/staging/known', bytes.length));
+    const privateUrl = new URL(storage.uploadUrl('mio/staging/known', bytes.length, 'private'));
+    expect(plain.searchParams.get('q-header-list')).toBe('content-length;host');
+    expect(privateUrl.searchParams.get('q-header-list')).toBe('content-length;host;x-cos-acl');
+    expect(privateUrl.searchParams.get('q-signature')).not.toBe(
+      plain.searchParams.get('q-signature'),
+    );
+    await storage.copy('mio/staging/known', 'mio/raw/known/copy', '"audio"', 'private');
+    expect(copy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ACL: 'private',
+        CopySourceIfMatch: '"audio"',
+        Headers: { 'x-cos-forbid-overwrite': 'true' },
+      }),
+    );
+    await storage.putAudio!(
+      'mio/raw/known/result',
+      bytes,
+      'mp3',
+      sha256,
+      new AbortController().signal,
+    );
+    expect(put).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ACL: 'private',
+        'x-cos-meta-sha256': sha256,
+        Headers: expect.objectContaining({ 'x-cos-forbid-overwrite': 'true' }),
+      }),
+    );
+  } finally {
+    copy.mockRestore();
+    put.mockRestore();
+  }
+});
+
+it('narrows the ACL only after identity checks and leaves an already-private object alone', async () => {
+  const bytes = Buffer.from('audio checkpoint fixture');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const storage = createCosStorage({
+    databaseURL: 'postgresql://example.invalid/media',
+    bucket: 'mio-test-1234567890',
+    region: 'ap-shanghai',
+    secretId: 'isolated-fixture',
+    secretKey: 'isolated-secret',
+  });
+  const head = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
+    ETag: '"frozen"',
+    headers: { 'content-length': String(bytes.length), 'x-cos-meta-sha256': sha256 },
+  });
+  const acl = vi
+    .spyOn(COS.prototype, 'getObjectAcl')
+    .mockResolvedValueOnce({ ACL: 'default' } as COS.GetObjectAclResult)
+    .mockResolvedValue({ ACL: 'private' } as COS.GetObjectAclResult);
+  const write = vi
+    .spyOn(COS.prototype, 'putObjectAcl')
+    .mockResolvedValue({ statusCode: 200, headers: {} });
+  try {
+    const identity = { sizeBytes: bytes.length, etag: '"frozen"', sha256 };
+    const signal = new AbortController().signal;
+    await expect(
+      storage.ensureAudioPrivate!(
+        'mio/raw/known/result',
+        { ...identity, etag: '"changed"' },
+        signal,
+      ),
+    ).rejects.toMatchObject({ statusCode: 412 });
+    expect(acl).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    await storage.ensureAudioPrivate!('mio/raw/known/result', identity, signal);
+    await storage.ensureAudioPrivate!('mio/raw/known/result', identity, signal);
+    expect(write).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        Key: 'mio/raw/known/result',
+        ACL: 'private',
+      }),
+    );
+  } finally {
+    write.mockRestore();
+    acl.mockRestore();
+    head.mockRestore();
+  }
+});
+
+it('returns the private upload header and conditionally publishes audio from only the owned staging key', async () => {
+  const id = randomUUID();
+  const actor = { userId: 'audio-owner', sessionId: 'audio-session' };
+  const key = `mio/staging/${id}`;
+  const row = {
+    id,
+    state: 'pending',
+    staging_key: key,
+    raw_key: null,
+    source_etag: null,
+    content_type: 'audio/wav',
+    size_bytes: '12',
+    created_at: new Date(),
+  };
+  const store = {
+    create: async (created: string, owner: string, filename: string) => ({
+      ...row,
+      id: created,
+      staging_key: `mio/staging/${created}`,
+      owner_id: owner,
+      filename,
+    }),
+    owned: async () => row,
+    claim: async () => row,
+    release: async () => {},
+    commit: async (_id: string, _owner: string, _lease: string, rawKey: string) => ({
+      ...row,
+      raw_key: rawKey,
+      state: 'ready',
+    }),
+    expiredStaging: async () => [],
+    close: async () => {},
+  } as unknown as AssetStore;
+  const uploadUrl = vi.fn(() => 'https://example.invalid/upload');
+  const ensureAudioPrivate = vi.fn(async () => {});
+  const copy = vi.fn(async () => {});
+  const service = createAssetService(store, {
+    uploadUrl,
+    downloadUrl: () => 'https://example.invalid/download',
+    head: async () => ({ size: 12, etag: '"frozen"' }),
+    ensureAudioPrivate,
+    copy,
+    delete: async () => {},
+  });
+  try {
+    const receipt = await service.create(actor, 'sample.wav', 'audio/wav', 12);
+    expect(receipt.uploadHeaders).toEqual({ 'x-cos-acl': 'private' });
+    expect(uploadUrl).toHaveBeenCalledWith(`mio/staging/${receipt.assetId}`, 12, 'private');
+    const image = await service.create(actor, 'image.png', 'image/png', 12);
+    expect(image.uploadHeaders).toBeUndefined();
+    expect(uploadUrl).toHaveBeenCalledWith(`mio/staging/${image.assetId}`, 12);
+    row.staging_key = `mio/staging/${randomUUID()}`;
+    await expect(service.complete(actor, id)).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE' });
+    expect(ensureAudioPrivate).not.toHaveBeenCalled();
+    row.staging_key = key;
+    expect((await service.complete(actor, id)).status).toBe('ready');
+    expect(ensureAudioPrivate).toHaveBeenCalledExactlyOnceWith(
+      key,
+      { sizeBytes: 12, etag: '"frozen"' },
+      expect.any(AbortSignal),
+    );
+    expect(copy).toHaveBeenCalledExactlyOnceWith(
+      key,
+      expect.stringMatching(new RegExp(`^mio/raw/${id}/[a-f0-9-]{36}$`)),
+      '"frozen"',
+      'private',
+    );
+  } finally {
+    await service.close();
+  }
+});

@@ -10,7 +10,7 @@ export interface AssetPrincipal {
 }
 
 export interface AssetObjectStore {
-  uploadUrl(key: string, size: number): string;
+  uploadUrl(key: string, size: number, acl?: 'private'): string;
   downloadUrl(key: string): string;
   audioPlaybackUrl?(key: string, contentType: string): string;
   materialUrl?(key: string): string;
@@ -31,7 +31,12 @@ export interface AssetObjectStore {
     sha256: string,
     signal: AbortSignal,
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
-  copy(source: string, target: string, etag: string): Promise<void>;
+  ensureAudioPrivate?(
+    key: string,
+    expected: { sizeBytes: number; etag: string; sha256?: string },
+    signal: AbortSignal,
+  ): Promise<void>;
+  copy(source: string, target: string, etag: string, acl?: 'private'): Promise<void>;
   delete(key: string): Promise<void>;
 }
 

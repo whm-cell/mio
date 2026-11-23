@@ -128,7 +128,7 @@ it('migrates pre-truncation receipts in place without deriving a terminal marker
   const actor = { userId: randomUUID(), sessionId: randomUUID() };
   let store: Awaited<ReturnType<typeof createConversationStore>> | undefined;
   try {
-    // Schema before the nullable truncation column was added.
+    // Original receipt schema before truncation and audio context became nullable columns.
     await pool.query(`
       CREATE TABLE mio_conversations (
         id uuid PRIMARY KEY, owner_id text NOT NULL, dsh_session_id text NOT NULL UNIQUE,
@@ -161,9 +161,13 @@ it('migrates pre-truncation receipts in place without deriving a terminal marker
     await pool.query(conversationSchemaSQL);
     await pool.query(conversationSchemaSQL);
     const migrated = await pool.query(
-      "SELECT to_jsonb(r) - 'truncation_reason' AS original,truncation_reason FROM mio_conversation_requests r ORDER BY request_id",
+      'SELECT to_jsonb(r) AS original FROM mio_conversation_requests r ORDER BY request_id',
     );
-    expect(migrated.rows).toEqual(old.rows.map((row) => ({ ...row, truncation_reason: null })));
+    expect(migrated.rows).toEqual(
+      old.rows.map(({ original }) => ({
+        original: { ...original, truncation_reason: null, audio_context: null },
+      })),
+    );
     store = await createConversationStore(database.url);
     for (const [requestId, status, error] of [
       ['settled', 'completed', undefined],

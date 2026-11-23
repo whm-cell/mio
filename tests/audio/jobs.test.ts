@@ -122,12 +122,23 @@ async function fixture() {
     return { size: item.bytes.length, etag: item.etag, sha256: item.sha256 };
   };
   const head = vi.fn(headObject);
+  const ensureAudioPrivate = vi.fn<NonNullable<AssetObjectStore['ensureAudioPrivate']>>(
+    async (key, expected) => {
+      const checked = await headObject(key);
+      expect(checked).toMatchObject({
+        size: expected.sizeBytes,
+        etag: expected.etag,
+        ...(expected.sha256 === undefined ? {} : { sha256: expected.sha256 }),
+      });
+    },
+  );
   const storage: AssetObjectStore = {
     uploadUrl: () => '',
     downloadUrl: () => '',
     copy: async () => {},
     delete: async () => {},
     head,
+    ensureAudioPrivate,
     readAudio: async (key, etag, size) => {
       const item = objects.get(key)!;
       if (item.etag !== etag) throw Object.assign(new Error('ETAG_CHANGED'), { statusCode: 412 });
@@ -183,7 +194,11 @@ async function fixture() {
       providers,
       storage,
       { inspect, close: async () => {} },
-      { owned: (id, owner) => assets.owned(id, owner), publishAudio },
+      {
+        owned: (id, owner) => assets.owned(id, owner),
+        checkAudioPublicationIdentity: (input) => assets.checkAudioPublicationIdentity(input),
+        publishAudio,
+      },
       { submit, pollMs: 5 },
     );
   const jobs = startJobs();
@@ -226,6 +241,7 @@ async function fixture() {
     modelId,
     head,
     headObject,
+    ensureAudioPrivate,
     submit,
     inspect,
     inspectObject,
@@ -337,6 +353,15 @@ it('recovers upload and publication failure using the saved output without anoth
   await f.jobs.recover(f.actor, job.jobId);
   await f.settled(job.jobId, 'ready');
   expect(f.submit).toHaveBeenCalledTimes(1);
+  expect(f.ensureAudioPrivate).toHaveBeenCalledWith(
+    registered.key,
+    expect.objectContaining({
+      sizeBytes: registered.sizeBytes,
+      etag: registered.etag,
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    }),
+    expect.any(AbortSignal),
+  );
   expect(
     (await assetPool.query('SELECT id FROM mio_assets WHERE id=$1', [registered.assetId])).rowCount,
   ).toBe(1);
@@ -447,6 +472,7 @@ it("rejects another owner's sample in the separate asset database before supplie
   ).rejects.toMatchObject({ code: 'ASSET_NOT_FOUND', status: 404 });
   expect(f.submit).not.toHaveBeenCalled();
   expect(f.inspect).not.toHaveBeenCalled();
+  expect(f.ensureAudioPrivate).not.toHaveBeenCalled();
 });
 it('preserves unknown upstream result and never re-POSTs it', async () => {
   const f = await fixture();
@@ -500,6 +526,11 @@ it('clones an authorized ready sample then reuses its stable voice reference for
   expect(ready.voiceRef).toBeTruthy();
   expect(f.inspect).toHaveBeenCalledWith(
     expect.objectContaining({ purpose: 'sample', assetId: sampleAssetId }),
+    expect.any(AbortSignal),
+  );
+  expect(f.ensureAudioPrivate).toHaveBeenCalledExactlyOnceWith(
+    expect.stringMatching(new RegExp(`^mio/raw/${sampleAssetId}/[a-f0-9-]{36}$`)),
+    { sizeBytes: Buffer.byteLength('checkpoint-audio-fixture'), etag: 'sample-etag' },
     expect.any(AbortSignal),
   );
   const tts = await f.jobs.create(f.actor, { ...f.body, voiceRef: ready.voiceRef });
@@ -619,6 +650,7 @@ it('rejects a changed sample after a completed inspection and keeps the supplier
     recordId: null,
   });
   expect(f.submit).not.toHaveBeenCalled();
+  expect(f.ensureAudioPrivate).not.toHaveBeenCalled();
 });
 
 it('preserves a confirmed clone without an audition as terminal, without publishing or retrying', async () => {
@@ -744,3 +776,66 @@ it('keeps an accepted clone on the frozen route after the route closes', async (
   expect(await f.settled(job.jobId, 'ready')).toMatchObject({ upstreamConfirmed: true });
   expect(f.submit).toHaveBeenCalledOnce();
 });
+
+it('never changes the ACL of an already stored output if the asset identity belongs to a different owner', async () => {
+  const f = await fixture();
+  f.failPublish(true);
+  const { job } = await f.jobs.create(f.actor, f.body);
+  await vi.waitFor(async () =>
+    expect((await f.jobs.get(f.actor, job.jobId)).recoverable).toBe(true),
+  );
+  const original = f.publishAudio.mock.calls[0]![0];
+  const otherOwner = randomUUID();
+  await assetPool.query('UPDATE mio_assets SET owner_id=$2 WHERE id=$1', [
+    original.assetId,
+    otherOwner,
+  ]);
+  f.failPublish(false);
+  await f.jobs.recover(f.actor, job.jobId);
+  await vi.waitFor(async () =>
+    expect(await f.jobs.get(f.actor, job.jobId)).toMatchObject({
+      status: 'materializing',
+      errorCode: 'AUDIO_STORAGE_UNAVAILABLE',
+      recoverable: true,
+    }),
+  );
+  expect(f.ensureAudioPrivate).not.toHaveBeenCalled();
+  expect(f.submit).toHaveBeenCalledOnce();
+  expect(await f.assets.owned(original.assetId, otherOwner)).toMatchObject({
+    raw_key: original.key,
+  });
+});
+
+it.each([
+  [403, 'AUDIO_STORAGE_UNAVAILABLE'],
+  [412, 'AUDIO_SAMPLE_CHANGED'],
+])(
+  'stops before the first clone POST when the verified sample private ACL fails with HTTP %s',
+  async (statusCode, code) => {
+    const f = await fixture();
+    const sampleAssetId = await f.sample();
+    f.ensureAudioPrivate.mockRejectedValueOnce(
+      Object.assign(new Error('ACL_FIXTURE_FAILURE'), { statusCode }),
+    );
+    const { job } = await f.jobs.clone(f.actor, {
+      requestId: randomUUID(),
+      modelRef: f.modelRef,
+      sampleAssetId,
+      name: '授权样本',
+      auditionText: '请试听这段文字。',
+      sampleAuthorization: true,
+    });
+    expect(await f.settled(job.jobId, 'failed')).toMatchObject({
+      errorCode: code,
+      upstreamConfirmed: false,
+      recordId: null,
+    });
+    expect(f.inspect).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ purpose: 'sample', assetId: sampleAssetId }),
+      expect.any(AbortSignal),
+    );
+    expect(f.ensureAudioPrivate).toHaveBeenCalledOnce();
+    expect(f.submit).not.toHaveBeenCalled();
+    expect(f.publishAudio).not.toHaveBeenCalled();
+  },
+);

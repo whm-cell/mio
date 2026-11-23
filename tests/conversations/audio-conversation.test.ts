@@ -33,6 +33,7 @@ import { makeChatRouteFixture } from '../providers/fixtures/onelink-routes-fixtu
 import { kernelRuntime, ScriptedModel, textResponse } from '../support/kernel-runtime.ts';
 
 const base = '/api/v1/conversations';
+const localRequestTimeoutMs = 5_000;
 const voiceA = randomUUID();
 const voiceB = randomUUID();
 const sourceAsset = randomUUID();
@@ -138,11 +139,15 @@ function fixtureAudio() {
 
 async function openEvents(origin: string, id: string) {
   const abort = new AbortController();
+  const deadline = setTimeout(
+    () => abort.abort(new Error('Audio SSE handshake timed out')),
+    localRequestTimeoutMs,
+  );
   const response = await fetch(`${origin}${base}/${id}/events`, {
     headers: { origin, cookie: 'synthetic=owner' },
     signal: abort.signal,
-  });
-  expect(response.status).toBe(200);
+  }).finally(() => clearTimeout(deadline));
+  expect(response.status, 'audio SSE handshake').toBe(200);
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   const received: Record<string, unknown>[] = [];
@@ -168,10 +173,15 @@ async function openEvents(origin: string, id: string) {
       reader.releaseLock();
     }
   })();
+  void reading.catch(() => {});
   return {
     received,
     close: () => {
-      abort.abort();
+      if (!abort.signal.aborted) {
+        // Release a pending reader even if the client socket has not processed the abort yet.
+        void reader.cancel().catch(() => {});
+        abort.abort();
+      }
       return reading;
     },
   };
@@ -273,6 +283,7 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
   const call = (path: string, method = 'GET', input?: unknown, owner = true) =>
     fetch(`${origin}${base}${path}`, {
       method,
+      signal: AbortSignal.timeout(localRequestTimeoutMs),
       headers: {
         origin,
         cookie: owner ? 'synthetic=owner' : 'synthetic=stranger',
@@ -382,7 +393,7 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
     const live = await openEvents(origin, id);
     streams.push(live);
     await vi.waitFor(() =>
-      expect(live.received).toContainEqual(
+      expect(live.received, 'audio live stream').toContainEqual(
         expect.objectContaining({ type: 'snapshot', audioSelection: selectedA }),
       ),
     );
@@ -392,7 +403,7 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
     await terminal(id, 'voice-switch');
     expect(audio.create).not.toHaveBeenCalled();
     await vi.waitFor(() =>
-      expect(live.received).toContainEqual(
+      expect(live.received, 'audio live stream').toContainEqual(
         expect.objectContaining({
           type: 'audio-selection',
           selection: { voiceRef: voiceB, name: 'B', revision: selectedA.revision + 1 },
@@ -409,7 +420,7 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
     };
     expect((await call(`/${id}/messages`, 'POST', input)).status).toBe(202);
     await vi.waitFor(() =>
-      expect(live.received).toContainEqual(
+      expect(live.received, 'audio live stream').toContainEqual(
         expect.objectContaining({
           type: 'tool',
           tool: 'submit_audio_job',
@@ -427,7 +438,7 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
     const reconnected = await openEvents(origin, id);
     streams.push(reconnected);
     await vi.waitFor(() =>
-      expect(reconnected.received).toContainEqual(
+      expect(reconnected.received, 'audio reconnect snapshot').toContainEqual(
         expect.objectContaining({
           type: 'snapshot',
           receipt: expect.objectContaining({ requestId: input.requestId, status: 'completed' }),
@@ -536,9 +547,10 @@ it('runs the audio conversation through HTTP, PostgreSQL, native DSH tools, dura
       ),
     ).toBe(true);
   } finally {
-    await Promise.all(streams.map((stream) => stream.close()));
-    await handler.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    handler.close();
+    const stopped = new Promise<void>((resolve) => server.close(() => resolve()));
+    server.closeAllConnections();
+    await Promise.all([stopped, ...streams.map((stream) => stream.close())]);
     await service.close();
     await legacyEngine.close();
     await providers.close();

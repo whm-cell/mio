@@ -16,7 +16,7 @@ AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?,
 
 输入：`{filename,contentType,size}`；文件名非空且 UTF-8 不超过 255 字节，contentType 是不带参数的 MIME，size 是 1 至 1073741824 的整数。
 
-成功：201 `{assetId,uploadUrl,expiresIn:300}`；调用方将对应长度的文件以 PUT 直传该 URL；签名绑定 Content-Length 和 Host。URL 到期后需新建上传，不可提供内部存储地址。
+成功：201 `{assetId,uploadUrl,expiresIn:300,uploadHeaders?}`。调用方以 PUT 直传对应长度的文件并发送 `uploadHeaders` 中的头。签名绑定 Content-Length 和 Host。MP3、WAV、M4A、FLAC 的受支持 MIME 另签入 `x-cos-acl: private`，通过 `uploadHeaders` 返回。丢弃或改变该头会导致签名验证失败。浏览器直传的 COS CORS 须允许调用方精确 Origin、PUT 和签发的请求头。地址到期后新建上传。
 
 错误：见共同约定。
 
@@ -32,7 +32,7 @@ AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?,
 
 错误：404 ASSET_NOT_FOUND；409 ASSET_UPLOAD_NOT_FOUND/ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED/ASSET_BUSY/ASSET_EXPIRED/ASSET_FINALIZE_SUPERSEDED；其余见共同约定。冲突可在明确原因后重试，源内容改变后应新建资产。
 
-副作用：HEAD 核验长度及 ETag，持久冻结源标识并抢占，按 ETag 条件复制到新的 raw 键，再条件登记；PG 与 COS 不是同一事务，失败可能留下未登记的复制残留。不会把 staging 直接作为已登记原件。
+副作用：HEAD 核验长度及 ETag，持久冻结源标识并抢占，再按 ETag 条件复制和登记新的 raw 键。音频完成时核对本人原 staging 键和对象身份，为原 staging 和新 raw 明确使用 private ACL。PG 和 COS 分别提交，失败可能留下未登记的复制残留。成功的原件使用新 raw 键。
 
 ## GET /api/v1/assets/{id}
 

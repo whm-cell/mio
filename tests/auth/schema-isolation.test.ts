@@ -224,7 +224,11 @@ it.each([
     const acquired = await starting.catch(() => undefined);
     if (acquired) await acquired.close();
     await expect(starting).rejects.toThrow('AUTH_SCHEMA');
-    expect(await active()).toBe(before);
+    // pool.end() may resolve before PostgreSQL removes its session from pg_stat_activity.
+    await vi.waitFor(async () => expect(await active()).toBe(before), {
+      timeout: 1000,
+      interval: 10,
+    });
   } finally {
     await f.close();
   }

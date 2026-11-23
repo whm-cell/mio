@@ -337,7 +337,7 @@ it('serializes archive with reception and preserves owner-only historical access
     status: 409,
     code: 'CONVERSATION_ARCHIVED',
   });
-  await expect(store.bind(owner, id, 'model', deny)).rejects.toMatchObject({
+  await expect(store.selectModel(owner, id, 'model', deny)).rejects.toMatchObject({
     status: 409,
     code: 'CONVERSATION_ARCHIVED',
   });

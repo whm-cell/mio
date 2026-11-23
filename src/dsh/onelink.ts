@@ -317,6 +317,8 @@ function requestAdapter(
   });
 }
 
+export const OBSERVATION_UNAVAILABLE = 'OBSERVATION_UNAVAILABLE';
+
 /** Stable registration, request-owned snapshots. A Session id by itself grants no billing authority. */
 export class OneLinkAdapter extends LlmAdapter {
   private readonly vision: ConversationVision | undefined;
@@ -472,6 +474,13 @@ export class OneLinkAdapter extends LlmAdapter {
             : 'partial',
       };
     };
+    const persistObservation = async (finish: string) => {
+      try {
+        await run.observe(observation(finish));
+      } catch {
+        throw new LlmError('OneLink observation unavailable', OBSERVATION_UNAVAILABLE);
+      }
+    };
     try {
       const containsImages = options.messages.some((message) =>
         message.content.some((block) => block.type === 'image'),
@@ -509,12 +518,13 @@ export class OneLinkAdapter extends LlmAdapter {
           }
           if (execution.started) {
             observed = true;
-            await run.observe(observation(safe.reason.kind));
+            await persistObservation(safe.reason.kind);
           }
           yield safe;
         } else yield chunk;
       }
     } catch (error) {
+      if (error instanceof LlmError && error.code === OBSERVATION_UNAVAILABLE) throw error;
       if (error instanceof LlmError && error.code === IMAGE_OFFLOAD_REQUIRED_CODE) {
         failureCode = IMAGE_OFFLOAD_REQUIRED_CODE;
         throw error;
@@ -530,11 +540,7 @@ export class OneLinkAdapter extends LlmAdapter {
       // The loop may stop consuming immediately after abort; it need not request a terminal chunk.
       if (!observed && execution.started) {
         failureCode ??= signal.aborted ? 'ABORTED' : 'ONELINK_UNKNOWN';
-        try {
-          await run.observe(observation(signal.aborted ? 'aborted' : 'unknown'));
-        } catch {
-          throw new LlmError('OneLink observation unavailable', 'OBSERVATION_UNAVAILABLE');
-        }
+        await persistObservation(signal.aborted ? 'aborted' : 'unknown');
       }
     }
   }

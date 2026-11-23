@@ -1,4 +1,5 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createId } from '@mio/foundation/identifiers';
 import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
@@ -40,6 +41,9 @@ export interface ConversationRow {
   model_binding: ChatSelection | null;
   purpose: ConversationPurpose;
   reasoning_effort: ChatReasoningEffort | null;
+  forked_from_conversation_id: string | null;
+  forked_until_seq: string | null;
+  fork_requested_until_seq: string | null;
 }
 
 type RequestModelSnapshot = ChatRuntimeSnapshot & {
@@ -73,6 +77,12 @@ export const projectConversation = (row: ConversationRow): Conversation => ({
   ...(row.model_binding ? { modelRef: row.model_binding.modelRef } : {}),
   ...(row.purpose === 'drama-script' ? { purpose: row.purpose } : {}),
   ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
+  ...(row.forked_from_conversation_id
+    ? {
+        forkedFromConversationId: row.forked_from_conversation_id,
+        forkedUntilSeq: Number(row.forked_until_seq),
+      }
+    : {}),
 });
 function requireUnarchived(row: ConversationRow): void {
   if (row.archived_at) throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
@@ -157,30 +167,108 @@ export class ConversationStore {
       )
     ).rows[0]!;
   }
-  async bind(
+  /** Freeze the first resolved cutoff before any native target can be written. */
+  async reserveFork(
+    actor: Principal,
+    id: string,
+    requestId: string,
+    requestedSeq: number | undefined,
+    resolveBoundary: (nativeId: string) => Promise<number>,
+  ): Promise<{ sourceSessionId: string; targetId: string }> {
+    return this.transaction(async (client) => {
+      const source = await this.readOwned(actor, id, client);
+      const reserved = (
+        await client.query<Pick<ConversationRow, 'id' | 'fork_requested_until_seq'>>(
+          `SELECT id, fork_requested_until_seq FROM mio_conversations
+           WHERE owner_id=$1 AND forked_from_conversation_id=$2 AND fork_request_id=$3`,
+          [actor.userId, id, requestId],
+        )
+      ).rows[0];
+      if (reserved) {
+        if (reserved.fork_requested_until_seq !== (requestedSeq?.toString() ?? null))
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
+        return { sourceSessionId: source.dsh_session_id, targetId: reserved.id };
+      }
+      if (source.state !== 'ready')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+      const cutoff = await resolveBoundary(source.dsh_session_id);
+      const targetId = createId();
+      const binding = source.model_binding;
+      const selection = binding && {
+        providerConfigId: binding.providerConfigId,
+        modelRef: binding.modelRef,
+        modelKey: binding.modelKey,
+        modelId: binding.modelId,
+        protocol: binding.protocol,
+      };
+      await client.query(
+        `INSERT INTO mio_conversations(
+           id,owner_id,dsh_session_id,state,model_binding,purpose,reasoning_effort,title,title_pinned,
+           forked_from_conversation_id,forked_until_seq,fork_request_id,fork_requested_until_seq
+         ) VALUES($1,$2,$3,'creating',$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          targetId,
+          actor.userId,
+          `mio-${targetId}`,
+          selection ? JSON.stringify(selection) : null,
+          source.purpose,
+          source.reasoning_effort,
+          source.title,
+          source.title_pinned,
+          id,
+          cutoff,
+          requestId,
+          requestedSeq ?? null,
+        ],
+      );
+      return { sourceSessionId: source.dsh_session_id, targetId };
+    });
+  }
+  /** Serialize native retries on the target, leaving the source free to receive a new turn. */
+  async completeFork(
+    actor: Principal,
+    targetId: string,
+    materialize: (nativeId: string, cutoff: number, selection?: ChatSelection) => Promise<void>,
+  ): Promise<{ conversation: Conversation; created: boolean }> {
+    return this.transaction(async (client) => {
+      const target = await this.readOwned(actor, targetId, client);
+      if (target.state !== 'creating')
+        return { conversation: projectConversation(target), created: false };
+      if (target.forked_until_seq === null)
+        throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNKNOWN');
+      await materialize(
+        target.dsh_session_id,
+        Number(target.forked_until_seq),
+        target.model_binding ?? undefined,
+      );
+      await client.query("UPDATE mio_conversations SET state='ready' WHERE id=$1", [targetId]);
+      return { conversation: projectConversation({ ...target, state: 'ready' }), created: true };
+    });
+  }
+  async selectModel(
     actor: Principal,
     id: string,
     modelRef: string,
-    select: () => Promise<ChatSelection>,
+    select: (row: Readonly<ConversationRow>) => Promise<ChatSelection>,
   ): Promise<Conversation> {
     return this.transaction(async (client) => {
       const row = await this.readOwned(actor, id, client);
       requireUnarchived(row);
-      if (row.model_binding) {
-        const legacy = legacyReference(modelRef);
-        if (row.model_binding.modelRef !== modelRef && legacy?.id !== row.model_binding.modelId)
-          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_LOCKED');
-      } else {
-        if (row.active_request)
-          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
-        if (row.state !== 'ready')
-          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
-        row.model_binding = await select();
-        await client.query('UPDATE mio_conversations SET model_binding=$2::jsonb WHERE id=$1', [
-          id,
-          JSON.stringify(row.model_binding),
-        ]);
-      }
+      if (
+        row.model_binding &&
+        (row.model_binding.modelRef === modelRef ||
+          legacyReference(modelRef)?.id === row.model_binding.modelId)
+      )
+        return projectConversation(row);
+      if (row.active_request)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+      if (row.state !== 'ready')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+      row.model_binding = await select(row);
+      await client.query('UPDATE mio_conversations SET model_binding=$2::jsonb WHERE id=$1', [
+        id,
+        JSON.stringify(row.model_binding),
+      ]);
       return projectConversation(row);
     });
   }
@@ -512,8 +600,9 @@ export async function createConversationStore(databaseURL: string): Promise<Conv
       `UPDATE mio_conversation_requests SET status='unknown',error_code='PROCESS_INTERRUPTED',updated_at=now() WHERE status IN ('accepted','input-persisted')`,
     );
     await lease.query(
-      `UPDATE mio_conversations SET active_request=NULL,state=CASE WHEN state='creating' THEN 'unknown' ELSE state END
-       WHERE active_request IS NOT NULL OR state='creating'`,
+      `UPDATE mio_conversations SET active_request=NULL,
+         state=CASE WHEN state='creating' AND fork_request_id IS NULL THEN 'unknown' ELSE state END
+       WHERE active_request IS NOT NULL OR (state='creating' AND fork_request_id IS NULL)`,
     );
     return new ConversationStore(pool, lease);
   } catch (error) {

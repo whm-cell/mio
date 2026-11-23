@@ -10,6 +10,8 @@ import { ConversationCompaction } from './conversation-compaction.ts';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
 import type {} from './kernel.ts';
 
+export const CHECKPOINT_INTERRUPTED = 'MIO_CHECKPOINT_INTERRUPTED';
+
 const failedCheckpoints = new WeakSet<Session>();
 
 export function hasCheckpointFailure(session: Session): boolean {
@@ -26,7 +28,7 @@ async function checkpoint(kernel: Context['mioKernel'], session: Session): Promi
   }
   // The tool pipeline converts dispatch exceptions into results. Latch this
   // failure so subsequent native boundaries still refuse to dispatch.
-  if (failedCheckpoints.has(session)) throw new Error('MIO_CHECKPOINT_INTERRUPTED');
+  if (failedCheckpoints.has(session)) throw new Error(CHECKPOINT_INTERRUPTED);
   return true;
 }
 

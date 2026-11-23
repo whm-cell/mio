@@ -282,7 +282,7 @@ it('keeps owner snapshots across interleaved streams, rotation/disable, cancel, 
   );
 });
 
-it('reads unbound old history, requires an explicit owner binding once, and keeps Messages separate', async () => {
+it('reads unbound old history, binds it explicitly, and switches to the Messages protocol', async () => {
   const id = await create();
   await observer.query('UPDATE mio_conversations SET model_binding=NULL WHERE id=$1', [id]);
   expect((await call(`/api/v1/conversations/${id}/history`)).status).toBe(200);
@@ -296,10 +296,26 @@ it('reads unbound old history, requires an explicit owner binding once, and keep
   expect((await call(`/api/v1/conversations/${id}/model`, 'PUT', { modelRef: ref })).status).toBe(
     200,
   );
-  const claude = 'onelink:chat:claude-sonnet-4.5-20250929';
-  expect(
-    (await call(`/api/v1/conversations/${id}/model`, 'PUT', { modelRef: claude })).status,
-  ).toBe(409);
+  const claudeId = 'claude-sonnet-4.5-20250929';
+  const claude = `onelink:chat:${claudeId}`;
+  const catalog = (await (await call('/api/v1/providers/onelink/models')).json()) as {
+    items: { modelId: string; modelRef: string }[];
+  };
+  const declared = catalog.items.find(({ modelId }) => modelId === claudeId);
+  expect(declared).toBeDefined();
+  const beforeSwitch = (await runtime.onelinkRequests()).length;
+  const switched = await call(`/api/v1/conversations/${id}/model`, 'PUT', { modelRef: claude });
+  expect(switched.status, await switched.clone().text()).toBe(200);
+  expect(await switched.json()).toMatchObject({ modelRef: declared!.modelRef });
+  expect((await runtime.onelinkRequests()).length).toBe(beforeSwitch);
+  expect((await send(id, 'after-switch', 'continue in Messages')).status).toBe(202);
+  expect(await terminal(id, 'after-switch')).toBe('completed');
+  expect((await runtime.onelinkRequests()).slice(beforeSwitch)).toEqual([
+    expect.objectContaining({
+      path: '/v1/messages',
+      body: expect.objectContaining({ model: claudeId }),
+    }),
+  ]);
   const messages = await create(0, claude);
   for (const requestId of ['messages-one', 'messages-two']) {
     expect((await send(messages, requestId, 'Messages protocol')).status).toBe(202);

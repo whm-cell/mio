@@ -18,7 +18,7 @@ export function apply(ctx: Context) {
       return originalFetch(input, init);
     }
     if (url.pathname === '/v1/models')
-      return Response.json({ data: [{ id: 'deepseek-v4.1-flash' }] });
+      return Response.json({ data: [{ id: 'deepseek-v4.1-flash' }, { id: 'deepseek-v4-flash' }] });
     const body = (await request.clone().json()) as Record<string, unknown>;
     await appendFile(
       new URL('./requests.jsonl', import.meta.url),

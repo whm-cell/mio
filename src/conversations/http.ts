@@ -219,7 +219,7 @@ export function createConversationHandler(
       else if (
         validId &&
         parts.length === 2 &&
-        ['messages', 'cancel', 'compact'].includes(action ?? '')
+        ['messages', 'cancel', 'compact', 'forks'].includes(action ?? '')
       )
         methods = ['POST'];
       else if (validId && action === 'requests' && validRequestId(receiptId) && parts.length === 3)
@@ -285,13 +285,15 @@ export function createConversationHandler(
           ? ['requestId', 'text', 'imageAssetIds', 'reasoningEffort']
           : action === 'compact'
             ? ['requestId']
-            : creating
-              ? ['modelRef', 'purpose', 'reasoningEffort']
-              : action === 'model'
-                ? ['modelRef']
-                : method === 'PATCH'
-                  ? ['title']
-                  : [];
+            : action === 'forks'
+              ? ['requestId', 'turnEndSeq']
+              : creating
+                ? ['modelRef', 'purpose', 'reasoningEffort']
+                : action === 'model'
+                  ? ['modelRef']
+                  : method === 'PATCH'
+                    ? ['title']
+                    : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const reasoningEffort = value.reasoningEffort;
@@ -326,7 +328,7 @@ export function createConversationHandler(
       if (action === 'model') {
         if (typeof value.modelRef !== 'string')
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        return send(HTTP_STATUS.OK, await service.bind(actor, id!, value.modelRef));
+        return send(HTTP_STATUS.OK, await service.selectModel(actor, id!, value.modelRef));
       }
       if (method === 'PATCH') {
         if (
@@ -370,6 +372,17 @@ export function createConversationHandler(
       }
       if (action === 'requests')
         return send(HTTP_STATUS.OK, await service.request(actor, id!, receiptId!));
+      if (action === 'forks') {
+        const { requestId, turnEndSeq } = value;
+        if (
+          !validRequestId(requestId) ||
+          (turnEndSeq !== undefined &&
+            (typeof turnEndSeq !== 'number' || !Number.isSafeInteger(turnEndSeq) || turnEndSeq < 0))
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        const { conversation, created } = await service.fork(actor, id!, requestId, turnEndSeq);
+        return send(created ? HTTP_STATUS.CREATED : HTTP_STATUS.OK, conversation);
+      }
       if (action === 'compact') {
         if (!validRequestId(value.requestId)) return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(HTTP_STATUS.ACCEPTED, await service.compact(actor, id!, value.requestId));

@@ -50,7 +50,7 @@ export function createConversationService(
   store: ConversationStore,
   engine: ConversationEngine,
   providers?: Pick<ProviderService, 'selectChat' | 'resolveChat' | 'recordVerification'> &
-    Partial<Pick<ProviderService, 'chatContextWindow'>>,
+    Partial<Pick<ProviderService, 'chatContextWindow' | 'selectChatRoute'>>,
   vision?: ConversationVision,
   resolveProjectContext?: ConversationProjectContextResolver,
 ) {
@@ -255,7 +255,42 @@ export function createConversationService(
         return projectConversation({ ...row, state: 'ready' });
       });
     },
-    bind(actor: Principal, id: string, modelRef: string) {
+    fork(actor: Principal, id: string, requestId: string, turnEndSeq?: number) {
+      return admit(async () => {
+        const reservation = await store.reserveFork(
+          actor,
+          id,
+          requestId,
+          turnEndSeq,
+          (nativeId) => {
+            if (!engine.resolveForkBoundary || !engine.fork)
+              throw new ConversationError(
+                HTTP_STATUS.SERVICE_UNAVAILABLE,
+                'CONVERSATION_UNAVAILABLE',
+              );
+            return engine.resolveForkBoundary(nativeId, turnEndSeq);
+          },
+        );
+        try {
+          return await store.completeFork(
+            actor,
+            reservation.targetId,
+            (nativeId, cutoff, selection) => {
+              if (!engine.fork)
+                throw new ConversationError(
+                  HTTP_STATUS.SERVICE_UNAVAILABLE,
+                  'CONVERSATION_UNAVAILABLE',
+                );
+              return engine.fork(reservation.sourceSessionId, nativeId, cutoff, selection);
+            },
+          );
+        } catch (error) {
+          if (error instanceof ConversationError) throw error;
+          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNKNOWN');
+        }
+      });
+    },
+    selectModel(actor: Principal, id: string, modelRef: string) {
       return admit(async () => {
         if (!providers) {
           const row = await store.owned(actor, id);
@@ -263,9 +298,23 @@ export function createConversationService(
             throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
           throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
         }
-        return store.bind(actor, id, modelRef, () =>
-          providerAction(() => providers.selectChat(actor, modelRef)),
-        );
+        return store.selectModel(actor, id, modelRef, async (row) => {
+          if (!providers.selectChatRoute)
+            throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+          const { selection, inputModalities } = await providerAction(() =>
+            providers.selectChatRoute!(actor, modelRef, row.reasoning_effort ?? undefined),
+          );
+          if (!inputModalities.includes('image')) {
+            if (!engine.hasRetainedImages)
+              throw new ConversationError(
+                HTTP_STATUS.SERVICE_UNAVAILABLE,
+                'CONVERSATION_UNAVAILABLE',
+              );
+            if (await engine.hasRetainedImages(row.dsh_session_id))
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+          }
+          return selection;
+        });
       });
     },
     list: (actor: Principal, after: ConversationCursor | undefined, limit: number) => {

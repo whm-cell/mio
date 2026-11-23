@@ -95,6 +95,19 @@ export function createProviderService(
       throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
     return state;
   };
+  const selectChatRoute = async (
+    actor: ProviderPrincipal,
+    modelRef?: string,
+    reasoningEffort?: ChatReasoningEffort,
+  ) => {
+    const { selection, adaptation } = await chatState(actor, modelRef);
+    if (
+      reasoningEffort !== undefined &&
+      !supportsChatReasoning(adaptation.capabilityMetadata.reasoning, reasoningEffort)
+    )
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_REASONING_UNSUPPORTED');
+    return { selection, inputModalities: adaptation.inputModalities };
+  };
   const discover = async (actor: ProviderPrincipal): Promise<Discovery> => {
     const row = await store.beginRefresh(actor.userId);
     const result: Discovery = {
@@ -265,14 +278,9 @@ export function createProviderService(
       modelRef?: string,
       reasoningEffort?: ChatReasoningEffort,
     ): Promise<ChatSelection> {
-      const { selection, adaptation } = await chatState(actor, modelRef);
-      if (
-        reasoningEffort !== undefined &&
-        !supportsChatReasoning(adaptation.capabilityMetadata.reasoning, reasoningEffort)
-      )
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_REASONING_UNSUPPORTED');
-      return selection;
+      return (await selectChatRoute(actor, modelRef, reasoningEffort)).selection;
     },
+    selectChatRoute,
     async chatContextWindow(
       actor: ProviderPrincipal,
       selected: ChatSelection,

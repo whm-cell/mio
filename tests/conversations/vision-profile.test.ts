@@ -10,6 +10,7 @@ import { Pool } from 'pg';
 import sharp from 'sharp';
 import { imageOutputKey } from '../../src/generations/contracts.ts';
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import type { Conversation, HistoryPage } from '../../src/conversations/contracts.ts';
 import {
   makeChatRouteFixture,
   importRoutesViaCli,
@@ -102,14 +103,17 @@ beforeAll(async () => {
     expect(result.status, result.stdout + result.stderr).toBe(0);
   }
   const route = makeChatRouteFixture('deepseek-v4.1-flash', 'deepseek');
-  await importRoutesViaCli(env, {
-    ...route,
-    capabilityMetadata: {
-      ...route.capabilityMetadata,
-      inputModalities: ['text', 'image'],
-      maxRequestImages: 1,
+  await importRoutesViaCli(env, [
+    {
+      ...route,
+      capabilityMetadata: {
+        ...route.capabilityMetadata,
+        inputModalities: ['text', 'image'],
+        maxRequestImages: 1,
+      },
     },
-  });
+    makeChatRouteFixture('deepseek-v4-flash', 'deepseek'),
+  ]);
   runtime = await packedAuthRuntime(database.url, '', 'unused', {
     conversations: true,
     visionCosOrigin: `http://127.0.0.1:${address.port}`,
@@ -274,6 +278,55 @@ it('accepts owned original and derived sources and rejects unauthorized, unready
   expect(gets.get(lateChanging.key)).toBe(2);
   expect((await runtime.onelinkRequests()).length).toBe(baseline);
 }, 30000);
+
+it('rejects text-only switching on retained images and allows it on a pre-image fork', async () => {
+  const source = await call('/api/v1/conversations', 'POST', {});
+  expect(source.status, await source.clone().text()).toBe(201);
+  const { id: sourceId, modelRef } = (await source.json()) as Conversation;
+  const sourcePath = `/api/v1/conversations/${sourceId}`;
+  const assetId = [...objects.keys()][0]!.split('/')[2]!;
+  const requestsBefore = (await runtime.onelinkRequests()).length;
+  const send = async (path: string, requestId: string, text: string, imageAssetIds?: string[]) => {
+    const accepted = await call(`${path}/messages`, 'POST', { requestId, text, imageAssetIds });
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    await expect
+      .poll(async () => {
+        const receipt = await call(`${path}/requests/${requestId}`);
+        return ((await receipt.json()) as { status: string }).status;
+      })
+      .toBe('completed');
+  };
+  await send(sourcePath, 'text', 'text before image');
+  const history = await call(`${sourcePath}/history`);
+  expect(history.status).toBe(200);
+  const cutoff = ((await history.json()) as HistoryPage).items.find(
+    ({ role }) => role === 'status',
+  )!.seq;
+  await send(sourcePath, 'image', 'image after cutoff', [assetId]);
+  const textModel = { modelRef: 'onelink:chat:deepseek-v4-flash' };
+  const rejected = await call(`${sourcePath}/model`, 'PUT', textModel);
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toMatchObject({ error: { code: 'MODEL_MODALITY_UNSUPPORTED' } });
+  const sourceSelection = await call(`${sourcePath}/model`, 'PUT', { modelRef });
+  expect(await sourceSelection.json()).toMatchObject({ modelRef });
+
+  const branched = await call(`${sourcePath}/forks`, 'POST', {
+    requestId: 'before-image',
+    turnEndSeq: cutoff,
+  });
+  expect(branched.status, await branched.clone().text()).toBe(201);
+  const { id: childId } = (await branched.json()) as Conversation;
+  const childPath = `/api/v1/conversations/${childId}`;
+  const selected = await call(`${childPath}/model`, 'PUT', textModel);
+  expect(selected.status, await selected.clone().text()).toBe(200);
+  expect(await runtime.onelinkRequests()).toHaveLength(requestsBefore + 2);
+  await send(childPath, 'text-only', 'branch without the later image');
+  const wires = await runtime.onelinkRequests();
+  expect(wires).toHaveLength(requestsBefore + 3);
+  expect(wires.at(-1)?.body.model).toBe('deepseek-v4-flash');
+  expect(JSON.stringify(wires.at(-1)?.body.messages)).toContain('text before image');
+  expect(JSON.stringify(wires.at(-1)?.body.messages)).not.toContain('image after cutoff');
+});
 
 it('drains an offloaded turn, cancels blocked cold history on shutdown and reads it after restart', async () => {
   const ids = [...objects.keys()].map((key) => key.split('/')[2]!);

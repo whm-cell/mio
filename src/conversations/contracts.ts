@@ -50,6 +50,8 @@ export interface Conversation {
   modelRef?: string | null;
   purpose?: 'drama-script';
   reasoningEffort?: ChatReasoningEffort;
+  forkedFromConversationId?: string;
+  forkedUntilSeq?: number;
 }
 export interface ConversationArchive {
   id: string;
@@ -238,6 +240,14 @@ export type ConversationEvent =
 export interface ConversationEngine {
   readonly available: boolean;
   create(id: string, selection?: ChatSelection): Promise<void>;
+  resolveForkBoundary?(sourceId: string, upToSeq?: number): Promise<number>;
+  fork?(
+    sourceId: string,
+    targetId: string,
+    upToSeq: number,
+    selection?: ChatSelection,
+  ): Promise<void>;
+  hasRetainedImages?(id: string): Promise<boolean>;
   rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
   contextUsage?(id: string, signal?: AbortSignal): Promise<ContextUsage>;

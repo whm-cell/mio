@@ -16,7 +16,7 @@
 
 未启用 provider 域时保留 legacy：没有 provider/model 仍可创建/查询，发送返回 `503 MODEL_UNAVAILABLE` 且不新增接收记录；未注册 provider 拒绝，不支持的 model 沿原驱动结算失败。启用[用户供应商域](providers.md)后公共对话统一使用 BYOK，当前用户缺配置不回退全局或他人 Key；同时存在的 legacy 环境不参与选模或缺配校验。已绑定 BYOK 的会话不能在 legacy 装配下改跑全局模型。已有请求 ID 始终先查询/去重。
 
-BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策）。HTTP 响应等待与流空闲默认 30 秒，显式支持推理的路由可声明到 120 秒。不支持的内容或选项在出站前拒绝。
+BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。旧分类引用无损映射到同一 raw ID。旧无绑定会话可读历史，下一次新发送前由 owner 显式选择模型。元数据、创建及切模不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策）。HTTP 响应等待与流空闲默认 30 秒，显式支持推理的路由可声明到 120 秒。不支持的内容或选项在出站前拒绝。
 
 平台聊天路由的 `cacheRetention` 随本轮适配快照冻结。Anthropic Messages 默认发送短期缓存标记，OpenAI Chat Completions 由上游处理自动前缀缓存。系统提示词的能力组合与历史前缀保持一致时，实际缓存读写仍取决于供应商与本轮输入，按实际返回用量观察。[供应商配置](providers.md#受控适配声明与实际验证)
 
@@ -29,7 +29,7 @@ pnpm build
 pnpm start:dev
 ```
 
-第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。用途增量列为 `purpose text NOT NULL DEFAULT 'general'`，已有会话按通用用途继续使用。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
+第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。用途增量列为 `purpose text NOT NULL DEFAULT 'general'`，已有会话按通用用途继续使用。分叉增量增加可空的来源、请求 ID、请求序号和实际截止序号，原有会话无需回填。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
 
 ## 会话用途与项目上下文
 
@@ -48,6 +48,14 @@ pnpm start:dev
 接收新消息时，在归属行锁内用当前路由快照验证生效档位。缺少支持声明或明确档位时返回 `409 MODEL_REASONING_UNSUPPORTED`，发生在受理和模型派发前。已受理的请求使用冻结的路由、能力、超时和档位完成本轮。同一 requestId 与相同客户端输入首先返回原回执。显式单轮覆盖计入摘要，使用 `reasoning:v1:` 加 `SHA256(JSON.stringify([text, orderedIds, reasoningEffort]))`。省略单轮档位的文本与视觉摘要沿用原算法，既有请求可按原输入重放查询。请求 `model_binding` 仅在有生效档位时保存 `reasoningEffort` 作为内部审计字段。
 
 公开 SSE 的 `reasoning` 承载声明支持推理的路由实际发出的思考增量。轮次执行已授权工具时，`tool-status` 只投影工具名与脱敏的开始或完成状态。SSE 订阅、快照交接和背压仍使用有界资源；重连用原回执和正式历史恢复。原生 DSH 日志按私有会话规则保留思考块。公开历史保留正式助手正文、有效图片任务卡片和原有状态投影。[对话 HTTP](apis/conversations.md#get-apiv1conversationsidevents)
+
+## 历史分叉与模型选择
+
+分叉在源会话归属锁下读取已持久的原生轮次截止，创建一条新 PG 映射并先提交。映射复制当时的标题及手工固定状态、用途、会话默认推理档和无凭据的当前逻辑模型。归档、活动请求、旧回执和实时工具授权各自仍属于源会话。分叉后的项目解析使用新会话 ID 与实际用户，即使私有原生前缀含有早先的内部输入，新轮也只使用在子会话重新核对的项目快照。
+
+PG 按 owner、源会话和分叉 requestId 唯一约束。省略请求截止时，库内仍保存实际选中截止。请求序号留空和显式给出同一序号分别比较。提交预约后，在目标归属锁内完成固定原生 ID 的 seed，经过 flush 才发布 ready。源会话可继续运行。PG 未确认 ready 时，重启保留已预约的 creating 目标，重试同一输入并核对已经持久的原生前缀。已完成的子会话只读回当前元数据。普通新建会话的中断恢复仍使用 unknown。详细原生约束见 [DSH 集成](integrations/dsh.md)。
+
+切模在会话归属锁内校验空闲就绪、未归档、当前用户的聊天模型资格、默认推理档及原生模型上下文里的未卸载图片。同模型的稳定引用和旧分类别名沿现有重放语义。目标是纯文字模型时，保留的图片会导致 `409 MODEL_MODALITY_UNSUPPORTED`，已卸载图片可以用现有文字占位继续。写入只更改会话级逻辑绑定，原生选择在下一轮 setup 时记录。原请求回执、模型快照和观察保持原样。分叉和切模均没有模型出站。
 
 ## 归属、接收与持久化
 

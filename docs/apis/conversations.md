@@ -4,11 +4,11 @@
 
 ## 本域共同约定
 
-每次操作使用账号 Cookie 经数据库解析，服务 Bearer 不能替代用户。猜测他人 ID 与不存在 ID 均返回 404。正文不允许自授 owner、密钥、DSH ID 或额外字段，modelRef 只在创建和一次绑定入口接受。POST、PUT、PATCH、DELETE 必须有认证允许的精确 Origin，GET 有 Origin 时也须匹配。写入接口要求 `application/json`，DELETE 可以省略正文和 Content-Type。实际写入在读取正文前后各复核一次身份。OPTIONS 不要求登录。错误为 `{error:{code,message,requestId}}`，其中 requestId 是服务端 HTTP 追踪标识。所有响应禁止缓存，并带 X-Content-Type-Options 与 X-Request-Id。
+每次操作使用账号 Cookie 经数据库解析，服务 Bearer 不能替代用户。猜测他人 ID 与不存在 ID 均返回 404。正文不允许自授 owner、密钥、DSH ID 或额外字段，modelRef 只在创建和模型选择入口接受。POST、PUT、PATCH、DELETE 必须有认证允许的精确 Origin，GET 有 Origin 时也须匹配。写入接口要求 `application/json`，DELETE 可以省略正文和 Content-Type。实际写入在读取正文前后各复核一次身份。OPTIONS 不要求登录。错误为 `{error:{code,message,requestId}}`，其中 requestId 是服务端 HTTP 追踪标识。所有响应禁止缓存，并带 X-Content-Type-Options 与 X-Request-Id。
 
 消息入口的 JSON 正文和解码后的文本各自以 256 KiB 为上限，控制入口正文上限为 16 KiB。所有正文读取期限为 10 秒。客户端 requestId 为 1–80 个字母、数字、下划线或连字符，随本地对话保留。通用错误包括 400 BODY_INVALID/QUERY_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 CONVERSATION_NOT_FOUND/REQUEST_NOT_FOUND/NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED 和 503 CONVERSATION_UNAVAILABLE。源错误、路径、凭据、系统提示、推理、原始工具调用参数、目录探测内部结果、工具拒绝或异常详情与 trace 均不透传。
 
-BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVIDER_DISABLED/PROVIDER_AUTH_REJECTED/MODEL_CATALOG_NOT_DISCOVERED/MODEL_NOT_FOUND/MODEL_REMOVED/LEGACY_MODEL_REF_INVALID/ADAPTER_PENDING/MODEL_DISABLED/MODEL_DEFAULT_NOT_SET/MODEL_DEFAULT_INVALID；解密失败为 503 PROVIDER_CREDENTIAL_UNAVAILABLE。稳定引用来自本人[动态模型目录](providers.md#get-apiv1providersonelinkmodels)，兼容旧分类引用；当前目录不可用不回退其他模型或 Key。
+BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVIDER_DISABLED/PROVIDER_AUTH_REJECTED/MODEL_CATALOG_NOT_DISCOVERED/MODEL_NOT_FOUND/MODEL_REMOVED/LEGACY_MODEL_REF_INVALID/ADAPTER_PENDING/MODEL_DISABLED/MODEL_DEFAULT_NOT_SET/MODEL_DEFAULT_INVALID。仅运行时解密，失败为 503 PROVIDER_CREDENTIAL_UNAVAILABLE。稳定引用来自本人[动态模型目录](providers.md#get-apiv1providersonelinkmodels)，兼容旧分类引用；当前目录不可用不回退其他模型或 Key。
 
 ## POST /api/v1/conversations
 
@@ -28,7 +28,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：可选 `after` 接收上页原样返回的游标。省略时从首页开始。`limit` 默认 20，可取 1–100。
 
-成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?}],nextAfter}`，仅包含未归档会话。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
+成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?,forkedFromConversationId?,forkedUntilSeq?}],nextAfter}`，仅包含未归档会话。分叉时新增源会话和截止序号两个字段。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
 
 错误：见本域共同约定。
 
@@ -40,7 +40,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{title}`。原始标题最多 120 个 UTF-8 字节，须由有效的 Unicode 码点组成，清理控制字符并折叠空白后仍须非空。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?}`。
+成功：200，返回与列表项相同的会话元数据。
 
 错误：正文含其他字段、标题无效或超长均返回 400 BODY_INVALID。归档后返回 409 CONVERSATION_ARCHIVED，归属不匹配返回 404。
 
@@ -56,7 +56,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 错误：创建中或有活动请求时返回 409 CONVERSATION_BUSY。用户可以先取消活动请求并等待回执进入终态。
 
-副作用：归档的会话退出列表，owner 仍能读取历史和旧回执，也能用相同 ID 与内容重取原接收回执。新消息、绑定、改名和取消返回 409 CONVERSATION_ARCHIVED。归档保留原生日志、回执和图片资产引用。
+副作用：归档的会话退出列表，owner 仍能读取历史和旧回执、分叉已结算的轮次，也能用相同 ID 与内容重取原接收回执。新消息、切模、改名和取消返回 409 CONVERSATION_ARCHIVED。归档保留原生日志、回执和图片资产引用。
 
 ## GET /api/v1/conversations/:id/history
 
@@ -108,11 +108,21 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{modelRef}`，准确的本人允许 chat 目录引用，最多 512 字节；不接收 mode、Key、配置 ID、URL 或 header。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef,purpose?,reasoningEffort?}`。仅为旧无绑定会话设置一次。已经绑定相同值时返回原绑定，不重新验证当前 Key。归档会话拒绝绑定。
+成功：200，返回与列表项相同的会话元数据。空闲就绪的会话可设置或切换绑定。已绑定的同一模型可用同引用或旧分类别名重取当前绑定，归档会话拒绝操作。
 
-错误：409 包括 CONVERSATION_MODEL_LOCKED、CONVERSATION_BUSY、CONVERSATION_UNKNOWN 和 CONVERSATION_ARCHIVED。未绑定时还须满足共同约定的当前 BYOK 资格。
+错误：新绑定须满足当前 BYOK 资格。活动请求、非就绪会话和归档分别返回 409 CONVERSATION_BUSY、CONVERSATION_UNKNOWN 和 CONVERSATION_ARCHIVED。目标模型不支持会话默认推理档时返回 409 MODEL_REASONING_UNSUPPORTED。历史模型上下文仍有未卸载图像且目标只支持文字时返回 409 MODEL_MODALITY_UNSUPPORTED。可选视觉模型，或从未含该类图片的前缀派生会话后切换。
 
-副作用：事务锁住 owner 对话、保存逻辑配置/模型绑定；不解密、不调用模型、不改写历史。BYOK 旧无绑定会话在下一次新发送前须显式调用；历史和已有回执始终可读。
+副作用：事务锁住 owner 对话，核对资格和当前上下文，再保存逻辑模型绑定。该操作没有解密或模型出站。下一次 fresh 轮次重新校验资格并在 DSH 中记录模型选择，原有历史和请求快照保留。旧无绑定会话须先显式选择模型，随后才可通过 BYOK 接收新消息。
+
+## POST /api/v1/conversations/:id/forks
+
+当前登录用户须拥有源会话。正文为 `{requestId,turnEndSeq?}`。`turnEndSeq` 为非负安全整数，须匹配源历史中已持久、真实结算的 `turn/end` 序号。省略取最新可分叉轮次。归档或有活动请求的源会话仍可选择其已结算前缀。
+
+完成创建返回 201，之后相同请求返回 200。响应形状与列表项相同，包含 `forkedFromConversationId` 和 `forkedUntilSeq`。新会话的公开历史保留截止点内的原序号和内容。初始标题、用途、默认推理档及逻辑模型绑定取首次预约时源会话的值，活跃时间从新会话的创建时间开始。源已从模型 A 切到 B 时，从 A 轮次分叉可保留其历史，子会话当前绑定为 B。后续执行按子会话 ID 重新核对项目关联、模型资格和权限。
+
+分叉请求按 owner、源会话与 requestId 去重。首次确定的目标 ID 与截止点固定。源后来增加新轮或换模，同输入重放仍定位同一子会话。省略序号与显式指定同一序号属于不同输入。形状错误返回 400 BODY_INVALID，合法序号无法证明为已结算边界或没有可分叉轮次时返回 409 CONVERSATION_FORK_BOUNDARY_INVALID，同 ID 异输入返回 409 REQUEST_ID_CONFLICT。写入未确认时可用相同 ID 和原输入重试。
+
+分叉只复制截止点内的原生事件。源日志、源回执及资产归属保持原样。该操作不产生模型或工具调用。
 
 ## GET /api/v1/conversations/:id/requests/:requestId
 

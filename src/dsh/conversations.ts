@@ -11,9 +11,9 @@ import {
   QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm';
-import type { UserMessage } from '@deepseek-ai/dsh-llm';
+import type { RequestMessage, UserMessage } from '@deepseek-ai/dsh-llm';
 import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session';
-import type { Session, SessionSeq, TurnEndReason } from '@deepseek-ai/dsh-session';
+import type { Session, SessionEvent, SessionSeq, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title';
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
@@ -35,6 +35,7 @@ import type {
 import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
 import {
+  CHECKPOINT_INTERRUPTED,
   hasCheckpointFailure,
   trackConversationToolCheckpoints,
 } from './conversation-checkpoints.ts';
@@ -42,7 +43,7 @@ import { ConversationCompaction, measureConversationContext } from './conversati
 import { stageProjectContext } from './conversation-context.ts';
 import type { ProjectContext } from './conversation-context.ts';
 import type {} from './kernel.ts';
-import { registerOneLink, onelinkRoute } from './onelink.ts';
+import { OBSERVATION_UNAVAILABLE, onelinkRoute, registerOneLink } from './onelink.ts';
 import { authorizeConversationImageTools } from './policy.ts';
 import { conversationImageAssetId } from './vision.ts';
 import { registerVisionTool } from './vision-tool.ts';
@@ -79,6 +80,41 @@ function publicModelFailure(code: string): ModelFailure | undefined {
       return code;
   }
   return undefined;
+}
+
+function isForkBoundary(event: SessionEvent | undefined): event is SessionEvent<'turn/end'> {
+  if (event?.type !== 'turn/end') return false;
+  const { reason } = event.data;
+  switch (reason.kind) {
+    case 'completed':
+    case 'max-tokens':
+    case 'blocked':
+      return true;
+    case 'error':
+      return (
+        reason.error.code !== OBSERVATION_UNAVAILABLE &&
+        (reason.error.code !== 'UNKNOWN' || reason.error.message !== CHECKPOINT_INTERRUPTED)
+      );
+    case 'aborted':
+      return reason.reason.kind === 'user';
+    default:
+      return false;
+  }
+}
+
+function forkBoundary(events: readonly SessionEvent[], requested?: number): number {
+  // The native persistence codec validates turn, step and tool pairing inside
+  // the decoded prefix. Recovery-generated endings never settle a user turn.
+  const boundary = requested === undefined ? events.findLast(isForkBoundary) : events[requested];
+  if (!isForkBoundary(boundary) || (requested !== undefined && boundary.seq !== requested))
+    throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_FORK_BOUNDARY_INVALID');
+  return boundary.seq;
+}
+
+function containsRetainedImages(messages: readonly RequestMessage[]): boolean {
+  return messages.some((message) =>
+    message.content.some((block) => block.type === 'image' && block.offloaded !== true),
+  );
 }
 
 /** Narrow bridge: DSH values stop here; only public text/tool-card/status values leave it. */
@@ -182,6 +218,27 @@ export function createDshConversationEngine(
           await handle.dispose();
         }
       });
+    },
+    async resolveForkBoundary(sourceId, upToSeq) {
+      const { events } = await ctx.mioKernel.readPersistedHistory(sourceId);
+      return forkBoundary(events, upToSeq);
+    },
+    async fork(sourceId, targetId, upToSeq, selection) {
+      if (closing) throw new Error('MIO_ENGINE_CLOSED');
+      await inSessionOrder(targetId, async () => {
+        const { events } = await ctx.mioKernel.readPersistedHistory(sourceId);
+        const boundary = forkBoundary(events, upToSeq);
+        await ctx.mioKernel.createFork(
+          sourceId,
+          targetId,
+          events.slice(0, boundary + 1),
+          selectedOptions(selection),
+        );
+      });
+    },
+    async hasRetainedImages(id) {
+      const view = await ctx.mioKernel.readPersistedView(id);
+      return containsRetainedImages(view.deriveMessages());
     },
     async rename(id, title) {
       if (closing) throw new Error('MIO_ENGINE_CLOSED');
@@ -497,26 +554,15 @@ export function createDshConversationEngine(
                 'TURN_STEP_BUDGET_EXCEEDED',
               );
             }
-            if (!observedBinding?.snapshot.inputModalities?.includes('image')) {
-              const hasPendingImage = payload.messages.some((message) =>
-                message.content.some((block) => block.type === 'image'),
+            if (
+              !observedBinding?.snapshot.inputModalities?.includes('image') &&
+              (containsRetainedImages(payload.messages) ||
+                containsRetainedImages(agent.session.deriveMessages()))
+            )
+              throw new LlmError(
+                'Model does not support image input',
+                'MODEL_MODALITY_UNSUPPORTED',
               );
-              const hasHistoryImage = agent.session.surface.nodes.some((seq) => {
-                const event = agent.session.eventAt(seq);
-                return Boolean(
-                  event &&
-                  (event.type === 'user/message' || event.type === 'tool/result') &&
-                  agent.session
-                    .deriveEventMessage(event)
-                    ?.content.some((block) => block.type === 'image'),
-                );
-              });
-              if (hasPendingImage || hasHistoryImage)
-                throw new LlmError(
-                  'Model does not support image input',
-                  'MODEL_MODALITY_UNSUPPORTED',
-                );
-            }
             if (observedBinding && onelink) {
               if (
                 payload.agent.id !== observedBinding.dshSessionId ||

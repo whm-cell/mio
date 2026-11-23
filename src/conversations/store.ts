@@ -9,6 +9,7 @@ import type { ConversationCursor } from './cursor.ts';
 import type {
   Conversation,
   ConversationArchive,
+  ConversationPurpose,
   ConversationSnapshot,
   Principal,
   Receipt,
@@ -33,6 +34,7 @@ export interface ConversationRow {
   state: Conversation['state'];
   active_request: string | null;
   model_binding: ChatSelection | null;
+  purpose: ConversationPurpose;
 }
 interface RequestRow {
   conversation_id: string;
@@ -53,13 +55,14 @@ const receipt = (row: ReceiptRow): Receipt => ({
   ...(row.error_code ? { error: row.error_code } : {}),
   ...(row.truncation_reason === outputTruncation.reason ? { truncation: outputTruncation } : {}),
 });
-const conversation = (row: ConversationRow): Conversation => ({
+export const projectConversation = (row: ConversationRow): Conversation => ({
   id: row.id,
   createdAt: row.created_at.toISOString(),
   updatedAt: row.updated_at.toISOString(),
   title: row.title,
   state: row.state,
   ...(row.model_binding ? { modelRef: row.model_binding.modelRef } : {}),
+  ...(row.purpose === 'drama-script' ? { purpose: row.purpose } : {}),
 });
 function requireUnarchived(row: ConversationRow): void {
   if (row.archived_at) throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
@@ -121,12 +124,18 @@ export class ConversationStore {
     return row;
   }
 
-  async create(actor: Principal, id: string, selection?: ChatSelection): Promise<ConversationRow> {
+  async create(
+    actor: Principal,
+    id: string,
+    selection?: ChatSelection,
+    purpose: ConversationPurpose = 'general',
+  ): Promise<ConversationRow> {
     this.assertActive();
     return (
       await this.pool.query<ConversationRow>(
-        `INSERT INTO mio_conversations(id,owner_id,dsh_session_id,state,model_binding) VALUES($1,$2,$3,'creating',$4::jsonb) RETURNING *`,
-        [id, actor.userId, `mio-${id}`, selection ? JSON.stringify(selection) : null],
+        `INSERT INTO mio_conversations(id,owner_id,dsh_session_id,state,model_binding,purpose)
+         VALUES($1,$2,$3,'creating',$4::jsonb,$5) RETURNING *`,
+        [id, actor.userId, `mio-${id}`, selection ? JSON.stringify(selection) : null, purpose],
       )
     ).rows[0]!;
   }
@@ -154,7 +163,7 @@ export class ConversationStore {
           JSON.stringify(row.model_binding),
         ]);
       }
-      return conversation(row);
+      return projectConversation(row);
     });
   }
   async rename(
@@ -171,7 +180,7 @@ export class ConversationStore {
         id,
         row.title,
       ]);
-      return conversation(row);
+      return projectConversation(row);
     });
   }
   async archive(actor: Principal, id: string): Promise<ConversationArchive> {
@@ -206,7 +215,7 @@ export class ConversationStore {
         [actor.userId, cursor.id, limit + 1],
       );
       return {
-        items: rows.slice(0, limit).map(conversation),
+        items: rows.slice(0, limit).map(projectConversation),
         nextAfter: rows.length > limit ? rows[limit - 1]!.id : null,
       };
     }
@@ -221,7 +230,7 @@ export class ConversationStore {
     );
     const last = rows.length > limit ? rows[limit - 1] : undefined;
     return {
-      items: rows.slice(0, limit).map(conversation),
+      items: rows.slice(0, limit).map(projectConversation),
       nextAfter: last ? encodeConversationCursor(last.cursor_time, last.id) : null,
     };
   }

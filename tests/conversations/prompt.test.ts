@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   buildConversationSystemPrompt,
@@ -103,4 +104,30 @@ describe('conversation platform system prompt', () => {
     });
     expect(new Set(outputs).size).toBe(4);
   });
+
+  it('keeps the general template byte-identical for all pre-M4 capability combinations', () => {
+    const outputs = CAPABILITY_COMBINATIONS.map((capabilities) => {
+      const general = buildConversationSystemPrompt(capabilities, 'general');
+      expect(general).toBe(buildConversationSystemPrompt(capabilities));
+      return general;
+    });
+    expect(createHash('sha256').update(JSON.stringify(outputs)).digest('hex')).toBe(
+      '5c9f8bff49588dbb5428c62a27d04f88a36ec5a82e832582da4b94673dd4cbbb',
+    );
+  });
+
+  it.each(CAPABILITY_COMBINATIONS)(
+    'adds deterministic script guidance with the same tool capabilities (%o)',
+    (capabilities) => {
+      const general = buildConversationSystemPrompt(capabilities);
+      const drama = buildConversationSystemPrompt(capabilities, 'drama-script');
+      expect(drama).toBe(buildConversationSystemPrompt({ ...capabilities }, 'drama-script'));
+      expect(drama).toContain('【剧本创作工作区】');
+      expect(drama).toContain('分场、对白和旁白');
+      expect(drama).toContain('区分已确认的设定与本轮创作建议');
+      expect(drama.match(/【生图与改图能力】[\s\S]*$/)?.[0]).toEqual(
+        general.match(/【生图与改图能力】[\s\S]*$/)?.[0],
+      );
+    },
+  );
 });

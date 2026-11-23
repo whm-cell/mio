@@ -29,6 +29,7 @@ import {
   compactionThreshold,
 } from '../conversations/compaction.ts';
 import type { ContextUsage, ConversationRun } from '../conversations/contracts.ts';
+import type { ProjectContext } from './conversation-context.ts';
 import { fitSummaryInput } from './conversation-summary.ts';
 import { onelinkRoute, snapshotMaxTokens } from './onelink.ts';
 import type { OneLinkAdapter } from './onelink.ts';
@@ -42,6 +43,7 @@ interface CompactRequest {
     readonly firstStep: boolean;
     readonly pending: readonly UserMessage[];
     readonly inputSeq: SessionSeq | undefined;
+    readonly projectContext: ProjectContext | undefined;
   };
 }
 
@@ -132,15 +134,18 @@ export class ConversationCompaction extends CompactionEngine {
     }
     const meter = this.ctx.get('tokenMeter');
     if (!meter) return null;
-    const { inputSeq } = request.turn;
+    const { inputSeq, projectContext } = request.turn;
     const admitted = inputSeq === undefined ? undefined : session.eventAt(inputSeq);
     const input =
       admitted?.type === 'user/message'
         ? admitted.data
         : request.turn.pending.find((message) => message.source.kind === 'user');
-    // Replacing history cannot shrink this turn's indivisible user input.
+    // Replacing history cannot shrink the current input or frozen project snapshot.
     // Its estimate governs the auxiliary call only; the body still reaches the provider.
-    if (input && meter.estimateMessage(input) >= window) {
+    const fixedTokens =
+      (input ? meter.estimateMessage(input) : 0) +
+      (projectContext ? meter.estimateMessage(projectContext.message) : 0);
+    if (fixedTokens >= window) {
       if (request.turn.firstStep && trigger === 'pressure') await this.prune(session, signal);
       return null;
     }
@@ -235,12 +240,17 @@ export class ConversationCompaction extends CompactionEngine {
       (count, { heuristicTokens }) => count + heuristicTokens,
       0,
     );
+    const activeContextSeq = request.turn?.projectContext?.seq;
+    const replayedContext =
+      activeContextSeq === undefined
+        ? undefined
+        : selected.find(({ seq }) => seq === activeContextSeq);
     const startEventType = session.eventAt(region.start);
     if (
       (selected.length === 1 &&
         startEventType?.type === 'user/message' &&
         isCompactCheckpointSource(startEventType.data.source)) ||
-      shadowedTokenCount <=
+      shadowedTokenCount - (replayedContext?.heuristicTokens ?? 0) <=
         meter.estimateMessage(
           createUserMessage({
             source: { kind: 'user' },
@@ -276,7 +286,7 @@ export class ConversationCompaction extends CompactionEngine {
       });
       if (
         meter.estimateMessage(checkpoint) >=
-        selected.reduce((count, node) => count + node.tokens, 0)
+        selected.reduce((count, node) => count + node.tokens, 0) - (replayedContext?.tokens ?? 0)
       )
         throw new ManualCompactionError(
           'summary',

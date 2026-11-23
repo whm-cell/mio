@@ -29,7 +29,17 @@ pnpm build
 pnpm start:dev
 ```
 
-第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
+第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。用途增量列为 `purpose text NOT NULL DEFAULT 'general'`，已有会话按通用用途继续使用。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
+
+## 会话用途与项目上下文
+
+创建时固定为通用 `general` 或剧本创作 `drama-script`。用途与已授权的工具能力决定固定系统提示词。剧本创作模板引导分场、对白与旁白打磨。相同用途和工具能力下，项目设定更新不会改变本轮系统提示词前缀的字节。
+
+可信服务端业务模块可在同一 Cordis 作用域提供 `mioConversationProjectContext` 读取器。它接收 `{ownerId, conversationId, signal}`，按这两个标识从业务域自己的关联中读取最新设定，返回 `{ownerId, conversationId, snapshot}` 或表示未关联的 `null`。对话服务核对返回的两个标识。读取器在接收事务持有当前会话行锁时执行，只查询业务域自身的数据，须按有界范围读取并响应退出信号。关联和剧本修订存于业务域。
+
+剧本用途的每个新请求在通过归属、原回执去重和接收检查后读取快照。快照接受可选的 `scriptSummary` 字符串、`worldbuilding` 字符串和 `characters` 字符串数组。编码后的快照 JSON 最多 64 KiB UTF-8，包含转义和结构字符。读取器未装配或返回未关联时正常执行剧本用途。读取失败、归属不符、格式无效或超限时拒绝接收，原 requestId 可以重试。已受理请求的回执重放不重新读取项目。
+
+有效快照参与本轮的模型上下文预算。对话 PostgreSQL 元数据和回执不存项目快照。DSH 私有原生日志可能保留内部输入，访问随会话日志保护。公开历史、实时事件和自动标题只投影原有允许来源，助手正文按模型实际输出传递。[DSH 集成](integrations/dsh.md)
 
 ## 归属、接收与持久化
 

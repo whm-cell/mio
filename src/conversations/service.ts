@@ -10,6 +10,7 @@ import type {
   ConversationEngine,
   ConversationEvent,
   ConversationImageReference,
+  ConversationPurpose,
   ConversationRun,
   ConversationRunResult,
   ConversationVision,
@@ -17,6 +18,9 @@ import type {
   Receipt,
 } from './contracts.ts';
 import type { ConversationCursor } from './cursor.ts';
+import { loadConversationProjectContext } from './project-context.ts';
+import type { ConversationProjectContextResolver } from './project-context.ts';
+import { projectConversation } from './store.ts';
 import type { ConversationStore } from './store.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
@@ -40,6 +44,7 @@ export function createConversationService(
   providers?: Pick<ProviderService, 'selectChat' | 'resolveChat' | 'recordVerification'> &
     Partial<Pick<ProviderService, 'chatContextWindow'>>,
   vision?: ConversationVision,
+  resolveProjectContext?: ConversationProjectContextResolver,
 ) {
   const pending = new Map<string, Promise<void>>();
   const receiving = new Map<string, Promise<Receipt>>();
@@ -214,14 +219,18 @@ export function createConversationService(
     return accepted;
   };
   return {
-    create(actor: Principal, modelRef?: string): Promise<Conversation> {
+    create(
+      actor: Principal,
+      modelRef?: string,
+      purpose: ConversationPurpose = 'general',
+    ): Promise<Conversation> {
       return admit(async () => {
         if (!providers && modelRef)
           throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
         const selection = providers
           ? await providerAction(() => providers.selectChat(actor, modelRef))
           : undefined;
-        const row = await store.create(actor, createId(), selection);
+        const row = await store.create(actor, createId(), selection, purpose);
         try {
           await engine.create(row.dsh_session_id, selection);
           await store.setReady(row.id, true);
@@ -229,14 +238,7 @@ export function createConversationService(
           await store.setReady(row.id, false).catch(() => {});
           throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNKNOWN');
         }
-        return {
-          id: row.id,
-          createdAt: row.created_at.toISOString(),
-          updatedAt: row.updated_at.toISOString(),
-          title: row.title,
-          state: 'ready' as const,
-          ...(selection ? { modelRef: selection.modelRef } : {}),
-        };
+        return projectConversation({ ...row, state: 'ready' });
       });
     },
     bind(actor: Principal, id: string, modelRef: string) {
@@ -361,13 +363,13 @@ export function createConversationService(
             preparingImages--;
           }
         }
+        let projectContext: string | undefined;
         const received = await receive(actor, id, requestId, digest, async (row) => {
+          let snapshot: ChatRuntimeSnapshot | undefined;
           if (providers) {
             if (!row.model_binding)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
-            const snapshot = await providerAction(() =>
-              providers.resolveChat(actor, row.model_binding!),
-            );
+            snapshot = await providerAction(() => providers.resolveChat(actor, row.model_binding!));
             if (images.length && !snapshot.inputModalities?.includes('image'))
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
             if (
@@ -378,13 +380,19 @@ export function createConversationService(
                 JSON.stringify(snapshot.imageBudget) !== JSON.stringify(preflight.imageBudget))
             )
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
-            return snapshot;
+          } else {
+            if (images.length)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+            if (row.model_binding || !engine.available)
+              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
           }
-          if (images.length)
-            throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-          if (row.model_binding || !engine.available)
-            throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
-          return undefined;
+          if (row.purpose === 'drama-script' && resolveProjectContext)
+            projectContext = await loadConversationProjectContext(resolveProjectContext, {
+              ownerId: row.owner_id,
+              conversationId: row.id,
+              signal: admissionStop.signal,
+            });
+          return snapshot;
         });
         if (!received.fresh) return received.receipt;
         const nativeId = received.row.dsh_session_id;
@@ -418,6 +426,10 @@ export function createConversationService(
                 });
               },
               capture,
+              {
+                purpose: received.row.purpose,
+                ...(projectContext !== undefined ? { projectContext } : {}),
+              },
             ),
           async () => {
             const retry = retryActivity;

@@ -91,13 +91,19 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
   const { rows } = await pool.query(`
     SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns
     WHERE table_schema=current_schema() AND table_name='mio_conversations'
-      AND column_name IN ('archived_at','title','title_pinned','updated_at') ORDER BY column_name`);
+      AND column_name IN ('archived_at','purpose','title','title_pinned','updated_at') ORDER BY column_name`);
   expect(rows).toEqual([
     {
       column_name: 'archived_at',
       data_type: 'timestamp with time zone',
       is_nullable: 'YES',
       column_default: null,
+    },
+    {
+      column_name: 'purpose',
+      data_type: 'text',
+      is_nullable: 'NO',
+      column_default: "'general'::text",
     },
     { column_name: 'title', data_type: 'text', is_nullable: 'YES', column_default: null },
     {
@@ -121,7 +127,7 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
   );
   expect(
     (
-      await pool.query(`SELECT title,title_pinned,archived_at,updated_at=created_at AS exact,
+      await pool.query(`SELECT title,title_pinned,archived_at,purpose,updated_at=created_at AS exact,
        dsh_session_id FROM mio_conversations`)
     ).rows,
   ).toEqual([
@@ -129,6 +135,7 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
       title: null,
       title_pinned: false,
       archived_at: null,
+      purpose: 'general',
       exact: true,
       dsh_session_id: 'original-dsh',
     },

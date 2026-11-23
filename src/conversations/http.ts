@@ -278,16 +278,19 @@ export function createConversationHandler(
         actor = await identity(headers);
         if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       }
+      const creating = base && method === 'POST';
       const expected =
         action === 'messages'
           ? ['requestId', 'text', 'imageAssetIds']
           : action === 'compact'
             ? ['requestId']
-            : (base && method === 'POST') || action === 'model'
-              ? ['modelRef']
-              : method === 'PATCH'
-                ? ['title']
-                : [];
+            : creating
+              ? ['modelRef', 'purpose']
+              : action === 'model'
+                ? ['modelRef']
+                : method === 'PATCH'
+                  ? ['title']
+                  : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (status: number, value: unknown) => {
@@ -295,18 +298,22 @@ export function createConversationHandler(
         response.end(JSON.stringify(value));
       };
       if (
-        ((base && method === 'POST') || action === 'model') &&
+        (creating || action === 'model') &&
         value.modelRef !== undefined &&
         (typeof value.modelRef !== 'string' ||
           !value.modelRef ||
           Buffer.byteLength(value.modelRef) > 512)
       )
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-      if (base && method === 'POST')
+      if (creating) {
+        const { purpose } = value;
+        if (purpose !== undefined && purpose !== 'general' && purpose !== 'drama-script')
+          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(
           HTTP_STATUS.CREATED,
-          await service.create(actor, value.modelRef as string | undefined),
+          await service.create(actor, value.modelRef as string | undefined, purpose),
         );
+      }
       if (action === 'model') {
         if (typeof value.modelRef !== 'string')
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');

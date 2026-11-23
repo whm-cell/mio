@@ -5,6 +5,21 @@ import { protocolResponse } from './fixture.ts';
 
 /** Temporary child-Profile overlay only. Production Mio/PiAi/loop remain the request implementation. */
 export function apply(ctx: Context) {
+  ctx.provide('mioConversationProjectContext', async ({ ownerId, conversationId, signal }) => {
+    const association = await readFile(new URL('./project-context.json', import.meta.url), {
+      encoding: 'utf8',
+      signal,
+    }).then(
+      (raw) => JSON.parse(raw) as Awaited<ReturnType<Context['mioConversationProjectContext']>>,
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      },
+    );
+    return association?.ownerId === ownerId && association.conversationId === conversationId
+      ? association
+      : null;
+  });
   ctx.on('llm/stream', (options, next) => {
     const input = options.messages.filter((message) => message.role === 'user').at(-1);
     if (!JSON.stringify(input).includes('PAUSE_WIRE')) return next();

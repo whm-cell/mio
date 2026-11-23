@@ -4,6 +4,7 @@ import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session
 import { isPlainJsonRecord } from '@deepseek-ai/dsh-tools';
 import type { TokenMeter, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter';
 import { isUuidV4 } from '@mio/foundation/identifiers';
+import { PROJECT_CONTEXT_SOURCE } from './conversation-context.ts';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
 import { conversationImageAssetId } from './vision.ts';
 
@@ -60,7 +61,13 @@ function keepToolReferences(
 
 function summaryRow(session: Session, event: SessionEvent, references: Set<string>): string {
   const message = session.deriveEventMessage(event);
-  if (!message || message.role === 'system' || message.role === 'developer') return '';
+  if (
+    !message ||
+    message.role === 'system' ||
+    message.role === 'developer' ||
+    (message.role === 'user' && message.source.kind === PROJECT_CONTEXT_SOURCE)
+  )
+    return '';
   const texts: string[] = [];
   for (const block of message.content) {
     if (block.type === 'text') {

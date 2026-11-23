@@ -14,11 +14,11 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 身份：当前登录用户，owner 由服务取得。
 
-输入：`{modelRef?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。
+输入：`{modelRef?,purpose?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。purpose 仅接受 `general` 或 `drama-script`，省略时使用 `general`。purpose 在会话创建后固定。接口拒绝自定义系统提示词、项目关联标识与项目上下文。
 
-成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。
+成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?,purpose?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。元数据仅在用途为 `drama-script` 时带 `purpose`，省略表示 `general`，亦适用于既有会话。
 
-错误：BYOK 按共同约定的具体资格错误；legacy 的 503 MODEL_UNAVAILABLE 保留。503 CONVERSATION_UNKNOWN 表示跨存储未收口，所属列表可能已有 unknown 映射。缺模型/配置/资格不创建映射。
+错误：未知或无效的 purpose 返回 400 BODY_INVALID。BYOK 按共同约定的具体资格错误；legacy 的 503 MODEL_UNAVAILABLE 保留。503 CONVERSATION_UNKNOWN 表示跨存储未收口，所属列表可能已有 unknown 映射。缺模型/配置/资格不创建映射。
 
 副作用：创建 PG 归属映射和 DSH 原生会话头，不调用模型或授权工具。
 
@@ -28,7 +28,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：可选 `after` 接收上页原样返回的游标。省略时从首页开始。`limit` 默认 20，可取 1–100。
 
-成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?}],nextAfter}`，仅包含未归档会话。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
+成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?}],nextAfter}`，仅包含未归档会话。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
 
 错误：见本域共同约定。
 
@@ -40,7 +40,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{title}`。原始标题最多 120 个 UTF-8 字节，须由有效的 Unicode 码点组成，清理控制字符并折叠空白后仍须非空。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef?}`。
+成功：200 `{id,createdAt,updatedAt,title,state,modelRef?,purpose?}`。
 
 错误：正文含其他字段、标题无效或超长均返回 400 BODY_INVALID。归档后返回 409 CONVERSATION_ARCHIVED，归属不匹配返回 404。
 
@@ -78,6 +78,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{requestId,text,imageAssetIds?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
 
+已关联项目的 `drama-script` 会话使用标准消息请求。服务端按拥有者和会话读取本轮项目快照，项目字段写入 HTTP 正文会返回 400 BODY_INVALID。快照超出 64 KiB UTF-8 JSON 会返回 413 CONVERSATION_CONTEXT_TOO_LARGE。关联来源异常、无效或归属不符返回脱敏的 503 CONVERSATION_CONTEXT_UNAVAILABLE。两种拒绝均发生在接收前，可用原 requestId 重试。已受理请求的回执重放不重新解析项目。
+
 成功：202 原接收回执 `{conversationId,requestId,status,error?,truncation?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
 
 错误：409 包括 CONVERSATION_BUSY、CONVERSATION_ARCHIVED、REQUEST_ID_CONFLICT、CONVERSATION_UNKNOWN、CONVERSATION_MODEL_REQUIRED、MODEL_MODALITY_UNSUPPORTED 和 MODEL_VISION_CHANGED。BYOK 资格与解密错误见本域共同约定。无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码、格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。每服务同时最多准备两个新的带图请求，满载立即返回 503 IMAGE_UNAVAILABLE。已有同 ID 先比较摘要，匹配时返回原回执，不匹配时即使已归档也返回 REQUEST_ID_CONFLICT。fresh 输入看到已归档会在查询供应商或资产前被拒绝，行锁内的最终检查仍能拒绝预检过程中发生的归档。拒绝不新增 fresh 接收。摘要不含可变凭据、目录或适配版本。接收 ACK 或存储未知时按原 ID 查询。
@@ -104,7 +106,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{modelRef}`，准确的本人允许 chat 目录引用，最多 512 字节；不接收 mode、Key、配置 ID、URL 或 header。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef}`。仅为旧无绑定会话设置一次。已经绑定相同值时返回原绑定，不重新验证当前 Key。归档会话拒绝绑定。
+成功：200 `{id,createdAt,updatedAt,title,state,modelRef,purpose?}`。仅为旧无绑定会话设置一次。已经绑定相同值时返回原绑定，不重新验证当前 Key。归档会话拒绝绑定。
 
 错误：409 包括 CONVERSATION_MODEL_LOCKED、CONVERSATION_BUSY、CONVERSATION_UNKNOWN 和 CONVERSATION_ARCHIVED。未绑定时还须满足共同约定的当前 BYOK 资格。
 

@@ -30,6 +30,13 @@ export const isInFlightRequest = (status: RequestStatus) =>
 export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
 export const MAX_CONVERSATION_TITLE_BYTES = 120;
 
+export type ConversationPurpose = 'general' | 'drama-script';
+export interface ConversationTurnContext {
+  readonly purpose: ConversationPurpose;
+  /** Validated UTF-8 JSON from the trusted project resolver for this turn. */
+  readonly projectContext?: string;
+}
+
 export interface Conversation {
   id: string;
   createdAt: string;
@@ -37,6 +44,7 @@ export interface Conversation {
   title: string | null;
   state: 'creating' | 'ready' | 'unknown';
   modelRef?: string | null;
+  purpose?: 'drama-script';
 }
 export interface ConversationArchive {
   id: string;
@@ -234,6 +242,7 @@ export interface ConversationEngine {
     images?: readonly ConversationImageReference[],
     admitted?: (eventTimeMs: number, autoTitle?: string) => Promise<void>,
     captureContextUsage?: CaptureContextUsage,
+    turnContext?: ConversationTurnContext,
   ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;

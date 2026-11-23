@@ -38,6 +38,8 @@ import {
   trackConversationToolCheckpoints,
 } from './conversation-checkpoints.ts';
 import { ConversationCompaction, measureConversationContext } from './conversation-compaction.ts';
+import { stageProjectContext } from './conversation-context.ts';
+import type { ProjectContext } from './conversation-context.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
 import { authorizeConversationImageTools } from './policy.ts';
@@ -347,7 +349,7 @@ export function createDshConversationEngine(
         hasMore: items.length > limit,
       };
     },
-    run(id, requestId, text, durable, emit, binding, images = [], admitted, capture) {
+    run(id, requestId, text, durable, emit, binding, images = [], admitted, capture, turnContext) {
       if (closing || active.has(id)) return Promise.reject(new Error('MIO_ENGINE_BUSY'));
       if (
         config.byok &&
@@ -381,6 +383,7 @@ export function createDshConversationEngine(
       const humanInput = Promise.withResolvers<number>();
       let submittedId: UserMessage['id'] | undefined;
       let inputSeq: SessionSeq | undefined;
+      let projectContext: ProjectContext | undefined;
       const compactionBudget = { used: false };
       const resume = () =>
         ctx.mioKernel.resume(id, runOptions, (agentCtx, agent) => {
@@ -413,10 +416,10 @@ export function createDshConversationEngine(
             name: PERSONA_PREFIX_SECTION,
             order: 0,
             interpolate: false,
-            text: buildConversationSystemPrompt({
-              imageGeneration: hasGenerationTools,
-              imageInspection: hasInspectionTool,
-            }),
+            text: buildConversationSystemPrompt(
+              { imageGeneration: hasGenerationTools, imageInspection: hasInspectionTool },
+              turnContext?.purpose,
+            ),
           });
           if (observedBinding && onelink && (imageTools || inspection)) {
             revokeImageTools = authorizeConversationImageTools(agentCtx, agent, {
@@ -437,24 +440,44 @@ export function createDshConversationEngine(
           }
           const compactStep =
             compaction && onelink && observedBinding
-              ? (
+              ? async (
                   trigger: 'pressure' | 'context-overflow',
                   turn: number,
                   step: number,
                   signal: AbortSignal,
                   pending: readonly UserMessage[],
-                ) =>
-                  compaction.withRequest(
+                ) => {
+                  const result = await compaction.withRequest(
                     agent,
                     signal,
                     {
                       binding: observedBinding,
                       adapter: onelink,
                       budget: compactionBudget,
-                      turn: { number: turn, firstStep: step === 1, pending, inputSeq },
+                      turn: {
+                        number: turn,
+                        firstStep: step === 1,
+                        pending,
+                        inputSeq,
+                        projectContext,
+                      },
                     },
                     () => compaction.compactIfNeeded(agent, trigger, signal),
-                  )
+                  );
+                  if (
+                    projectContext?.seq !== undefined &&
+                    result?.shadowedSeqs.includes(projectContext.seq)
+                  ) {
+                    signal.throwIfAborted();
+                    const { source, content } = projectContext.message;
+                    projectContext.seq = agent.session.append(
+                      'user/message',
+                      createUserMessage({ source, content }),
+                      { surfaceOp: 'append' },
+                    ).seq;
+                  }
+                  return result;
+                }
               : undefined;
           agentCtx.on('agent/pre-step', async (payload, next) => {
             if (payload.step > MAX_TURN_STEPS) {
@@ -493,14 +516,21 @@ export function createDshConversationEngine(
               if (!releases.has(payload.signal))
                 releases.set(payload.signal, onelink.bind(payload.signal, observedBinding));
             }
-            await compactStep?.(
-              'pressure',
-              payload.turn,
-              payload.step,
-              payload.signal,
-              payload.messages,
-            );
-            return next();
+            const decision = await next();
+            if (decision.kind === 'reject') return decision;
+            let messages = decision.messages;
+            if (
+              turnContext?.purpose === 'drama-script' &&
+              payload.step === 1 &&
+              messages.some((message) => message.id === submittedId)
+            ) {
+              payload.signal.throwIfAborted();
+              projectContext = stageProjectContext(agent.session, turnContext.projectContext);
+              if (projectContext && projectContext.seq === undefined)
+                messages = [projectContext.message, ...messages];
+            }
+            await compactStep?.('pressure', payload.turn, payload.step, payload.signal, messages);
+            return messages === decision.messages ? decision : { ...decision, messages };
           });
           let attemptPublishedText = false;
           if (compactStep) {
@@ -539,13 +569,12 @@ export function createDshConversationEngine(
           });
           agentCtx.on('session/event', (session, event) => {
             if (session !== agent.session) return;
-            if (
-              event.type === 'user/message' &&
-              event.data.source.kind === 'user' &&
-              event.data.id === submittedId
-            ) {
-              inputSeq = event.seq;
-              humanInput.resolve(event.time);
+            if (event.type === 'user/message') {
+              if (projectContext?.message.id === event.data.id) projectContext.seq = event.seq;
+              if (event.data.source.kind === 'user' && event.data.id === submittedId) {
+                inputSeq = event.seq;
+                humanInput.resolve(event.time);
+              }
             }
             if (event.type === 'turn/end') end = event.data.reason;
           });

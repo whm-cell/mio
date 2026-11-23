@@ -28,6 +28,7 @@ import { createConversationStore } from './conversations/store.ts';
 import { createConversationService } from './conversations/service.ts';
 import type { ConversationService } from './conversations/service.ts';
 import type { ConversationImageTools } from './conversations/contracts.ts';
+import type { ConversationProjectContextResolver } from './conversations/project-context.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
 import { applyConversationPolicies } from './dsh/conversation-checkpoints.ts';
@@ -74,6 +75,12 @@ import { createAdminHandler } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    mioConversationProjectContext: ConversationProjectContextResolver;
+  }
+}
 
 class ConversationTokenMeter extends TokenMeter {
   // The parent retains sessionProjections until its conversation work drains.
@@ -493,6 +500,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                   ),
                   providers,
                   vision,
+                  async (lookup) => {
+                    const resolve = conversationCtx.get('mioConversationProjectContext');
+                    return resolve ? resolve(lookup) : null;
+                  },
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,

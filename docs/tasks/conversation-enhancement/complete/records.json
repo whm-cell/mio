@@ -3,6 +3,47 @@
   "prd": "docs/tasks/conversation-enhancement/prd.md",
   "results": [
     {
+      "key": "conversation-context-compaction",
+      "title": "长对话上下文计量、工具裁剪与漫剧摘要压缩",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "手动压缩的 HTTP 受理、权限、回执和 SSE 上下文水位"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "复用归属、活动占用与请求幂等的手动压缩入口"
+        },
+        {
+          "path": "src/dsh/conversation-compaction.ts",
+          "purpose": "原生计量、裁剪及同路由有界摘要与检查点"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "同一次模型尝试的正文发布与超窗恢复控制"
+        },
+        {
+          "path": "src/dsh/mixed-session-persistence.ts",
+          "purpose": "旧日志原格式续写与新校验和 zstd 格式"
+        },
+        {
+          "path": "tests/conversations/m3-profile.test.ts",
+          "purpose": "正式打包对话入口、持久观测、历史与重启回归"
+        }
+      ],
+      "outcomes": "SSE 初始和可估算的终态公开脱敏 Token 水位，窗口无依据时返回 null。工具输出先按确定性规则裁剪，原始历史、正式消息和资产 UUID 保持可读。空闲会话的 owner 可按 requestId 手动压缩并查询原回执。自动恢复使用同会话的冻结 BYOK 路由。明确超窗且本次尝试未公开非空正文时，最多一次摘要及一次正文重发，三次实际出站分开记录。本次尝试已公开正文时保留已推送片段，以 MODEL_CONTEXT_OVERFLOW 结算。旧无压缩日志留在原目录续写，新会话使用带校验和的 zstd。",
+      "verification": "候选 50cae853466ff6ffd3734be06c367406fac87689，契约修订 6，11 项证据通过。完整静态及生产构建、43 文件 371 项正式隔离定向、打包烟测和独立审查通过。同候选较早的 30 文件 269 项是补测，直接父项的原件独立保留。pnpm check 覆盖采用主分支成功的全量 CI 基线、合流和当前实际增量。相同五轮历史经 Qwen-Long 实际生成完整摘要并持久化检查点，冷启动后另一次真实正文准确答出仅首轮出现的角色饰物、位置和完整资产 UUID，公开历史压缩及重启前后相同，两次出站分别留回执。先前四次真实截断和一次较短样本的摘要成功保留为各自的原始观察。",
+      "limitations": "摘要硬输出预算取路由输出上限、1024、声明窗口八分之一下取整中的最小值，最低 1 token。普通路由未声明输出上限时使用默认 1024。短摘要长度是软目标，输出截断只保留原历史和既有观察。估算有误差，无法容纳的非替换输入或历史前缀可能无法压缩。真实正向验收覆盖进程内声明 W8192/O1024 的 Qwen-Long 路由。产品超窗、未知、取消及损坏边界由协议替身和隔离数据验证。当前候选远端全量、生产性能及其它供应商容量仍待各自验证。",
+      "acceptance": {
+        "candidate": {
+          "commit": "50cae853466ff6ffd3734be06c367406fac87689",
+          "contractRevision": 6
+        },
+        "statement": "接受并登记 M3",
+        "reference": "当前 Codex 多轮对话进阶会话中，用户在得知 50cae853466ff6ffd3734be06c367406fac87689（契约修订 6）、草稿 6ada6ead-be97-4524-84ec-9f48de5e5093、11 项验收及 Qwen-Long 冷启动真实续聊的验收结果后，明确回复「接受并登记 M3」。"
+      }
+    },
+    {
       "key": "conversation-lifecycle-and-titles",
       "title": "会话标题、活跃分页、软归档及 256 KiB 消息",
       "locations": [

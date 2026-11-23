@@ -78,8 +78,14 @@ function rejection(status: number, code = contextCode) {
   );
 }
 
-function anthropicFailure(type: string, withText = false) {
-  const prefix = withText
+function anthropicFailure(type: string, emitted?: 'body' | 'thinking' | 'empty') {
+  const block =
+    emitted === 'thinking' ? { type: 'thinking', thinking: '' } : { type: 'text', text: '' };
+  const delta =
+    emitted === 'thinking'
+      ? { type: 'thinking_delta', thinking: '内部思考' }
+      : { type: 'text_delta', text: emitted === 'body' ? '先出现的正文' : '' };
+  const prefix = emitted
     ? [
         {
           type: 'message_start',
@@ -91,12 +97,8 @@ function anthropicFailure(type: string, withText = false) {
             usage: { input_tokens: 9, output_tokens: 0 },
           },
         },
-        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
-        {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'text_delta', text: '先出现的正文' },
-        },
+        { type: 'content_block_start', index: 0, content_block: block },
+        { type: 'content_block_delta', index: 0, delta },
       ]
     : [];
   const frames = [
@@ -104,7 +106,14 @@ function anthropicFailure(type: string, withText = false) {
     { type: 'error', error: { type, message: 'private upstream detail' } },
   ];
   return new Response(
-    frames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''),
+    frames
+      .map(
+        (frame) => `event: ${frame.type}
+data: ${JSON.stringify(frame)}
+
+`,
+      )
+      .join(''),
     {
       headers: { 'content-type': 'text/event-stream' },
     },
@@ -533,27 +542,74 @@ it('keeps SDK-inferred request size separate from confirmed stream overflow', as
   expect(fixture.observations.at(-1)).toMatchObject({ status: 200, failureCode: 'PI_AI_ERROR' });
 });
 
-it('observes an exact stream overflow after dispatching a visible prefix', async () => {
+it('settles confirmed overflow without recovery once the failing attempt publishes a body prefix', async () => {
   const fixture = await setup({ profile: 'anthropic-messages' });
   expect(await fixture.run('old', world)).toBe('completed');
   const before = fixture.calls.length;
   const eventsBefore = fixture.events.length;
   fixture.respond((call) => {
     if (fixture.calls.length === before + 1)
-      return anthropicFailure('context_window_exceeded', true);
-    return fixture.answer(call, call.options.purpose === 'compaction' ? summary : '恢复正文');
+      return anthropicFailure('context_window_exceeded', 'body');
+    return fixture.answer(call, call.options.purpose === 'compaction' ? summary : '意外的重发正文');
   });
-  expect(await fixture.run('stream-exact')).toBe('completed');
+  expect(await fixture.run('stream-exact')).toEqual({
+    status: 'failed',
+    error: 'MODEL_CONTEXT_OVERFLOW',
+  });
+  expect(fixture.calls.slice(before)).toHaveLength(1);
   expect(fixture.observations.slice(before)).toMatchObject([
     { status: 200, failureCode: 'CONTEXT_OVERFLOW' },
-    { status: 200, purpose: 'compaction' },
-    { status: 200, finish: 'stop' },
   ]);
-  expect(fixture.events.slice(eventsBefore)).toMatchObject([
-    { type: 'text', text: '先出现的正文' },
-    { type: 'text', text: '恢复正文' },
+  expect(fixture.events.slice(eventsBefore)).toEqual([
+    { type: 'text', requestId: 'stream-exact', text: '先出现的正文' },
+  ]);
+
+  const durable = await fixture.raw();
+  const failedAttempts = durable.filter((event) => event.type === 'assistant/attempt');
+  expect(failedAttempts).toHaveLength(1);
+  expect(JSON.stringify(failedAttempts[0]!.data.stream)).toContain('先出现的正文');
+  expect(durable.some((event) => event.type === 'compaction/start')).toBe(false);
+  const history = await fixture.engine.history(sessionId, -1, 100);
+  expect(history.items.at(-1)).toMatchObject({ role: 'status', status: 'failed' });
+  expect(history.items.filter((item) => item.role === 'assistant')).toEqual([
+    expect.objectContaining({ text: '继续' }),
   ]);
 });
+
+it.each(['thinking', 'empty'] as const)(
+  'retains confirmed overflow recovery when the failing attempt only emits %s',
+  async (emitted) => {
+    const fixture = await setup({ profile: 'anthropic-messages' });
+    expect(await fixture.run('old', world)).toBe('completed');
+    const before = fixture.calls.length;
+    const eventsBefore = fixture.events.length;
+    const chunks: StreamChunk[] = [];
+    fixture.ctx.on('agent/assistant-stream', ({ frame }) => {
+      if (frame.type === 'chunk') chunks.push(frame.chunk);
+    });
+    fixture.respond((call) => {
+      if (fixture.calls.length === before + 1)
+        return anthropicFailure('context_window_exceeded', emitted);
+      return fixture.answer(call, call.options.purpose === 'compaction' ? summary : '恢复正文');
+    });
+    expect(await fixture.run('stream-exact')).toBe('completed');
+    expect(fixture.calls.slice(before).map((call) => call.options.purpose)).toEqual([
+      undefined,
+      'compaction',
+      undefined,
+    ]);
+    expect(chunks).toContainEqual(
+      expect.objectContaining(
+        emitted === 'thinking'
+          ? { type: 'reasoning-delta', text: '内部思考' }
+          : { type: 'text-delta', text: '' },
+      ),
+    );
+    expect(
+      fixture.events.slice(eventsBefore).filter((event) => event.type === 'text' && event.text),
+    ).toEqual([{ type: 'text', requestId: 'stream-exact', text: '恢复正文' }]);
+  },
+);
 
 it('records a successful body in a previous step without losing recovery of a later step', async () => {
   const fixture = await setup({ images: true });

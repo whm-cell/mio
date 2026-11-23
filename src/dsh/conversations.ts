@@ -502,6 +502,7 @@ export function createDshConversationEngine(
             );
             return next();
           });
+          let attemptPublishedText = false;
           if (compactStep) {
             agentCtx.on(
               'agent/request-error',
@@ -512,6 +513,7 @@ export function createDshConversationEngine(
                   payload.failure.code !== 'CONTEXT_OVERFLOW' ||
                   payload.signal.aborted ||
                   !observedBinding?.snapshot.contextWindow ||
+                  attemptPublishedText ||
                   observationFailed ||
                   compactionBudget.used
                 )
@@ -529,8 +531,11 @@ export function createDshConversationEngine(
             );
           }
           agentCtx.on('agent/assistant-stream', ({ frame }) => {
-            if (frame.type === 'chunk' && frame.chunk.type === 'text-delta')
+            if (frame.type === 'start') attemptPublishedText = false;
+            if (frame.type === 'chunk' && frame.chunk.type === 'text-delta') {
+              if (frame.chunk.text.length > 0) attemptPublishedText = true;
               emit({ type: 'text', requestId, text: frame.chunk.text });
+            }
           });
           agentCtx.on('session/event', (session, event) => {
             if (session !== agent.session) return;

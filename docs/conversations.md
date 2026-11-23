@@ -29,17 +29,23 @@ pnpm build
 pnpm start:dev
 ```
 
-第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。用途增量列为 `purpose text NOT NULL DEFAULT 'general'`，已有会话按通用用途继续使用。分叉增量增加可空的来源、请求 ID、请求序号和实际截止序号，原有会话无需回填。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
+第一条只展示 SQL，第二条才执行迁移。新版本启动前需显式执行新迁移，启动只读检查列。先停止旧实例、审阅计划并按目标库责任备份。输出截断迁移新增可空 `truncation_reason`，现有回执继续按原状态和错误码读取。生命周期增量为旧行用 `created_at` 回填 `updated_at`，标题初始为空且未固定，旧会话继续可读。用途增量列为 `purpose text NOT NULL DEFAULT 'general'`，已有会话按通用用途继续使用。音频增量扩展该列的用途约束，并添加可空的 `audio_selection` 与逐轮 `audio_context`。分叉增量增加可空的来源、请求 ID、请求序号和实际截止序号，原有会话无需回填。两种列表顺序均保留独立的归属索引。共享数据库约束见[PostgreSQL](integrations/postgres.md)。
 
 ## 会话用途与项目上下文
 
-创建时固定为通用 `general` 或剧本创作 `drama-script`。用途与已授权的工具能力决定固定系统提示词。剧本创作模板引导分场、对白与旁白打磨。相同用途和工具能力下，项目设定更新不会改变本轮系统提示词前缀的字节。
+创建时固定为通用 `general`、剧本创作 `drama-script` 或音频创作 `audio`。用途与已授权的工具能力决定固定系统提示词。剧本创作模板引导分场、对白与旁白打磨。相同用途和工具能力下，项目设定更新不会改变本轮系统提示词前缀的字节。
 
 可信服务端业务模块可在同一 Cordis 作用域提供 `mioConversationProjectContext` 读取器。它接收 `{ownerId, conversationId, signal}`，按这两个标识从业务域自己的关联中读取最新设定，返回 `{ownerId, conversationId, snapshot}` 或表示未关联的 `null`。对话服务核对返回的两个标识。读取器在接收事务持有当前会话行锁时执行，只查询业务域自身的数据，须按有界范围读取并响应退出信号。关联和剧本修订存于业务域。
 
 剧本用途的每个新请求在通过归属、原回执去重和接收检查后读取快照。快照接受可选的 `scriptSummary` 字符串、`worldbuilding` 字符串和 `characters` 字符串数组。编码后的快照 JSON 最多 64 KiB UTF-8，包含转义和结构字符。读取器未装配或返回未关联时正常执行剧本用途。读取失败、归属不符、格式无效或超限时拒绝接收，原 requestId 可以重试。已受理请求的回执重放不重新读取项目。
 
 有效快照参与本轮的模型上下文预算。对话 PostgreSQL 元数据和回执不存项目快照。DSH 私有原生日志可能保留内部输入，访问随会话日志保护。公开历史、实时事件和自动标题只投影原有允许来源，助手正文按模型实际输出传递。[DSH 集成](integrations/dsh.md)
+
+## 音频轮次与选音
+
+独立音频列表按 `purpose='audio'` 查询。创建或受理音频会话要求音频桥和本人有效 BYOK 聊天绑定。音频工具在该绑定的活动 Agent 轮次注册。有活动请求时，仅受理该请求内的选音。页面空闲选音和轮内选音经同一 owner、音色资格和期望版本检查。选音、消息及任务各有身份。已受理消息的回放以显式输入摘要查询回执，直接使用首次受理的结果。分叉按截止点复制历史，选择从空状态开始，复刻样本须由新轮明确授权。
+
+会话服务对复制的 `audioContext` 冻结模型、音色与参数，授权样本另存版本指纹，供该轮复刻执行时重新核对。工具以已确认的音色为准；在同轮更换时，只有成功写入的新选择才可用于后续配音。单独换音色返回选择确认。每轮最多发起一次配音或复刻任务。工具调用使用与原消息绑定的稳定任务请求 ID，卡片通过原生持久化检查后发布。对话取消收敛回复；音频任务由其独立取消入口处理。[对话 API](apis/conversations.md) · [音频 API](apis/audio.md)
 
 ## 深度思考与实时工具进度
 
@@ -130,6 +136,8 @@ PG 活跃投影首写失败时，已受理的模型轮次继续，服务在结�
 ## 验证及限制
 
 `tests/conversations/conversations.test.ts` 经真实认证、PG、官方 loop、JSONL 和 HTTP/SSE 验证归属、多轮、忙时/去重、故障回执、订阅窗口、失效登录及断网；`tests/conversations/prompt.test.ts` 与 `tests/conversations/conversations-engine.test.ts` 验证平台系统提示词规则、四种工具能力组合、确定性输出、legacy/BYOK 会话注入、多轮前缀稳定与字面量 `{{...}}` 安全，以及多所有者异常关闭和无文本取消；`tests/conversations/conversations-profile.test.ts` 验证打包后的正式 Profile（含移除上游 `DeepSeek Harness` 开场白、注入 `miioo AI 漫剧助手` 且公开历史不外泄系统提示）、多轮、正常重启及 SIGKILL；`tests/conversations/conversation-image-tools.test.ts` 经 A 内的 generations、隔离 PG、受控上游与 COS 替身、官方 loop、真实 JSONL 与正式打包 Profile，在不启动 B 和图片 MQ 的条件下验证多轮生图/改图工具闭环、权限隔离、注入拦截、预算/步数熔断、幂等去重、取消与重启恢复。测试模型只安装在临时 Profile overlay，另有完全不含该 overlay 的正式装配验证，生产包不含测试夹具。
+
+`tests/conversations/audio-conversation.test.ts` 使用实际 DSH 工具执行和 JSONL、隔离 PG、受控音频替身与 HTTP/SSE 验证选择、断线重放、分叉和当轮样本。
 
 `tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
 

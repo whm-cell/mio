@@ -8,13 +8,22 @@ import type {
   SocketOptions,
 } from 'amqplib';
 import {
+  AUDIO_COMMAND_ROUTING_KEY,
+  AUDIO_MAX_MESSAGE_BYTES,
+  AUDIO_RESULT_QUEUE,
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
   COMPUTE_MAX_MESSAGE_BYTES,
   RESULT_QUEUE,
+  parseAudioInspectResultV1,
   parseComputeResultV1,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  AudioInspectCommandV1,
+  AudioInspectResultV1,
+  ComputeCommandV1,
+  ComputeResultV1,
+} from '@mio/compute-contracts';
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -196,7 +205,18 @@ export class ComputeBroker {
     }
   }
 
-  async publish(message: ComputeCommandV1): Promise<void> {
+  publish(message: ComputeCommandV1): Promise<void> {
+    return this.publishCommand(COMMAND_ROUTING_KEY, message);
+  }
+
+  publishAudio(message: AudioInspectCommandV1): Promise<void> {
+    return this.publishCommand(AUDIO_COMMAND_ROUTING_KEY, message);
+  }
+
+  private async publishCommand(
+    routingKey: string,
+    message: ComputeCommandV1 | AudioInspectCommandV1,
+  ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
@@ -206,7 +226,6 @@ export class ComputeBroker {
     let onDrain: (() => void) | undefined;
     try {
       let drain: Promise<void> = Promise.resolve();
-      const routingKey = COMMAND_ROUTING_KEY;
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.publisher.publish(
           COMMAND_EXCHANGE,
@@ -242,36 +261,68 @@ export class ComputeBroker {
     }
   }
 
-  async consume(
-    handle: (result: ComputeResultV1) => Promise<void>,
+  consume(handle: (result: ComputeResultV1) => Promise<void>, failed: () => void): Promise<void> {
+    return this.consumeResults(
+      { queue: RESULT_QUEUE, maxBytes: COMPUTE_MAX_MESSAGE_BYTES, parse: parseComputeResultV1 },
+      handle,
+      failed,
+      this.transport.signal,
+    );
+  }
+
+  consumeAudio(
+    handle: (result: AudioInspectResultV1) => Promise<void>,
     failed: () => void,
+    stop: AbortSignal,
   ): Promise<void> {
+    return this.consumeResults(
+      {
+        queue: AUDIO_RESULT_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectResultV1,
+      },
+      handle,
+      failed,
+      AbortSignal.any([stop, this.transport.signal]),
+    );
+  }
+
+  private async consumeResults<T extends { messageId: string }>(
+    protocol: { queue: string; maxBytes: number; parse: (value: unknown) => T },
+    handle: (result: T) => Promise<void>,
+    failed: () => void,
+    stop: AbortSignal,
+  ): Promise<void> {
+    stop.throwIfAborted();
+    const stream = protocol.queue === AUDIO_RESULT_QUEUE;
     await untilAborted(
       this.consumer.consume(
-        RESULT_QUEUE,
+        protocol.queue,
         (message: ConsumeMessage | null) => {
           if (!this.accepting || this.lifecycle.closed) return;
           if (!message) {
             failed();
             return;
           }
-          let result: ComputeResultV1;
+          let result: T;
           try {
             if (
               message.properties.userId !== this.expectedUserId ||
               message.properties.contentType !== 'application/json' ||
-              message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+              message.content.length > protocol.maxBytes
             )
               throw new Error('RESULT_INVALID');
             const value: unknown = JSON.parse(
               new TextDecoder('utf-8', { fatal: true }).decode(message.content),
             );
-            result = parseComputeResultV1(value);
+            result = protocol.parse(value);
             if (message.properties.messageId !== result.messageId)
               throw new Error('RESULT_ID_MISMATCH');
           } catch {
             try {
-              this.consumer.reject(message, false);
+              // A stream retains entries after ACK. Advance this consumer past invalid entries.
+              if (stream) this.consumer.ack(message);
+              else this.consumer.reject(message, false);
             } catch {
               if (this.accepting) failed();
             }
@@ -285,7 +336,8 @@ export class ComputeBroker {
               if (!this.lifecycle.closed) {
                 if ((error as { permanent?: boolean })?.permanent) {
                   try {
-                    this.consumer.reject(message, false);
+                    if (stream) this.consumer.ack(message);
+                    else this.consumer.reject(message, false);
                   } catch {
                     shouldFail = true;
                   }
@@ -309,9 +361,9 @@ export class ComputeBroker {
           });
           this.inFlight.add(tracked);
         },
-        { noAck: false },
+        { noAck: false, ...(stream ? { arguments: { 'x-stream-offset': 'next' } } : {}) },
       ),
-      this.transport.signal,
+      stop,
     );
   }
   onClose(callback: () => void): void {

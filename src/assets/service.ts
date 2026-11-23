@@ -18,8 +18,19 @@ import type {
 import type { AssetRow, AssetStore } from './store.ts';
 
 const log = createLogger('app', 'assets');
+const playableAudio = new Set([
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/flac',
+  'audio/mp4',
+  'audio/x-m4a',
+  'audio/m4a',
+]);
 
 function view(row: AssetRow, objects: AssetObjectStore) {
+  const rawKey = row.state === 'ready' ? row.raw_key : null;
   return {
     assetId: row.id,
     status: row.state !== 'ready' && row.upload_expired ? 'expired' : row.state,
@@ -27,8 +38,9 @@ function view(row: AssetRow, objects: AssetObjectStore) {
     contentType: row.content_type,
     size: Number(row.size_bytes),
     createdAt: row.created_at.toISOString(),
-    ...(row.state === 'ready' && row.raw_key
-      ? { downloadUrl: objects.downloadUrl(row.raw_key) }
+    ...(rawKey ? { downloadUrl: objects.downloadUrl(rawKey) } : {}),
+    ...(rawKey && objects.audioPlaybackUrl && playableAudio.has(row.content_type)
+      ? { playbackUrl: objects.audioPlaybackUrl(rawKey, row.content_type) }
       : {}),
   };
 }

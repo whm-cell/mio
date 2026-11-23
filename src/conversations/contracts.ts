@@ -1,3 +1,5 @@
+import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
+import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HttpError } from '@mio/foundation/errors';
 import type {
   ImageDriver,
@@ -34,11 +36,32 @@ export const isInFlightRequest = (status: RequestStatus) =>
 export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
 export const MAX_CONVERSATION_TITLE_BYTES = 120;
 
-export type ConversationPurpose = 'general' | 'drama-script';
+export type ConversationPurpose = 'general' | 'drama-script' | 'audio';
+export interface AudioSelection {
+  voiceRef: string | null;
+  name: string | null;
+  revision: number;
+}
+export const emptyAudioSelection: AudioSelection = Object.freeze({
+  voiceRef: null,
+  name: null,
+  revision: 0,
+});
+
+export interface ConversationAudioTurn {
+  readonly userId: string;
+  readonly conversationId: string;
+  readonly requestId: string;
+  readonly audioContext: FrozenAudioContext;
+  readonly audioSelection: AudioSelection;
+  selectAudioVoice(voiceRef: string): Promise<AudioSelection>;
+}
+
 export interface ConversationTurnContext {
   readonly purpose: ConversationPurpose;
   /** Validated UTF-8 JSON from the trusted project resolver for this turn. */
   readonly projectContext?: string;
+  readonly audio?: ConversationAudioTurn;
 }
 
 export interface Conversation {
@@ -48,7 +71,8 @@ export interface Conversation {
   title: string | null;
   state: 'creating' | 'ready' | 'unknown';
   modelRef?: string | null;
-  purpose?: 'drama-script';
+  purpose?: 'drama-script' | 'audio';
+  audioSelection?: AudioSelection;
   reasoningEffort?: ChatReasoningEffort;
   forkedFromConversationId?: string;
   forkedUntilSeq?: number;
@@ -99,6 +123,7 @@ export interface Receipt {
 export interface ConversationSnapshot {
   conversationId: string;
   activeRequestId: string | null;
+  audioSelection?: AudioSelection;
   receipt: Receipt | null;
   contextUsage?: ContextUsage;
 }
@@ -154,8 +179,15 @@ export interface ConversationVision {
   acquireRequest(signal: AbortSignal): Promise<() => void>;
 }
 export type ConversationImageToolName = 'submit_image_job' | 'get_image_job';
+export type ConversationAudioToolName = 'submit_audio_job' | 'get_audio_job' | 'clone_audio_voice';
 export type ConversationToolName =
-  ConversationImageToolName | 'list_image_models' | 'inspect_image_asset';
+  | ConversationImageToolName
+  | 'list_image_models'
+  | 'inspect_image_asset'
+  | ConversationAudioToolName
+  | 'list_audio_models'
+  | 'list_audio_voices'
+  | 'select_audio_voice';
 export interface ConversationImageJobOutput {
   readonly index: number;
   readonly assetId: string;
@@ -200,6 +232,26 @@ export interface ConversationImageTools {
   ): Promise<ConversationImageJobView>;
   getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
 }
+export interface ConversationAudioTools {
+  listModels(actor: { userId: string }, operation: AudioOperation): Promise<unknown[]>;
+  listVoices(actor: { userId: string }, query: URLSearchParams): Promise<unknown>;
+  create(
+    actor: { userId: string },
+    body: Record<string, unknown>,
+  ): Promise<{ created: boolean; job: AudioJobView }>;
+  clone(
+    actor: { userId: string },
+    body: Record<string, unknown>,
+    fingerprint?: string,
+  ): Promise<{ created: boolean; job: AudioJobView }>;
+  get(actor: { userId: string }, id: string): Promise<AudioJobView>;
+  freezeContext(actor: { userId: string }, value: unknown): Promise<FrozenAudioContext>;
+  resolveVoice(
+    actor: { userId: string },
+    voiceRef: string,
+  ): Promise<{ voiceRef: string; name: string }>;
+}
+
 export type HistoryItem =
   | {
       seq: number;
@@ -209,6 +261,7 @@ export type HistoryItem =
       imageAssetIds?: string[];
     }
   | { seq: number; role: 'tool'; tool: ConversationImageToolName; job: ConversationImageJobView }
+  | { seq: number; role: 'tool'; tool: ConversationAudioToolName; job: AudioJobView }
   | {
       seq: number;
       role: 'status';
@@ -235,6 +288,8 @@ export type ConversationEvent =
       tool: ConversationImageToolName;
       job: ConversationImageJobView;
     }
+  | { type: 'tool'; requestId: string; tool: ConversationAudioToolName; job: AudioJobView }
+  | { type: 'audio-selection'; conversationId: string; selection: AudioSelection }
   | { type: 'state'; receipt: Receipt; contextUsage?: ContextUsage }
   | { type: 'error'; code: string };
 export interface ConversationEngine {

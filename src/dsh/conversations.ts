@@ -26,6 +26,7 @@ import {
 import type {
   CaptureContextUsage,
   ConversationEngine,
+  ConversationAudioTools,
   ConversationImageTools,
   ConversationRunResult,
   ConversationVision,
@@ -34,6 +35,7 @@ import type {
 } from '../conversations/contracts.ts';
 import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
+import { parseAudioJobPresentationMeta, registerConversationAudioTools } from './audio-tools.ts';
 import {
   CHECKPOINT_INTERRUPTED,
   hasCheckpointFailure,
@@ -44,7 +46,7 @@ import { stageProjectContext } from './conversation-context.ts';
 import type { ProjectContext } from './conversation-context.ts';
 import type {} from './kernel.ts';
 import { OBSERVATION_UNAVAILABLE, onelinkRoute, registerOneLink } from './onelink.ts';
-import { authorizeConversationImageTools } from './policy.ts';
+import { authorizeConversationAudioTools, authorizeConversationImageTools } from './policy.ts';
 import { conversationImageAssetId } from './vision.ts';
 import { registerVisionTool } from './vision-tool.ts';
 import type { ChatRuntimeSnapshot, ChatSelection } from '../providers/contracts.ts';
@@ -123,6 +125,7 @@ export function createDshConversationEngine(
   config: ConversationConfig,
   imageTools?: ConversationImageTools,
   vision?: ConversationVision,
+  audioTools?: ConversationAudioTools,
 ): ConversationEngine {
   const active = new Map<string, ActiveRequest>();
   const sessionActions = new Map<string, Promise<unknown>>();
@@ -374,9 +377,10 @@ export function createDshConversationEngine(
           isAppendSurfaceEvent(event) &&
           !event.data.message.isError
         ) {
-          const projected = parseImageJobPresentationMeta(event.data.meta);
-          if (projected)
-            items.push({ seq: event.seq, role: 'tool', tool: projected.tool, job: projected.job });
+          const projected =
+            parseImageJobPresentationMeta(event.data.meta) ??
+            parseAudioJobPresentationMeta(event.data.meta);
+          if (projected) items.push({ seq: event.seq, role: 'tool', ...projected });
         }
         if (event.type === 'turn/end') {
           const reason = event.data.reason;
@@ -441,7 +445,7 @@ export function createDshConversationEngine(
         : undefined;
       let end: TurnEndReason | undefined;
       let waitForToolCheckpoints: (() => Promise<void>) | undefined;
-      let revokeImageTools: (() => void) | undefined;
+      let revokeTools: (() => void) | undefined;
       const humanInput = Promise.withResolvers<number>();
       let submittedId: UserMessage['id'] | undefined;
       let inputSeq: SessionSeq | undefined;
@@ -473,10 +477,13 @@ export function createDshConversationEngine(
               model: runOptions.model,
               ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
             });
-          const inspection = Boolean(
-            vision && observedBinding?.snapshot.inputModalities?.includes('image'),
-          );
-          const hasGenerationTools = Boolean(observedBinding && onelink && imageTools);
+          const audioPurpose = turnContext?.purpose === 'audio';
+          const audioTurn = turnContext?.audio;
+          const inspection =
+            !audioPurpose &&
+            Boolean(vision && observedBinding?.snapshot.inputModalities?.includes('image'));
+          const hasGenerationTools =
+            !audioPurpose && Boolean(observedBinding && onelink && imageTools);
           const hasInspectionTool = Boolean(observedBinding && onelink && inspection);
           agentCtx.systemPrompt.section({
             name: PERSONA_PREFIX_SECTION,
@@ -487,8 +494,29 @@ export function createDshConversationEngine(
               turnContext?.purpose,
             ),
           });
-          if (observedBinding && onelink && (imageTools || inspection)) {
-            revokeImageTools = authorizeConversationImageTools(
+          if (
+            audioPurpose &&
+            audioTools &&
+            audioTurn &&
+            observedBinding &&
+            onelink &&
+            audioTurn.userId === observedBinding.userId &&
+            audioTurn.conversationId === observedBinding.conversationId &&
+            audioTurn.requestId === requestId
+          ) {
+            revokeTools = authorizeConversationAudioTools(agentCtx, agent, (tool, status) =>
+              emit({ type: 'tool-status', requestId, tool, status }),
+            );
+            waitForToolCheckpoints = trackConversationToolCheckpoints(
+              agentCtx,
+              agent,
+              ctx.mioKernel,
+              requestId,
+              emit,
+            );
+            registerConversationAudioTools(agentCtx, audioTurn, audioTools);
+          } else if (!audioPurpose && observedBinding && onelink && (imageTools || inspection)) {
+            revokeTools = authorizeConversationImageTools(
               agentCtx,
               agent,
               { generation: hasGenerationTools, inspection: hasInspectionTool },
@@ -687,7 +715,7 @@ export function createDshConversationEngine(
           }
           await idle;
           await waitForToolCheckpoints?.();
-          revokeImageTools?.();
+          revokeTools?.();
           await ctx.mioKernel.flush(handle.agent.session);
           if (observationFailed || hasCheckpointFailure(handle.agent.session))
             return 'unknown' as const;
@@ -712,7 +740,7 @@ export function createDshConversationEngine(
           try {
             await inSessionOrder(id, () => handle.dispose());
           } finally {
-            revokeImageTools?.();
+            revokeTools?.();
             for (const release of releases.values()) release();
           }
         }

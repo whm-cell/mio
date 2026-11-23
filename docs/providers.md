@@ -24,6 +24,8 @@
 
 旧 92 项数据原样保存在[测试参考](../tests/providers/fixtures/onelink-legacy-snapshot.ts)，不为任何用户 seed 成员或适配。生产代码和构建不依赖该文件；构建先清理生成的 dist，防止已移出模块残留在包中。
 
+供应商迁移同时创建或升级 `mio_provider_voices`、`mio_provider_voice_catalogs`、`mio_audio_jobs` 和 `mio_audio_records`，并扩展路由、验证和修订表的操作约束。同库启动检查对应类型与操作约束。按资产配置登记和读取试听、复刻样本、成品资产。启用管理后台时，使用它的显式迁移更新路由模板的操作约束。[音频 API](apis/audio.md) · [管理 API](apis/admin.md)
+
 ## 凭据与资源
 
 Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 字节 tag，AAD 绑定格式、owner、配置、credentialVersion 和主密钥 ID。元数据查询只返回 hasKey 和固定 mask，不解密。明文、密文、源异常均不得进入 HTTP、日志、Session 或工具参数。
@@ -104,6 +106,28 @@ pnpm providers:route <--stdin | routes.json>
 chat 路由可显式声明 `capabilityMetadata.inputModalities`；必须包含 `text`，仅接受互异的 `text`、`image`，缺省按纯文本处理。只有声明二者的路由可使用对话图片，并可声明四项正整数预算：`maxRequestImages` 默认 4、上限 16；`maxRequestImageBytes` 默认 10 MiB、上限 20 MiB，是每次请求全部图片的 Base64 硬上限；`requestImagePixelBudget` 默认 4,194,304、上限 16,777,216；`requestImageMaxBytes` 默认 5 MiB、上限 10 MiB，是单张预览的软目标。纯文本或未声明视觉的路由不能携带视觉预算。能力声明和预算不证明真实视觉调用成功。
 
 验证只来自当前用户本人的成功运行观察（文本对话完成或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。chat 现有 verified 维度不区分文本和视觉，历史文本成功不代表视觉已实证。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
+
+### 音频操作和音色登记
+
+语音路由使用 `classification='voice'`、`vendor='minimax'`，各操作按本人 Key 最近成功发现的精确模型 ID 准入，并遵循模型可见性、供应商启停及 `voice` 用途偏好。平台补录的未发现模型不参与语音准入。每个操作单独读取验证状态，成功的配音观察仅更新该凭据、目录、模型和声明版本的 TTS 验证。
+
+| 操作                | 驱动             | 路径                              |
+| ------------------- | ---------------- | --------------------------------- |
+| `audio.voices.list` | `minimax-voices` | `/minimax/v1/get_voice`           |
+| `audio.tts`         | `minimax-tts`    | `/minimax/v1/t2a_v2`              |
+| `audio.clone`       | `minimax-clone`  | `/minimax/v1/t2a_pro/voice_clone` |
+
+语音目录路由接受空参数规格。配音与复刻规格必须声明 `speed`、`volume`、`pitch` 的 `{min,max,default}`、`formats`、`defaultFormat`、`textMaxCodePoints`、`textMaxBytes`、`sampleMaxBytes`、`sampleMinSeconds`、`sampleMaxSeconds`。路由只能收紧服务端预算。固定协议仅接受上述路径，`editPath` 与 `queryPathTemplate` 留空，`requestDefaults`、`outputSpec` 和 `capabilityMetadata` 保持空对象。[OneLink 语音协议](integrations/onelink.md#使用经验与适用条件)
+
+在测试账号下确认一个上游系统音色 ID 对应精确 TTS 模型可用后，使用下面的入口预览登记，增加 `--apply` 写入。`--evidence` 填脱敏的实际运行或已有授权记录引用。前端展示清单可用于寻找待核实的音色。
+
+```sh
+pnpm audio:voices:import --owner-id <id> --model-ref <ref> --voice-id <id> --name <label> --evidence <reference>
+```
+
+登记限定为本人配置、一个上游音色和已发现的 TTS 模型。同身份重放保留 `voiceRef`、收藏和试听。换 Key 后保留目录条目和收藏，重新发现且路由仍启用时恢复相应系统音色的使用资格。复刻音色需属于本人有效凭据或已有的当前目录快照。用户刷新只读取本地音色。
+
+有授权试听文件时，使用 `pnpm audio:previews:import --stage --source-manifest <file> --source-directory <dir>` 准备清单与 MP3 文件，再用 `pnpm audio:previews:import --owner-id <id> --model-id <exact-id>` 查看计划。核对后加 `--apply`，脚本复用私有资产登记并绑定对应音色。发布后校验所有者、对象和文件摘要。重跑可补齐已登记资产但绑定失败的步骤。[音频 API](apis/audio.md)
 
 ### 模型扩展边界
 

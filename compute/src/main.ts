@@ -6,6 +6,7 @@ import { processIdentity } from './adapters/media.ts';
 import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
+import { runAudioRuntime } from './audio-runtime.ts';
 
 const log = createLogger('worker', 'main');
 
@@ -69,6 +70,11 @@ async function start(): Promise<void> {
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  const audio = runAudioRuntime(
+    { url, username, expectedUser, directory },
+    store,
+    stopping.signal,
+  ).catch(() => log.error('AUDIO_WORKER_STOPPED'));
   try {
     while (!stopping.signal.aborted) {
       const { promise: stopped, resolve: resolveStopped } = Promise.withResolvers<void>();
@@ -120,6 +126,8 @@ async function start(): Promise<void> {
         await delay(5000, undefined, { signal: stopping.signal }).catch(() => {});
     }
   } finally {
+    stop();
+    await audio;
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
     journal.close();

@@ -1,4 +1,9 @@
 import type { Pool } from 'pg';
+import {
+  checkProviderOperations,
+  providerOperationCheck,
+  upgradeProviderOperationSQL,
+} from '../providers/operation-schema.ts';
 
 const initialRouteTemplatesSeedJson = JSON.stringify([
   {
@@ -446,7 +451,7 @@ CREATE TABLE IF NOT EXISTS mio_admin_route_templates (
   description text NOT NULL DEFAULT ''
     CHECK (char_length(description) <= 500),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   vendor text NOT NULL
     CHECK (char_length(vendor) BETWEEN 1 AND 64 AND vendor ~ '^[a-z0-9-]+$'),
   driver text NOT NULL
@@ -460,6 +465,7 @@ CREATE TABLE IF NOT EXISTS mio_admin_route_templates (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+${upgradeProviderOperationSQL('mio_admin_route_templates')}
 CREATE TABLE IF NOT EXISTS mio_admin_audit_logs (
   id uuid PRIMARY KEY,
   actor_id text,
@@ -535,6 +541,7 @@ END $$;
 `;
 
 export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void> {
+  await checkProviderOperations(pool, ['mio_admin_route_templates']);
   for (const [sql, types] of [
     [
       'SELECT id,username,password_hash,is_super_admin,created_at,updated_at FROM mio_admin_accounts LIMIT 0',

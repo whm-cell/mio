@@ -56,6 +56,8 @@
     "conversations:migrate": "node scripts/service/migrate-conversations.ts",
     "materials:migrate": "node scripts/service/migrate-materials.ts",
     "assets:migrate": "node scripts/service/migrate-assets.ts",
+    "audio:voices:import": "node --env-file-if-exists=.env scripts/service/import-system-voice.ts",
+    "audio:previews:import": "node --env-file-if-exists=.env scripts/service/import-voice-previews.ts",
     "compute:migrate": "node scripts/service/migrate-compute.ts",
     "providers:migrate": "node scripts/service/migrate-providers.ts",
     "providers:route": "node scripts/service/import-provider-route.ts",

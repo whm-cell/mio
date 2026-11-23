@@ -2,9 +2,12 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, realpath } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { AUDIO_RESULT_QUEUE } from '@mio/compute-contracts';
 import { readComputeBrokerEnvironment } from './compute-broker-env.ts';
 import {
+  audioResultPolicy,
   computeCapacity,
+  computeDeadLetters,
   computeExchanges as exchanges,
   computeQueues as queues,
   computePermissions,
@@ -102,10 +105,13 @@ const definition = object(cap.definition);
 if (
   cap.pattern !== '.*' ||
   !['all', 'queues', 'quorum_queues'].some((target) => cap['apply-to'] === target) ||
+  (cap['apply-to'] !== 'quorum_queues' &&
+    (typeof cap.priority !== 'number' || cap.priority >= audioResultPolicy.definition.priority)) ||
   definition['max-length-bytes'] !== computeCapacity['max-length-bytes'] ||
   definition.overflow !== computeCapacity.overflow
 )
   throw new Error('BROKER_OPERATOR_POLICY_MISMATCH');
+await absent(`operator-policies/${encoded(originalVhost)}/${audioResultPolicy.name}`);
 for (const role of Object.values(roles)) await absent(`users/${encoded(role.user)}`);
 for (const vhost of vhosts.slice(1)) await absent(`vhosts/${encoded(vhost)}`);
 for (const exchange of exchanges)
@@ -165,9 +171,15 @@ try {
       'apply-to': 'queues',
     });
   }
-  for (const vhost of vhosts)
+  for (const vhost of vhosts) {
+    await mutate(
+      'PUT',
+      `operator-policies/${encoded(vhost)}/${audioResultPolicy.name}`,
+      audioResultPolicy.definition,
+    );
     for (const resource of computeTopology(vhost))
       await mutate(resource.method, resource.path, resource.body);
+  }
   for (const role of ['a', 'b'] as const) {
     const identity = roles[role];
     await mutate('PUT', `users/${encoded(identity.user)}`, {
@@ -200,7 +212,7 @@ try {
   // Management adds effective policy to the first statistics sample after declaration.
   const policyStatsDeadline = performance.now() + 10_000;
   for (const vhost of vhosts) {
-    for (const [index, queue] of queues.entries()) {
+    for (const queue of queues) {
       const path = `queues/${encoded(vhost)}/${encoded(queue)}`;
       let response = await api('GET', path);
       let q = object(response.value);
@@ -214,6 +226,20 @@ try {
         q = object(response.value);
       }
       const args = object(q.arguments);
+      if (queue === AUDIO_RESULT_QUEUE) {
+        if (
+          response.status !== 200 ||
+          q.type !== 'stream' ||
+          q.durable !== true ||
+          q.operator_policy !== audioResultPolicy.name ||
+          args['x-max-age'] !== '1h' ||
+          object(q.effective_policy_definition)['max-length-bytes'] !==
+            audioResultPolicy.definition.definition['max-length-bytes'] ||
+          Object.hasOwn(object(q.effective_policy_definition), 'overflow')
+        )
+          throw new Error(`BROKER_STREAM_RETENTION_MISMATCH ${vhost}/${queue}`);
+        continue;
+      }
       if (
         response.status !== 200 ||
         q.type !== 'quorum' ||
@@ -231,12 +257,12 @@ try {
         (effective as Json).overflow !== computeCapacity.overflow
       )
         throw new Error(`BROKER_QUEUE_CAPACITY_MISMATCH ${vhost}/${queue}`);
+      const deadLetter = computeDeadLetters.get(queue);
       if (
-        index < 2 &&
+        deadLetter &&
         (args['x-dead-letter-strategy'] !== 'at-least-once' ||
-          args['x-dead-letter-exchange'] !== exchanges[index + 2] ||
-          args['x-dead-letter-routing-key'] !==
-            ['transcode.dead.v1', 'transcode.result.dead.v1'][index])
+          args['x-dead-letter-exchange'] !== deadLetter.exchange ||
+          args['x-dead-letter-routing-key'] !== deadLetter.routingKey)
       )
         throw new Error('BROKER_DEAD_LETTER_MISMATCH');
     }

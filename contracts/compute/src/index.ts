@@ -217,3 +217,5 @@ export function parseComputeResultV1(value: unknown): ComputeResultV1 {
     return { ...envelope, state: 'unknown', errorCode: message.errorCode as ComputeUnknownCodeV1 };
   return invalid();
 }
+
+export * from './audio.ts';

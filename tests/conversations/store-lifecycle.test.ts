@@ -151,7 +151,7 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
   );
   expect(
     (await pool.query('SELECT to_jsonb(r) AS row FROM mio_conversation_requests r')).rows,
-  ).toEqual(originalRequests);
+  ).toEqual(originalRequests.map(({ row }) => ({ row: { ...row, audio_context: null } })));
   await checkConversationSchema(pool);
   store = await createConversationStore(database!.url);
   const created = await store.create(owner, randomUUID());

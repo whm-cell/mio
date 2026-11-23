@@ -1,6 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
+import { AUDIO_RESULT_QUEUE } from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
-import { computeCapacity, computePermissions, computeTopology } from './compute-broker-topology.ts';
+import {
+  audioResultPolicy,
+  computeCapacity,
+  computePermissions,
+  computeTopology,
+} from './compute-broker-topology.ts';
 
 type Json = Record<string, unknown>;
 
@@ -51,6 +57,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
   const vhost = `mio-${name}`;
   const vhostPath = `vhosts/${vhost}`;
   const capacityPath = `operator-policies/${vhost}/mio-capacity`;
+  const audioPolicyPath = `operator-policies/${vhost}/${audioResultPolicy.name}`;
   const roles = ['a', 'b'] as const;
   // These management endpoints can replace existing metadata. Compose provisions the root vhost.
   const prerequisites: { path: string; expected: Json }[] = [
@@ -64,6 +71,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
         'apply-to': 'queues',
       },
     },
+    { path: audioPolicyPath, expected: audioResultPolicy.definition },
   ];
   for (const role of roles) {
     const user = `mio-${name}-${role}`;
@@ -98,10 +106,14 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
         missingTopology.push(resource);
     }
   }
-  // Exchanges are safe without the capacity policy. Queues and bindings wait for it.
-  const declarations = missingPrerequisites.has(capacityPath)
-    ? missingTopology.filter(({ path }) => path.startsWith('exchanges/'))
-    : missingTopology;
+  // Each queue and binding waits for its own policy.
+  const declarations = missingTopology.filter(({ path }) => {
+    if (path.startsWith('exchanges/')) return true;
+    return (
+      !missingPrerequisites.has(capacityPath) &&
+      (!path.endsWith('/' + AUDIO_RESULT_QUEUE) || !missingPrerequisites.has(audioPolicyPath))
+    );
+  });
   for (const resource of declarations) await api(resource.method, resource.path, resource.body);
   function requireProvisioned(missing: Set<string>) {
     if (missing.size)

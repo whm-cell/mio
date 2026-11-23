@@ -2,13 +2,17 @@
 
 仓库内开发、人工测试优先使用[常驻环境](../docs/local-environments.md)的 `compute:init:dev/test` 与 `compute:start:dev/test`；初始化只做一次，启动在前台运行，使用该环境独立的 broker 身份和 journal。`start:dev/test` 启动主服务 A，不会同时启动 B。MQ 权限与部署边界见 [RabbitMQ 契约](../docs/integrations/rabbitmq.md)；下列原始入口仍用于独立部署产物。
 
-本进程只接受计算协议 v1，通过受限 B 身份消费命令并发送结果。需要 Node 24、`ffmpeg`（含 libx264、AAC）和 `ffprobe`。先用仓库根 `pnpm build` 构建共享基础库、协议和 Worker，独立产物须提供这两个工作区运行时依赖，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`；临时凭据还需 `MIO_COS_SESSION_TOKEN`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
+本进程使用受限 B 身份消费视频转码及 `audio.inspect.v1` 命令并发送结果。需要 Node 24、`ffmpeg`（含 libx264、AAC）和 `ffprobe`。先用仓库根 `pnpm build` 构建共享基础库、协议和 Worker，独立产物须提供这两个工作区运行时依赖，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`；临时凭据还需 `MIO_COS_SESSION_TOKEN`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
 
 首次新建卷时显式运行 `node compute/dist/main.js init`，其后运行 `node compute/dist/main.js start`。已有卷丢失、损坏或实例身份不一致时，停止消费并调查；不要对已有卷重新初始化。journal、WAL、SHM 和未确认的输入/输出都须保留在一起。目录是单实例独占的；SQLite 的锁在进程退出后释放，各事件和状态独立提交。
 
 已有 schema 3 的 journal 会在实例身份及完整性核对后，在 SQLite 事务内升级到 schema 4；升级中断时继续保留原卷并重新启动，不另建空库。终态结果已持久化且发布确认、未被退回后，本地文件可幂等清理；重投仍从 journal 应答，不重新计算。journal 的 `ack_dispatched` 只表示本地 ACK 调用返回，AMQP 没有该 ACK 的服务端回执；`cleaned` 记录本地文件清理，二者不能证明 broker 已收到 ACK。未知状态继续保留文件。
 
-Worker B 仅执行本地重媒体转码，命令通道保持单并发（`prefetch=1`）。云端图片生成、查询及物化恢复已迁至 A 的独立生成服务，不需要向 B 注入 OneLink 凭据或图片 RSA 私钥，也不消费图片专用队列。旧图片消息不能交给新 B 重跑；切换前应按[图片迁移要求](../docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md)排空并对账旧任务、outbox、消息、journal 和部分产物。
+B 的视频转码命令通道保持单并发（`prefetch=1`）。云端图片生成、查询及物化恢复已迁至 A 的独立生成服务，不需要向 B 注入 OneLink 凭据或图片 RSA 私钥，也不消费图片专用队列。旧图片消息不能交给新 B 重跑；切换前应按[图片迁移要求](../docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md)排空并对账旧任务、outbox、消息、journal 和部分产物。
+
+音频检测另开单并发命令通道，可与视频并行。启用前按 [RabbitMQ 契约](../docs/integrations/rabbitmq.md#拓扑与权限)预置音频队列和结果 stream。B 仅从配置的私有 COS 桶读取消息指定的样本原件或该任务成品检查点，核对对象键、ETag、字节数及已有摘要。检测完整的单音轨，返回格式、MIME、编码、采样率、声道、字节数、SHA-256 和解码实测时长。样本允许 MP3/WAV/M4A、至多 20 MiB、10–300 秒。成品允许 MP3/WAV/FLAC、至多 100 MiB、1 毫秒至 60 分钟。超出时长范围或解码失败返回失败结果。
+
+临时输入位于实例目录的 `audio-inspection/`。B 拿到 journal 独占锁后清理其中残留的请求输入。音频检测仅读对象，可在重投时再做一次，发布结果后才确认消息。视频 journal 的状态和恢复流程继续沿用。
 
 既有 journal 的图片历史表和卷保留供只读对账；运行时不再写入或接管这些图片记录。视频的恢复、独占目录和实例身份规则继续生效。
 

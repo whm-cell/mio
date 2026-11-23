@@ -59,6 +59,10 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets`、`compute`、`generations`、`materials` 或 `admin`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算、生成或素材迁移，供应商迁移先于或随 `admin` 迁移执行，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。管理后台在设置 `MIO_ADMIN_ENABLED=true`（及可选前端 Origin 白名单 `MIO_ADMIN_ALLOWED_ORIGINS`）并完成 `pnpm migrate:dev admin --apply` 后启用，超级管理员账号通过 `pnpm admin:dev --username <name> --password-stdin` 显式初始化，RabbitMQ 与 Redis 完整档只读监控账号通过 `pnpm monitor:init:dev`（或 `pnpm monitor:init:test`）一键生成最小权限监控凭据并完成探针核验，详见[管理后台 HTTP](apis/admin.md)。未启用域不自动迁移。
 
+[语音任务和音色](apis/audio.md)沿供应商库迁移。认证和供应商启用后可读取本地音色库。执行配音及复刻还需具备资产库、私有 COS 和包含音频队列的计算服务配置。启用前预览供应商和会话迁移，备份实际的供应商与资产库，并在隔离现场恢复和重跑。先完成两域结构，再为确认过的本人模型受控导入语音路由和登记音色。已有音色和成功作品继续按原引用查询，待处理任务按原输出检查点恢复。
+
+语音回归使用隔离的模型、音色、COS 协议替身和测试队列。开发环境的真实验证可以用本机私有旁库和临时 vhost 限定一名测试用户，并沿用其现成供应商配置和私有 COS。用可识别的最小测试任务记录实际供应商提交次数和回执，断线继续原任务，发布后通过原 assetId 重新签发地址。上游操作范围、音色导入和回退边界分别见[供应商配置](providers.md)和[语音 PRD](tasks/onelink-audio-generation/prd.md#53-验证启用与回退)。
+
 素材管理显式设置 `MIO_MATERIALS_ENABLED=true` 后启用，沿现有认证、供应商与媒体数据库配置；先 `pnpm migrate:dev assets --apply`，再 `pnpm migrate:dev materials --apply`（test 对应 test）。新增三表保留既有资产，启动仅检查，不自动迁移、枚举上游组或重发 unknown 创建。配置和 HTTP 见[素材契约](apis/materials.md)。Unit 1 不需要模型/default/目录资格，图片登记、真人认证及视频引用随后续单元接入。
 
 真人认证额外配置 `MIO_MATERIALS_PUBLIC_BASE_URL=https://实际可达的本候选入口`，不能因 `.env` 的 `MIO_AUTH_BASE_URL` 指向既有域名就复用该生产回调。先显式 `pnpm migrate:dev materials --apply` 增加 auth_sessions 及审计列，启动只读检查结构；缺省此变量保持 Unit 1/2 功能且不暴露认证入口。手机必须访问该公开 HTTPS origin 下的精确 launch/complete，隧道/代理选择及真实权限由具体现场核对，不改其他人的 DNS/代理；本机先用协议替身完成隔离回归，真人验收需使用可达的 HTTPS 路线并由本人同意和扫码。20 分钟逻辑到期，访问即时清密文。已有会话表时，即使撤下公开配置，素材服务启动及健康运行期间每 30 秒仍分批清理，每批最多 100 条。整个素材服务停机期间的后台清理顺延至恢复运行。

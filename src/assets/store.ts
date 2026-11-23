@@ -51,6 +51,37 @@ export class AssetStore {
     return row;
   }
 
+  /** The job owns the output ID; replay accepts only the same ready asset. */
+  async publishAudio(input: {
+    assetId: string;
+    ownerId: string;
+    filename: string;
+    contentType: string;
+    sizeBytes: number;
+    key: string;
+    etag: string;
+  }): Promise<void> {
+    const result = await this.pool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
+       VALUES($1,$2,$3,$4,$5,$6,$6,'ready',$7,now(),now())
+       ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id
+       WHERE mio_assets.owner_id=EXCLUDED.owner_id AND mio_assets.state='ready'
+         AND mio_assets.raw_key=EXCLUDED.raw_key AND mio_assets.source_etag=EXCLUDED.source_etag
+         AND mio_assets.size_bytes=EXCLUDED.size_bytes AND mio_assets.content_type=EXCLUDED.content_type
+         AND mio_assets.filename=EXCLUDED.filename`,
+      [
+        input.assetId,
+        input.ownerId,
+        input.filename,
+        input.contentType,
+        input.sizeBytes,
+        input.key,
+        input.etag,
+      ],
+    );
+    if (!result.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+  }
+
   async claim(id: string, owner: string, etag: string, lease: string): Promise<AssetRow | null> {
     return (
       (

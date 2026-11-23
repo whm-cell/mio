@@ -10,6 +10,15 @@ const ALLOWED_CONVERSATION_IMAGE_TOOLS = [
   'inspect_image_asset',
 ] as const satisfies readonly ConversationToolName[];
 
+const ALLOWED_CONVERSATION_AUDIO_TOOLS = [
+  'list_audio_models',
+  'list_audio_voices',
+  'select_audio_voice',
+  'submit_audio_job',
+  'clone_audio_voice',
+  'get_audio_job',
+] as const satisfies readonly ConversationToolName[];
+
 const MAX_TOOL_CALLS_PER_TURN = 12;
 const MAX_IMAGE_SUBMITS_PER_TURN = 4;
 
@@ -17,13 +26,14 @@ interface TurnToolGrant {
   active: boolean;
   totalCalls: number;
   imageSubmits: number;
+  audioSubmits: number;
   readonly allowed: ReadonlyMap<string, ConversationToolName>;
   readonly countedTokens: WeakSet<object>;
 }
 
 const activeToolGrants = new WeakMap<Agent, TurnToolGrant>();
 
-function isAuthorizedConversationImageCall(exec: Readonly<ToolExecution>): boolean {
+function isAuthorizedConversationCall(exec: Readonly<ToolExecution>): boolean {
   if (!exec.agent || exec.signal.aborted) return false;
   const grant = activeToolGrants.get(exec.agent);
   return grant?.active === true && grant.allowed.has(exec.name);
@@ -32,7 +42,7 @@ function isAuthorizedConversationImageCall(exec: Readonly<ToolExecution>): boole
 /** The foundation and kernel own the same monotonic deny policy for their respective lifetimes. */
 export function denyModelTools(ctx: Context): void {
   ctx.tools.guard((exec) =>
-    isAuthorizedConversationImageCall(exec)
+    isAuthorizedConversationCall(exec)
       ? undefined
       : 'MIO_TOOL_DENIED: no model tool is authorized in the Mio profile',
   );
@@ -51,15 +61,41 @@ export function authorizeConversationImageTools(
     status: Extract<ConversationEvent, { type: 'tool-status' }>['status'],
   ) => void,
 ): () => void {
-  const allowed = new Map<string, ConversationToolName>();
-  for (const name of ALLOWED_CONVERSATION_IMAGE_TOOLS) {
-    if (name === 'inspect_image_asset' ? options.inspection : options.generation)
-      allowed.set(name, name);
-  }
+  return authorizeTurnTools(
+    agentCtx,
+    agent,
+    ALLOWED_CONVERSATION_IMAGE_TOOLS.filter((name) =>
+      name === 'inspect_image_asset' ? options.inspection : options.generation,
+    ),
+    progress,
+  );
+}
+
+type Progress = (
+  tool: ConversationToolName,
+  status: Extract<ConversationEvent, { type: 'tool-status' }>['status'],
+) => void;
+
+export function authorizeConversationAudioTools(
+  agentCtx: Context,
+  agent: Agent,
+  progress?: Progress,
+) {
+  return authorizeTurnTools(agentCtx, agent, ALLOWED_CONVERSATION_AUDIO_TOOLS, progress);
+}
+
+function authorizeTurnTools(
+  agentCtx: Context,
+  agent: Agent,
+  names: readonly ConversationToolName[],
+  progress?: Progress,
+) {
+  const allowed = new Map(names.map((name) => [name as string, name]));
   const grant: TurnToolGrant = {
     active: true,
     totalCalls: 0,
     imageSubmits: 0,
+    audioSubmits: 0,
     allowed,
     countedTokens: new WeakSet<object>(),
   };
@@ -86,9 +122,13 @@ export function authorizeConversationImageTools(
     if (exec.name === 'submit_image_job' && grant.imageSubmits >= MAX_IMAGE_SUBMITS_PER_TURN) {
       return `MIO_TOOL_BUDGET_EXCEEDED: max ${MAX_IMAGE_SUBMITS_PER_TURN} image submissions per turn`;
     }
+    const audioSubmit = exec.name === 'submit_audio_job' || exec.name === 'clone_audio_voice';
+    if (audioSubmit && grant.audioSubmits > 0)
+      return 'MIO_TOOL_BUDGET_EXCEEDED: one audio submission per turn';
     grant.countedTokens.add(exec);
     grant.totalCalls++;
     if (exec.name === 'submit_image_job') grant.imageSubmits++;
+    if (audioSubmit) grant.audioSubmits++;
     return undefined;
   });
   if (progress) {

@@ -14,9 +14,9 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 身份：当前登录用户，owner 由服务取得。
 
-输入：`{modelRef?,purpose?,reasoningEffort?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。purpose 仅接受 `general` 或 `drama-script`，省略时使用 `general`。`reasoningEffort` 可取 `low`、`medium`、`high`，选填以设置本会话的轮次默认档位。服务校验所选聊天路由当前明确支持该档位。用途与档位默认值在创建时固定。接口拒绝自定义系统提示词、项目关联标识与项目上下文。
+输入：`{modelRef?,purpose?,reasoningEffort?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。purpose 接受 `general`、`drama-script` 或 `audio`，省略时使用 `general`。`reasoningEffort` 可取 `low`、`medium`、`high`，选填以设置本会话的轮次默认档位。服务校验所选聊天路由当前明确支持该档位。用途与档位默认值在创建时固定。接口拒绝自定义系统提示词、项目关联标识与项目上下文。
 
-成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?,purpose?,reasoningEffort?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。元数据仅在用途为 `drama-script` 时带 `purpose`，省略表示 `general`，亦适用于既有会话。配置了会话默认档位时返回 `reasoningEffort`。
+成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?,purpose?,reasoningEffort?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。剧本和音频会话返回 `purpose`，省略表示 `general`，亦适用于既有会话。音频会话返回 `audioSelection:{voiceRef:null,name:null,revision:0}`，创建要求 BYOK 聊天绑定和音频服务均已就绪。配置了会话默认档位时返回 `reasoningEffort`。
 
 错误：未知或无效的 purpose、reasoningEffort 返回 400 BODY_INVALID。选定路由或 legacy 未声明该档位时返回 409 MODEL_REASONING_UNSUPPORTED。BYOK 按共同约定的具体资格错误；legacy 的 503 MODEL_UNAVAILABLE 保留。503 CONVERSATION_UNKNOWN 表示跨存储未收口，所属列表可能已有 unknown 映射。缺模型、配置或资格，以及档位不受支持时均不创建映射。
 
@@ -26,9 +26,9 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 身份：当前登录用户，只返回自己的对话。
 
-输入：可选 `after` 接收上页原样返回的游标。省略时从首页开始。`limit` 默认 20，可取 1–100。
+输入：可选 `after` 接收上页原样返回的游标。省略时从首页开始。`limit` 默认 20，可取 1–100。`purpose=audio` 读取独立的音频会话列表，省略 `purpose` 读取通用和剧本会话。
 
-成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?,forkedFromConversationId?,forkedUntilSeq?}],nextAfter}`，仅包含未归档会话。分叉时新增源会话和截止序号两个字段。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
+成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?,audioSelection?,reasoningEffort?,forkedFromConversationId?,forkedUntilSeq?}],nextAfter}`，仅包含未归档会话。分叉时新增源会话和截止序号两个字段。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
 
 错误：见本域共同约定。
 
@@ -45,6 +45,18 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 错误：正文含其他字段、标题无效或超长均返回 400 BODY_INVALID。归档后返回 409 CONVERSATION_ARCHIVED，归属不匹配返回 404。
 
 副作用：在 DSH 日志和 PG 元数据保存并固定手工标题，保留原来的 `updatedAt`。
+
+## PATCH /api/v1/conversations/:id/audio-selection
+
+身份：目前登录用户须拥有空闲音频会话。
+
+输入：`{voiceRef,expectedRevision}`，音色为本人可用于配音的 UUID，版本取最近确认的非负整数。
+
+成功：200 `{voiceRef,name,revision}`，已有选择一致时复用对应版本。
+
+错误：非音频会话返回 409 `AUDIO_CONTEXT_NOT_ALLOWED`，活动轮次返回 409 `CONVERSATION_BUSY`，版本过期返回 409 `AUDIO_SELECTION_CONFLICT`，不可用音色返回 404 `VOICE_NOT_FOUND`。
+
+副作用：只写选音元数据并发布 `audio-selection`，当前轮次的选音工具在该轮内沿用相同版本检查。[音色 API](audio.md)
 
 ## DELETE /api/v1/conversations/:id
 
@@ -64,7 +76,7 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 输入：`afterSeq`（默认 -1，可原样复用空页/末页 cursor）、`limit`（默认 20、1–100）。
 
-成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
+成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）、`{seq,role:'tool',tool:'submit_audio_job'|'get_audio_job'|'clone_audio_voice',job}`（`job` 为公开音频任务视图）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 和 `mio.audio-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
 
 原生日志证明轮次达到输出上限时，轮次末尾的 status 项为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。同轮助手项按原顺序返回已保存正文。跨页时使用返回的 cursor 继续读到轮次末尾。
 
@@ -76,17 +88,19 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 身份：当前登录用户与对话 owner；受理后登录失效仍允许该轮结算。
 
-输入：`{requestId,text,imageAssetIds?,reasoningEffort?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
+输入：`{requestId,text,imageAssetIds?,reasoningEffort?,audioContext?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
 
 `reasoningEffort` 的 `low`、`medium` 或 `high` 只覆盖本轮。省略时继承会话默认档位；会话也未设置时沿用驱动默认请求行为。新请求按受理时路由验证生效档位，声明移除后先前的默认档位也会被拒绝。无效值返回 400 BODY_INVALID，路由未明确支持生效档位时返回 409 MODEL_REASONING_UNSUPPORTED。两类拒绝均在模型派发前发生。同一 requestId 再次提交同一正文、图片与显式档位，先读取原回执。改变、增加或移除显式档位与改变正文一样构成 REQUEST_ID_CONFLICT。
 
 已关联项目的 `drama-script` 会话使用标准消息请求。服务端按拥有者和会话读取本轮项目快照，项目字段写入 HTTP 正文会返回 400 BODY_INVALID。快照超出 64 KiB UTF-8 JSON 会返回 413 CONVERSATION_CONTEXT_TOO_LARGE。关联来源异常、无效或归属不符返回脱敏的 503 CONVERSATION_CONTEXT_UNAVAILABLE。两种拒绝均发生在接收前，可用原 requestId 重试。已受理请求的回执重放不重新解析项目。
 
+音频会话可传 `audioContext:{modelRef?,voiceRef?,parameters?,sample?}`。其中 `modelRef` 是精确的配音或复刻模型；创建会话时的顶层 `modelRef` 仍是聊天模型。若传 `voiceRef`，它须等于服务端当前已确认的选择。`sample` 为 `{assetId,authorized:true,name,auditionText}`，授权限本次消息，复刻上下文省略 `voiceRef`。音频消息不能带 `imageAssetIds`。服务在受理前核对本人资产，内部保存样本指纹。回执重放根据显式输入核对身份，复用原请求状态；之后的音色、路由和资产变化不参与旧摘要。每轮可选一次配音或复刻提交。模型选音后可在同轮使用新选择，单独选音不提交任务。[音频 API](audio.md)
+
 成功：202 原接收回执 `{conversationId,requestId,status,error?,truncation?}`。accepted/input-persisted/最终结算各表示不同屏障；同 ID 同内容返回原状态，不能据 HTTP 202 判断已输出或已持久完成。
 
 错误：409 包括 CONVERSATION_BUSY、CONVERSATION_ARCHIVED、REQUEST_ID_CONFLICT、CONVERSATION_UNKNOWN、CONVERSATION_MODEL_REQUIRED、MODEL_MODALITY_UNSUPPORTED 和 MODEL_VISION_CHANGED。BYOK 资格与解密错误见本域共同约定。无权、未 ready、非图片或登记键不合法的资产为 404 ASSET_NOT_FOUND，登记大小无效或超过源上限为 400 ASSET_INPUT_INVALID，图片解码、格式或本次预算无效为 400 IMAGE_INPUT_INVALID，实际资产长度或源版本变化为 409 ASSET_SIZE_MISMATCH/ASSET_SOURCE_CHANGED，资产或图片处理不可用为脱敏 503。每服务同时最多准备两个新的带图请求，满载立即返回 503 IMAGE_UNAVAILABLE。已有同 ID 先比较摘要，匹配时返回原回执，不匹配时即使已归档也返回 REQUEST_ID_CONFLICT。fresh 输入看到已归档会在查询供应商或资产前被拒绝，行锁内的最终检查仍能拒绝预检过程中发生的归档。拒绝不新增 fresh 接收。摘要不含可变凭据、目录或适配版本。接收 ACK 或存储未知时按原 ID 查询。
 
-副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；仅当 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
+副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；通用和剧本会话的 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
 
 视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
 
@@ -120,7 +134,7 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 输入：`{requestId,turnEndSeq?}`。`turnEndSeq` 为非负安全整数，须匹配源历史中已持久、真实结算的 `turn/end` 序号。省略取最新可分叉轮次。归档或有活动请求的源会话仍可选择其已结算前缀。
 
-成功：完成创建返回 201，之后相同请求返回 200。响应形状与列表项相同，包含 `forkedFromConversationId` 和 `forkedUntilSeq`。新会话的公开历史保留截止点内的原序号和内容。初始标题、用途、默认推理档及逻辑模型绑定取首次预约时源会话的值，活跃时间从新会话的创建时间开始。源已从模型 A 切到 B 时，从 A 轮次分叉可保留其历史，子会话当前绑定为 B。后续执行按子会话 ID 重新核对项目关联、模型资格和权限。
+成功：完成创建返回 201，之后相同请求返回 200。响应形状与列表项相同，包含 `forkedFromConversationId` 和 `forkedUntilSeq`。新会话的公开历史保留截止点内的原序号和内容。初始标题、用途、默认推理档及逻辑模型绑定取首次预约时源会话的值，活跃时间从新会话的创建时间开始。源已从模型 A 切到 B 时，从 A 轮次分叉可保留其历史，子会话当前绑定为 B。后续执行按子会话 ID 重新核对项目关联、模型资格和权限。音频分叉的 `audioSelection` 初始为空、版本为 0，历史截止内保留可公开的音频卡片，新轮的样本授权由当前用户重新提供。
 
 分叉请求按 owner、源会话与 requestId 去重。首次确定的目标 ID 与截止点固定。源后来增加新轮或换模，同输入重放仍定位同一子会话。省略序号与显式指定同一序号属于不同输入。
 
@@ -165,9 +179,11 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、reasoning `{requestId,text}`、tool-status `{requestId,tool,status}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`。每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?,audioSelection?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、reasoning `{requestId,text}`、tool-status `{requestId,tool,status}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`。每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
-reasoning 来自声明支持推理的路由本轮产生的真实思考增量。tool-status 只含请求 ID、已授权工具名称及 `running`、`completed` 或 `failed`。工具名称为 `list_image_models`、`submit_image_job`、`get_image_job` 或 `inspect_image_asset`，以本轮实际授权为准。此状态对应工具本次执行，图片任务的进度和产物仍查卡片或任务回执。思考增量与工具状态仅在连接期间可见，公开 GET history 继续投影正式消息、有效图片任务卡片和轮次状态。
+reasoning 来自声明支持推理的路由本轮产生的真实思考增量。tool-status 只含请求 ID、已授权工具名称及 `running`、`completed` 或 `failed`。工具名称以本轮实际授权为准。通用和剧本会话使用已获授权的图片工具。音频工具见下文。此状态对应工具本次执行，图片任务的进度和产物仍查卡片或任务回执。思考增量与工具状态仅在连接期间可见，公开 GET history 继续投影正式消息、有效图片任务卡片和轮次状态。
+
+音频会话的快照携带 `audioSelection`。`audio-selection` 事件携带 `{conversationId,selection}`，用于同步最新版本。`tool-status` 可携带 `list_audio_models`、`list_audio_voices`、`select_audio_voice`、`submit_audio_job`、`clone_audio_voice`、`get_audio_job`。通过持久化检查且合法的后三项结果可发布 `tool` 帧，形状为 `{requestId,tool,job}`。断线后查询同一消息回执和持久历史，作品状态由音频 `jobId` 独立查询。
 
 水位 `{estimatedTokens,contextWindow,compacted}` 在可估算时随 snapshot 与轮次或手动压缩的结算状态返回。BYOK snapshot 显示发起订阅时当前可用的绑定路由窗口；结算 state 显示本次已受理请求的冻结窗口。用 `contextWindow: null` 表示缺少适用的路由窗口，`compacted: true` 表示上下文含已持久化的压缩检查点。估算无法取得时省略该字段，回执照常返回。窗口只读取本地元数据，公开字段不含提示词、摘要、凭据或原始工具输出。
 

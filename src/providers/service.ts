@@ -1,3 +1,4 @@
+import { createProviderAudioService } from './audio.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
 import { ProviderError, categories, supportsChatReasoning } from './contracts.ts';
@@ -5,6 +6,7 @@ import type {
   Category,
   Discovery,
   ProviderPrincipal,
+  ProviderOperation,
   ChatReasoningEffort,
   ChatSelection,
   ChatRuntimeSnapshot,
@@ -161,7 +163,9 @@ export function createProviderService(
       throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
     return { row, model: model!, adaptation };
   };
+  const audio = createProviderAudioService(store, config, assertOpen);
   return {
+    ...audio,
     sealMaterialAuth(
       ownerId: string,
       sessionId: string,
@@ -337,11 +341,7 @@ export function createProviderService(
       assertOpen();
       return store.importRoutes(input, actor);
     },
-    deleteRoutes(
-      rawModelId: string,
-      actor: RouteRevisionActor,
-      operation?: 'chat' | 'image.generate',
-    ) {
+    deleteRoutes(rawModelId: string, actor: RouteRevisionActor, operation?: ProviderOperation) {
       assertOpen();
       return store.deleteRoutes(rawModelId, actor, operation);
     },
@@ -395,7 +395,7 @@ export function createProviderService(
       if (!closing) {
         cancellation.abort();
         closing = (async () => {
-          await Promise.allSettled([...active]);
+          await Promise.allSettled([...active, audio.voices.close()]);
           await store.close();
         })();
       }

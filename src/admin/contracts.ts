@@ -6,6 +6,7 @@ import type {
   PlatformModelOriginSource,
   PlatformRouteRecord,
   PlatformRouteRevisionRecord,
+  ProviderOperation,
 } from '../providers/contracts.ts';
 
 export class AdminError extends HttpError {}
@@ -72,6 +73,7 @@ export interface AdminModelCatalogItem {
   readonly userDiscoveredCount: number;
   readonly userVerifiedChatCount: number;
   readonly userVerifiedImageCount: number;
+  readonly audioRoutes: readonly AdminAudioRouteView[];
   readonly policy: {
     readonly userVisible: boolean;
     readonly allowUndiscovered: boolean;
@@ -100,6 +102,15 @@ export interface AdminModelCatalogItem {
   readonly updatedAt: string;
 }
 
+export interface AdminAudioRouteView {
+  readonly operation: Extract<ProviderOperation, `audio.${string}`>;
+  readonly route: Record<string, unknown>;
+  readonly enabled: boolean;
+  readonly declarationVersion: number;
+  readonly verifiedUserCount: number;
+  readonly updatedAt: string;
+}
+
 export interface AdminCatalogSummary {
   readonly totalModels: number;
   readonly benchmarkModels: number;
@@ -123,7 +134,7 @@ export interface AdminRouteTemplateView {
   readonly templateKey: string;
   readonly label: string;
   readonly description: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: ProviderOperation;
   readonly vendor: string;
   readonly driver: string;
   readonly routeTemplate: Record<string, unknown>;
@@ -188,6 +199,9 @@ export interface UnifiedModelRawSources {
     discovered_users: number;
     verified_chat_users: number;
     verified_image_users: number;
+    verified_voice_users: number;
+    verified_tts_users: number;
+    verified_clone_users: number;
     sample_metadata: Record<string, unknown> | null;
   }[];
   readonly routeRows: readonly (PlatformRouteRecord & { updated_at: Date })[];

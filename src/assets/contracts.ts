@@ -12,10 +12,19 @@ export interface AssetPrincipal {
 export interface AssetObjectStore {
   uploadUrl(key: string, size: number): string;
   downloadUrl(key: string): string;
+  audioPlaybackUrl?(key: string, contentType: string): string;
   materialUrl?(key: string): string;
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   putImage?(
+    key: string,
+    bytes: Uint8Array,
+    format: string,
+    sha256: string,
+    signal: AbortSignal,
+  ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
+  readAudio?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  putAudio?(
     key: string,
     bytes: Uint8Array,
     format: string,

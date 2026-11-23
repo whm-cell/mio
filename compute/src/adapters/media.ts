@@ -22,7 +22,12 @@ import {
 import { join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
+import {
+  AUDIO_INSPECTION_LIMITS,
+  AUDIO_MIME_TYPES,
+  COMPUTE_MAX_MEDIA_BYTES,
+} from '@mio/compute-contracts';
+import type { AudioInspectCommandV1, AudioInspection } from '@mio/compute-contracts';
 
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
@@ -30,6 +35,7 @@ const MIN_FREE_BYTES = 2 * 1024 ** 3;
 export class MediaError extends ApplicationError<
   | 'INPUT_INVALID'
   | 'INPUT_TOO_LONG'
+  | 'INPUT_CHANGED'
   | 'TRANSCODE_FAILED'
   | 'OUTPUT_INVALID'
   | 'EXECUTION_TIMEOUT'
@@ -102,9 +108,12 @@ function directoryBytes(path: string): number {
   return size;
 }
 
-export function requireSpace(directory: string): void {
+export function requireSpace(directory: string, incomingBytes = 0): void {
   const fs = statfsSync(directory);
-  if (directoryBytes(directory) >= MAX_DIRECTORY_BYTES || fs.bavail * fs.bsize < MIN_FREE_BYTES) {
+  if (
+    directoryBytes(directory) + incomingBytes >= MAX_DIRECTORY_BYTES ||
+    fs.bavail * fs.bsize < MIN_FREE_BYTES + incomingBytes
+  ) {
     throw new MediaError('DISK_FULL');
   }
 }
@@ -453,4 +462,145 @@ export function removeFiles(directory: string, attemptId: string): void {
   const files = paths(directory, attemptId);
   for (const path of Object.values(files)) if (existsSync(path)) rmSync(path);
   syncPath(resolve(directory));
+}
+
+/** Called under the instance journal lock, before the dedicated consumer starts. */
+export function prepareAudioDirectory(directory: string): string {
+  const path = join(resolve(directory), 'audio-inspection');
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(path);
+  if (
+    !stat.isDirectory() ||
+    (stat.mode & 0o077) !== 0 ||
+    (typeof process.getuid === 'function' && stat.uid !== process.getuid())
+  )
+    throw new Error('AUDIO_DIRECTORY_INVALID');
+  for (const filename of readdirSync(path)) {
+    if (filename.endsWith('.input') && isUuidV4(filename.slice(0, -6)))
+      rmSync(join(path, filename));
+  }
+  return path;
+}
+
+type AudioProbe = {
+  format?: { format_name?: string };
+  streams?: { codec_type?: string; codec_name?: string; sample_rate?: string; channels?: number }[];
+};
+
+const audioDemuxers = ['-protocol_whitelist', 'file', '-format_whitelist', 'mp3,wav,mov,flac'];
+
+async function probeAudio(
+  input: string,
+  purpose: AudioInspectCommandV1['purpose'],
+  signal: AbortSignal,
+): Promise<Pick<AudioInspection, 'format' | 'mimeType' | 'codec' | 'sampleRate' | 'channels'>> {
+  const result = await runProcess(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      ...audioDemuxers,
+      '-show_entries',
+      'format=format_name:stream=codec_type,codec_name,sample_rate,channels',
+      '-of',
+      'json',
+      input,
+    ],
+    signal,
+  );
+  if (result.aborted) throw new MediaError('EXECUTION_TIMEOUT');
+  if (result.exitCode !== 0) throw new MediaError('INPUT_INVALID');
+  const parsed = JSON.parse(result.stdout) as AudioProbe;
+  const stream = parsed.streams?.[0];
+  const container = parsed.format?.format_name?.split(',')[0];
+  const format = container === 'mov' ? 'm4a' : container;
+  const sampleRate = Number(stream?.sample_rate);
+  if (
+    !stream ||
+    parsed.streams?.length !== 1 ||
+    stream.codec_type !== 'audio' ||
+    (format !== 'mp3' && format !== 'wav' && format !== 'm4a' && format !== 'flac') ||
+    (purpose === 'sample' && format === 'flac') ||
+    (purpose === 'output' && format === 'm4a') ||
+    !stream.codec_name ||
+    !/^[a-z0-9_]{1,40}$/.test(stream.codec_name) ||
+    !Number.isSafeInteger(sampleRate) ||
+    sampleRate < 8000 ||
+    sampleRate > 192000 ||
+    (stream.channels !== 1 && stream.channels !== 2)
+  )
+    throw new MediaError('INPUT_INVALID');
+  return {
+    format,
+    mimeType: AUDIO_MIME_TYPES[format],
+    codec: stream.codec_name,
+    sampleRate,
+    channels: stream.channels,
+  };
+}
+
+/** Count decoded samples through EOF. Stop early only when the duration is already invalid. */
+export async function inspectAudio(
+  directory: string,
+  command: AudioInspectCommandV1,
+  objectSha256: string | null,
+  signal: AbortSignal,
+): Promise<AudioInspection> {
+  const input = paths(directory, command.inspectionId).input;
+  const digest = await fileDigest(input, signal);
+  if (
+    digest.size !== command.input.sizeBytes ||
+    (objectSha256 !== null && digest.sha256 !== objectSha256) ||
+    (command.input.sha256 !== undefined && digest.sha256 !== command.input.sha256)
+  )
+    throw new MediaError('INPUT_CHANGED');
+  const media = await probeAudio(input, command.purpose, signal);
+  const { minDurationMs, maxDurationMs } = AUDIO_INSPECTION_LIMITS[command.purpose];
+  const decoded = await runProcess(
+    'ffmpeg',
+    [
+      '-hide_banner',
+      '-nostdin',
+      '-v',
+      'error',
+      '-xerror',
+      '-err_detect',
+      'explode',
+      ...audioDemuxers,
+      '-threads',
+      '2',
+      '-i',
+      input,
+      '-map',
+      '0:a:0',
+      // Produce a duration from PCM samples, including files with unusual input timestamps.
+      '-af',
+      'asetpts=N/SR/TB',
+      '-filter_threads',
+      '2',
+      '-t',
+      String(maxDurationMs / 1000 + 1),
+      '-stats_period',
+      '3601',
+      '-progress',
+      'pipe:1',
+      '-f',
+      'null',
+      '-',
+    ],
+    signal,
+  );
+  if (decoded.aborted) throw new MediaError('EXECUTION_TIMEOUT');
+  if (decoded.exitCode !== 0 || !/^progress=end$/m.test(decoded.stdout))
+    throw new MediaError('INPUT_INVALID');
+  const clocks = [...decoded.stdout.matchAll(/^out_time_us=(\d+)$/gm)];
+  const durationMs = Number(clocks.at(-1)?.[1]) / 1000;
+  if (!Number.isFinite(durationMs) || durationMs < minDurationMs || durationMs > maxDurationMs)
+    throw new MediaError('INPUT_TOO_LONG');
+  return {
+    ...media,
+    durationMs: Math.round(durationMs),
+    sizeBytes: digest.size,
+    sha256: digest.sha256,
+  };
 }

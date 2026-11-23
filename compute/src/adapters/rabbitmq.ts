@@ -10,13 +10,22 @@ import type {
   SocketOptions,
 } from 'amqplib';
 import {
+  AUDIO_COMMAND_QUEUE,
+  AUDIO_MAX_MESSAGE_BYTES,
+  AUDIO_RESULT_ROUTING_KEY,
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  parseAudioInspectCommandV1,
   parseComputeCommandV1,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  AudioInspectCommandV1,
+  AudioInspectResultV1,
+  ComputeCommandV1,
+  ComputeResultV1,
+} from '@mio/compute-contracts';
 
 const BROKER_STARTUP_TIMEOUT_MS = 5000;
 const BROKER_CLOSE_TIMEOUT_MS = 5000;
@@ -224,9 +233,17 @@ export class Broker {
   }
 
   publish(message: ComputeResultV1): Promise<void> {
-    return this.publishMessage(message);
+    return this.publishMessage(message, RESULT_ROUTING_KEY);
   }
-  private async publishMessage(message: ComputeResultV1): Promise<void> {
+
+  publishAudio(message: AudioInspectResultV1): Promise<void> {
+    return this.publishMessage(message, AUDIO_RESULT_ROUTING_KEY);
+  }
+
+  private async publishMessage(
+    message: ComputeResultV1 | AudioInspectResultV1,
+    routingKey: string,
+  ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
     let returned = false;
     const onReturn = (result: Message) => {
@@ -246,7 +263,7 @@ export class Broker {
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.#publisher.publish(
           RESULT_EXCHANGE,
-          RESULT_ROUTING_KEY,
+          routingKey,
           Buffer.from(JSON.stringify(message)),
           {
             persistent: true,
@@ -276,8 +293,39 @@ export class Broker {
     }
   }
 
-  async consume(
+  consume(
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    canAdmit: () => boolean,
+  ): Promise<void> {
+    return this.consumeCommands(
+      { queue: COMMAND_QUEUE, maxBytes: COMPUTE_MAX_MESSAGE_BYTES, parse: parseComputeCommandV1 },
+      handle,
+      failed,
+      canAdmit,
+    );
+  }
+
+  consumeAudio(
+    handle: (command: AudioInspectCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    canAdmit: () => boolean,
+  ): Promise<void> {
+    return this.consumeCommands(
+      {
+        queue: AUDIO_COMMAND_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectCommandV1,
+      },
+      handle,
+      failed,
+      canAdmit,
+    );
+  }
+
+  private async consumeCommands<T extends { messageId: string }>(
+    protocol: { queue: string; maxBytes: number; parse: (value: unknown) => T },
+    handle: (command: T, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
   ): Promise<void> {
@@ -299,7 +347,7 @@ export class Broker {
       failed(error);
     };
     await slot.channel.consume(
-      COMMAND_QUEUE,
+      protocol.queue,
       (message: ConsumeMessage | null) => {
         // A closed gate leaves late deliveries unacked; closing this exact channel requeues them.
         // Late cancellation notifications from that channel also belong to the old consumer.
@@ -317,17 +365,17 @@ export class Broker {
           report(error);
           return;
         }
-        let command: ComputeCommandV1;
+        let command: T;
         try {
           if (
             message.properties.userId !== this.#expectedUserId ||
             message.properties.contentType !== 'application/json' ||
-            message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+            message.content.length > protocol.maxBytes
           )
             throw new Error('COMMAND_INVALID');
           const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
           const value: unknown = JSON.parse(body);
-          command = parseComputeCommandV1(value);
+          command = protocol.parse(value);
           if (message.properties.messageId !== command.messageId)
             throw new Error('COMMAND_ID_MISMATCH');
         } catch {

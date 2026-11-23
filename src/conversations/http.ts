@@ -214,6 +214,7 @@ export function createConversationHandler(
       if (base) methods = ['GET', 'POST'];
       else if (validId && parts.length === 1) methods = ['PATCH', 'DELETE'];
       else if (validId && parts.length === 2 && action === 'model') methods = ['PUT'];
+      else if (validId && parts.length === 2 && action === 'audio-selection') methods = ['PATCH'];
       else if (validId && parts.length === 2 && ['history', 'events'].includes(action ?? ''))
         methods = ['GET'];
       else if (
@@ -282,7 +283,7 @@ export function createConversationHandler(
       const creating = base && method === 'POST';
       const expected =
         action === 'messages'
-          ? ['requestId', 'text', 'imageAssetIds', 'reasoningEffort']
+          ? ['requestId', 'text', 'imageAssetIds', 'reasoningEffort', 'audioContext']
           : action === 'compact'
             ? ['requestId']
             : action === 'forks'
@@ -291,9 +292,11 @@ export function createConversationHandler(
                 ? ['modelRef', 'purpose', 'reasoningEffort']
                 : action === 'model'
                   ? ['modelRef']
-                  : method === 'PATCH'
-                    ? ['title']
-                    : [];
+                  : action === 'audio-selection'
+                    ? ['voiceRef', 'expectedRevision']
+                    : method === 'PATCH'
+                      ? ['title']
+                      : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const reasoningEffort = value.reasoningEffort;
@@ -313,7 +316,12 @@ export function createConversationHandler(
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       if (creating) {
         const { purpose } = value;
-        if (purpose !== undefined && purpose !== 'general' && purpose !== 'drama-script')
+        if (
+          purpose !== undefined &&
+          purpose !== 'general' &&
+          purpose !== 'drama-script' &&
+          purpose !== 'audio'
+        )
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(
           HTTP_STATUS.CREATED,
@@ -330,6 +338,21 @@ export function createConversationHandler(
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(HTTP_STATUS.OK, await service.selectModel(actor, id!, value.modelRef));
       }
+      if (action === 'audio-selection') {
+        const { voiceRef, expectedRevision } = value;
+        if (
+          typeof voiceRef !== 'string' ||
+          !isUuidV4(voiceRef) ||
+          typeof expectedRevision !== 'number' ||
+          !Number.isSafeInteger(expectedRevision) ||
+          expectedRevision < 0
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        return send(
+          HTTP_STATUS.OK,
+          await service.selectAudioVoice(actor, id!, voiceRef, expectedRevision),
+        );
+      }
       if (method === 'PATCH') {
         if (
           typeof value.title !== 'string' ||
@@ -342,10 +365,21 @@ export function createConversationHandler(
       }
       if (method === 'DELETE') return send(HTTP_STATUS.OK, await service.archive(actor, id!));
       if (base) {
+        const purpose = url.searchParams.get('purpose');
+        if (
+          (purpose !== null && purpose !== 'audio') ||
+          url.searchParams.getAll('purpose').length > 1
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
         const after = parseConversationCursor(url.searchParams.get('after') ?? undefined);
         return send(
           HTTP_STATUS.OK,
-          await service.list(actor, after, integer(url.searchParams.get('limit'), 20, 1, 100)),
+          await service.list(
+            actor,
+            after,
+            integer(url.searchParams.get('limit'), 20, 1, 100),
+            purpose ?? undefined,
+          ),
         );
       }
       if (action === 'history') {
@@ -412,6 +446,7 @@ export function createConversationHandler(
             value.text,
             value.imageAssetIds as string[] | undefined,
             reasoningEffort,
+            value.audioContext,
           ),
         );
       }

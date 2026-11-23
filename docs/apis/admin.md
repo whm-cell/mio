@@ -124,7 +124,7 @@
 
 输入：可选查询参数 `q`（关键词）、`category`（`chat|image|video|voice|music`）、`status`（`enabled|disabled|pending`）、`visibility`（`visible|hidden|curated`）。
 
-成功：200 `{summary,items}`。以平台模型主表 `mio_provider_catalog_models` 为权威来源，合并探测命中标记、跨用户脱敏发现/实测统计、平台路由（`chat` 与 `image.generate`）及可见性/补录策略，不暴露普通用户账号明细或私有凭据。
+成功：200 `{summary,items}`。以平台模型主表 `mio_provider_catalog_models` 为权威来源，合并探测命中标记、跨用户脱敏发现/实测统计、平台路由及可见性/补录策略，不暴露普通用户账号明细或私有凭据。每个模型的 `audioRoutes` 返回语音操作的 `operation`、`route`、`enabled`、`declarationVersion`、`verifiedUserCount` 和 `updatedAt`。`status` 筛选和路由汇总包含语音操作。语音实测人数按各操作的当前验证元组计算。
 
 错误：400 `QUERY_INVALID`；其余见共同约定。
 
@@ -182,7 +182,7 @@
 
 身份：当前登录管理员。
 
-输入：`{rawModelId,operation,summary?}`，`operation` 为 `chat` 或 `image.generate`。
+输入：`{rawModelId,operation,summary?}`，`operation` 可为 `chat`、`image.generate`、`audio.voices.list`、`audio.tts` 或 `audio.clone`。
 
 成功：200 `{deleted:{id,rawModelId,operation,declarationVersion,action:'delete'}}`。
 
@@ -208,7 +208,7 @@
 
 输入：无查询参数。
 
-成功：200 `{drivers:{chat,image},categories,items}`，返回服务端已实现的协议驱动枚举及数据库中按 `sortOrder` 排序的全部动态快捷配置模板（含 `routeTemplate` 与 `uiHints`）。
+成功：200 `{drivers:{chat,image,audio},categories,items}`，返回服务端已实现的协议驱动枚举及数据库中按 `sortOrder` 排序的全部动态快捷配置模板（含 `routeTemplate` 与 `uiHints`）。
 
 错误：见共同约定。
 

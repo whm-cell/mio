@@ -81,6 +81,8 @@ chat `adaptation.metadata.inputModalities` 是部署声明的输入类型，缺�
 
 图片候选另以 `image: {adaptation,parameters,enabled,runnable,unavailableReason}` 返回图片生效适配、生图参数边界和本地资格，`profile` 标识生效原厂驱动（`openai-images`、`volcengine-ark-images`、`vidu-images`、`kling-images`）；原有顶层 adaptation、protocol 和 runnable 保持 chat 含义。当存在有效且就绪（`asyncReady`）的 `image.generate` 生效路由时，`image.parameters` 直接由该路由规格在同一次只读查询内派生返回完整 `ImageParameterView`（含 `supportedOperations`、`requiresAsync`、`maxN`、`allowExplicitN`、`allowedSizes`、`defaultSize`、`allowCustomDimensions`、`allowedAspectRatios`、`maxReferenceImages`、`allowGenerateReferences`、`allowMaskPng`、`allowOutpaintGeometry`、`allowedQualities`、`allowedBackgrounds`、`allowedModerations`、`allowedOutputFormats`、`fixedOutputFormat`、`allowOutputCompression`、`allowWatermarkOverride`、`defaultWatermark`），便于 C 端界面按管理员配置的路由边界动态渲染生图选项；纯对话型号以及未适配或未就绪（`ADAPTER_PENDING`）的路由返回 `image.parameters = null`。图片 `adaptation.metadata.image` 由生效路由规格派生：`modes` 必须包含 `generate`，可声明 `edit`、`mask:{format:"png"}`、供应商参考图能力 `references:{maxImages}`（`1..16`）、`geometry:{unit:"pixels",edges:["left","top","right","bottom"]}` 和 `async:{operations,maxQueries,maxAgeSeconds}`；`outpaint` 必须同时声明 geometry，async operations 必须属于 modes，省略这些字段不推断能力。异步驱动（`vidu-images`、`kling-images`）仅在具备 generate async 规格与合法相对查询模板时 `runnable=true`，原样发送该成员的精确 modelId（`kling-images` 可按路由区分标准 `/kling/v1/images/generations` 与 Omni `/kling/v1/images/omni-image`）。`references.maxImages` 不是固定模型或图片容量策略。`parameters.async:true` 只有在当前生效路由显式声明 async capability 时受理。图片路由和本地资格不代表供应商已验证或实时可用；真实调用与远端 CI 仍分别记录。
 
+语音的标准配音、复刻与目录模型由[音频 API](audio.md)按操作读取。普通模型目录中的 `category=voice` 可用于分类浏览。语音准入要求本人当前凭据实际发现且有精确语音声明。
+
 错误：400 QUERY_INVALID；其余见共同约定。
 
 副作用：一条 SQL 一致读取本人目录/配置/受成员门控的平台路由/本人验证与偏好，不解密、不联网，不返回用户目录并集或静态名单。

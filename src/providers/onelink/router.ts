@@ -13,6 +13,8 @@ import type {
   ImageRouteConfig,
   ImageRouteParamSpec,
 } from '../../generations/contracts.ts';
+import { AUDIO_ROUTES, audioCapabilities, validAudioRoute } from './audio.ts';
+import { VOICE_DRIVER, VOICE_OPERATION, VOICE_PATH, validVoiceRoute } from './voices.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,
@@ -23,6 +25,7 @@ import {
 import type {
   AdaptationCapabilityMetadata,
   AdaptationSourceKind,
+  AudioDriver,
   Category,
   ChatProfile,
   ChatReasoningCapability,
@@ -30,6 +33,7 @@ import type {
   ImageParameterView,
   ChatImageBudget,
   PlatformRouteRecord,
+  ProviderOperation,
   VerificationRecord,
 } from '../contracts.ts';
 
@@ -104,9 +108,9 @@ export function deriveImageParameterView(route: ImageRouteConfig): ImageParamete
 export interface ValidatedModelRoute {
   readonly providerType: 'onelink';
   readonly rawModelId: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: ProviderOperation;
   readonly vendor: string;
-  readonly driver: ChatProfile | ImageDriver;
+  readonly driver: ChatProfile | ImageDriver | AudioDriver;
   readonly classification: Category;
   readonly submitPath: string;
   readonly editPath: string | null;
@@ -338,6 +342,37 @@ export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
       requestDefaults: {},
       outputSpec: {},
       capabilityMetadata: validateChatMetadata(value.capabilityMetadata),
+      sourceKind: value.sourceKind as AdaptationSourceKind,
+      source,
+      sourceVersion,
+      enabled,
+    };
+  }
+
+  if (
+    value.operation === 'audio.tts' ||
+    value.operation === 'audio.clone' ||
+    value.operation === VOICE_OPERATION
+  ) {
+    const listing = value.operation === VOICE_OPERATION;
+    if (listing ? !validVoiceRoute(value) : !validAudioRoute(value)) invalidRoute();
+    const route = listing
+      ? { driver: VOICE_DRIVER, path: VOICE_PATH }
+      : AUDIO_ROUTES[value.operation === 'audio.tts' ? 'tts' : 'clone'];
+    return {
+      providerType,
+      rawModelId,
+      operation: value.operation,
+      vendor: 'minimax',
+      driver: route.driver,
+      classification: 'voice',
+      submitPath: route.path,
+      editPath: null,
+      queryPathTemplate: null,
+      paramSpec: listing ? {} : { ...audioCapabilities(value.paramSpec)! },
+      requestDefaults: {},
+      outputSpec: {},
+      capabilityMetadata: {},
       sourceKind: value.sourceKind as AdaptationSourceKind,
       source,
       sourceVersion,
@@ -643,7 +678,7 @@ export function resolveImageRoute(row: PlatformRouteRecord): ResolvedImageRoute 
 
 export function resolveVerificationView(options: {
   verification: VerificationRecord | undefined;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   declarationVersion: number;
   profile: string;
   credentialVersion: number;

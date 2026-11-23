@@ -51,7 +51,11 @@ export class ObjectStore {
     if (pending) await within(() => pending, signal);
   }
 
-  async download(command: ComputeCommandV1, directory: string, signal: AbortSignal): Promise<void> {
+  async download(
+    command: Pick<ComputeCommandV1, 'input' | 'attemptId'>,
+    directory: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (signal.aborted) throw new Error('EXECUTION_TIMEOUT');
     const stream = this.#client.getObjectStream({
       Bucket: this.#bucket,

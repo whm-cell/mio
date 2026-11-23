@@ -35,6 +35,7 @@ import {
   makeChatRouteFixture,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { makeAudioRouteFixture } from '../providers/fixtures/onelink-audio-route.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -1434,4 +1435,87 @@ it('keeps the newest committed auth policy when PATCH responses complete out of 
     first.resolve(raceEnabledSettings);
     await service.close();
   }
+});
+
+it('manages voice operation templates and route revisions through the admin endpoints', async () => {
+  const modelId = `speech-admin-${randomUUID()}`;
+  const tts = makeAudioRouteFixture(modelId);
+  const routes = [
+    tts,
+    makeAudioRouteFixture(modelId, 'audio.voices.list'),
+    makeAudioRouteFixture(modelId, 'audio.clone'),
+  ];
+  const requestRoute = (body: unknown) =>
+    requestApi('/api/v1/admin/routes', 'POST', body, adminCookie);
+  const published = await requestRoute({ routes });
+  expect(published.status).toBe(200);
+  const { revisions } = (await published.json()) as {
+    revisions: { id: string; operation: string }[];
+  };
+  expect(revisions.map((revision) => revision.operation)).toEqual(
+    routes.map((route) => route.operation),
+  );
+  const info = () =>
+    requestApi(`/api/v1/admin/models?category=voice&q=${modelId}`, 'GET', undefined, adminCookie);
+  const rows = ((await (await info()).json()) as { items: { audioRoutes: unknown[] }[] }).items;
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.audioRoutes).toEqual(
+    expect.arrayContaining(
+      routes.map((route) =>
+        expect.objectContaining({
+          operation: route.operation,
+          enabled: true,
+          declarationVersion: 1,
+          verifiedUserCount: 0,
+        }),
+      ),
+    ),
+  );
+  const disabled = await requestRoute({ route: { ...tts, enabled: false } });
+  expect(await disabled.json()).toMatchObject({
+    revisions: [{ action: 'disable', declarationVersion: 2 }],
+  });
+  const rollback = await requestApi(
+    '/api/v1/admin/routes/rollback',
+    'POST',
+    { revisionId: revisions[0]!.id },
+    adminCookie,
+  );
+  expect(rollback.status).toBe(200);
+  expect(await rollback.json()).toMatchObject({ operation: 'audio.tts', declarationVersion: 3 });
+  const deleted = await requestApi(
+    '/api/v1/admin/routes',
+    'DELETE',
+    { rawModelId: modelId, operation: 'audio.clone' },
+    adminCookie,
+  );
+  expect(deleted.status).toBe(200);
+  const routeHistory = await requestApi(
+    `/api/v1/admin/revisions?rawModelId=${modelId}`,
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(await routeHistory.json()).toMatchObject({
+    routeRevisions: expect.arrayContaining([
+      expect.objectContaining({ operation: 'audio.tts', action: 'rollback' }),
+      expect.objectContaining({ operation: 'audio.clone', action: 'delete' }),
+    ]),
+  });
+  const routeTemplate: Record<string, unknown> = { ...tts };
+  delete routeTemplate.rawModelId;
+  const template = await requestApi(
+    '/api/v1/admin/templates',
+    'POST',
+    {
+      templateKey: 'voice-tts-fixture',
+      label: 'Speech fixture',
+      routeTemplate,
+    },
+    adminCookie,
+  );
+  expect(template.status).toBe(201);
+  expect(await template.json()).toMatchObject({
+    template: { operation: 'audio.tts', driver: 'minimax-tts' },
+  });
 });

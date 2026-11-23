@@ -23,6 +23,7 @@ vi.mock('../src/worker.ts', () => ({
     async waitIdle() {}
   },
 }));
+vi.mock('../src/audio-runtime.ts', () => ({ runAudioRuntime: async () => {} }));
 vi.mock('../src/maintenance.ts', () => ({
   Maintenance: class {
     async tick() {}

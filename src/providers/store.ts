@@ -1,3 +1,7 @@
+import { AudioError } from '../audio/contracts.ts';
+import { createAudioStore } from '../audio/jobs/store.ts';
+import { VoiceError } from '../audio/voices/contracts.ts';
+import { createVoiceStore } from '../audio/voices/store.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
@@ -9,6 +13,7 @@ import type {
   ProviderView,
   Category,
   PlatformRouteRecord,
+  ProviderOperation,
   RouteRevisionAction,
   RouteRevisionActor,
   VerificationSnapshot,
@@ -23,6 +28,7 @@ import {
   findCatalogModel,
   findModel,
   membershipError,
+  modelReference,
   resolveEffectiveChat,
   resolveEffectiveImage,
 } from './catalog.ts';
@@ -31,6 +37,7 @@ import {
   serializeRouteInputSnapshot,
   validateRouteImportPayload,
 } from './onelink/router.ts';
+import { resolveProviderAudioRoute, selectAudioModel } from './audio-admission.ts';
 
 const log = createLogger('app', 'provider-store');
 
@@ -49,7 +56,7 @@ export interface ModelPatch {
 export interface RouteRevisionResult {
   id: string;
   rawModelId: string;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   declarationVersion: number;
   action: RouteRevisionAction;
 }
@@ -62,12 +69,27 @@ export interface RouteImportSummary {
 }
 /** All mutations serialize on the configuration row; network calls run outside the transaction. */
 export class ProviderStore {
+  readonly voices: ReturnType<typeof createVoiceStore>;
+  readonly audio: ReturnType<typeof createAudioStore>;
   private readonly pool: Pool;
   private readonly config: ProviderConfig;
   private closing: Promise<void> | undefined;
   constructor(pool: Pool, config: ProviderConfig) {
     this.pool = pool;
     this.config = config;
+    const query = <Row extends object>(sql: string, values?: unknown[]) =>
+      pool.query<Row>(sql, values);
+    this.voices = createVoiceStore(query, Boolean(config.catalogWhitelist));
+    this.audio = createAudioStore(
+      query,
+      (action) =>
+        this.transaction((client) =>
+          action(<Row extends object>(sql: string, values?: unknown[]) =>
+            client.query<Row>(sql, values),
+          ),
+        ),
+      Boolean(config.catalogWhitelist),
+    );
   }
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -79,7 +101,9 @@ export class ProviderStore {
       return value;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      throw error instanceof ProviderError
+      throw error instanceof ProviderError ||
+        error instanceof VoiceError ||
+        error instanceof AudioError
         ? error
         : new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
     } finally {
@@ -458,7 +482,7 @@ export class ProviderStore {
   async deleteRoutes(
     rawModelId: string,
     actor: RouteRevisionActor,
-    operation?: 'chat' | 'image.generate',
+    operation?: ProviderOperation,
   ): Promise<RouteRevisionResult[]> {
     return this.transaction(async (client) => {
       const existingRows = (
@@ -597,6 +621,85 @@ export class ProviderStore {
       );
     });
   }
+  /** Records one independently reviewed system voice for one owner and exact TTS model. */
+  async registerSystemVoice(
+    input: {
+      ownerId: string;
+      modelRef: string;
+      upstreamId: string;
+      name: string;
+      evidence: string;
+    },
+    apply: boolean,
+  ) {
+    for (const [value, max] of [
+      [input.ownerId, 256],
+      [input.modelRef, 256],
+      [input.upstreamId, 256],
+      [input.name, 100],
+      [input.evidence, 500],
+    ] as const) {
+      if (
+        typeof value !== 'string' ||
+        !value.trim() ||
+        !value.isWellFormed() ||
+        Array.from(value).length > max ||
+        /[\x00-\x1f\x7f]/.test(value)
+      )
+        throw new VoiceError(HTTP_STATUS.BAD_REQUEST, 'VOICE_REGISTRATION_INVALID');
+    }
+    if (Buffer.byteLength(input.upstreamId) > 256)
+      throw new VoiceError(HTTP_STATUS.BAD_REQUEST, 'VOICE_REGISTRATION_INVALID');
+    const register = async (client: Pick<Pool, 'query'> | PoolClient) => {
+      const state = (await client.query<ProviderState>(providerStateSQL(false), [input.ownerId]))
+        .rows[0];
+      if (!state) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
+      const { model } = selectAudioModel(
+        state,
+        input.modelRef,
+        'tts',
+        Boolean(this.config.catalogWhitelist),
+      );
+      if (input.modelRef !== modelReference(model.model_key))
+        throw new VoiceError(HTTP_STATUS.BAD_REQUEST, 'VOICE_REGISTRATION_INVALID');
+      const existing = (
+        await client.query<{ id: string; registration_model_key: string | null }>(
+          `SELECT id,registration_model_key FROM mio_provider_voices
+         WHERE provider_id=$1 AND source='system' AND upstream_id=$2`,
+          [state.id, input.upstreamId],
+        )
+      ).rows[0];
+      if (existing?.registration_model_key && existing.registration_model_key !== model.model_key)
+        throw new VoiceError(HTTP_STATUS.CONFLICT, 'VOICE_REGISTRATION_MODEL_CONFLICT');
+      const result = {
+        modelRef: input.modelRef,
+        voiceRef: existing?.id ?? null,
+        exists: Boolean(existing),
+      };
+      if (!apply) return result;
+      const saved = await client.query<{ id: string }>(
+        `INSERT INTO mio_provider_voices (
+           provider_id,source,upstream_id,name,descriptions,seen_seq,registration_model_key,registration_evidence
+         ) VALUES ($1,'system',$2,$3,'[]'::jsonb,1,$4,$5)
+         ON CONFLICT(provider_id,source,upstream_id) DO UPDATE SET name=EXCLUDED.name,present=true,
+           registration_model_key=EXCLUDED.registration_model_key,
+           registration_evidence=EXCLUDED.registration_evidence,updated_at=now()
+         WHERE (mio_provider_voices.name,mio_provider_voices.present,
+                mio_provider_voices.registration_model_key,mio_provider_voices.registration_evidence)
+           IS DISTINCT FROM (EXCLUDED.name,true,EXCLUDED.registration_model_key,EXCLUDED.registration_evidence)
+         RETURNING id`,
+        [state.id, input.upstreamId, input.name.trim(), model.model_key, input.evidence.trim()],
+      );
+      return { ...result, voiceRef: saved.rows[0]?.id ?? existing!.id };
+    };
+    return apply
+      ? this.transaction(async (client) => {
+          await this.locked(client, input.ownerId);
+          return register(client);
+        })
+      : register(this.pool);
+  }
+
   /** Only an observed successful runtime call may mark the exact tested tuple; old references stay visible. */
   async recordVerification(
     owner: string,
@@ -618,7 +721,14 @@ export class ProviderStore {
       const effective =
         snapshot.operation === 'chat'
           ? resolveEffectiveChat(state, model)
-          : resolveEffectiveImage(state, model);
+          : snapshot.operation === 'image.generate'
+            ? resolveEffectiveImage(state, model)
+            : resolveProviderAudioRoute(
+                state,
+                model,
+                snapshot.operation,
+                Boolean(this.config.catalogWhitelist),
+              );
       if (
         !effective ||
         effective.declarationVersion !== snapshot.adaptationVersion ||

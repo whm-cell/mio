@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import {
+  audioResultPolicy,
   computeCapacity,
   computePermissions,
   computeTopology,
@@ -71,6 +72,7 @@ const testEnv = {
   MIO_LOCAL_RABBITMQ_B_PASSWORD: 'fixture-b-password',
 };
 const policyPath = 'operator-policies/mio-test/mio-capacity';
+const audioPolicyPath = `operator-policies/mio-test/${audioResultPolicy.name}`;
 const testPolicy = {
   pattern: '.*',
   definition: computeCapacity,
@@ -84,7 +86,7 @@ const userMetadata = {
 };
 
 function brokerFixture(beforeWrite?: () => Promise<void>) {
-  const values = new Map<string, unknown>();
+  const values = new Map<string, unknown>([[audioPolicyPath, audioResultPolicy.definition]]);
   const writes: string[] = [];
   vi.stubGlobal(
     'fetch',
@@ -246,13 +248,14 @@ it('lists prerequisites removed during declarations when a role login also fails
   expect(writes).toEqual(computeTopology('mio-test').map(({ path }) => path));
 });
 
-it('preserves retired image resources and only prepares the heavy-media topology', async () => {
+it('preserves retired image resources when the current topology already matches', async () => {
   vi.spyOn(ComputeBroker, 'connect').mockResolvedValue({
     close: async () => {},
   } as unknown as ComputeBroker);
 
   const state = new Map<string, unknown>();
   state.set('vhosts/mio-test', { name: 'mio-test' });
+  state.set(audioPolicyPath, audioResultPolicy.definition);
   state.set('operator-policies/mio-test/mio-capacity', {
     pattern: '.*',
     definition: computeCapacity,
@@ -279,16 +282,12 @@ it('preserves retired image resources and only prepares the heavy-media topology
   state.set('permissions/mio-test/mio-test-a', {
     user: 'mio-test-a',
     vhost: 'mio-test',
-    configure: '^$',
-    write: '^mio\\.compute\\.commands\\.v1$',
-    read: '^mio\\.compute\\.results\\.v1$',
+    ...computePermissions('a'),
   });
   state.set('permissions/mio-test/mio-test-b', {
     user: 'mio-test-b',
     vhost: 'mio-test',
-    configure: '^$',
-    write: '^mio\\.compute\\.results\\.v1$',
-    read: '^mio\\.compute\\.commands\\.v1$',
+    ...computePermissions('b'),
   });
 
   const mutations: { method: string; path: string; body: unknown }[] = [];
@@ -360,4 +359,24 @@ it('rejects non-legacy Role B permission drift with LOCAL_BROKER_CONFLICT before
     }),
   ).rejects.toThrow('LOCAL_BROKER_CONFLICT: permissions/mio-test/mio-test-b');
   expect(new Set(methods)).toEqual(new Set(['GET']));
+});
+
+it('leaves the new stream absent until its own scoped retention policy exists', async () => {
+  const { values, writes } = brokerFixture();
+  values.set('vhosts/mio-test', {});
+  values.set(policyPath, testPolicy);
+  values.delete(audioPolicyPath);
+  provisionTestRoles(values);
+  vi.spyOn(ComputeBroker, 'connect').mockResolvedValue({
+    close: async () => {},
+  } as ComputeBroker);
+
+  await expect(prepareLocalBroker('test', testEnv)).rejects.toThrow(
+    `LOCAL_BROKER_PREPROVISION_REQUIRED: ${audioPolicyPath}`,
+  );
+  expect(writes.some((path) => path.endsWith('/mio.compute.results.v1'))).toBe(true);
+  expect(writes.some((path) => path.endsWith('/mio.compute.audio.results.v1'))).toBe(false);
+  values.set(audioPolicyPath, audioResultPolicy.definition);
+  await prepareLocalBroker('test', testEnv);
+  expect(writes.filter((path) => path.endsWith('/mio.compute.audio.results.v1'))).toHaveLength(2);
 });

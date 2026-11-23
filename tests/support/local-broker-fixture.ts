@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import {
+  audioResultPolicy,
   computeCapacity,
   computePermissions,
   computeTopology,
@@ -12,7 +13,16 @@ const run = promisify(execFile);
 const image =
   'rabbitmq:4.4.0-management@sha256:af6f50d38098d8bd52fef7f3fa85015dd8b2bf6def58e995bf584ae9ba0f6407';
 
+type QueueDefinition = {
+  name: string;
+  type: string;
+  arguments: [name: string, type: string, value: unknown][];
+  operator_policy: string;
+  effective_policy_definition: Record<string, unknown>;
+};
+
 type TestBroker = {
+  queueDefinitions: () => Promise<QueueDefinition[]>;
   appBrokerUrl: string;
   workerBrokerUrl: string;
   userA: string;
@@ -221,9 +231,37 @@ export async function withLocalTestBroker<T>(
       '.*',
       JSON.stringify(computeCapacity),
     ]);
+    const retention = audioResultPolicy.definition;
+    await ctl([
+      'set_operator_policy',
+      '--vhost',
+      vhost,
+      '--priority',
+      String(retention.priority),
+      '--apply-to',
+      retention['apply-to'],
+      audioResultPolicy.name,
+      retention.pattern,
+      JSON.stringify(retention.definition),
+    ]);
     // The import only contains queues, exchanges, bindings and permissions in the owned vhost.
     await ctl(['import_definitions', '/dev/stdin'], testDefinitions(vhost, users));
     result = await exercise({
+      async queueDefinitions() {
+        const output = await ctl([
+          '--formatter=json',
+          'list_queues',
+          '--vhost',
+          vhost,
+          'name',
+          'type',
+          'arguments',
+          'operator_policy',
+          'effective_policy_definition',
+        ]);
+        assert(output);
+        return JSON.parse(output) as QueueDefinition[];
+      },
       appBrokerUrl: amqpUrl(a),
       workerBrokerUrl: amqpUrl(b),
       userA: a.name,

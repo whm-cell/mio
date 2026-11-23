@@ -8,6 +8,7 @@ import * as ToolTimeout from '@deepseek-ai/dsh-tool-call-timeout-policy';
 import type { ConversationEvent } from '../conversations/contracts.ts';
 import { ConversationCompaction } from './conversation-compaction.ts';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
+import { parseAudioJobPresentationMeta } from './audio-tools.ts';
 import type {} from './kernel.ts';
 
 export const CHECKPOINT_INTERRUPTED = 'MIO_CHECKPOINT_INTERRUPTED';
@@ -74,7 +75,9 @@ export function trackConversationToolCheckpoints(
       event.data.message.isError
     )
       return;
-    const card = parseImageJobPresentationMeta(event.data.meta);
+    const card =
+      parseImageJobPresentationMeta(event.data.meta) ??
+      parseAudioJobPresentationMeta(event.data.meta);
     if (!card) return;
     // Session event observers are synchronous. Start the write after native
     // routing has enqueued the result, then wait at the next step.
@@ -85,7 +88,7 @@ export function trackConversationToolCheckpoints(
         return;
       }
       try {
-        emit({ type: 'tool', requestId, tool: card.tool, job: card.job });
+        emit({ type: 'tool', requestId, ...card });
       } catch {
         // Delivery is independent of the committed result.
       }

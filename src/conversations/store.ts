@@ -1,14 +1,21 @@
+import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createId } from '@mio/foundation/identifiers';
 import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { checkConversationSchema } from './schema.ts';
-import { ConversationError, isInFlightRequest, outputTruncation } from './contracts.ts';
+import {
+  ConversationError,
+  emptyAudioSelection,
+  isInFlightRequest,
+  outputTruncation,
+} from './contracts.ts';
 import { encodeConversationCursor } from './cursor.ts';
 import type { ConversationCursor } from './cursor.ts';
 import type {
   Conversation,
+  AudioSelection,
   ConversationArchive,
   ConversationPurpose,
   ConversationSnapshot,
@@ -40,6 +47,7 @@ export interface ConversationRow {
   active_request: string | null;
   model_binding: ChatSelection | null;
   purpose: ConversationPurpose;
+  audio_selection: AudioSelection | null;
   reasoning_effort: ChatReasoningEffort | null;
   forked_from_conversation_id: string | null;
   forked_until_seq: string | null;
@@ -75,7 +83,10 @@ export const projectConversation = (row: ConversationRow): Conversation => ({
   title: row.title,
   state: row.state,
   ...(row.model_binding ? { modelRef: row.model_binding.modelRef } : {}),
-  ...(row.purpose === 'drama-script' ? { purpose: row.purpose } : {}),
+  ...(row.purpose === 'general' ? {} : { purpose: row.purpose }),
+  ...(row.purpose === 'audio'
+    ? { audioSelection: row.audio_selection ?? emptyAudioSelection }
+    : {}),
   ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
   ...(row.forked_from_conversation_id
     ? {
@@ -313,11 +324,49 @@ export class ConversationStore {
     this.assertActive();
     return this.readOwned(actor, id);
   }
-  async list(actor: Principal, cursor: ConversationCursor | undefined, limit: number) {
+  async selectAudioVoice(
+    actor: Principal,
+    id: string,
+    voiceRef: string,
+    expectedRevision: number,
+    resolve: (voiceRef: string) => Promise<{ voiceRef: string; name: string }>,
+    requestId?: string,
+  ): Promise<AudioSelection> {
+    return this.transaction(async (client) => {
+      const row = await this.readOwned(actor, id, client);
+      requireUnarchived(row);
+      if (row.state !== 'ready')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+      if (row.purpose !== 'audio')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'AUDIO_CONTEXT_NOT_ALLOWED');
+      if (row.active_request !== (requestId ?? null))
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+      const previous = row.audio_selection ?? emptyAudioSelection;
+      if (previous.revision !== expectedRevision)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'AUDIO_SELECTION_CONFLICT');
+      const selected = await resolve(voiceRef);
+      if (selected.voiceRef === previous.voiceRef && selected.name === previous.name)
+        return previous;
+      const selection = { ...selected, revision: previous.revision + 1 };
+      await client.query('UPDATE mio_conversations SET audio_selection=$2::jsonb WHERE id=$1', [
+        id,
+        JSON.stringify(selection),
+      ]);
+      return selection;
+    });
+  }
+  async list(
+    actor: Principal,
+    cursor: ConversationCursor | undefined,
+    limit: number,
+    purpose?: 'audio',
+  ) {
     this.assertActive();
+    const purposeFilter = purpose === 'audio' ? "purpose='audio'" : "purpose<>'audio'";
     if (cursor?.kind === 'legacy') {
       const { rows } = await this.pool.query<ConversationRow>(
-        'SELECT * FROM mio_conversations WHERE owner_id=$1 AND archived_at IS NULL AND id>$2::uuid ORDER BY id LIMIT $3',
+        `SELECT * FROM mio_conversations WHERE owner_id=$1 AND archived_at IS NULL AND ${purposeFilter}
+         AND id>$2::uuid ORDER BY id LIMIT $3`,
         [actor.userId, cursor.id, limit + 1],
       );
       return {
@@ -329,7 +378,7 @@ export class ConversationStore {
     if (cursor) args.push(cursor.updatedAt, cursor.id);
     const { rows } = await this.pool.query<ConversationRow & { cursor_time: string }>(
       `SELECT *, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
-       FROM mio_conversations WHERE owner_id=$1 AND archived_at IS NULL
+       FROM mio_conversations WHERE owner_id=$1 AND archived_at IS NULL AND ${purposeFilter}
        ${cursor ? 'AND (updated_at, id) < ($3::timestamptz, $4::uuid)' : ''}
        ORDER BY updated_at DESC, id DESC LIMIT $2`,
       args,
@@ -368,8 +417,12 @@ export class ConversationStore {
   async snapshot(actor: Principal, id: string): Promise<ConversationSnapshot> {
     this.assertActive();
     const row = (
-      await this.pool.query<{ active_request: string | null; latest: ReceiptRow | null }>(
-        `SELECT c.active_request, row_to_json(r) AS latest
+      await this.pool.query<
+        Pick<ConversationRow, 'active_request' | 'purpose' | 'audio_selection'> & {
+          latest: ReceiptRow | null;
+        }
+      >(
+        `SELECT c.active_request, c.purpose, c.audio_selection, row_to_json(r) AS latest
          FROM mio_conversations c
          LEFT JOIN LATERAL (
            SELECT ${receiptColumns}
@@ -384,6 +437,9 @@ export class ConversationStore {
     return {
       conversationId: id,
       activeRequestId: row.active_request,
+      ...(row.purpose === 'audio'
+        ? { audioSelection: row.audio_selection ?? emptyAudioSelection }
+        : {}),
       receipt: row.latest && receipt(row.latest),
     };
   }
@@ -393,6 +449,7 @@ export class ConversationStore {
     requestId: string,
     digest: string,
     resolveFresh: (row: Readonly<ConversationRow>) => Promise<RequestModelSnapshot | undefined>,
+    resolveAudio?: (row: Readonly<ConversationRow>) => Promise<FrozenAudioContext | undefined>,
   ) {
     return this.transaction(async (client) => {
       const row = await this.readOwned(actor, id, client);
@@ -407,6 +464,7 @@ export class ConversationStore {
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
       this.assertActive();
       const snapshot = await resolveFresh(row);
+      const audioContext = await resolveAudio?.(row);
       // Only explicit non-secret fields may cross the persistence boundary.
       const binding = snapshot
         ? {
@@ -429,16 +487,22 @@ export class ConversationStore {
         : null;
       const accepted = (
         await client.query<ReceiptRow>(
-          `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding)
-           VALUES($1,$2,$3,'accepted',$4::jsonb) RETURNING ${receiptColumns}`,
-          [id, requestId, digest, binding ? JSON.stringify(binding) : null],
+          `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding,audio_context)
+           VALUES($1,$2,$3,'accepted',$4::jsonb,$5::jsonb) RETURNING ${receiptColumns}`,
+          [
+            id,
+            requestId,
+            digest,
+            binding ? JSON.stringify(binding) : null,
+            audioContext ? JSON.stringify(audioContext) : null,
+          ],
         )
       ).rows[0]!;
       await client.query('UPDATE mio_conversations SET active_request=$2 WHERE id=$1', [
         id,
         requestId,
       ]);
-      return { row, receipt: receipt(accepted), fresh: true, snapshot };
+      return { row, receipt: receipt(accepted), fresh: true, snapshot, audioContext };
     });
   }
   async observe(id: string, requestId: string, observation: ModelObservation): Promise<void> {

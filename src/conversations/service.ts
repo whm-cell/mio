@@ -2,11 +2,19 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { sha256Utf8 } from '@mio/foundation/hash';
-import { ConversationError, isInFlightRequest, outputTruncation } from './contracts.ts';
+import {
+  ConversationError,
+  emptyAudioSelection,
+  isInFlightRequest,
+  outputTruncation,
+} from './contracts.ts';
+import { audioAction, canonicalAudioContext, freezeConversationAudio } from './audio-context.ts';
 import type {
   CaptureContextUsage,
   ContextUsage,
   Conversation,
+  ConversationAudioTools,
+  ConversationAudioTurn,
   ConversationEngine,
   ConversationEvent,
   ConversationImageReference,
@@ -53,6 +61,7 @@ export function createConversationService(
     Partial<Pick<ProviderService, 'chatContextWindow' | 'selectChatRoute'>>,
   vision?: ConversationVision,
   resolveProjectContext?: ConversationProjectContextResolver,
+  audio?: ConversationAudioTools,
 ) {
   const pending = new Map<string, Promise<void>>();
   const receiving = new Map<string, Promise<Receipt>>();
@@ -118,9 +127,10 @@ export function createConversationService(
     requestId: string,
     digest: string,
     resolveFresh: Parameters<ConversationStore['receive']>[4],
+    resolveAudio?: Parameters<ConversationStore['receive']>[5],
   ) => {
     try {
-      return await store.receive(actor, id, requestId, digest, resolveFresh);
+      return await store.receive(actor, id, requestId, digest, resolveFresh, resolveAudio);
     } catch (error) {
       if (!(error instanceof ConversationError) && !pending.has(`${id}:${requestId}`)) {
         try {
@@ -228,7 +238,31 @@ export function createConversationService(
     void running.finally(() => pending.delete(key));
     return accepted;
   };
+  const selectAudioVoice = (
+    actor: Principal,
+    id: string,
+    voiceRef: string,
+    revision: number,
+    requestId?: string,
+  ) =>
+    admit(async () => {
+      const selection = await store.selectAudioVoice(
+        actor,
+        id,
+        voiceRef,
+        revision,
+        (ref) => {
+          if (!providers || !audio)
+            throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'AUDIO_UNAVAILABLE');
+          return audioAction(() => audio.resolveVoice(actor, ref));
+        },
+        requestId,
+      );
+      publish(id, { type: 'audio-selection', conversationId: id, selection });
+      return selection;
+    });
   return {
+    selectAudioVoice,
     create(
       actor: Principal,
       modelRef?: string,
@@ -236,6 +270,8 @@ export function createConversationService(
       reasoningEffort?: ChatReasoningEffort,
     ): Promise<Conversation> {
       return admit(async () => {
+        if (purpose === 'audio' && (!providers || !audio))
+          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'AUDIO_UNAVAILABLE');
         if (!providers) {
           requireReasoning(undefined, reasoningEffort);
           if (modelRef)
@@ -317,9 +353,14 @@ export function createConversationService(
         });
       });
     },
-    list: (actor: Principal, after: ConversationCursor | undefined, limit: number) => {
+    list: (
+      actor: Principal,
+      after: ConversationCursor | undefined,
+      limit: number,
+      purpose?: 'audio',
+    ) => {
       check();
-      return store.list(actor, after, limit);
+      return store.list(actor, after, limit, purpose);
     },
     rename: (actor: Principal, id: string, title: string) =>
       admit(() => store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title))),
@@ -371,20 +412,28 @@ export function createConversationService(
       text: string,
       imageAssetIds: string[] = [],
       reasoningEffort?: ChatReasoningEffort,
+      audioContext?: unknown,
     ) {
       const ids = [...imageAssetIds];
+      const rawAudio = audioContext === undefined ? undefined : canonicalAudioContext(audioContext);
       const digest =
-        reasoningEffort !== undefined
-          ? `reasoning:v1:${sha256Utf8(JSON.stringify([text, ids, reasoningEffort]))}`
-          : ids.length
-            ? `vision:v1:${sha256Utf8(JSON.stringify([text, ids]))}`
-            : sha256Utf8(text);
+        rawAudio !== undefined
+          ? `audio:v1:${sha256Utf8(JSON.stringify([text, ids, reasoningEffort ?? null, rawAudio]))}`
+          : reasoningEffort !== undefined
+            ? `reasoning:v1:${sha256Utf8(JSON.stringify([text, ids, reasoningEffort]))}`
+            : ids.length
+              ? `vision:v1:${sha256Utf8(JSON.stringify([text, ids]))}`
+              : sha256Utf8(text);
       return receiveInOrder(actor, id, requestId, async () => {
         const images: ConversationImageReference[] = [];
         let preflight: ChatRuntimeSnapshot | undefined;
         if (ids.length) {
           const { row, replay } = await store.existing(actor, id, requestId, digest);
           if (replay) return replay;
+          if (row.purpose === 'audio')
+            throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_NOT_ALLOWED');
+          if (rawAudio !== undefined)
+            throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'AUDIO_CONTEXT_NOT_ALLOWED');
           if (preparingImages >= IMAGE_PREPARATION_CONCURRENCY)
             throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
           preparingImages++;
@@ -435,46 +484,89 @@ export function createConversationService(
           }
         }
         let projectContext: string | undefined;
-        const received = await receive(actor, id, requestId, digest, async (row) => {
-          const effort = reasoningEffort ?? row.reasoning_effort ?? undefined;
-          let snapshot: ChatRuntimeSnapshot | undefined;
-          if (providers) {
-            if (!row.model_binding)
-              throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
-            snapshot = await providerAction(() => providers.resolveChat(actor, row.model_binding!));
-            requireReasoning(snapshot, effort);
-            if (images.length && !snapshot.inputModalities?.includes('image'))
-              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-            if (
-              preflight &&
-              (snapshot.providerConfigId !== preflight.providerConfigId ||
-                snapshot.modelId !== preflight.modelId ||
-                snapshot.adaptationVersion !== preflight.adaptationVersion ||
-                JSON.stringify(snapshot.imageBudget) !== JSON.stringify(preflight.imageBudget))
-            )
-              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
-          } else {
-            requireReasoning(undefined, effort);
-            if (images.length)
-              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-            if (row.model_binding || !engine.available)
-              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
-          }
-          if (row.purpose === 'drama-script' && resolveProjectContext)
-            projectContext = await loadConversationProjectContext(resolveProjectContext, {
-              ownerId: row.owner_id,
-              conversationId: row.id,
-              signal: admissionStop.signal,
-            });
-          return snapshot && effort !== undefined
-            ? Object.freeze({ ...snapshot, reasoningEffort: effort })
-            : snapshot;
-        });
+        const received = await receive(
+          actor,
+          id,
+          requestId,
+          digest,
+          async (row) => {
+            if (row.purpose !== 'audio' && rawAudio !== undefined)
+              throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'AUDIO_CONTEXT_NOT_ALLOWED');
+            if (row.purpose === 'audio' && (!providers || !audio))
+              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'AUDIO_UNAVAILABLE');
+            const effort = reasoningEffort ?? row.reasoning_effort ?? undefined;
+            let snapshot: ChatRuntimeSnapshot | undefined;
+            if (providers) {
+              if (!row.model_binding)
+                throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
+              snapshot = await providerAction(() =>
+                providers.resolveChat(actor, row.model_binding!),
+              );
+              requireReasoning(snapshot, effort);
+              if (images.length && !snapshot.inputModalities?.includes('image'))
+                throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+              if (
+                preflight &&
+                (snapshot.providerConfigId !== preflight.providerConfigId ||
+                  snapshot.modelId !== preflight.modelId ||
+                  snapshot.adaptationVersion !== preflight.adaptationVersion ||
+                  JSON.stringify(snapshot.imageBudget) !== JSON.stringify(preflight.imageBudget))
+              )
+                throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
+            } else {
+              requireReasoning(undefined, effort);
+              if (images.length)
+                throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+              if (row.model_binding || !engine.available)
+                throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+            }
+            if (row.purpose === 'drama-script' && resolveProjectContext)
+              projectContext = await loadConversationProjectContext(resolveProjectContext, {
+                ownerId: row.owner_id,
+                conversationId: row.id,
+                signal: admissionStop.signal,
+              });
+            return snapshot && effort !== undefined
+              ? Object.freeze({ ...snapshot, reasoningEffort: effort })
+              : snapshot;
+          },
+          async (row) => {
+            if (row.purpose === 'audio')
+              return freezeConversationAudio(
+                audio!,
+                actor,
+                text,
+                row.audio_selection,
+                rawAudio ?? {},
+              );
+          },
+        );
         if (!received.fresh) return received.receipt;
         const nativeId = received.row.dsh_session_id;
         const snapshot = received.snapshot;
         const binding =
           snapshot && bindRun(actor, id, nativeId, requestId, snapshot, snapshot.reasoningEffort);
+        let audioSelection = received.row.audio_selection ?? emptyAudioSelection;
+        const audioTurn: ConversationAudioTurn | undefined =
+          received.audioContext === undefined
+            ? undefined
+            : {
+                userId: actor.userId,
+                conversationId: id,
+                requestId,
+                audioContext: received.audioContext,
+                audioSelection,
+                async selectAudioVoice(voiceRef) {
+                  audioSelection = await selectAudioVoice(
+                    actor,
+                    id,
+                    voiceRef,
+                    audioSelection.revision,
+                    requestId,
+                  );
+                  return audioSelection;
+                },
+              };
         let retryActivity: (() => Promise<void>) | undefined;
         return startRequest(
           actor,
@@ -505,6 +597,7 @@ export function createConversationService(
               capture,
               {
                 purpose: received.row.purpose,
+                ...(audioTurn ? { audio: audioTurn } : {}),
                 ...(projectContext !== undefined ? { projectContext } : {}),
               },
             ),

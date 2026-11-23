@@ -45,6 +45,12 @@ import { createProviderHandler } from './providers/http.ts';
 import { AssetError } from './assets/contracts.ts';
 import { readAssetConfig } from './assets/config.ts';
 import { createAssetStore } from './assets/store.ts';
+import type { AssetStore } from './assets/store.ts';
+import type { AssetObjectStore } from './assets/contracts.ts';
+import { createAudioHandler } from './audio/http.ts';
+import { createAudioJobService } from './audio/jobs/service.ts';
+import type { AudioJobService } from './audio/jobs/service.ts';
+import { createAudioMediaClient } from './audio/media.ts';
 import { createAssetService } from './assets/service.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
@@ -193,6 +199,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let generations: GenerationService | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let audio: AudioJobService | undefined;
+    let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
     const verifyAvatarAsset = async (
       identity: { userId: string; sessionId: string },
@@ -214,7 +222,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
       try {
-        const acquired = (assets = createAssetService(store, createCosStorage(assetConfig)));
+        const objects = createCosStorage(assetConfig);
+        assetResources = { store, objects };
+        const acquired = (assets = createAssetService(store, objects));
         vision = createConversationVision((owner, id, expected, signal) =>
           acquired.readVisionSource(owner, id, expected, signal),
         );
@@ -223,6 +233,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             closeMioResources(
               () => conversations?.close(),
               () => materials?.close(),
+              () => audio?.close(),
               () => acquired.close(),
             ),
         );
@@ -273,6 +284,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       providers = createProviderService(store, providerConfig);
       const ownedProviders = providers;
       try {
+        if (computeConfig && assetResources) {
+          audio = createAudioJobService(
+            ownedProviders.audioStore,
+            ownedProviders,
+            assetResources.objects,
+            createAudioMediaClient(computeConfig),
+            assetResources.store,
+          );
+        }
+        const ownedAudio = audio;
         // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
         ctx.effect(
           () => () =>
@@ -281,6 +302,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => conversations?.close(),
               () => generations?.close(),
               () => materials?.close(),
+              () => ownedAudio?.close(),
               () => ownedProviders.close(),
             ),
         );
@@ -291,8 +313,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             handler: createProviderHandler(ownedProviders, auth.identity, authConfig.origins),
           }),
         );
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/audio',
+            handler: createAudioHandler(
+              ownedProviders,
+              auth.identity,
+              authConfig.origins,
+              ownedAudio,
+            ),
+          }),
+        );
       } catch (error) {
-        await ownedProviders.close();
+        await closeMioResources(
+          () => audio?.close(),
+          () => ownedProviders.close(),
+        );
         throw error;
       }
     }
@@ -433,6 +470,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           'systemPrompt',
         ],
         async apply(conversationCtx: Context) {
+          const audioTools = conversationConfig.byok ? audio : undefined;
           let acquired: ConversationService | undefined;
           let http: ReturnType<typeof createConversationHandler> | undefined;
           // Keep the plugin on the parent's retained service scope. A child with its
@@ -497,6 +535,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     conversationConfig,
                     imageTools,
                     vision,
+                    audioTools,
                   ),
                   providers,
                   vision,
@@ -504,6 +543,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     const resolve = conversationCtx.get('mioConversationProjectContext');
                     return resolve ? resolve(lookup) : null;
                   },
+                  audioTools,
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,

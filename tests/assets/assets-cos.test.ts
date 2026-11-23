@@ -75,6 +75,11 @@ it('uses the official SDK to bind PUT length and host and signs a private attach
   expect(download.protocol).toBe('https:');
   expect(download.searchParams.get('response-content-disposition')).toBe('attachment');
   expect(download.searchParams.get('q-signature')).toBeTruthy();
+  const playback = new URL(storage.audioPlaybackUrl!('mio/raw/example/attempt', 'audio/mpeg'));
+  expect(playback.pathname).toBe(download.pathname);
+  expect(playback.searchParams.get('response-content-disposition')).toBe('inline');
+  expect(playback.searchParams.get('response-content-type')).toBe('audio/mpeg');
+  expect(playback.searchParams.get('q-signature')).toBeTruthy();
 });
 
 it('passes conditional copy and non-overwrite headers to the official SDK', async () => {

@@ -47,13 +47,29 @@ export function membershipError(
   },
   model?: ModelRecord,
   whitelist = false,
+  allowUndiscovered = true,
+): string | null {
+  return catalogMembershipError(
+    row,
+    model,
+    findCatalogModel(row.catalog_models, model?.raw_model_id),
+    whitelist,
+    allowUndiscovered,
+  );
+}
+
+export function catalogMembershipError(
+  row: ProviderRow,
+  model: ModelRecord | undefined,
+  catalogModel: PlatformCatalogModelRecord | undefined,
+  whitelist: boolean,
+  allowUndiscovered: boolean,
 ): string | null {
   if (!row.enabled) return 'PROVIDER_DISABLED';
   if (row.credential_auth_state === 'rejected') return 'PROVIDER_AUTH_REJECTED';
   if (row.catalog_version === null || row.catalog_credential_version !== row.credential_version)
     return 'MODEL_CATALOG_NOT_DISCOVERED';
   if (!model) return 'MODEL_NOT_FOUND';
-  const catalogModel = findCatalogModel(row.catalog_models, model.raw_model_id);
   if (whitelist) {
     if (!catalogModel || !catalogModel.user_visible) return 'MODEL_HIDDEN';
   } else if (catalogModel && !catalogModel.user_visible) {
@@ -65,6 +81,7 @@ export function membershipError(
     model.credential_version === row.credential_version &&
     model.catalog_version === row.catalog_version;
   const curatedAllowed =
+    allowUndiscovered &&
     model.metadata_source === 'admin-curated-hidden' &&
     Boolean(catalogModel?.allow_undiscovered) &&
     Boolean(catalogModel?.user_visible);

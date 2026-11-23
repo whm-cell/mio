@@ -1,4 +1,11 @@
 import type { Pool } from 'pg';
+import { audioSchemaSQL, checkAudioSchema } from '../audio/jobs/schema.ts';
+import { voiceSchemaSQL, checkVoiceSchema } from '../audio/voices/schema.ts';
+import {
+  checkProviderOperations,
+  providerOperationCheck,
+  upgradeProviderOperationSQL,
+} from './operation-schema.ts';
 import { legacyProviderUpgradeSQL } from './schema-migration.ts';
 export { providerReferencesSQL } from './schema-migration.ts';
 
@@ -68,7 +75,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_routes (
   raw_model_id text COLLATE "C" NOT NULL
     CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   vendor text NOT NULL
     CHECK (char_length(vendor) BETWEEN 1 AND 64 AND vendor ~ '^[a-z0-9-]+$'),
   driver text NOT NULL
@@ -126,7 +133,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
   provider_id uuid NOT NULL,
   model_key uuid NOT NULL,
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   declaration_version integer NOT NULL
     CHECK (declaration_version > 0),
   driver text NOT NULL
@@ -139,6 +146,8 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
   PRIMARY KEY (provider_id, model_key, operation),
   FOREIGN KEY (provider_id, model_key) REFERENCES mio_provider_models(provider_id, model_key)
 );
+${upgradeProviderOperationSQL('mio_provider_model_routes')}
+${upgradeProviderOperationSQL('mio_provider_model_verifications')}
 ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin;
 DO $$ BEGIN
   IF NOT EXISTS (
@@ -224,7 +233,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
   raw_model_id text COLLATE "C" NOT NULL
     CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   declaration_version integer NOT NULL
     CHECK (declaration_version >= 1),
   action text NOT NULL
@@ -245,6 +254,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
     OR (action <> 'delete' AND after_route IS NOT NULL AND jsonb_typeof(after_route) = 'object')
   )
 );
+${upgradeProviderOperationSQL('mio_provider_model_route_revisions')}
 ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
 DO $$
 DECLARE
@@ -290,6 +300,8 @@ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_lookup
   ON mio_provider_model_route_revisions (provider_type, raw_model_id, operation, created_at DESC);
+${voiceSchemaSQL}
+${audioSchemaSQL}
 `;
 
 export async function checkProviderSchema(
@@ -297,6 +309,13 @@ export async function checkProviderSchema(
   _images = false,
 ): Promise<void> {
   void _images;
+  await checkProviderOperations(pool, [
+    'mio_provider_model_routes',
+    'mio_provider_model_verifications',
+    'mio_provider_model_route_revisions',
+  ]);
+  await checkVoiceSchema(pool);
+  await checkAudioSchema(pool);
   for (const [sql, types] of [
     [
       'SELECT id,credential_version,catalog_version,catalog_credential_version,catalog_succeeded_at,latest_refresh_seq,last_attempt_seq,last_attempt_credential_version,last_attempt_started_at,last_attempt_finished_at,last_attempt_status,last_attempt_error_code,credential_auth_state FROM mio_provider_configs LIMIT 0',
@@ -351,6 +370,10 @@ export async function checkProviderSchema(
     ['mio_provider_model_verifications', ['provider_id', 'model_key', 'operation']],
     ['mio_provider_catalog_models', ['provider_type', 'raw_model_id']],
     ['mio_provider_model_route_revisions', ['id']],
+    ['mio_provider_voice_catalogs', ['provider_id']],
+    ['mio_provider_voices', ['id']],
+    ['mio_audio_jobs', ['id']],
+    ['mio_audio_records', ['id']],
   ] as const) {
     const pk = await pool.query<{
       unique: boolean;

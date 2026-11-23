@@ -13,6 +13,19 @@ export interface ProviderPrincipal {
 }
 export const categories = ['chat', 'image', 'video', 'voice', 'music'] as const;
 export type Category = (typeof categories)[number];
+export const providerOperations = [
+  'chat',
+  'image.generate',
+  'audio.voices.list',
+  'audio.tts',
+  'audio.clone',
+] as const;
+export type ProviderOperation = (typeof providerOperations)[number];
+export type AudioDriver = 'minimax-voices' | 'minimax-tts' | 'minimax-clone';
+
+export function isProviderOperation(value: unknown): value is ProviderOperation {
+  return providerOperations.some((operation) => operation === value);
+}
 export class ProviderError extends HttpError {}
 export interface Discovery {
   credentialVersion: number;
@@ -158,7 +171,7 @@ export interface ModelRecord {
 export interface PlatformRouteRecord {
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   vendor: string;
   driver: string;
   classification: Category;
@@ -178,7 +191,7 @@ export interface PlatformRouteRecord {
 export interface VerificationRecord {
   provider_id: string;
   model_key: string;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   declaration_version: number;
   driver: string;
   verification_status: 'unverified' | 'verified';
@@ -221,7 +234,7 @@ export interface PlatformRouteRevisionRecord {
   id: string;
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   declaration_version: number;
   action: RouteRevisionAction;
   actor_type: 'admin' | 'cli';
@@ -236,9 +249,9 @@ export interface PlatformRouteRevisionRecord {
 export interface ModelRouteInput {
   providerType?: 'onelink';
   rawModelId: string;
-  operation: 'chat' | 'image.generate';
+  operation: ProviderOperation;
   vendor: string;
-  driver: ChatProfile | ImageDriver;
+  driver: ChatProfile | ImageDriver | AudioDriver;
   classification: Category;
   submitPath: string;
   editPath?: string | null;
@@ -259,7 +272,7 @@ export interface VerificationSnapshot {
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
   readonly modelKey: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: ProviderOperation;
   readonly profile: string;
 }
 

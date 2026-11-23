@@ -1,5 +1,10 @@
 import type { Pool } from 'pg';
 
+const purposeCheck = `(purpose = ANY (ARRAY['general'::text, 'drama-script'::text, 'audio'::text]))`;
+const currentPurposeConstraint = `conrelid='mio_conversations'::regclass
+  AND conname='mio_conversations_purpose_check' AND contype='c' AND convalidated
+  AND pg_get_expr(conbin,conrelid) = $purpose$${purposeCheck}$purpose$`;
+
 /** Local metadata; message content remains solely in native DSH logs. */
 export const conversationSchemaSQL = `
 CREATE TABLE IF NOT EXISTS mio_conversations (
@@ -32,7 +37,17 @@ ALTER TABLE mio_conversations
 CREATE INDEX IF NOT EXISTS mio_conversations_owner_activity_page
   ON mio_conversations(owner_id, updated_at DESC, id DESC) WHERE archived_at IS NULL;
 ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'general'
-  CHECK (purpose IN ('general', 'drama-script'));
+  CHECK (purpose IN ('general', 'drama-script', 'audio'));
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_constraint WHERE ${currentPurposeConstraint}) THEN
+    ALTER TABLE mio_conversations DROP CONSTRAINT IF EXISTS mio_conversations_purpose_check,
+      ADD CONSTRAINT mio_conversations_purpose_check CHECK (purpose IN ('general', 'drama-script', 'audio'));
+  END IF;
+END $$;
+ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS audio_selection jsonb
+  CHECK (audio_selection IS NULL OR jsonb_typeof(audio_selection)='object');
+ALTER TABLE mio_conversation_requests ADD COLUMN IF NOT EXISTS audio_context jsonb
+  CHECK (audio_context IS NULL OR jsonb_typeof(audio_context)='object');
 ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS reasoning_effort text
   CHECK (reasoning_effort IN ('low', 'medium', 'high'));
 ALTER TABLE mio_conversations
@@ -49,17 +64,22 @@ export async function checkConversationSchema(database: Pick<Pool, 'query'>): Pr
   for (const [table, columns, types] of [
     [
       'mio_conversations',
-      'id,owner_id,dsh_session_id,created_at,state,active_request,model_binding,title,title_pinned,updated_at,archived_at,purpose,reasoning_effort,forked_from_conversation_id,forked_until_seq,fork_request_id,fork_requested_until_seq',
-      [2950, 25, 25, 1184, 25, 25, 3802, 25, 16, 1184, 1184, 25, 25, 2950, 20, 25, 20],
+      'id,owner_id,dsh_session_id,created_at,state,active_request,model_binding,title,title_pinned,updated_at,archived_at,purpose,reasoning_effort,forked_from_conversation_id,forked_until_seq,fork_request_id,fork_requested_until_seq,audio_selection',
+      [2950, 25, 25, 1184, 25, 25, 3802, 25, 16, 1184, 1184, 25, 25, 2950, 20, 25, 20, 3802],
     ],
     [
       'mio_conversation_requests',
-      'conversation_id,request_id,digest,status,error_code,created_at,updated_at,model_binding,model_observations,truncation_reason',
-      [2950, 25, 25, 25, 25, 1184, 1184, 3802, 3802, 25],
+      'conversation_id,request_id,digest,status,error_code,created_at,updated_at,model_binding,model_observations,truncation_reason,audio_context',
+      [2950, 25, 25, 25, 25, 1184, 1184, 3802, 3802, 25, 3802],
     ],
   ] as const) {
     const result = await database.query(`SELECT ${columns} FROM ${table} LIMIT 0`);
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('CONVERSATION_SCHEMA: incompatible metadata columns');
   }
+  const result = await database.query<{ valid: boolean }>(
+    `SELECT EXISTS(SELECT FROM pg_constraint WHERE ${currentPurposeConstraint}) AS valid`,
+  );
+  if (!result.rows[0]?.valid)
+    throw new Error('CONVERSATION_SCHEMA: conversation purpose constraint required');
 }

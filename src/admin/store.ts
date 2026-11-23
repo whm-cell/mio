@@ -4,6 +4,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { utcISOString } from '@mio/foundation/time';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
+import type { AuthRuntimePolicy, AuthSmsMode } from '../auth/config.ts';
 import type { DiscoveredModel } from '../integrations/onelink/models.ts';
 import type {
   Category,
@@ -14,7 +15,7 @@ import type {
 } from '../providers/contracts.ts';
 import { checkProviderSchema } from '../providers/schema.ts';
 import type { AdminConfig } from './config.ts';
-import { AdminError } from './contracts.ts';
+import { AdminError, SMS_BYPASS_CODE_PATTERN, isAuthSmsMode } from './contracts.ts';
 import type {
   AdminAccountView,
   AdminAuditLogRecord,
@@ -23,6 +24,7 @@ import type {
   AdminRevisionsView,
   AdminRouteTemplateUiHints,
   AdminRouteTemplateView,
+  AdminStoredAuthSettings,
   MonitoringWindow,
   ProbeConfigView,
   UnifiedModelRawSources,
@@ -77,6 +79,51 @@ type CatalogModelDbRow = Omit<PlatformCatalogModelRecord, 'created_at' | 'update
   created_at: Date;
   updated_at: Date;
 };
+
+interface GlobalSettingsRow {
+  setting_key: string;
+  value: Record<string, unknown>;
+  revision: number;
+  updated_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function parseStoredAuthPolicy(value: Record<string, unknown>): AuthRuntimePolicy {
+  const smsMode: AuthSmsMode = isAuthSmsMode(value.smsMode) ? value.smsMode : 'live';
+  const smsBypassCode =
+    typeof value.smsBypassCode === 'string' && SMS_BYPASS_CODE_PATTERN.test(value.smsBypassCode)
+      ? value.smsBypassCode
+      : null;
+  return {
+    emailPasswordEnabled:
+      typeof value.emailPasswordEnabled === 'boolean' ? value.emailPasswordEnabled : true,
+    smsMode,
+    smsBypassCode,
+  };
+}
+
+function toStoredAuthSettings(row: GlobalSettingsRow): AdminStoredAuthSettings {
+  return {
+    auth: parseStoredAuthPolicy(row.value),
+    revision: row.revision,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function maskBypassCode(code: string | null): string | null {
+  return code ? `${code.slice(0, 2)}****` : null;
+}
+
+function toAuditAuthState(policy: AuthRuntimePolicy, revision: number): Record<string, unknown> {
+  return {
+    emailPasswordEnabled: policy.emailPasswordEnabled,
+    smsMode: policy.smsMode,
+    smsBypassCodeMasked: maskBypassCode(policy.smsBypassCode),
+    revision,
+  };
+}
 
 function toAccountView(row: AdminAccountRow): AdminAccountView {
   return {
@@ -165,6 +212,7 @@ async function materializeCuratedModelForActiveProviders(
 }
 
 export class AdminStore {
+  readonly initialAuthSettings: AdminStoredAuthSettings | null;
   private readonly pool: Pool;
   private readonly conversationsPool: Pool | null;
   private readonly ownsConversationsPool: boolean;
@@ -176,11 +224,13 @@ export class AdminStore {
     conversationsPool: Pool | null,
     ownsConversationsPool: boolean,
     mediaPool: Pool | null,
+    initialAuthSettings: AdminStoredAuthSettings | null = null,
   ) {
     this.pool = pool;
     this.conversationsPool = conversationsPool;
     this.ownsConversationsPool = ownsConversationsPool;
     this.mediaPool = mediaPool;
+    this.initialAuthSettings = initialAuthSettings;
   }
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -1639,6 +1689,86 @@ export class AdminStore {
     };
   }
 
+  async readGlobalAuthSettings(): Promise<AdminStoredAuthSettings | null> {
+    const row = (
+      await this.pool.query<GlobalSettingsRow>(
+        "SELECT setting_key, value, revision, updated_by, created_at, updated_at FROM mio_admin_global_settings WHERE setting_key = 'auth'",
+      )
+    ).rows[0];
+    return row ? toStoredAuthSettings(row) : null;
+  }
+
+  async updateGlobalAuthSettings(
+    actor: AdminAccountView,
+    input: {
+      expectedRevision: number;
+      auth: AuthRuntimePolicy;
+    },
+  ): Promise<AdminStoredAuthSettings> {
+    return this.transaction(async (client) => {
+      const serializedValue = JSON.stringify({
+        emailPasswordEnabled: input.auth.emailPasswordEnabled,
+        smsMode: input.auth.smsMode,
+        smsBypassCode: input.auth.smsBypassCode,
+      });
+      let beforeState: Record<string, unknown> | null = null;
+      let updatedRow: GlobalSettingsRow | undefined;
+
+      if (input.expectedRevision === 0) {
+        updatedRow = (
+          await client.query<GlobalSettingsRow>(
+            `INSERT INTO mio_admin_global_settings (setting_key, value, revision, updated_by)
+             VALUES ('auth', $1::jsonb, 1, $2)
+             ON CONFLICT (setting_key) DO NOTHING
+             RETURNING setting_key, value, revision, updated_by, created_at, updated_at`,
+            [serializedValue, actor.username],
+          )
+        ).rows[0];
+        if (!updatedRow) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+      } else {
+        const existing = (
+          await client.query<Pick<GlobalSettingsRow, 'value' | 'revision'>>(
+            "SELECT value, revision FROM mio_admin_global_settings WHERE setting_key = 'auth' FOR UPDATE",
+          )
+        ).rows[0];
+        if (!existing || existing.revision !== input.expectedRevision) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+        beforeState = toAuditAuthState(parseStoredAuthPolicy(existing.value), existing.revision);
+        updatedRow = (
+          await client.query<GlobalSettingsRow>(
+            `UPDATE mio_admin_global_settings
+             SET value = $1::jsonb, revision = revision + 1, updated_by = $2, updated_at = now()
+             WHERE setting_key = 'auth' AND revision = $3
+             RETURNING setting_key, value, revision, updated_by, created_at, updated_at`,
+            [serializedValue, actor.username, input.expectedRevision],
+          )
+        ).rows[0];
+        if (!updatedRow) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+      }
+
+      const saved = toStoredAuthSettings(updatedRow);
+      await client.query(
+        `INSERT INTO mio_admin_audit_logs (
+           id, actor_id, actor_name, action, target_id, summary, before_state, after_state
+         ) VALUES ($1, $2, $3, 'settings.global.update', 'auth', $4, $5::jsonb, $6::jsonb)`,
+        [
+          createId(),
+          actor.id,
+          actor.username,
+          `Updated global auth settings (emailPassword=${saved.auth.emailPasswordEnabled}, smsMode=${saved.auth.smsMode}, rev=${saved.revision})`,
+          beforeState ? JSON.stringify(beforeState) : null,
+          JSON.stringify(toAuditAuthState(saved.auth, saved.revision)),
+        ],
+      );
+      return saved;
+    });
+  }
+
   close(): Promise<void> {
     if (!this.closing) {
       this.closing = (async () => {
@@ -1664,6 +1794,12 @@ export async function createAdminStore(config: AdminConfig): Promise<AdminStore>
   try {
     await checkProviderSchema(pool);
     await checkAdminSchema(pool);
+    const initialAuthRow = (
+      await pool.query<GlobalSettingsRow>(
+        "SELECT setting_key, value, revision, updated_by, created_at, updated_at FROM mio_admin_global_settings WHERE setting_key = 'auth'",
+      )
+    ).rows[0];
+    const initialAuthSettings = initialAuthRow ? toStoredAuthSettings(initialAuthRow) : null;
     if (config.conversationsDatabaseURL) {
       if (config.conversationsDatabaseURL === config.databaseURL) {
         conversationsPool = pool;
@@ -1675,7 +1811,13 @@ export async function createAdminStore(config: AdminConfig): Promise<AdminStore>
     if (config.mediaDatabaseURL) {
       mediaPool = createManagedPool(config.mediaDatabaseURL, 'mio-admin-media', 2);
     }
-    return new AdminStore(pool, conversationsPool, ownsConversationsPool, mediaPool);
+    return new AdminStore(
+      pool,
+      conversationsPool,
+      ownsConversationsPool,
+      mediaPool,
+      initialAuthSettings,
+    );
   } catch (error) {
     await Promise.allSettled([
       pool.end(),

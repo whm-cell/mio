@@ -10,6 +10,7 @@ import { probeRabbitmqMetrics } from '../integrations/rabbitmq-monitor.ts';
 import type { RedisMonitorSnapshot } from '../integrations/redis.ts';
 import { probeRedisMetrics } from '../integrations/redis.ts';
 import { hashAdminPassword, verifyAdminPassword } from '../auth/admin-password.ts';
+import type { AuthRuntimePolicy } from '../auth/config.ts';
 import type { ProviderConfig } from '../providers/config.ts';
 import { CHAT_PROFILES, ProviderError, categories } from '../providers/contracts.ts';
 import type { Category, PlatformRouteRecord } from '../providers/contracts.ts';
@@ -18,15 +19,18 @@ import {
   validateModelRouteEntry,
 } from '../providers/onelink/router.ts';
 import type { ProviderService } from '../providers/service.ts';
-import { AdminError } from './contracts.ts';
+import { AdminError, SMS_BYPASS_CODE_PATTERN, isAuthSmsMode } from './contracts.ts';
 import type {
   AdminAccountView,
+  AdminAuthRuntimeDefaults,
   AdminCatalogSummary,
   AdminDiscoveryCandidateItem,
+  AdminGlobalSettingsView,
   AdminModelCatalogItem,
   AdminPrincipal,
   AdminProbeDiscoveryResult,
   AdminRouteTemplateUiHints,
+  AdminStoredAuthSettings,
   MonitoringWindow,
 } from './contracts.ts';
 import { decryptProbeKey, encryptProbeKey, maskProbeKeyHint } from './credentials.ts';
@@ -36,7 +40,53 @@ const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,64}$/;
 const TEMPLATE_KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/;
 const VENDOR_LABEL_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AUTH_SETTINGS_KEYS = ['emailPasswordEnabled', 'smsMode', 'smsBypassCode'] as const;
+const MAX_PG_INT32 = 2_147_483_647;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function validateGlobalSettingsUpdate(input: { expectedRevision?: unknown; auth?: unknown }): {
+  expectedRevision: number;
+  auth: AuthRuntimePolicy;
+} {
+  if (
+    typeof input.expectedRevision !== 'number' ||
+    !Number.isSafeInteger(input.expectedRevision) ||
+    input.expectedRevision < 0 ||
+    input.expectedRevision > MAX_PG_INT32
+  ) {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  if (!isPlainObject(input.auth)) {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  for (const key of Object.keys(input.auth)) {
+    if (!(AUTH_SETTINGS_KEYS as readonly string[]).includes(key)) {
+      throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+    }
+  }
+  const { emailPasswordEnabled, smsMode, smsBypassCode } = input.auth;
+  if (typeof emailPasswordEnabled !== 'boolean' || !isAuthSmsMode(smsMode)) {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  if (smsMode === 'bypass') {
+    if (typeof smsBypassCode !== 'string' || !SMS_BYPASS_CODE_PATTERN.test(smsBypassCode)) {
+      throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+    }
+  } else if (
+    smsBypassCode !== null &&
+    (typeof smsBypassCode !== 'string' || !SMS_BYPASS_CODE_PATTERN.test(smsBypassCode))
+  ) {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  return {
+    expectedRevision: input.expectedRevision,
+    auth: {
+      emailPasswordEnabled,
+      smsMode,
+      smsBypassCode: smsBypassCode as string | null,
+    },
+  };
+}
 
 export interface AdminMonitorProbes {
   readonly probeRabbitmq?: () => Promise<RabbitmqMonitorSnapshot>;
@@ -298,11 +348,41 @@ export function createAdminService(
   providerConfig: ProviderConfig,
   transport?: ModelTransport,
   monitors?: AdminMonitorProbes,
+  authRuntimeDefaults?: AdminAuthRuntimeDefaults,
 ) {
   const cancellation = new AbortController();
   const activeProbes = new Set<Promise<AdminProbeDiscoveryResult>>();
   let dummyHashPromise: Promise<string> | undefined;
   let closing: Promise<void> | undefined;
+
+  const defaults: AdminAuthRuntimeDefaults = {
+    emailPasswordEnabled: authRuntimeDefaults?.emailPasswordEnabled ?? true,
+    smsProviderConfigured: authRuntimeDefaults?.smsProviderConfigured ?? false,
+  };
+  const defaultAuthPolicy = (): AuthRuntimePolicy => ({
+    emailPasswordEnabled: defaults.emailPasswordEnabled,
+    smsMode: 'live',
+    smsBypassCode: null,
+  });
+  let currentAuthPolicy: AuthRuntimePolicy = store.initialAuthSettings
+    ? { ...store.initialAuthSettings.auth }
+    : defaultAuthPolicy();
+  let currentAuthRevision = store.initialAuthSettings?.revision ?? 0;
+
+  const formatGlobalSettingsView = (
+    stored: AdminStoredAuthSettings | null,
+  ): AdminGlobalSettingsView => ({
+    settings: stored ?? {
+      auth: defaultAuthPolicy(),
+      revision: 0,
+      updatedBy: null,
+      updatedAt: null,
+    },
+    runtime: {
+      envEmailPasswordDefault: defaults.emailPasswordEnabled,
+      smsProviderConfigured: defaults.smsProviderConfigured,
+    },
+  });
 
   const runRabbitmqProbe = monitors?.probeRabbitmq ?? (() => probeRabbitmqMetrics(undefined));
   const runRedisProbe = monitors?.probeRedis ?? (() => probeRedisMetrics(undefined));
@@ -1068,6 +1148,34 @@ export function createAdminService(
         rabbitmq,
         redis,
       };
+    },
+
+    getAuthPolicy(): AuthRuntimePolicy {
+      return currentAuthPolicy;
+    },
+
+    async getGlobalSettings(): Promise<AdminGlobalSettingsView> {
+      assertOpen();
+      const stored = await store.readGlobalAuthSettings();
+      if ((stored?.revision ?? 0) >= currentAuthRevision) {
+        currentAuthPolicy = stored ? { ...stored.auth } : defaultAuthPolicy();
+        currentAuthRevision = stored?.revision ?? 0;
+      }
+      return formatGlobalSettingsView(stored);
+    },
+
+    async updateGlobalSettings(
+      principal: AdminPrincipal,
+      input: { expectedRevision?: unknown; auth?: unknown },
+    ): Promise<AdminGlobalSettingsView> {
+      assertOpen();
+      const validated = validateGlobalSettingsUpdate(input);
+      const saved = await store.updateGlobalAuthSettings(principal.admin, validated);
+      if (saved.revision >= currentAuthRevision) {
+        currentAuthPolicy = { ...saved.auth };
+        currentAuthRevision = saved.revision;
+      }
+      return formatGlobalSettingsView(saved);
     },
 
     close() {

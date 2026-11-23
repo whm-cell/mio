@@ -8,7 +8,7 @@
 
 所有写入请求（`POST`、`PUT`、`PATCH`、`DELETE`）必须携带允许列表内的精确 `Origin`（合并 `MIO_AUTH_ALLOWED_ORIGINS`、`MIO_AUTH_BASE_URL` 与可选 `MIO_ADMIN_ALLOWED_ORIGINS`）；携带正文的写入接口要求 `application/json`，常规接口上限 16384 字节，路由与模板写入上限 65536 字节，批量模型导入上限 262144 字节，读取期限均为 10 秒。`GET` 提供 `Origin` 时也须匹配。`OPTIONS` 预检无需登录但须匹配允许的 `Origin`。修改类入口在读取完请求体后重新核验管理员会话仍然有效。
 
-所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`。
+所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`。
 
 ## POST /api/v1/admin/auth/login
 
@@ -256,7 +256,7 @@
 
 输入：可选查询参数 `rawModelId`、`limit`（1 至 100，默认 50）。
 
-成功：200 `{routeRevisions,auditLogs}`，按时间倒序返回路由版本快照与模型/模板/账号管理审计。
+成功：200 `{routeRevisions,auditLogs}`，按时间倒序返回路由版本快照与模型/模板/账号/全局配置管理审计（全局配置审计仅保存脱敏后的 `smsBypassCodeMasked`，绝不含固定验证码明文）。
 
 错误：400 `QUERY_INVALID`；其余见共同约定。
 
@@ -273,3 +273,27 @@
 错误：400 `QUERY_INVALID`；其余见共同约定。
 
 副作用：执行有界只读聚合与隔离监控探针，不输出提示词、用户隐私、业务键值、API Key 或签名 URL。
+
+## GET /api/v1/admin/settings/global
+
+身份：当前登录管理员。
+
+输入：无查询参数。
+
+成功：200 `{settings:{auth:{emailPasswordEnabled,smsMode,smsBypassCode},revision,updatedBy,updatedAt},runtime:{envEmailPasswordDefault,smsProviderConfigured}}`。当 `mio_admin_global_settings` 尚无 `'auth'` 记录时，返回 `revision:0`、`emailPasswordEnabled:envEmailPasswordDefault`、`smsMode:'live'`、`smsBypassCode:null`、`updatedBy:null`、`updatedAt:null`。`runtime` 返回启动环境默认开关与当前进程是否配置腾讯短信供应商。
+
+错误：见共同约定。
+
+副作用：读取数据库中的全局认证配置并同步刷新服务内存策略快照，不修改数据库且不联网。
+
+## PATCH /api/v1/admin/settings/global
+
+身份：当前登录管理员；读取请求体后重新核验管理员会话仍然有效。
+
+输入：`{expectedRevision,auth:{emailPasswordEnabled,smsMode,smsBypassCode}}`，严格拒绝额外字段。`expectedRevision` 为非负整数；`auth.emailPasswordEnabled` 为布尔值；`auth.smsMode` 为 `'live' | 'bypass' | 'disabled'`；当 `smsMode='bypass'` 时 `auth.smsBypassCode` 必须为 6 位数字字符串（`/^\d{6}$/`），其他模式下允许为 `null` 或 6 位数字字符串。
+
+成功：200，返回结构与 `GET /api/v1/admin/settings/global` 相同；首次写入后 `revision` 为 `1`，后续每次成功更新递增 `1`。
+
+错误：输入非法为 400 `ADMIN_INPUT_INVALID`；`expectedRevision` 与数据库当前版本不一致为 409 `SETTINGS_CONFLICT`；其余见共同约定。
+
+副作用：在单事务内按乐观锁写入 `mio_admin_global_settings` 并记录 `action='settings.global.update'`、`target_id='auth'` 的审计日志（`summary`、`before_state` 与 `after_state` 均绝不写入 `smsBypassCode` 明文，仅以 `smsBypassCodeMasked` 保存前两位加 `****` 或 `null`）；事务提交后立即热更新内存认证策略快照，无需重启服务即可作用于下一次认证请求（详见[认证 HTTP 契约](auth.md)）。

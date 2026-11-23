@@ -1,12 +1,19 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { readBody } from '../http-request.ts';
+import { readBody, readJsonBody } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import { parseProfilePatch } from './account.ts';
 import { AUTH_BASE_PATH } from './config.ts';
-import type { AuthConfig } from './config.ts';
+import type { AuthConfig, AuthPolicyReader } from './config.ts';
 import type { Authentication } from './service.ts';
 import { wechatCallbackURL } from './wechat-input.ts';
+
+export type AvatarAssetStatus = 'ok' | 'not_found' | 'not_ready' | 'invalid_type' | 'unavailable';
+export type AvatarAssetVerifier = (
+  identity: { userId: string; sessionId: string },
+  assetId: string,
+) => Promise<AvatarAssetStatus>;
 
 const AUTH_BODY_LIMIT_BYTES = 16 * 1024;
 const WECHAT_BRIDGE_PARAM = 'mio_bridge';
@@ -17,6 +24,12 @@ const BRIDGE_BODY = Buffer.from(
   `<!doctype html><meta charset="utf-8"><script>${BRIDGE_SCRIPT}</script>`,
 );
 const BRIDGE_CSP = `default-src 'none'; script-src 'sha256-${createHash('sha256').update(BRIDGE_SCRIPT).digest('base64')}'; frame-ancestors 'self'`;
+
+const emailPasswordPaths = new Set([
+  `${AUTH_BASE_PATH}/sign-up/email`,
+  `${AUTH_BASE_PATH}/sign-in/email`,
+  `${AUTH_BASE_PATH}/change-password`,
+]);
 
 const routes = new Map([
   ['/sign-up/email', 'POST'],
@@ -76,9 +89,66 @@ function hasNonEmptyCookie(header: string | undefined, name: string): boolean {
   return false;
 }
 
+async function handleProfileRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  headers: Headers,
+  auth: Authentication,
+  fail: (status: number, code: string) => void,
+  verifyAvatarAsset?: AvatarAssetVerifier,
+): Promise<void> {
+  if (request.method === 'GET') {
+    const identity = await auth.identity(headers);
+    if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+    const profile = await auth.profile(identity.userId);
+    if (!profile) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+    response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(profile));
+    return;
+  }
+  const body = await readJsonBody(request, AUTH_BODY_LIMIT_BYTES);
+  const identity = await auth.identity(headers);
+  if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+  const patch = parseProfilePatch(body);
+  if (!patch) return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
+  if (patch.avatarAssetId) {
+    if (!verifyAvatarAsset) return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+    const assetStatus = await verifyAvatarAsset(identity, patch.avatarAssetId);
+    if (assetStatus === 'not_found') return fail(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+    if (assetStatus === 'not_ready') return fail(HTTP_STATUS.CONFLICT, 'ASSET_NOT_READY');
+    if (assetStatus === 'invalid_type') return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
+    if (assetStatus === 'unavailable')
+      return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+  }
+  const updated = await auth.updateProfile(identity.userId, patch);
+  if (!updated) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+  response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(updated));
+}
+
+function allowedMethodsFor(pathname: string, qrPoll: boolean): readonly string[] | undefined {
+  if (pathname === '/api/v1/me' || qrPoll) return ['GET'];
+  if (pathname === '/api/v1/me/profile') return ['GET', 'PATCH'];
+  if (!pathname.startsWith(`${AUTH_BASE_PATH}/`)) return undefined;
+  const method = routes.get(pathname.slice(AUTH_BASE_PATH.length));
+  return method ? [method] : undefined;
+}
+
 /** Bound browser-facing auth endpoints; future provider/plugin routes are not exposed implicitly. */
-export function createAuthHandler(config: AuthConfig, auth: Authentication) {
+export function createAuthHandler(
+  config: AuthConfig,
+  auth: Authentication,
+  verifyAvatarAsset?: AvatarAssetVerifier,
+  getPolicy?: AuthPolicyReader,
+) {
   const allowed = new Set(config.origins);
+  const readPolicy: AuthPolicyReader =
+    getPolicy ??
+    (() => ({
+      emailPasswordEnabled: config.emailPasswordEnabled,
+      smsMode: 'live',
+      smsBypassCode: null,
+    }));
   const stateCookieName = config.baseURL.startsWith('https:') ? '__Secure-mio.state' : 'mio.state';
   const wechatCallbackPath = `${AUTH_BASE_PATH}/callback/wechat`;
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -107,30 +177,29 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
       ].includes(pathname) ||
       qrCreate ||
       qrPoll;
-    const method =
-      pathname === '/api/v1/me' || qrPoll
-        ? 'GET'
-        : routes.get(pathname.slice(AUTH_BASE_PATH.length));
-    if (!method) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+    const allowedMethods = allowedMethodsFor(pathname, qrPoll);
+    if (!allowedMethods) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+    const allowHeader = `${allowedMethods.join(', ')}, OPTIONS`;
     if (request.method === 'OPTIONS') {
       if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
       response.writeHead(HTTP_STATUS.NO_CONTENT, {
-        'access-control-allow-methods': `${method}, OPTIONS`,
+        'access-control-allow-methods': allowHeader,
         'access-control-allow-headers': 'Content-Type',
       });
       response.end();
       return;
     }
-    if (request.method !== method) {
-      response.setHeader('allow', `${method}, OPTIONS`);
+    const method = request.method;
+    if (!method || !allowedMethods.includes(method)) {
+      response.setHeader('allow', allowHeader);
       return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
     }
-    if (method === 'POST' && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-    if (
-      method === 'POST' &&
-      request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
-    )
+    const isMutation = method === 'POST' || method === 'PATCH';
+    if (isMutation && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+    if (isMutation && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
       return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
+    if (emailPasswordPaths.has(pathname) && !readPolicy().emailPasswordEnabled)
+      return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'EMAIL_PASSWORD_UNAVAILABLE');
     if (wechatRoute && !config.wechat)
       return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'WECHAT_UNAVAILABLE');
     try {
@@ -172,6 +241,10 @@ export function createAuthHandler(config: AuthConfig, auth: Authentication) {
         if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
         response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
         response.end(JSON.stringify(identity));
+        return;
+      }
+      if (pathname === '/api/v1/me/profile') {
+        await handleProfileRequest(request, response, headers, auth, fail, verifyAvatarAsset);
         return;
       }
       let body =

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "identity": "docs/tasks/legacy-migration/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/legacy-migration/prd.md"
+    }
+  ]
+}

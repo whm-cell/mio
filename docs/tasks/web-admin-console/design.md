@@ -7,7 +7,7 @@
 1. **后端插件服务（`mio` 仓库）**：
    - `src/auth/admin-password.ts`：在 `src/auth/` 边界内封装 `better-auth/crypto` 的 `hashPassword` 与 `verifyPassword`，供 `src/admin/` 与初始化 CLI 复用。
    - `src/providers/`：持有平台模型主表 `mio_provider_catalog_models` 与路由修订历史表 `mio_provider_model_route_revisions`（平台模型真值 100% 收敛至 `mio_provider_catalog_models` + `mio_provider_model_routes`；迁移先幂等回填历史 `mio_provider_model_policies` 与 `mio_provider_model_adaptations` 再删除两张历史表，并移除 `mio_provider_models` 已废弃的 `classification` / `classification_source` 列）。当 `MIO_ADMIN_ENABLED=true`（或显式 `MIO_PROVIDERS_CATALOG_WHITELIST=true`）时，在单条 `providerStateSQL` 快照读取与准入链路中开启平台白名单总控；并通过 `ImageParameterView`（`contracts.ts`）与 `deriveImageParameterView(route)`（`onelink/router.ts`）在 C 端 `catalogView`（`items[].image.parameters`）中以 `O(1)` 投影管理员配置的生图路由参数边界，同时在 `service.ts` 的 `listImageModels` 复用派生逻辑。
-   - `src/admin/`：持有管理员账号与会话（`mio_admin_accounts`、`mio_admin_sessions`）、动态协议快捷模板（`mio_admin_route_templates`、`mio_admin_seed_history`）、上游探测缓存与忽略名单（`mio_admin_catalog_models`、`mio_admin_ignored_models`）、加密探测凭据（`mio_admin_probe_configs`）及操作审计（`mio_admin_audit_logs`）。
+   - `src/admin/`：持有管理员账号与会话（`mio_admin_accounts`、`mio_admin_sessions`）、动态协议快捷模板（`mio_admin_route_templates`、`mio_admin_seed_history`）、上游探测缓存与忽略名单（`mio_admin_catalog_models`、`mio_admin_ignored_models`）、加密探测凭据（`mio_admin_probe_configs`）、全局运行时配置（`mio_admin_global_settings`）及操作审计（`mio_admin_audit_logs`）。
    - `src/integrations/redis.ts` 与 `src/integrations/rabbitmq-monitor.ts`：分别提供物理隔离于业务主连接的 Redis 只读探针 `probeRedisMetrics` 与 RabbitMQ Management HTTP 只读探针 `probeRabbitmqMetrics`。
 2. **独立管理前端（同级 `mio-admin-web` 工程）**：
    - 采用 Vite + React + TypeScript + Tailwind CSS + Lucide Icons，前后端生产源码零硬编码模型清单或快捷模板；所有协议模板、推荐尺寸/比例与支持驱动列表均实时从 `/api/v1/admin/templates` 动态读取。
@@ -32,6 +32,14 @@
 
 - `POST /api/v1/admin/onelink/discover` 使用内存临时 Key 或加密保存的探测 Key 拉取上游 `/v1/models`，仅刷新候选快照缓存 `mio_admin_catalog_models` 并对照 `mio_provider_catalog_models` 与 `mio_admin_ignored_models` 返回每项的 `importState`（`new | existing | ignored`），**不自动向平台模型主表插入未确认模型**。
 - 管理员在前端勾选所需型号后调用 `POST /api/v1/admin/models/import` 正式入库；删除模型时若勾选 `ignoreFutureImports: true`，该 ID 记入 `mio_admin_ignored_models`，后续重新探测时自动归入 `ignored` 分组且默认不勾选。
+
+### 2.4 全局配置热更新与边界隔离（`admin-global-settings`）
+
+- **`mio_admin_global_settings`**（`MIO_PROVIDERS_DATABASE_URL`）：
+  - 主键 `setting_key text CHECK (setting_key = 'auth')`，`value jsonb CHECK (jsonb_typeof(value) = 'object')`，乐观锁 `revision integer DEFAULT 1 CHECK (revision >= 1)`，`updated_by`、`created_at`、`updated_at`。
+  - **启动水合与内存热生效**：`createAdminStore` 在 `checkAdminSchema` 之后同步预读已有 `'auth'` 行至 `store.initialAuthSettings`，`createAdminService` 构造时即完成内存 `AuthRuntimePolicy` 水合；`src/plugin.ts` 通过窄只读回调 `getAuthPolicy` 将策略注入 `createAuthentication` 与 `createAuthHandler`，并确保 `AUTH_BASE_PATH` 路由在 `admin` 完成水合后注册，保持 `src/auth/*` 绝不导入 `src/admin/*`。未启用管理后台时回退至 `MIO_AUTH_EMAIL_PASSWORD_ENABLED` 与 `smsMode: 'live'`。
+  - **严格校验、并发控制与脱敏审计**：`PATCH /api/v1/admin/settings/global` 在单事务内按 `expectedRevision` 执行乐观锁写入（`0` 走 `INSERT ... ON CONFLICT DO NOTHING`，`>0` 走 `SELECT ... FOR UPDATE` + `UPDATE ... WHERE revision = $3`，冲突抛 `409 SETTINGS_CONFLICT`），同事务写入 `action = 'settings.global.update'`、`target_id = 'auth'` 的审计日志，且仅记录 `smsBypassCodeMasked`（前两位 + `****` 或 `null`），绝不在 `summary`、`before_state`、`after_state` 持久化固定测试验证码明文；事务提交后立即刷新内存快照。
+  - **认证侧路由语义与不变量**：Better Auth 始终以 `emailAndPassword.enabled = true` 挂载邮箱密码路由，由 `createAuthHandler` 按 `readPolicy().emailPasswordEnabled` 热门控 `503 EMAIL_PASSWORD_UNAVAILABLE`；`phonePlugin` 按 `readPolicy().smsMode` 分流：`disabled` 拦截全部 4 个手机入口返回 `503 SMS_UNAVAILABLE`；`bypass` 仅放行 `/phone-number/send-otp`（校验输入、已配置合法 6 位固定测试码与 IP，跳过短信供应商与预算）与 `/phone-number/verify`（`timingSafeEqual` 校验 6 位固定测试码并执行原登录/禁用校验/自动建号流程，保留路由限流），`/phone-binding/*` 不跟随 `bypass`。不开放 `GET /api/auth/methods` 或任何新的 C 端探测接口；管理前端在独立「全局配置」菜单页提供配置表单。
 
 ## 3. 中间件完整档只读监控与最小权限隔离
 

@@ -2,8 +2,9 @@ import type { BetterAuthOptions } from 'better-auth';
 import type { Pool } from 'pg';
 import type { TencentSmsConfig } from '../integrations/tencent-sms.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
+import { accountPlugin, isUserDisabled } from './account.ts';
 import { phonePlugin } from './phone.ts';
-import type { PhoneSmsRuntime } from './phone.ts';
+import type { AuthSmsMode, PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
@@ -12,14 +13,30 @@ import { AuthPostgresDialect } from './database.ts';
 export const AUTH_BASE_PATH = '/api/auth';
 export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
 
+export type { AuthSmsMode };
+
+export interface AuthRuntimePolicy extends PhoneSmsPolicy {
+  readonly emailPasswordEnabled: boolean;
+}
+
+export type AuthPolicyReader = () => AuthRuntimePolicy;
+
 export interface AuthConfig {
   baseURL: string;
   secret: string;
   databaseURL: string;
   origins: readonly string[];
+  emailPasswordEnabled: boolean;
   sms?: TencentSmsConfig;
   smsLimits: PhoneLimits;
   wechat?: WechatConfig;
+}
+
+function readEmailPasswordEnabled(env: NodeJS.ProcessEnv): boolean {
+  const enabled = env.MIO_AUTH_EMAIL_PASSWORD_ENABLED ?? 'true';
+  if (enabled !== 'true' && enabled !== 'false')
+    throw new Error('AUTH_CONFIG: invalid email/password switch');
+  return enabled === 'true';
 }
 
 function readWechatConfig(env: NodeJS.ProcessEnv) {
@@ -88,7 +105,8 @@ export function readAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
   if (!keys.some((key) => env[key] !== undefined)) {
     if (
       (env.MIO_AUTH_SMS_ENABLED && env.MIO_AUTH_SMS_ENABLED !== 'false') ||
-      (env.MIO_AUTH_WECHAT_ENABLED && env.MIO_AUTH_WECHAT_ENABLED !== 'false')
+      (env.MIO_AUTH_WECHAT_ENABLED && env.MIO_AUTH_WECHAT_ENABLED !== 'false') ||
+      (env.MIO_AUTH_EMAIL_PASSWORD_ENABLED && env.MIO_AUTH_EMAIL_PASSWORD_ENABLED !== 'false')
     )
       throw new Error('AUTH_CONFIG: provider requires authentication configuration');
     return undefined;
@@ -127,12 +145,14 @@ export function readAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
     throw new Error('AUTH_CONFIG: secret must have at least 32 characters');
   if (!['postgres:', 'postgresql:'].includes(database.protocol))
     throw new Error('AUTH_CONFIG: PostgreSQL URL required');
+  const emailPasswordEnabled = readEmailPasswordEnabled(env);
   const wechat = readWechatConfig(env);
   return {
     baseURL: base.origin,
     secret: env.MIO_AUTH_SECRET!,
     databaseURL: env.MIO_AUTH_DATABASE_URL!,
     origins: [base.origin, ...(extra as string[])],
+    emailPasswordEnabled,
     ...readSmsConfig(env),
     ...(wechat ? { wechat } : {}),
   };
@@ -143,6 +163,7 @@ export function authOptions(
   config: AuthConfig,
   pool: Pool,
   sms?: PhoneSmsRuntime,
+  getPolicy?: AuthPolicyReader,
 ): BetterAuthOptions {
   return {
     appName: 'Mio',
@@ -152,7 +173,8 @@ export function authOptions(
     database: { dialect: new AuthPostgresDialect({ pool }), type: 'postgres', transaction: true },
     trustedOrigins: [...config.origins],
     plugins: [
-      phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN),
+      accountPlugin(),
+      phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
     ],
@@ -165,6 +187,8 @@ export function authOptions(
           user.email?.toLowerCase().endsWith(`@${AUTH_PLACEHOLDER_EMAIL_DOMAIN}`)
         )
           return { error: 'RESERVED_EMAIL_DOMAIN' };
+        if (source.action !== 'create-user' && isUserDisabled(user))
+          return { error: 'ACCOUNT_DISABLED' };
         return validateWechatUser(data, context);
       },
     },

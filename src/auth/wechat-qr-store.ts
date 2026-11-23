@@ -122,8 +122,11 @@ function claimWechatQR(pool: Pool, id: string, cookieHash: string, identity: Ses
         `UPDATE "mioWechatQR"
          SET status=CASE WHEN "expiresAt"<=statement_timestamp() THEN 'expired' ELSE 'consumed' END
          WHERE ${match} AND EXISTS (
-           SELECT 1 FROM "session"
-           WHERE id=$4 AND "userId"=$3 AND "expiresAt">statement_timestamp()
+           SELECT 1 FROM "session" s
+           JOIN "user" u ON u.id = s."userId"
+           WHERE s.id=$4 AND s."userId"=$3
+             AND COALESCE(u.disabled, false) = false
+             AND s."expiresAt">statement_timestamp()
          ) RETURNING status`,
         [...values, identity.sessionId],
       )

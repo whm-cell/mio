@@ -1,4 +1,5 @@
 import { HttpError } from '@mio/foundation/errors';
+import type { AuthRuntimePolicy, AuthSmsMode } from '../auth/config.ts';
 import type {
   Category,
   PlatformCatalogModelRecord,
@@ -195,4 +196,30 @@ export interface UnifiedModelRawSources {
 export interface AdminRevisionsView {
   readonly routeRevisions: readonly PlatformRouteRevisionRecord[];
   readonly auditLogs: readonly AdminAuditLogRecord[];
+}
+
+export const SMS_BYPASS_CODE_PATTERN = /^\d{6}$/;
+
+export function isAuthSmsMode(value: unknown): value is AuthSmsMode {
+  return value === 'live' || value === 'bypass' || value === 'disabled';
+}
+
+export interface AdminStoredAuthSettings {
+  readonly auth: AuthRuntimePolicy;
+  readonly revision: number;
+  readonly updatedBy: string | null;
+  readonly updatedAt: string | null;
+}
+
+export interface AdminAuthRuntimeDefaults {
+  readonly emailPasswordEnabled: boolean;
+  readonly smsProviderConfigured: boolean;
+}
+
+export interface AdminGlobalSettingsView {
+  readonly settings: AdminStoredAuthSettings;
+  readonly runtime: {
+    readonly envEmailPasswordDefault: boolean;
+    readonly smsProviderConfigured: boolean;
+  };
 }

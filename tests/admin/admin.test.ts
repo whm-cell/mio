@@ -4,12 +4,13 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { readAdminConfig } from '../../src/admin/config.ts';
+import type { AdminPrincipal, AdminStoredAuthSettings } from '../../src/admin/contracts.ts';
 import { createAdminHandler } from '../../src/admin/http.ts';
 import { adminSchemaSQL, checkAdminSchema } from '../../src/admin/schema.ts';
 import { createAdminService } from '../../src/admin/service.ts';
-import { createAdminStore } from '../../src/admin/store.ts';
+import { AdminStore, createAdminStore } from '../../src/admin/store.ts';
 import { hashAdminPassword } from '../../src/auth/admin-password.ts';
 import { AUTH_BASE_PATH, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
@@ -1065,4 +1066,372 @@ it('aggregates runtime image/conversation/compute outbox monitoring plus full-ti
     clockHealthy: true,
   });
   expect(mon.redis.memory).toMatchObject({ maxHuman: '128.00M', oomRisk: false });
+});
+
+it('manages global auth settings with optimistic locking, strict validation, and masked audit logs', async () => {
+  // Auth / method / query / CORS gates
+  expect((await requestApi('/api/v1/admin/settings/global')).status).toBe(401);
+  expect(
+    (await requestApi('/api/v1/admin/settings/global', 'GET', undefined, userCookie)).status,
+  ).toBe(401);
+  expect(
+    (await requestApi('/api/v1/admin/settings/global?extra=1', 'GET', undefined, adminCookie))
+      .status,
+  ).toBe(400);
+  const optRes = await requestApi('/api/v1/admin/settings/global', 'OPTIONS');
+  expect(optRes.status).toBe(204);
+  expect(optRes.headers.get('access-control-allow-methods')).toBe('GET, PATCH, OPTIONS');
+  expect((await requestApi('/api/v1/admin/settings/global', 'POST', {}, adminCookie)).status).toBe(
+    405,
+  );
+
+  // Initial state before any DB row exists -> revision 0 with runtime defaults
+  const initialRes = await requestApi(
+    '/api/v1/admin/settings/global',
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(initialRes.status).toBe(200);
+  expect(await initialRes.json()).toEqual({
+    settings: {
+      auth: {
+        emailPasswordEnabled: true,
+        smsMode: 'live',
+        smsBypassCode: null,
+      },
+      revision: 0,
+      updatedBy: null,
+      updatedAt: null,
+    },
+    runtime: {
+      envEmailPasswordDefault: true,
+      smsProviderConfigured: false,
+    },
+  });
+
+  // Invalid payloads -> 400 ADMIN_INPUT_INVALID
+  for (const invalidBody of [
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+      extra: true,
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null, extra: 1 },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live' },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: null },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '12345' },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: 'abcdef' },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: '' },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: '1234567' },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'mock', smsBypassCode: null },
+    },
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: 'true', smsMode: 'live', smsBypassCode: null },
+    },
+    {
+      expectedRevision: -1,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+    },
+    {
+      expectedRevision: 1.5,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+    },
+    {
+      expectedRevision: 2_147_483_648,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+    },
+  ]) {
+    const res = await requestApi(
+      '/api/v1/admin/settings/global',
+      'PATCH',
+      invalidBody,
+      adminCookie,
+    );
+    expect(res.status, JSON.stringify(invalidBody)).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe(
+      'ADMIN_INPUT_INVALID',
+    );
+  }
+
+  // Stale revision > 0 when no row exists -> 409 SETTINGS_CONFLICT
+  const conflictBeforeInsert = await requestApi(
+    '/api/v1/admin/settings/global',
+    'PATCH',
+    {
+      expectedRevision: 1,
+      auth: { emailPasswordEnabled: false, smsMode: 'live', smsBypassCode: null },
+    },
+    adminCookie,
+  );
+  expect(conflictBeforeInsert.status).toBe(409);
+  expect(((await conflictBeforeInsert.json()) as { error: { code: string } }).error.code).toBe(
+    'SETTINGS_CONFLICT',
+  );
+
+  // First save (rev 0 -> 1) with bypass code and disabled email/password
+  const save1Res = await requestApi(
+    '/api/v1/admin/settings/global',
+    'PATCH',
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: false, smsMode: 'bypass', smsBypassCode: '886644' },
+    },
+    adminCookie,
+  );
+  expect(save1Res.status).toBe(200);
+  const save1 = (await save1Res.json()) as {
+    settings: {
+      auth: { emailPasswordEnabled: boolean; smsMode: string; smsBypassCode: string | null };
+      revision: number;
+      updatedBy: string | null;
+      updatedAt: string | null;
+    };
+    runtime: { envEmailPasswordDefault: boolean; smsProviderConfigured: boolean };
+  };
+  expect(save1.settings).toMatchObject({
+    auth: { emailPasswordEnabled: false, smsMode: 'bypass', smsBypassCode: '886644' },
+    revision: 1,
+    updatedBy: 'miioo_admin',
+  });
+  expect(save1.settings.updatedAt).toBeTruthy();
+  expect(adminService.getAuthPolicy()).toEqual({
+    emailPasswordEnabled: false,
+    smsMode: 'bypass',
+    smsBypassCode: '886644',
+  });
+
+  // Stale revision 0 against existing revision 1 -> 409 SETTINGS_CONFLICT
+  const conflict0 = await requestApi(
+    '/api/v1/admin/settings/global',
+    'PATCH',
+    {
+      expectedRevision: 0,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+    },
+    adminCookie,
+  );
+  expect(conflict0.status).toBe(409);
+  expect(((await conflict0.json()) as { error: { code: string } }).error.code).toBe(
+    'SETTINGS_CONFLICT',
+  );
+
+  // Second save (rev 1 -> 2) switching to disabled while retaining a new bypass code
+  const save2Res = await requestApi(
+    '/api/v1/admin/settings/global',
+    'PATCH',
+    {
+      expectedRevision: 1,
+      auth: { emailPasswordEnabled: true, smsMode: 'disabled', smsBypassCode: '997755' },
+    },
+    adminCookie,
+  );
+  expect(save2Res.status).toBe(200);
+  const save2 = (await save2Res.json()) as typeof save1;
+  expect(save2.settings).toMatchObject({
+    auth: { emailPasswordEnabled: true, smsMode: 'disabled', smsBypassCode: '997755' },
+    revision: 2,
+    updatedBy: 'miioo_admin',
+  });
+  expect(adminService.getAuthPolicy()).toEqual({
+    emailPasswordEnabled: true,
+    smsMode: 'disabled',
+    smsBypassCode: '997755',
+  });
+
+  // Stale revision 1 against revision 2 -> 409 SETTINGS_CONFLICT
+  const conflict1 = await requestApi(
+    '/api/v1/admin/settings/global',
+    'PATCH',
+    {
+      expectedRevision: 1,
+      auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+    },
+    adminCookie,
+  );
+  expect(conflict1.status).toBe(409);
+  expect(((await conflict1.json()) as { error: { code: string } }).error.code).toBe(
+    'SETTINGS_CONFLICT',
+  );
+
+  // GET reads persisted DB state and syncs in-memory snapshot
+  const readAfter = await requestApi(
+    '/api/v1/admin/settings/global',
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(readAfter.status).toBe(200);
+  expect((await readAfter.json()) as typeof save1).toMatchObject({
+    settings: {
+      auth: { emailPasswordEnabled: true, smsMode: 'disabled', smsBypassCode: '997755' },
+      revision: 2,
+      updatedBy: 'miioo_admin',
+    },
+  });
+
+  // Audit logs record settings.global.update and NEVER persist plaintext smsBypassCode
+  const revRes = await requestApi(
+    '/api/v1/admin/revisions?rawModelId=auth&limit=10',
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(revRes.status).toBe(200);
+  const revJson = (await revRes.json()) as {
+    auditLogs: {
+      action: string;
+      targetId: string | null;
+      summary: string | null;
+      beforeState: Record<string, unknown> | null;
+      afterState: Record<string, unknown> | null;
+    }[];
+  };
+  const settingsAudits = revJson.auditLogs.filter((log) => log.action === 'settings.global.update');
+  expect(settingsAudits).toHaveLength(2);
+  const serializedAudits = JSON.stringify(settingsAudits);
+  expect(serializedAudits).not.toContain('886644');
+  expect(serializedAudits).not.toContain('997755');
+
+  const [secondAudit, firstAudit] = settingsAudits;
+  expect(firstAudit).toMatchObject({
+    action: 'settings.global.update',
+    targetId: 'auth',
+    beforeState: null,
+    afterState: {
+      emailPasswordEnabled: false,
+      smsMode: 'bypass',
+      smsBypassCodeMasked: '88****',
+      revision: 1,
+    },
+  });
+  expect(secondAudit).toMatchObject({
+    action: 'settings.global.update',
+    targetId: 'auth',
+    beforeState: {
+      emailPasswordEnabled: false,
+      smsMode: 'bypass',
+      smsBypassCodeMasked: '88****',
+      revision: 1,
+    },
+    afterState: {
+      emailPasswordEnabled: true,
+      smsMode: 'disabled',
+      smsBypassCodeMasked: '99****',
+      revision: 2,
+    },
+  });
+});
+
+function createPolicyRaceService(initial: AdminStoredAuthSettings | null) {
+  const store = new AdminStore(
+    new Pool({ connectionString: database.url }),
+    null,
+    false,
+    null,
+    initial,
+  );
+  const config = readProviderConfig({
+    MIO_PROVIDERS_DATABASE_URL: database.url,
+    MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+    MIO_PROVIDERS_MASTER_KEY_ID: 'policy-race-test',
+  })!;
+  return { store, service: createAdminService(store, providerService, config) };
+}
+
+const racePrincipal: AdminPrincipal = {
+  admin: {
+    id: '00000000-0000-4000-8000-000000000001',
+    username: 'policy-race-test',
+    isSuperAdmin: true,
+    createdAt: '2026-11-23T00:00:00Z',
+    updatedAt: '2026-11-23T00:00:00Z',
+  },
+  sessionId: 'policy-race-session',
+  tokenDigest: 'policy-race-token-digest',
+};
+const raceEnabledSettings: AdminStoredAuthSettings = {
+  auth: { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null },
+  revision: 1,
+  updatedBy: racePrincipal.admin.username,
+  updatedAt: '2026-11-23T00:00:00Z',
+};
+const raceDisabledSettings: AdminStoredAuthSettings = {
+  ...raceEnabledSettings,
+  auth: { emailPasswordEnabled: false, smsMode: 'disabled', smsBypassCode: null },
+  revision: 2,
+};
+
+it.each([null, raceEnabledSettings])(
+  'keeps the newest auth policy when a captured settings read completes after a PATCH (%j)',
+  async (initial) => {
+    const { store, service } = createPolicyRaceService(initial);
+    const read = Promise.withResolvers<AdminStoredAuthSettings | null>();
+    vi.spyOn(store, 'readGlobalAuthSettings').mockReturnValueOnce(read.promise);
+    const saved = { ...raceDisabledSettings, revision: (initial?.revision ?? 0) + 1 };
+    vi.spyOn(store, 'updateGlobalAuthSettings').mockResolvedValueOnce(saved);
+    try {
+      const pendingRead = service.getGlobalSettings();
+      await service.updateGlobalSettings(racePrincipal, {
+        expectedRevision: initial?.revision ?? 0,
+        auth: saved.auth,
+      });
+      expect(service.getAuthPolicy()).toEqual(saved.auth);
+      read.resolve(initial);
+      expect((await pendingRead).settings.revision).toBe(initial?.revision ?? 0);
+      expect(service.getAuthPolicy()).toEqual(saved.auth);
+    } finally {
+      read.resolve(initial);
+      await service.close();
+    }
+  },
+);
+
+it('keeps the newest committed auth policy when PATCH responses complete out of order', async () => {
+  const { store, service } = createPolicyRaceService(null);
+  const first = Promise.withResolvers<AdminStoredAuthSettings>();
+  vi.spyOn(store, 'updateGlobalAuthSettings')
+    .mockReturnValueOnce(first.promise)
+    .mockResolvedValueOnce(raceDisabledSettings);
+  try {
+    const pendingFirst = service.updateGlobalSettings(racePrincipal, {
+      expectedRevision: 0,
+      auth: raceEnabledSettings.auth,
+    });
+    await service.updateGlobalSettings(racePrincipal, {
+      expectedRevision: 1,
+      auth: raceDisabledSettings.auth,
+    });
+    expect(service.getAuthPolicy()).toEqual(raceDisabledSettings.auth);
+    first.resolve(raceEnabledSettings);
+    expect((await pendingFirst).settings.revision).toBe(1);
+    expect(service.getAuthPolicy()).toEqual(raceDisabledSettings.auth);
+  } finally {
+    first.resolve(raceEnabledSettings);
+    await service.close();
+  }
 });

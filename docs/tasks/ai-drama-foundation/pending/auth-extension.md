@@ -1,6 +1,6 @@
 # Mio 追加认证方案：手机号与微信
 
-状态：保留原分析与方案背景。2026-11-13 项目负责人已授权实施推荐的手机号和微信单元；本期范围、验收和动态边界以[认证扩展变更](../changes/phone-wechat-auth/change.md)为准。授权本身不表示实现、真实供应商验证或用户接受已经完成。
+状态：保留原分析与方案背景。2026-11-13 项目负责人已授权实施推荐的手机号和微信单元；本期范围、验收和动态边界以[认证扩展变更](../changes/phone-wechat-auth/change.md)为准。2026-11-22 项目负责人调整决策：旧用户与业务数据改为迁移（见[旧数据迁移 PRD](../../legacy-migration/prd.md)），并新增邮箱密码配置开关、账号禁用与用户资料能力（见[账号控制与资料扩展](../changes/auth-account-controls-and-profile/change.md)）。历史背景与既有接受事实保持不变。
 
 归属：[技术底座 PRD](../prd.md)；现行行为以[认证底座](../../../auth.md)和[认证 HTTP 契约](../../../apis/auth.md)为准；原认证接受见[成果入口](../complete/report.md#auth-registration-foundation)。本提案不替换现行规范或原接受事实。
 

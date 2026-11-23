@@ -35,8 +35,12 @@ async function bindingSessionIsActive(client: PoolClient, binding: BindingIdenti
   );
   if (!locked.rowCount) return false;
   const active = await client.query(
-    `SELECT id FROM "session" WHERE id = $1 AND "userId" = $2 AND "expiresAt" > clock_timestamp()
-     AND "createdAt" > clock_timestamp() - interval '10 minutes'`,
+    `SELECT s.id FROM "session" s
+     JOIN "user" u ON u.id = s."userId"
+     WHERE s.id = $1 AND s."userId" = $2
+       AND COALESCE(u.disabled, false) = false
+       AND s."expiresAt" > clock_timestamp()
+       AND s."createdAt" > clock_timestamp() - interval '10 minutes'`,
     [binding.sessionId, binding.userId],
   );
   return active.rowCount === 1;

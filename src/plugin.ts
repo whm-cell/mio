@@ -1,3 +1,4 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { monotonicMs } from '@mio/foundation/time';
 import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
@@ -7,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { createHandler } from './http.ts';
 import { AUTH_BASE_PATH, readAuthConfig, readAuthRateLimitBackend } from './auth/config.ts';
+import type { AuthRuntimePolicy } from './auth/config.ts';
 import { createAuthentication } from './auth/service.ts';
 import { createAuthHandler } from './auth/http.ts';
 import { createRedisRateLimit } from './auth/rate-limit.ts';
@@ -35,6 +37,7 @@ import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
 import type { ProviderService } from './providers/service.ts';
 import { createProviderHandler } from './providers/http.ts';
+import { AssetError } from './assets/contracts.ts';
 import { readAssetConfig } from './assets/config.ts';
 import { createAssetStore } from './assets/store.ts';
 import { createAssetService } from './assets/service.ts';
@@ -67,6 +70,8 @@ import { createAdminHandler } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
+
+const AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 export interface Config {
   tokenEnv: string;
@@ -144,6 +149,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (backend === 'redis' && !authConfig)
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
+    let admin: AdminService | undefined;
+    const getAuthPolicy = (): AuthRuntimePolicy =>
+      admin?.getAuthPolicy() ?? {
+        emailPasswordEnabled: authConfig.emailPasswordEnabled,
+        smsMode: 'live',
+        smsBypassCode: null,
+      };
     const redisConfig = backend === 'redis' ? readRedisConfig() : undefined;
     const deadline = monotonicMs() + 5000;
     const redis = redisConfig ? await createRedisResource(redisConfig, deadline) : undefined;
@@ -151,7 +163,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     try {
       const rateLimit =
         redis && (await createRedisRateLimit(redis, redisConfig!.namespace, deadline));
-      auth = await createAuthentication(authConfig, rateLimit);
+      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy);
       const acquired = auth;
       ctx.effect(() => async () => {
         await Promise.all([acquired.close(), redis?.close()]);
@@ -161,19 +173,28 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       await Promise.all([auth?.close(), redis?.close()]);
       throw error;
     }
-    const authHandler = createAuthHandler(authConfig, auth);
-    ctx.effect(() =>
-      ctx.webServer.register({
-        kind: 'prefix',
-        path: AUTH_BASE_PATH,
-        handler: authHandler,
-      }),
-    );
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
+    const verifyAvatarAsset = async (
+      identity: { userId: string; sessionId: string },
+      assetId: string,
+    ): Promise<'ok' | 'not_found' | 'not_ready' | 'invalid_type' | 'unavailable'> => {
+      if (!assets) return 'unavailable';
+      try {
+        const asset = await assets.get(identity, assetId);
+        if (asset.status !== 'ready') return 'not_ready';
+        if (!AVATAR_MIME_TYPES.has(asset.contentType.toLowerCase())) return 'invalid_type';
+        return 'ok';
+      } catch (error) {
+        if (error instanceof AssetError && error.status === HTTP_STATUS.NOT_FOUND)
+          return 'not_found';
+        return 'unavailable';
+      }
+    };
+    const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL);
       try {
@@ -202,7 +223,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
-    let admin: AdminService | undefined;
     if (computeConfig && assetConfig) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
@@ -267,10 +287,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const acquired =
           (admin =
           ownedAdmin =
-            createAdminService(store, providers, providerConfig, undefined, {
-              probeRabbitmq: () => probeRabbitmqMetrics(rabbitmqMonitorConfig),
-              probeRedis: () => probeRedisMetrics(redisMonitorConfig),
-            }));
+            createAdminService(
+              store,
+              providers,
+              providerConfig,
+              undefined,
+              {
+                probeRabbitmq: () => probeRabbitmqMetrics(rabbitmqMonitorConfig),
+                probeRedis: () => probeRedisMetrics(redisMonitorConfig),
+              },
+              {
+                emailPasswordEnabled: authConfig.emailPasswordEnabled,
+                smsProviderConfigured: Boolean(authConfig.sms),
+              },
+            ));
         ctx.effect(() => () => acquired.close());
         ctx.effect(() =>
           ctx.webServer.register({
@@ -472,8 +502,22 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     ctx.effect(() =>
       ctx.webServer.register({
+        kind: 'prefix',
+        path: AUTH_BASE_PATH,
+        handler: authHandler,
+      }),
+    );
+    ctx.effect(() =>
+      ctx.webServer.register({
         kind: 'exact',
         path: '/api/v1/me',
+        handler: authHandler,
+      }),
+    );
+    ctx.effect(() =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: '/api/v1/me/profile',
         handler: authHandler,
       }),
     );

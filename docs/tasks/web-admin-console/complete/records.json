@@ -1,0 +1,71 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/web-admin-console/prd.md",
+  "results": [
+    {
+      "key": "admin-global-settings",
+      "title": "管理后台全局配置与认证策略热生效",
+      "locations": [
+        {
+          "path": "src/admin/schema.ts",
+          "purpose": "新增 mio_admin_global_settings 表与 checkAdminSchema 列校验"
+        },
+        {
+          "path": "src/admin/contracts.ts",
+          "purpose": "全局配置视图类型与短信模式/6 位验证码共享校验契约"
+        },
+        {
+          "path": "src/admin/store.ts",
+          "purpose": "启动预读水合、expectedRevision 乐观锁读写与脱敏审计落库"
+        },
+        {
+          "path": "src/admin/service.ts",
+          "purpose": "全局配置校验、内存热更新快照与同步策略读取器 getAuthPolicy"
+        },
+        {
+          "path": "src/admin/http.ts",
+          "purpose": "GET/PATCH /api/v1/admin/settings/global 接口与 409 SETTINGS_CONFLICT 错误映射"
+        },
+        {
+          "path": "src/auth/config.ts",
+          "purpose": "AuthRuntimePolicy/AuthPolicyReader 类型与 authOptions 恒开邮箱路由热委托"
+        },
+        {
+          "path": "src/auth/http.ts",
+          "purpose": "按动态运行时策略实时门控邮箱密码注册/登录/改密（503 EMAIL_PASSWORD_UNAVAILABLE）"
+        },
+        {
+          "path": "src/auth/phone.ts",
+          "purpose": "短信验证码 live/bypass/disabled 三态分流（固定 6 位码 timingSafeEqual、phone-binding 不跟随 bypass）"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "通过窄回调注入管理域热策略并在 admin 完成水合后注册 /api/auth 路由"
+        },
+        {
+          "path": "docs/apis/admin.md",
+          "purpose": "同步 GET/PATCH /api/v1/admin/settings/global 与 409 SETTINGS_CONFLICT 契约"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "同步动态认证策略与手机验证码三态 HTTP 语义"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "同步认证配置默认回退与热策略模块边界"
+        }
+      ],
+      "outcomes": "管理后台全局配置持久化与即时认证策略热生效：GET/PATCH乐观锁与脱敏审计、邮箱密码开关、SMS live/bypass/disabled三态、绑定隔离和重启水合；管理Web表单校验/风险提示/409恢复。补修旧GET/null/乱序PATCH响应回退内存策略，持久revision单调发布。",
+      "verification": "候选ae449c0238ec37ce19ed8d8d309e895fe520b980/contractRevision1：work run静态与构建、12文件154项隔离回归、打包冒烟通过；前端b8c57af全量pnpm check18项通过。可信c00a018全量CI现查成功+原0ade12d覆盖依据+两文件受影响增量构成pnpm check有效覆盖（本机全量执行0次）。常驻mio_dev增量迁移、真实浏览器表单/双标签409/审计与HTTP热切换/绑定隔离/disabled/关闭管理页后的重启水合全部PASS；最终true/live/null恢复rev7，原env逐字节恢复，2个新增测试用户保留。主控独立Diff/断言/质量/规范/业务证据审阅通过，详见local-20261123/local-acceptance-report.md。",
+      "limitations": "未调用真实腾讯云短信、真实模型或生产部署；当前SHA未推送无远端CI。原env指向HTTPS域，交回本地服务通过忽略目录私有start-local.mjs仅进程覆盖localhost baseURL与SMSfalse；原env文件未改变。保留配置/审计增量及测试用户。3125fb3既有HFS+交付处理单列，未在本次解决。",
+      "acceptance": {
+        "candidate": {
+          "commit": "ae449c0238ec37ce19ed8d8d309e895fe520b980",
+          "contractRevision": 1
+        },
+        "statement": "接受本次全局配置成果，按计划执行 complete。",
+        "reference": "2026-11-23，本对话用户在审阅本次全局配置联调报告与complete计划后，明确回复‘接受本次全局配置成果，按计划执行 complete。’"
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/conversation-enhancement/prd.md",
+  "results": [
+    {
+      "key": "conversation-lifecycle-and-titles",
+      "title": "会话标题、活跃分页、软归档及 256 KiB 消息",
+      "locations": [
+        {
+          "path": "src/conversations/http.ts",
+          "purpose": "改名、归档与消息长度控制的公开入口"
+        },
+        {
+          "path": "src/conversations/store.ts",
+          "purpose": "所有权、事务、精度分页、归档和活动投影"
+        },
+        {
+          "path": "src/conversations/schema.ts",
+          "purpose": "活动时间、标题和归档字段的兼容增量迁移"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "官方标题、持久人类事件和原生会话生命周期"
+        },
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "当前 HTTP、游标和持久边界合同"
+        },
+        {
+          "path": "tests/conversations/conversation-lifecycle.test.ts",
+          "purpose": "打包 Profile 基于真实 PG 和 JSONL 的生命周期、长消息与投影故障验证"
+        }
+      ],
+      "outcomes": "首条真实人类输入落盘后生成确定性标题。手工标题固定，活跃度只由真实人类输入推进。默认活跃倒序保留 PG 微秒游标并接受现有 UUID 页游标。空闲归档幂等，保留历史、旧回执与资产引用，已归档的新写入受阻。消息正文与文本容纳到 256 KiB，控制入口保留 16 KiB。活动投影初次失败时只用同一已持久事件补写一次，模型终态按实际执行结算。",
+      "verification": "当前干净候选静态检查、AST 与构建通过。正式打包 Profile 装载、认证、关闭与端口释放通过。完整对话 21 文件 159 项及跨域 64 文件 697 项通过，含 180 KiB 完整冷读、256 KiB 与 +1 边界、原始控制能力、旧数据迁移、真实 PG 一次/两次投影故障和 BYOK 单次调度。覆盖 pnpm check 的结论来自父提交 4feeb45 的完整 GitHub Actions run 45128875498 和当前候选增量。独立代码、质量与规范审阅均通过。",
+      "limitations": "本机隔离 PostgreSQL 和原生日志为实测环境，模型、OneLink 与 COS 使用替身。当前 SHA 的远端门禁、真实供应商长文本容量和生产迁移及部署未验证。M1 与 M2 保留独立候选，文本合流预演发现四处源码冲突，等待单独集成验证。",
+      "acceptance": {
+        "candidate": {
+          "commit": "07fa5ec93de0e43e37c26bf036e771bd403a6b2e",
+          "contractRevision": 4
+        },
+        "statement": "接受 M2 候选",
+        "reference": "2026-11-23 当前对话已交回 M2 本地候选 07fa5ec93de0e43e37c26bf036e771bd403a6b2e（契约修订 4、5 项证据和草稿 cb969e40-99b6-4f5e-b622-88956212cd00）。用户在该候选的确认题答复「接受 M2 候选」。"
+      }
+    }
+  ]
+}

@@ -82,6 +82,21 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 成功：200 原回执，status 为 accepted/input-persisted/completed/cancelled/failed/unknown；error 只有服务定义脱敏码。
 
+已结算为 `failed` 的请求可在 `error` 中返回以下固定值。它们描述原请求的执行结果，查询本身仍返回 HTTP 200。
+
+| `error`                     | 含义                                       |
+| --------------------------- | ------------------------------------------ |
+| `MODEL_AUTH_FAILED`         | 模型凭据缺失、无效或权限被拒绝             |
+| `MODEL_QUOTA_EXCEEDED`      | 上游明确拒绝本次额度或付款                 |
+| `MODEL_RATE_LIMITED`        | 上游对本次调用限流                         |
+| `MODEL_TIMEOUT`             | 模型请求或流式响应超时                     |
+| `MODEL_CONTEXT_OVERFLOW`    | 模型协议或引擎确认输入超过上下文限制       |
+| `MODEL_UPSTREAM_ERROR`      | 上游服务或模型调用传输失败                 |
+| `TURN_STEP_BUDGET_EXCEEDED` | 继续执行将超过本轮模型步数上限             |
+| `MODEL_FAILED`              | 其他未细分的明确失败，也是兼容的历史错误码 |
+
+已取消或无法证明结算的请求沿实际状态返回。客户端可按原 requestId 查询，和 SSE `state` 或 `snapshot` 中的同一回执核对。普通模型错误不会自动重发，服务不返回供应商响应原文或凭据。
+
 输出截断的已结算回执为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。该标记仅来自实际原生轮次终态及持久化确认，正文可从历史读取。普通结算及旧回执省略该字段。
 
 错误：404 REQUEST_NOT_FOUND 不代表可以重发未知外部动作；数据库不可查时 503，其余见本域共同约定。
@@ -97,6 +112,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
 截断轮次完成后，state 中的回执带 `truncation`。如果该请求是订阅建立时的最近回执，snapshot 中也包含同一标记。已发送的 text 原样保留。
+
+图片任务 `tool` 帧在对应原生日志记录通过持久化检查点后发布。连接中断或缺帧时，可以查询已持久历史和原回执，确认已有结果。
 
 错误：响应前遵循本域错误体，限额为 429 `SSE_LIMITED`，初次鉴权错误或超时为 503 `AUTH_UNAVAILABLE`。建流后会话失效或身份变化发 `UNAUTHORIZED`，鉴权错误或超时发 `AUTH_UNAVAILABLE`，随后关闭；其他错误只发脱敏 error 并关闭或结束连接。单帧、排队基线事件或 socket 待写缓冲超过 64 KiB 时关闭该订阅，客户端补读历史/回执。
 

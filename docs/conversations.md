@@ -18,6 +18,8 @@
 
 BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策），30 秒 idle/HTTP 是 Mio 政策。不支持的内容/选项在出站前拒绝。
 
+平台聊天路由的 `cacheRetention` 随本轮适配快照冻结。Anthropic Messages 默认发送短期缓存标记，OpenAI Chat Completions 由上游处理自动前缀缓存。系统提示词的能力组合与历史前缀保持一致时，实际缓存读写仍取决于供应商与本轮输入，按实际返回用量观察。[供应商配置](providers.md#受控适配声明与实际验证)
+
 真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察沿用固定 DSH 的计数口径。`inputTokens` 为未计入缓存读写的输入，缓存读写分别记为 `cacheReadTokens` 和 `cacheWriteTokens`。可取得的 `totalTokens` 和 `reasoningTokens` 原样保存，观察层不重算或累加计数。一次正常调用如果只报告缓存用量，也记为 `reported`。失败或取消时，已有非零计数记为 `partial`，全零或缺失记为 `unknown`。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
 
 ```sh
@@ -35,9 +37,15 @@ pnpm start:dev
 
 PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与接收/结算状态，不保存第二份消息正文；正文以 DSH 原生日志为权威。先保存 creating 映射，再创建并 flush 原生 Session，最后标 ready；失败映射保持 unknown，可从所属用户列表定位，不伪报已持久创建。
 
-显式增量迁移保留可空对话模型绑定、可空请求绑定和观察数组；旧行不从环境回填、不删除旧回执。fresh 请求保存配置 ID/revision、modelKey、精确 modelRef/modelId、credentialVersion/catalogVersion/adaptationVersion（取平台路由 `declaration_version`）、operation/profile，兼容保留 protocol/capabilityVersion；owner/内部 Session 沿对话取得。Key 只在运行内存，不能序列化整个快照。多步工具轮次（如 `tool-calls -> stop`）按步向 `model_observations` 追加受控 HTTP status、provider request ID、token usage/已知程度、finish 和稳定 failureCode；401/403、402、408/504、429 分别区分鉴权、额度、超时、限流，不能分类的失败保持 unknown。请求观察落库失败结算 unknown；独立供应商验证标记失败保留已持久请求观察，不重发模型。仅当步骤达到 `status === 200` 且 `finish` 为 `stop` 或 `max-tokens` 时，才把该用户本人 `mio_provider_model_verifications` 在对应当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组下标记为 `verified`，不改动平台路由或他人验证状态，旧运行晚到不能覆盖新验证。
+模型出站前、顶层工具执行前及进入下一步之前，必须确认相应原生日志前缀已落盘。有效图片任务结果先补充 flush，再向 SSE 发布卡片，下一步等待这个检查点。检查点失败后阻止该轮尚未开始的工具或模型派发，按未知结算。冷读可以恢复已落盘的卡片和文本。生图提交和 DSH 日志分属不同持久层，任务已受理但结果尚未形成或落盘时，卡片可能缺失。恢复沿原对话和请求身份查询，服务不重放输入、工具或计费调用。[DSH 集成](integrations/dsh.md#必须遵守的约束)
+
+显式增量迁移保留可空对话模型绑定、可空请求绑定和观察数组；旧行不从环境回填、不删除旧回执。fresh 请求保存配置 ID/revision、modelKey、精确 modelRef/modelId、credentialVersion/catalogVersion/adaptationVersion（取平台路由 `declaration_version`）、operation/profile，兼容保留 protocol/capabilityVersion；owner/内部 Session 沿对话取得。Key 只在运行内存，不能序列化整个快照。多步工具轮次（如 `tool-calls -> stop`）按步向 `model_observations` 追加受控 HTTP status、provider request ID、token usage/已知程度、finish 和稳定 failureCode。模型错误结算取本轮最后一步已持久观察的有效分类，或官方轮次终态中的已知错误码，使用公开脱敏码。无法细分的明确失败沿用 `MODEL_FAILED`，历史回执继续按原错误码读取。观察落库失败结算 unknown。普通上游故障不会自动重发计费模型请求。[对话回执](apis/conversations.md#get-apiv1conversationsidrequestsrequestid)
+
+仅当步骤达到 `status === 200` 且 `finish` 为 `stop` 或 `max-tokens` 时，才把该用户本人 `mio_provider_model_verifications` 在对应当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组下标记为 `verified`，不改动平台路由或他人验证状态，旧运行晚到不能覆盖新验证。独立供应商验证标记失败保留已持久请求观察。
 
 当 BYOK、`assets` 与显式启用的 A `generations` 同时就绪时，插件向对话引擎注入窄桥接 `ConversationImageTools`（对话契约层不导入 DSH 或生成模块内部实现），仅在活动轮次的 `agentCtx.tools` 开放三个受控意图级生图工具：只读不解密的 `list_image_models`、异步/同步非阻塞受理的 `submit_image_job`（自动为 `requiresAsync: true` 路由补齐 `async: true`，按路由 `supportedOperations` 与 `allowGenerateReferences` 归一化参考图操作模式，并以 `sha256Utf8("mio:conv-image:v1:${userId}:${conversationId}:${turnRequestId}:${clientOperationKey ?? exec.callId}")` 派生确定性 UUID v4 `requestId` 交 `GenerationService.createImage` 幂等去重）以及先经 `isUuidV4` 校验的 `get_image_job`。工具严禁接收 `apiKey`、`userId`、裸 URL、Base64、COS 键或未知字段，单轮受 12 次总调用、4 次图片提交与 8 步硬熔断（`TURN_STEP_BUDGET_EXCEEDED`）约束；单轮内对尚未达到终态（`accepted`、`submitted`、`processing`、`materializing`）的同轮新建任务或本轮已查得非终态的同任务重复调用 `get_image_job` 会被以 `IMAGE_JOB_POLL_DEFERRED` 拦截（不产生重复卡片），跨轮对前序 `jobId` 的首次查询语义保持不变；轮次结束或卸载立即撤销工具授权。历史与 SSE 仅对非错误且通过严格结构校验的 `mio.image-job` 卡片做白名单投影。
+
+DSH 在连续两次、四次调用同一工具且参数相同时分别向模型提醒和加强提醒，异参调用仍按原工具授权与预算执行。启用图片查看时，`inspect_image_asset` 使用 60 秒协作期限，包含图像准备队列等待，并通过原有取消信号等待工具收敛。图片任务提交沿用提交前取消及现有存储和上游期限，避免在受理已提交后丢失任务句柄。[DSH 集成](integrations/dsh.md#必须遵守的约束)
 
 图片工具提交会先按用户和派生的请求 ID 查已有任务。重试时按任务冻结的路由补齐 `async` 和参考图操作后比对请求摘要。同一意图在供应商停用或路由默认值变化时仍返回原任务。相同请求 ID 归一后的参数不同会返回 `REQUEST_CONFLICT`。新提交按当前路由受理。
 

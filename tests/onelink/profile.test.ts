@@ -5,6 +5,7 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { packedAuthRuntime } from '../support/auth-runtime.ts';
 import { importDeclaration } from '../providers/fixtures/provider-declaration.ts';
+import type { Receipt } from '../../src/conversations/contracts.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;
@@ -13,6 +14,7 @@ let declarationEnv: NodeJS.ProcessEnv;
 const cookies: string[] = [];
 const owners: string[] = [];
 const ref = 'onelink:chat:deepseek-v4.1-flash';
+const terminalStatuses = ['completed', 'failed', 'cancelled', 'unknown'];
 const call = (path: string, method = 'GET', value?: unknown, owner = 0) =>
   fetch(`${runtime.origin}${path}`, {
     method,
@@ -50,12 +52,41 @@ async function terminal(id: string, requestId: string, timeout = 8000, owner = 0
         receipt = (await (
           await call(`/api/v1/conversations/${id}/requests/${requestId}`, 'GET', undefined, owner)
         ).json()) as { status: string };
-        return ['completed', 'failed', 'cancelled', 'unknown'].includes(receipt.status);
+        return terminalStatuses.includes(receipt.status);
       },
       { timeout },
     )
     .toBe(true);
   return receipt.status;
+}
+
+async function readTerminalState(response: Response, requestId: string) {
+  expect(response.status).toBe(200);
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const prefix = 'event: state\ndata: ';
+  let buffer = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error('SSE closed before the final receipt');
+      buffer += decoder.decode(value, { stream: true });
+      let boundary: number;
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (!frame.startsWith(prefix)) continue;
+        const state = JSON.parse(frame.slice(prefix.length)) as { type: 'state'; receipt: Receipt };
+        if (
+          state.receipt.requestId === requestId &&
+          terminalStatuses.includes(state.receipt.status)
+        )
+          return state;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
 }
 beforeAll(async () => {
   database = await authDatabase();
@@ -345,6 +376,53 @@ it('reads cache-only, partial and zero accounting from real PostgreSQL after fix
     expect((await send(id, test.requestId, test.input)).status).toBe(202);
   }
   expect((await runtime.onelinkRequests()).length).toBe(count + cases.length);
+});
+
+it('publishes the same sanitized failure in GET and SSE after one real BYOK adapter attempt', async () => {
+  const cases = [
+    ['401', 401, 'AUTH', 'MODEL_AUTH_FAILED'],
+    ['402', 402, 'QUOTA_EXCEEDED', 'MODEL_QUOTA_EXCEEDED'],
+    ['429', 429, 'RATE_LIMIT', 'MODEL_RATE_LIMITED'],
+    ['500', 500, 'SERVER', 'MODEL_UPSTREAM_ERROR'],
+    ['504', 504, 'TIMEOUT', 'MODEL_TIMEOUT'],
+    ['CONTEXT', 400, 'CONTEXT_OVERFLOW', 'MODEL_CONTEXT_OVERFLOW'],
+    ['INVALID', 400, 'INVALID_REQUEST', 'MODEL_FAILED'],
+  ] as const;
+  const id = await create(0, 'onelink:chat:claude-sonnet-4.5-20250929');
+  for (const [fixture, status, failureCode, error] of cases) {
+    const requestId = `failure-${fixture}`;
+    const count = (await runtime.onelinkRequests()).length;
+    const stream = await fetch(`${runtime.origin}/api/v1/conversations/${id}/events`, {
+      headers: { origin: runtime.origin, cookie: cookies[0]! },
+      signal: AbortSignal.timeout(5000),
+    });
+    expect((await send(id, requestId, `FIXTURE_FAILURE_${fixture}`)).status).toBe(202);
+    const state = await readTerminalState(stream, requestId);
+    expect(state).toEqual({
+      type: 'state',
+      receipt: { conversationId: id, requestId, status: 'failed', error },
+    });
+    const response = await call(`/api/v1/conversations/${id}/requests/${requestId}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(state.receipt);
+
+    const { model_observations: observations } = (
+      await observer.query<{ model_observations: Record<string, unknown>[] }>(
+        'SELECT model_observations FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2',
+        [id, requestId],
+      )
+    ).rows[0]!;
+    expect(observations).toEqual([
+      { status, failureCode, finish: 'error', usageStatus: 'unknown' },
+    ]);
+    const requests = (await runtime.onelinkRequests()).slice(count);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      path: '/v1/messages',
+      authorization: expect.stringMatching(/^Bearer synthetic-profile-/),
+    });
+    expect(JSON.stringify(requests[0]!.body)).toContain(`FIXTURE_FAILURE_${fixture}`);
+  }
 });
 
 it('preserves both wire protocols’ capped text and settled receipts after a real Profile restart', async () => {

@@ -1,6 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { Context } from '@deepseek-ai/cordis';
 import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
   IMAGE_OFFLOAD_REQUIRED_CODE,
   LlmAdapter,
   LlmError,
@@ -21,7 +22,7 @@ import type {
 import type { ChatProfile, ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 import { DEFAULT_CHAT_IMAGE_BUDGET } from '../providers/contracts.ts';
 import { ONELINK_ORIGIN } from '../integrations/onelink/models.ts';
-import { chatTransport } from '../integrations/onelink/chat.ts';
+import { chatTransport, isChatContextOverflow } from '../integrations/onelink/chat.ts';
 import type { ChatResponseFacts } from '../integrations/onelink/chat.ts';
 import { prepareVisionRequest, visionAttachmentStore } from './vision-request.ts';
 
@@ -43,13 +44,21 @@ const chatProfiles = {
     api: openAICompletionsApi,
     apiId: 'openai-completions',
     path: '/v1/chat/completions',
-    compat: { maxTokensField: 'max_tokens', supportsStore: false },
+    defaultCacheRetention: 'none',
+    // OneLink's Chat Completions endpoint manages prefix caching on the server.
+    compat: {
+      maxTokensField: 'max_tokens',
+      supportsStore: false,
+      supportsLongCacheRetention: false,
+      sendSessionAffinityHeaders: false,
+    },
   },
   'anthropic-messages': {
     provider: 'onelink-anthropic',
     api: anthropicMessagesApi,
     apiId: 'anthropic-messages',
     path: '/v1/messages',
+    defaultCacheRetention: 'short',
     // Disable SDK strict-tool downgrade/repost; Mio owns every visible attempt.
     compat: { supportsStrictTools: false },
   },
@@ -92,8 +101,13 @@ function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
   return { protocol, submitPath, baseUrl: ONELINK_ORIGIN };
 }
 
-function chatFailureCode(aborted: boolean, status: number | undefined, fallback: string): string {
+function chatFailureCode(
+  aborted: boolean,
+  facts: ChatResponseFacts,
+  failure: { code: string; message?: string },
+): string {
   if (aborted) return 'ABORTED';
+  const { status, contextOverflow } = facts;
   switch (status) {
     case HTTP_STATUS.UNAUTHORIZED:
     case HTTP_STATUS.FORBIDDEN:
@@ -107,8 +121,14 @@ function chatFailureCode(aborted: boolean, status: number | undefined, fallback:
       return 'TIMEOUT';
   }
   if (status !== undefined && status >= 500) return 'SERVER';
-  if (status !== undefined && status >= HTTP_STATUS.BAD_REQUEST) return 'INVALID_REQUEST';
-  return fallback;
+  if (status !== undefined && status >= HTTP_STATUS.BAD_REQUEST)
+    return contextOverflow ? 'CONTEXT_OVERFLOW' : 'INVALID_REQUEST';
+  if (status === HTTP_STATUS.OK && failure.message && isChatContextOverflow(failure.message))
+    return 'CONTEXT_OVERFLOW';
+  // The SDK also infers overflow from payload size and usage heuristics.
+  if (failure.code === CONTEXT_WINDOW_EXCEEDED_CODE) return 'PI_AI_ERROR';
+  if (failure.code === 'STREAM_CLOSED') return 'TRANSPORT';
+  return failure.code;
 }
 
 function metadata(
@@ -200,7 +220,7 @@ function requestAdapter(
     streamIdleTimeoutMs: 30_000,
     timeoutMs: 30_000,
     transport: 'sse',
-    cacheRetention: 'none',
+    cacheRetention: run.snapshot.cacheRetention ?? protocol.defaultCacheRetention,
     maxRequestImageBytes: budget.maxRequestImageBytes,
     maxRequestImages: budget.maxRequestImages,
     imageOffloadCountQuantum: 1,
@@ -312,19 +332,19 @@ export class OneLinkAdapter extends LlmAdapter {
     let release: (() => void) | undefined;
     execution.started = false;
     const observation = (finish: string): ModelObservation => {
-      // DSH can report cached input with both uncached input and output at zero.
-      if (!usage || !Object.values(usage).some((count) => count > 0))
-        return {
-          ...facts,
-          finish,
-          usageStatus: 'unknown',
-          ...(failureCode ? { failureCode } : {}),
-        };
-      return {
-        ...facts,
-        usage,
+      const { status, providerRequestId } = facts;
+      const base = {
+        ...(status !== undefined ? { status } : {}),
+        ...(providerRequestId !== undefined ? { providerRequestId } : {}),
         finish,
         ...(failureCode ? { failureCode } : {}),
+      };
+      // DSH can report cached input with both uncached input and output at zero.
+      if (!usage || !Object.values(usage).some((count) => count > 0))
+        return { ...base, usageStatus: 'unknown' };
+      return {
+        ...base,
+        usage,
         usageStatus:
           finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls'
             ? 'reported'
@@ -350,7 +370,7 @@ export class OneLinkAdapter extends LlmAdapter {
         if (chunk.type === 'finish') {
           let safe = chunk;
           if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-            failureCode = chatFailureCode(signal.aborted, facts.status, chunk.reason.failure.code);
+            failureCode = chatFailureCode(signal.aborted, facts, chunk.reason.failure);
             safe = {
               type: 'finish',
               reason: {
@@ -378,11 +398,11 @@ export class OneLinkAdapter extends LlmAdapter {
         failureCode = IMAGE_OFFLOAD_REQUIRED_CODE;
         throw error;
       }
-      failureCode = signal.aborted
-        ? 'ABORTED'
-        : error instanceof LlmError && error.code === 'TIMEOUT'
-          ? 'TIMEOUT'
-          : 'ONELINK_FAILED';
+      failureCode = chatFailureCode(
+        signal.aborted,
+        facts,
+        error instanceof LlmError ? error : { code: 'ONELINK_FAILED' },
+      );
       throw new LlmError('OneLink model request failed', failureCode);
     } finally {
       release?.();

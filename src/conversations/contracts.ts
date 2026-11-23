@@ -13,9 +13,22 @@ export interface Principal {
 export type RequestStatus =
   'accepted' | 'input-persisted' | 'completed' | 'cancelled' | 'failed' | 'unknown';
 export type TerminalRequestStatus = Exclude<RequestStatus, 'accepted' | 'input-persisted'>;
+export type ModelFailure =
+  | 'MODEL_AUTH_FAILED'
+  | 'MODEL_QUOTA_EXCEEDED'
+  | 'MODEL_RATE_LIMITED'
+  | 'MODEL_TIMEOUT'
+  | 'MODEL_CONTEXT_OVERFLOW'
+  | 'MODEL_UPSTREAM_ERROR'
+  | 'TURN_STEP_BUDGET_EXCEEDED';
+export type ConversationRunResult =
+  | TerminalRequestStatus
+  | typeof outputTruncation.reason
+  | { status: 'failed'; error: ModelFailure };
 export const isInFlightRequest = (status: RequestStatus) =>
   status === 'accepted' || status === 'input-persisted';
 export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
+
 export interface Conversation {
   id: string;
   createdAt: string;
@@ -196,7 +209,7 @@ export interface ConversationEngine {
     emit: (event: ConversationEvent) => void,
     binding?: ConversationRun,
     images?: readonly ConversationImageReference[],
-  ): Promise<TerminalRequestStatus | typeof outputTruncation.reason>;
+  ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;
 }

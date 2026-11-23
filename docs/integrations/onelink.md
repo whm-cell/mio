@@ -20,7 +20,11 @@
 
 ## 使用经验与适用条件
 
-聊天只允许固定 origin 下经路由校验的相对提交路径：`openai-chat` 要求以 `/v1/` 开头且以 `/chat/completions` 结尾（默认 `/v1/chat/completions`），`anthropic-messages` 固定为 `/v1/messages`（兼容固定 Anthropic SDK 精确的 `?beta=true` 查询），不放行 `..`、`//` 或其他路径/查询。两协议统一 Bearer，SDK x-api-key 被移除，无 ambient/native credential 回退。重定向为 error；SDK及Mio自动 retry 均为0，Anthropic strict-tool 自动降级重发也关闭。鉴权、端点、并发快照不通过共享环境变量切换。正常响应保留公开 PiAi 编码语义；非2xx错误体在进入SDK前替换为固定诊断，观察只取白名单status/requestId/usage/finish/failureCode，不透传原响应/异常。已知HTTP 401/403、408/504、429分别映射鉴权、超时、限流，其他失败不猜测额度或可用性。取消/超时和观察持久化失败分别记录实际状态。
+聊天只允许固定 origin 下经路由校验的相对提交路径：`openai-chat` 要求以 `/v1/` 开头且以 `/chat/completions` 结尾（默认 `/v1/chat/completions`），`anthropic-messages` 固定为 `/v1/messages`（兼容固定 Anthropic SDK 精确的 `?beta=true` 查询），不放行 `..`、`//` 或其他路径/查询。两协议统一 Bearer，SDK x-api-key 被移除，无 ambient/native credential 回退。重定向为 error。SDK 和 Mio 自动重试次数均为 0，Anthropic strict-tool 自动降级重发也关闭。鉴权、端点、并发快照不通过共享环境变量切换。正常响应保留公开 PiAi 编码语义。
+
+固定 `@earendil-works/pi-ai@1.5.0` 按冻结的聊天路由发送缓存策略。`anthropic-messages` 默认用 `short` 在公开 SDK 允许的断点发 `cache_control: {type:'ephemeral'}`，`long` 额外请求 `ttl:'1h'`，`none` 不发送缓存标记。`openai-chat` 依赖上游自动前缀缓存，省略 `prompt_cache_key`、`prompt_cache_retention` 与 SDK 会话关联头。实际缓存可用性和读写量由供应商响应确认。
+
+HTTP 401/403、402、408/504、429 分别分类为鉴权、额度、超时、限流，其他 5xx 是上游失败。400/413/422 响应仅在 1 秒内取得不超过 8 KiB 的完整错误体时识别白名单上下文超限诊断。成功 HTTP 响应里的已知流终止诊断也可识别上下文超限。其他拒绝保持一般失败。非 2xx 响应进入 SDK 前替换为固定诊断，观察只保存白名单 HTTP 状态、供应商请求 ID、用量、终止原因和失败分类。原响应和异常详情不会透传。取消、超时和观察持久化失败分别按实际状态记录。[公开回执错误码](../apis/conversations.md#get-apiv1conversationsidrequestsrequestid)
 
 明确声明视觉输入的 chat 路由沿相同固定端点与认证，通过公开 PiAi 编码向 OpenAI 或 Anthropic 协议发送有界图片预览。预算预检和旧图卸载发生在供应商 transport 启动之前；本地失败或卸载重试不登记虚假的上游调用观察。测试替身的线级成功不等于真实视觉模型已验证，现有 chat verified 也不区分文字与图片。
 

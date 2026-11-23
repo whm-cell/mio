@@ -267,18 +267,23 @@ export function createConversationService(
                   images,
                 );
             executionEnded = true;
-            const truncated = result === outputTruncation.reason;
+            const status = typeof result === 'string' ? result : result.status;
+            const truncated = status === outputTruncation.reason;
+            const error =
+              typeof result !== 'string'
+                ? result.error
+                : status === 'failed'
+                  ? 'MODEL_FAILED'
+                  : status === 'unknown'
+                    ? 'PROCESS_INTERRUPTED'
+                    : undefined;
             publish(id, {
               type: 'state',
               receipt: await store.finish(
                 id,
                 requestId,
-                truncated ? 'completed' : result,
-                result === 'failed'
-                  ? 'MODEL_FAILED'
-                  : result === 'unknown'
-                    ? 'PROCESS_INTERRUPTED'
-                    : undefined,
+                truncated ? 'completed' : status,
+                error,
                 truncated ? outputTruncation.reason : undefined,
               ),
             });

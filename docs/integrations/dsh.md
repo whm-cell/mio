@@ -8,6 +8,8 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 
 正式 Profile 使用 `@mio/plugin/profile` 薄入口以模块级依赖等待 `mioKernel`；独立 `@mio/plugin` 不新增该依赖。活动对话与冷读排空之前保留官方 `@deepseek-ai/dsh-compaction-image-offload` 投影及其恢复监听器，显式串行释放，不依赖同级 fiber 的卸载顺序。
 
+`mio-conversations` 保留作用域内装配 `@deepseek-ai/dsh-session-checkpoint-policy`、`@deepseek-ai/dsh-repeat-tool-reminder` 和 `@deepseek-ai/dsh-tool-call-timeout-policy`。三者都是正式产物的显式生产依赖，固定为 `0.2.2-rc.1`，随图片卸载策略保留到活动对话和读取排空。根 Profile 的工具授权仍由单调拒绝守卫和活动轮次的白名单决定。
+
 [OneLink 包装](../../src/dsh/onelink.ts)只使用固定发布包 PiAiAdapter、公开 createProvider 和协议工厂，不复制 Agent/codec。公开 agent/pre-step 将同一可信 run 快照绑定到 turn AbortSignal；resolve/metadata/prepare 消费该冻结模型/目录/适配事实，prepare 捕获同一绑定，dispatch 核对原 signal、Session、model/provider 和 purpose。无 owner 的全局 listModels 返回空，不能返回各用户目录并集；无可信 signal 的 resolve/prepare 拒绝且不解密。Key 不入 Session。当前 Profile 只有官方 loop 发起 LLM；未来新增提前解析 metadata 或持有 turn signal 的辅助插件时须重新核对授权。
 
 未知 context 在外层 metadata 省略；有来源声明时通过公开 `context.contextWindow` 传递同一快照。inner 0 是固定 SDK 1.5.0 的内部未知标记，SDK 必填 cost 的 0 也不是供应商价格。1024 是 Mio 输出政策，不是供应商最大能力。每请求的 createProvider 只包含已准入精确 ID，可编码未在 SDK 内置目录中的模型。保留官方 usage/finish、工具块和 replay；错误在进入 JSONL 前投影为固定安全诊断，取消 consumer return 也保存安全观察。根级与非授权 Agent 单调守卫保持默认全拒绝。
@@ -25,7 +27,8 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 - 预检先按 occurrence 检查张数，再逐个取得实际预览长度，以 Base64 总字节数判断是否需要旧图卸载；仅本轮开始前的 occurrence 可卸载。公开 `projectOffloadedImages` 在请求副本中生成含 assetId 和 `inspect_image_asset` 的占位，原日志和冻结输入不被改写。PiAi 发送前重新读取并核对摘要、尺寸、MIME 与预览指纹；有界并发和取消负责释放在途图片资源。
 - 普通输入使用 followup，steer 不自动成为公共入口。Handle 持有者负责释放，完成释放后可在同一内核恢复，释放中重开明确拒绝；DSH ID 不等于登录会话 ID，使用者须先完成可信身份与资源归属检查。
 - assistant-stream chunk 是瞬态展示；assistant/message 或 assistant/attempt 是结算记录，也仍不等于已落盘。whenIdle 只证明排空，需检查真实 turn/end.reason 才判断 completed、aborted、error 或 interrupted。
-- sessions.flush 必须等待成功且返回 true；无 listener 或失败不能发布持久成功。PostgreSQL 和原生日志不是原子事务。
+- `sessions.flush` 必须等待成功且返回 true。Mio 为原生检查点策略接入严格 flush，在模型派发前、顶层工具函数执行前及步间确认已记录前缀。无持久化监听、返回 false 或抛错均阻止尚未进入的下游工作，同一轮余下检查点保持失败。有效图片卡片生成后补充 flush，成功再发 SSE 卡片，后续步等待其结果。PostgreSQL 和原生日志分别持久化，已受理图片任务可能早于工具结果落盘。
+- 工具提醒使用 DSH 原生连续同参检测，阈值为 `2` 和 `4`。提醒仅进入模型上下文，异参调用继续沿原权限和预算检查。协作超时只作用于声明 `timeoutMs` 的工具。`inspect_image_asset` 为 60 秒，含准备队列等待，沿实际 AbortSignal 取消并等待工具收敛。`submit_image_job` 沿用提交前取消与现有存储期限，以便已受理的任务仍能返回句柄。
 - 正常显式关闭先停新入口，再 mioKernel.close：cancel、whenIdle、flush、Handle.dispose。根卸载 fallback 只加入公开 Handle.dispose，其内置写句柄关闭负责排空；required injection 保留驱动和持久化服务到消费者清理后，不在 detach 后再次 flush。
 - resume 的 setup 清空恢复的 next-step/next-turn inbox 并 flush，再允许新输入，防止旧未知请求在未来 followup 时执行。恢复及读取不是重新调用付费模型的授权。
 

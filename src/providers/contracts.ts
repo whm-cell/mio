@@ -60,6 +60,7 @@ export interface ModelPreference {
 
 export const CHAT_PROFILES = ['openai-chat', 'anthropic-messages'] as const;
 export type ChatProfile = (typeof CHAT_PROFILES)[number];
+export type ChatCacheRetention = 'none' | 'short' | 'long';
 /** Evidence for an implemented protocol route; catalog membership is deliberately absent. */
 export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
 export interface ImageCapabilityMetadata {
@@ -98,6 +99,7 @@ export interface ImageParameterView {
 export interface AdaptationCapabilityMetadata {
   contextWindow?: number;
   maxOutputTokens?: number;
+  cacheRetention?: ChatCacheRetention;
   inputModalities?: ('text' | 'image')[];
   maxRequestImages?: number;
   maxRequestImageBytes?: number;
@@ -264,6 +266,7 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly submitPath?: string;
   readonly maxOutputTokens?: number;
   readonly contextWindow?: number;
+  readonly cacheRetention?: ChatCacheRetention;
   readonly inputModalities?: readonly ('text' | 'image')[];
   readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;

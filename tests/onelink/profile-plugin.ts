@@ -46,6 +46,26 @@ export function apply(ctx: Context) {
     );
     const messages = body.messages as { role: string; content: unknown }[];
     const text = JSON.stringify(messages.filter((message) => message.role === 'user').at(-1));
+    const failure = text?.match(/\bFIXTURE_FAILURE_(401|402|429|500|504|CONTEXT|INVALID)\b/)?.[1];
+    if (failure) {
+      const diagnostic =
+        failure === 'CONTEXT'
+          ? 'prompt is too long: 200001 tokens > 200000 maximum'
+          : 'invalid body';
+      return Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: `${diagnostic}; upstream-private-diagnostic ${request.headers.get('authorization')}`,
+          },
+        },
+        {
+          status: failure === 'CONTEXT' || failure === 'INVALID' ? 400 : Number(failure),
+          headers: { 'x-should-retry': 'true', 'retry-after': '0' },
+        },
+      );
+    }
     if (text.includes('FIXTURE_OUTPUT_LIMIT'))
       return protocolResponse(request, '保留已生成的正文', false, { ending: 'max-tokens' });
     if (text.includes('FIXTURE_CACHE_READ'))

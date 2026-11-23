@@ -2,7 +2,13 @@ import type { Context } from '@deepseek-ai/cordis';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
-import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm';
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  createUserMessage,
+  INVALID_CREDENTIAL_CODE,
+  LlmError,
+  QUOTA_EXCEEDED_CODE,
+} from '@deepseek-ai/dsh-llm';
 import type { TurnEndReason } from '@deepseek-ai/dsh-session';
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
 import type { ConversationConfig } from '../conversations/config.ts';
@@ -12,9 +18,14 @@ import type {
   ConversationImageTools,
   ConversationVision,
   HistoryItem,
+  ModelFailure,
 } from '../conversations/contracts.ts';
 import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
+import {
+  hasCheckpointFailure,
+  trackConversationToolCheckpoints,
+} from './conversation-checkpoints.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
 import { authorizeConversationImageTools } from './policy.ts';
@@ -23,6 +34,31 @@ import { registerVisionTool } from './vision-tool.ts';
 import type { ChatRuntimeSnapshot, ChatSelection } from '../providers/contracts.ts';
 
 const MAX_TURN_STEPS = 8;
+
+function publicModelFailure(code: string): ModelFailure | undefined {
+  switch (code) {
+    case 'AUTH':
+    case 'MISSING_CREDENTIAL':
+    case INVALID_CREDENTIAL_CODE:
+      return 'MODEL_AUTH_FAILED';
+    case 'QUOTA_EXCEEDED':
+    case QUOTA_EXCEEDED_CODE:
+      return 'MODEL_QUOTA_EXCEEDED';
+    case 'RATE_LIMIT':
+      return 'MODEL_RATE_LIMITED';
+    case 'TIMEOUT':
+      return 'MODEL_TIMEOUT';
+    case 'CONTEXT_OVERFLOW':
+    case CONTEXT_WINDOW_EXCEEDED_CODE:
+      return 'MODEL_CONTEXT_OVERFLOW';
+    case 'SERVER':
+    case 'TRANSPORT':
+      return 'MODEL_UPSTREAM_ERROR';
+    case 'TURN_STEP_BUDGET_EXCEEDED':
+      return code;
+  }
+  return undefined;
+}
 
 /** Narrow bridge: DSH values stop here; only public text/tool-card/status values leave it. */
 export function createDshConversationEngine(
@@ -153,14 +189,16 @@ export function createDshConversationEngine(
       const releases = new Map<AbortSignal, () => void>();
       const runOptions = selectedOptions(binding?.snapshot);
       let observationFailed = false;
+      let observedFailureCode: string | undefined;
       let oldImageCount = () => 0;
       const observedBinding = binding
         ? {
             ...binding,
             offloadableImages: () => oldImageCount(),
-            observe: async (...args: Parameters<typeof binding.observe>) => {
+            observe: async (observation: Parameters<typeof binding.observe>[0]) => {
               try {
-                await binding.observe(...args);
+                await binding.observe(observation);
+                observedFailureCode = observation.failureCode;
               } catch {
                 observationFailed = true;
                 throw new Error('MIO_OBSERVATION_UNKNOWN');
@@ -169,6 +207,7 @@ export function createDshConversationEngine(
           }
         : undefined;
       let end: TurnEndReason | undefined;
+      let waitForToolCheckpoints: (() => Promise<void>) | undefined;
       let revokeImageTools: (() => void) | undefined;
       const entry: {
         opening: Promise<AgentHandle>;
@@ -211,7 +250,16 @@ export function createDshConversationEngine(
               generation: hasGenerationTools,
               inspection: hasInspectionTool,
             });
-            if (imageTools) registerConversationImageTools(agentCtx, observedBinding, imageTools);
+            if (imageTools) {
+              waitForToolCheckpoints = trackConversationToolCheckpoints(
+                agentCtx,
+                agent,
+                ctx.mioKernel,
+                requestId,
+                emit,
+              );
+              registerConversationImageTools(agentCtx, observedBinding, imageTools);
+            }
             if (inspection) registerVisionTool(agentCtx, observedBinding, vision!);
           }
           agentCtx.on('agent/pre-step', (payload, next) => {
@@ -258,12 +306,6 @@ export function createDshConversationEngine(
           });
           agentCtx.on('session/event', (session, event) => {
             if (session !== agent.session) return;
-            if (event.type === 'tool/result' && !event.data.message.isError) {
-              const projected = parseImageJobPresentationMeta(event.data.meta);
-              if (projected) {
-                emit({ type: 'tool', requestId, tool: projected.tool, job: projected.job });
-              }
-            }
             if (event.type === 'turn/end') end = event.data.reason;
           });
         }),
@@ -290,15 +332,21 @@ export function createDshConversationEngine(
           await ctx.mioKernel.flush(handle.agent.session);
           await durable();
           await handle.agent.whenIdle();
+          await waitForToolCheckpoints?.();
           revokeImageTools?.();
           await ctx.mioKernel.flush(handle.agent.session);
-          if (observationFailed) return 'unknown' as const;
+          if (observationFailed || hasCheckpointFailure(handle.agent.session))
+            return 'unknown' as const;
           // A disposed session can leave only a durable prefix, with no turn/end
           // event. Cold replay then reports interruption, not a definite failure.
           if (!end || end.kind === 'interrupted') return 'unknown' as const;
           if (end.kind === 'completed' || end.kind === outputTruncation.reason) return end.kind;
           if (end.kind === 'aborted' && end.reason.kind === 'user') return 'cancelled' as const;
           if (end.kind === 'aborted' && end.reason.kind === 'disposed') return 'unknown' as const;
+          if (end.kind === 'error') {
+            const error = publicModelFailure(observedFailureCode ?? end.error.code);
+            if (error) return { status: 'failed' as const, error };
+          }
           return 'failed' as const;
         } finally {
           try {

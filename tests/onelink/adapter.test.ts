@@ -59,12 +59,21 @@ function binding(
 }
 
 it.each([
-  ['OpenAI default', false, undefined, '/v1/chat/completions'],
-  ['OpenAI prefixed', false, '/v1/fixture/chat/completions', '/v1/fixture/chat/completions'],
-  ['Anthropic', true, undefined, '/v1/messages'],
+  ['OpenAI default', false, undefined, '/v1/chat/completions', undefined],
+  [
+    'OpenAI prefixed',
+    false,
+    '/v1/fixture/chat/completions',
+    '/v1/fixture/chat/completions',
+    'long',
+  ],
+  ['Anthropic default', true, undefined, '/v1/messages', undefined],
+  ['Anthropic short', true, undefined, '/v1/messages', 'short'],
+  ['Anthropic long', true, undefined, '/v1/messages', 'long'],
+  ['Anthropic no cache', true, undefined, '/v1/messages', 'none'],
 ] as const)(
   'runs two rounds through the official loop and public PiAi protocol (%s)',
-  async (_name, anthropic, submitPath, expectedPath) => {
+  async (_name, anthropic, submitPath, expectedPath, cacheRetention) => {
     const root = await mkdtemp(join(tmpdir(), 'mio-onelink-adapter-'));
     const ctx = await kernelRuntime(root, new ScriptedModel([]));
     const requests: { request: Request; body: Record<string, unknown> }[] = [];
@@ -79,6 +88,7 @@ it.each([
       const selected = {
         ...snapshot(anthropic),
         ...(submitPath === undefined ? {} : { submitPath }),
+        ...(cacheRetention === undefined ? {} : { cacheRetention }),
       };
       await engine.create('one', selected);
       for (const [requestId, text] of [
@@ -103,6 +113,35 @@ it.each([
         expectedPath,
         expectedPath,
       ]);
+      const cacheControl = {
+        type: 'ephemeral',
+        ...(cacheRetention === 'long' ? { ttl: '1h' } : {}),
+      };
+      for (const { request, body } of requests) {
+        expect(new URL(request.url).search).toBe(anthropic ? '?beta=true' : '');
+        expect(JSON.stringify(body)).not.toMatch(/"prompt_cache_(?:key|retention)":/);
+        for (const header of [
+          'x-session-id',
+          'x-session-affinity',
+          'session_id',
+          'x-client-request-id',
+        ])
+          expect(request.headers.has(header)).toBe(false);
+        if (anthropic && cacheRetention !== 'none') {
+          expect(body.system).toEqual([
+            { type: 'text', text: expect.any(String), cache_control: cacheControl },
+          ]);
+          expect(body.messages).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                role: 'user',
+                content: [expect.objectContaining({ cache_control: cacheControl })],
+              }),
+            ]),
+          );
+        } else expect(JSON.stringify(body)).not.toContain('"cache_control":');
+      }
+      if (anthropic) expect(requests[1]!.body.system).toEqual(requests[0]!.body.system);
       expect(requests[0]!.request.headers.get('authorization')).toBe('Bearer synthetic-owner-key');
       expect(requests[0]!.request.headers.has('x-api-key')).toBe(false);
       expect(requests[0]!.request.redirect).toBe('error');
@@ -244,40 +283,99 @@ it('rejects absent, mismatched and auxiliary bindings before network or credenti
   expect(transport).not.toHaveBeenCalled();
 });
 
-it.each([
-  [401, 'AUTH', false],
-  [403, 'AUTH', false],
-  [402, 'QUOTA_EXCEEDED', false],
-  [408, 'TIMEOUT', false],
-  [429, 'RATE_LIMIT', false],
-  [499, 'INVALID_REQUEST', false],
-  [500, 'SERVER', false],
-  [504, 'TIMEOUT', false],
-  [undefined, 'TRANSPORT', false],
-  [401, 'ABORTED', true],
-] as const)(
-  'classifies HTTP %s as %s without retry or leaking the source',
-  async (status, failureCode, cancelled) => {
+it.each<{
+  status?: number;
+  failureCode: string;
+  anthropic?: boolean;
+  cancelled?: boolean;
+  diagnostic?: { code?: string; type?: string; message?: string };
+}>([
+  { status: 401, failureCode: 'AUTH' },
+  { status: 403, failureCode: 'AUTH' },
+  { status: 402, failureCode: 'QUOTA_EXCEEDED', anthropic: true },
+  { status: 408, failureCode: 'TIMEOUT' },
+  { status: 429, failureCode: 'RATE_LIMIT', anthropic: true },
+  { status: 499, failureCode: 'INVALID_REQUEST' },
+  { status: 500, failureCode: 'SERVER' },
+  { status: 504, failureCode: 'TIMEOUT', anthropic: true },
+  { failureCode: 'TRANSPORT' },
+  { status: 401, failureCode: 'ABORTED', cancelled: true },
+  { status: 200, failureCode: 'TRANSPORT' },
+  {
+    status: 400,
+    diagnostic: { code: 'context_length_exceeded' },
+    failureCode: 'CONTEXT_OVERFLOW',
+  },
+  {
+    status: 400,
+    anthropic: true,
+    diagnostic: {
+      type: 'invalid_request_error',
+      message: 'prompt is too long: 200,001 tokens > 200,000 maximum',
+    },
+    failureCode: 'CONTEXT_OVERFLOW',
+  },
+  {
+    status: 400,
+    anthropic: true,
+    diagnostic: { type: 'invalid_request_error', message: 'invalid body' },
+    failureCode: 'INVALID_REQUEST',
+  },
+  {
+    status: 413,
+    anthropic: true,
+    diagnostic: { type: 'request_too_large', message: 'Request exceeds the maximum size' },
+    failureCode: 'INVALID_REQUEST',
+  },
+  {
+    status: 200,
+    diagnostic: { message: 'Your input exceeds the context window of this model' },
+    failureCode: 'CONTEXT_OVERFLOW',
+  },
+  {
+    status: 200,
+    anthropic: true,
+    diagnostic: { type: 'context_window_exceeded' },
+    failureCode: 'CONTEXT_OVERFLOW',
+  },
+  {
+    status: 200,
+    anthropic: true,
+    diagnostic: { type: 'request_too_large', message: 'invalid request body' },
+    failureCode: 'PI_AI_ERROR',
+  },
+])(
+  'classifies HTTP $status as $failureCode with one sanitized attempt',
+  async ({ status, failureCode, anthropic, cancelled, diagnostic }) => {
     const adapter = new OneLinkAdapter();
     const observations: ModelObservation[] = [];
     const controller = new AbortController();
-    adapter.bind(controller.signal, binding('one', observations));
-    const transport = vi.fn(async () => {
-      const message = 'synthetic-owner-key private text';
+    const run = binding('one', observations, anthropic);
+    adapter.bind(controller.signal, run);
+    const provider = anthropic ? 'onelink-anthropic' : 'onelink-openai';
+    const privateText = 'synthetic-owner-key private text';
+    const transport = vi.fn(async (request: Request) => {
+      const message = diagnostic?.message ? `${diagnostic.message}; ${privateText}` : privateText;
       if (status === undefined) throw new Error(message);
       if (cancelled) controller.abort();
-      return new Response(JSON.stringify({ error: { message } }), { status });
+      const error = { ...diagnostic, message };
+      if (status === 200)
+        return diagnostic
+          ? new Response(`event: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`, {
+              headers: { 'content-type': 'text/event-stream' },
+            })
+          : protocolResponse(request, 'interrupted response', false, { ending: 'incomplete' });
+      return Response.json(
+        { error },
+        { status, headers: { 'x-should-retry': 'true', 'retry-after': '0' } },
+      );
     });
     vi.stubGlobal('fetch', transport);
-    const prepared = await adapter.prepareCall(
-      'onelink-openai',
-      'future-text:route-Q',
-      controller.signal,
-    );
+    const prepared = await adapter.prepareCall(provider, run.snapshot.modelId, controller.signal);
     const chunks: StreamChunk[] = await collect(
       prepared.stream({
-        provider: 'onelink-openai',
-        model: 'future-text:route-Q',
+        provider,
+        model: run.snapshot.modelId,
         maxTokens: 1024,
         messages: [],
         signal: controller.signal,
@@ -285,7 +383,7 @@ it.each([
       }),
     );
     expect(transport).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(chunks)).not.toContain('synthetic-owner-key');
+    expect(JSON.stringify(chunks)).not.toContain(privateText);
     expect(chunks.at(-1)).toMatchObject({
       type: 'finish',
       reason: { kind: cancelled ? 'aborted' : 'error', failure: { code: failureCode } },
@@ -298,7 +396,8 @@ it.each([
     });
     if (status === undefined) expect(observations[0]).not.toHaveProperty('status');
     expect(observations[0]).not.toHaveProperty('usage');
-    expect(JSON.stringify(observations)).not.toContain('synthetic-owner-key');
+    expect(observations[0]).not.toHaveProperty('contextOverflow');
+    expect(JSON.stringify(observations)).not.toContain(privateText);
   },
 );
 

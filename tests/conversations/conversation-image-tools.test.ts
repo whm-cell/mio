@@ -122,16 +122,22 @@ function extractMessageText(content: unknown): string {
   return JSON.stringify(content ?? '');
 }
 
+function userPromptIndex(messages: Record<string, unknown>[]): number {
+  return messages.findLastIndex((message) => {
+    if (message.role !== 'user') return false;
+    // The OpenAI wire format represents DSH's internal repeat notices as user content.
+    const text = extractMessageText(message.content);
+    return (
+      !text.startsWith('You are repeating the exact same tool call with identical arguments.') &&
+      !text.startsWith('Repeated tool call detected:')
+    );
+  });
+}
+
 function currentTurnToolOutputs(
   messages: Record<string, unknown>[],
 ): { toolCallId: string; text: string }[] {
-  let lastUserIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === 'user') {
-      lastUserIndex = index;
-      break;
-    }
-  }
+  const lastUserIndex = userPromptIndex(messages);
   const slice = lastUserIndex >= 0 ? messages.slice(lastUserIndex + 1) : messages;
   return slice
     .filter((msg) => msg.role === 'tool')
@@ -519,7 +525,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
           messages,
         });
         const reqSeq = `obs-${chatRequests.length}`;
-        const lastUser = messages.filter((m) => m.role === 'user').at(-1);
+        const lastUser = messages[userPromptIndex(messages)];
         const prompt = extractMessageText(lastUser?.content);
         const toolOutputs = currentTurnToolOutputs(messages);
 
@@ -2160,7 +2166,7 @@ export function apply(ctx: Context) {
     ).toBe(202);
     const stepReceipt = await waitReceiptStatus(budgetConv, 'step-budget', 0);
     expect(stepReceipt.status).toBe('failed');
-    expect(stepReceipt.error).toBe('MODEL_FAILED');
+    expect(stepReceipt.error).toBe('TURN_STEP_BUDGET_EXCEEDED');
     expect(chatRequests.length - chatBeforeStepBudget).toBe(8);
 
     // 5. Mid-turn cancel revokes active grant cleanly and allows subsequent turns

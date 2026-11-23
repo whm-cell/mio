@@ -267,6 +267,7 @@ export function createProviderService(
         { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
         config,
       );
+      const { cacheRetention } = adaptation.capabilityMetadata;
       return Object.freeze({
         ...selection,
         modelKey: selection.modelKey!,
@@ -283,6 +284,7 @@ export function createProviderService(
         inputModalities: Object.freeze([...adaptation.inputModalities]),
         imageBudget: Object.freeze({ ...adaptation.imageBudget }),
         ...(adaptation.contextWindow ? { contextWindow: adaptation.contextWindow } : {}),
+        ...(cacheRetention !== undefined ? { cacheRetention } : {}),
         apiKey,
       });
     },

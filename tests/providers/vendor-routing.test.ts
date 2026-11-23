@@ -386,7 +386,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             driver: 'openai-chat',
             classification: 'chat',
             submitPath: '/v1/chat/completions',
-            capabilityMetadata: { maxOutputTokens: 2048 },
+            capabilityMetadata: { maxOutputTokens: 2048, cacheRetention: 'long' },
             sourceKind: 'protocol-reference',
             source: 'unit1-acceptance-scenario-4',
             sourceVersion: 'v1',
@@ -506,6 +506,10 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           const catalog = await providerService.catalog(actor);
           const chatModel = catalog.items.find((i) => i.modelId === 's-chat-custom-2048')!;
           const imageModel = catalog.items.find((i) => i.modelId === 'WL-Next-Seedream-X')!;
+          const selection = await providerService.selectChat(actor, chatModel.modelRef);
+          const snapshot = await providerService.resolveChat(actor, selection);
+          expect(snapshot.cacheRetention).toBe('long');
+          expect(Object.isFrozen(snapshot)).toBe(true);
 
           const created = await convService.create(actor, chatModel.modelRef);
           const chatReqId = randomUUID();
@@ -519,6 +523,9 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             model: 's-chat-custom-2048',
             max_tokens: 2048,
           });
+          expect(JSON.stringify(chatOutbound[0])).not.toMatch(
+            /"(?:prompt_cache_(?:key|retention)|cache_control)":/,
+          );
 
           const postRes = await realFetch(`${httpOrigin}/api/v1/compute/images`, {
             method: 'POST',

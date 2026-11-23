@@ -30,6 +30,7 @@ import type { ConversationService } from './conversations/service.ts';
 import type { ConversationImageTools } from './conversations/contracts.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
+import { applyConversationPolicies } from './dsh/conversation-checkpoints.ts';
 import { createConversationVision } from './dsh/vision.ts';
 import * as imageOffload from '@deepseek-ai/dsh-compaction-image-offload';
 import { readProviderConfig } from './providers/config.ts';
@@ -414,14 +415,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           // Keep the plugin on the parent's retained service scope. A child with its
           // own required injections may otherwise unload when those services begin
           // shutting down, before the parent has drained history and active turns.
-          const offload = conversationCtx.plugin({
-            name: imageOffload.name,
-            apply: imageOffload.apply,
+          const policies = conversationCtx.plugin({
+            name: 'mio-conversation-policies',
+            apply(policyCtx: Context) {
+              applyConversationPolicies(policyCtx);
+              imageOffload.apply(policyCtx);
+            },
           });
           // Cordis unloads sibling effects concurrently. Collect the plugin disposer and
-          // conversation drain in one effect so the projection outlives every agent.
+          // conversation drain in one effect so the policies outlive every agent.
           conversationCtx.effect(function* () {
-            yield offload.dispose;
+            yield policies.dispose;
             yield async () => {
               const failures: unknown[] = [];
               try {
@@ -436,7 +440,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               }
               if (failures.length) {
                 try {
-                  await offload.dispose();
+                  await policies.dispose();
                 } catch (error) {
                   failures.push(error);
                 }
@@ -444,7 +448,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               }
             };
           });
-          await offload;
+          await policies;
           const store = await createConversationStore(conversationConfig.databaseURL);
           try {
             const imageTools: ConversationImageTools | undefined =

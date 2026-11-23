@@ -95,6 +95,8 @@ pnpm providers:route <--stdin | routes.json>
 
 平台路由仅对用户已存在成员补充空缺分类，未知分类仍不自动归入 chat；可选文本 `capabilityMetadata.contextWindow` 为正整数，`capabilityMetadata.maxOutputTokens` 为 `1..65536` 正整数（缺省按 1024 执行）。未知上下文/价格/工具/媒体能力不补值。来源明确是部署路由声明，不冒充供应商元数据。路由入口不创造成员、不接收任意外部主机 URL/Key/verified，不开放普通用户管理 API（平台管理员通过独立鉴权的[管理后台 HTTP](apis/admin.md)维护路由、修订回滚与模型策略）。每次实质路由更新递增 `declaration_version`、追加 `mio_provider_model_route_revisions` 快照并使旧版本验证回到 `unverified`，分类变化保留身份/偏好。
 
+文本路由可声明 `capabilityMetadata.cacheRetention`，值限于 `none`、`short`、`long`。该字段随 fresh 请求的路由快照冻结。`anthropic-messages` 缺省为 `short`，发送 `cache_control` 的 `ephemeral` 标记。`long` 在该标记上添加 `ttl: '1h'`，须确认目标支持并显式配置。`none` 省略标记。`openai-chat` 由上游自动处理前缀缓存，Mio 保持原请求形状，省略显式缓存字段与会话关联头。实际缓存读写以对应调用的供应商用量为准。[OneLink 集成](integrations/onelink.md#使用经验与适用条件)
+
 平台模型主表 `mio_provider_catalog_models` 直接控制隐藏模型双向行为：`user_visible=false` 时对普通用户屏蔽该模型（不进入模型列表，显式调用或修改返回 `MODEL_HIDDEN`，已有默认保留目标但 `effective=false`）；`allow_undiscovered=true` 且 `user_visible=true` 时，仅对配置启用、凭据未拒绝且已完成当前凭据目录刷新的用户幂等补录稳定 `admin-curated-hidden` 模型身份，使其在具备生效路由时可选择、调用和记录本人验证，关闭后立即停止对未实际发现用户的开放。
 
 chat 路由可显式声明 `capabilityMetadata.inputModalities`；必须包含 `text`，仅接受互异的 `text`、`image`，缺省按纯文本处理。只有声明二者的路由可使用对话图片，并可声明四项正整数预算：`maxRequestImages` 默认 4、上限 16；`maxRequestImageBytes` 默认 10 MiB、上限 20 MiB，是每次请求全部图片的 Base64 硬上限；`requestImagePixelBudget` 默认 4,194,304、上限 16,777,216；`requestImageMaxBytes` 默认 5 MiB、上限 10 MiB，是单张预览的软目标。纯文本或未声明视觉的路由不能携带视觉预算。能力声明和预算不证明真实视觉调用成功。

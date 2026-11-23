@@ -79,6 +79,12 @@ it('limits route imports to sourced, implemented vendor drivers and rejects endp
     submitPath: '/v1/chat/completions',
   });
   expect(validateRouteImportPayload({ routes: [entry] })).toHaveLength(1);
+  for (const cacheRetention of ['none', 'short', 'long'])
+    expect(
+      validateModelRouteEntry({ ...entry, capabilityMetadata: { cacheRetention } }),
+    ).toMatchObject({
+      capabilityMetadata: { cacheRetention },
+    });
   for (const patch of [
     { driver: 'unknown' },
     { driver: 'gpt-images-v1' },
@@ -94,6 +100,9 @@ it('limits route imports to sourced, implemented vendor drivers and rejects endp
     { endpoint: 'https://other.test' },
     { capabilityMetadata: { price: 0 } },
     { capabilityMetadata: { contextWindow: 0 } },
+    { capabilityMetadata: { cacheRetention: '24h' } },
+    { capabilityMetadata: { cacheRetention: null } },
+    { capabilityMetadata: { cacheRetention: 60 } },
     { classification: 'unknown' },
   ])
     expect(() => validateModelRouteEntry({ ...entry, ...patch })).toThrow('ROUTE_INVALID');
@@ -211,6 +220,7 @@ it('validates explicit image route paramSpec, edit/mask/outpaint gates, and deri
   });
 
   for (const bad of [
+    { ...gptFixture, capabilityMetadata: { cacheRetention: 'long' } },
     // edit without editPath
     { ...gptFixture, editPath: null },
     // edit with 0 maxReferenceImages

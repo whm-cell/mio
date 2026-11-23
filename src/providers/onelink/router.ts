@@ -155,6 +155,7 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
       ![
         'contextWindow',
         'maxOutputTokens',
+        'cacheRetention',
         'inputModalities',
         'maxRequestImages',
         'maxRequestImageBytes',
@@ -174,6 +175,14 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
     (!Number.isSafeInteger(value.maxOutputTokens) ||
       Number(value.maxOutputTokens) < 1 ||
       Number(value.maxOutputTokens) > 65_536)
+  )
+    invalidRoute();
+  const { cacheRetention } = value;
+  if (
+    cacheRetention !== undefined &&
+    cacheRetention !== 'none' &&
+    cacheRetention !== 'short' &&
+    cacheRetention !== 'long'
   )
     invalidRoute();
   if (
@@ -205,6 +214,7 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
     ...(typeof value.maxOutputTokens === 'number'
       ? { maxOutputTokens: value.maxOutputTokens }
       : {}),
+    ...(cacheRetention !== undefined ? { cacheRetention } : {}),
     ...(Array.isArray(value.inputModalities)
       ? { inputModalities: value.inputModalities.includes('image') ? ['text', 'image'] : ['text'] }
       : {}),

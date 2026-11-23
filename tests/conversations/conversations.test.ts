@@ -147,6 +147,114 @@ async function events(id: string, cookie = ownerCookie) {
   };
 }
 
+it.each([
+  ['AUTH', 'MODEL_AUTH_FAILED'],
+  ['INVALID_CREDENTIAL', 'MODEL_AUTH_FAILED'],
+  ['MISSING_CREDENTIAL', 'MODEL_AUTH_FAILED'],
+  ['QUOTA_EXCEEDED', 'MODEL_QUOTA_EXCEEDED'],
+  ['QUOTA', 'MODEL_QUOTA_EXCEEDED'],
+  ['RATE_LIMIT', 'MODEL_RATE_LIMITED'],
+  ['TIMEOUT', 'MODEL_TIMEOUT'],
+  ['CONTEXT_OVERFLOW', 'MODEL_CONTEXT_OVERFLOW'],
+  ['CONTEXT_WINDOW_EXCEEDED', 'MODEL_CONTEXT_OVERFLOW'],
+  ['SERVER', 'MODEL_UPSTREAM_ERROR'],
+  ['TRANSPORT', 'MODEL_UPSTREAM_ERROR'],
+  ['UNKNOWN', 'MODEL_FAILED'],
+  ['INVALID_REQUEST', 'MODEL_FAILED'],
+] as const)(
+  'publishes the same sanitized failure for %s through GET and SSE',
+  async (code, error) => {
+    const id = await create();
+    const requestId = 'redacted-failure';
+    const upstreamDiagnostic = 'private-key=synthetic fixture https://provider.example.test/hidden';
+    const stream = await events(id);
+    const initial = model.requests.length;
+    script.push([
+      {
+        type: 'finish',
+        reason: { kind: 'error', failure: { code, message: upstreamDiagnostic } },
+      },
+    ]);
+    const expected = { conversationId: id, requestId, status: 'failed', error };
+    try {
+      expect((await send(id, requestId, 'continue')).status).toBe(202);
+      expect(await terminal(id, requestId)).toEqual(expected);
+      await stream.wait(
+        (event) => event.type === 'state' && (event.receipt as Receipt).status === 'failed',
+      );
+      expect(stream.received).toContainEqual({ type: 'state', receipt: expected });
+      expect(await (await send(id, requestId, 'continue')).json()).toEqual(expected);
+      expect(JSON.stringify(stream.received)).not.toMatch(/private-key|provider\.example\.test/);
+      expect(await (await call(path(id, 'history'))).text()).not.toMatch(
+        /private-key|provider\.example\.test/,
+      );
+      expect(model.requests.length - initial).toBe(1);
+    } finally {
+      await stream.close();
+    }
+  },
+);
+
+it('keeps a non-checkpoint engine error as MODEL_FAILED', async () => {
+  const id = await create();
+  const requestId = 'engine-error';
+  const initial = model.requests.length;
+  const detach = ctx.on('agent/pre-step', ({ agent }, next) => {
+    if (agent.id === `mio-${id}`) throw new Error('private step diagnostic');
+    return next();
+  });
+  try {
+    expect((await send(id, requestId, 'continue')).status).toBe(202);
+    expect(await terminal(id, requestId)).toEqual({
+      conversationId: id,
+      requestId,
+      status: 'failed',
+      error: 'MODEL_FAILED',
+    });
+    expect(model.requests.length).toBe(initial);
+  } finally {
+    detach();
+  }
+});
+
+it('refuses dispatch on a model checkpoint failure through the production conversation plugin', async () => {
+  const id = await create();
+  const requestId = 'checkpoint-rejected';
+  const stream = await events(id);
+  const initial = model.requests.length;
+  let requestLogged = false;
+  let rejected = false;
+  const stopEvent = ctx.on('session/event', (session, event) => {
+    if (session.id === `mio-${id}` && event.type === 'request/header') requestLogged = true;
+  });
+  const stopFlush = ctx.on('session/flush', (session) => {
+    if (session.id !== `mio-${id}` || !requestLogged || rejected) return;
+    rejected = true;
+    throw new Error('private persistence diagnostic');
+  });
+  const expected = {
+    conversationId: id,
+    requestId,
+    status: 'unknown',
+    error: 'PROCESS_INTERRUPTED',
+  };
+  script.push(textResponse('model dispatch must be blocked'));
+  try {
+    expect((await send(id, requestId, 'continue')).status).toBe(202);
+    expect(await terminal(id, requestId)).toEqual(expected);
+    await stream.wait(
+      (event) => event.type === 'state' && (event.receipt as Receipt).status === 'unknown',
+    );
+    expect(stream.received).toContainEqual({ type: 'state', receipt: expected });
+    expect(rejected).toBe(true);
+    expect(model.requests.length).toBe(initial);
+  } finally {
+    stopEvent();
+    stopFlush();
+    await stream.close();
+  }
+});
+
 beforeAll(async () => {
   database = await authDatabase();
   observer = new Pool({ connectionString: database.observerURL });

@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/conversations/http.ts](../../../../src/conversations/http.ts) · [src/conversations/store.ts](../../../../src/conversations/store.ts) · [src/conversations/schema.ts](../../../../src/conversations/schema.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [docs/apis/conversations.md](../../../apis/conversations.md) · [tests/conversations/conversation-lifecycle.test.ts](../../../../tests/conversations/conversation-lifecycle.test.ts)
 
+## conversation-step-reliability-and-cache
+
+**对话步级检查点、前缀缓存与脱敏错误回执**
+
+[src/dsh/conversation-checkpoints.ts](../../../../src/dsh/conversation-checkpoints.ts) · [src/providers/onelink/router.ts](../../../../src/providers/onelink/router.ts) · [src/dsh/onelink.ts](../../../../src/dsh/onelink.ts) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [docs/conversations.md](../../../conversations.md) · [docs/apis/conversations.md](../../../apis/conversations.md)
+
 ```mio-prd-results
 {
   "version": 5,

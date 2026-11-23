@@ -42,6 +42,47 @@
         "statement": "接受 M2 候选",
         "reference": "2026-11-23 当前对话已交回 M2 本地候选 07fa5ec93de0e43e37c26bf036e771bd403a6b2e（契约修订 4、5 项证据和草稿 cb969e40-99b6-4f5e-b622-88956212cd00）。用户在该候选的确认题答复「接受 M2 候选」。"
       }
+    },
+    {
+      "key": "conversation-step-reliability-and-cache",
+      "title": "对话步级检查点、前缀缓存与脱敏错误回执",
+      "locations": [
+        {
+          "path": "src/dsh/conversation-checkpoints.ts",
+          "purpose": "正式 DSH 检查点、重复提醒、协作超时和持久工具卡片"
+        },
+        {
+          "path": "src/providers/onelink/router.ts",
+          "purpose": "平台聊天路由缓存元数据校验"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "固定协议的请求快照、受控缓存与安全模型观察"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "归属请求的公开结算与实时状态"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "持久化、恢复、工具和缓存运行边界"
+        },
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "对外回执与 SSE 已采用契约"
+        }
+      ],
+      "outcomes": "实现 M1 助手模型出站、顶层工具执行与步间的原生日志检查点，以及持久后发布的图像任务卡片。提供连续同参提醒、图片查看协作期限和路由受控的前缀缓存。GET 回执与 SSE 共用细分脱敏失败码，沿用历史 MODEL_FAILED 和当前用户请求身份。",
+      "verification": "候选 978d72073e63272fea07b7b1b8c5fa462385b49a 的八项必需证据通过。全量静态和构建、隔离定向回归 76 文件 855 测试、独立打包 Profile 烟测成功。完整检查覆盖来自主分支 4feeb452 的全量 CI 基线和当前增量。独立真实验证使用本人开发账号当前 minimax-m3 和进程私有 Anthropic 快照发送一次短缓存标记，HTTP 200、max-tokens，适配观察报告 183 cache-read tokens。",
+      "limitations": "图像任务受理与对话日志落盘分属持久层，互有中断窗口。真实验证使用临时进程内路由，确认一次真实网关兼容，对应 32 token 截断且无文本增量。供应商报告的缓存读数不证明标记因果或跨轮缓存效果。正式 HTTP/SSE 由隔离打包 Profile 验证。受验提交和草稿仅在本地，当前候选没有远端 CI 或发布。",
+      "acceptance": {
+        "candidate": {
+          "commit": "978d72073e63272fea07b7b1b8c5fa462385b49a",
+          "contractRevision": 3
+        },
+        "statement": "接受 M1 候选",
+        "reference": "Codex 多轮对话进阶 PRD 实施会话中，用户对 M1 978d72073e63272fea07b7b1b8c5fa462385b49a 草稿的明确回复。"
+      }
     }
   ]
 }

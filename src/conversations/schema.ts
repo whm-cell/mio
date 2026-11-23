@@ -32,15 +32,17 @@ ALTER TABLE mio_conversations
 CREATE INDEX IF NOT EXISTS mio_conversations_owner_activity_page
   ON mio_conversations(owner_id, updated_at DESC, id DESC) WHERE archived_at IS NULL;
 ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'general'
-  CHECK (purpose IN ('general', 'drama-script'));`;
+  CHECK (purpose IN ('general', 'drama-script'));
+ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS reasoning_effort text
+  CHECK (reasoning_effort IN ('low', 'medium', 'high'));`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
 export async function checkConversationSchema(database: Pick<Pool, 'query'>): Promise<void> {
   for (const [table, columns, types] of [
     [
       'mio_conversations',
-      'id,owner_id,dsh_session_id,created_at,state,active_request,model_binding,title,title_pinned,updated_at,archived_at,purpose',
-      [2950, 25, 25, 1184, 25, 25, 3802, 25, 16, 1184, 1184, 25],
+      'id,owner_id,dsh_session_id,created_at,state,active_request,model_binding,title,title_pinned,updated_at,archived_at,purpose,reasoning_effort',
+      [2950, 25, 25, 1184, 25, 25, 3802, 25, 16, 1184, 1184, 25, 25],
     ],
     [
       'mio_conversation_requests',

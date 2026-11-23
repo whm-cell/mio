@@ -1,10 +1,11 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
-import { ProviderError, categories } from './contracts.ts';
+import { ProviderError, categories, supportsChatReasoning } from './contracts.ts';
 import type {
   Category,
   Discovery,
   ProviderPrincipal,
+  ChatReasoningEffort,
   ChatSelection,
   ChatRuntimeSnapshot,
   ImageAdmissionSnapshot,
@@ -259,8 +260,18 @@ export function createProviderService(
       }
       return models;
     },
-    async selectChat(actor: ProviderPrincipal, modelRef?: string): Promise<ChatSelection> {
-      return (await chatState(actor, modelRef)).selection;
+    async selectChat(
+      actor: ProviderPrincipal,
+      modelRef?: string,
+      reasoningEffort?: ChatReasoningEffort,
+    ): Promise<ChatSelection> {
+      const { selection, adaptation } = await chatState(actor, modelRef);
+      if (
+        reasoningEffort !== undefined &&
+        !supportsChatReasoning(adaptation.capabilityMetadata.reasoning, reasoningEffort)
+      )
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_REASONING_UNSUPPORTED');
+      return selection;
     },
     async chatContextWindow(
       actor: ProviderPrincipal,
@@ -279,7 +290,11 @@ export function createProviderService(
         { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
         config,
       );
-      const { cacheRetention } = adaptation.capabilityMetadata;
+      const { cacheRetention, reasoning, streamIdleTimeoutMs } = adaptation.capabilityMetadata;
+      const frozenReasoning =
+        reasoning?.supported && reasoning.efforts
+          ? Object.freeze({ ...reasoning, efforts: Object.freeze([...reasoning.efforts]) })
+          : reasoning && Object.freeze({ ...reasoning });
       return Object.freeze({
         ...selection,
         modelKey: selection.modelKey!,
@@ -297,6 +312,8 @@ export function createProviderService(
         imageBudget: Object.freeze({ ...adaptation.imageBudget }),
         ...(adaptation.contextWindow ? { contextWindow: adaptation.contextWindow } : {}),
         ...(cacheRetention !== undefined ? { cacheRetention } : {}),
+        ...(frozenReasoning !== undefined ? { reasoning: frozenReasoning } : {}),
+        ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
         apiKey,
       });
     },

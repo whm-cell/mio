@@ -14,11 +14,11 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 身份：当前登录用户，owner 由服务取得。
 
-输入：`{modelRef?,purpose?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。purpose 仅接受 `general` 或 `drama-script`，省略时使用 `general`。purpose 在会话创建后固定。接口拒绝自定义系统提示词、项目关联标识与项目上下文。
+输入：`{modelRef?,purpose?,reasoningEffort?}`。modelRef 为准确目录引用、非空且最多 512 字节。BYOK 下省略时选择本人显式 chat 默认，不自动替代；legacy 只接受省略该值。purpose 仅接受 `general` 或 `drama-script`，省略时使用 `general`。`reasoningEffort` 可取 `low`、`medium`、`high`，选填以设置本会话的轮次默认档位。服务校验所选聊天路由当前明确支持该档位。用途与档位默认值在创建时固定。接口拒绝自定义系统提示词、项目关联标识与项目上下文。
 
-成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?,purpose?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。元数据仅在用途为 `drama-script` 时带 `purpose`，省略表示 `general`，亦适用于既有会话。
+成功：201 `{id,createdAt,updatedAt,title:null,state:'ready',modelRef?,purpose?,reasoningEffort?}`。PG 映射和原生 Session 均达到本地创建屏障，初始 `updatedAt` 等于 `createdAt`。BYOK 返回冻结的 modelRef。元数据仅在用途为 `drama-script` 时带 `purpose`，省略表示 `general`，亦适用于既有会话。配置了会话默认档位时返回 `reasoningEffort`。
 
-错误：未知或无效的 purpose 返回 400 BODY_INVALID。BYOK 按共同约定的具体资格错误；legacy 的 503 MODEL_UNAVAILABLE 保留。503 CONVERSATION_UNKNOWN 表示跨存储未收口，所属列表可能已有 unknown 映射。缺模型/配置/资格不创建映射。
+错误：未知或无效的 purpose、reasoningEffort 返回 400 BODY_INVALID。选定路由或 legacy 未声明该档位时返回 409 MODEL_REASONING_UNSUPPORTED。BYOK 按共同约定的具体资格错误；legacy 的 503 MODEL_UNAVAILABLE 保留。503 CONVERSATION_UNKNOWN 表示跨存储未收口，所属列表可能已有 unknown 映射。缺模型、配置或资格，以及档位不受支持时均不创建映射。
 
 副作用：创建 PG 归属映射和 DSH 原生会话头，不调用模型或授权工具。
 
@@ -28,7 +28,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：可选 `after` 接收上页原样返回的游标。省略时从首页开始。`limit` 默认 20，可取 1–100。
 
-成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?}],nextAfter}`，仅包含未归档会话。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
+成功：200 `{items:[{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?}],nextAfter}`，仅包含未归档会话。首页按 `updated_at DESC, id DESC`，游标保存精确的数据库排序位置，客户端直接传回 `nextAfter`。继续使用旧 UUID 游标时，服务沿 UUID 升序分页并继续返回 UUID 游标，省略 `after` 后即使用活跃顺序。`nextAfter:null` 表示已到末页。`title:null` 表示尚无标题，legacy 或未绑定时省略 modelRef。
 
 错误：见本域共同约定。
 
@@ -40,7 +40,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{title}`。原始标题最多 120 个 UTF-8 字节，须由有效的 Unicode 码点组成，清理控制字符并折叠空白后仍须非空。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef?,purpose?}`。
+成功：200 `{id,createdAt,updatedAt,title,state,modelRef?,purpose?,reasoningEffort?}`。
 
 错误：正文含其他字段、标题无效或超长均返回 400 BODY_INVALID。归档后返回 409 CONVERSATION_ARCHIVED，归属不匹配返回 404。
 
@@ -76,7 +76,9 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 身份：当前登录用户与对话 owner；受理后登录失效仍允许该轮结算。
 
-输入：`{requestId,text,imageAssetIds?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
+输入：`{requestId,text,imageAssetIds?,reasoningEffort?}`，普通输入经官方 followup；不开放 steer。`imageAssetIds` 最多 4 个互异小写 UUIDv4，顺序有意义，空数组等同省略，文本仍须非空。仅接受本人 ready 的 original 或 derived PNG/JPEG/WebP，源文件最多 10 MiB、16,777,216 像素且每边不超过 8192；仅显式声明 text 与 image 输入的 chat 路由可带图。
+
+`reasoningEffort` 的 `low`、`medium` 或 `high` 只覆盖本轮。省略时继承会话默认档位；会话也未设置时沿用驱动默认请求行为。新请求按受理时路由验证生效档位，声明移除后先前的默认档位也会被拒绝。无效值返回 400 BODY_INVALID，路由未明确支持生效档位时返回 409 MODEL_REASONING_UNSUPPORTED。两类拒绝均在模型派发前发生。同一 requestId 再次提交同一正文、图片与显式档位，先读取原回执。改变、增加或移除显式档位与改变正文一样构成 REQUEST_ID_CONFLICT。
 
 已关联项目的 `drama-script` 会话使用标准消息请求。服务端按拥有者和会话读取本轮项目快照，项目字段写入 HTTP 正文会返回 400 BODY_INVALID。快照超出 64 KiB UTF-8 JSON 会返回 413 CONVERSATION_CONTEXT_TOO_LARGE。关联来源异常、无效或归属不符返回脱敏的 503 CONVERSATION_CONTEXT_UNAVAILABLE。两种拒绝均发生在接收前，可用原 requestId 重试。已受理请求的回执重放不重新解析项目。
 
@@ -106,7 +108,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`{modelRef}`，准确的本人允许 chat 目录引用，最多 512 字节；不接收 mode、Key、配置 ID、URL 或 header。
 
-成功：200 `{id,createdAt,updatedAt,title,state,modelRef,purpose?}`。仅为旧无绑定会话设置一次。已经绑定相同值时返回原绑定，不重新验证当前 Key。归档会话拒绝绑定。
+成功：200 `{id,createdAt,updatedAt,title,state,modelRef,purpose?,reasoningEffort?}`。仅为旧无绑定会话设置一次。已经绑定相同值时返回原绑定，不重新验证当前 Key。归档会话拒绝绑定。
 
 错误：409 包括 CONVERSATION_MODEL_LOCKED、CONVERSATION_BUSY、CONVERSATION_UNKNOWN 和 CONVERSATION_ARCHIVED。未绑定时还须满足共同约定的当前 BYOK 资格。
 
@@ -135,7 +137,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 已取消或无法证明结算的请求沿实际状态返回。客户端可按原 requestId 查询，和 SSE `state` 或 `snapshot` 中的同一回执核对。普通模型错误不会自动重发。出错的模型尝试尚未发布非空正文且收到明确的上游上下文超限时，启用摘要的轮次最多执行一次摘要和一次正文重发，三次实际出站观察都归原请求。重发仍超限返回 `MODEL_CONTEXT_OVERFLOW`。
 
-出错的模型尝试已通过 SSE 发布非空 `text` 时，之后确证的上下文超限直接结算为 `MODEL_CONTEXT_OVERFLOW`。流上已推送的片段保留，该次失败后无摘要或重发。前序步骤的正文及本次隐藏推理不影响这项判定。失败尝试保存在内部日志，重连按原请求回执和正式消息的历史投影恢复。服务不返回供应商响应原文或凭据。
+出错的模型尝试已通过 SSE 发布非空 `text` 时，之后确证的上下文超限直接结算为 `MODEL_CONTEXT_OVERFLOW`。流上已推送的片段保留，该次失败后无摘要或重发。前序步骤的正文及本次思考增量不影响这项判定。失败尝试保存在内部日志，重连按原请求回执和正式消息的历史投影恢复。服务不返回供应商响应原文或凭据。
 
 输出截断的已结算回执为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。该标记仅来自实际原生轮次终态及持久化确认，正文可从历史读取。普通结算及旧回执省略该字段。
 
@@ -149,7 +151,9 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、reasoning `{requestId,text}`、tool-status `{requestId,tool,status}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`。每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+
+reasoning 来自声明支持推理的路由本轮产生的真实思考增量。tool-status 只含请求 ID、已授权工具名称及 `running`、`completed` 或 `failed`。工具名称为 `list_image_models`、`submit_image_job`、`get_image_job` 或 `inspect_image_asset`，以本轮实际授权为准。此状态对应工具本次执行，图片任务的进度和产物仍查卡片或任务回执。思考增量与工具状态仅在连接期间可见，公开 GET history 继续投影正式消息、有效图片任务卡片和轮次状态。
 
 水位 `{estimatedTokens,contextWindow,compacted}` 在可估算时随 snapshot 与轮次或手动压缩的结算状态返回。BYOK snapshot 显示发起订阅时当前可用的绑定路由窗口；结算 state 显示本次已受理请求的冻结窗口。用 `contextWindow: null` 表示缺少适用的路由窗口，`compacted: true` 表示上下文含已持久化的压缩检查点。估算无法取得时省略该字段，回执照常返回。窗口只读取本地元数据，公开字段不含提示词、摘要、凭据或原始工具输出。
 

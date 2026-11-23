@@ -24,13 +24,17 @@
 
 固定 `@earendil-works/pi-ai@1.5.0` 按冻结的聊天路由发送缓存策略。`anthropic-messages` 默认用 `short` 在公开 SDK 允许的断点发 `cache_control: {type:'ephemeral'}`，`long` 额外请求 `ttl:'1h'`，`none` 不发送缓存标记。`openai-chat` 依赖上游自动前缀缓存，省略 `prompt_cache_key`、`prompt_cache_retention` 与 SDK 会话关联头。实际缓存可用性和读写量由供应商响应确认。
 
+选中已声明的推理档位时，`openai-chat` 编码 `reasoning_effort`。声明 `vendor: 'deepseek'` 的该协议路由使用固定 SDK 的 DeepSeek 兼容项，额外编码 `thinking.type: 'enabled'` 并保留工具衔接所需的 `reasoning_content`。`anthropic-messages` 当前的可选档位对应支持自适应推理的模型，编码 `thinking.type: 'adaptive'` 和 `output_config.effort`，输出上限沿原路由；仅支持旧版预算的模型可声明推理支持并省略可选档位。未选档的普通请求和辅助摘要都沿原协议参数与上游默认。本地目录和 SDK 协议编码结果不能代替端点的实际档位证据。
+
+固定 SDK 的公开响应观察钩子读取上游明确报告的 `completion_tokens_details.reasoning_tokens`（Chat Completions）或 `output_tokens_details.thinking_tokens`（Messages）。合法值按原计数进入 `model_observations.usage.reasoningTokens`，显式零也保留。字段缺失时省略，输出用量沿 SDK 原值，已经包含的思考 token 不另行累加。提前结束流时，已报告的推理用量可作为 `partial` 观察独立保存。
+
 HTTP 401/403、402、408/504、429 分别分类为鉴权、额度、超时、限流，其他 5xx 是上游失败。400/413/422 响应仅在 1 秒内取得不超过 8 KiB 的完整错误体时识别白名单上下文超限诊断。成功 HTTP 响应里的已知流终止诊断也可识别上下文超限。其他拒绝保持一般失败。非 2xx 响应进入 SDK 前替换为固定诊断，观察只保存白名单 HTTP 状态、供应商请求 ID、用量、终止原因和失败分类。原响应和异常详情不会透传。取消、超时和观察持久化失败分别按实际状态记录。[公开回执错误码](../apis/conversations.md#get-apiv1conversationsidrequestsrequestid)
 
 M3 在声明了上下文窗口的路由上使用同一请求冻结的账号、模型、路径、凭据和取消信号调用漫剧摘要。摘要请求只携带文本。模型返回的正式摘要写入会话日志，隐藏思考和未完成摘要丢弃。检查点同时保留成功图片工具调用中已验证的参考图、蒙版、任务或检查对象 UUID。每轮最多发一次摘要调用。适配器明确归类为 `CONTEXT_OVERFLOW` 时，该次尝试尚未发布非空正文且有用摘要已持久化，才可重发一次当前正文步骤。若该次尝试已发布正文，保留已发流式片段并以 `MODEL_CONTEXT_OVERFLOW` 结算。原始会话日志保留失败尝试，公开历史按既有消息规则投影。此前步骤的正文、该次尝试的隐藏思考和空文本增量不影响恢复。普通限流、上游故障、超时和 SDK 根据体积推测的超窗均无计费重发。单条新消息的估算已达到窗口容量时，仍由供应商判定正常正文请求结果，该轮无摘要调用或自动重发。手动压缩使用本次授权会话的冻结路由和凭据。实际发出的调用按顺序追加到同一请求的 `model_observations`，摘要带 `purpose: compaction`。省略用量时按实际标记未知，记录不携带摘要提示词或上游错误原文。
 
 明确声明视觉输入的 chat 路由沿相同固定端点与认证，通过公开 PiAi 编码向 OpenAI 或 Anthropic 协议发送有界图片预览。预算预检和旧图卸载发生在供应商 transport 启动之前；本地失败或卸载重试不登记虚假的上游调用观察。测试替身的线级成功不等于真实视觉模型已验证，现有 chat verified 也不区分文字与图片。
 
-Mio 文本输出上限按路由/适配 `maxOutputTokens`（合法范围 `1..65536`，未配置时默认 `1024`）及 30 秒 HTTP/idle 本地政策执行，未知 supplier context/最大输出不从 SDK 默认大容量推导。普通 check 使用协议替身；独立 conversations-live 经正式用户入口执行真实文本，失败记录实际白名单观察。各协议保留确定性回归，真实验证目标与开发安排沿[万联 PRD](../tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，实际接受范围与限制见对应成果入口。一个目标通过不证明其他目标，未发现或无对应成功观察的目标仍未验证。
+Mio 文本输出上限按路由/适配 `maxOutputTokens`（合法范围 `1..65536`，未配置时默认 `1024`）执行，未知 supplier context/最大输出不从 SDK 默认大容量推导。普通路由的 HTTP 请求期限和 SDK 流式空闲期限均为 30 秒。明确支持推理的路由可声明最长 120 秒的 `streamIdleTimeoutMs`，并同时用于 HTTP 请求期限和流式空闲期限。普通 check 使用协议替身；独立 conversations-live 经正式用户入口执行真实文本，失败记录实际白名单观察。各协议保留确定性回归，真实验证目标与开发安排沿[万联 PRD](../tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，实际接受范围与限制见对应成果入口。一个目标通过不证明其他目标，未发现或无对应成功观察的目标仍未验证。
 
 旧地址归一化允许其他 host 原样通过，不能作为允许列表复用；旧 TLS 补链、回退和重试没有作为当前必需能力搬入。旧预设及其冲突仅是迁移参考。其余非文本协议路径、错误和生成重试在后续真实消费者出现时另行采纳，不从目录成功推导 Messages、图片、MiniMax 或素材线路可用。
 

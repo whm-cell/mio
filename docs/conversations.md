@@ -16,11 +16,11 @@
 
 未启用 provider 域时保留 legacy：没有 provider/model 仍可创建/查询，发送返回 `503 MODEL_UNAVAILABLE` 且不新增接收记录；未注册 provider 拒绝，不支持的 model 沿原驱动结算失败。启用[用户供应商域](providers.md)后公共对话统一使用 BYOK，当前用户缺配置不回退全局或他人 Key；同时存在的 legacy 环境不参与选模或缺配校验。已绑定 BYOK 的会话不能在 legacy 装配下改跑全局模型。已有请求 ID 始终先查询/去重。
 
-BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策），30 秒 idle/HTTP 是 Mio 政策。不支持的内容/选项在出站前拒绝。
+BYOK 创建使用本人动态目录的稳定 modelRef 或显式 chat 用途默认，不套旧目录默认或测试型号。当前凭据有效成功成员、启用状态及已启用平台模型路由（`mio_provider_model_routes`）共同决定资格；缺目录、被移除、认证拒绝、待适配和默认失效分别拒绝。逻辑模型/配置冻结，不开放会话内切换；旧分类引用无损映射到同一 raw ID，旧无绑定会话可读历史，下一次新发送前由 owner 一次绑定。元数据、创建及绑定不解密或联网，fresh 接收从一条 SQL 一致读取本人配置、成员、受成员门控的平台路由与用途偏好，再解密。该读取是刷新/轮换/停用的 admission 线性化点；已取得快照的运行继续原版本，后来的请求核对新状态，不能随默认变化换模型。未知 supplier context 在外层 DSH 省略；出站 `submitPath` 由路由受控提供并校验安全相对路径（`openai-chat` 为 `/v1/.../chat/completions`，`anthropic-messages` 为 `/v1/messages`），单轮输出上限取路由 `maxOutputTokens`（`1..65536`，未声明时沿用 Mio 默认 1024 tokens 政策）。HTTP 响应等待与流空闲默认 30 秒，显式支持推理的路由可声明到 120 秒。不支持的内容或选项在出站前拒绝。
 
 平台聊天路由的 `cacheRetention` 随本轮适配快照冻结。Anthropic Messages 默认发送短期缓存标记，OpenAI Chat Completions 由上游处理自动前缀缓存。系统提示词的能力组合与历史前缀保持一致时，实际缓存读写仍取决于供应商与本轮输入，按实际返回用量观察。[供应商配置](providers.md#受控适配声明与实际验证)
 
-真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察沿用固定 DSH 的计数口径。`inputTokens` 为未计入缓存读写的输入，缓存读写分别记为 `cacheReadTokens` 和 `cacheWriteTokens`。可取得的 `totalTokens` 和 `reasoningTokens` 原样保存，观察层不重算或累加计数。一次正常调用如果只报告缓存用量，也记为 `reported`。失败或取消时，已有非零计数记为 `partial`，全零或缺失记为 `unknown`。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
+真实文本验证使用独立进程与本人 Key，执行前核对实际测试范围和费用授权；普通检查不自动收费，文本授权不扩大媒体范围。token 观察沿用固定 DSH 的计数口径。`inputTokens` 为未计入缓存读写的输入，缓存读写分别记为 `cacheReadTokens` 和 `cacheWriteTokens`。可取得的 `totalTokens` 和供应商明确返回的 `reasoningTokens` 原样保存，包含明确报告的零。观察层不重算计数，`outputTokens` 继续使用原汇总口径。一次正常调用如果只报告缓存用量，也记为 `reported`。失败或取消且仅观察到思考用量时，保存该数字，省略未知输入及输出计数，记为 `partial`。其他失败或取消时，已有非零计数记为 `partial`，全零或缺失记为 `unknown`。取消不保证上游立即停止、退款或费用回滚。服务未提供生产容量或计费总预算保证。
 
 ```sh
 pnpm migrate:dev conversations
@@ -40,6 +40,14 @@ pnpm start:dev
 剧本用途的每个新请求在通过归属、原回执去重和接收检查后读取快照。快照接受可选的 `scriptSummary` 字符串、`worldbuilding` 字符串和 `characters` 字符串数组。编码后的快照 JSON 最多 64 KiB UTF-8，包含转义和结构字符。读取器未装配或返回未关联时正常执行剧本用途。读取失败、归属不符、格式无效或超限时拒绝接收，原 requestId 可以重试。已受理请求的回执重放不重新读取项目。
 
 有效快照参与本轮的模型上下文预算。对话 PostgreSQL 元数据和回执不存项目快照。DSH 私有原生日志可能保留内部输入，访问随会话日志保护。公开历史、实时事件和自动标题只投影原有允许来源，助手正文按模型实际输出传递。[DSH 集成](integrations/dsh.md)
+
+## 深度思考与实时工具进度
+
+创建会话时，可以从当前聊天路由列出的档位中选取 `reasoningEffort` 作为缺省值。显式选定值保存到新增可空列 `mio_conversations.reasoning_effort`，旧行为空。对话列表、创建及元数据响应返回已设置的缺省值。发送消息可为该轮覆盖。两处都省略时，沿用所选驱动的默认请求行为。
+
+接收新消息时，在归属行锁内用当前路由快照验证生效档位。缺少支持声明或明确档位时返回 `409 MODEL_REASONING_UNSUPPORTED`，发生在受理和模型派发前。已受理的请求使用冻结的路由、能力、超时和档位完成本轮。同一 requestId 与相同客户端输入首先返回原回执。显式单轮覆盖计入摘要，使用 `reasoning:v1:` 加 `SHA256(JSON.stringify([text, orderedIds, reasoningEffort]))`。省略单轮档位的文本与视觉摘要沿用原算法，既有请求可按原输入重放查询。请求 `model_binding` 仅在有生效档位时保存 `reasoningEffort` 作为内部审计字段。
+
+公开 SSE 的 `reasoning` 承载声明支持推理的路由实际发出的思考增量。轮次执行已授权工具时，`tool-status` 只投影工具名与脱敏的开始或完成状态。SSE 订阅、快照交接和背压仍使用有界资源；重连用原回执和正式历史恢复。原生 DSH 日志按私有会话规则保留思考块。公开历史保留正式助手正文、有效图片任务卡片和原有状态投影。[对话 HTTP](apis/conversations.md#get-apiv1conversationsidevents)
 
 ## 归属、接收与持久化
 
@@ -85,7 +93,7 @@ DSH 在连续两次、四次调用同一工具且参数相同时分别向模型�
 
 同一轮自动摘要最多一次。在出错的模型尝试发布非空正文前收到上游明确超限时，可执行一次摘要和一次正文重发。按实际出站向原请求分别追加首次正文失败、标有 `purpose: 'compaction'` 的摘要，以及正文重发观察。重发仍超限时以 `MODEL_CONTEXT_OVERFLOW` 结算。
 
-若报错的模型尝试已通过 SSE 发布非空正文，保留流上已推送的片段并直接以 `MODEL_CONTEXT_OVERFLOW` 结算，无后续摘要或正文重发。是否发布过正文只取决于该次尝试的公开 text，前序步骤和隐藏推理不参与判定。原生日志保留失败尝试，公开历史沿既有规则投影正式助手消息。普通上游错误、未知结果或压缩检查点未确认时保留实际回执。
+若报错的模型尝试已通过 SSE 发布非空正文，保留流上已推送的片段并直接以 `MODEL_CONTEXT_OVERFLOW` 结算，无后续摘要或正文重发。是否发布过正文只取决于该次尝试的公开 text，前序步骤和思考增量不参与判定。原生日志保留失败尝试，公开历史沿既有规则投影正式助手消息。普通上游错误、未知结果或压缩检查点未确认时保留实际回执。
 
 手动压缩沿同一 PG 接收、占用、取消、恢复及回执流程。fresh 请求需要空闲、未归档的 owner 会话及当前有窗口的 BYOK 路由。空范围可直接完成；已受理记录沿原 ID 读取。手动压缩使用自身请求的观察数组，标题和活跃时间由真实人类输入继续维护。[手动压缩 API](apis/conversations.md#post-apiv1conversationsidcompact)
 

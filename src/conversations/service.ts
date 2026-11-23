@@ -22,9 +22,9 @@ import { loadConversationProjectContext } from './project-context.ts';
 import type { ConversationProjectContextResolver } from './project-context.ts';
 import { projectConversation } from './store.ts';
 import type { ConversationStore } from './store.ts';
-import { ProviderError } from '../providers/contracts.ts';
+import { ProviderError, supportsChatReasoning } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
-import type { ChatRuntimeSnapshot } from '../providers/contracts.ts';
+import type { ChatReasoningEffort, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 import { AssetError } from '../assets/contracts.ts';
 
 const log = createLogger('app', 'conversations');
@@ -36,6 +36,14 @@ const publicContextUsage = ({ estimatedTokens, contextWindow, compacted }: Conte
   contextWindow,
   compacted,
 });
+
+function requireReasoning(
+  snapshot: ChatRuntimeSnapshot | undefined,
+  effort: ChatReasoningEffort | undefined,
+): void {
+  if (effort !== undefined && !supportsChatReasoning(snapshot?.reasoning, effort))
+    throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_REASONING_UNSUPPORTED');
+}
 
 /** Authorization and request ownership remain above the DSH adapter and below HTTP. */
 export function createConversationService(
@@ -130,12 +138,14 @@ export function createConversationService(
     dshSessionId: string,
     requestId: string,
     snapshot: ChatRuntimeSnapshot,
+    reasoningEffort?: ChatReasoningEffort,
   ): ConversationRun => ({
     userId: actor.userId,
     conversationId: id,
     dshSessionId,
     requestId,
     snapshot,
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     async observe(observation) {
       await store.observe(id, requestId, observation);
       if (
@@ -223,14 +233,18 @@ export function createConversationService(
       actor: Principal,
       modelRef?: string,
       purpose: ConversationPurpose = 'general',
+      reasoningEffort?: ChatReasoningEffort,
     ): Promise<Conversation> {
       return admit(async () => {
-        if (!providers && modelRef)
-          throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+        if (!providers) {
+          requireReasoning(undefined, reasoningEffort);
+          if (modelRef)
+            throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+        }
         const selection = providers
-          ? await providerAction(() => providers.selectChat(actor, modelRef))
+          ? await providerAction(() => providers.selectChat(actor, modelRef, reasoningEffort))
           : undefined;
-        const row = await store.create(actor, createId(), selection, purpose);
+        const row = await store.create(actor, createId(), selection, purpose, reasoningEffort);
         try {
           await engine.create(row.dsh_session_id, selection);
           await store.setReady(row.id, true);
@@ -307,11 +321,15 @@ export function createConversationService(
       requestId: string,
       text: string,
       imageAssetIds: string[] = [],
+      reasoningEffort?: ChatReasoningEffort,
     ) {
       const ids = [...imageAssetIds];
-      const digest = ids.length
-        ? `vision:v1:${sha256Utf8(JSON.stringify([text, ids]))}`
-        : sha256Utf8(text);
+      const digest =
+        reasoningEffort !== undefined
+          ? `reasoning:v1:${sha256Utf8(JSON.stringify([text, ids, reasoningEffort]))}`
+          : ids.length
+            ? `vision:v1:${sha256Utf8(JSON.stringify([text, ids]))}`
+            : sha256Utf8(text);
       return receiveInOrder(actor, id, requestId, async () => {
         const images: ConversationImageReference[] = [];
         let preflight: ChatRuntimeSnapshot | undefined;
@@ -322,17 +340,21 @@ export function createConversationService(
             throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'IMAGE_UNAVAILABLE');
           preparingImages++;
           try {
+            const effort = reasoningEffort ?? row.reasoning_effort ?? undefined;
             if (row.state !== 'ready')
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
             if (row.active_request)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
-            if (!providers)
+            if (!providers) {
+              requireReasoning(undefined, effort);
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+            }
             if (!row.model_binding)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
             preflight = await providerAction(() =>
               providers.resolveChat(actor, row.model_binding!),
             );
+            requireReasoning(preflight, effort);
             if (!preflight.inputModalities?.includes('image') || !preflight.imageBudget)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
             if (ids.length > preflight.imageBudget.maxRequestImages)
@@ -365,11 +387,13 @@ export function createConversationService(
         }
         let projectContext: string | undefined;
         const received = await receive(actor, id, requestId, digest, async (row) => {
+          const effort = reasoningEffort ?? row.reasoning_effort ?? undefined;
           let snapshot: ChatRuntimeSnapshot | undefined;
           if (providers) {
             if (!row.model_binding)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
             snapshot = await providerAction(() => providers.resolveChat(actor, row.model_binding!));
+            requireReasoning(snapshot, effort);
             if (images.length && !snapshot.inputModalities?.includes('image'))
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
             if (
@@ -381,6 +405,7 @@ export function createConversationService(
             )
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
           } else {
+            requireReasoning(undefined, effort);
             if (images.length)
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
             if (row.model_binding || !engine.available)
@@ -392,10 +417,15 @@ export function createConversationService(
               conversationId: row.id,
               signal: admissionStop.signal,
             });
-          return snapshot;
+          return snapshot && effort !== undefined
+            ? Object.freeze({ ...snapshot, reasoningEffort: effort })
+            : snapshot;
         });
         if (!received.fresh) return received.receipt;
         const nativeId = received.row.dsh_session_id;
+        const snapshot = received.snapshot;
+        const binding =
+          snapshot && bindRun(actor, id, nativeId, requestId, snapshot, snapshot.reasoningEffort);
         let retryActivity: (() => Promise<void>) | undefined;
         return startRequest(
           actor,
@@ -414,9 +444,7 @@ export function createConversationService(
                 });
               },
               (event) => publish(id, event),
-              received.snapshot
-                ? bindRun(actor, id, nativeId, requestId, received.snapshot)
-                : undefined,
+              binding,
               images,
               (eventTimeMs, autoTitle) => {
                 const project = () => store.inputAdmitted(id, requestId, eventTimeMs, autoTitle);

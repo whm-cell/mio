@@ -9,6 +9,7 @@ import {
   INVALID_CREDENTIAL_CODE,
   LlmError,
   QUOTA_EXCEEDED_CODE,
+  ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm';
 import type { UserMessage } from '@deepseek-ai/dsh-llm';
 import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session';
@@ -358,6 +359,10 @@ export function createDshConversationEngine(
         return Promise.reject(new Error('MIO_BINDING_REQUIRED'));
       const releases = new Map<AbortSignal, () => void>();
       const runOptions = selectedOptions(binding?.snapshot);
+      const reasoningEffort =
+        binding?.reasoningEffort === undefined
+          ? undefined
+          : ReasoningEffortId(binding.reasoningEffort);
       let observationFailed = false;
       let observedFailureCode: string | undefined;
       let oldImageCount = () => 0;
@@ -406,7 +411,11 @@ export function createDshConversationEngine(
             return count;
           };
           if (runOptions.provider && runOptions.model)
-            agent.model.select({ provider: runOptions.provider, model: runOptions.model });
+            agent.model.select({
+              provider: runOptions.provider,
+              model: runOptions.model,
+              ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+            });
           const inspection = Boolean(
             vision && observedBinding?.snapshot.inputModalities?.includes('image'),
           );
@@ -422,10 +431,12 @@ export function createDshConversationEngine(
             ),
           });
           if (observedBinding && onelink && (imageTools || inspection)) {
-            revokeImageTools = authorizeConversationImageTools(agentCtx, agent, {
-              generation: hasGenerationTools,
-              inspection: hasInspectionTool,
-            });
+            revokeImageTools = authorizeConversationImageTools(
+              agentCtx,
+              agent,
+              { generation: hasGenerationTools, inspection: hasInspectionTool },
+              (tool, status) => emit({ type: 'tool-status', requestId, tool, status }),
+            );
             if (imageTools) {
               waitForToolCheckpoints = trackConversationToolCheckpoints(
                 agentCtx,
@@ -510,7 +521,8 @@ export function createDshConversationEngine(
               if (
                 payload.agent.id !== observedBinding.dshSessionId ||
                 payload.modelSelection.provider !== runOptions.provider ||
-                payload.modelSelection.model !== observedBinding.snapshot.modelId
+                payload.modelSelection.model !== observedBinding.snapshot.modelId ||
+                payload.modelSelection.reasoningEffort !== reasoningEffort
               )
                 throw new Error('MIO_BINDING_MISMATCH');
               if (!releases.has(payload.signal))
@@ -562,9 +574,17 @@ export function createDshConversationEngine(
           }
           agentCtx.on('agent/assistant-stream', ({ frame }) => {
             if (frame.type === 'start') attemptPublishedText = false;
-            if (frame.type === 'chunk' && frame.chunk.type === 'text-delta') {
+            if (frame.type !== 'chunk') return;
+            if (frame.chunk.type === 'text-delta') {
               if (frame.chunk.text.length > 0) attemptPublishedText = true;
               emit({ type: 'text', requestId, text: frame.chunk.text });
+            } else if (
+              frame.chunk.type === 'reasoning-delta' &&
+              observedBinding?.snapshot.reasoning?.supported &&
+              typeof frame.chunk.text === 'string' &&
+              frame.chunk.text.length > 0
+            ) {
+              emit({ type: 'reasoning', requestId, text: frame.chunk.text });
             }
           });
           agentCtx.on('session/event', (session, event) => {

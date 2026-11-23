@@ -61,6 +61,23 @@ export interface ModelPreference {
 export const CHAT_PROFILES = ['openai-chat', 'anthropic-messages'] as const;
 export type ChatProfile = (typeof CHAT_PROFILES)[number];
 export type ChatCacheRetention = 'none' | 'short' | 'long';
+export type ChatReasoningEffort = 'low' | 'medium' | 'high';
+export type ChatReasoningCapability =
+  | { readonly supported: false }
+  | { readonly supported: true; readonly efforts?: readonly ChatReasoningEffort[] };
+export const DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS = 30_000;
+
+export function isChatReasoningEffort(value: unknown): value is ChatReasoningEffort {
+  return value === 'low' || value === 'medium' || value === 'high';
+}
+
+export function supportsChatReasoning(
+  capability: ChatReasoningCapability | undefined,
+  effort: ChatReasoningEffort,
+): boolean {
+  return capability?.supported === true && capability.efforts?.includes(effort) === true;
+}
+
 /** Evidence for an implemented protocol route; catalog membership is deliberately absent. */
 export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
 export interface ImageCapabilityMetadata {
@@ -100,6 +117,8 @@ export interface AdaptationCapabilityMetadata {
   contextWindow?: number;
   maxOutputTokens?: number;
   cacheRetention?: ChatCacheRetention;
+  reasoning?: ChatReasoningCapability;
+  streamIdleTimeoutMs?: number;
   inputModalities?: ('text' | 'image')[];
   maxRequestImages?: number;
   maxRequestImageBytes?: number;
@@ -267,6 +286,8 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly maxOutputTokens?: number;
   readonly contextWindow?: number;
   readonly cacheRetention?: ChatCacheRetention;
+  readonly reasoning?: ChatReasoningCapability;
+  readonly streamIdleTimeoutMs?: number;
   readonly inputModalities?: readonly ('text' | 'image')[];
   readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;

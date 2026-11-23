@@ -18,12 +18,14 @@ import {
   DEFAULT_CHAT_IMAGE_BUDGET,
   ProviderError,
   categories,
+  isChatReasoningEffort,
 } from '../contracts.ts';
 import type {
   AdaptationCapabilityMetadata,
   AdaptationSourceKind,
   Category,
   ChatProfile,
+  ChatReasoningCapability,
   ImageCapabilityMetadata,
   ImageParameterView,
   ChatImageBudget,
@@ -147,6 +149,28 @@ function invalidRoute(): never {
   throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ROUTE_INVALID');
 }
 
+function validateChatReasoning(value: unknown): ChatReasoningCapability | undefined {
+  if (value === undefined) return;
+  if (
+    !isPlainObject(value) ||
+    Object.keys(value).some((key) => key !== 'supported' && key !== 'efforts')
+  )
+    invalidRoute();
+  const { supported, efforts } = value;
+  if (supported === false && efforts === undefined) return { supported: false };
+  if (supported !== true) invalidRoute();
+  if (efforts === undefined) return { supported };
+  if (
+    !Array.isArray(efforts) ||
+    efforts.length === 0 ||
+    efforts.length > 3 ||
+    !efforts.every(isChatReasoningEffort) ||
+    new Set(efforts).size !== efforts.length
+  )
+    invalidRoute();
+  return { supported, efforts: [...efforts] };
+}
+
 function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
   if (value === undefined) return {};
   if (!isPlainObject(value)) invalidRoute();
@@ -156,6 +180,8 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
         'contextWindow',
         'maxOutputTokens',
         'cacheRetention',
+        'reasoning',
+        'streamIdleTimeoutMs',
         'inputModalities',
         'maxRequestImages',
         'maxRequestImageBytes',
@@ -183,6 +209,17 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
     cacheRetention !== 'none' &&
     cacheRetention !== 'short' &&
     cacheRetention !== 'long'
+  )
+    invalidRoute();
+  const reasoning = validateChatReasoning(value.reasoning);
+  const { streamIdleTimeoutMs } = value;
+  if (
+    streamIdleTimeoutMs !== undefined &&
+    (reasoning?.supported !== true ||
+      typeof streamIdleTimeoutMs !== 'number' ||
+      !Number.isSafeInteger(streamIdleTimeoutMs) ||
+      streamIdleTimeoutMs < 1 ||
+      streamIdleTimeoutMs > 120_000)
   )
     invalidRoute();
   if (
@@ -215,6 +252,8 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
       ? { maxOutputTokens: value.maxOutputTokens }
       : {}),
     ...(cacheRetention !== undefined ? { cacheRetention } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
     ...(Array.isArray(value.inputModalities)
       ? { inputModalities: value.inputModalities.includes('image') ? ['text', 'image'] : ['text'] }
       : {}),

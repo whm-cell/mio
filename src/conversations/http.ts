@@ -3,6 +3,7 @@ import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseJsonBody, readBody, readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import { isChatReasoningEffort } from '../providers/contracts.ts';
 import { ConversationError, MAX_CONVERSATION_TITLE_BYTES } from './contracts.ts';
 import type { Principal, ConversationEvent, ConversationSnapshot } from './contracts.ts';
 import { parseConversationCursor } from './cursor.ts';
@@ -281,17 +282,20 @@ export function createConversationHandler(
       const creating = base && method === 'POST';
       const expected =
         action === 'messages'
-          ? ['requestId', 'text', 'imageAssetIds']
+          ? ['requestId', 'text', 'imageAssetIds', 'reasoningEffort']
           : action === 'compact'
             ? ['requestId']
             : creating
-              ? ['modelRef', 'purpose']
+              ? ['modelRef', 'purpose', 'reasoningEffort']
               : action === 'model'
                 ? ['modelRef']
                 : method === 'PATCH'
                   ? ['title']
                   : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
+        return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+      const reasoningEffort = value.reasoningEffort;
+      if (reasoningEffort !== undefined && !isChatReasoningEffort(reasoningEffort))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (status: number, value: unknown) => {
         response.writeHead(status, { 'content-type': 'application/json' });
@@ -311,7 +315,12 @@ export function createConversationHandler(
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
         return send(
           HTTP_STATUS.CREATED,
-          await service.create(actor, value.modelRef as string | undefined, purpose),
+          await service.create(
+            actor,
+            value.modelRef as string | undefined,
+            purpose,
+            reasoningEffort,
+          ),
         );
       }
       if (action === 'model') {
@@ -389,6 +398,7 @@ export function createConversationHandler(
             value.requestId,
             value.text,
             value.imageAssetIds as string[] | undefined,
+            reasoningEffort,
           ),
         );
       }

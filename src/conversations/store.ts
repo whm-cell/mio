@@ -17,7 +17,11 @@ import type {
   TerminalRequestStatus,
   ModelObservation,
 } from './contracts.ts';
-import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
+import type {
+  ChatReasoningEffort,
+  ChatRuntimeSnapshot,
+  ChatSelection,
+} from '../providers/contracts.ts';
 import { legacyReference } from '../providers/catalog.ts';
 
 const log = createLogger('app', 'conversation-store');
@@ -35,7 +39,12 @@ export interface ConversationRow {
   active_request: string | null;
   model_binding: ChatSelection | null;
   purpose: ConversationPurpose;
+  reasoning_effort: ChatReasoningEffort | null;
 }
+
+type RequestModelSnapshot = ChatRuntimeSnapshot & {
+  readonly reasoningEffort?: ChatReasoningEffort;
+};
 interface RequestRow {
   conversation_id: string;
   request_id: string;
@@ -63,6 +72,7 @@ export const projectConversation = (row: ConversationRow): Conversation => ({
   state: row.state,
   ...(row.model_binding ? { modelRef: row.model_binding.modelRef } : {}),
   ...(row.purpose === 'drama-script' ? { purpose: row.purpose } : {}),
+  ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
 });
 function requireUnarchived(row: ConversationRow): void {
   if (row.archived_at) throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
@@ -129,13 +139,21 @@ export class ConversationStore {
     id: string,
     selection?: ChatSelection,
     purpose: ConversationPurpose = 'general',
+    reasoningEffort?: ChatReasoningEffort,
   ): Promise<ConversationRow> {
     this.assertActive();
     return (
       await this.pool.query<ConversationRow>(
-        `INSERT INTO mio_conversations(id,owner_id,dsh_session_id,state,model_binding,purpose)
-         VALUES($1,$2,$3,'creating',$4::jsonb,$5) RETURNING *`,
-        [id, actor.userId, `mio-${id}`, selection ? JSON.stringify(selection) : null, purpose],
+        `INSERT INTO mio_conversations(id,owner_id,dsh_session_id,state,model_binding,purpose,reasoning_effort)
+         VALUES($1,$2,$3,'creating',$4::jsonb,$5,$6) RETURNING *`,
+        [
+          id,
+          actor.userId,
+          `mio-${id}`,
+          selection ? JSON.stringify(selection) : null,
+          purpose,
+          reasoningEffort ?? null,
+        ],
       )
     ).rows[0]!;
   }
@@ -286,7 +304,7 @@ export class ConversationStore {
     id: string,
     requestId: string,
     digest: string,
-    resolveFresh: (row: Readonly<ConversationRow>) => Promise<ChatRuntimeSnapshot | undefined>,
+    resolveFresh: (row: Readonly<ConversationRow>) => Promise<RequestModelSnapshot | undefined>,
   ) {
     return this.transaction(async (client) => {
       const row = await this.readOwned(actor, id, client);
@@ -316,6 +334,9 @@ export class ConversationStore {
             modelId: snapshot.modelId,
             protocol: snapshot.protocol,
             capabilityVersion: snapshot.capabilityVersion,
+            ...(snapshot.reasoningEffort !== undefined
+              ? { reasoningEffort: snapshot.reasoningEffort }
+              : {}),
           }
         : null;
       const accepted = (

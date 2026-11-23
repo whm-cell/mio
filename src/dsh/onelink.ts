@@ -5,6 +5,7 @@ import {
   IMAGE_OFFLOAD_REQUIRED_CODE,
   LlmAdapter,
   LlmError,
+  ReasoningEffortId,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
@@ -20,7 +21,11 @@ import type {
   ModelObservation,
 } from '../conversations/contracts.ts';
 import type { ChatProfile, ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
-import { DEFAULT_CHAT_IMAGE_BUDGET } from '../providers/contracts.ts';
+import {
+  DEFAULT_CHAT_IMAGE_BUDGET,
+  DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS,
+  supportsChatReasoning,
+} from '../providers/contracts.ts';
 import { ONELINK_ORIGIN } from '../integrations/onelink/models.ts';
 import { chatTransport, isChatContextOverflow } from '../integrations/onelink/chat.ts';
 import type { ChatResponseFacts } from '../integrations/onelink/chat.ts';
@@ -142,6 +147,7 @@ function metadata(
   model: string,
   snapshot: ChatRuntimeSnapshot,
 ): LlmResolvedModelInfo {
+  const efforts = snapshot.reasoning?.supported ? snapshot.reasoning.efforts : undefined;
   return {
     provider,
     id: model,
@@ -149,13 +155,66 @@ function metadata(
     inputModalities: [...(snapshot.inputModalities ?? ['text'])],
     defaultMaxTokens: snapshotMaxTokens(snapshot),
     ...(snapshot.contextWindow ? { context: { contextWindow: snapshot.contextWindow } } : {}),
+    ...(efforts?.length
+      ? { reasoning: { efforts: efforts.map((id) => ({ id: ReasoningEffortId(id), name: id })) } }
+      : {}),
   };
+}
+
+type OneLinkResponseFacts = ChatResponseFacts & { reasoningTokens?: number };
+
+/** Both fixed codecs expose the parsed event before usage normalization erases field presence. */
+function providerReasoningTokens(profile: ChatProfile, event: unknown): number | undefined {
+  type Usage = {
+    completion_tokens_details?: { reasoning_tokens?: unknown };
+    output_tokens_details?: { thinking_tokens?: unknown };
+  };
+  const data = event as {
+    type?: string;
+    usage?: Usage;
+    message?: { usage?: Usage };
+    choices?: { usage?: Usage }[];
+  } | null;
+  const tokens =
+    profile === 'openai-chat'
+      ? (data?.usage ?? data?.choices?.[0]?.usage)?.completion_tokens_details?.reasoning_tokens
+      : (data?.type === 'message_delta'
+          ? data.usage
+          : data?.type === 'message_start'
+            ? data.message?.usage
+            : undefined
+        )?.output_tokens_details?.thinking_tokens;
+  return typeof tokens === 'number' && Number.isSafeInteger(tokens) && tokens >= 0
+    ? tokens
+    : undefined;
+}
+
+function wireModel(
+  model: Model<Api>,
+  effort: SimpleStreamOptions['reasoning'],
+  vendor: ChatRuntimeSnapshot['vendor'],
+): Model<Api> {
+  if (!model.reasoning) return model;
+  // Preserve the old wire defaults for turns without a selection and for summaries.
+  if (effort === undefined) return { ...model, reasoning: false };
+  if (model.api === 'anthropic-messages')
+    return { ...model, compat: { ...model.compat, forceAdaptiveThinking: true } };
+  if (vendor === 'deepseek')
+    return {
+      ...model,
+      compat: {
+        ...model.compat,
+        thinkingFormat: 'deepseek',
+        requiresReasoningContentOnAssistantMessages: true,
+      },
+    };
+  return model;
 }
 
 /** One immutable request's SDK provider; only the public protocol factories perform encoding. */
 function requestAdapter(
   run: ConversationRun,
-  facts: ChatResponseFacts,
+  facts: OneLinkResponseFacts,
   vision: ConversationVision | undefined,
   expected: Parameters<typeof visionAttachmentStore>[2],
   execution: { started: boolean },
@@ -175,6 +234,10 @@ function requestAdapter(
       ...rest,
       fetch: transport,
       maxRetries: 0,
+      onProviderStreamEvent(event) {
+        const count = providerReasoningTokens(run.snapshot.protocol, event);
+        if (count !== undefined) facts.reasoningTokens = count;
+      },
       headers: {
         ...rest.headers,
         authorization: `Bearer ${run.snapshot.apiKey}`,
@@ -189,7 +252,7 @@ function requestAdapter(
     api: protocol.apiId,
     baseUrl,
     input: [...(run.snapshot.inputModalities ?? ['text'])],
-    reasoning: false,
+    reasoning: run.snapshot.reasoning?.supported === true,
     // SDK 1.5.0 treats zero as unknown. Never expose this as supplier metadata.
     contextWindow: run.snapshot.contextWindow ?? 0,
     maxTokens,
@@ -212,10 +275,17 @@ function requestAdapter(
       stream: (selected, context, options) =>
         api.stream(selected, context, requestOptions(options)),
       streamSimple: (selected, context, options) =>
-        api.streamSimple(selected, context, requestOptions(options)),
+        api.streamSimple(
+          wireModel(selected, options?.reasoning, run.snapshot.vendor),
+          context,
+          requestOptions(options),
+        ),
     },
   });
   const budget = run.snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET;
+  const streamIdleTimeoutMs =
+    (run.snapshot.reasoning?.supported ? run.snapshot.streamIdleTimeoutMs : undefined) ??
+    DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS;
   const profile: ResolvedPiAiProviderProfile = {
     provider,
     displayName: 'OneLinkAI',
@@ -223,8 +293,8 @@ function requestAdapter(
     modelErrors: new Map(),
     configuredMaxTokens: new Map([[run.snapshot.modelId, maxTokens]]),
     retryPolicy,
-    streamIdleTimeoutMs: 30_000,
-    timeoutMs: 30_000,
+    streamIdleTimeoutMs,
+    timeoutMs: streamIdleTimeoutMs,
     transport: 'sse',
     cacheRetention: run.snapshot.cacheRetention ?? protocol.defaultCacheRetention,
     maxRequestImageBytes: budget.maxRequestImageBytes,
@@ -310,7 +380,7 @@ export class OneLinkAdapter extends LlmAdapter {
   }
   override async prepareCall(provider: string, model: string, signal?: AbortSignal) {
     const run = this.bound(provider, model, signal);
-    const facts: ChatResponseFacts = {};
+    const facts: OneLinkResponseFacts = {};
     const expected = new Map();
     const execution = { started: false };
     const inner = await requestAdapter(run, facts, this.vision, expected, execution).prepareCall(
@@ -331,7 +401,7 @@ export class OneLinkAdapter extends LlmAdapter {
     options: GenerateOptions,
     signal: AbortSignal,
     run: ConversationRun,
-    facts: ChatResponseFacts,
+    facts: OneLinkResponseFacts,
     stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
     expected: Parameters<typeof visionAttachmentStore>[2] extends ReadonlyMap<infer K, infer V>
       ? Map<K, V>
@@ -340,11 +410,14 @@ export class OneLinkAdapter extends LlmAdapter {
   ): AsyncIterable<StreamChunk> {
     const maxTokens = snapshotMaxTokens(run.snapshot);
     const grant = options.purpose === 'compaction' ? this.compactionGrants.get(signal) : undefined;
+    const effort = grant ? undefined : run.reasoningEffort;
     if (
       this.bindings.get(signal) !== run ||
       options.signal !== signal ||
       signal.aborted ||
       options.sessionId !== run.dshSessionId ||
+      options.reasoningEffort !== effort ||
+      (effort !== undefined && !supportsChatReasoning(run.snapshot.reasoning, effort)) ||
       (options.purpose !== undefined &&
         (!grant ||
           grant.run !== run ||
@@ -375,7 +448,7 @@ export class OneLinkAdapter extends LlmAdapter {
     let release: (() => void) | undefined;
     execution.started = false;
     const observation = (finish: string): ModelObservation => {
-      const { status, providerRequestId } = facts;
+      const { status, providerRequestId, reasoningTokens } = facts;
       const base = {
         ...(status !== undefined ? { status } : {}),
         ...(providerRequestId !== undefined ? { providerRequestId } : {}),
@@ -384,13 +457,17 @@ export class OneLinkAdapter extends LlmAdapter {
         ...(failureCode ? { failureCode } : {}),
       };
       // DSH can report cached input with both uncached input and output at zero.
-      if (!usage || !Object.values(usage).some((count) => count > 0))
+      const observedUsage = reasoningTokens === undefined ? usage : { ...usage, reasoningTokens };
+      if (
+        !observedUsage ||
+        (reasoningTokens === undefined && !Object.values(observedUsage).some((count) => count > 0))
+      )
         return { ...base, usageStatus: 'unknown' };
       return {
         ...base,
-        usage,
+        usage: observedUsage,
         usageStatus:
-          finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls'
+          usage && (finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls')
             ? 'reported'
             : 'partial',
       };

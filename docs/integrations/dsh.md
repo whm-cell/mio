@@ -14,6 +14,8 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 
 [OneLink 包装](../../src/dsh/onelink.ts)只使用固定发布包 PiAiAdapter、公开 createProvider 和协议工厂，不复制 Agent/codec。公开 agent/pre-step 将同一可信 run 快照绑定到 turn AbortSignal；resolve/metadata/prepare 消费该冻结模型/目录/适配事实，prepare 捕获同一绑定，dispatch 核对原 signal、Session、model/provider 和 purpose。无 owner 的全局 listModels 返回空，不能返回各用户目录并集；无可信 signal 的 resolve/prepare 拒绝且不解密。Key 不入 Session。当前 Profile 只有官方 loop 发起 LLM；未来新增提前解析 metadata 或持有 turn signal 的辅助插件时须重新核对授权。
 
+每轮通过公开 `agent.model.select` 完整设置本轮模型与已准入的 `reasoningEffort`。省略档位时清除原生选择中的前轮值，按上游默认请求。适配器只把当前路由声明的可用档位交给 DSH，并在调用时核对实际档位和绑定。摘要使用同一受控绑定与单次额度，沿用辅助目的和独立的无档请求。
+
 未知 context 在外层 metadata 省略；有来源声明时通过公开 `context.contextWindow` 传递同一快照。inner 0 是固定 SDK 1.5.0 的内部未知标记，SDK 必填 cost 的 0 也不是供应商价格。1024 是 Mio 输出政策，不是供应商最大能力。每请求的 createProvider 只包含已准入精确 ID，可编码未在 SDK 内置目录中的模型。保留官方 usage/finish、工具块和 replay；错误在进入 JSONL 前投影为固定安全诊断，取消 consumer return 也保存安全观察。根级与非授权 Agent 单调守卫保持默认全拒绝。
 
 接入只用发布包，不依赖本机相邻源码。上游公开接口核对基线为提交 `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`；升级时重新核对本文时序。
@@ -45,7 +47,9 @@ mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 
 
 官方后端可恢复未完成的末尾 JSONL 行或 Zstandard 帧；完整格式、校验和或结构损坏拒绝精确读取。强杀可能只留下用户输入和运行边界，没有未结算 chunk。可恢复前缀不代表任意崩溃零丢失；未知请求不自动重发，不承诺撤销已发生动作。
 
-精确读取会读、验证完整单会话日志，I/O、时间与内存随内容量增长；公开分页只限制返回体。本地开发不据此承诺上线容量，尚无证据支持 FTS、缓存或第二份消息库。外部必须白名单投影文本、终态状态、脱敏错误以及经严格结构校验的 `mio.image-job`（仅限非错误的 `submit_image_job` / `get_image_job` 结果卡片），绝不透传系统提示、推理、`tool/call` 原始参数、`list_image_models` 内部输出、工具拒绝/异常详情、路径或 trace。
+精确读取会读、验证完整单会话日志，I/O、时间与内存随内容量增长；公开分页只限制返回体。本地开发不据此承诺上线容量，尚无证据支持 FTS、缓存或第二份消息库。历史和 SSE 按公开契约投影文本、终态、脱敏错误及经严格结构校验的 `mio.image-job`（仅限非错误的 `submit_image_job` / `get_image_job` 结果卡片）。系统提示、`tool/call` 原始参数、`list_image_models` 内部输出、工具拒绝或异常详情、路径和 trace 留在各自内部边界。
+
+声明支持推理的活动轮次可将 `agent/assistant-stream` 的非空 `reasoning-delta` 发到实时 SSE。签名、加密回放数据和已完成的思考块由原生日志保留，公开历史只取助手正式正文。辅助摘要不进入该 SSE 通道。工具状态从守卫已放行的 `tools/execute` 开始，按该次原生执行 token 与最终 `tools/result` 配对。并行调用的终态沿 DSH 的模型请求顺序发布。SSE 只携带公开工具名与脱敏状态，拒绝的调用无运行进度。两个进度事件共用现有的单帧、连接队列及待写字节边界。[对话 HTTP 契约](../apis/conversations.md)
 
 ## 验证入口与变更影响
 

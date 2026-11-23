@@ -1,31 +1,30 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { ToolExecution } from '@deepseek-ai/dsh-tools';
+import type { ToolExecution, ToolExecutionToken } from '@deepseek-ai/dsh-tools';
+import type { ConversationEvent, ConversationToolName } from '../conversations/contracts.ts';
 
 const ALLOWED_CONVERSATION_IMAGE_TOOLS = [
   'list_image_models',
   'submit_image_job',
   'get_image_job',
   'inspect_image_asset',
-] as const;
+] as const satisfies readonly ConversationToolName[];
 
 const MAX_TOOL_CALLS_PER_TURN = 12;
 const MAX_IMAGE_SUBMITS_PER_TURN = 4;
-
-const allowedImageToolSet = new Set<string>(ALLOWED_CONVERSATION_IMAGE_TOOLS);
 
 interface TurnToolGrant {
   active: boolean;
   totalCalls: number;
   imageSubmits: number;
-  readonly allowed: ReadonlySet<string>;
+  readonly allowed: ReadonlyMap<string, ConversationToolName>;
   readonly countedTokens: WeakSet<object>;
 }
 
 const activeToolGrants = new WeakMap<Agent, TurnToolGrant>();
 
 function isAuthorizedConversationImageCall(exec: Readonly<ToolExecution>): boolean {
-  if (!exec.agent || exec.signal.aborted || !allowedImageToolSet.has(exec.name)) return false;
+  if (!exec.agent || exec.signal.aborted) return false;
   const grant = activeToolGrants.get(exec.agent);
   return grant?.active === true && grant.allowed.has(exec.name);
 }
@@ -47,11 +46,16 @@ export function authorizeConversationImageTools(
   agentCtx: Context,
   agent: Agent,
   options: { generation: boolean; inspection: boolean } = { generation: true, inspection: false },
+  progress?: (
+    tool: ConversationToolName,
+    status: Extract<ConversationEvent, { type: 'tool-status' }>['status'],
+  ) => void,
 ): () => void {
-  const allowed = new Set<string>([
-    ...(options.generation ? ['list_image_models', 'submit_image_job', 'get_image_job'] : []),
-    ...(options.inspection ? ['inspect_image_asset'] : []),
-  ]);
+  const allowed = new Map<string, ConversationToolName>();
+  for (const name of ALLOWED_CONVERSATION_IMAGE_TOOLS) {
+    if (name === 'inspect_image_asset' ? options.inspection : options.generation)
+      allowed.set(name, name);
+  }
   const grant: TurnToolGrant = {
     active: true,
     totalCalls: 0,
@@ -87,5 +91,24 @@ export function authorizeConversationImageTools(
     if (exec.name === 'submit_image_job') grant.imageSubmits++;
     return undefined;
   });
+  if (progress) {
+    // Pair the actual guarded dispatches by their private DSH invocation token.
+    const executing = new Map<ToolExecutionToken, ConversationToolName>();
+    agentCtx.on('tools/execute', (exec, next) => {
+      const tool = grant.allowed.get(exec.name);
+      if (tool && grant.active && !exec.signal.aborted && grant.countedTokens.has(exec)) {
+        executing.set(exec.token, tool);
+        progress(tool, 'running');
+      }
+      return next();
+    });
+    agentCtx.on('tools/result', (exec, result) => {
+      const tool = executing.get(exec.token);
+      if (tool) {
+        executing.delete(exec.token);
+        progress(tool, result.isError ? 'failed' : 'completed');
+      }
+    });
+  }
   return revoke;
 }

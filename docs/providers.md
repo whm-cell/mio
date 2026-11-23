@@ -97,6 +97,8 @@ pnpm providers:route <--stdin | routes.json>
 
 文本路由可声明 `capabilityMetadata.cacheRetention`，值限于 `none`、`short`、`long`。该字段随 fresh 请求的路由快照冻结。`anthropic-messages` 缺省为 `short`，发送 `cache_control` 的 `ephemeral` 标记。`long` 在该标记上添加 `ttl: '1h'`，须确认目标支持并显式配置。`none` 省略标记。`openai-chat` 由上游自动处理前缀缓存，Mio 保持原请求形状，省略显式缓存字段与会话关联头。实际缓存读写以对应调用的供应商用量为准。[OneLink 集成](integrations/onelink.md#使用经验与适用条件)
 
+聊天路由通过 `capabilityMetadata.reasoning` 声明推理支持。`{supported: true, efforts: ['low', 'high']}` 开放已核对的档位，列表如有提供须非空、互异，值限 `low`、`medium`、`high`。`{supported: true}` 允许投影上游默认产生的实时思考。未声明或声明 `{supported: false}` 时，平台目录显示 `supported: false`。只有 `supported: true` 的路由可设 `capabilityMetadata.streamIdleTimeoutMs`，范围为 `1..120000` 的整数。省略时为 30 秒。创建会话时校验显式档位，接纳新消息时按当前路由重新校验并冻结能力和期限。推理能力以管理员路由声明为准，和目录成员、当前凭据、实际单次模型观测各自独立。[OneLink 集成](integrations/onelink.md#使用经验与适用条件)
+
 平台模型主表 `mio_provider_catalog_models` 直接控制隐藏模型双向行为：`user_visible=false` 时对普通用户屏蔽该模型（不进入模型列表，显式调用或修改返回 `MODEL_HIDDEN`，已有默认保留目标但 `effective=false`）；`allow_undiscovered=true` 且 `user_visible=true` 时，仅对配置启用、凭据未拒绝且已完成当前凭据目录刷新的用户幂等补录稳定 `admin-curated-hidden` 模型身份，使其在具备生效路由时可选择、调用和记录本人验证，关闭后立即停止对未实际发现用户的开放。
 
 chat 路由可显式声明 `capabilityMetadata.inputModalities`；必须包含 `text`，仅接受互异的 `text`、`image`，缺省按纯文本处理。只有声明二者的路由可使用对话图片，并可声明四项正整数预算：`maxRequestImages` 默认 4、上限 16；`maxRequestImageBytes` 默认 10 MiB、上限 20 MiB，是每次请求全部图片的 Base64 硬上限；`requestImagePixelBudget` 默认 4,194,304、上限 16,777,216；`requestImageMaxBytes` 默认 5 MiB、上限 10 MiB，是单张预览的软目标。纯文本或未声明视觉的路由不能携带视觉预算。能力声明和预算不证明真实视觉调用成功。

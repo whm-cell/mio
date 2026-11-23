@@ -4,7 +4,11 @@ import type {
   ImageOperation,
   ImageRequestParameters,
 } from '../generations/contracts.ts';
-import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
+import type {
+  ChatReasoningEffort,
+  ChatRuntimeSnapshot,
+  ChatSelection,
+} from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
   userId: string;
@@ -45,6 +49,7 @@ export interface Conversation {
   state: 'creating' | 'ready' | 'unknown';
   modelRef?: string | null;
   purpose?: 'drama-script';
+  reasoningEffort?: ChatReasoningEffort;
 }
 export interface ConversationArchive {
   id: string;
@@ -60,8 +65,8 @@ export interface ModelObservation {
   readonly status?: number;
   readonly providerRequestId?: string;
   readonly usage?: {
-    inputTokens: number;
-    outputTokens: number;
+    inputTokens?: number;
+    outputTokens?: number;
     totalTokens?: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
@@ -78,6 +83,7 @@ export interface ConversationRun {
   readonly dshSessionId: string;
   readonly requestId: string;
   readonly snapshot: ChatRuntimeSnapshot;
+  readonly reasoningEffort?: ChatReasoningEffort;
   offloadableImages?(): number;
   observe(observation: ModelObservation): Promise<void>;
 }
@@ -146,6 +152,8 @@ export interface ConversationVision {
   acquireRequest(signal: AbortSignal): Promise<() => void>;
 }
 export type ConversationImageToolName = 'submit_image_job' | 'get_image_job';
+export type ConversationToolName =
+  ConversationImageToolName | 'list_image_models' | 'inspect_image_asset';
 export interface ConversationImageJobOutput {
   readonly index: number;
   readonly assetId: string;
@@ -212,6 +220,13 @@ export interface HistoryPage {
 }
 export type ConversationEvent =
   | { type: 'text'; requestId: string; text: string }
+  | { type: 'reasoning'; requestId: string; text: string }
+  | {
+      type: 'tool-status';
+      requestId: string;
+      tool: ConversationToolName;
+      status: 'running' | 'completed' | 'failed';
+    }
   | {
       type: 'tool';
       requestId: string;

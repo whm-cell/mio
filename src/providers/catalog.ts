@@ -275,6 +275,11 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
           enabled: chat?.enabled ?? true,
           isDefault: chat?.isDefault ?? false,
           protocol: chatRoute?.profile ?? null,
+          ...(effectiveCategory === 'chat'
+            ? {
+                reasoning: chatRoute?.capabilityMetadata.reasoning ?? { supported: false as const },
+              }
+            : {}),
           runnable: reason === null,
           unavailableReason: reason,
         };

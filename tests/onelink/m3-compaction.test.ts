@@ -19,7 +19,11 @@ import type {
 import { applyConversationPolicies } from '../../src/dsh/conversation-checkpoints.ts';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
 import { OneLinkAdapter, onelinkRoute } from '../../src/dsh/onelink.ts';
-import type { ChatProfile, ChatRuntimeSnapshot } from '../../src/providers/contracts.ts';
+import type {
+  ChatProfile,
+  ChatReasoningEffort,
+  ChatRuntimeSnapshot,
+} from '../../src/providers/contracts.ts';
 import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
 import { protocolResponse } from './fixture.ts';
 
@@ -58,6 +62,7 @@ function runBinding(
   requestId: string,
   route: ChatRuntimeSnapshot,
   observations: ModelObservation[],
+  reasoningEffort?: ChatReasoningEffort,
 ): ConversationRun {
   return {
     userId: 'fixture-owner',
@@ -65,6 +70,7 @@ function runBinding(
     dshSessionId: sessionId,
     requestId,
     snapshot: route,
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     observe: async (observation) => {
       observations.push(observation);
     },
@@ -310,14 +316,14 @@ async function setup(
     raw,
     answer,
     createImage,
-    run: (id: string, text = '接续当前场景', model = route) =>
+    run: (id: string, text = '接续当前场景', model = route, effort?: ChatReasoningEffort) =>
       engine.run(
         sessionId,
         id,
         text,
         async () => {},
         (event) => events.push(event),
-        runBinding(id, model, observations),
+        runBinding(id, model, observations, effort),
         [],
         undefined,
         (read) => contextUsage.push(read()),
@@ -580,6 +586,10 @@ it.each(['thinking', 'empty'] as const)(
   'retains confirmed overflow recovery when the failing attempt only emits %s',
   async (emitted) => {
     const fixture = await setup({ profile: 'anthropic-messages' });
+    const route = {
+      ...fixture.route,
+      reasoning: { supported: true, efforts: ['high'] },
+    } satisfies ChatRuntimeSnapshot;
     expect(await fixture.run('old', world)).toBe('completed');
     const before = fixture.calls.length;
     const eventsBefore = fixture.events.length;
@@ -590,13 +600,20 @@ it.each(['thinking', 'empty'] as const)(
     fixture.respond((call) => {
       if (fixture.calls.length === before + 1)
         return anthropicFailure('context_window_exceeded', emitted);
-      return fixture.answer(call, call.options.purpose === 'compaction' ? summary : '恢复正文');
+      return call.options.purpose === 'compaction'
+        ? anthropicThinking(summary)
+        : fixture.answer(call, '恢复正文');
     });
-    expect(await fixture.run('stream-exact')).toBe('completed');
+    expect(await fixture.run('stream-exact', undefined, route, 'high')).toBe('completed');
     expect(fixture.calls.slice(before).map((call) => call.options.purpose)).toEqual([
       undefined,
       'compaction',
       undefined,
+    ]);
+    expect(fixture.calls.slice(before).map((call) => call.options.reasoningEffort)).toEqual([
+      'high',
+      undefined,
+      'high',
     ]);
     expect(chunks).toContainEqual(
       expect.objectContaining(
@@ -606,8 +623,15 @@ it.each(['thinking', 'empty'] as const)(
       ),
     );
     expect(
-      fixture.events.slice(eventsBefore).filter((event) => event.type === 'text' && event.text),
-    ).toEqual([{ type: 'text', requestId: 'stream-exact', text: '恢复正文' }]);
+      fixture.events
+        .slice(eventsBefore)
+        .filter((event) => event.type === 'reasoning' || (event.type === 'text' && event.text)),
+    ).toEqual([
+      ...(emitted === 'thinking'
+        ? [{ type: 'reasoning', requestId: 'stream-exact', text: '内部思考' }]
+        : []),
+      { type: 'text', requestId: 'stream-exact', text: '恢复正文' },
+    ]);
   },
 );
 

@@ -367,6 +367,7 @@ export function createAdminService(
   let currentAuthPolicy: AuthRuntimePolicy = store.initialAuthSettings
     ? { ...store.initialAuthSettings.auth }
     : defaultAuthPolicy();
+  let currentAuthRevision = store.initialAuthSettings?.revision ?? 0;
 
   const formatGlobalSettingsView = (
     stored: AdminStoredAuthSettings | null,
@@ -1156,7 +1157,10 @@ export function createAdminService(
     async getGlobalSettings(): Promise<AdminGlobalSettingsView> {
       assertOpen();
       const stored = await store.readGlobalAuthSettings();
-      currentAuthPolicy = stored ? { ...stored.auth } : defaultAuthPolicy();
+      if ((stored?.revision ?? 0) >= currentAuthRevision) {
+        currentAuthPolicy = stored ? { ...stored.auth } : defaultAuthPolicy();
+        currentAuthRevision = stored?.revision ?? 0;
+      }
       return formatGlobalSettingsView(stored);
     },
 
@@ -1167,7 +1171,10 @@ export function createAdminService(
       assertOpen();
       const validated = validateGlobalSettingsUpdate(input);
       const saved = await store.updateGlobalAuthSettings(principal.admin, validated);
-      currentAuthPolicy = { ...saved.auth };
+      if (saved.revision >= currentAuthRevision) {
+        currentAuthPolicy = { ...saved.auth };
+        currentAuthRevision = saved.revision;
+      }
       return formatGlobalSettingsView(saved);
     },
 

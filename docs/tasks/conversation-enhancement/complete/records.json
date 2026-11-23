@@ -130,6 +130,51 @@
       }
     },
     {
+      "key": "conversation-reasoning-and-progress-events",
+      "title": "可控深度思考与实时执行进度",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "会话默认与单轮覆盖、公开 SSE 及回执契约"
+        },
+        {
+          "path": "docs/apis/providers.md",
+          "purpose": "聊天模型目录的推理能力与档位"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "两协议的档位映射、空闲期限与用量口径"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "请求归属、幂等、当前快照和冻结档位"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "请求级绑定、受控协议选项和可用推理计数"
+        },
+        {
+          "path": "tests/conversations/conversation-image-tools.test.ts",
+          "purpose": "正式 Profile 的实时进度、图片任务卡片、回执与冷读回归"
+        },
+        {
+          "path": "tests/onelink/m5-runtime.test.ts",
+          "purpose": "固定协议、工具守卫和断流用量回归"
+        }
+      ],
+      "outcomes": "平台聊天路由明确声明推理支持、允许档位和可选延长的连接期限，用户目录公开能力。创建时可确定会话默认，单轮覆盖只作用本轮。未声明档位在接收前明确拒绝，已受理回执按原输入优先重放。正式 SSE 显示上游真实思考增量和授权工具的脱敏执行状态，公开历史继续提供正文、有效图片任务卡片与原有状态。PG 保留上游实际报告的推理计数，包括显式零和提前断流时已取得的项目。",
+      "verification": "候选 ef3b0c73130e4169184bd39b771bd7b92ac3e911，契约修订 3，8 项证据通过。全仓静态与生产构建、48 文件 407 项受影响隔离回归和正式打包 smoke 通过。pnpm check 的覆盖由共同全量 CI 4feeb452、M1 至 M4 增量及本候选实际差分核对得到。真实单轮在同代码修订 2 通过官方打包 Profile 和隔离 mio_dev 实际发出一次 DeepSeek V4.1 Flash high 请求，1024 token 上限，SSE 59 个 reasoning 帧和 6 个正文帧，终态 completed，供应商自报与 PG 均为 155 个 reasoning tokens。修订 3 仅记录旧 Anthropic 取舍，真实原件保持原身份并按同输入人工复核。",
+      "limitations": "旧 Anthropic 预算型路由延续普通聊天。精确档位适用于已验证能在原输出上限正确编码档位的路由。SSE 沿原 64 KiB 单帧、快照队列与待写限制，超限关闭订阅。真实模型仅观察所列 DeepSeek 单轮，其他协议用确定性替身。候选远端全量、生产验证和接续单元各自保留。",
+      "acceptance": {
+        "candidate": {
+          "commit": "ef3b0c73130e4169184bd39b771bd7b92ac3e911",
+          "contractRevision": 3
+        },
+        "statement": "接受并登记 M5",
+        "reference": "2026-11-23 当前 Codex 对话中，交回 M5 本地候选 ef3b0c73130e4169184bd39b771bd7b92ac3e911、契约修订 3 与草稿 55ee7b53-b8d7-4403-ad23-95a1d4112742 后，用户明确回复「接受并登记 M5」。"
+      }
+    },
+    {
       "key": "conversation-step-reliability-and-cache",
       "title": "对话步级检查点、前缀缓存与脱敏错误回执",
       "locations": [

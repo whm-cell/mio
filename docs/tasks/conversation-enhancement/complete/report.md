@@ -20,6 +20,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [docs/apis/conversations.md](../../../apis/conversations.md) · [docs/conversations.md](../../../conversations.md) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/conversations/project-context.ts](../../../../src/conversations/project-context.ts) · [src/dsh/conversation-context.ts](../../../../src/dsh/conversation-context.ts) · [tests/conversations/m4-profile.test.ts](../../../../tests/conversations/m4-profile.test.ts)
 
+## conversation-reasoning-and-progress-events
+
+**可控深度思考与实时执行进度**
+
+[docs/apis/conversations.md](../../../apis/conversations.md) · [docs/apis/providers.md](../../../apis/providers.md) · [docs/integrations/onelink.md](../../../integrations/onelink.md) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/dsh/onelink.ts](../../../../src/dsh/onelink.ts) · [tests/conversations/conversation-image-tools.test.ts](../../../../tests/conversations/conversation-image-tools.test.ts) · [tests/onelink/m5-runtime.test.ts](../../../../tests/onelink/m5-runtime.test.ts)
+
 ## conversation-step-reliability-and-cache
 
 **对话步级检查点、前缀缓存与脱敏错误回执**

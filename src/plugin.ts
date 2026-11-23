@@ -31,6 +31,7 @@ import type { ConversationImageTools } from './conversations/contracts.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
 import { applyConversationPolicies } from './dsh/conversation-checkpoints.ts';
+import { installConversationTitles } from './dsh/conversation-titles.ts';
 import { createConversationVision } from './dsh/vision.ts';
 import * as imageOffload from '@deepseek-ai/dsh-compaction-image-offload';
 import { readProviderConfig } from './providers/config.ts';
@@ -408,7 +409,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (!ctx.get('mioKernel')) throw new Error('CONVERSATION_CONFIG: DSH kernel required');
       await ctx.plugin({
         name: 'mio-conversations',
-        inject: ['mioKernel', 'llm', 'webServer', 'agents', 'sessions', 'systemPrompt'],
+        inject: [
+          'mioKernel',
+          'llm',
+          'webServer',
+          'agents',
+          'sessions',
+          'sessionProjections',
+          'systemPrompt',
+        ],
         async apply(conversationCtx: Context) {
           let acquired: ConversationService | undefined;
           let http: ReturnType<typeof createConversationHandler> | undefined;
@@ -422,9 +431,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               imageOffload.apply(policyCtx);
             },
           });
-          // Cordis unloads sibling effects concurrently. Collect the plugin disposer and
-          // conversation drain in one effect so the policies outlive every agent.
+          const titles = installConversationTitles(conversationCtx);
+          // Cordis unloads sibling effects concurrently. Adopt both disposers so
+          // the policies and title service outlive every conversation agent.
           conversationCtx.effect(function* () {
+            yield titles.dispose;
             yield policies.dispose;
             yield async () => {
               const failures: unknown[] = [];
@@ -439,16 +450,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 failures.push(error);
               }
               if (failures.length) {
-                try {
-                  await policies.dispose();
-                } catch (error) {
-                  failures.push(error);
-                }
+                const retired = await Promise.allSettled([policies.dispose(), titles.dispose()]);
+                for (const result of retired)
+                  if (result.status === 'rejected') failures.push(result.reason);
                 throw new AggregateError(failures, 'Conversation cleanup failed');
               }
             };
           });
-          await policies;
+          await Promise.all([policies, titles]);
           const store = await createConversationStore(conversationConfig.databaseURL);
           try {
             const imageTools: ConversationImageTools | undefined =

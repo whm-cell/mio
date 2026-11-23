@@ -19,6 +19,7 @@ import type { GenerationObjects } from '../../src/generations/execution.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { createConversationService } from '../../src/conversations/service.ts';
 import { createConversationStore } from '../../src/conversations/store.ts';
+import { installConversationTitles } from '../../src/dsh/conversation-titles.ts';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
 import type { ProviderConfig } from '../../src/providers/config.ts';
 import type { ModelRouteInput, ProviderPrincipal } from '../../src/providers/contracts.ts';
@@ -497,6 +498,9 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         });
 
         try {
+          await ctx.inject(['sessions', 'sessionProjections', 'agents'], async (titleCtx) => {
+            await installConversationTitles(titleCtx);
+          });
           await providerService.save(actor, 0, 'sk-zero-ts-key-12345');
           const afterSave = (await providerService.get(actor))!;
           await providerService.settings(actor, afterSave.revision, {
@@ -519,6 +523,11 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
               'completed',
             );
           });
+          const conversations = await convService.list(actor, undefined, 20);
+          expect(conversations.items).toContainEqual(
+            expect.objectContaining({ id: created.id, title: 'ping' }),
+          );
+          expect(chatOutbound).toHaveLength(1);
           expect(chatOutbound[0]).toMatchObject({
             model: 's-chat-custom-2048',
             max_tokens: 2048,

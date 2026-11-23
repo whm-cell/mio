@@ -12,6 +12,7 @@ import type {
   Principal,
   Receipt,
 } from './contracts.ts';
+import type { ConversationCursor } from './cursor.ts';
 import type { ConversationStore } from './store.ts';
 import { ProviderError } from '../providers/contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
@@ -86,6 +87,8 @@ export function createConversationService(
         return {
           id: row.id,
           createdAt: row.created_at.toISOString(),
+          updatedAt: row.updated_at.toISOString(),
+          title: row.title,
           state: 'ready' as const,
           ...(selection ? { modelRef: selection.modelRef } : {}),
         };
@@ -94,7 +97,9 @@ export function createConversationService(
     bind(actor: Principal, id: string, modelRef: string) {
       return admit(async () => {
         if (!providers) {
-          await store.owned(actor, id);
+          const row = await store.owned(actor, id);
+          if (row.archived_at)
+            throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
           throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
         }
         return store.bind(actor, id, modelRef, () =>
@@ -102,10 +107,13 @@ export function createConversationService(
         );
       });
     },
-    list: (actor: Principal, after: string | undefined, limit: number) => {
+    list: (actor: Principal, after: ConversationCursor | undefined, limit: number) => {
       check();
       return store.list(actor, after, limit);
     },
+    rename: (actor: Principal, id: string, title: string) =>
+      admit(() => store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title))),
+    archive: (actor: Principal, id: string) => admit(() => store.archive(actor, id)),
     request: (actor: Principal, id: string, requestId: string) => {
       check();
       return store.request(actor, id, requestId);
@@ -228,6 +236,12 @@ export function createConversationService(
         publish(id, { type: 'state', receipt: received.receipt });
         const running = (async () => {
           let executionEnded = false;
+          let retryActivity: (() => Promise<void>) | undefined;
+          const settleActivity = async () => {
+            const retry = retryActivity;
+            retryActivity = undefined;
+            await retry?.().catch(() => log.error('CONVERSATION_ACTIVITY_UNAVAILABLE'));
+          };
           try {
             const result = cancelledBeforeStart
               ? 'cancelled'
@@ -265,8 +279,17 @@ export function createConversationService(
                       }
                     : undefined,
                   images,
+                  (eventTimeMs, autoTitle) => {
+                    const project = () =>
+                      store.inputAdmitted(id, requestId, eventTimeMs, autoTitle);
+                    return project().catch(() => {
+                      // Retain the persisted event for one retry before releasing the active request.
+                      retryActivity = project;
+                    });
+                  },
                 );
             executionEnded = true;
+            await settleActivity();
             const status = typeof result === 'string' ? result : result.status;
             const truncated = status === outputTruncation.reason;
             const error =
@@ -290,6 +313,7 @@ export function createConversationService(
           } catch {
             if (!executionEnded)
               await engine.cancel(received.row.dsh_session_id, requestId).catch(() => {});
+            await settleActivity();
             try {
               publish(id, {
                 type: 'state',
@@ -317,6 +341,8 @@ export function createConversationService(
     async cancel(actor: Principal, id: string) {
       check();
       const row = await store.owned(actor, id);
+      if (row.archived_at)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
       if (row.active_request) {
         const key = `${id}:${row.active_request}`;
         cancellations.add(key);

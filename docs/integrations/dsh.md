@@ -26,11 +26,14 @@ Mio 固定采用 `0.2.2-rc.1` 的官方公开 Agent、Agent Loop、LLM、Session
 - 对话子插件 `mio-conversations` 显式注入 `systemPrompt`；[对话引擎](../../src/dsh/conversations.ts)在每次活动轮次 `resume` 的 `setup` 中统一（覆盖 legacy 与 BYOK）按本轮实际工具授权结果注册会话级 `agentCtx.systemPrompt.section({ name: PERSONA_PREFIX_SECTION, order: 0, interpolate: false, text })`（不设 `complete: true`）。文本由纯业务模块[对话系统提示词](../../src/conversations/prompt.ts)生成（固定对外身份 `miioo AI 漫剧助手`，不含时间戳/UUID/用户 ID 等动态字段以维持 DSH `SystemPromptProjection` KV-cache 前缀稳定）；`interpolate: false` 防止字面量 `{{...}}` 被模板插值误解析，且系统消息受公开历史与流式白名单投影隔离，绝不外泄给客户端。
 - 预检先按 occurrence 检查张数，再逐个取得实际预览长度，以 Base64 总字节数判断是否需要旧图卸载；仅本轮开始前的 occurrence 可卸载。公开 `projectOffloadedImages` 在请求副本中生成含 assetId 和 `inspect_image_asset` 的占位，原日志和冻结输入不被改写。PiAi 发送前重新读取并核对摘要、尺寸、MIME 与预览指纹；有界并发和取消负责释放在途图片资源。
 - 普通输入使用 followup，steer 不自动成为公共入口。Handle 持有者负责释放，完成释放后可在同一内核恢复，释放中重开明确拒绝；DSH ID 不等于登录会话 ID，使用者须先完成可信身份与资源归属检查。
+- 启用对话服务时，在其子插件装配同版本的官方 `@deepseek-ai/dsh-session-title`，使用本地确定性首条人类消息回退及显式 `rename`。配置的回退限制为 12 词、96 个 UTF-8 字节，手工标题上限 120 字节。该服务未注册标题生成 provider。PG 只接收已完成原生 flush 的人类消息时间和标题，用于会话列表。官方标题事件只存在于原生日志，公开历史和模型上下文依旧由既有投影产生。关闭时在对话写入排空后释放标题服务。
 - assistant-stream chunk 是瞬态展示；assistant/message 或 assistant/attempt 是结算记录，也仍不等于已落盘。whenIdle 只证明排空，需检查真实 turn/end.reason 才判断 completed、aborted、error 或 interrupted。
 - `sessions.flush` 必须等待成功且返回 true。Mio 为原生检查点策略接入严格 flush，在模型派发前、顶层工具函数执行前及步间确认已记录前缀。无持久化监听、返回 false 或抛错均阻止尚未进入的下游工作，同一轮余下检查点保持失败。有效图片卡片生成后补充 flush，成功再发 SSE 卡片，后续步等待其结果。PostgreSQL 和原生日志分别持久化，已受理图片任务可能早于工具结果落盘。
 - 工具提醒使用 DSH 原生连续同参检测，阈值为 `2` 和 `4`。提醒仅进入模型上下文，异参调用继续沿原权限和预算检查。协作超时只作用于声明 `timeoutMs` 的工具。`inspect_image_asset` 为 60 秒，含准备队列等待，沿实际 AbortSignal 取消并等待工具收敛。`submit_image_job` 沿用提交前取消与现有存储期限，以便已受理的任务仍能返回句柄。
 - 正常显式关闭先停新入口，再 mioKernel.close：cancel、whenIdle、flush、Handle.dispose。根卸载 fallback 只加入公开 Handle.dispose，其内置写句柄关闭负责排空；required injection 保留驱动和持久化服务到消费者清理后，不在 detach 后再次 flush。
 - resume 的 setup 清空恢复的 next-step/next-turn inbox 并 flush，再允许新输入，防止旧未知请求在未来 followup 时执行。恢复及读取不是重新调用付费模型的授权。
+
+空闲会话改名通过同一受控 resume 保存官方标题，清理持久 inbox 中的未执行输入。公开历史项目和已有回执沿各自原边界读取。
 
 ## 历史、恢复与错误
 

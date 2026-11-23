@@ -60,6 +60,7 @@ const vision: ConversationVision = {
 const engine: ConversationEngine = {
   available: true,
   create: async () => {},
+  rename: async (_id, title) => title,
   history: async () => ({ items: [], nextAfterSeq: -1, hasMore: false }),
   run: vi.fn<ConversationEngine['run']>(async (_id, _requestId, _text, durable) => {
     await durable();
@@ -132,6 +133,64 @@ const post = (id: string, value: unknown, cookie = 'owner') =>
     headers: { origin: 'http://fixture.test', cookie, 'content-type': 'application/json' },
     body: JSON.stringify(value),
   });
+const archive = (id: string) =>
+  fetch(`${origin}/api/v1/conversations/${id}`, {
+    method: 'DELETE',
+    headers: { origin: 'http://fixture.test', cookie: 'owner' },
+  });
+
+it('checks archived image requests and replays before provider or asset lookup', async () => {
+  const id = await conversation();
+  const original = { requestId: 'before-archive', text: 'a scene', imageAssetIds: [randomUUID()] };
+  expect((await post(id, original)).status).toBe(202);
+  await expect
+    .poll(async () => (await service.request(actor, id, original.requestId)).status)
+    .toBe('completed');
+  expect((await archive(id)).status).toBe(200);
+  provider.resolveChat.mockClear();
+  vi.mocked(vision.prepareRequest).mockClear();
+  vi.mocked(engine.run).mockClear();
+
+  const fresh = await post(id, { ...original, requestId: 'after-archive' });
+  expect(fresh.status).toBe(409);
+  expect(await fresh.json()).toMatchObject({ error: { code: 'CONVERSATION_ARCHIVED' } });
+  const replay = await post(id, original);
+  expect(replay.status).toBe(202);
+  expect(await replay.json()).toMatchObject({ status: 'completed', requestId: original.requestId });
+  const conflict = await post(id, { ...original, text: 'a different scene' });
+  expect(conflict.status).toBe(409);
+  expect(await conflict.json()).toMatchObject({ error: { code: 'REQUEST_ID_CONFLICT' } });
+  expect(provider.resolveChat).not.toHaveBeenCalled();
+  expect(vision.prepareRequest).not.toHaveBeenCalled();
+  expect(engine.run).not.toHaveBeenCalled();
+});
+
+it('rejects locked admission when archive wins during image preflight', async () => {
+  const id = await conversation();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  vi.mocked(vision.prepareRequest).mockImplementationOnce(async (_owner, assetId) => {
+    entered.resolve();
+    await release.promise;
+    return { reference: makeRef(assetId), previewBytes: 3 };
+  });
+  const input = { requestId: 'archive-during-image', text: 'scene', imageAssetIds: [randomUUID()] };
+  const sending = post(id, input);
+  try {
+    await entered.promise;
+    expect((await archive(id)).status).toBe(200);
+  } finally {
+    release.resolve();
+  }
+  const rejected = await sending;
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toMatchObject({ error: { code: 'CONVERSATION_ARCHIVED' } });
+  expect(provider.resolveChat).toHaveBeenCalledTimes(1);
+  expect(engine.run).not.toHaveBeenCalled();
+  await expect(service.request(actor, id, input.requestId)).rejects.toMatchObject({
+    code: 'REQUEST_NOT_FOUND',
+  });
+});
 
 it('rejects a third fresh image preparation without queueing or receiving while replay stays available', async () => {
   const replayId = await conversation();

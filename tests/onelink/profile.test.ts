@@ -5,7 +5,7 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { packedAuthRuntime } from '../support/auth-runtime.ts';
 import { importDeclaration } from '../providers/fixtures/provider-declaration.ts';
-import type { Receipt } from '../../src/conversations/contracts.ts';
+import type { Conversation, HistoryPage, Receipt } from '../../src/conversations/contracts.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;
@@ -423,6 +423,101 @@ it('publishes the same sanitized failure in GET and SSE after one real BYOK adap
     });
     expect(JSON.stringify(requests[0]!.body)).toContain(`FIXTURE_FAILURE_${fixture}`);
   }
+});
+
+it('keeps the first title and history through a BYOK rate limit and archive replay', async () => {
+  const id = await create(0, 'onelink:chat:claude-sonnet-4.5-20250929');
+  const path = `/api/v1/conversations/${id}`;
+  const requestId = 'first-turn';
+  const title = '雨夜 码头 侦探 拿起 剧本 发现 线索 要求 保留 人物 与 对白';
+  const text =
+    '雨夜\n码头 侦探 拿起 剧本 发现 线索 要求 保留 人物 与 对白 PAUSE_WIRE FIXTURE_FAILURE_429';
+  const failure = { conversationId: id, requestId, status: 'failed', error: 'MODEL_RATE_LIMITED' };
+  const conversation = async () => {
+    const response = await call('/api/v1/conversations?limit=100');
+    expect(response.status).toBe(200);
+    const { items } = (await response.json()) as { items: Conversation[] };
+    return items.find((item) => item.id === id);
+  };
+  const receipt = async () => {
+    const response = await call(`${path}/requests/${requestId}`);
+    expect(response.status).toBe(200);
+    return (await response.json()) as Receipt;
+  };
+  const created = await conversation();
+  expect(created).toMatchObject({ title: null });
+  const count = (await runtime.onelinkRequests()).length;
+
+  let stream: Response;
+  try {
+    expect((await send(id, requestId, text)).status).toBe(202);
+    await expect.poll(() => runtime.onelinkPaused(), { timeout: 5000 }).toBe(true);
+    await expect.poll(conversation, { timeout: 5000 }).toMatchObject({ title });
+    expect((await receipt()).status).toBe('input-persisted');
+    expect(await runtime.onelinkRequests()).toHaveLength(count);
+    stream = await fetch(`${runtime.origin}${path}/events`, {
+      headers: { origin: runtime.origin, cookie: cookies[0]! },
+      signal: AbortSignal.timeout(5000),
+    });
+  } finally {
+    if (await runtime.onelinkPaused()) {
+      await runtime.releaseOnelink();
+      await expect.poll(() => runtime.onelinkPaused(), { timeout: 5000 }).toBe(false);
+    }
+  }
+
+  expect(await readTerminalState(stream, requestId)).toEqual({ type: 'state', receipt: failure });
+  expect(await receipt()).toEqual(failure);
+  const sent = (await runtime.onelinkRequests()).slice(count);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    path: '/v1/messages',
+    body: {
+      system: expect.arrayContaining([
+        expect.objectContaining({ type: 'text', cache_control: { type: 'ephemeral' } }),
+      ]),
+    },
+  });
+  expect(JSON.stringify(sent[0]!.body)).toContain('FIXTURE_FAILURE_429');
+
+  await runtime.stop();
+  await runtime.start('database');
+  const cold = await conversation();
+  expect(cold).toMatchObject({ title });
+  expect(Date.parse(cold!.updatedAt)).toBeGreaterThan(Date.parse(created!.updatedAt));
+  const manualTitle = '确认版·雨夜码头';
+  const renamed = await call(path, 'PATCH', { title: manualTitle });
+  expect(renamed.status).toBe(200);
+  expect(await renamed.json()).toMatchObject({ id, title: manualTitle });
+  const pinned = await observer.query(
+    'SELECT title, title_pinned FROM mio_conversations WHERE id=$1',
+    [id],
+  );
+  expect(pinned.rows).toEqual([{ title: manualTitle, title_pinned: true }]);
+
+  const archive = await call(path, 'DELETE');
+  expect(archive.status).toBe(200);
+  const archived = await archive.json();
+  expect(archived).toMatchObject({ id, archivedAt: expect.any(String) });
+  const repeated = await call(path, 'DELETE');
+  expect(repeated.status).toBe(200);
+  expect(await repeated.json()).toEqual(archived);
+  expect(await conversation()).toBeUndefined();
+  const fresh = await send(id, 'fresh', '归档后新消息');
+  expect(fresh.status).toBe(409);
+  expect(await fresh.json()).toMatchObject({ error: { code: 'CONVERSATION_ARCHIVED' } });
+  const replay = await send(id, requestId, text);
+  expect(replay.status).toBe(202);
+  expect(await replay.json()).toEqual(failure);
+  expect(await receipt()).toEqual(failure);
+  const history = await call(`${path}/history`);
+  expect(history.status).toBe(200);
+  const { items } = (await history.json()) as HistoryPage;
+  expect(items).toMatchObject([
+    { role: 'user', text },
+    { role: 'status', status: 'failed' },
+  ]);
+  expect((await runtime.onelinkRequests()).slice(count)).toEqual(sent);
 });
 
 it('preserves both wire protocols’ capped text and settled receipts after a real Profile restart', async () => {

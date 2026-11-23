@@ -14,6 +14,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/conversations/http.ts](../../../../src/conversations/http.ts) · [src/conversations/store.ts](../../../../src/conversations/store.ts) · [src/conversations/schema.ts](../../../../src/conversations/schema.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [docs/apis/conversations.md](../../../apis/conversations.md) · [tests/conversations/conversation-lifecycle.test.ts](../../../../tests/conversations/conversation-lifecycle.test.ts)
 
+## conversation-purpose-and-context-injection
+
+**会话用途模板与受控项目上下文注入**
+
+[docs/apis/conversations.md](../../../apis/conversations.md) · [docs/conversations.md](../../../conversations.md) · [docs/integrations/dsh.md](../../../integrations/dsh.md) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/conversations/project-context.ts](../../../../src/conversations/project-context.ts) · [src/dsh/conversation-context.ts](../../../../src/dsh/conversation-context.ts) · [tests/conversations/m4-profile.test.ts](../../../../tests/conversations/m4-profile.test.ts)
+
 ## conversation-step-reliability-and-cache
 
 **对话步级检查点、前缀缓存与脱敏错误回执**

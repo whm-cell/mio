@@ -85,6 +85,51 @@
       }
     },
     {
+      "key": "conversation-purpose-and-context-injection",
+      "title": "会话用途模板与受控项目上下文注入",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "创建用途、正常消息入口与公开响应"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "迁移、服务端项目来源、归属及源码部署契约"
+        },
+        {
+          "path": "docs/integrations/dsh.md",
+          "purpose": "固定提示前缀、原生项目上下文、计量与公开投影"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "会话创建与可信 fresh 消息接收"
+        },
+        {
+          "path": "src/conversations/project-context.ts",
+          "purpose": "拥有者和会话两重身份、结构与 UTF-8 字节限制"
+        },
+        {
+          "path": "src/dsh/conversation-context.ts",
+          "purpose": "固定 DSH 会话中的当轮内部项目上下文"
+        },
+        {
+          "path": "tests/conversations/m4-profile.test.ts",
+          "purpose": "打包 Profile 标准消息和冷启动、分页及用量验收"
+        }
+      ],
+      "outcomes": "创建时支持受控 general 和 drama-script，既有通用会话形状与提示词兼容。通过标准消息 HTTP 用拥有者及会话标识在新受理轮次读取最新可选项目数据，校验完整且有界的 JSON，支持未关联及失败后同 ID 重试。模型接收当轮项目数据，同时保持固定提示前缀和 M3 水位计算。公开历史、实时事件、标题和 PG 元数据保持既有投影。已由独立合流带入真实 M3 成果。",
+      "verification": "本地候选 117651aa6a10ea6d3591d0957ebb3029176e1c62，契约修订 3，6 项必需证据通过。全仓 check:static、构建、独立 Profile 烟测和 46 文件 387 项受影响用例通过。标准打包 HTTP、双真实 codec 的协议替身、原始 SIGKILL 中断和冷启动复验均通过。完整 pnpm check 依据公共全量共同基线、M1-M3 和当前代码/成果差异及定向原件人工覆盖。",
+      "limitations": "当前以固定 DSH、隔离 PostgreSQL 和受控协议替身验证。外部业务域 D2 项目源接入、实际供应商生成质量/缓存命中及生产表现有各自验收。原生内部日志适用私有日志访问规则。",
+      "acceptance": {
+        "candidate": {
+          "commit": "117651aa6a10ea6d3591d0957ebb3029176e1c62",
+          "contractRevision": 3
+        },
+        "statement": "接受并登记 M4",
+        "reference": "2026-11-23 当前 Codex 对话中，用户针对本地 M4 候选 117651aa6a10ea6d3591d0957ebb3029176e1c62、契约修订 3 和草稿 b8e9790b-30a1-4192-916f-6ddb7ce165f8 明确答复「接受并登记 M4」。"
+      }
+    },
+    {
       "key": "conversation-step-reliability-and-cache",
       "title": "对话步级检查点、前缀缓存与脱敏错误回执",
       "locations": [

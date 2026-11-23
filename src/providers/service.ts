@@ -83,6 +83,17 @@ export function createProviderService(
     });
     return { row, selection, adaptation };
   };
+  const boundChatState = async (actor: ProviderPrincipal, selected: ChatSelection) => {
+    const state = await chatState(actor, selected.modelRef);
+    const { selection } = state;
+    if (
+      selection.providerConfigId !== selected.providerConfigId ||
+      selection.modelId !== selected.modelId ||
+      (selected.modelKey !== undefined && selected.modelKey !== selection.modelKey)
+    )
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
+    return state;
+  };
   const discover = async (actor: ProviderPrincipal): Promise<Discovery> => {
     const row = await store.beginRefresh(actor.userId);
     const result: Discovery = {
@@ -251,17 +262,18 @@ export function createProviderService(
     async selectChat(actor: ProviderPrincipal, modelRef?: string): Promise<ChatSelection> {
       return (await chatState(actor, modelRef)).selection;
     },
+    async chatContextWindow(
+      actor: ProviderPrincipal,
+      selected: ChatSelection,
+    ): Promise<number | null> {
+      const { adaptation } = await boundChatState(actor, selected);
+      return adaptation.contextWindow ?? null;
+    },
     async resolveChat(
       actor: ProviderPrincipal,
       selected: ChatSelection,
     ): Promise<ChatRuntimeSnapshot> {
-      const { row, selection, adaptation } = await chatState(actor, selected.modelRef);
-      if (
-        selection.providerConfigId !== selected.providerConfigId ||
-        selection.modelId !== selected.modelId ||
-        (selected.modelKey !== undefined && selected.modelKey !== selection.modelKey)
-      )
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
+      const { row, selection, adaptation } = await boundChatState(actor, selected);
       const apiKey = decryptCredential(
         row,
         { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },

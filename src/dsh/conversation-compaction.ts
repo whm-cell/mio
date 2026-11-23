@@ -6,7 +6,6 @@ import {
   ManualCompactionError,
   compactCheckpointSource,
   isCompactCheckpointSource,
-  toolPairingBalancedAfter,
   toolPairingBalancedBefore,
 } from '@deepseek-ai/dsh-compaction';
 import type {
@@ -23,7 +22,7 @@ import {
 } from '@deepseek-ai/dsh-llm';
 import type { ContentBlock, TokenUsage, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session';
-import type { TokenMeasurement, TokenMeter, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter';
+import type { TokenMeter, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter';
 import type {} from '@deepseek-ai/dsh-compaction-tool-result-pruner';
 import {
   CONVERSATION_COMPACTION_PROMPT,
@@ -46,11 +45,6 @@ interface CompactRequest {
   };
 }
 
-interface Region {
-  readonly start: SessionSeq;
-  readonly end: SessionSeq;
-}
-
 const checkpointPreamble = '以下是本会话先前的创作资料。按当前用户请求接续。';
 
 export function measureConversationContext(
@@ -66,29 +60,19 @@ export function measureConversationContext(
   return { estimatedTokens: totalTokens, contextWindow, compacted };
 }
 
-function rangeFor(
+function compactablePrefix(
   session: Session,
-  measurement: TokenMeasurement,
+  nodes: readonly TokenSurfaceNode[],
   inputSeq?: SessionSeq,
-): Region | undefined {
-  const { nodes } = measurement;
+): TokenSurfaceNode[] | undefined {
   const head = nodes[0];
   if (!head) return;
-  const start = Number(session.eventAt(head.seq)?.type === 'system/message');
+  const start = session.eventAt(head.seq)?.type === 'system/message' ? 1 : 0;
   const inputIndex = inputSeq === undefined ? -1 : nodes.findIndex(({ seq }) => seq === inputSeq);
   let cut = nodes.length - Math.ceil((nodes.length - start) * 0.2);
   if (inputIndex !== -1) cut = Math.min(cut, inputIndex);
   while (cut > start && !toolPairingBalancedBefore(session, nodes[cut]!.seq)) cut--;
-  if (cut <= start) return;
-  const first = nodes[start]!;
-  const event = session.eventAt(first.seq);
-  if (
-    cut === start + 1 &&
-    event?.type === 'user/message' &&
-    isCompactCheckpointSource(event.data.source)
-  )
-    return;
-  return { start: first.seq, end: nodes[cut - 1]!.seq };
+  if (cut > start) return nodes.slice(start, cut);
 }
 
 export class ConversationCompaction extends CompactionEngine {
@@ -123,9 +107,9 @@ export class ConversationCompaction extends CompactionEngine {
     }
   }
 
-  private owner(agent: CompactionAgentContext, signal?: AbortSignal): CompactRequest {
+  private owner(agent: CompactionAgentContext, signal: AbortSignal): CompactRequest {
     const bound = this.requests.get(agent.session);
-    if (!bound || !signal || bound.signal !== signal)
+    if (!bound || bound.signal !== signal)
       throw new LlmError('Conversation compaction binding required', 'BINDING_REQUIRED');
     signal.throwIfAborted();
     return bound.request;
@@ -148,6 +132,18 @@ export class ConversationCompaction extends CompactionEngine {
     }
     const meter = this.ctx.get('tokenMeter');
     if (!meter) return null;
+    const { inputSeq } = request.turn;
+    const admitted = inputSeq === undefined ? undefined : session.eventAt(inputSeq);
+    const input =
+      admitted?.type === 'user/message'
+        ? admitted.data
+        : request.turn.pending.find((message) => message.source.kind === 'user');
+    // Replacing history cannot shrink this turn's indivisible user input.
+    // Its estimate governs the auxiliary call only; the body still reaches the provider.
+    if (input && meter.estimateMessage(input) >= window) {
+      if (request.turn.firstStep && trigger === 'pressure') await this.prune(session, signal);
+      return null;
+    }
     const threshold = compactionThreshold(window, snapshotMaxTokens(request.binding.snapshot));
     const pending = request.turn.pending.reduce(
       (sum, message) => sum + meter.estimateMessage(message),
@@ -161,9 +157,9 @@ export class ConversationCompaction extends CompactionEngine {
       measurement = meter.measure(session);
       if (belowThreshold()) return null;
     }
-    const region = rangeFor(session, measurement, request.turn.inputSeq);
-    return region
-      ? this.commit(session, region, request, request.turn.number, signal, meter, measurement.nodes)
+    const candidates = compactablePrefix(session, measurement.nodes, inputSeq);
+    return candidates
+      ? this.commit(session, candidates, request, request.turn.number, signal, meter)
       : null;
   }
 
@@ -188,75 +184,37 @@ export class ConversationCompaction extends CompactionEngine {
       const ownedSignal = AbortSignal.any([signal, maintenanceSignal]);
       ownedSignal.throwIfAborted();
       await this.prune(session, ownedSignal);
-      const measurement = meter.measure(session);
-      const range = rangeFor(session, measurement);
-      if (!range) return null;
+      const candidates = compactablePrefix(session, meter.measure(session).nodes);
+      if (!candidates) return null;
       const release = request.adapter.bind(ownedSignal, request.binding);
       try {
-        return await this.commit(
-          session,
-          range,
-          request,
-          null,
-          ownedSignal,
-          meter,
-          measurement.nodes,
-        );
+        return await this.commit(session, candidates, request, null, ownedSignal, meter);
       } finally {
         release();
       }
     });
   }
 
-  override async compactRegion(
-    start: SessionSeq,
-    end: SessionSeq,
-    agent: CompactionAgentContext,
-    signal?: AbortSignal,
-  ): Promise<CompactionResult> {
-    const request = this.owner(agent, signal);
-    const meter = this.ctx.get('tokenMeter');
-    if (!meter || !request.turn) throw new Error('MIO_COMPACTION_SCOPE_REQUIRED');
-    const result = await this.commit(
-      agent.session,
-      { start, end },
-      request,
-      request.turn.number,
-      signal!,
-      meter,
-      meter.measure(agent.session).nodes,
-      true,
+  override async compactRegion(): Promise<never> {
+    throw new LlmError(
+      'Conversation compaction requires a Mio-owned operation',
+      'BINDING_REQUIRED',
     );
-    if (!result)
-      throw new ManualCompactionError('summary', 'Selected history cannot fit a useful summary');
-    return result;
   }
 
   private async commit(
     session: Session,
-    proposed: Region,
+    candidates: readonly TokenSurfaceNode[],
     request: CompactRequest,
     turn: number | null,
     signal: AbortSignal,
     meter: TokenMeter,
-    nodes: readonly TokenSurfaceNode[],
-    exact = false,
   ): Promise<CompactionResult | null> {
     signal.throwIfAborted();
     const { binding, budget } = request;
     const window = binding.snapshot.contextWindow;
     if (!window || budget.used)
       throw new ManualCompactionError('busy', 'Compaction is unavailable');
-    const first = nodes.findIndex(({ seq }) => seq === proposed.start);
-    const last = nodes.findIndex(({ seq }) => seq === proposed.end);
-    if (
-      first < 0 ||
-      last < first ||
-      !toolPairingBalancedBefore(session, proposed.start) ||
-      !toolPairingBalancedAfter(session, proposed.end)
-    )
-      throw new ManualCompactionError('changed', 'Compaction requires balanced surface boundaries');
-    const candidates = nodes.slice(first, last + 1);
     const system = createSystemMessage(CONVERSATION_COMPACTION_PROMPT);
     const maxTokens = Math.max(
       1,
@@ -268,12 +226,11 @@ export class ConversationCompaction extends CompactionEngine {
       meter,
       window - maxTokens - meter.estimateMessage(system),
     );
-    if (!input || (exact && input.count !== candidates.length)) return null;
+    if (!input) return null;
     const { message, referenceText } = input;
     const selected = candidates.slice(0, input.count);
     const shadowedSeqs = selected.map(({ seq }) => seq);
-    const end = shadowedSeqs.at(-1)!;
-    const region = { start: proposed.start, end };
+    const region = { start: shadowedSeqs[0]!, end: shadowedSeqs.at(-1)! };
     const shadowedTokenCount = selected.reduce(
       (count, { heuristicTokens }) => count + heuristicTokens,
       0,

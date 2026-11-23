@@ -401,6 +401,7 @@ it('publishes the same sanitized failure in GET and SSE after one real BYOK adap
     expect(state).toEqual({
       type: 'state',
       receipt: { conversationId: id, requestId, status: 'failed', error },
+      contextUsage: { estimatedTokens: expect.any(Number), contextWindow: null, compacted: false },
     });
     const response = await call(`/api/v1/conversations/${id}/requests/${requestId}`);
     expect(response.status).toBe(200);
@@ -466,7 +467,11 @@ it('keeps the first title and history through a BYOK rate limit and archive repl
     }
   }
 
-  expect(await readTerminalState(stream, requestId)).toEqual({ type: 'state', receipt: failure });
+  expect(await readTerminalState(stream, requestId)).toEqual({
+    type: 'state',
+    receipt: failure,
+    contextUsage: { estimatedTokens: expect.any(Number), contextWindow: null, compacted: false },
+  });
   expect(await receipt()).toEqual(failure);
   const sent = (await runtime.onelinkRequests()).slice(count);
   expect(sent).toHaveLength(1);

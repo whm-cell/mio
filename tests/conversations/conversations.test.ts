@@ -182,7 +182,15 @@ it.each([
       await stream.wait(
         (event) => event.type === 'state' && (event.receipt as Receipt).status === 'failed',
       );
-      expect(stream.received).toContainEqual({ type: 'state', receipt: expected });
+      expect(stream.received).toContainEqual({
+        type: 'state',
+        receipt: expected,
+        contextUsage: {
+          estimatedTokens: expect.any(Number),
+          contextWindow: null,
+          compacted: false,
+        },
+      });
       expect(await (await send(id, requestId, 'continue')).json()).toEqual(expected);
       expect(JSON.stringify(stream.received)).not.toMatch(/private-key|provider\.example\.test/);
       expect(await (await call(path(id, 'history'))).text()).not.toMatch(
@@ -972,6 +980,11 @@ it('keeps output-limited text and the same marker in hot history, paged history,
   const receiptPath = path(id, 'requests/cutoff');
   const historyPath = path(id, 'history');
   const settled = { conversationId: id, requestId: 'cutoff', status: 'completed', truncation };
+  const contextUsage = {
+    estimatedTokens: expect.any(Number),
+    contextWindow: null,
+    compacted: false,
+  };
   script.push(limited.response);
   try {
     expect((await send(id, 'cutoff', 'generate once')).status).toBe(202);
@@ -998,7 +1011,11 @@ it('keeps output-limited text and the same marker in hot history, paged history,
     await stream.wait(
       (event) => event.type === 'state' && (event.receipt as Receipt).status === 'completed',
     );
-    expect(stream.received).toContainEqual({ type: 'state', receipt: settled });
+    expect(stream.received).toContainEqual({
+      type: 'state',
+      receipt: settled,
+      contextUsage,
+    });
     expect(await terminal(id, 'cutoff')).toEqual(settled);
     expect(await (await send(id, 'cutoff', 'generate once')).json()).toEqual(settled);
     expect(model.requests.length - initial).toBe(1);
@@ -1012,6 +1029,7 @@ it('keeps output-limited text and the same marker in hot history, paged history,
         conversationId: id,
         activeRequestId: null,
         receipt: settled,
+        contextUsage,
       });
     } finally {
       await reconnected.close();

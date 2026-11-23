@@ -37,7 +37,8 @@ const publicContextUsage = ({ estimatedTokens, contextWindow, compacted }: Conte
 export function createConversationService(
   store: ConversationStore,
   engine: ConversationEngine,
-  providers?: Pick<ProviderService, 'selectChat' | 'resolveChat' | 'recordVerification'>,
+  providers?: Pick<ProviderService, 'selectChat' | 'resolveChat' | 'recordVerification'> &
+    Partial<Pick<ProviderService, 'chatContextWindow'>>,
   vision?: ConversationVision,
 ) {
   const pending = new Map<string, Promise<void>>();
@@ -473,7 +474,17 @@ export function createConversationService(
             .catch(() => undefined);
           signal?.throwIfAborted();
           check();
-          if (usage) snapshot.contextUsage = publicContextUsage(usage);
+          if (usage) {
+            const window = row.model_binding
+              ? await providers?.chatContextWindow?.(actor, row.model_binding).catch(() => null)
+              : usage.contextWindow;
+            signal?.throwIfAborted();
+            check();
+            snapshot.contextUsage = {
+              ...publicContextUsage(usage),
+              contextWindow: window ?? null,
+            };
+          }
         }
         return { snapshot, close };
       } catch (error) {

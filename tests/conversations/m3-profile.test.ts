@@ -26,13 +26,15 @@ import { readSessionArtifact } from '../support/session-artifact.ts';
 const execFileAsync = promisify(execFile);
 const modelId = 'deepseek-v4.1-flash';
 const modelRef = `onelink:chat:${modelId}`;
-const contextWindow = 8192;
+const originalWindow = 8192;
+const revisedWindow = 4096;
 const apiKey = 'synthetic-m3-profile-owner';
 const assistantText = 'fixture answer';
 const base = '/api/v1/conversations';
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let observer: Pool;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;
+let fixtureEnvironment: NodeJS.ProcessEnv;
 let cookie = '';
 
 const call = (path: string, method = 'GET', body?: unknown) =>
@@ -130,6 +132,12 @@ async function observations(id: string, requestId: string) {
   return result.rows[0]?.model_observations;
 }
 
+const declareChatWindow = (contextWindow: number) =>
+  importRoutesViaCli(
+    fixtureEnvironment,
+    makeChatRouteFixture(modelId, 'deepseek', { contextWindow, maxOutputTokens: 1024 }),
+  );
+
 beforeAll(async () => {
   database = await authDatabase();
   observer = new Pool({ connectionString: database.observerURL });
@@ -145,14 +153,14 @@ beforeAll(async () => {
     MIO_PROVIDERS_MASTER_KEY: providerMasterKey,
     MIO_PROVIDERS_MASTER_KEY_ID: providerKeyId,
   };
+  fixtureEnvironment = env;
   for (const domain of ['auth', 'providers', 'conversations']) {
     await execFileAsync(process.execPath, [`scripts/service/migrate-${domain}.ts`, '--apply'], {
       env,
       timeout: 30000,
     });
   }
-  const route = makeChatRouteFixture(modelId, 'deepseek', { contextWindow, maxOutputTokens: 1024 });
-  await importRoutesViaCli(env, route);
+  await declareChatWindow(originalWindow);
   runtime = await packedAuthRuntime(database.url, '', 'unused', {
     conversations: true,
     onelinkFixture: true,
@@ -203,12 +211,12 @@ it('compacts through the packed Profile, restores its history and limits overflo
   let artifact: string;
   let compactedLog: string;
   try {
-    expect((await stream.next()).value).toMatchObject({
+    expect((await stream.next()).value, 'fresh snapshot for the bound route').toMatchObject({
       type: 'snapshot',
       conversationId: id,
       activeRequestId: null,
       receipt: null,
-      contextUsage: { compacted: false },
+      contextUsage: { contextWindow: originalWindow, compacted: false },
     });
     let beforeTokens = 0;
     for (const [index, text] of inputs.entries()) {
@@ -216,7 +224,7 @@ it('compacts through the packed Profile, restores its history and limits overflo
       await json(await call(`${path}/messages`, 'POST', { requestId, text }), 202);
       const state = await settled(stream, path, requestId);
       expect(state.text).toBe(assistantText);
-      expect(state.contextUsage).toMatchObject({ contextWindow, compacted: false });
+      expect(state.contextUsage).toMatchObject({ contextWindow: originalWindow, compacted: false });
       beforeTokens = state.contextUsage!.estimatedTokens;
     }
     expect(await runtime.onelinkRequests()).toHaveLength(inputs.length);
@@ -243,12 +251,13 @@ it('compacts through the packed Profile, restores its history and limits overflo
     artifact = join(compressedRoot, modernFiles[0]!);
     const originalLog = await readSessionArtifact(artifact);
 
+    expect(await declareChatWindow(revisedWindow)).toMatchObject({ updated: 1 });
     await json(await compact(), 202);
     const terminal = await settled(stream, path, compactId);
     compactReceipt = terminal.receipt;
     expect(terminal.text).toBe('');
     expect(terminal.contextUsage).toEqual({
-      contextWindow,
+      contextWindow: revisedWindow,
       compacted: true,
       estimatedTokens: expect.any(Number),
     });
@@ -296,11 +305,14 @@ it('compacts through the packed Profile, restores its history and limits overflo
   const coldStream = events(path);
   const followup = '下一集的筹备表里，需要引用钟表匠的哪张定妆照？';
   try {
-    expect((await coldStream.next()).value).toMatchObject({
+    expect(
+      (await coldStream.next()).value,
+      'cold snapshot after revising the bound route',
+    ).toMatchObject({
       type: 'snapshot',
       activeRequestId: null,
       receipt: compactReceipt,
-      contextUsage: { contextWindow, compacted: true },
+      contextUsage: { contextWindow: revisedWindow, compacted: true },
     });
     expect(await runtime.onelinkRequests()).toHaveLength(wireAfterCompact.length);
     await json(
@@ -309,7 +321,7 @@ it('compacts through the packed Profile, restores its history and limits overflo
     );
     const terminal = await settled(coldStream, path, 'cold-followup');
     expect(terminal.text).toBe(assistantText);
-    expect(terminal.contextUsage).toMatchObject({ contextWindow, compacted: true });
+    expect(terminal.contextUsage).toMatchObject({ contextWindow: revisedWindow, compacted: true });
   } finally {
     await coldStream.return(undefined);
   }

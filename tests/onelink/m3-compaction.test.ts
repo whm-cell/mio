@@ -407,6 +407,66 @@ it('prunes only historical large tool results before using one drama summary and
   ).toBe(true);
 });
 
+it('preserves authorized edit inputs and masks when the model summary omits them', async () => {
+  const fixture = await setup({ images: true });
+  const input = 'bd932443-06d1-4f7f-98c5-1a49413817ae';
+  const otherInput = 'f9192044-e330-4ba4-a6f7-7d4403ddc735';
+  const mask = 'f5377f3e-1146-4614-83d0-2a5692b141a3';
+  const denied = '9edd528c-b17d-4e9f-b952-fa2e1cb38a1d';
+  const edit = {
+    modelRef: 'onelink:image:one',
+    prompt: '用蒙版编辑背景',
+    operation: 'edit',
+    imageAssetIds: [input, otherInput],
+    maskAssetId: mask,
+  };
+  fixture.respond((call) =>
+    fixture.calls.length === 1 ? toolResponse('submit_image_job', edit) : fixture.answer(call),
+  );
+  expect(await fixture.run('edit', world)).toBe('completed');
+  expect(fixture.createImage).toHaveBeenCalledWith(
+    { userId: 'fixture-owner' },
+    expect.any(String),
+    edit.modelRef,
+    expect.objectContaining({
+      operation: 'edit',
+      imageAssetIds: [input, otherInput],
+      maskAssetId: mask,
+    }),
+    expect.any(AbortSignal),
+  );
+  const deniedStart = fixture.calls.length;
+  fixture.createImage.mockRejectedValueOnce(new Error('fixture rejected inaccessible asset'));
+  fixture.respond((call) =>
+    fixture.calls.length === deniedStart + 1
+      ? toolResponse('submit_image_job', { ...edit, imageAssetIds: [denied] })
+      : fixture.answer(call),
+  );
+  expect(await fixture.run('denied-edit', '另一个编辑建议')).toBe('completed');
+  fixture.respond((call) => fixture.answer(call, call.options.purpose ? summary : '后续进展'));
+  expect(await fixture.run('older-context', '历史场景补充。' + '灯下'.repeat(400))).toBe(
+    'completed',
+  );
+
+  expect(await fixture.compact('retain-edit')).toBe('completed');
+  const firstSummary = fixture.calls.at(-1)!;
+  expect(firstSummary.options.purpose).toBe('compaction');
+  expect(summary).not.toContain(input);
+  expect(summary).not.toContain(mask);
+  expect(await fixture.run('still-edit', '继续修改已确认的场景')).toBe('completed');
+  const wire = fixture.calls.at(-1)!.wire;
+  expect(wire).toContain('imageAssetIds=' + input);
+  expect(wire).toContain('imageAssetIds=' + otherInput);
+  expect(wire).toContain('maskAssetId=' + mask);
+  expect(wire).not.toContain('imageAssetIds=' + denied);
+
+  expect(await fixture.compact('retain-again')).toBe('completed');
+  expect(fixture.calls.at(-1)!.options.purpose).toBe('compaction');
+  expect(await fixture.run('after-second', '根据目前成果继续')).toBe('completed');
+  expect(fixture.calls.at(-1)!.wire).toContain('maskAssetId=' + mask);
+  expect(fixture.calls.at(-1)!.wire).toContain('imageAssetIds=' + input);
+});
+
 it.each([false, true])(
   'uses one paid recovery on exact overflow (second overflow=%s)',
   async (again) => {
@@ -559,6 +619,51 @@ it('refuses to retry an indivisible new input that exhausts the known window', a
   expect((await fixture.raw()).some((event) => event.type === 'compaction/start')).toBe(false);
 });
 
+it.each([200, 400])(
+  'keeps one ordinary attempt with old compressible history when current input fills the window (HTTP %i)',
+  async (status) => {
+    const fixture = await setup();
+    expect(await fixture.run('old', world)).toBe('completed');
+    const giant = '本轮完整的超长剧本' + 'a'.repeat(40_000);
+    fixture.respond((call) =>
+      status === 200 ? fixture.answer(call, '供应商接受长输入') : rejection(400),
+    );
+    expect(await fixture.run('long-current-turn', giant)).toEqual(
+      status === 200 ? 'completed' : { status: 'failed', error: 'MODEL_CONTEXT_OVERFLOW' },
+    );
+    expect(fixture.calls).toHaveLength(2);
+    const ordinary = fixture.calls.at(-1)!;
+    expect(ordinary.options.purpose).toBeUndefined();
+    expect(ordinary.wire).toContain(giant);
+    expect(ordinary.wire).toContain(world);
+    expect(fixture.observations.at(-1)).toMatchObject({ status });
+    expect((await fixture.raw()).some((event) => event.type === 'compaction/start')).toBe(false);
+    const history = await fixture.engine.history(sessionId, -1, 100);
+    expect(history.items).toContainEqual(expect.objectContaining({ role: 'user', text: world }));
+    expect(history.items).toContainEqual(expect.objectContaining({ role: 'user', text: giant }));
+  },
+);
+
+it('does not dispatch a summary when its oldest indivisible historical node cannot fit', async () => {
+  const fixture = await setup({ contextWindow: null });
+  const giant = '不可切分的存量剧本' + 'r'.repeat(25_000);
+  expect(await fixture.run('large-old', giant)).toBe('completed');
+  const route = snapshot('openai-chat', 4096);
+  expect(await fixture.compact('unfittable-history', route)).toBe('completed');
+  expect(fixture.calls).toHaveLength(1);
+  fixture.respond(() => rejection(400));
+  expect(await fixture.run('failure-after-large-history', '继续编剧', route)).toEqual({
+    status: 'failed',
+    error: 'MODEL_CONTEXT_OVERFLOW',
+  });
+  expect(fixture.calls).toHaveLength(2);
+  expect(fixture.calls.at(-1)!.options.purpose).toBeUndefined();
+  expect(fixture.calls.at(-1)!.wire).toContain(giant);
+  expect((await fixture.raw()).some((event) => event.type === 'compaction/start')).toBe(false);
+  const history = await fixture.engine.history(sessionId, -1, 100);
+  expect(history.items).toContainEqual(expect.objectContaining({ role: 'user', text: giant }));
+});
+
 it('prunes historical large tools without guessing an undeclared window or billing a summary', async () => {
   const fixture = await setup({ contextWindow: null, images: true });
   fixture.respond((call) =>
@@ -571,6 +676,23 @@ it('prunes historical large tools without guessing an undeclared window or billi
   expect(fixture.calls.at(-1)!.wire).toContain('MODEL_HEAD');
   expect(fixture.calls.at(-1)!.wire).not.toContain('MODEL_MIDDLE');
   expect(await fixture.usage()).toMatchObject({ contextWindow: null, compacted: false });
+});
+
+it('requires Mio admission for direct DSH region compaction', async () => {
+  const fixture = await setup();
+  expect(await fixture.run('old', world)).toBe('completed');
+  const session = await fixture.ctx.mioKernel.readView(sessionId);
+  const seq = session.surface.nodes[1]!;
+  await expect(
+    fixture.ctx.compaction.compactRegion(
+      seq,
+      seq,
+      { session, options: {} },
+      new AbortController().signal,
+    ),
+  ).rejects.toMatchObject({ code: 'BINDING_REQUIRED' });
+  expect(fixture.calls).toHaveLength(1);
+  expect((await fixture.raw()).some((event) => event.type === 'compaction/start')).toBe(false);
 });
 
 it('commits a manual summary without admitting a turn or emitting summary text', async () => {

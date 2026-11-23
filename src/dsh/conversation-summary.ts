@@ -1,12 +1,62 @@
 import { toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session';
+import { isPlainJsonRecord } from '@deepseek-ai/dsh-tools';
 import type { TokenMeter, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter';
+import { isUuidV4 } from '@mio/foundation/identifiers';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
 import { conversationImageAssetId } from './vision.ts';
 
+const referenceLabels = {
+  assetid: 'assetId',
+  imageassetids: 'imageAssetIds',
+  maskassetid: 'maskAssetId',
+  jobid: 'jobId',
+} as const;
 const assetReference =
-  /\b(assetId|jobId)["']?\s*(?::|=|：)\s*["']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
+  /\b(assetId|imageAssetIds|maskAssetId|jobId)["']?\s*(?::|=|：)\s*["']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
+
+function keepToolReferences(
+  session: Session,
+  result: SessionEvent<'tool/result'>,
+  references: Set<string>,
+): void {
+  // A pruned result cites its original, which cites the recorded tool call.
+  let source: SessionEvent | undefined = result;
+  while (source?.type === 'tool/result') {
+    const seq: SessionSeq | undefined = source.sourceEventSeqs?.[0];
+    source = seq === undefined ? undefined : session.eventAt(seq);
+  }
+  if (
+    source?.type !== 'tool/call' ||
+    source.data.callId !== result.data.message.toolCallId ||
+    source.data.turn !== result.data.turn ||
+    source.data.step !== result.data.step
+  )
+    return;
+  const { name, arguments: raw } = source.data;
+  if (name !== 'submit_image_job' && name !== 'get_image_job' && name !== 'inspect_image_asset')
+    return;
+  let args: unknown;
+  try {
+    args = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!isPlainJsonRecord(args)) return;
+  const keep = (field: string, value: unknown) => {
+    if (typeof value === 'string' && isUuidV4(value)) references.add(`${field}=${value}`);
+  };
+  if (name === 'submit_image_job') {
+    if (Array.isArray(args.imageAssetIds))
+      for (const id of args.imageAssetIds) keep('imageAssetIds', id);
+    keep('maskAssetId', args.maskAssetId);
+  } else if (name === 'get_image_job') {
+    keep('jobId', args.jobId);
+  } else {
+    keep('assetId', args.assetId);
+  }
+}
 
 function summaryRow(session: Session, event: SessionEvent, references: Set<string>): string {
   const message = session.deriveEventMessage(event);
@@ -15,8 +65,10 @@ function summaryRow(session: Session, event: SessionEvent, references: Set<strin
   for (const block of message.content) {
     if (block.type === 'text') {
       texts.push(block.text);
-      for (const [, name, id] of block.text.matchAll(assetReference))
-        references.add(`${name!.toLowerCase() === 'assetid' ? 'assetId' : 'jobId'}=${id}`);
+      for (const [, label, id] of block.text.matchAll(assetReference)) {
+        const key = label!.toLowerCase() as keyof typeof referenceLabels;
+        references.add(`${referenceLabels[key]}=${id}`);
+      }
     } else if (block.type === 'image') {
       const id = conversationImageAssetId(String(block.attachment.attachmentId));
       if (id) references.add(`assetId=${id}`);
@@ -24,7 +76,8 @@ function summaryRow(session: Session, event: SessionEvent, references: Set<strin
       texts.push(`${block.name} ${block.arguments}`);
     }
   }
-  if (event.type === 'tool/result') {
+  if (event.type === 'tool/result' && !event.data.message.isError) {
+    keepToolReferences(session, event, references);
     const card = parseImageJobPresentationMeta(event.data.meta);
     if (card) {
       references.add(`jobId=${card.job.jobId}`);

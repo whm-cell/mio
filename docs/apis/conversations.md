@@ -147,7 +147,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
-水位 `{estimatedTokens,contextWindow,compacted}` 在可估算时随 snapshot 与正常轮次或手动压缩的结算状态返回。用 `contextWindow: null` 表示尚无适用的路由窗口，`compacted: true` 表示上下文含已持久化的压缩检查点。估算无法取得时省略该字段，回执照常返回。估算读取在本地完成，公开字段不含提示词、摘要、凭据或原始工具输出。
+水位 `{estimatedTokens,contextWindow,compacted}` 在可估算时随 snapshot 与轮次或手动压缩的结算状态返回。BYOK snapshot 显示发起订阅时当前可用的绑定路由窗口；结算 state 显示本次已受理请求的冻结窗口。用 `contextWindow: null` 表示缺少适用的路由窗口，`compacted: true` 表示上下文含已持久化的压缩检查点。估算无法取得时省略该字段，回执照常返回。窗口只读取本地元数据，公开字段不含提示词、摘要、凭据或原始工具输出。
 
 截断轮次完成后，state 中的回执带 `truncation`。如果该请求是订阅建立时的最近回执，snapshot 中也包含同一标记。已发送的 text 原样保留。
 

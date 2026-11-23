@@ -1,3 +1,5 @@
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -14,6 +16,13 @@ import {
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { packedAuthRuntime } from '../support/auth-runtime.ts';
+import {
+  kernelRuntime,
+  modelOptions,
+  ScriptedModel,
+  textResponse,
+} from '../support/kernel-runtime.ts';
+import { readSessionArtifact } from '../support/session-artifact.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;
@@ -300,12 +309,13 @@ it('drains an offloaded turn, cancels blocked cold history on shutdown and reads
     status: string;
   };
   const debugHistory = await (await call(`/api/v1/conversations/${id}/history?limit=100`)).json();
-  const files = await readdir(runtime.nativeLogRoot, { recursive: true, withFileTypes: true });
+  const files = await readdir(runtime.nativeLogRoots[1], { recursive: true, withFileTypes: true });
   const logs = await Promise.all(
     files
-      .filter((entry) => entry.isFile())
-      .map((entry) => readFile(join(entry.parentPath, entry.name), 'utf8')),
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl.zstd'))
+      .map((entry) => readSessionArtifact(join(entry.parentPath, entry.name))),
   );
+  expect(logs.length).toBeGreaterThan(0);
   const persisted = logs.join('\n');
   expect(persisted).toContain('"type":"image/offload"');
   expect(persisted).not.toContain('synthetic-profile-key');
@@ -351,3 +361,74 @@ it('drains an offloaded turn, cancels blocked cold history on shutdown and reads
   expect(replayed).toContain(ids[0]);
   expect(replayed).toContain(ids[1]);
 }, 30000);
+
+it('restarts the packed Profile, reads a pre-existing legacy session, and appends to its raw log', async () => {
+  const created = await call('/api/v1/conversations', 'POST', {});
+  expect(created.status, await created.clone().text()).toBe(201);
+  const { id } = (await created.json()) as { id: string };
+  const legacyId = SessionId(randomUUID());
+
+  // Seed a real pre-upgrade artifact through the old SDK composition, using
+  // only this regression Profile's home and database fixture.
+  await runtime.stop();
+  const old = await kernelRuntime(
+    runtime.nativeLogRoots[0],
+    new ScriptedModel([textResponse('legacy-profile-response')]),
+  );
+  let legacyPath: string;
+  try {
+    const handle = await old.mioKernel.create(legacyId, modelOptions);
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'legacy-profile-input' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    await old.mioKernel.flush(handle.agent.session);
+    const artifact = (await old.sessionPersistence.stat(legacyId))?.location;
+    if (artifact?.kind !== 'jsonl') throw new Error('Missing legacy fixture artifact');
+    legacyPath = artifact.path;
+    await old.mioKernel.close();
+  } finally {
+    await old.fiber.dispose();
+  }
+  const original = await readFile(legacyPath);
+  const stored = await observer.query(
+    'UPDATE mio_conversations SET dsh_session_id=$1 WHERE id=$2 AND owner_id=$3',
+    [legacyId, id, ownerId],
+  );
+  expect(stored.rowCount).toBe(1);
+  await runtime.start('database');
+
+  const initialCalls = (await runtime.onelinkRequests()).length;
+  const before = await call(`/api/v1/conversations/${id}/history?limit=100`);
+  expect(before.status).toBe(200);
+  expect(await before.text()).toContain('legacy-profile-response');
+  expect((await readFile(legacyPath)).equals(original)).toBe(true);
+  expect((await runtime.onelinkRequests()).length).toBe(initialCalls);
+
+  const next = await call(`/api/v1/conversations/${id}/messages`, 'POST', {
+    requestId: 'legacy-continuation',
+    text: 'Continue the previous legacy conversation',
+  });
+  expect(next.status, await next.clone().text()).toBe(202);
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (
+            await call(`/api/v1/conversations/${id}/requests/legacy-continuation`)
+          ).json()) as { status: string }
+        ).status,
+    )
+    .toBe('completed');
+  const calls = await runtime.onelinkRequests();
+  expect(calls).toHaveLength(initialCalls + 1);
+  expect(JSON.stringify(calls.at(-1)?.body)).toContain('legacy-profile-response');
+  const continued = await readFile(legacyPath);
+  expect(continued.subarray(0, original.length).equals(original)).toBe(true);
+  expect(continued.subarray(original.length).toString('utf8')).toContain(
+    'previous legacy conversation',
+  );
+});

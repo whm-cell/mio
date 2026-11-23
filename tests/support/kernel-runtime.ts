@@ -71,7 +71,11 @@ export type ModelScript =
 
 export const modelOptions = { provider: 'mio-test-only', model: 'scripted', maxTokens: 128 };
 
-export async function kernelRuntime(root: string, adapter: ScriptedModel) {
+export async function kernelRuntime(
+  root: string,
+  adapter: ScriptedModel,
+  mountPersistence?: (ctx: Context) => PromiseLike<unknown>,
+) {
   const ctx = new Context();
   try {
     await ctx.plugin(Llm);
@@ -82,7 +86,8 @@ export async function kernelRuntime(root: string, adapter: ScriptedModel) {
     await ctx.plugin(NativeExecutor);
     await ctx.plugin(Agents);
     await ctx.plugin(AgentLoop, { agents: [] });
-    await ctx.plugin(Jsonl, { root, compression: 'none' });
+    if (mountPersistence) await mountPersistence(ctx);
+    else await ctx.plugin(Jsonl, { root, compression: 'none' });
     ctx.llm.registerAdapter(['mio-test-only'], adapter);
     await ctx.plugin(MioKernel);
     return ctx;

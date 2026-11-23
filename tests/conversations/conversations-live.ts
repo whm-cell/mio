@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
+import { readSessionArtifact } from '../support/session-artifact.ts';
 import { importDeclaration } from '../providers/fixtures/provider-declaration.ts';
 import {
   authenticateOrCreateRetainedDevOwner,
@@ -341,14 +342,20 @@ async function main() {
       ),
     );
     if (rawSecretForLeakScan) {
+      let inspectedSessionLog = false;
       const inspect = async (directoryPath: string): Promise<void> => {
         for (const entry of await readdir(directoryPath, { withFileTypes: true })) {
           const itemPath = join(directoryPath, entry.name);
           if (entry.isDirectory()) await inspect(itemPath);
-          else assert(!(await readFile(itemPath, 'utf8')).includes(rawSecretForLeakScan));
+          else {
+            assert(!(await readSessionArtifact(itemPath)).includes(rawSecretForLeakScan));
+            if (/^session(?:\.v[0-9]+)?\.jsonl(?:\.zstd)?$/.test(entry.name))
+              inspectedSessionLog = true;
+          }
         }
       };
       await inspect(runtime.nativeLogRoot);
+      assert(inspectedSessionLog, 'Live leak scan did not inspect a native Session log');
     }
     console.log(
       JSON.stringify({

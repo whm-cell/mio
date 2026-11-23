@@ -26,6 +26,12 @@ import { chatTransport, isChatContextOverflow } from '../integrations/onelink/ch
 import type { ChatResponseFacts } from '../integrations/onelink/chat.ts';
 import { prepareVisionRequest, visionAttachmentStore } from './vision-request.ts';
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface LlmRequestPurposeMap {
+    compaction: true;
+  }
+}
+
 const retryPolicy = resolveRetryPolicy({ mode: 'normal', maxRetries: 0 }, 'Mio OneLink');
 const noCredentials: CredentialStore = {
   read: async () => undefined,
@@ -72,7 +78,7 @@ function protocolProfile(profile: ChatProfile) {
 export const onelinkRoute = (selection: ChatSelection) =>
   protocolProfile(selection.protocol).provider;
 
-function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
+export function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
   const maxTokens = snapshot.maxOutputTokens ?? 1024;
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 65536)
     throw new LlmError('OneLink maxOutputTokens is invalid', 'BINDING_REQUIRED');
@@ -249,6 +255,31 @@ export class OneLinkAdapter extends LlmAdapter {
     this.vision = vision;
   }
   private readonly bindings = new WeakMap<AbortSignal, ConversationRun>();
+  private readonly compactionGrants = new WeakMap<
+    AbortSignal,
+    { run: ConversationRun; used: boolean }
+  >();
+
+  async withCompaction<T>(
+    signal: AbortSignal,
+    run: ConversationRun,
+    dispatch: () => Promise<T>,
+  ): Promise<T> {
+    signal.throwIfAborted();
+    if (
+      this.bindings.get(signal) !== run ||
+      run.snapshot.contextWindow === undefined ||
+      this.compactionGrants.has(signal)
+    )
+      throw new LlmError('OneLink summary has no trusted binding', 'BINDING_REQUIRED');
+    this.compactionGrants.set(signal, { run, used: false });
+    try {
+      return await dispatch();
+    } finally {
+      this.compactionGrants.delete(signal);
+    }
+  }
+
   bind(signal: AbortSignal, run: ConversationRun): () => void {
     const old = this.bindings.get(signal);
     if (old && old !== run) throw new LlmError('OneLink binding conflict', 'BINDING_CONFLICT');
@@ -308,12 +339,23 @@ export class OneLinkAdapter extends LlmAdapter {
     execution: { started: boolean },
   ): AsyncIterable<StreamChunk> {
     const maxTokens = snapshotMaxTokens(run.snapshot);
+    const grant = options.purpose === 'compaction' ? this.compactionGrants.get(signal) : undefined;
     if (
       this.bindings.get(signal) !== run ||
       options.signal !== signal ||
       signal.aborted ||
       options.sessionId !== run.dshSessionId ||
-      options.purpose !== undefined ||
+      (options.purpose !== undefined &&
+        (!grant ||
+          grant.run !== run ||
+          grant.used ||
+          options.toolHistory !== undefined ||
+          Boolean(options.tools?.length) ||
+          options.messages.some(
+            (message) =>
+              (message.role !== 'system' && message.role !== 'user') ||
+              message.content.some((block) => block.type !== 'text'),
+          ))) ||
       options.provider !== onelinkRoute(run.snapshot) ||
       options.model !== run.snapshot.modelId ||
       !options.maxTokens ||
@@ -326,6 +368,7 @@ export class OneLinkAdapter extends LlmAdapter {
         (!run.snapshot.inputModalities?.includes('image') || !this.vision))
     )
       throw new LlmError('OneLink request does not match its binding', 'BINDING_REQUIRED');
+    if (grant) grant.used = true;
     let usage: ModelObservation['usage'];
     let failureCode: string | undefined;
     let observed = false;
@@ -337,6 +380,7 @@ export class OneLinkAdapter extends LlmAdapter {
         ...(status !== undefined ? { status } : {}),
         ...(providerRequestId !== undefined ? { providerRequestId } : {}),
         finish,
+        ...(grant ? { purpose: 'compaction' as const } : {}),
         ...(failureCode ? { failureCode } : {}),
       };
       // DSH can report cached input with both uncached input and output at zero.

@@ -27,10 +27,10 @@
       config:
         agents: []
     - id: sessions
-      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+      name: '@mio/plugin/session-persistence'
       config:
-        root: !!js dshHomePath('sessions')
-        compression: none
+        legacyRoot: !!js dshHomePath('sessions')
+        compressedRoot: !!js dshHomePath('sessions-zstd')
     - id: mio-kernel
       name: '@mio/plugin/kernel'
     - id: webserver

@@ -42,6 +42,12 @@ export interface ConversationArchive {
   id: string;
   archivedAt: string;
 }
+export interface ContextUsage {
+  estimatedTokens: number;
+  contextWindow: number | null;
+  compacted: boolean;
+}
+export type CaptureContextUsage = (read: () => ContextUsage) => void;
 export interface ModelObservation {
   readonly status?: number;
   readonly providerRequestId?: string;
@@ -56,6 +62,7 @@ export interface ModelObservation {
   readonly usageStatus?: 'reported' | 'partial' | 'unknown';
   readonly finish: string;
   readonly failureCode?: string;
+  readonly purpose?: 'compaction';
 }
 export interface ConversationRun {
   readonly userId: string;
@@ -77,6 +84,7 @@ export interface ConversationSnapshot {
   conversationId: string;
   activeRequestId: string | null;
   receipt: Receipt | null;
+  contextUsage?: ContextUsage;
 }
 /** Serializable image identity; binary content and private object keys stay outside history. */
 export interface ConversationImageReference {
@@ -202,13 +210,20 @@ export type ConversationEvent =
       tool: ConversationImageToolName;
       job: ConversationImageJobView;
     }
-  | { type: 'state'; receipt: Receipt }
+  | { type: 'state'; receipt: Receipt; contextUsage?: ContextUsage }
   | { type: 'error'; code: string };
 export interface ConversationEngine {
   readonly available: boolean;
   create(id: string, selection?: ChatSelection): Promise<void>;
   rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
+  contextUsage?(id: string, signal?: AbortSignal): Promise<ContextUsage>;
+  compact?(
+    id: string,
+    binding: ConversationRun,
+    signal: AbortSignal,
+    captureContextUsage?: CaptureContextUsage,
+  ): Promise<ConversationRunResult>;
   run(
     id: string,
     requestId: string,
@@ -218,6 +233,7 @@ export interface ConversationEngine {
     binding?: ConversationRun,
     images?: readonly ConversationImageReference[],
     admitted?: (eventTimeMs: number, autoTitle?: string) => Promise<void>,
+    captureContextUsage?: CaptureContextUsage,
   ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;

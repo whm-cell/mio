@@ -140,7 +140,7 @@ export async function packedAuthRuntime(
   };
   return {
     origin,
-    nativeLogRoot: join(home, 'sessions'),
+    nativeLogRoots: [join(home, 'sessions'), join(home, 'sessions-zstd')] as const,
     async blockVisionHistory() {
       await writeFile(join(directory, 'model-fixture/block-history'), 'block');
     },

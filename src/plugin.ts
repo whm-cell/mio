@@ -34,6 +34,8 @@ import { applyConversationPolicies } from './dsh/conversation-checkpoints.ts';
 import { installConversationTitles } from './dsh/conversation-titles.ts';
 import { createConversationVision } from './dsh/vision.ts';
 import * as imageOffload from '@deepseek-ai/dsh-compaction-image-offload';
+import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner';
+import TokenMeter from '@deepseek-ai/dsh-token-meter';
 import { readProviderConfig } from './providers/config.ts';
 import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
@@ -72,6 +74,11 @@ import { createAdminHandler } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
+
+class ConversationTokenMeter extends TokenMeter {
+  // The parent retains sessionProjections until its conversation work drains.
+  static override inject = [];
+}
 
 const AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
@@ -426,9 +433,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           // shutting down, before the parent has drained history and active turns.
           const policies = conversationCtx.plugin({
             name: 'mio-conversation-policies',
-            apply(policyCtx: Context) {
+            async apply(policyCtx: Context) {
               applyConversationPolicies(policyCtx);
               imageOffload.apply(policyCtx);
+              await Promise.all([
+                policyCtx.plugin(ConversationTokenMeter),
+                policyCtx.plugin(ToolResultPruner),
+              ]);
             },
           });
           const titles = installConversationTitles(conversationCtx);

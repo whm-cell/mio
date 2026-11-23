@@ -86,6 +86,18 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
 
+## POST /api/v1/conversations/:id/compact
+
+身份：当前登录用户与对话 owner。
+
+输入：`{"requestId":"compact-1"}`。同一会话的压缩和消息共用 requestId 命名空间。重放同一操作返回原回执。已归档会话仍可重放已受理压缩的回执。
+
+成功：202 `{conversationId,requestId,status,error?}`。客户端用原请求 GET 回执或已连接的 SSE 观察结算。手动压缩没有新的人工输入，直接从 `accepted` 进入终态。当前无可压缩前缀时以 `completed` 结算，实际模型调用为零。
+
+错误：新请求需要空闲且未归档的会话。已有活动请求、未知会话状态或归档分别返回 409 `CONVERSATION_BUSY`、`CONVERSATION_UNKNOWN` 或 `CONVERSATION_ARCHIVED`。复用消息请求的 ID 返回 409 `REQUEST_ID_CONFLICT`。无受支持的 BYOK 压缩路由或路由未声明正整数上下文窗口时返回 409 `CONVERSATION_COMPACTION_UNSUPPORTED`。已绑定路由的当前 BYOK 资格或凭据不可用时沿本域共同约定返回错误。接收未知时按原 requestId 查询。
+
+副作用：摘要使用当前用户在此会话的同一模型，最多发起一次模型调用。该请求的内部摘要和实际用量记录分别保留于原生会话日志和 PG 回执审计。公开历史、标题和活跃时间沿既有会话语义。取消及重启恢复使用同一活动请求和回执。
+
 ## PUT /api/v1/conversations/:id/model
 
 身份：当前登录用户与对话 owner。
@@ -119,7 +131,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 | `TURN_STEP_BUDGET_EXCEEDED` | 继续执行将超过本轮模型步数上限             |
 | `MODEL_FAILED`              | 其他未细分的明确失败，也是兼容的历史错误码 |
 
-已取消或无法证明结算的请求沿实际状态返回。客户端可按原 requestId 查询，和 SSE `state` 或 `snapshot` 中的同一回执核对。普通模型错误不会自动重发，服务不返回供应商响应原文或凭据。
+已取消或无法证明结算的请求沿实际状态返回。客户端可按原 requestId 查询，和 SSE `state` 或 `snapshot` 中的同一回执核对。普通模型错误不会自动重发。收到明确的上游上下文超限时，启用摘要的轮次最多执行一次摘要和一次正文重发，三次实际出站观察都归原请求。再次超限返回 `MODEL_CONTEXT_OVERFLOW`。服务不返回供应商响应原文或凭据。
 
 输出截断的已结算回执为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。该标记仅来自实际原生轮次终态及持久化确认，正文可从历史读取。普通结算及旧回执省略该字段。
 
@@ -133,7 +145,9 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+
+水位 `{estimatedTokens,contextWindow,compacted}` 在可估算时随 snapshot 与正常轮次或手动压缩的结算状态返回。用 `contextWindow: null` 表示尚无适用的路由窗口，`compacted: true` 表示上下文含已持久化的压缩检查点。估算无法取得时省略该字段，回执照常返回。估算读取在本地完成，公开字段不含提示词、摘要、凭据或原始工具输出。
 
 截断轮次完成后，state 中的回执带 `truncation`。如果该请求是订阅建立时的最近回执，snapshot 中也包含同一标记。已发送的 text 原样保留。
 

@@ -5,12 +5,14 @@ import { AttachmentId } from '@deepseek-ai/dsh-attachment';
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   createUserMessage,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
   INVALID_CREDENTIAL_CODE,
   LlmError,
   QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm';
 import type { UserMessage } from '@deepseek-ai/dsh-llm';
-import type { Session, TurnEndReason } from '@deepseek-ai/dsh-session';
+import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session';
+import type { Session, SessionSeq, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title';
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
@@ -21,8 +23,10 @@ import {
   outputTruncation,
 } from '../conversations/contracts.ts';
 import type {
+  CaptureContextUsage,
   ConversationEngine,
   ConversationImageTools,
+  ConversationRunResult,
   ConversationVision,
   HistoryItem,
   ModelFailure,
@@ -33,6 +37,7 @@ import {
   hasCheckpointFailure,
   trackConversationToolCheckpoints,
 } from './conversation-checkpoints.ts';
+import { ConversationCompaction, measureConversationContext } from './conversation-compaction.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
 import { authorizeConversationImageTools } from './policy.ts';
@@ -85,6 +90,10 @@ export function createDshConversationEngine(
   const tasks = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
   const onelink = config.byok ? registerOneLink(ctx, vision) : undefined;
+  const installedCompaction = ctx.get('compaction');
+  const compaction =
+    installedCompaction instanceof ConversationCompaction ? installedCompaction : undefined;
+  const meter = ctx.get('tokenMeter');
   const options = {
     ...(config.provider ? { provider: config.provider } : {}),
     ...(config.model ? { model: config.model } : {}),
@@ -113,6 +122,24 @@ export function createDshConversationEngine(
     };
     void pending.then(done, done);
     return pending;
+  }
+
+  function track<T>(id: string, work: Promise<T>): Promise<T> {
+    tasks.add(work);
+    const done = () => {
+      active.delete(id);
+      tasks.delete(work);
+    };
+    void work.then(done, done);
+    return work;
+  }
+
+  function captureUsage(
+    session: Session,
+    capture: CaptureContextUsage | undefined,
+    window?: number | null,
+  ) {
+    if (meter) capture?.(() => measureConversationContext(meter, session, window));
   }
 
   function titleService() {
@@ -169,6 +196,82 @@ export function createDshConversationEngine(
         }
       });
     },
+    ...(meter && {
+      async contextUsage(id, signal) {
+        const view = await ctx.mioKernel.readView(id, signal);
+        return measureConversationContext(meter, view);
+      },
+    }),
+    ...(compaction &&
+      meter &&
+      onelink && {
+        compact(id, binding, signal, capture) {
+          if (closing || active.has(id)) return Promise.reject(new Error('MIO_ENGINE_BUSY'));
+          if (id !== binding.dshSessionId) return Promise.reject(new Error('MIO_BINDING_REQUIRED'));
+          const window = binding.snapshot.contextWindow;
+          if (!window)
+            return Promise.reject(
+              new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_COMPACTION_UNSUPPORTED'),
+            );
+          const entry: ActiveRequest = {
+            opening: inSessionOrder(id, () =>
+              ctx.mioKernel.resume(id, selectedOptions(binding.snapshot)),
+            ),
+            requestId: binding.requestId,
+          };
+          active.set(id, entry);
+          return track(
+            id,
+            (async (): Promise<ConversationRunResult> => {
+              const handle = await entry.opening;
+              const { agent } = handle;
+              let observationFailed = false;
+              const bound = {
+                ...binding,
+                observe: async (observation: Parameters<typeof binding.observe>[0]) => {
+                  try {
+                    await binding.observe(observation);
+                  } catch {
+                    observationFailed = true;
+                    throw new Error('MIO_OBSERVATION_UNKNOWN');
+                  }
+                },
+              };
+              const stop = () =>
+                entry.stop === 'user'
+                  ? 'cancelled'
+                  : signal.aborted || entry.stop
+                    ? 'unknown'
+                    : undefined;
+              try {
+                const before = stop();
+                if (before) return before;
+                await compaction.withRequest(
+                  agent,
+                  signal,
+                  {
+                    binding: bound,
+                    adapter: onelink,
+                    budget: { used: false },
+                  },
+                  () => compaction.compactNow(agent, signal),
+                );
+                captureUsage(agent.session, capture, window);
+                return 'completed';
+              } catch (error) {
+                if (observationFailed || hasCheckpointFailure(agent.session)) return 'unknown';
+                const stopped = stop();
+                if (stopped) return stopped;
+                const failure = error instanceof LlmError && publicModelFailure(error.code);
+                return failure ? { status: 'failed', error: failure } : 'failed';
+              } finally {
+                entry.disposing = true;
+                await inSessionOrder(id, () => handle.dispose());
+              }
+            })(),
+          );
+        },
+      }),
     async history(id, afterSeq, limit, signal) {
       const { events } = await ctx.mioKernel.history(id, signal);
       const items: HistoryItem[] = [];
@@ -206,7 +309,11 @@ export function createDshConversationEngine(
               ...(event.data.interrupted ? { interrupted: true } : {}),
             });
         }
-        if (event.type === 'tool/result' && !event.data.message.isError) {
+        if (
+          event.type === 'tool/result' &&
+          isAppendSurfaceEvent(event) &&
+          !event.data.message.isError
+        ) {
           const projected = parseImageJobPresentationMeta(event.data.meta);
           if (projected)
             items.push({ seq: event.seq, role: 'tool', tool: projected.tool, job: projected.job });
@@ -240,7 +347,7 @@ export function createDshConversationEngine(
         hasMore: items.length > limit,
       };
     },
-    run(id, requestId, text, durable, emit, binding, images = [], admitted) {
+    run(id, requestId, text, durable, emit, binding, images = [], admitted, capture) {
       if (closing || active.has(id)) return Promise.reject(new Error('MIO_ENGINE_BUSY'));
       if (
         config.byok &&
@@ -259,7 +366,8 @@ export function createDshConversationEngine(
             observe: async (observation: Parameters<typeof binding.observe>[0]) => {
               try {
                 await binding.observe(observation);
-                observedFailureCode = observation.failureCode;
+                if (observation.purpose !== 'compaction')
+                  observedFailureCode = observation.failureCode;
               } catch {
                 observationFailed = true;
                 throw new Error('MIO_OBSERVATION_UNKNOWN');
@@ -272,15 +380,21 @@ export function createDshConversationEngine(
       let revokeImageTools: (() => void) | undefined;
       const humanInput = Promise.withResolvers<number>();
       let submittedId: UserMessage['id'] | undefined;
+      let inputSeq: SessionSeq | undefined;
+      const compactionBudget = { used: false };
       const resume = () =>
         ctx.mioKernel.resume(id, runOptions, (agentCtx, agent) => {
           const oldNodes = new Set(agent.session.surface.nodes);
           oldImageCount = () => {
             let count = 0;
             for (const seq of agent.session.surface.nodes) {
-              if (!oldNodes.has(seq)) continue;
               const event = agent.session.eventAt(seq);
               if (!event || (event.type !== 'user/message' && event.type !== 'tool/result'))
+                continue;
+              if (
+                !oldNodes.has(seq) &&
+                !event.sourceEventSeqs?.some((source) => oldNodes.has(source))
+              )
                 continue;
               count += (agent.session.deriveEventMessage(event)?.content ?? []).filter(
                 (block) => block.type === 'image' && block.offloaded !== true,
@@ -321,7 +435,28 @@ export function createDshConversationEngine(
             }
             if (inspection) registerVisionTool(agentCtx, observedBinding, vision!);
           }
-          agentCtx.on('agent/pre-step', (payload, next) => {
+          const compactStep =
+            compaction && onelink && observedBinding
+              ? (
+                  trigger: 'pressure' | 'context-overflow',
+                  turn: number,
+                  step: number,
+                  signal: AbortSignal,
+                  pending: readonly UserMessage[],
+                ) =>
+                  compaction.withRequest(
+                    agent,
+                    signal,
+                    {
+                      binding: observedBinding,
+                      adapter: onelink,
+                      budget: compactionBudget,
+                      turn: { number: turn, firstStep: step === 1, pending, inputSeq },
+                    },
+                    () => compaction.compactIfNeeded(agent, trigger, signal),
+                  )
+              : undefined;
+          agentCtx.on('agent/pre-step', async (payload, next) => {
             if (payload.step > MAX_TURN_STEPS) {
               throw new LlmError(
                 `Conversation turn exceeded ${MAX_TURN_STEPS} steps`,
@@ -355,10 +490,44 @@ export function createDshConversationEngine(
                 payload.modelSelection.model !== observedBinding.snapshot.modelId
               )
                 throw new Error('MIO_BINDING_MISMATCH');
-              releases.set(payload.signal, onelink.bind(payload.signal, observedBinding));
+              if (!releases.has(payload.signal))
+                releases.set(payload.signal, onelink.bind(payload.signal, observedBinding));
             }
+            await compactStep?.(
+              'pressure',
+              payload.turn,
+              payload.step,
+              payload.signal,
+              payload.messages,
+            );
             return next();
           });
+          if (compactStep) {
+            agentCtx.on(
+              'agent/request-error',
+              async (payload, next) => {
+                // Native image offload is a local pre-transport correction.
+                if (payload.failure.code === IMAGE_OFFLOAD_REQUIRED_CODE) return next();
+                if (
+                  payload.failure.code !== 'CONTEXT_OVERFLOW' ||
+                  payload.signal.aborted ||
+                  !observedBinding?.snapshot.contextWindow ||
+                  observationFailed ||
+                  compactionBudget.used
+                )
+                  return;
+                const result = await compactStep(
+                  'context-overflow',
+                  payload.turn,
+                  payload.step,
+                  payload.signal,
+                  [],
+                );
+                if (result && !payload.signal.aborted) return { kind: 'retry' };
+              },
+              { prepend: true },
+            );
+          }
           agentCtx.on('agent/assistant-stream', ({ frame }) => {
             if (frame.type === 'chunk' && frame.chunk.type === 'text-delta')
               emit({ type: 'text', requestId, text: frame.chunk.text });
@@ -369,8 +538,10 @@ export function createDshConversationEngine(
               event.type === 'user/message' &&
               event.data.source.kind === 'user' &&
               event.data.id === submittedId
-            )
+            ) {
+              inputSeq = event.seq;
               humanInput.resolve(event.time);
+            }
             if (event.type === 'turn/end') end = event.data.reason;
           });
         });
@@ -420,6 +591,11 @@ export function createDshConversationEngine(
           await ctx.mioKernel.flush(handle.agent.session);
           if (observationFailed || hasCheckpointFailure(handle.agent.session))
             return 'unknown' as const;
+          captureUsage(
+            handle.agent.session,
+            capture,
+            binding ? (binding.snapshot.contextWindow ?? null) : undefined,
+          );
           // A disposed session can leave only a durable prefix, with no turn/end
           // event. Cold replay then reports interruption, not a definite failure.
           if (!end || end.kind === 'interrupted') return 'unknown' as const;
@@ -441,13 +617,7 @@ export function createDshConversationEngine(
           }
         }
       })();
-      tasks.add(running);
-      const done = () => {
-        active.delete(id);
-        tasks.delete(running);
-      };
-      void running.then(done, done);
-      return running;
+      return track(id, running);
     },
     async cancel(id, requestId) {
       const entry = active.get(id);

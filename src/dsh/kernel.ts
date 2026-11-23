@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { AgentHandle, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-agent-loop';
 import { Session, SessionId } from '@deepseek-ai/dsh-session';
-import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session';
+import type { SessionEvent, SessionHeader, SessionLogOffset } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-persistence';
 import { readColdSessionLog } from '@deepseek-ai/dsh-session-query';
 import { denyModelTools } from './policy.ts';
@@ -12,6 +12,13 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     mioKernel: MioKernel;
   }
+}
+
+interface StoredHistory {
+  header: SessionHeader;
+  events: readonly SessionEvent[];
+  inheritedEventCount: SessionLogOffset;
+  view?: Session;
 }
 
 /** Owned public DSH handles; the official driver remains the only Agent loop. */
@@ -65,6 +72,19 @@ export default class MioKernel extends Service {
     id: string,
     signal?: AbortSignal,
   ): Promise<{ header: SessionHeader; events: readonly SessionEvent[] }> {
+    const { header, events } = await this.readHistory(id, signal);
+    return { header, events };
+  }
+
+  /** A detached replay for trusted internal projections through the persisted prefix. */
+  async readView(id: string, signal?: AbortSignal): Promise<Session> {
+    const history = await this.readHistory(id, signal);
+    const view = history.view ?? this.replay(SessionId(id), history);
+    signal?.throwIfAborted();
+    return view;
+  }
+
+  private async readHistory(id: string, signal?: AbortSignal): Promise<StoredHistory> {
     signal?.throwIfAborted();
     const live = this.ctx.sessions.get(SessionId(id));
     if (live) {
@@ -75,7 +95,11 @@ export default class MioKernel extends Service {
       try {
         const { events } = await reader.read(0, undefined, options);
         signal?.throwIfAborted();
-        return { header: reader.header, events };
+        return {
+          header: reader.header,
+          events,
+          inheritedEventCount: reader.inheritedEventCount,
+        };
       } finally {
         await reader.close();
       }
@@ -83,17 +107,21 @@ export default class MioKernel extends Service {
     const stored = await readColdSessionLog(this.ctx.sessionPersistence, SessionId(id), signal);
     signal?.throwIfAborted();
     // A concurrent resume may have attached a writer while the cold read awaited I/O.
-    if (this.ctx.sessions.get(SessionId(id))) return this.history(id, signal);
-    // Reuse the official replay validation and message projections, without publishing an Agent.
-    Session.create(
-      SessionId(id),
-      stored.events,
-      stored.header,
-      stored.inheritedEventCount,
+    if (this.ctx.sessions.get(SessionId(id))) return this.readHistory(id, signal);
+    // Validate the cold log once and reuse the detached replay when requested.
+    const view = this.replay(SessionId(id), stored);
+    signal?.throwIfAborted();
+    return { ...stored, view };
+  }
+
+  private replay(id: SessionId, { header, events, inheritedEventCount }: StoredHistory): Session {
+    return Session.create(
+      id,
+      events,
+      header,
+      inheritedEventCount,
       this.ctx.sessions.messageProjections,
     );
-    signal?.throwIfAborted();
-    return { header: stored.header, events: stored.events };
   }
 
   /** False means there is no durability listener; it must never become a persisted receipt. */

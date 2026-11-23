@@ -1,10 +1,12 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
+import { isAppendSurfaceEvent } from '@deepseek-ai/dsh-session';
 import type { Session } from '@deepseek-ai/dsh-session';
 import * as CheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy';
 import * as RepeatToolReminder from '@deepseek-ai/dsh-repeat-tool-reminder';
 import * as ToolTimeout from '@deepseek-ai/dsh-tool-call-timeout-policy';
 import type { ConversationEvent } from '../conversations/contracts.ts';
+import { ConversationCompaction } from './conversation-compaction.ts';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
 import type {} from './kernel.ts';
 
@@ -39,6 +41,7 @@ export function applyConversationPolicies(ctx: Context): void {
     },
   });
   CheckpointPolicy.apply(ctx.extend({ sessions }));
+  new ConversationCompaction(ctx, (session) => checkpoint(kernel, session));
   ToolTimeout.apply(ctx);
   RepeatToolReminder.apply(ctx, RepeatToolReminder.Config({ thresholds: [2, 4] }));
 }
@@ -62,7 +65,12 @@ export function trackConversationToolCheckpoints(
     { prepend: true },
   );
   ctx.on('session/event', (session, event) => {
-    if (session !== agent.session || event.type !== 'tool/result' || event.data.message.isError)
+    if (
+      session !== agent.session ||
+      event.type !== 'tool/result' ||
+      !isAppendSurfaceEvent(event) ||
+      event.data.message.isError
+    )
       return;
     const card = parseImageJobPresentationMeta(event.data.meta);
     if (!card) return;

@@ -4,10 +4,14 @@ import { createId } from '@mio/foundation/identifiers';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { ConversationError, isInFlightRequest, outputTruncation } from './contracts.ts';
 import type {
+  CaptureContextUsage,
+  ContextUsage,
   Conversation,
   ConversationEngine,
   ConversationEvent,
   ConversationImageReference,
+  ConversationRun,
+  ConversationRunResult,
   ConversationVision,
   Principal,
   Receipt,
@@ -21,6 +25,13 @@ import { AssetError } from '../assets/contracts.ts';
 
 const log = createLogger('app', 'conversations');
 const IMAGE_PREPARATION_CONCURRENCY = 2;
+// A separate operation in the same requestId namespace as text and vision sends.
+const COMPACTION_DIGEST = 'compact:v1';
+const publicContextUsage = ({ estimatedTokens, contextWindow, compacted }: ContextUsage) => ({
+  estimatedTokens,
+  contextWindow,
+  compacted,
+});
 
 /** Authorization and request ownership remain above the DSH adapter and below HTTP. */
 export function createConversationService(
@@ -67,6 +78,139 @@ export function createConversationService(
       if (error instanceof ProviderError) throw new ConversationError(error.status, error.code);
       throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
     }
+  };
+  const receiveInOrder = (
+    actor: Principal,
+    id: string,
+    requestId: string,
+    work: () => Promise<Receipt>,
+  ) => {
+    const ownerKey = `${actor.userId}:${id}:${requestId}`;
+    const earlier = receiving.get(ownerKey);
+    const job = admit(async () => {
+      if (earlier) await earlier.catch(() => {});
+      return work();
+    });
+    receiving.set(ownerKey, job);
+    const forget = () => {
+      if (receiving.get(ownerKey) === job) receiving.delete(ownerKey);
+    };
+    void job.then(forget, forget);
+    return job;
+  };
+  const receive = async (
+    actor: Principal,
+    id: string,
+    requestId: string,
+    digest: string,
+    resolveFresh: Parameters<ConversationStore['receive']>[4],
+  ) => {
+    try {
+      return await store.receive(actor, id, requestId, digest, resolveFresh);
+    } catch (error) {
+      if (!(error instanceof ConversationError) && !pending.has(`${id}:${requestId}`)) {
+        try {
+          await store.reconcileReception(actor, id, requestId, digest);
+        } catch {
+          store.markUnavailable();
+        }
+      }
+      throw error;
+    }
+  };
+  const bindRun = (
+    actor: Principal,
+    id: string,
+    dshSessionId: string,
+    requestId: string,
+    snapshot: ChatRuntimeSnapshot,
+  ): ConversationRun => ({
+    userId: actor.userId,
+    conversationId: id,
+    dshSessionId,
+    requestId,
+    snapshot,
+    async observe(observation) {
+      await store.observe(id, requestId, observation);
+      if (
+        observation.purpose !== 'compaction' &&
+        observation.status === 200 &&
+        ['stop', 'max-tokens'].includes(observation.finish)
+      ) {
+        // A provider verification failure cannot invalidate a durable model observation.
+        await providers!
+          .recordVerification(actor, snapshot, `${id}:${requestId}`)
+          .catch(() => log.error('PROVIDER_VERIFICATION_UNAVAILABLE'));
+      }
+    },
+  });
+  const startRequest = (
+    actor: Principal,
+    accepted: Receipt,
+    dshSessionId: string,
+    run: (captureContextUsage: CaptureContextUsage) => Promise<ConversationRunResult>,
+    settleActivity?: () => Promise<void>,
+  ) => {
+    const { conversationId: id, requestId } = accepted;
+    const key = `${id}:${requestId}`;
+    const cancelledBeforeStart = cancellations.delete(key);
+    let contextUsage: ContextUsage | undefined;
+    const capture: CaptureContextUsage = (read) => {
+      if (!listeners.get(id)?.size) return;
+      try {
+        contextUsage = publicContextUsage(read());
+      } catch {
+        // An estimate is optional and cannot change the request's outcome.
+      }
+    };
+    const publishTerminal = (receipt: Receipt) =>
+      publish(id, {
+        type: 'state',
+        receipt,
+        ...(contextUsage ? { contextUsage } : {}),
+      });
+    publish(id, { type: 'state', receipt: accepted });
+    const running = (async () => {
+      let executionEnded = false;
+      try {
+        const result = cancelledBeforeStart ? 'cancelled' : await run(capture);
+        executionEnded = true;
+        await settleActivity?.();
+        const status = typeof result === 'string' ? result : result.status;
+        const truncated = status === outputTruncation.reason;
+        const error =
+          typeof result !== 'string'
+            ? result.error
+            : status === 'failed'
+              ? 'MODEL_FAILED'
+              : status === 'unknown'
+                ? 'PROCESS_INTERRUPTED'
+                : undefined;
+        publishTerminal(
+          await store.finish(
+            id,
+            requestId,
+            truncated ? 'completed' : status,
+            error,
+            truncated ? outputTruncation.reason : undefined,
+          ),
+        );
+      } catch {
+        if (!executionEnded) await engine.cancel(dshSessionId, requestId).catch(() => {});
+        await settleActivity?.();
+        try {
+          publishTerminal(await store.reconcileExecution(actor, id, requestId));
+        } catch {
+          store.markUnavailable();
+          publish(id, { type: 'error', code: 'CONVERSATION_UNAVAILABLE' });
+        }
+      } finally {
+        cancellations.delete(key);
+      }
+    })();
+    pending.set(key, running);
+    void running.finally(() => pending.delete(key));
+    return accepted;
   };
   return {
     create(actor: Principal, modelRef?: string): Promise<Conversation> {
@@ -127,6 +271,33 @@ export function createConversationService(
         return engine.history(row.dsh_session_id, after, limit, stopped);
       });
     },
+    compact(actor: Principal, id: string, requestId: string) {
+      return receiveInOrder(actor, id, requestId, async () => {
+        const received = await receive(actor, id, requestId, COMPACTION_DIGEST, async (row) => {
+          if (!engine.compact || !providers || !row.model_binding)
+            throw new ConversationError(
+              HTTP_STATUS.CONFLICT,
+              'CONVERSATION_COMPACTION_UNSUPPORTED',
+            );
+          const snapshot = await providerAction(() =>
+            providers.resolveChat(actor, row.model_binding!),
+          );
+          const window = snapshot.contextWindow;
+          if (window === undefined || !Number.isSafeInteger(window) || window < 1)
+            throw new ConversationError(
+              HTTP_STATUS.CONFLICT,
+              'CONVERSATION_COMPACTION_UNSUPPORTED',
+            );
+          return snapshot;
+        });
+        if (!received.fresh) return received.receipt;
+        const nativeId = received.row.dsh_session_id;
+        const binding = bindRun(actor, id, nativeId, requestId, received.snapshot!);
+        return startRequest(actor, received.receipt, nativeId, (capture) =>
+          engine.compact!(nativeId, binding, admissionStop.signal, capture),
+        );
+      });
+    },
     send(
       actor: Principal,
       id: string,
@@ -134,16 +305,11 @@ export function createConversationService(
       text: string,
       imageAssetIds: string[] = [],
     ) {
-      check();
-      const key = `${id}:${requestId}`;
-      const ownerKey = `${actor.userId}:${key}`;
       const ids = [...imageAssetIds];
       const digest = ids.length
         ? `vision:v1:${sha256Utf8(JSON.stringify([text, ids]))}`
         : sha256Utf8(text);
-      const earlier = receiving.get(ownerKey);
-      const job = admit(async () => {
-        if (earlier) await earlier.catch(() => {});
+      return receiveInOrder(actor, id, requestId, async () => {
         const images: ConversationImageReference[] = [];
         let preflight: ChatRuntimeSnapshot | undefined;
         if (ids.length) {
@@ -194,149 +360,71 @@ export function createConversationService(
             preparingImages--;
           }
         }
-        let received;
-        try {
-          received = await store.receive(actor, id, requestId, digest, async (row) => {
-            if (providers) {
-              if (!row.model_binding)
-                throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
-              const snapshot = await providerAction(() =>
-                providers.resolveChat(actor, row.model_binding!),
-              );
-              if (images.length && !snapshot.inputModalities?.includes('image'))
-                throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-              if (
-                preflight &&
-                (snapshot.providerConfigId !== preflight.providerConfigId ||
-                  snapshot.modelId !== preflight.modelId ||
-                  snapshot.adaptationVersion !== preflight.adaptationVersion ||
-                  JSON.stringify(snapshot.imageBudget) !== JSON.stringify(preflight.imageBudget))
-              )
-                throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
-              return snapshot;
-            }
-            if (images.length)
+        const received = await receive(actor, id, requestId, digest, async (row) => {
+          if (providers) {
+            if (!row.model_binding)
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_MODEL_REQUIRED');
+            const snapshot = await providerAction(() =>
+              providers.resolveChat(actor, row.model_binding!),
+            );
+            if (images.length && !snapshot.inputModalities?.includes('image'))
               throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
-            if (row.model_binding || !engine.available)
-              throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
-            return undefined;
-          });
-        } catch (error) {
-          if (!(error instanceof ConversationError) && !pending.has(key)) {
-            try {
-              await store.reconcileReception(actor, id, requestId, digest);
-            } catch {
-              store.markUnavailable();
-            }
+            if (
+              preflight &&
+              (snapshot.providerConfigId !== preflight.providerConfigId ||
+                snapshot.modelId !== preflight.modelId ||
+                snapshot.adaptationVersion !== preflight.adaptationVersion ||
+                JSON.stringify(snapshot.imageBudget) !== JSON.stringify(preflight.imageBudget))
+            )
+              throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_VISION_CHANGED');
+            return snapshot;
           }
-          throw error;
-        }
+          if (images.length)
+            throw new ConversationError(HTTP_STATUS.CONFLICT, 'MODEL_MODALITY_UNSUPPORTED');
+          if (row.model_binding || !engine.available)
+            throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MODEL_UNAVAILABLE');
+          return undefined;
+        });
         if (!received.fresh) return received.receipt;
-        const cancelledBeforeStart = cancellations.delete(key);
-        publish(id, { type: 'state', receipt: received.receipt });
-        const running = (async () => {
-          let executionEnded = false;
-          let retryActivity: (() => Promise<void>) | undefined;
-          const settleActivity = async () => {
+        const nativeId = received.row.dsh_session_id;
+        let retryActivity: (() => Promise<void>) | undefined;
+        return startRequest(
+          actor,
+          received.receipt,
+          nativeId,
+          (capture) =>
+            engine.run(
+              nativeId,
+              requestId,
+              text,
+              async () => {
+                await store.inputPersisted(id, requestId);
+                publish(id, {
+                  type: 'state',
+                  receipt: { conversationId: id, requestId, status: 'input-persisted' },
+                });
+              },
+              (event) => publish(id, event),
+              received.snapshot
+                ? bindRun(actor, id, nativeId, requestId, received.snapshot)
+                : undefined,
+              images,
+              (eventTimeMs, autoTitle) => {
+                const project = () => store.inputAdmitted(id, requestId, eventTimeMs, autoTitle);
+                return project().catch(() => {
+                  // Retain the persisted event for one retry before releasing the active request.
+                  retryActivity = project;
+                });
+              },
+              capture,
+            ),
+          async () => {
             const retry = retryActivity;
             retryActivity = undefined;
             await retry?.().catch(() => log.error('CONVERSATION_ACTIVITY_UNAVAILABLE'));
-          };
-          try {
-            const result = cancelledBeforeStart
-              ? 'cancelled'
-              : await engine.run(
-                  received.row.dsh_session_id,
-                  requestId,
-                  text,
-                  async () => {
-                    await store.inputPersisted(id, requestId);
-                    publish(id, {
-                      type: 'state',
-                      receipt: { conversationId: id, requestId, status: 'input-persisted' },
-                    });
-                  },
-                  (event) => publish(id, event),
-                  received.snapshot
-                    ? {
-                        userId: actor.userId,
-                        conversationId: id,
-                        dshSessionId: received.row.dsh_session_id,
-                        requestId,
-                        snapshot: received.snapshot,
-                        observe: async (observation) => {
-                          await store.observe(id, requestId, observation);
-                          if (
-                            observation.status === 200 &&
-                            ['stop', 'max-tokens'].includes(observation.finish)
-                          ) {
-                            // The durable request observation remains authoritative if the separate provider DB is unavailable.
-                            await providers!
-                              .recordVerification(actor, received.snapshot!, `${id}:${requestId}`)
-                              .catch(() => log.error('PROVIDER_VERIFICATION_UNAVAILABLE'));
-                          }
-                        },
-                      }
-                    : undefined,
-                  images,
-                  (eventTimeMs, autoTitle) => {
-                    const project = () =>
-                      store.inputAdmitted(id, requestId, eventTimeMs, autoTitle);
-                    return project().catch(() => {
-                      // Retain the persisted event for one retry before releasing the active request.
-                      retryActivity = project;
-                    });
-                  },
-                );
-            executionEnded = true;
-            await settleActivity();
-            const status = typeof result === 'string' ? result : result.status;
-            const truncated = status === outputTruncation.reason;
-            const error =
-              typeof result !== 'string'
-                ? result.error
-                : status === 'failed'
-                  ? 'MODEL_FAILED'
-                  : status === 'unknown'
-                    ? 'PROCESS_INTERRUPTED'
-                    : undefined;
-            publish(id, {
-              type: 'state',
-              receipt: await store.finish(
-                id,
-                requestId,
-                truncated ? 'completed' : status,
-                error,
-                truncated ? outputTruncation.reason : undefined,
-              ),
-            });
-          } catch {
-            if (!executionEnded)
-              await engine.cancel(received.row.dsh_session_id, requestId).catch(() => {});
-            await settleActivity();
-            try {
-              publish(id, {
-                type: 'state',
-                receipt: await store.reconcileExecution(actor, id, requestId),
-              });
-            } catch {
-              store.markUnavailable();
-              publish(id, { type: 'error', code: 'CONVERSATION_UNAVAILABLE' });
-            }
-          } finally {
-            cancellations.delete(key);
-          }
-        })();
-        pending.set(key, running);
-        void running.finally(() => pending.delete(key));
-        return received.receipt;
+          },
+        );
       });
-      receiving.set(ownerKey, job);
-      const forget = () => {
-        if (receiving.get(ownerKey) === job) receiving.delete(ownerKey);
-      };
-      void job.then(forget, forget);
-      return job;
     },
     async cancel(actor: Principal, id: string) {
       check();
@@ -360,7 +448,7 @@ export function createConversationService(
     ) {
       check();
       signal?.throwIfAborted();
-      await store.owned(actor, id);
+      const row = await store.owned(actor, id);
       signal?.throwIfAborted();
       check();
       let group = listeners.get(id);
@@ -379,6 +467,14 @@ export function createConversationService(
         const snapshot = await store.snapshot(actor, id);
         signal?.throwIfAborted();
         check();
+        if (engine.contextUsage && row.state === 'ready') {
+          const usage = await engine
+            .contextUsage(row.dsh_session_id, signal)
+            .catch(() => undefined);
+          signal?.throwIfAborted();
+          check();
+          if (usage) snapshot.contextUsage = publicContextUsage(usage);
+        }
         return { snapshot, close };
       } catch (error) {
         close();

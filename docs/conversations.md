@@ -1,6 +1,6 @@
 # 本地对话服务
 
-本地服务只接收测试账号和测试内容。生产部署验收仍待完成。实际接受范围、候选和限制见[成果入口](tasks/conversation-service/complete/report.md)，真实文本观察按实际候选和协议分别记录。真实用户内容保留、物理清除与上线容量另定。需求与开发安排见[对话 PRD](tasks/conversation-service/prd.md)和[对话增强 PRD](tasks/conversation-enhancement/prd.md)，公开协议见[对话 HTTP](apis/conversations.md)。
+本地服务只接收测试账号和测试内容。生产部署验收仍待完成。接受范围、候选和限制见[原对话成果](tasks/conversation-service/complete/report.md)及[多轮增强成果](tasks/conversation-enhancement/complete/report.md)，真实文本观察按实际候选和协议分别记录。真实用户内容保留、物理清除与上线容量另定。需求与开发安排见[对话 PRD](tasks/conversation-service/prd.md)和[对话增强 PRD](tasks/conversation-enhancement/prd.md)，公开协议见[对话 HTTP](apis/conversations.md)。
 
 ## 配置与迁移
 
@@ -35,13 +35,13 @@ pnpm start:dev
 
 应用服务接收认证解析的 `{userId,sessionId}`，每次经 owner 条件查对话。客户端不能自授 owner、DSH ID 或工具权限。conversationId、登录 sessionId 和内部 dshSessionId 各有职责，不混用。
 
-PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与接收/结算状态，不保存第二份消息正文；正文以 DSH 原生日志为权威。先保存 creating 映射，再创建并 flush 原生 Session，最后标 ready；失败映射保持 unknown，可从所属用户列表定位，不伪报已持久创建。
+PostgreSQL 保存归属、创建状态、request ID、请求摘要与接收/结算状态，正文以 DSH 原生日志为权威。消息使用内容摘要，手动压缩在同一 request ID 命名空间使用独立操作标记。先保存 creating 映射，再创建并 flush 原生 Session，最后标 ready；失败映射保持 unknown，可从所属用户列表定位，不伪报已持久创建。
 
 模型出站前、顶层工具执行前及进入下一步之前，必须确认相应原生日志前缀已落盘。有效图片任务结果先补充 flush，再向 SSE 发布卡片，下一步等待这个检查点。检查点失败后阻止该轮尚未开始的工具或模型派发，按未知结算。冷读可以恢复已落盘的卡片和文本。生图提交和 DSH 日志分属不同持久层，任务已受理但结果尚未形成或落盘时，卡片可能缺失。恢复沿原对话和请求身份查询，服务不重放输入、工具或计费调用。[DSH 集成](integrations/dsh.md#必须遵守的约束)
 
 显式增量迁移保留可空对话模型绑定、可空请求绑定和观察数组；旧行不从环境回填、不删除旧回执。fresh 请求保存配置 ID/revision、modelKey、精确 modelRef/modelId、credentialVersion/catalogVersion/adaptationVersion（取平台路由 `declaration_version`）、operation/profile，兼容保留 protocol/capabilityVersion；owner/内部 Session 沿对话取得。Key 只在运行内存，不能序列化整个快照。多步工具轮次（如 `tool-calls -> stop`）按步向 `model_observations` 追加受控 HTTP status、provider request ID、token usage/已知程度、finish 和稳定 failureCode。模型错误结算取本轮最后一步已持久观察的有效分类，或官方轮次终态中的已知错误码，使用公开脱敏码。无法细分的明确失败沿用 `MODEL_FAILED`，历史回执继续按原错误码读取。观察落库失败结算 unknown。普通上游故障不会自动重发计费模型请求。[对话回执](apis/conversations.md#get-apiv1conversationsidrequestsrequestid)
 
-仅当步骤达到 `status === 200` 且 `finish` 为 `stop` 或 `max-tokens` 时，才把该用户本人 `mio_provider_model_verifications` 在对应当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组下标记为 `verified`，不改动平台路由或他人验证状态，旧运行晚到不能覆盖新验证。独立供应商验证标记失败保留已持久请求观察。
+仅当正文调用达到 `status === 200` 且 `finish` 为 `stop` 或 `max-tokens` 时，才把该用户本人 `mio_provider_model_verifications` 在对应当前 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组下标记为 `verified`，不改动平台路由或他人验证状态，旧运行晚到不能覆盖新验证。独立供应商验证标记失败保留已持久请求观察。
 
 当 BYOK、`assets` 与显式启用的 A `generations` 同时就绪时，插件向对话引擎注入窄桥接 `ConversationImageTools`（对话契约层不导入 DSH 或生成模块内部实现），仅在活动轮次的 `agentCtx.tools` 开放三个受控意图级生图工具：只读不解密的 `list_image_models`、异步/同步非阻塞受理的 `submit_image_job`（自动为 `requiresAsync: true` 路由补齐 `async: true`，按路由 `supportedOperations` 与 `allowGenerateReferences` 归一化参考图操作模式，并以 `sha256Utf8("mio:conv-image:v1:${userId}:${conversationId}:${turnRequestId}:${clientOperationKey ?? exec.callId}")` 派生确定性 UUID v4 `requestId` 交 `GenerationService.createImage` 幂等去重）以及先经 `isUuidV4` 校验的 `get_image_job`。工具严禁接收 `apiKey`、`userId`、裸 URL、Base64、COS 键或未知字段，单轮受 12 次总调用、4 次图片提交与 8 步硬熔断（`TURN_STEP_BUDGET_EXCEEDED`）约束；单轮内对尚未达到终态（`accepted`、`submitted`、`processing`、`materializing`）的同轮新建任务或本轮已查得非终态的同任务重复调用 `get_image_job` 会被以 `IMAGE_JOB_POLL_DEFERRED` 拦截（不产生重复卡片），跨轮对前序 `jobId` 的首次查询语义保持不变；轮次结束或卸载立即撤销工具授权。历史与 SSE 仅对非错误且通过严格结构校验的 `mio.image-job` 卡片做白名单投影。
 
@@ -64,6 +64,18 @@ DSH 在连续两次、四次调用同一工具且参数相同时分别向模型�
 取消绑定本次 active request ID；包括 PG 已受理但 adapter 尚未登记的窗口。取消回执只是 requested，实际 cancelled/其他结算通过原请求查询；延迟取消不能取消下一条请求。
 
 如果 Agent 尚在打开，首次生效的终止意图固定：先收到用户取消则不提交输入、结算 cancelled；先开始关闭则不提交输入、结算 unknown，后到取消不能改写关闭原因。Agent 已开始执行时仍以实际持久终态判断，不能把未取得的终态冒充用户取消。
+
+## 上下文计量与压缩
+
+确定性计量根据模型可见上下文估算 token。SSE 首帧与结算帧公开估算值、已知路由窗口及是否存在内部摘要检查点。窗口采用该会话已知且适用的路由声明，缺少依据时为 `null`。估算从本地原生状态取得；关闭或断开流时取消当前读取。活跃订阅共享同一次结算估算，回执按既有持久化屏障发布。
+
+工具结果先在本轮模型投影内裁剪，保留原生结果及公开历史。高水位摘要复用本轮同一 owner、冻结 BYOK 路由及凭据，保留近期上下文和工具配对，以漫剧世界观、角色、场景、道具、分集进度、画风、镜头语言、待办与资产标识接续。未声明窗口的路由只能做无模型裁剪。摘要不携带工具或二进制附件，成功持久化摘要检查点后才使用压缩表面。公开历史仍从原始事件投影。
+
+同一轮自动摘要最多一次。明确的上游上下文超限可以触发一次摘要和一次正文重发；按实际出站向原请求分别追加首次正文失败、标有 `purpose: 'compaction'` 的摘要，以及正文重发观察。再次超限以 `MODEL_CONTEXT_OVERFLOW` 结算。普通上游错误、未知结果或压缩检查点未确认时保留实际回执。
+
+手动压缩沿同一 PG 接收、占用、取消、恢复及回执流程。fresh 请求需要空闲、未归档的 owner 会话及当前有窗口的 BYOK 路由。空范围可直接完成；已受理记录沿原 ID 读取。手动压缩使用自身请求的观察数组，标题和活跃时间由真实人类输入继续维护。[手动压缩 API](apis/conversations.md#post-apiv1conversationsidcompact)
+
+原 `DSH_HOME/sessions` 中的未压缩会话在原目录冷读和续写；新会话在并列 `DSH_HOME/sessions-zstd` 使用带校验和的 zstd 帧。备份、恢复和归档保留完整两套原生目录及 PG 映射。重复会话 ID 或无法安全读取任一匹配日志时拒绝继续。[DSH 存储约定](integrations/dsh.md)
 
 ## 标题、活跃度与归档
 

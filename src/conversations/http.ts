@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseJsonBody, readBody, readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { ConversationError, MAX_CONVERSATION_TITLE_BYTES } from './contracts.ts';
-import type { Principal, ConversationEvent, ConversationSnapshot, Receipt } from './contracts.ts';
+import type { Principal, ConversationEvent, ConversationSnapshot } from './contracts.ts';
 import { parseConversationCursor } from './cursor.ts';
 import type { ConversationService } from './service.ts';
 import { createSseRegistry } from './sse-registry.ts';
@@ -15,18 +15,28 @@ const MAX_STREAM_BUFFER = 64 * 1024;
 const requestIdPattern = /^[A-Za-z0-9_-]{1,80}$/;
 type Identity = (headers: Headers) => Promise<Principal | null>;
 
-function coveredBySnapshot(baseline: Receipt | null, receipt: Receipt): boolean {
-  if (baseline?.requestId !== receipt.requestId) return false;
-  if (baseline.status === receipt.status) {
+function validRequestId(value: unknown): value is string {
+  return typeof value === 'string' && requestIdPattern.test(value);
+}
+
+type StateEvent = Extract<ConversationEvent, { type: 'state' }>;
+function coveredBySnapshot(
+  baseline: ConversationSnapshot | undefined,
+  { receipt, contextUsage }: StateEvent,
+): boolean {
+  const previous = baseline?.receipt;
+  if (previous?.requestId !== receipt.requestId || (contextUsage && !baseline?.contextUsage))
+    return false;
+  if (previous.status === receipt.status) {
     return (
-      (receipt.error === undefined || baseline.error !== undefined) &&
+      (receipt.error === undefined || previous.error !== undefined) &&
       (receipt.truncation === undefined ||
-        baseline.truncation?.reason === receipt.truncation.reason)
+        previous.truncation?.reason === receipt.truncation.reason)
     );
   }
   return (
     receipt.status === 'accepted' ||
-    (receipt.status === 'input-persisted' && baseline.status !== 'accepted')
+    (receipt.status === 'input-persisted' && previous.status !== 'accepted')
   );
 }
 
@@ -68,8 +78,8 @@ async function streamConversation({
   let closed = false;
   let started = false;
   let errored = false;
-  let baseline: Receipt | null = null;
-  const queued: { data: string; receipt?: Receipt }[] = [];
+  let baseline: ConversationSnapshot | undefined;
+  const queued: { data: string; state?: StateEvent }[] = [];
   let queuedBytes = 0;
   const close = () => {
     if (closed) return;
@@ -94,14 +104,14 @@ async function streamConversation({
   };
   const write = (event: ConversationEvent | ({ type: 'snapshot' } & ConversationSnapshot)) => {
     if (closed || response.destroyed || response.writableEnded) return close();
-    if (event.type === 'state' && coveredBySnapshot(baseline, event.receipt)) return;
+    if (event.type === 'state' && coveredBySnapshot(baseline, event)) return;
     const data = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
     const bytes = Buffer.byteLength(data);
     if (bytes > MAX_STREAM_BUFFER) return overflow();
     if (!started) {
       queuedBytes += bytes;
       if (queuedBytes > MAX_STREAM_BUFFER) return overflow();
-      queued.push(event.type === 'state' ? { data, receipt: event.receipt } : { data });
+      queued.push(event.type === 'state' ? { data, state: event } : { data });
       if (event.type === 'error') errored = true;
       return;
     }
@@ -145,10 +155,10 @@ async function streamConversation({
     });
     response.flushHeaders();
     started = true;
-    baseline = installed.snapshot.receipt;
+    baseline = installed.snapshot;
     write({ type: 'snapshot', ...installed.snapshot });
-    for (const { data, receipt } of queued) {
-      if (!receipt || !coveredBySnapshot(baseline, receipt)) sendFrame(data);
+    for (const { data, state } of queued) {
+      if (!state || !coveredBySnapshot(baseline, state)) sendFrame(data);
     }
     queued.length = 0;
     if (response.destroyed || response.writableEnded || closed || errored) close();
@@ -205,15 +215,13 @@ export function createConversationHandler(
       else if (validId && parts.length === 2 && action === 'model') methods = ['PUT'];
       else if (validId && parts.length === 2 && ['history', 'events'].includes(action ?? ''))
         methods = ['GET'];
-      else if (validId && parts.length === 2 && ['messages', 'cancel'].includes(action ?? ''))
-        methods = ['POST'];
       else if (
         validId &&
-        action === 'requests' &&
-        receiptId &&
-        requestIdPattern.test(receiptId) &&
-        parts.length === 3
+        parts.length === 2 &&
+        ['messages', 'cancel', 'compact'].includes(action ?? '')
       )
+        methods = ['POST'];
+      else if (validId && action === 'requests' && validRequestId(receiptId) && parts.length === 3)
         methods = ['GET'];
       if (!methods) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const method = request.method ?? '';
@@ -273,11 +281,13 @@ export function createConversationHandler(
       const expected =
         action === 'messages'
           ? ['requestId', 'text', 'imageAssetIds']
-          : (base && method === 'POST') || action === 'model'
-            ? ['modelRef']
-            : method === 'PATCH'
-              ? ['title']
-              : [];
+          : action === 'compact'
+            ? ['requestId']
+            : (base && method === 'POST') || action === 'model'
+              ? ['modelRef']
+              : method === 'PATCH'
+                ? ['title']
+                : [];
       if (Object.keys(value).some((key) => !expected.includes(key)))
         return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
       const send = (status: number, value: unknown) => {
@@ -344,10 +354,13 @@ export function createConversationHandler(
       }
       if (action === 'requests')
         return send(HTTP_STATUS.OK, await service.request(actor, id!, receiptId!));
+      if (action === 'compact') {
+        if (!validRequestId(value.requestId)) return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
+        return send(HTTP_STATUS.ACCEPTED, await service.compact(actor, id!, value.requestId));
+      }
       if (action === 'messages') {
         if (
-          typeof value.requestId !== 'string' ||
-          !requestIdPattern.test(value.requestId) ||
+          !validRequestId(value.requestId) ||
           typeof value.text !== 'string' ||
           !value.text.trim() ||
           (value.imageAssetIds !== undefined &&

@@ -46,7 +46,7 @@ function result(command: AudioInspectCommandV1, durationMs: number): AudioInspec
   };
 }
 
-it('routes independent stream cursors, confirmation and command redelivery through the broker', async () => {
+it('routes out-of-order results to independent stream cursors', async () => {
   await withLocalTestBroker(
     async ({ appBrokerUrl, workerBrokerUrl, userA, userB, queueDefinitions }) => {
       const queues = await queueDefinitions();
@@ -126,62 +126,77 @@ it('routes independent stream cursors, confirmation and command redelivery throu
       } finally {
         bothArrived.resolve();
         published.resolve();
-        await Promise.all([firstWorker.close(), secondWorker.close()]);
-      }
-
-      const interruptedWorker = await Broker.connect(workerBrokerUrl, userB, userA);
-      const interrupted = Promise.withResolvers<AudioInspectCommandV1>();
-      const publishFailed = Promise.withResolvers<unknown>();
-      const replacement = await Broker.connect(workerBrokerUrl, userB, userA);
-      try {
-        await interruptedWorker.consumeAudio(
-          async (command) => {
-            interrupted.resolve(command);
-            throw new Error('SIMULATED_RESULT_CONFIRMATION_FAILURE');
-          },
-          publishFailed.resolve,
-          () => true,
-        );
-        const inspected = firstClient.inspect(input(), AbortSignal.timeout(8_000));
-        void inspected.catch(() => {});
-        const command = await Promise.race([
-          interrupted.promise,
-          inspected.then(() => {
-            throw new Error('UNEXPECTED_INSPECTION_COMPLETION');
-          }),
-        ]);
-        expect(await publishFailed.promise).toMatchObject({
-          message: 'SIMULATED_RESULT_CONFIRMATION_FAILURE',
-        });
-        await replacement.consumeAudio(
-          async (value, ack) => {
-            expect(value).toEqual(command);
-            await replacement.publishAudio(result(value, 13_000));
-            ack();
-          },
-          workerFailure.reject,
-          () => true,
-        );
-        await interruptedWorker.close();
-        await expect(Promise.race([inspected, workerFailure.promise])).resolves.toMatchObject({
-          durationMs: 13_000,
-        });
-        await replacement.pause();
-
-        const cancelled = secondClient.inspect(input(), AbortSignal.timeout(8_000));
-        const assertion = expect(cancelled).rejects.toMatchObject({
-          code: 'AUDIO_INSPECTION_UNAVAILABLE',
-        });
-        await secondClient.close();
-        await assertion;
-      } finally {
-        await Promise.allSettled([
+        await Promise.all([
+          firstWorker.close(),
+          secondWorker.close(),
           firstClient.close(),
           secondClient.close(),
-          interruptedWorker.close(),
-          replacement.close(),
         ]);
       }
     },
   );
+}, 90_000);
+
+it('redelivers the interrupted inspection command and cancels a pending inspection on close', async () => {
+  // A fresh vhost keeps earlier deliveries with in-flight ACKs out of this scenario.
+  await withLocalTestBroker(async ({ appBrokerUrl, workerBrokerUrl, userA, userB }) => {
+    const client = createAudioMediaClient({
+      brokerURL: appBrokerUrl,
+      brokerUser: userA,
+      expectedResultUser: userB,
+    });
+    const interruptedWorker = await Broker.connect(workerBrokerUrl, userB, userA);
+    const replacement = await Broker.connect(workerBrokerUrl, userB, userA);
+    const interrupted = Promise.withResolvers<AudioInspectCommandV1>();
+    const publishFailed = Promise.withResolvers<unknown>();
+    const workerFailure = Promise.withResolvers<never>();
+    void workerFailure.promise.catch(() => {});
+    const confirmationFailure = new Error('SIMULATED_RESULT_CONFIRMATION_FAILURE');
+    const request = input();
+    const { jobId, purpose, ...object } = request;
+    try {
+      await interruptedWorker.consumeAudio(
+        async (command) => {
+          expect(command).toMatchObject({ jobId, purpose, input: object });
+          interrupted.resolve(command);
+          throw confirmationFailure;
+        },
+        publishFailed.resolve,
+        () => true,
+      );
+      const inspected = client.inspect(request, AbortSignal.timeout(8_000));
+      void inspected.catch(() => {});
+      const failure = await Promise.race([
+        publishFailed.promise,
+        inspected.then(() => {
+          throw new Error('UNEXPECTED_INSPECTION_COMPLETION');
+        }),
+      ]);
+      expect(failure).toBe(confirmationFailure);
+      const command = await interrupted.promise;
+      await replacement.consumeAudio(
+        async (value, ack) => {
+          expect(value).toEqual(command);
+          await replacement.publishAudio(result(value, 13_000));
+          ack();
+        },
+        workerFailure.reject,
+        () => true,
+      );
+      await interruptedWorker.close();
+      await expect(Promise.race([inspected, workerFailure.promise])).resolves.toMatchObject({
+        durationMs: 13_000,
+      });
+      await replacement.pause();
+
+      const cancelled = client.inspect(input(), AbortSignal.timeout(8_000));
+      const assertion = expect(cancelled).rejects.toMatchObject({
+        code: 'AUDIO_INSPECTION_UNAVAILABLE',
+      });
+      await client.close();
+      await assertion;
+    } finally {
+      await Promise.allSettled([client.close(), interruptedWorker.close(), replacement.close()]);
+    }
+  });
 }, 90_000);

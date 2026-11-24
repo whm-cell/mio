@@ -129,7 +129,11 @@ it('keeps budget denials monotonic across repeated guard checks, honors aborted 
   const { ctx } = await setup([]);
   let revoke: (() => void) | undefined;
   const handle = await ctx.mioKernel.create('guard-monotonic', {}, (agentCtx, agent) => {
-    revoke = authorizeConversationTools(agentCtx, agent);
+    revoke = authorizeConversationTools(agentCtx, agent, {
+      imageGeneration: true,
+      imageInspection: false,
+      videoGeneration: true,
+    });
   });
   try {
     const makeExec = (
@@ -157,6 +161,13 @@ it('keeps budget denials monotonic across repeated guard checks, honors aborted 
     const fifthSubmit = makeExec('sub-5', 'submit_image_job');
     expect(ctx.tools.checkGuards(fifthSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
     expect(ctx.tools.checkGuards(fifthSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
+
+    const videoSubmit = makeExec('video-sub-1', 'submit_video_job');
+    expect(ctx.tools.checkGuards(videoSubmit)).toBeUndefined();
+    expect(ctx.tools.checkGuards(videoSubmit)).toBeUndefined();
+    const repeatedVideoSubmit = makeExec('video-sub-2', 'submit_video_job');
+    expect(ctx.tools.checkGuards(repeatedVideoSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
+    expect(ctx.tools.checkGuards(repeatedVideoSubmit)).toContain('MIO_TOOL_BUDGET_EXCEEDED');
 
     // Aborted signal is denied on both root and agent guard layers
     const abortedController = new AbortController();

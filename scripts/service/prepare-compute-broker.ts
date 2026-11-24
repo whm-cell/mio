@@ -2,14 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, realpath } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { AUDIO_RESULT_QUEUE } from '@mio/compute-contracts';
+import { AUDIO_RESULT_QUEUE, parseWorkerInstanceIds } from '@mio/compute-contracts';
 import { readComputeBrokerEnvironment } from './compute-broker-env.ts';
 import {
   audioResultPolicy,
   computeCapacity,
   computeDeadLetters,
   computeExchanges as exchanges,
-  computeQueues as queues,
+  computeQueues,
   computePermissions,
   computeTopology,
 } from './compute-broker-topology.ts';
@@ -23,6 +23,15 @@ if (!adminFile || !outputPath || extra.length)
   throw new Error(
     'Usage: node scripts/service/prepare-compute-broker.ts <admin-env> <new-private-output-dir>',
   );
+
+const workerInstanceIds = parseWorkerInstanceIds(process.env.MIO_COMPUTE_WORKER_INSTANCE_IDS);
+const workerInstanceId = process.env.MIO_COMPUTE_INSTANCE_ID ?? workerInstanceIds[0];
+if (workerInstanceId && !workerInstanceIds.includes(workerInstanceId))
+  throw new Error('BROKER_WORKER_INSTANCE_NOT_PROVISIONED');
+if (workerInstanceIds.length > 1 && !process.env.MIO_COMPUTE_INSTANCE_ID)
+  throw new Error('BROKER_WORKER_INSTANCE_REQUIRED');
+const deadLetters = computeDeadLetters(workerInstanceIds);
+const queues = computeQueues(deadLetters);
 
 function object(value: unknown): Json {
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -148,7 +157,13 @@ function roleEnv(role: 'a' | 'b', vhost: string): string {
   const uri = `amqp://${encoded(identity.user)}:${encoded(identity.password)}@127.0.0.1:${amqpPort}/${encoded(vhost)}`;
   const peer =
     role === 'a' ? 'MIO_COMPUTE_EXPECTED_RESULT_USER' : 'MIO_COMPUTE_EXPECTED_COMMAND_USER';
-  return `RABBITMQ_URL=${uri}\nMIO_COMPUTE_BROKER_USER=${identity.user}\n${peer}=${roles[role === 'a' ? 'b' : 'a'].user}\n`;
+  const instance =
+    role === 'b' && workerInstanceId ? `MIO_COMPUTE_INSTANCE_ID=${workerInstanceId}\n` : '';
+  const allowlist =
+    role === 'a' && workerInstanceIds.length
+      ? `MIO_COMPUTE_WORKER_INSTANCE_IDS=${workerInstanceIds.join(',')}\n`
+      : '';
+  return `${instance}${allowlist}RABBITMQ_URL=${uri}\nMIO_COMPUTE_BROKER_USER=${identity.user}\n${peer}=${roles[role === 'a' ? 'b' : 'a'].user}\n`;
 }
 
 try {
@@ -177,7 +192,7 @@ try {
       `operator-policies/${encoded(vhost)}/${audioResultPolicy.name}`,
       audioResultPolicy.definition,
     );
-    for (const resource of computeTopology(vhost))
+    for (const resource of computeTopology(vhost, workerInstanceIds))
       await mutate(resource.method, resource.path, resource.body);
   }
   for (const role of ['a', 'b'] as const) {
@@ -190,7 +205,7 @@ try {
       await mutate(
         'PUT',
         `permissions/${encoded(vhost)}/${encoded(identity.user)}`,
-        computePermissions(role),
+        computePermissions(role, workerInstanceId),
       );
   }
   for (const role of ['a', 'b'] as const) {
@@ -203,8 +218,8 @@ try {
       if (
         result.status !== 200 ||
         p.configure !== '^$' ||
-        p.write !== computePermissions(role).write ||
-        p.read !== computePermissions(role).read
+        p.write !== computePermissions(role, workerInstanceId).write ||
+        p.read !== computePermissions(role, workerInstanceId).read
       )
         throw new Error('BROKER_RUNTIME_PERMISSION_MISMATCH');
     }
@@ -257,7 +272,7 @@ try {
         (effective as Json).overflow !== computeCapacity.overflow
       )
         throw new Error(`BROKER_QUEUE_CAPACITY_MISMATCH ${vhost}/${queue}`);
-      const deadLetter = computeDeadLetters.get(queue);
+      const deadLetter = deadLetters.get(queue);
       if (
         deadLetter &&
         (args['x-dead-letter-strategy'] !== 'at-least-once' ||

@@ -22,6 +22,7 @@ import {
 } from './adapters/media.ts';
 import type { ObjectStore } from './adapters/cos.ts';
 import type { Broker } from './adapters/rabbitmq.ts';
+import { ResourceSlots } from './resource-slots.ts';
 import type { Attempt, Phase } from './types.ts';
 
 const ATTEMPT_MS = 60 * 60 * 1000;
@@ -39,6 +40,7 @@ export class Worker {
   readonly #store: Pick<ObjectStore, 'download' | 'head' | 'verify' | 'upload'>;
   readonly #broker: Pick<Broker, 'publish'>;
   readonly #directory: string;
+  readonly #slots: ResourceSlots;
   #busy = false;
   #activeAttemptId: string | null = null;
   #cursor = '';
@@ -50,11 +52,14 @@ export class Worker {
     store: Pick<ObjectStore, 'download' | 'head' | 'verify' | 'upload'>,
     broker: Pick<Broker, 'publish'>,
     directory: string,
+    slots = new ResourceSlots(),
   ) {
     this.#journal = journal;
     this.#store = store;
     this.#broker = broker;
     this.#directory = directory;
+    this.#slots = slots;
+    this.#syncProcessHold();
   }
 
   stop(): void {
@@ -66,8 +71,14 @@ export class Worker {
     while (this.#busy) await sleep(50);
   }
 
+  #syncProcessHold(): void {
+    this.#slots.setHold('encode', 'transcode', this.#journal.hasUnknownProcess());
+  }
+
   admissionReady(): boolean {
-    if (this.#stopped || this.#busy || this.#journal.hasUnknownProcess()) return false;
+    if (this.#stopped || this.#busy) return false;
+    this.#syncProcessHold();
+    if (!this.#slots.available('encode')) return false;
     try {
       requireSpace(this.#directory);
       return true;
@@ -243,8 +254,25 @@ export class Worker {
     }
     if (!attempt) return;
     this.#cursor = attempt.command.attemptId;
-    await this.#recover(attempt);
-    const current = this.#journal.get(attempt.command.attemptId);
+    const recoveringOutput = [
+      'output_ready',
+      'uploading',
+      'unknown_upload',
+      'unknown_mismatch',
+    ].includes(attempt.phase);
+    // A HOLD prevents new FFmpeg work. Existing upload reconciliation keeps its own capacity charge.
+    const release = recoveringOutput ? this.#slots.acquireOutputRecovery('encode') : null;
+    if (recoveringOutput && !release) return;
+    try {
+      await this.#recover(attempt);
+      this.#cleanup(attempt.command.attemptId);
+    } finally {
+      this.#releaseSlot(release);
+    }
+  }
+
+  #cleanup(attemptId: string): void {
+    const current = this.#journal.get(attemptId);
     if (current && !current.cleaned && ['succeeded', 'failed'].includes(current.phase)) {
       this.#requireConfirmedOutcome(current.command.attemptId);
       removeFiles(this.#directory, current.command.attemptId);
@@ -252,8 +280,21 @@ export class Worker {
     }
   }
 
+  #releaseSlot(release: (() => void) | null): void {
+    try {
+      this.#syncProcessHold();
+    } catch (error) {
+      this.#slots.setHold('encode', 'transcode', true);
+      throw error;
+    } finally {
+      release?.();
+    }
+  }
+
   async handle(command: ComputeCommandV1, ack: () => void): Promise<void> {
     if (!this.admissionReady()) throw new Error('WORKER_NOT_READY');
+    const release = this.#slots.acquire('encode');
+    if (!release) throw new Error('WORKER_NOT_READY');
     const attemptLog = log.child({
       jobId: command.jobId,
       attemptId: command.attemptId,
@@ -281,17 +322,14 @@ export class Worker {
       }
       await this.#flush(command.attemptId);
       this.#requireConfirmedOutcome(command.attemptId);
-      const final = this.#journal.get(command.attemptId);
-      if (final && !final.cleaned && ['succeeded', 'failed'].includes(final.phase)) {
-        removeFiles(this.#directory, command.attemptId);
-        this.#journal.markCleaned(command.attemptId);
-      }
+      this.#cleanup(command.attemptId);
       ack();
       this.#journal.markAckDispatched(command.attemptId);
       attemptLog.info('COMMAND_ACK_DISPATCHED');
     } finally {
       this.#activeAttemptId = null;
       this.#busy = false;
+      this.#releaseSlot(release);
     }
   }
 

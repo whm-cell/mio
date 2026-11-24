@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { AUDIO_RESULT_QUEUE } from '@mio/compute-contracts';
+import { AUDIO_RESULT_QUEUE, parseWorkerInstanceIds } from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import {
   audioResultPolicy,
@@ -12,6 +12,12 @@ type Json = Record<string, unknown>;
 
 /** Verify operator-provisioned resources and declare only the matching media topology. */
 export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.ProcessEnv) {
+  const workerInstanceId = values.MIO_LOCAL_COMPUTE_INSTANCE_ID;
+  const workerInstanceIds = parseWorkerInstanceIds(
+    values.MIO_COMPUTE_WORKER_INSTANCE_IDS ?? workerInstanceId,
+  );
+  if (workerInstanceId && !workerInstanceIds.includes(workerInstanceId))
+    throw new Error('LOCAL_BROKER_WORKER_INSTANCE_NOT_PROVISIONED');
   const base = `http://127.0.0.1:${values.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT}/api/`;
   const auth = Buffer.from(`mio-${name}-admin:${values.MIO_LOCAL_RABBITMQ_PASSWORD}`).toString(
     'base64',
@@ -86,7 +92,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     });
     prerequisites.push({
       path: `permissions/${vhost}/${user}`,
-      expected: computePermissions(role),
+      expected: computePermissions(role, workerInstanceId),
     });
   }
   async function readPrerequisiteGaps() {
@@ -97,7 +103,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     return missing;
   }
   const missingPrerequisites = await readPrerequisiteGaps();
-  const topology = computeTopology(vhost);
+  const topology = computeTopology(vhost, workerInstanceIds);
   const missingTopology: typeof topology = [];
   // Preflight everything before the first write. A failed/unknown write leaves resources for rerun.
   if (!missingPrerequisites.has(vhostPath)) {

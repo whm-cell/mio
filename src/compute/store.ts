@@ -7,6 +7,7 @@ import { COMPUTE_PROFILE, COMPUTE_VERSION } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
 import { ComputeError } from './errors.ts';
+import { checkComputeCapacity, lockComputeCapacity } from './capacity.ts';
 const log = createLogger('app', 'compute-store');
 
 export interface JobRow {
@@ -68,19 +69,6 @@ const retryable = new Set([
   'OUTPUT_INVALID',
 ]);
 
-const VIDEO_QUOTA_LOCK = 672049923;
-
-async function checkVideoCapacity(client: PoolClient, owner: string): Promise<void> {
-  const video = (
-    await client.query<{ global_count: string; owner_count: string }>(
-      "SELECT count(*) AS global_count, count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_compute_jobs WHERE state IN ('accepted','queued','running')",
-      [owner],
-    )
-  ).rows[0]!;
-  if (Number(video.global_count) >= 500 || Number(video.owner_count) >= 10)
-    throw new ComputeError(HTTP_STATUS.TOO_MANY_REQUESTS, 'COMPUTE_QUOTA_EXCEEDED');
-}
-
 export class ComputeStore {
   private readonly pool: Pool;
   constructor(pool: Pool) {
@@ -124,8 +112,7 @@ export class ComputeStore {
     etag: string,
   ): Promise<{ job: JobRow; created: boolean }> {
     return transaction(this.pool, async (client) => {
-      // Serializing video admission keeps per-user and global video quotas exact.
-      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+      await lockComputeCapacity(client);
       const existing = (
         await client.query<JobRow>(
           'SELECT * FROM mio_compute_jobs WHERE owner_id=$1 AND request_id=$2',
@@ -137,7 +124,7 @@ export class ComputeStore {
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return { job: existing, created: false };
       }
-      await checkVideoCapacity(client, owner);
+      await checkComputeCapacity(client, owner);
       const asset = (
         await client.query<{ raw_key: string; size_bytes: string }>(
           "SELECT raw_key,size_bytes FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' FOR SHARE",

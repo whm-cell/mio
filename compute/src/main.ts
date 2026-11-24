@@ -7,6 +7,7 @@ import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
 import { runAudioRuntime } from './audio-runtime.ts';
+import { ResourceSlots } from './resource-slots.ts';
 
 const log = createLogger('worker', 'main');
 
@@ -62,6 +63,8 @@ async function start(): Promise<void> {
       : {}),
   });
   const journal = new Journal(directory, instance);
+  const slots = new ResourceSlots();
+  slots.setHold('encode', 'transcode', journal.hasUnknownProcess());
   const stopping = new AbortController();
   let worker: Worker | null = null;
   const stop = () => {
@@ -74,6 +77,7 @@ async function start(): Promise<void> {
     { url, username, expectedUser, directory },
     store,
     stopping.signal,
+    slots,
   ).catch(() => log.error('AUDIO_WORKER_STOPPED'));
   try {
     while (!stopping.signal.aborted) {
@@ -86,7 +90,7 @@ async function start(): Promise<void> {
       try {
         broker = await Broker.connect(url, username, expectedUser, stopping.signal);
         stopping.signal.throwIfAborted();
-        worker = new Worker(journal, store, broker, directory);
+        worker = new Worker(journal, store, broker, directory, slots);
         const current = worker;
         let fail: (error: unknown) => void = () => {};
         const failed = new Promise<never>((_resolve, reject) => {

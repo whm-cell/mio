@@ -25,6 +25,7 @@ type TestBroker = {
   queueDefinitions: () => Promise<QueueDefinition[]>;
   appBrokerUrl: string;
   workerBrokerUrl: string;
+  restrictWorkerToObservation?: () => Promise<string>;
   userA: string;
   userB: string;
 };
@@ -113,11 +114,17 @@ async function testBrokerTarget() {
   };
 }
 
-function testDefinitions(vhost: string, users: readonly { role: 'a' | 'b'; name: string }[]) {
+type WorkerScope = { instanceId: string; instanceIds: readonly string[]; observeQueue?: string };
+
+function testDefinitions(
+  vhost: string,
+  users: readonly { role: 'a' | 'b'; name: string }[],
+  scope?: WorkerScope,
+) {
   const exchanges = [];
   const queues = [];
   const bindings = [];
-  for (const { path, body } of computeTopology(vhost)) {
+  for (const { path, body } of computeTopology(vhost, scope?.instanceIds)) {
     const [kind, scope, name, source, destinationType, destination] = path.split('/');
     assert.equal(scope, vhost);
     if (kind === 'exchanges') exchanges.push({ ...body, vhost, name });
@@ -134,13 +141,14 @@ function testDefinitions(vhost: string, users: readonly { role: 'a' | 'b'; name:
     permissions: users.map(({ role, name }) => ({
       vhost,
       user: name,
-      ...computePermissions(role),
+      ...computePermissions(role, scope?.instanceId),
     })),
   });
 }
 
 export async function withLocalTestBroker<T>(
   exercise: (broker: TestBroker) => Promise<T>,
+  scope?: WorkerScope,
 ): Promise<T> {
   const { port, ctl } = await testBrokerTarget();
   const token = randomBytes(16).toString('hex');
@@ -245,7 +253,7 @@ export async function withLocalTestBroker<T>(
       JSON.stringify(retention.definition),
     ]);
     // The import only contains queues, exchanges, bindings and permissions in the owned vhost.
-    await ctl(['import_definitions', '/dev/stdin'], testDefinitions(vhost, users));
+    await ctl(['import_definitions', '/dev/stdin'], testDefinitions(vhost, users, scope));
     result = await exercise({
       async queueDefinitions() {
         const output = await ctl([
@@ -264,6 +272,18 @@ export async function withLocalTestBroker<T>(
       },
       appBrokerUrl: amqpUrl(a),
       workerBrokerUrl: amqpUrl(b),
+      ...(scope?.observeQueue
+        ? {
+            async restrictWorkerToObservation() {
+              const queue = scope.observeQueue!;
+              assert(await ownsVhost(), `RABBITMQ_TEST_VHOST_OWNERSHIP: ${vhost}`);
+              await ctl(['authenticate_user', b.name], `${b.password}\n`);
+              const read = `^${queue.replace(/[^a-zA-Z0-9_-]/g, '\\$&')}$`;
+              await ctl(['set_permissions', '--vhost', vhost, b.name, '^$', '^$', read]);
+              return amqpUrl(b);
+            },
+          }
+        : {}),
       userA: a.name,
       userB: b.name,
     });

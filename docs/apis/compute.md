@@ -14,7 +14,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 错误：400 BODY_INVALID/COMPUTE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 ASSET_NOT_FOUND、409 REQUEST_CONFLICT/ASSET_SIZE_MISMATCH、429 COMPUTE_QUOTA_EXCEEDED、503 COMPUTE_STORAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
 
-副作用：受理时独立统计活动视频任务（`accepted`、`queued`、`running`），限制每用户最多 10 个、全局最多 500 个未结束视频任务（与图片任务配额及事务锁分离）；向持久 outbox 写入固定 profile 命令并立即唤醒有界批量排空发布至 `mio.compute.commands.v1`（`transcode.v1`），发布确认与业务成功分别记录。
+副作用：视频任务在 `accepted`、`queued`、`running` 时占用名额。准入事务与通用媒体任务共享锁，合计每用户最多 10 个、全局最多 500 个活动任务，图片配额和锁单独计算。幂等命中仍返回原任务，同键冲突仍返回 409。新受理时向持久 outbox 写入固定 profile 命令并立即唤醒有界批量排空发布至 `mio.compute.commands.v1`（`transcode.v1`），发布确认与业务成功分别记录。
 
 ## GET /api/v1/compute/jobs/{id}
 

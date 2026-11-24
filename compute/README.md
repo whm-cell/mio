@@ -6,17 +6,17 @@
 
 首次新建卷时显式运行 `node compute/dist/main.js init`，其后运行 `node compute/dist/main.js start`。已有卷丢失、损坏或实例身份不一致时，停止消费并调查；不要对已有卷重新初始化。journal、WAL、SHM 和未确认的输入/输出都须保留在一起。目录是单实例独占的；SQLite 的锁在进程退出后释放，各事件和状态独立提交。
 
-已有 schema 3 的 journal 会在实例身份及完整性核对后，在 SQLite 事务内升级到 schema 4；升级中断时继续保留原卷并重新启动，不另建空库。终态结果已持久化且发布确认、未被退回后，本地文件可幂等清理；重投仍从 journal 应答，不重新计算。journal 的 `ack_dispatched` 只表示本地 ACK 调用返回，AMQP 没有该 ACK 的服务端回执；`cleaned` 记录本地文件清理，二者不能证明 broker 已收到 ACK。未知状态继续保留文件。
+已有 journal 在核对实例身份及完整性后逐次升级。SQLite schema 7 在原连接的事务中增设媒体 attempt、事件与控制记录，保留既有转码和图片历史。升级前先备份卷，并显式执行 A 的 `compute:migrate --apply` 增量迁移。升级中断后沿同一卷恢复。应用回退前须先暂停新准入并核对在途任务和未知副作用。终态结果已持久化且发布确认、未被退回后，本地文件可幂等清理；重投仍从 journal 应答，不重新计算。journal 的 `ack_dispatched` 只表示本地 ACK 调用返回，AMQP 没有该 ACK 的服务端回执；`cleaned` 记录本地文件清理，二者不能证明 broker 已收到 ACK。未知状态继续保留文件。
 
 B 的视频转码命令通道保持单并发（`prefetch=1`）。云端图片生成、查询及物化恢复已迁至 A 的独立生成服务，不需要向 B 注入 OneLink 凭据或图片 RSA 私钥，也不消费图片专用队列。旧图片消息不能交给新 B 重跑；切换前应按[图片迁移要求](../docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md)排空并对账旧任务、outbox、消息、journal 和部分产物。
 
-音频检测另开单并发命令通道，可与视频并行。启用前按 [RabbitMQ 契约](../docs/integrations/rabbitmq.md#拓扑与权限)预置音频队列和结果 stream。B 仅从配置的私有 COS 桶读取消息指定的样本原件或该任务成品检查点，核对对象键、ETag、字节数及已有摘要。检测完整的单音轨，返回格式、MIME、编码、采样率、声道、字节数、SHA-256 和解码实测时长。样本允许 MP3/WAV/M4A、至多 20 MiB、10–300 秒。成品允许 MP3/WAV/FLAC、至多 100 MiB、1 毫秒至 60 分钟。超出时长范围或解码失败返回失败结果。
+音频检测另开单并发命令通道，可与视频并行。B 共享一个计数槽池，视频消耗 encode，音频检测消耗 probe，默认与最低部署硬上限为 total=2、encode=1、probe=1。槽一直保留到本次收尾，视频进程未确认退出时 encode 保持 HOLD。启用前按 [RabbitMQ 契约](../docs/integrations/rabbitmq.md#拓扑与权限)预置音频队列和结果 stream。B 仅从配置的私有 COS 桶读取消息指定的样本原件或该任务成品检查点，核对对象键、ETag、字节数及已有摘要。检测完整的单音轨，返回格式、MIME、编码、采样率、声道、字节数、SHA-256 和解码实测时长。样本允许 MP3/WAV/M4A、至多 20 MiB、10–300 秒。成品允许 MP3/WAV/FLAC、至多 100 MiB、1 毫秒至 60 分钟。超出时长范围或解码失败返回失败结果。
 
 临时输入位于实例目录的 `audio-inspection/`。B 拿到 journal 独占锁后清理其中残留的请求输入。音频检测仅读对象，可在重投时再做一次，发布结果后才确认消息。视频 journal 的状态和恢复流程继续沿用。
 
 既有 journal 的图片历史表和卷保留供只读对账；运行时不再写入或接管这些图片记录。视频的恢复、独占目录和实例身份规则继续生效。
 
-进程启动意图已提交而 PID 尚未持久化时，Worker 会发送 `PROCESS_UNKNOWN` 并停止新计算；重启不能证明旧进程结束。人工应先停止 Worker，核对同一宿主、启动周期和进程命名空间，并通过覆盖该运行环境的进程/隔离运行时记录，确认对应 FFmpeg 及其子进程均已终止。无法确认就保持 HOLD。**只有人工实际完成确认后**，以同一目录及实例身份运行 `node compute/dist/main.js resolve-no-pid <attempt-id> --confirmed-process-terminated '<确认依据>'`；它只接受无 PID 的 unknown 记录，保存依据并持久创建 interrupted 事件。再次启动后有界对账会发布该事件。该操作不会重新执行原 attempt。
+进程启动意图已提交而 PID 尚未持久化时，Worker 会发送 `PROCESS_UNKNOWN` 并暂停新的 encode 任务。重启不能证明旧进程结束。人工应先停止 Worker，核对同一宿主、启动周期和进程命名空间，并通过覆盖该运行环境的进程/隔离运行时记录，确认对应 FFmpeg 及其子进程均已终止。无法确认就保持 HOLD。**只有人工实际完成确认后**，以同一目录及实例身份运行 `node compute/dist/main.js resolve-no-pid <attempt-id> --confirmed-process-terminated '<确认依据>'`；它只接受无 PID 的 unknown 记录，保存依据并持久创建 interrupted 事件。再次启动后有界对账会发布该事件。该操作不会重新执行原 attempt。
 
 视频上传结果未知时保留原输出和 journal，继续按固定 attempt 键对账。连接或读写无进度的 60 秒超时与总预算不同；本地超时不证明远端 PUT 已取消。视频未知上传恢复通过 GET 流式校验完整内容，未知对象内容不符或本地输出缺失时保持待对账，不删除 COS 资产。
 

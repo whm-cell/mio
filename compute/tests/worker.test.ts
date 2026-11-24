@@ -20,6 +20,7 @@ import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import { Journal } from '../src/adapters/journal.ts';
 import { paths, processGone, processIdentity, transcode } from '../src/adapters/media.ts';
 import type { MediaError } from '../src/adapters/media.ts';
+import { ResourceSlots } from '../src/resource-slots.ts';
 import { Worker } from '../src/worker.ts';
 
 const directories: string[] = [];
@@ -256,6 +257,10 @@ describe('worker journal and real ffmpeg', () => {
     const old = new DatabaseSync(join(root, 'journal.sqlite3'));
     old.exec(`BEGIN IMMEDIATE;
       DROP TABLE image_attempts;
+      DROP TABLE media_events;
+      DROP TABLE media_cancellations;
+      DROP TABLE media_manual_resolutions;
+      DROP TABLE media_attempts;
       DROP INDEX attempts_cleanup;
       ALTER TABLE attempts RENAME COLUMN ack_dispatched TO acknowledged;
       CREATE INDEX attempts_cleanup ON attempts(attempt_id) WHERE phase IN ('succeeded','failed') AND acknowledged = 1 AND cleaned = 0;
@@ -655,6 +660,65 @@ describe('worker journal and real ffmpeg', () => {
     journal.close();
   }, 30_000);
 
+  it('reconciles an existing upload during an unrelated FFmpeg HOLD without admitting new encode work', async () => {
+    const source = fixture(directory());
+    const root = directory();
+    const uploaded = { ...command(source), attemptId: '00000000-0000-4000-8000-000000000001' };
+    const maybeRunning = { ...command(source), attemptId: '00000000-0000-4000-8000-000000000002' };
+    const bytes = Buffer.from('prior durable output');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const key = `mio/derived/${uploaded.jobId}/${uploaded.attemptId}/result.mp4`;
+    const initialized = new Journal(root, 'instance', true);
+    try {
+      initialized.accept(uploaded);
+      initialized.transition(uploaded.attemptId, 'launching');
+      initialized.recordPid(uploaded.attemptId, process.pid, processIdentity()!);
+      initialized.recordOutput(uploaded.attemptId, bytes.length, sha256);
+      initialized.transition(uploaded.attemptId, 'unknown_upload');
+      writeFileSync(paths(root, uploaded.attemptId).output, bytes);
+      initialized.accept(maybeRunning);
+      initialized.transition(maybeRunning.attemptId, 'launching');
+    } finally {
+      initialized.close();
+    }
+    const journal = new Journal(root, 'instance');
+    try {
+      const slots = new ResourceSlots();
+      const store = {
+        download: vi.fn(async () => {}),
+        head: vi.fn(async () => ({ sizeBytes: bytes.length, sha256, etag: 'existing' })),
+        verify: vi.fn(async () => true),
+        upload: vi.fn(async () => {}),
+      };
+      const publish = vi.fn<(event: ComputeResultV1) => Promise<void>>(async () => {});
+      const worker = new Worker(journal, store, { publish }, root, slots);
+      expect(slots.available('encode')).toBe(false);
+      await worker.reconcileOne();
+      expect(journal.get(uploaded.attemptId)).toMatchObject({ phase: 'succeeded', cleaned: true });
+      expect(journal.get(maybeRunning.attemptId)).toMatchObject({ phase: 'launching', pid: null });
+      expect(publish).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jobId: uploaded.jobId,
+          state: 'succeeded',
+          output: { key, sizeBytes: bytes.length, sha256, etag: 'existing' },
+        }),
+      );
+      expect(store.verify).toHaveBeenCalledWith(key, bytes.length, sha256, expect.any(AbortSignal));
+      expect(store.upload).not.toHaveBeenCalled();
+      expect(store.download).not.toHaveBeenCalled();
+      expect(existsSync(paths(root, uploaded.attemptId).output)).toBe(false);
+      expect(slots.available('encode')).toBe(false);
+      expect(slots.available('probe')).toBe(true);
+      const next = command(source);
+      const ack = vi.fn();
+      await expect(worker.handle(next, ack)).rejects.toThrow('WORKER_NOT_READY');
+      expect(journal.get(next.attemptId)).toBeNull();
+      expect(ack).not.toHaveBeenCalled();
+    } finally {
+      journal.close();
+    }
+  });
+
   it('holds a launch without PID across reopen and reports a known-dead process interrupted', async () => {
     const fixtureRoot = directory();
     const root = directory();
@@ -675,6 +739,7 @@ describe('worker journal and real ffmpeg', () => {
       },
       async upload() {},
     };
+    const slots = new ResourceSlots();
     let worker = new Worker(
       journal,
       store,
@@ -684,7 +749,10 @@ describe('worker journal and real ffmpeg', () => {
         },
       },
       root,
+      slots,
     );
+    expect(slots.available('encode')).toBe(false);
+    expect(slots.available('probe')).toBe(true);
     await worker.reconcileOne();
     expect(journal.hasUnknownProcess()).toBe(true);
     expect(journal.get(input.attemptId)?.phase).toBe('unknown_process');
@@ -693,6 +761,7 @@ describe('worker journal and real ffmpeg', () => {
     await worker.reconcileOne();
     expect(published.at(-1)).toMatchObject({ state: 'failed', errorCode: 'WORKER_INTERRUPTED' });
     expect(journal.hasUnknownProcess()).toBe(false);
+    expect(slots.available('encode')).toBe(true);
     journal.close();
 
     const other = directory();

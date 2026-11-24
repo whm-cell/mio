@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { checkMediaSchema, mediaSchemaSQL } from './media-schema.ts';
 
 /** Incremental media-domain migration; existing original assets remain intact. */
 export const computeSchemaSQL = `
@@ -27,7 +28,8 @@ CREATE INDEX IF NOT EXISTS mio_compute_outbox_pending ON mio_compute_outbox(crea
   WHERE sent_at IS NULL;
 CREATE TABLE IF NOT EXISTS mio_compute_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
-);`;
+);
+${mediaSchemaSQL}`;
 
 export async function checkComputeSchema(database: Pick<Pool, 'query'>): Promise<void> {
   await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
@@ -38,4 +40,5 @@ export async function checkComputeSchema(database: Pick<Pool, 'query'>): Promise
     'SELECT id,job_id,command,lease_id,lease_until,sent_at,created_at FROM mio_compute_outbox LIMIT 0',
   );
   await database.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
+  await checkMediaSchema(database);
 }

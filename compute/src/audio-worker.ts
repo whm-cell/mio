@@ -8,6 +8,7 @@ import { createId } from '@mio/foundation/identifiers';
 import type { ObjectStore } from './adapters/cos.ts';
 import { inspectAudio, MediaError, removeFiles, requireSpace } from './adapters/media.ts';
 import type { Broker } from './adapters/rabbitmq.ts';
+import { ResourceSlots } from './resource-slots.ts';
 
 function failureCode(error: unknown, signal: AbortSignal): AudioInspectFailure {
   if (signal.aborted) return 'AUDIO_INSPECTION_TIMEOUT';
@@ -42,6 +43,7 @@ export class AudioWorker {
   private readonly directory: string;
   private readonly scratch: string;
   private readonly stop: AbortSignal;
+  private readonly slots: ResourceSlots;
 
   constructor(
     store: Pick<ObjectStore, 'download' | 'head'>,
@@ -49,12 +51,14 @@ export class AudioWorker {
     directory: string,
     scratch: string,
     stop: AbortSignal,
+    slots = new ResourceSlots(),
   ) {
     this.store = store;
     this.broker = broker;
     this.directory = directory;
     this.scratch = scratch;
     this.stop = stop;
+    this.slots = slots;
   }
 
   private async inspect(
@@ -81,7 +85,16 @@ export class AudioWorker {
   }
 
   async handle(command: AudioInspectCommandV1, ack: () => void): Promise<void> {
-    this.stop.throwIfAborted();
+    const release = await this.slots.wait('probe', this.stop);
+    try {
+      this.stop.throwIfAborted();
+      await this.execute(command, ack);
+    } finally {
+      release();
+    }
+  }
+
+  private async execute(command: AudioInspectCommandV1, ack: () => void): Promise<void> {
     const signal = AbortSignal.any([this.stop, AbortSignal.timeout(150_000)]);
     const base = {
       version: 1 as const,

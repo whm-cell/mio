@@ -219,3 +219,6 @@ export function parseComputeResultV1(value: unknown): ComputeResultV1 {
 }
 
 export * from './audio.ts';
+export * from './media-types.ts';
+export * from './media.ts';
+export * from './worker-observability.ts';

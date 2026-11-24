@@ -11,6 +11,7 @@ const fixture = vi.hoisted(() => ({
 vi.mock('../src/adapters/journal.ts', () => ({
   Journal: class {
     close = fixture.closeJournal;
+    hasUnknownProcess = () => false;
   },
   isJournalFailure: () => false,
 }));

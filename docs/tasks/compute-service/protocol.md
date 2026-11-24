@@ -39,7 +39,7 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 
 ## 路由、回执与状态
 
-所有路由在隔离 vhost 内建立，共使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
+以下单路转码路由在隔离 vhost 内使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
 
 | 路由     | 交换机                        | Routing key                | 队列                          |
 | -------- | ----------------------------- | -------------------------- | ----------------------------- |
@@ -52,11 +52,23 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 
 A 在一个 PostgreSQL 事务写入视频 job 与 outbox，落库后触发 `wakePoll()`，合并并发唤醒，每轮认领并发布最多 10 条命令。Broker 故障后的重试从 1 秒起指数退避，最多 30 秒。结果消费者成功注册且同一 Broker 完成当轮 outbox 检查和发布后恢复初始退避。相同 owner/requestId 和输入返回原 job，输入冲突返回 409。收到发布确认且消息未退回时才将 outbox 标为已送达。B 在 journal 中持久化结果事件后发布，并在完成对应结果的确认后 ACK 命令。A 验证结果并提交 inbox 去重、资产及状态后 ACK 结果。连接中断后按稳定 messageId 幂等重投。
 
-视频任务状态为 accepted、queued、running、succeeded、failed。A 对 jobId、commandId、当前 attemptId 与 attempt 序号做一致核对，以数据库条件更新；running 不能覆盖终态，旧 attempt 的 running、failed 或 succeeded 均不回退或重试当前任务。unknown 不伪装失败或成功，保留待对账且不自动增加 attempt。终态后重复同事件无副作用。视频活动任务限制每用户最多 10、全局最多 500（`mio_compute_jobs` 的 `accepted`/`queued`/`running`），并发受理时以事务维持。
+视频任务状态为 accepted、queued、running、succeeded、failed。A 对 jobId、commandId、当前 attemptId 与 attempt 序号做一致核对，以数据库条件更新；running 不能覆盖终态，旧 attempt 的 running、failed 或 succeeded 均不回退或重试当前任务。unknown 不伪装失败或成功，保留待对账且不自动增加 attempt。终态后重复同事件无副作用。`mio_compute_jobs` 的 `accepted`/`queued`/`running` 与 `mio_media_jobs` 的未终态合计每用户最多 10、全局最多 500。新增活动任务在同一 PostgreSQL 事务内先取既有准入锁，再核对幂等请求与合计配额。活动中的原任务重试复用名额，图片使用独立配额。
 
 消息由独立 broker 身份隔离：A 可发布命令和消费结果，B 可消费命令和发布结果；限制 exchange/queue/vhost 权限，远程链路使用 TLS。发布者必须设置 AMQP `userId` 为自己的专用身份，消费者要求该属性存在且等于预期，禁止授予 `impersonator`；RabbitMQ 只在该属性存在时验证它与连接身份一致。消费者还须核验本地 attempt，不能信任正文的 worker 名；凭据泄露后的伪造不由字段格式单独解决。
 
 quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式配置 `dead-letter-strategy=at-least-once`、`overflow=reject-publish`、目标 DLX 和必要 feature flag，验证目标不可用时源队列保留待转发消息。把策略降为 at-most-once 或 drop-head 可能删除尚未确认的死信，恢复和运维不得静默降级。
+
+## 通用媒体处理与 Worker 观测协议
+
+通用媒体使用共享包中 `MEDIA_PROFILE = "standard-media"` 及 [16 种操作的参数和资源类定义](../../../contracts/compute/src/media-types.ts)。请求包含 `requestId`、`operation`、有序不重复的 `inputs` 和严格的 `parameters`。沿 wire 原始 UTF-8 字节核对 256 KiB 上限，并在解码时拒绝非法 UTF-8；输入最多 64 个，内部输入快照冻结对象键、大小及 ETag。媒体操作不接收用户指定的对象键、URL、任意路径或命令。
+
+独立消息的 `version` 为整数 `1`。`media.request` 以 UUID `messageId`、`jobId`、`attemptId`、`attempt` 和 `profile` 绑定快照。`media.control` 以独立 `messageId`、`jobId`、`attemptId` 和 `action` 表达 `cancel` 或 `recover`。`media.result` 带原 `commandId`、任务/尝试身份及状态 `running`、`succeeded`、`failed`、`reconciling` 或 `cancelled`。`running` 只附合法阶段和 0–1 进度；`succeeded` 只附 2 MiB 内的 SHA-256 manifest 描述；`failed`、`reconciling` 只附对应错误枚举。manifest 最多 4096 个对象，`name`、`key`、摘要、长度与 `mio/media/<jobId>/<attemptId>/` 归属都须核对。详细业务边界见[通用媒体处理设计](media-compute.md)。
+
+`media.encode`、`media.probe`、`media.control` 绑定既有命令交换机，`media.result` 绑定既有结果交换机，目标队列分别为 `mio.compute.media.encode`、`mio.compute.media.probe`、`mio.compute.media.control`、`mio.compute.media.results`。每条队列有专属 `.dlq`，死信沿既有方向的 DLX 可靠转发。`media.probe`、`scenes.detect` 和 `audio.waveform` 使用 probe 槽，其余使用 encode 槽。B 的单路转码和音频检测从同一进程内的 `total`、`encode`、`probe` 计数准入，占用保持至收尾，默认与最低部署硬上限为 `2/1/1`。各分类与总上限分别约束。
+
+Worker 控制使用 `worker.limits.command.<instanceId>` 绑定到对应实例的独立命令队列。`worker.telemetry` 结果路由同时承载 `worker.telemetry` 和 `worker.limits.result` 两种消息。两类回报均有 `instanceId`、`bootId`、`bootSequence`、`sequence` 和采样时间；遥测可携带实际执行身份、类别、占槽、待槽、HOLD 和事件。调限命令包含正整数 `revision`、操作者、请求时间和三维上限，回报绑定 `commandId` 及所处理的 `revision`。`applied` 的 `reason` 为 null，`rejected` 的 `reason` 使用枚举。Worker 协议消息以原始 UTF-8 字节计最多 64 KiB。发布与接收仍需 AMQP 身份校验，实例归属由实际接收方与部署身份核对。详见 [RabbitMQ 契约](../../integrations/rabbitmq.md#拓扑与权限)。
+
+M1 提供协议、拓扑、资源槽和存储基础。媒体收发与恢复属于 M2；遥测采集与持久调限属于 M5。
 
 ## 历史图片链路
 
@@ -68,7 +80,7 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 
 B 每轮在 5 秒内建立消费和发布两条 AMQP 连接、通道及预取设置。收到停止信号时终止尚未完成的建立和重连等待。连接可用后，停机先停止接纳新命令，等待已接纳的 handler 和正在运行的 journal 对账完成。随后关闭 AMQP 连接，等待关闭回执最多 5 秒。
 
-每个 attempt 在启动 FFmpeg 前持久写 launch intent，并且同一 attempt 最多 spawn 一次。A 最多创建三个 attempt；保守记账可能在 intent 已写但尚未证明 spawn 时消耗一次，不承诺恰好执行三次。`PROCESS_UNKNOWN` 时停止所有新计算 admission，包括新命令和重投，直到确认旧 FFmpeg 已终止，维持单实例并发 1。若 journal 已持久记录 PID，须核对同一宿主、boot 和进程命名空间，并确认该 PID 不存在；PID 仍存在或身份无法核对则继续 HOLD。若崩溃发生在 PID 落盘前，只能由可证明覆盖该进程的隔离运行时记录或人工核实；worker 或容器重启自身不能当作进程已结束的证明。确认后才能报告 interrupted，由 A 决定是否创建下一个 attempt。
+每个 attempt 在启动 FFmpeg 前持久写 launch intent，并且同一 attempt 最多 spawn 一次。A 最多创建三个 attempt；保守记账可能在 intent 已写但尚未证明 spawn 时消耗一次，不承诺恰好执行三次。`PROCESS_UNKNOWN` 时对应的 encode 类进入 HOLD，包括同类新命令与重投，直到确认旧 FFmpeg 已终止。独立的 probe 类保留自己的名额。已保存的旧 output 仍可按原键核验和恢复上传，这些对账操作计入容量且不重新启动 FFmpeg。若 journal 已持久记录 PID，须核对同一宿主、boot 和进程命名空间，并确认该 PID 不存在；PID 仍存在或身份无法核对则继续 HOLD。若崩溃发生在 PID 落盘前，只能由可证明覆盖该进程的隔离运行时记录或人工核实；worker 或容器重启自身不能当作进程已结束的证明。确认后才能报告 interrupted，由 A 决定是否创建下一个 attempt。
 
 每个视频 attempt 使用上述固定 derived 键。B 先持久化输出文件、长度和 SHA-256，再发带禁止覆盖头的 PUT；成功或结果未知后均 HEAD 同一键。上传结果未知且对象存在时 GET 同一键、流式重算 SHA-256 和长度再认领；不存在时仅用已持久输出重传同一键。同一进程中若 SDK PUT 因本地等待超时而仍未结束，对账须等待该请求真正结束，不能同时再次查询或写同一键；进程崩溃后只能按同键和摘要重新核验，不能声称旧请求已取消。对象内容不匹配、旧进程仍可能写入或本地输出丢失时保持 unknown，不无条件重新计算或更换键。unknown 事件持久并确认发布后可以 ACK 命令，但 journal 和必要本地文件必须保留；B 启动及有界定时对账可继续同一 attempt，解决后发布新的稳定事件，不能依赖已 ACK 消息再次投递。对账与命令重投共用 journal 排他控制，每次最多处理一个 attempt，定时扫描和失败退避须有界，不能并发对同一键恢复。
 

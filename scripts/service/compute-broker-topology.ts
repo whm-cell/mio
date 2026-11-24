@@ -6,9 +6,21 @@ import {
   COMMAND_EXCHANGE,
   COMMAND_QUEUE,
   COMMAND_ROUTING_KEY,
+  MEDIA_CONTROL_QUEUE,
+  MEDIA_CONTROL_ROUTING_KEY,
+  MEDIA_ENCODE_QUEUE,
+  MEDIA_ENCODE_ROUTING_KEY,
+  MEDIA_PROBE_QUEUE,
+  MEDIA_PROBE_ROUTING_KEY,
+  MEDIA_RESULT_QUEUE,
+  MEDIA_RESULT_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_QUEUE,
   RESULT_ROUTING_KEY,
+  WORKER_TELEMETRY_QUEUE,
+  WORKER_TELEMETRY_ROUTING_KEY,
+  workerControlQueue,
+  workerControlRoutingKey,
 } from '@mio/compute-contracts';
 
 const commandDlx = 'mio.compute.commands.dlx.v1';
@@ -17,21 +29,47 @@ const commandDlq = 'mio.compute.commands.dlq.v1';
 const resultDlq = 'mio.compute.results.dlq.v1';
 const audioDlq = 'mio.compute.audio.commands.dlq.v1';
 export const computeExchanges = [COMMAND_EXCHANGE, RESULT_EXCHANGE, commandDlx, resultDlx] as const;
-export const computeDeadLetters = new Map([
+const sharedDeadLetters = new Map([
   [COMMAND_QUEUE, { exchange: commandDlx, queue: commandDlq, routingKey: 'transcode.dead.v1' }],
   [RESULT_QUEUE, { exchange: resultDlx, queue: resultDlq, routingKey: 'transcode.result.dead.v1' }],
   [
     AUDIO_COMMAND_QUEUE,
     { exchange: commandDlx, queue: audioDlq, routingKey: 'audio.inspect.dead.v1' },
   ],
+  ...(
+    [
+      [MEDIA_ENCODE_QUEUE, commandDlx, 'media.encode.dead'],
+      [MEDIA_PROBE_QUEUE, commandDlx, 'media.probe.dead'],
+      [MEDIA_CONTROL_QUEUE, commandDlx, 'media.control.dead'],
+      [MEDIA_RESULT_QUEUE, resultDlx, 'media.result.dead'],
+      [WORKER_TELEMETRY_QUEUE, resultDlx, 'worker.telemetry.dead'],
+    ] as const
+  ).map(
+    ([queue, exchange, routingKey]) =>
+      [queue, { exchange, queue: `${queue}.dlq`, routingKey }] as const,
+  ),
 ]);
-export const computeQueues = [
-  ...computeDeadLetters.keys(),
-  commandDlq,
-  resultDlq,
-  audioDlq,
-  AUDIO_RESULT_QUEUE,
-];
+
+export function computeDeadLetters(workerInstanceIds: readonly string[] = []) {
+  const deadLetters = new Map(sharedDeadLetters);
+  for (const id of workerInstanceIds) {
+    deadLetters.set(workerControlQueue(id), {
+      exchange: commandDlx,
+      queue: `mio.compute.worker.control-dlq.${id}`,
+      routingKey: `worker.limits.dead.${id}`,
+    });
+  }
+  return deadLetters;
+}
+
+export function computeQueues(deadLetters = sharedDeadLetters): string[] {
+  return [
+    ...deadLetters.keys(),
+    ...Array.from(deadLetters.values(), (route) => route.queue),
+    AUDIO_RESULT_QUEUE,
+  ];
+}
+
 export const computeCapacity = { 'max-length-bytes': 1073741824, overflow: 'reject-publish' };
 
 const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -46,9 +84,18 @@ export const audioResultPolicy = {
   },
 };
 
-export function computePermissions(role: 'a' | 'b') {
+export function computePermissions(role: 'a' | 'b', workerInstanceId?: string) {
   const a = role === 'a';
-  const readable = a ? [RESULT_QUEUE, AUDIO_RESULT_QUEUE] : [COMMAND_QUEUE, AUDIO_COMMAND_QUEUE];
+  const readable = a
+    ? [RESULT_QUEUE, AUDIO_RESULT_QUEUE, MEDIA_RESULT_QUEUE, WORKER_TELEMETRY_QUEUE]
+    : [
+        COMMAND_QUEUE,
+        AUDIO_COMMAND_QUEUE,
+        MEDIA_ENCODE_QUEUE,
+        MEDIA_PROBE_QUEUE,
+        MEDIA_CONTROL_QUEUE,
+      ];
+  if (!a && workerInstanceId !== undefined) readable.push(workerControlQueue(workerInstanceId));
   return {
     configure: '^$',
     write: `^${escape(a ? COMMAND_EXCHANGE : RESULT_EXCHANGE)}$`,
@@ -57,7 +104,8 @@ export function computePermissions(role: 'a' | 'b') {
 }
 
 /** Shared by one-time isolated probes and persistent local environments. No runtime declarations. */
-export function computeTopology(vhost: string) {
+export function computeTopology(vhost: string, workerInstanceIds: readonly string[] = []) {
+  const deadLetters = computeDeadLetters(workerInstanceIds);
   const scope = encodeURIComponent(vhost);
   const resources: { method: 'PUT' | 'POST'; path: string; body: Record<string, unknown> }[] = [];
   for (const exchange of computeExchanges)
@@ -72,8 +120,8 @@ export function computeTopology(vhost: string) {
         arguments: {},
       },
     });
-  for (const queue of computeQueues) {
-    const deadLetter = computeDeadLetters.get(queue);
+  for (const queue of computeQueues(deadLetters)) {
+    const deadLetter = deadLetters.get(queue);
     const args =
       queue === AUDIO_RESULT_QUEUE
         ? {
@@ -105,8 +153,15 @@ export function computeTopology(vhost: string) {
     [RESULT_EXCHANGE, RESULT_QUEUE, RESULT_ROUTING_KEY],
     [COMMAND_EXCHANGE, AUDIO_COMMAND_QUEUE, AUDIO_COMMAND_ROUTING_KEY],
     [RESULT_EXCHANGE, AUDIO_RESULT_QUEUE, AUDIO_RESULT_ROUTING_KEY],
+    [COMMAND_EXCHANGE, MEDIA_ENCODE_QUEUE, MEDIA_ENCODE_ROUTING_KEY],
+    [COMMAND_EXCHANGE, MEDIA_PROBE_QUEUE, MEDIA_PROBE_ROUTING_KEY],
+    [COMMAND_EXCHANGE, MEDIA_CONTROL_QUEUE, MEDIA_CONTROL_ROUTING_KEY],
+    [RESULT_EXCHANGE, MEDIA_RESULT_QUEUE, MEDIA_RESULT_ROUTING_KEY],
+    [RESULT_EXCHANGE, WORKER_TELEMETRY_QUEUE, WORKER_TELEMETRY_ROUTING_KEY],
   ];
-  for (const deadLetter of computeDeadLetters.values())
+  for (const id of workerInstanceIds)
+    bindings.push([COMMAND_EXCHANGE, workerControlQueue(id), workerControlRoutingKey(id)]);
+  for (const deadLetter of deadLetters.values())
     bindings.push([deadLetter.exchange, deadLetter.queue, deadLetter.routingKey]);
   for (const [exchange, queue, routingKey] of bindings)
     resources.push({

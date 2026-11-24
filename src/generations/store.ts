@@ -19,6 +19,8 @@ import type {
 } from './execution.ts';
 import { GenerationError } from './errors.ts';
 import { checkGenerationSchema } from './schema.ts';
+import { VideoGenerationStore } from './video-store.ts';
+import { transaction } from './transaction.ts';
 
 const log = createLogger('app', 'generation-store');
 const QUOTA_LOCK = 672049924;
@@ -62,21 +64,6 @@ async function findImageRequest(
   ).rows[0];
 }
 
-async function transaction<T>(pool: Pool, run: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await run(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 async function capacity(client: PoolClient, owner: string): Promise<void> {
   const result = await client.query<{ all_count: string; owner_count: string }>(
     "SELECT count(*) AS all_count,count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_image_jobs WHERE state IN ('accepted','materializing')",
@@ -96,11 +83,17 @@ const selection = `SELECT j.id,j.owner_id,j.state,j.command,j.admitted,j.active_
 
 export class GenerationStore {
   private readonly pool: Pool;
+  private readonly videos: VideoGenerationStore;
   private executor: PoolClient | undefined;
   private executorFailure: (() => void) | undefined;
 
   constructor(pool: Pool) {
     this.pool = pool;
+    this.videos = new VideoGenerationStore(pool);
+  }
+
+  videoStore() {
+    return this.videos;
   }
 
   async startExecutor(onLost: () => void): Promise<void> {

@@ -13,8 +13,15 @@ import {
   COMPUTE_MAX_MESSAGE_BYTES,
   RESULT_QUEUE,
   parseComputeResultV1,
+  parseVideoProbeResultV1,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  ComputeResultV1,
+  VideoProbeCommandV1,
+  VideoProbeResultV1,
+} from '@mio/compute-contracts';
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -196,7 +203,7 @@ export class ComputeBroker {
     }
   }
 
-  async publish(message: ComputeCommandV1): Promise<void> {
+  async publish(message: ComputeCommandV1 | VideoProbeCommandV1): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
@@ -206,7 +213,8 @@ export class ComputeBroker {
     let onDrain: (() => void) | undefined;
     try {
       let drain: Promise<void> = Promise.resolve();
-      const routingKey = COMMAND_ROUTING_KEY;
+      const routingKey =
+        message.type === 'video.probe' ? VIDEO_PROBE_COMMAND_ROUTING_KEY : COMMAND_ROUTING_KEY;
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.publisher.publish(
           COMMAND_EXCHANGE,
@@ -245,6 +253,7 @@ export class ComputeBroker {
   async consume(
     handle: (result: ComputeResultV1) => Promise<void>,
     failed: () => void,
+    handleProbe?: (result: VideoProbeResultV1) => Promise<void>,
   ): Promise<void> {
     await untilAborted(
       this.consumer.consume(
@@ -255,7 +264,7 @@ export class ComputeBroker {
             failed();
             return;
           }
-          let result: ComputeResultV1;
+          let result: ComputeResultV1 | VideoProbeResultV1;
           try {
             if (
               message.properties.userId !== this.expectedUserId ||
@@ -266,7 +275,10 @@ export class ComputeBroker {
             const value: unknown = JSON.parse(
               new TextDecoder('utf-8', { fatal: true }).decode(message.content),
             );
-            result = parseComputeResultV1(value);
+            result =
+              (value as { type?: unknown })?.type === 'video.probe.result'
+                ? parseVideoProbeResultV1(value)
+                : parseComputeResultV1(value);
             if (message.properties.messageId !== result.messageId)
               throw new Error('RESULT_ID_MISMATCH');
           } catch {
@@ -280,7 +292,11 @@ export class ComputeBroker {
           let shouldFail = false;
           const task = (async () => {
             try {
-              await handle(result);
+              if (result.type === 'video.probe.result') {
+                if (!handleProbe)
+                  throw Object.assign(new Error('VIDEO_PROBE_UNAVAILABLE'), { permanent: true });
+                await handleProbe(result);
+              } else await handle(result);
             } catch (error) {
               if (!this.lifecycle.closed) {
                 if ((error as { permanent?: boolean })?.permanent) {

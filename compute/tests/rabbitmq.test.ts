@@ -7,8 +7,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, expect, it, vi } from 'vitest';
-import { COMPUTE_PROFILE, parseComputeCommandV1 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import {
+  COMPUTE_PROFILE,
+  parseComputeCommandV1,
+  parseVideoProbeResultV1,
+} from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  ComputeResultV1,
+  VideoProbeCommandV1,
+} from '@mio/compute-contracts';
 import type { ConsumeMessage } from 'amqplib';
 import { Journal } from '../src/adapters/journal.ts';
 import { paths, processIdentity } from '../src/adapters/media.ts';
@@ -120,6 +128,32 @@ function delivery(): ConsumeMessage {
   return {
     content: Buffer.from(JSON.stringify(command)),
     properties: { userId: 'app-a', contentType: 'application/json', messageId: command.messageId },
+  } as ConsumeMessage;
+}
+
+function videoProbeDelivery(): ConsumeMessage {
+  const jobId = randomUUID();
+  const outputIndex = 0;
+  const attemptId = randomUUID();
+  const messageId = randomUUID();
+  const command: VideoProbeCommandV1 = {
+    version: 1,
+    type: 'video.probe',
+    messageId,
+    jobId,
+    outputIndex,
+    attemptId,
+    attempt: 1,
+    source: {
+      stagingKey: `mio/staging/video/${jobId}/${outputIndex}/${attemptId}.media`,
+      sizeBytes: 1,
+      etag: '"staging"',
+      sha256: 'a'.repeat(64),
+    },
+  };
+  return {
+    content: Buffer.from(JSON.stringify(command)),
+    properties: { userId: 'app-a', contentType: 'application/json', messageId },
   } as ConsumeMessage;
 }
 
@@ -718,5 +752,52 @@ it('rejects retired image recovery commands before entering a heavy-media handle
   expect(consumer.reject).toHaveBeenCalledWith(message, false);
   expect(handle).not.toHaveBeenCalled();
   expect(failed).not.toHaveBeenCalled();
+  await broker.close();
+});
+
+it('dispatches video.probe v1 to its dedicated handler without entering transcode', async () => {
+  const { Broker, consumer } = await fixture();
+  const broker = await Broker.connect('amqp://localhost', 'worker-b', 'app-a');
+  const transcode = vi.fn(async (_command: ComputeCommandV1, ack: () => void) => ack());
+  const probe = vi.fn(async (_command: VideoProbeCommandV1, ack: () => void) => ack());
+  const failed = vi.fn();
+  await broker.consume(transcode, failed, () => true, probe);
+  const message = videoProbeDelivery();
+  consumer.deliver(message);
+  await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce());
+  expect(transcode).not.toHaveBeenCalled();
+  expect(probe.mock.calls[0]?.[0].source.stagingKey).toContain('mio/staging/video/');
+  await vi.waitFor(() => expect(consumer.ack).toHaveBeenCalledWith(message));
+  expect(consumer.reject).not.toHaveBeenCalled();
+  expect(failed).not.toHaveBeenCalled();
+  await broker.close();
+});
+
+it('publishes video.probe results on their separate v1 routing key', async () => {
+  const { Broker, publisher } = await fixture();
+  const broker = await Broker.connect('amqp://localhost', 'worker-b', 'app-a');
+  publisher.publish.mockImplementation((...args) => {
+    const confirm = args.at(-1) as (error: null) => void;
+    confirm(null);
+    return true;
+  });
+  const command = videoProbeDelivery();
+  const request = JSON.parse(command.content.toString('utf8')) as VideoProbeCommandV1;
+  const result = parseVideoProbeResultV1({
+    version: 1,
+    type: 'video.probe.result',
+    messageId: randomUUID(),
+    commandId: request.messageId,
+    jobId: request.jobId,
+    outputIndex: request.outputIndex,
+    attemptId: request.attemptId,
+    attempt: request.attempt,
+    source: request.source,
+    state: 'failed',
+    errorCode: 'SOURCE_INVALID',
+  });
+  await broker.publishVideoProbe(result);
+  expect(publisher.publish.mock.calls[0]?.[0]).toBe('mio.compute.results.v1');
+  expect(publisher.publish.mock.calls[0]?.[1]).toBe('video.probe.result.v1');
   await broker.close();
 });

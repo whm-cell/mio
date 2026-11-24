@@ -34,6 +34,10 @@ export class MediaError extends ApplicationError<
   | 'OUTPUT_INVALID'
   | 'EXECUTION_TIMEOUT'
   | 'DISK_FULL'
+  | 'SOURCE_INVALID'
+  | 'SOURCE_TOO_LARGE'
+  | 'SOURCE_CHANGED'
+  | 'PROBE_FAILED'
 > {
   constructor(code: MediaError['code']) {
     super(code);
@@ -91,6 +95,23 @@ export function paths(
   };
 }
 
+export function probePath(directory: string, messageId: string): string {
+  if (!isUuidV4(messageId)) throw new Error('VIDEO_PROBE_ID_INVALID');
+  return join(resolve(directory), `.video-probe-${messageId}.media`);
+}
+
+/** Remove only the regular probe file derived from a UUID in the private worker directory. */
+export function removeProbeFile(directory: string, messageId: string): void {
+  const path = probePath(directory, messageId);
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('VIDEO_PROBE_FILE_INVALID');
+    rmSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
 function directoryBytes(path: string): number {
   let size = 0;
   for (const entry of readdirSync(path)) {
@@ -107,6 +128,24 @@ export function requireSpace(directory: string): void {
   if (directoryBytes(directory) >= MAX_DIRECTORY_BYTES || fs.bavail * fs.bsize < MIN_FREE_BYTES) {
     throw new MediaError('DISK_FULL');
   }
+}
+
+/** Reserve both the worker-directory budget and filesystem safety margin before a probe download. */
+export function requireProbeSpace(directory: string, expectedBytes: number): void {
+  if (
+    !Number.isSafeInteger(expectedBytes) ||
+    expectedBytes < 1 ||
+    expectedBytes > COMPUTE_MAX_MEDIA_BYTES
+  )
+    throw new MediaError(
+      expectedBytes > COMPUTE_MAX_MEDIA_BYTES ? 'SOURCE_TOO_LARGE' : 'SOURCE_INVALID',
+    );
+  const fs = statfsSync(directory);
+  if (
+    directoryBytes(directory) + expectedBytes > MAX_DIRECTORY_BYTES ||
+    fs.bavail * fs.bsize < MIN_FREE_BYTES + expectedBytes
+  )
+    throw new MediaError('DISK_FULL');
 }
 
 export function processIdentity(): string | null {
@@ -212,6 +251,57 @@ export async function drainInput(
   finishInput(directory, attemptId);
 }
 
+/** Stream a private staging object to a private temporary file and verify actual bytes/digest. */
+export async function drainProbeInput(
+  source: Readable,
+  directory: string,
+  messageId: string,
+  expectedSize: number,
+  expectedSha256: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (
+    !Number.isSafeInteger(expectedSize) ||
+    expectedSize < 1 ||
+    expectedSize > COMPUTE_MAX_MEDIA_BYTES ||
+    !/^[a-f0-9]{64}$/.test(expectedSha256)
+  ) {
+    source.destroy();
+    throw new MediaError(
+      expectedSize > COMPUTE_MAX_MEDIA_BYTES ? 'SOURCE_TOO_LARGE' : 'SOURCE_INVALID',
+    );
+  }
+  const path = probePath(directory, messageId);
+  removeProbeFile(directory, messageId);
+  const hash = createHash('sha256');
+  let received = 0;
+  const { Transform } = await import('node:stream');
+  const inspect = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (received > expectedSize || received > COMPUTE_MAX_MEDIA_BYTES) {
+        callback(new MediaError('SOURCE_TOO_LARGE'));
+        return;
+      }
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  try {
+    await pipeline(source, inspect, createWriteStream(path, { flags: 'wx', mode: 0o600 }), {
+      signal,
+    });
+    const sha256 = hash.digest('hex');
+    if (received !== expectedSize || sha256 !== expectedSha256)
+      throw new MediaError('SOURCE_CHANGED');
+    return path;
+  } catch (error) {
+    removeProbeFile(directory, messageId);
+    if (signal.aborted) throw new MediaError('EXECUTION_TIMEOUT');
+    throw error;
+  }
+}
+
 type ProcessResult = { stdout: string; exitCode: number | null; aborted: boolean };
 
 async function runProcess(
@@ -255,6 +345,7 @@ async function runProcess(
 
 interface Probe {
   duration: number;
+  container: string;
   streams: {
     codec_type?: string;
     codec_name?: string;
@@ -303,7 +394,7 @@ async function probe(path: string, signal: AbortSignal): Promise<Probe> {
       '-format_whitelist',
       'mov,matroska,webm,avi,mpegts',
       '-show_entries',
-      'format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate:stream_side_data=rotation:stream_tags=rotate',
+      'format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate:stream_side_data=rotation:stream_tags=rotate',
       '-of',
       'json',
       path,
@@ -313,16 +404,75 @@ async function probe(path: string, signal: AbortSignal): Promise<Probe> {
   if (result.aborted) throw new MediaError('EXECUTION_TIMEOUT');
   if (result.exitCode !== 0) throw new MediaError('INPUT_INVALID');
   const value = JSON.parse(result.stdout) as {
-    format?: { duration?: string };
+    format?: { duration?: string; format_name?: string };
     streams?: Probe['streams'];
   };
   const duration = Number(value.format?.duration);
-  if (!Number.isFinite(duration) || duration <= 0 || !Array.isArray(value.streams))
+  if (
+    !Number.isFinite(duration) ||
+    duration <= 0 ||
+    typeof value.format?.format_name !== 'string' ||
+    value.format.format_name.length > 128 ||
+    !Array.isArray(value.streams)
+  )
     throw new MediaError('INPUT_INVALID');
   if (duration > 1800) throw new MediaError('INPUT_TOO_LONG');
   if (!value.streams.some((stream) => stream.codec_type === 'video'))
     throw new MediaError('INPUT_INVALID');
-  return { duration, streams: value.streams };
+  return { duration, container: value.format.format_name, streams: value.streams };
+}
+
+export interface VideoProbeMetadata {
+  container: string;
+  videoCodec: string;
+  width: number;
+  height: number;
+  durationSeconds: number;
+  hasAudio: boolean;
+  audioCodec: string | null;
+}
+
+/** Probe fixed local media paths with the worker's bounded ffprobe invocation. */
+export async function probeVideoFile(
+  path: string,
+  signal: AbortSignal,
+): Promise<VideoProbeMetadata> {
+  try {
+    const media = await probe(path, signal);
+    const video = media.streams.find((stream) => stream.codec_type === 'video');
+    const size = displaySize(video);
+    if (
+      !video?.codec_name ||
+      video.codec_name.length > 128 ||
+      !/^[A-Za-z0-9_,.+-]+$/.test(video.codec_name) ||
+      !size ||
+      size.width > 65536 ||
+      size.height > 65536
+    )
+      throw new MediaError('SOURCE_INVALID');
+    const audio = media.streams.find((stream) => stream.codec_type === 'audio');
+    const audioCodec = audio?.codec_name ?? null;
+    if (audioCodec !== null && (audioCodec.length > 128 || !/^[A-Za-z0-9_,.+-]+$/.test(audioCodec)))
+      throw new MediaError('SOURCE_INVALID');
+    if (media.container.length === 0 || !/^[A-Za-z0-9_,.+-]+$/.test(media.container))
+      throw new MediaError('SOURCE_INVALID');
+    return {
+      container: media.container,
+      videoCodec: video.codec_name,
+      width: size.width,
+      height: size.height,
+      durationSeconds: media.duration,
+      hasAudio: Boolean(audio),
+      audioCodec,
+    };
+  } catch (error) {
+    if (error instanceof MediaError) {
+      if (error.code === 'INPUT_INVALID') throw new MediaError('SOURCE_INVALID');
+      if (error.code === 'INPUT_TOO_LONG') throw new MediaError('SOURCE_INVALID');
+      throw error;
+    }
+    throw new MediaError('PROBE_FAILED');
+  }
 }
 
 export async function transcode(

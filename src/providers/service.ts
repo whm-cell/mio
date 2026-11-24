@@ -1,5 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
+import { createHash } from 'node:crypto';
+import type { VideoCapabilitiesView } from '../generations/video-contracts.ts';
 import { ProviderError, categories } from './contracts.ts';
 import type {
   Category,
@@ -11,6 +13,7 @@ import type {
   RouteRevisionActor,
   VerificationSnapshot,
   AccountCredentialSnapshot,
+  VideoAdmissionSnapshot,
 } from './contracts.ts';
 import type { ProviderConfig } from './config.ts';
 import type { ProviderStore, SettingsPatch, ModelPatch } from './store.ts';
@@ -23,8 +26,8 @@ import {
 } from './credentials.ts';
 import {
   catalogView,
-  findCatalogModel,
   findModel,
+  indexCatalogModels,
   indexEffectiveImageRoutes,
   membershipError,
   resolveEffectiveChat,
@@ -32,15 +35,24 @@ import {
   modelReference,
   legacyReference,
 } from './catalog.ts';
-import { deriveImageParameterView } from './onelink/router.ts';
+import { deriveImageParameterView, resolveVideoRoute } from './onelink/router.ts';
+import { videoModeParameters, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { discoverModels, DiscoveryError } from '../integrations/onelink/models.ts';
 import type { ModelTransport, DiscoveredModel } from '../integrations/onelink/models.ts';
+
+/** A declaration alone never enables execution; drivers enter this set after runtime support lands. */
+
+const VIDEO_UNAVAILABLE_REASONS = new Set(['MODEL_NOT_FOUND', 'MODEL_HIDDEN', 'MODEL_REMOVED']);
+function capabilityVersion(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('base64url');
+}
 
 /** Discovery is explicit; reads and model admission never issue a supplier request. */
 export function createProviderService(
   store: ProviderStore,
   config: ProviderConfig,
   transport?: ModelTransport,
+  videoRuntime = false,
 ) {
   const cancellation = new AbortController();
   const active = new Set<Promise<Discovery>>();
@@ -50,6 +62,72 @@ export function createProviderService(
       throw new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
   };
   const whitelist = Boolean(config.catalogWhitelist);
+  const videoState = async (actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) => {
+    assertOpen();
+    const row = await store.state(actor.userId, false);
+    assertOpen();
+    if (!row) {
+      return {
+        row: null,
+        model: undefined,
+        route: undefined,
+        preference: undefined,
+        reason: 'PROVIDER_NOT_CONFIGURED',
+        capabilitiesVersion: capabilityVersion(['video-capabilities-v1', modelRef, 'unavailable']),
+      };
+    }
+    const model = findModel(row.models, modelRef);
+    const membershipReason = membershipError(row, model, whitelist);
+    if (membershipReason && VIDEO_UNAVAILABLE_REASONS.has(membershipReason)) {
+      return {
+        row,
+        model: undefined,
+        route: undefined,
+        preference: undefined,
+        reason: 'MODEL_NOT_AVAILABLE',
+        capabilitiesVersion: capabilityVersion(['video-capabilities-v1', modelRef, 'unavailable']),
+      };
+    }
+    const declaredRoute = model?.raw_model_id
+      ? row.routes?.find(
+          (item) => item.raw_model_id === model.raw_model_id && item.operation === 'video.generate',
+        )
+      : undefined;
+    const route = declaredRoute ? resolveVideoRoute(declaredRoute) : undefined;
+    const preference = model
+      ? row.preferences.find((item) => item.model_key === model.model_key && item.usage === 'video')
+      : undefined;
+    const reason =
+      membershipReason ??
+      (!route
+        ? 'ROUTE_NOT_CONFIGURED'
+        : !route.enabled
+          ? 'MODEL_ROUTE_DISABLED'
+          : preference?.enabled === false
+            ? 'MODEL_DISABLED'
+            : !videoRuntime || !videoRouteRuntimeAvailable(route.route)
+              ? 'ADAPTER_PENDING'
+              : null);
+    const version = capabilityVersion([
+      'video-capabilities-v1',
+      row.id,
+      row.revision,
+      row.enabled,
+      row.credential_version,
+      row.credential_auth_state,
+      row.catalog_version,
+      row.catalog_credential_version,
+      row.catalog_succeeded_at?.toISOString() ?? null,
+      model?.model_key ?? null,
+      model?.membership_state ?? null,
+      model?.credential_version ?? null,
+      model?.catalog_version ?? null,
+      route ? [route.profile, route.enabled, route.declarationVersion, route.route] : null,
+      preference?.enabled ?? true,
+      row.default_video_watermark,
+    ]);
+    return { row, model, route, preference, reason, capabilitiesVersion: version };
+  };
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
     const row = await store.state(actor.userId, false);
@@ -188,6 +266,60 @@ export function createProviderService(
       assertOpen();
       return decryptCredentialSnapshot(ownerId, snapshot, config);
     },
+    async videoCapabilities(
+      actor: Pick<ProviderPrincipal, 'userId'>,
+      modelRef: string,
+    ): Promise<VideoCapabilitiesView> {
+      const { route, reason, capabilitiesVersion } = await videoState(actor, modelRef);
+      const modes =
+        route?.route.paramSpec.supportedModes.map((mode) => {
+          const parameters = videoModeParameters(route.route, mode);
+          return {
+            mode,
+            supported: videoRuntime && reason === null && videoRouteRuntimeAvailable(route.route),
+            ...(parameters ? { parameters } : {}),
+          };
+        }) ?? [];
+      return {
+        modelRef,
+        capabilitiesVersion,
+        available: reason === null,
+        unavailableReason: reason,
+        modes,
+        cancellation: { supported: false },
+      };
+    },
+    async snapshotVideo(
+      actor: Pick<ProviderPrincipal, 'userId'>,
+      modelRef: string,
+    ): Promise<VideoAdmissionSnapshot> {
+      const { row, model, route, reason, capabilitiesVersion } = await videoState(actor, modelRef);
+      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+      if (!row || !model || !route || !videoRuntime || !videoRouteRuntimeAvailable(route.route))
+        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+      const frozenRoute = Object.freeze({
+        ...route.route,
+        paramSpec: Object.freeze(structuredClone(route.route.paramSpec)),
+        requestDefaults: Object.freeze({}),
+        outputSpec: Object.freeze({}),
+      });
+      const credentialSnapshot = serializeCredentialSnapshot(row);
+      return Object.freeze({
+        ...credentialSnapshot,
+        credential: Object.freeze({ ...credentialSnapshot.credential }),
+        modelRef: modelReference(model.model_key),
+        modelId: model.raw_model_id!,
+        modelKey: model.model_key,
+        vendor: route.vendor,
+        profile: route.profile,
+        route: frozenRoute,
+        defaultVideoWatermark: row.default_video_watermark,
+        providerRevision: row.revision,
+        catalogVersion: row.catalog_version!,
+        adaptationVersion: route.declarationVersion,
+        capabilitiesVersion,
+      });
+    },
     /** Resolve only the current owner's credential for an already admitted task. */
     async resolveImageTaskCredential(ownerId: string) {
       assertOpen();
@@ -209,6 +341,7 @@ export function createProviderService(
       if (providerReason && providerReason !== 'MODEL_NOT_FOUND')
         throw new ProviderError(HTTP_STATUS.CONFLICT, providerReason);
       const indexedRoutes = indexEffectiveImageRoutes(row.routes);
+      const catalogByRawId = indexCatalogModels(row.catalog_models);
       const disabledKeys = new Set(
         row.preferences
           .filter((pref) => pref.usage === 'image' && !pref.enabled)
@@ -216,7 +349,10 @@ export function createProviderService(
       );
       const models = [];
       for (const model of row.models) {
-        if (membershipError(row, model, whitelist) !== null || disabledKeys.has(model.model_key))
+        if (
+          membershipError(row, model, whitelist, catalogByRawId) !== null ||
+          disabledKeys.has(model.model_key)
+        )
           continue;
         const adaptation = resolveEffectiveImage(row, model, indexedRoutes);
         if (!adaptation || !adaptation.asyncReady) continue;
@@ -226,7 +362,7 @@ export function createProviderService(
           modelId: model.raw_model_id!,
           name:
             model.display_name ??
-            findCatalogModel(row.catalog_models, model.raw_model_id)?.display_label ??
+            catalogByRawId.get(model.raw_model_id!)?.display_label ??
             model.raw_model_id!,
           vendor: adaptation.vendor,
           driver: adaptation.profile,
@@ -301,7 +437,7 @@ export function createProviderService(
     deleteRoutes(
       rawModelId: string,
       actor: RouteRevisionActor,
-      operation?: 'chat' | 'image.generate',
+      operation?: 'chat' | 'image.generate' | 'video.generate',
     ) {
       assertOpen();
       return store.deleteRoutes(rawModelId, actor, operation);
@@ -332,7 +468,7 @@ export function createProviderService(
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'MODEL_USAGE_REQUIRED');
       return store.preference(actor.userId, expected, modelRef, usage, patch);
     },
-    async catalog(actor: ProviderPrincipal, category?: string) {
+    async catalog(actor: Pick<ProviderPrincipal, 'userId'>, category?: string) {
       assertOpen();
       if (category !== undefined && !categories.includes(category as Category))
         throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
@@ -340,6 +476,7 @@ export function createProviderService(
         await store.state(actor.userId),
         category as Category | undefined,
         whitelist,
+        videoRuntime,
       );
     },
     async discover(actor: ProviderPrincipal) {

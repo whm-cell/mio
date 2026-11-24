@@ -2,6 +2,7 @@ import { isAbsolute } from 'node:path';
 
 export interface GenerationConfig {
   dataDirectory: string;
+  videoEnabled?: boolean;
 }
 
 /** Generation admission and its recovery directory are explicit, independent of B and MQ. */
@@ -14,5 +15,10 @@ export function readGenerationConfig(
   const dataDirectory = env.MIO_GENERATIONS_DATA_DIR;
   if (!dataDirectory || !isAbsolute(dataDirectory))
     throw new Error('GENERATION_CONFIG: an absolute persistent directory is required');
-  return { dataDirectory };
+  if (
+    env.MIO_VIDEO_GENERATIONS_ENABLED !== undefined &&
+    env.MIO_VIDEO_GENERATIONS_ENABLED !== 'true'
+  )
+    throw new Error('GENERATION_CONFIG: video enabled must be true');
+  return { dataDirectory, videoEnabled: env.MIO_VIDEO_GENERATIONS_ENABLED === 'true' };
 }

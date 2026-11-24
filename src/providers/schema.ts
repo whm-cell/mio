@@ -122,6 +122,122 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_routes (
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (provider_type, raw_model_id, operation)
 );
+DO $$
+DECLARE
+  target_table regclass;
+  rec record;
+BEGIN
+  FOREACH target_table IN ARRAY ARRAY['mio_provider_model_routes'::regclass] LOOP
+    FOR rec IN
+      SELECT conname FROM pg_constraint
+      WHERE conrelid = target_table AND contype = 'c'
+        AND position('operation' in pg_get_constraintdef(oid)) > 0
+        AND position('image.generate' in pg_get_constraintdef(oid)) > 0
+        AND position('video.generate' in pg_get_constraintdef(oid)) = 0
+    LOOP
+      EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', target_table, rec.conname);
+    END LOOP;
+  END LOOP;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_routes'::regclass
+      AND conname='mio_provider_model_routes_operation_v1_check'
+  ) THEN
+    ALTER TABLE mio_provider_model_routes ADD CONSTRAINT mio_provider_model_routes_operation_v1_check
+      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
+  END IF;
+  FOR rec IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid='mio_provider_model_routes'::regclass AND contype='c'
+      AND conname IN (
+        'mio_provider_model_routes_submit_path_check'
+      )
+  LOOP
+    EXECUTE format('ALTER TABLE mio_provider_model_routes DROP CONSTRAINT %I', rec.conname);
+  END LOOP;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_routes'::regclass
+      AND conname='mio_provider_model_routes_submit_path_safe_check'
+  ) THEN
+    ALTER TABLE mio_provider_model_routes ADD CONSTRAINT mio_provider_model_routes_submit_path_safe_check
+      CHECK (
+        char_length(submit_path) BETWEEN 2 AND 256
+        AND submit_path ~ '^/[A-Za-z0-9._:/{}-]+$'
+        AND position('..' in submit_path) = 0
+        AND position('//' in submit_path) = 0
+        AND (position(':' in submit_path) = 0 OR submit_path = '/v1beta/models/{model}:predictLongRunning')
+      ) NOT VALID;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_routes'::regclass
+      AND conname='mio_provider_model_routes_video_route_check'
+      AND position('parameters' in pg_get_constraintdef(oid))=0
+  ) THEN
+    ALTER TABLE mio_provider_model_routes DROP CONSTRAINT mio_provider_model_routes_video_route_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_routes'::regclass
+      AND conname='mio_provider_model_routes_video_route_check'
+  ) THEN
+    ALTER TABLE mio_provider_model_routes ADD CONSTRAINT mio_provider_model_routes_video_route_check
+      CHECK (
+        operation <> 'video.generate' OR (
+          classification = 'video'
+          AND driver IN ('volcengine-ark-videos','kling-videos','vidu-videos','veo-videos','happyhorse-videos')
+          AND edit_path IS NULL
+          AND CASE driver
+            WHEN 'volcengine-ark-videos' THEN
+              submit_path = '/volc/api/v3/contents/generations/tasks'
+              AND query_path_template = '/volc/api/v3/contents/generations/tasks/{task_id}'
+            WHEN 'kling-videos' THEN
+              submit_path IN (
+                '/kling/v1/videos/text2video','/kling/v1/videos/image2video',
+                '/kling/v1/videos/multi-image2video','/kling/v1/videos/omni-video'
+              )
+              AND query_path_template = submit_path || '/{task_id}'
+            WHEN 'vidu-videos' THEN
+              submit_path IN (
+                '/vidu/ent/v2/text2video','/vidu/ent/v2/img2video',
+                '/vidu/ent/v2/start-end2video','/vidu/ent/v2/reference2video'
+              )
+              AND query_path_template = '/vidu/ent/v2/tasks/{task_id}/creations'
+            WHEN 'veo-videos' THEN
+              submit_path = '/v1beta/models/{model}:predictLongRunning'
+              AND query_path_template = '/v1beta/operations/{task_id}'
+            WHEN 'happyhorse-videos' THEN
+              submit_path = '/happyhorse/v1/services/aigc/video-generation/video-synthesis'
+              AND query_path_template = '/happyhorse/v1/tasks/{task_id}'
+            ELSE false
+          END
+          AND jsonb_typeof(param_spec) = 'object'
+          AND param_spec - 'parameters' = jsonb_build_object('supportedModes', param_spec->'supportedModes')
+          AND (NOT (param_spec ? 'parameters') OR jsonb_typeof(param_spec->'parameters')='object')
+          AND jsonb_typeof(param_spec->'supportedModes') = 'array'
+          AND jsonb_array_length(param_spec->'supportedModes') BETWEEN 1 AND 8
+          AND param_spec->'supportedModes' <@
+            '["text_to_video","first_frame","last_frame","start_end","reference_subjects","full","video_ref","video_edit"]'::jsonb
+          AND request_defaults = '{}'::jsonb
+          AND output_spec = '{}'::jsonb
+          AND capability_metadata = jsonb_build_object(
+            'video', jsonb_build_object(
+              'modes', param_spec->'supportedModes',
+              'cancellation', jsonb_build_object('supported', false)
+            )
+          )
+        )
+      ) NOT VALID;
+  END IF;
+  FOR rec IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid='mio_provider_model_routes'::regclass AND contype='c'
+      AND NOT convalidated AND conname IN (
+        'mio_provider_model_routes_operation_v1_check',
+        'mio_provider_model_routes_submit_path_safe_check',
+        'mio_provider_model_routes_video_route_check'
+      )
+  LOOP
+    EXECUTE format('ALTER TABLE mio_provider_model_routes VALIDATE CONSTRAINT %I', rec.conname);
+  END LOOP;
+END $$;
 CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
   provider_id uuid NOT NULL,
   model_key uuid NOT NULL,
@@ -248,8 +364,50 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
 ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
 DO $$
 DECLARE
+  target_table regclass;
   rec record;
 BEGIN
+  FOREACH target_table IN ARRAY ARRAY[
+    'mio_provider_model_verifications'::regclass,
+    'mio_provider_model_route_revisions'::regclass
+  ] LOOP
+    FOR rec IN
+      SELECT conname FROM pg_constraint
+      WHERE conrelid=target_table AND contype='c'
+        AND position('operation' in pg_get_constraintdef(oid)) > 0
+        AND position('image.generate' in pg_get_constraintdef(oid)) > 0
+        AND position('video.generate' in pg_get_constraintdef(oid)) = 0
+    LOOP
+      EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', target_table, rec.conname);
+    END LOOP;
+  END LOOP;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_verifications'::regclass
+      AND conname='mio_provider_model_verifications_operation_v1_check'
+  ) THEN
+    ALTER TABLE mio_provider_model_verifications ADD CONSTRAINT mio_provider_model_verifications_operation_v1_check
+      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_route_revisions'::regclass
+      AND conname='mio_provider_model_route_revisions_operation_v1_check'
+  ) THEN
+    ALTER TABLE mio_provider_model_route_revisions ADD CONSTRAINT mio_provider_model_route_revisions_operation_v1_check
+      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
+  END IF;
+  FOR rec IN
+    SELECT conrelid::regclass AS table_name, conname FROM pg_constraint
+    WHERE conrelid IN (
+      'mio_provider_model_verifications'::regclass,
+      'mio_provider_model_route_revisions'::regclass
+    ) AND contype='c' AND NOT convalidated
+      AND conname IN (
+        'mio_provider_model_verifications_operation_v1_check',
+        'mio_provider_model_route_revisions_operation_v1_check'
+      )
+  LOOP
+    EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', rec.table_name, rec.conname);
+  END LOOP;
   FOR rec IN
     SELECT conname FROM pg_constraint
     WHERE conrelid = 'mio_provider_model_route_revisions'::regclass
@@ -345,6 +503,50 @@ export async function checkProviderSchema(
     const constraint = constraints.rows.find((item) => item.name === name);
     if (!constraint?.valid || constraint.definition !== definition)
       throw new Error('PROVIDER_SCHEMA: model metadata length constraints required');
+  }
+  const routeConstraints = await pool.query<{
+    table_name: string;
+    name: string;
+    definition: string;
+    valid: boolean;
+  }>(`
+    SELECT c.relname AS table_name,con.conname AS name,
+      pg_get_constraintdef(con.oid) AS definition,con.convalidated AS valid
+    FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid
+    WHERE con.conrelid IN ('mio_provider_model_routes'::regclass, 'mio_provider_model_verifications'::regclass, 'mio_provider_model_route_revisions'::regclass)
+    AND con.conname IN (
+      'mio_provider_model_routes_operation_v1_check',
+      'mio_provider_model_routes_submit_path_safe_check',
+      'mio_provider_model_routes_video_route_check',
+      'mio_provider_model_verifications_operation_v1_check',
+      'mio_provider_model_route_revisions_operation_v1_check'
+    )`);
+  for (const [table, name, marker] of [
+    ['mio_provider_model_routes', 'mio_provider_model_routes_operation_v1_check', 'video.generate'],
+    [
+      'mio_provider_model_routes',
+      'mio_provider_model_routes_submit_path_safe_check',
+      'predictLongRunning',
+    ],
+    ['mio_provider_model_routes', 'mio_provider_model_routes_video_route_check', 'kling-videos'],
+    [
+      'mio_provider_model_verifications',
+      'mio_provider_model_verifications_operation_v1_check',
+      'video.generate',
+    ],
+    [
+      'mio_provider_model_route_revisions',
+      'mio_provider_model_route_revisions_operation_v1_check',
+      'video.generate',
+    ],
+  ] as const) {
+    const constraint = routeConstraints.rows.find((item) => item.name === name);
+    if (
+      !constraint?.valid ||
+      constraint.table_name !== table ||
+      !constraint.definition.includes(marker)
+    )
+      throw new Error('PROVIDER_SCHEMA: video route constraints required');
   }
   for (const [table, pkColumns] of [
     ['mio_provider_model_routes', ['provider_type', 'raw_model_id', 'operation']],

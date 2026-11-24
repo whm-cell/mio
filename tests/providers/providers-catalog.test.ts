@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import { expect, it } from 'vitest';
 import { IMAGE_DRIVERS } from '../../src/generations/contracts.ts';
+import { VIDEO_DRIVERS } from '../../src/generations/video-contracts.ts';
 import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
 import {
   deriveImageCapabilityMetadata,
   deriveImageParameterView,
   resolveChatRoute,
   resolveImageRoute,
+  resolveVideoRoute,
   validateModelRouteEntry,
   validateRouteImportPayload,
 } from '../../src/providers/onelink/router.ts';
@@ -22,6 +24,41 @@ import {
   findFixtureImageRouteConfig,
   findFixtureRoute,
 } from './fixtures/onelink-routes-fixture.ts';
+
+const VIDEO_ROUTE_CASES = [
+  [
+    'volcengine-ark-videos',
+    '/volc/api/v3/contents/generations/tasks',
+    '/volc/api/v3/contents/generations/tasks/{task_id}',
+  ],
+  ['kling-videos', '/kling/v1/videos/text2video', '/kling/v1/videos/text2video/{task_id}'],
+  ['vidu-videos', '/vidu/ent/v2/start-end2video', '/vidu/ent/v2/tasks/{task_id}/creations'],
+  ['veo-videos', '/v1beta/models/{model}:predictLongRunning', '/v1beta/operations/{task_id}'],
+  [
+    'happyhorse-videos',
+    '/happyhorse/v1/services/aigc/video-generation/video-synthesis',
+    '/happyhorse/v1/tasks/{task_id}',
+  ],
+] as const;
+
+function makeVideoRoute(
+  rawModelId: string,
+  [driver, submitPath, queryPathTemplate]: (typeof VIDEO_ROUTE_CASES)[number],
+) {
+  return {
+    rawModelId,
+    operation: 'video.generate',
+    vendor: driver.replace(/-videos$/, ''),
+    driver,
+    classification: 'video',
+    submitPath,
+    queryPathTemplate,
+    paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+    sourceKind: 'protocol-reference',
+    source: 'fixture protocol observation',
+    sourceVersion: 'v1',
+  };
+}
 
 it('retains the original 92-entry snapshot only as a migration/test reference', () => {
   expect(legacySource.presetsSha256).toBe(
@@ -175,6 +212,42 @@ it('requires an explicit visual chat route for bounded image budgets', () => {
   expect(
     resolveChatRoute({ ...row, capability_metadata: { maxRequestImages: 4 } }),
   ).toBeUndefined();
+});
+
+it('accepts only the five fixed video drivers and their fixed route shapes', () => {
+  expect(VIDEO_DRIVERS).toEqual([
+    'volcengine-ark-videos',
+    'kling-videos',
+    'vidu-videos',
+    'veo-videos',
+    'happyhorse-videos',
+  ]);
+  for (const [index, route] of VIDEO_ROUTE_CASES.entries()) {
+    expect(validateModelRouteEntry(makeVideoRoute(`video-fixture-${index}`, route))).toMatchObject({
+      operation: 'video.generate',
+      driver: route[0],
+      classification: 'video',
+      capabilityMetadata: {
+        video: { modes: ['text_to_video', 'first_frame'], cancellation: { supported: false } },
+      },
+    });
+  }
+  const kling = makeVideoRoute('kling-fixture', VIDEO_ROUTE_CASES[1]!);
+  for (const patch of [
+    { driver: 'unknown-videos' },
+    { submitPath: 'https://provider.example/video' },
+    { submitPath: '/kling/v1/videos/text2video?script=1' },
+    { submitPath: '/kling/v1/videos/image2video' },
+    { queryPathTemplate: '/kling/v1/videos/image2video/{task_id}' },
+    { editPath: '/kling/v1/videos/edit/{task_id}' },
+    { paramSpec: { supportedModes: ['multiframe'] } },
+    { paramSpec: { supportedModes: ['text_to_video'], arbitrary: true } },
+    { requestDefaults: { baseUrl: 'https://provider.example' } },
+    { outputSpec: { downloadScript: 'run()' } },
+    { cancelPath: '/cancel' },
+    { classification: 'image' },
+  ])
+    expect(() => validateModelRouteEntry({ ...kling, ...patch })).toThrow('ROUTE_INVALID');
 });
 
 it('validates explicit image route paramSpec, edit/mask/outpaint gates, and derives capability metadata', () => {
@@ -561,4 +634,74 @@ it('validates schema tables, image drivers, and keeps incomplete async routes AD
     defaultWatermark: false,
   });
   expect(chatOnlyItem?.image.parameters).toBeNull();
+
+  const videoEntry = validateModelRouteEntry(
+    makeVideoRoute('catalog-video-fixture', VIDEO_ROUTE_CASES[0]!),
+  );
+  const videoRouteRecord: PlatformRouteRecord = {
+    provider_type: 'onelink',
+    raw_model_id: videoEntry.rawModelId,
+    operation: 'video.generate',
+    vendor: videoEntry.vendor,
+    driver: videoEntry.driver,
+    classification: 'video',
+    submit_path: videoEntry.submitPath,
+    edit_path: null,
+    query_path_template: videoEntry.queryPathTemplate,
+    param_spec: videoEntry.paramSpec,
+    request_defaults: videoEntry.requestDefaults,
+    output_spec: videoEntry.outputSpec,
+    capability_metadata: videoEntry.capabilityMetadata,
+    source_kind: videoEntry.sourceKind,
+    source: videoEntry.source,
+    source_version: videoEntry.sourceVersion,
+    declaration_version: 1,
+    enabled: true,
+  };
+  expect(resolveVideoRoute(videoRouteRecord)).toMatchObject({
+    operation: 'video.generate',
+    profile: 'volcengine-ark-videos',
+    enabled: true,
+  });
+  const videoModelKey = '00000000-0000-4000-8000-000000000096';
+  const videoView = catalogView({
+    ...baseState,
+    models: [
+      {
+        ...baseState.models[0]!,
+        model_key: videoModelKey,
+        raw_model_id: videoEntry.rawModelId,
+      },
+    ],
+    preferences: [{ model_key: videoModelKey, usage: 'video', enabled: true, is_default: false }],
+    catalog_models: [
+      {
+        provider_type: 'onelink',
+        raw_model_id: videoEntry.rawModelId,
+        display_label: 'Video fixture',
+        vendor_label: 'volcengine',
+        category: 'video',
+        description: null,
+        supplier_metadata: {},
+        user_visible: true,
+        allow_undiscovered: false,
+        call_notes: null,
+        origin_source: 'admin-manual',
+        updated_by: null,
+        created_at: now.toISOString(),
+        updated_at: now.toISOString(),
+      },
+    ],
+    routes: [videoRouteRecord],
+  });
+  expect(videoView.items[0]?.video).toMatchObject({
+    runnable: false,
+    unavailableReason: 'ADAPTER_PENDING',
+    modes: [
+      { mode: 'text_to_video', supported: false },
+      { mode: 'first_frame', supported: false },
+    ],
+    cancellation: { supported: false },
+    adaptation: { implementation: 'pending' },
+  });
 });

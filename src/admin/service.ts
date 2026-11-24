@@ -3,6 +3,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs, utcISOString } from '@mio/foundation/time';
 import { randomBytes } from 'node:crypto';
 import { IMAGE_DRIVERS } from '../generations/contracts.ts';
+import { VIDEO_DRIVERS } from '../generations/video-contracts.ts';
 import { DiscoveryError, discoverModels } from '../integrations/onelink/models.ts';
 import type { DiscoveredModel, ModelTransport } from '../integrations/onelink/models.ts';
 import type { RabbitmqMonitorSnapshot } from '../integrations/rabbitmq-monitor.ts';
@@ -822,9 +823,11 @@ export function createAdminService(
       const statsMap = new Map(raw.userStatsRows.map((row) => [row.raw_model_id, row]));
       const chatRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       const imageRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
+      const videoRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       for (const route of raw.routeRows) {
         if (route.operation === 'chat') chatRoutes.set(route.raw_model_id, route);
         else if (route.operation === 'image.generate') imageRoutes.set(route.raw_model_id, route);
+        else if (route.operation === 'video.generate') videoRoutes.set(route.raw_model_id, route);
       }
 
       const allItems: AdminModelCatalogItem[] = [...raw.catalogRows]
@@ -837,8 +840,13 @@ export function createAdminService(
           const stats = statsMap.get(rawModelId);
           const chat = chatRoutes.get(rawModelId);
           const image = imageRoutes.get(rawModelId);
+          const video = videoRoutes.get(rawModelId);
           const category: Category | null =
-            cat.category ?? image?.classification ?? chat?.classification ?? null;
+            cat.category ??
+            video?.classification ??
+            image?.classification ??
+            chat?.classification ??
+            null;
           const supplierMeta =
             Object.keys(cat.supplier_metadata ?? {}).length > 0
               ? cat.supplier_metadata
@@ -846,7 +854,7 @@ export function createAdminService(
           return {
             rawModelId,
             displayLabel: cat.display_label,
-            vendorLabel: cat.vendor_label ?? image?.vendor ?? chat?.vendor ?? null,
+            vendorLabel: cat.vendor_label ?? video?.vendor ?? image?.vendor ?? chat?.vendor ?? null,
             category,
             description: cat.description,
             originSource: cat.origin_source,
@@ -857,6 +865,7 @@ export function createAdminService(
             userDiscoveredCount: stats?.discovered_users ?? 0,
             userVerifiedChatCount: stats?.verified_chat_users ?? 0,
             userVerifiedImageCount: stats?.verified_image_users ?? 0,
+            userVerifiedVideoCount: stats?.verified_video_users ?? 0,
             policy: {
               userVisible: cat.user_visible,
               allowUndiscovered: cat.allow_undiscovered,
@@ -867,6 +876,7 @@ export function createAdminService(
             },
             chatRoute: chat ? serializeRouteInputSnapshot(chat) : null,
             imageRoute: image ? serializeRouteInputSnapshot(image) : null,
+            videoRoute: video ? serializeRouteInputSnapshot(video) : null,
             chatRouteMeta: chat
               ? {
                   enabled: chat.enabled,
@@ -885,6 +895,15 @@ export function createAdminService(
                   updatedAt: image.updated_at.toISOString(),
                 }
               : null,
+            videoRouteMeta: video
+              ? {
+                  enabled: video.enabled,
+                  declarationVersion: video.declaration_version,
+                  driver: video.driver,
+                  vendor: video.vendor,
+                  updatedAt: video.updated_at.toISOString(),
+                }
+              : null,
             createdAt: cat.created_at.toISOString(),
             updatedAt: cat.updated_at.toISOString(),
           };
@@ -896,16 +915,25 @@ export function createAdminService(
           (item) => item.inLatestProbe || item.userDiscoveredCount > 0,
         ).length,
         configuredEnabled: allItems.filter(
-          (item) => Boolean(item.chatRouteMeta?.enabled) || Boolean(item.imageRouteMeta?.enabled),
+          (item) =>
+            Boolean(item.chatRouteMeta?.enabled) ||
+            Boolean(item.imageRouteMeta?.enabled) ||
+            Boolean(item.videoRouteMeta?.enabled),
         ).length,
         configuredDisabled: allItems.filter(
           (item) =>
             !item.chatRouteMeta?.enabled &&
             !item.imageRouteMeta?.enabled &&
-            (item.chatRouteMeta !== null || item.imageRouteMeta !== null),
+            !item.videoRouteMeta?.enabled &&
+            (item.chatRouteMeta !== null ||
+              item.imageRouteMeta !== null ||
+              item.videoRouteMeta !== null),
         ).length,
         pendingRoutes: allItems.filter(
-          (item) => item.chatRouteMeta === null && item.imageRouteMeta === null,
+          (item) =>
+            item.chatRouteMeta === null &&
+            item.imageRouteMeta === null &&
+            item.videoRouteMeta === null,
         ).length,
         hiddenFromUsers: allItems.filter((item) => !item.policy.userVisible).length,
         curatedUndiscovered: allItems.filter((item) => item.policy.allowUndiscovered).length,
@@ -916,8 +944,13 @@ export function createAdminService(
         if (filters.category && item.category !== filters.category) return false;
         if (filters.status) {
           const hasEnabled =
-            Boolean(item.chatRouteMeta?.enabled) || Boolean(item.imageRouteMeta?.enabled);
-          const hasAny = item.chatRouteMeta !== null || item.imageRouteMeta !== null;
+            Boolean(item.chatRouteMeta?.enabled) ||
+            Boolean(item.imageRouteMeta?.enabled) ||
+            Boolean(item.videoRouteMeta?.enabled);
+          const hasAny =
+            item.chatRouteMeta !== null ||
+            item.imageRouteMeta !== null ||
+            item.videoRouteMeta !== null;
           if (filters.status === 'enabled' && !hasEnabled) return false;
           if (filters.status === 'disabled' && (!hasAny || hasEnabled)) return false;
           if (filters.status === 'pending' && hasAny) return false;
@@ -988,7 +1021,9 @@ export function createAdminService(
       assertOpen();
       if (
         !isValidRawModelId(input.rawModelId) ||
-        (input.operation !== 'chat' && input.operation !== 'image.generate')
+        (input.operation !== 'chat' &&
+          input.operation !== 'image.generate' &&
+          input.operation !== 'video.generate')
       ) {
         throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
       }
@@ -1056,6 +1091,7 @@ export function createAdminService(
         drivers: {
           chat: [...CHAT_PROFILES],
           image: [...IMAGE_DRIVERS],
+          video: [...VIDEO_DRIVERS],
         },
         categories: [...categories],
         items,

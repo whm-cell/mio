@@ -27,7 +27,7 @@ import { readConversationConfig } from './conversations/config.ts';
 import { createConversationStore } from './conversations/store.ts';
 import { createConversationService } from './conversations/service.ts';
 import type { ConversationService } from './conversations/service.ts';
-import type { ConversationImageTools } from './conversations/contracts.ts';
+import type { ConversationImageTools, ConversationVideoTools } from './conversations/contracts.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
 import { createConversationVision } from './dsh/vision.ts';
@@ -62,6 +62,12 @@ import { createGenerationStore } from './generations/store.ts';
 import { createGenerationService } from './generations/service.ts';
 import type { GenerationService } from './generations/service.ts';
 import { createGenerationHandler } from './generations/http.ts';
+import { createVideoGenerationService } from './generations/video-service.ts';
+import { createVideoGenerationHandler } from './generations/video-http.ts';
+import { createVideoExecutor } from './generations/video-executor.ts';
+import { createVideoMaterializer, createVideoCleanup } from './generations/video-media.ts';
+import { createVideoInputResolver } from './generations/video-inputs.ts';
+import { createVideoProtocol } from './integrations/onelink/video/index.ts';
 import { readAdminConfig } from './admin/config.ts';
 import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
@@ -175,6 +181,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
+    let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
@@ -223,20 +230,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     let providers: ProviderService | undefined;
+    let compute: ReturnType<typeof createComputeService> | undefined;
     if (computeConfig && assetConfig) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
       try {
-        const acquired = (ownedCompute = createComputeService(
-          store,
-          createCosStorage(assetConfig),
-          computeConfig,
-        ));
+        const acquired =
+          (compute =
+          ownedCompute =
+            createComputeService(store, createCosStorage(assetConfig), computeConfig));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
           () => () =>
             closeMioResources(
               () => conversations?.close(),
+              () => videoGenerations?.close(),
               () => acquired.close(),
             ),
         );
@@ -254,7 +262,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     if (providerConfig) {
       const store = await createProviderStore(providerConfig, imageEnabled);
-      providers = createProviderService(store, providerConfig);
+      providers = createProviderService(
+        store,
+        providerConfig,
+        undefined,
+        Boolean(generationConfig?.videoEnabled && assetConfig && computeConfig),
+      );
       const ownedProviders = providers;
       try {
         // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
@@ -263,6 +276,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             closeMioResources(
               () => admin?.close(),
               () => conversations?.close(),
+              () => videoGenerations?.close(),
               () => generations?.close(),
               () => materials?.close(),
               () => ownedProviders.close(),
@@ -374,6 +388,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (generationConfig && assetConfig) {
       const store = await createGenerationStore(assetConfig.databaseURL);
       let ownedGenerations: GenerationService | undefined;
+      let videoExecutor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined;
+      let videoInputs: ReturnType<typeof createVideoInputResolver> | undefined;
       try {
         const acquired =
           (generations =
@@ -384,10 +400,44 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               generationConfig,
               () => providers,
             ));
+        const videoStore = store.videoStore();
+        if (compute && generationConfig.videoEnabled) {
+          const objects = createCosStorage(assetConfig);
+          const probe = compute.probeVideo;
+          videoInputs = createVideoInputResolver(assetConfig.databaseURL, objects);
+          videoExecutor = await createVideoExecutor(
+            videoStore,
+            () => providers,
+            createVideoMaterializer(objects, generationConfig.dataDirectory, probe),
+            {
+              protocol: createVideoProtocol,
+              cleanup: createVideoCleanup(objects, generationConfig.dataDirectory),
+              references: (row, signal) =>
+                videoInputs!.resolve(row.owner_id, row.command.inputSnapshot, signal),
+            },
+          );
+        }
+        const admission = createVideoGenerationService(
+          videoStore,
+          () => providers,
+          videoExecutor,
+          videoInputs?.resolve,
+        );
+        let videoClosing: Promise<void> | undefined;
+        const ownedVideoGenerations = (videoGenerations = {
+          ...admission,
+          close: () =>
+            (videoClosing ??= closeMioResources(
+              () => admission.close(),
+              () => videoExecutor?.close(),
+              () => videoInputs?.close(),
+            )),
+        });
         ctx.effect(
           () => () =>
             closeMioResources(
               () => conversations?.close(),
+              () => ownedVideoGenerations.close(),
               () => acquired.close(),
             ),
         );
@@ -398,8 +448,32 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             handler: createGenerationHandler(acquired, auth.identity, authConfig.origins),
           }),
         );
+        const videoHandler = createVideoGenerationHandler(
+          ownedVideoGenerations,
+          auth.identity,
+          authConfig.origins,
+        );
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/video-capabilities',
+            handler: videoHandler,
+          }),
+        );
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/videos',
+            handler: videoHandler,
+          }),
+        );
       } catch (error) {
-        await (ownedGenerations ? ownedGenerations.close() : store.close());
+        await closeMioResources(
+          () => videoGenerations?.close(),
+          () => videoExecutor?.close(),
+          () => videoInputs?.close(),
+          () => (ownedGenerations ? ownedGenerations.close() : store.close()),
+        );
         throw error;
       }
     }
@@ -456,6 +530,28 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     getImage: (actor, jobId) => generations.getImage(actor, jobId),
                   }
                 : undefined;
+            const conversationVideoTools: ConversationVideoTools | undefined =
+              videoGenerations && providers && generationConfig?.videoEnabled && computeConfig
+                ? {
+                    listModels: async (actor) => {
+                      const catalog = await providers.catalog(actor, 'video');
+                      return catalog.items.map((item) => ({
+                        modelRef: item.modelRef,
+                        modelId: item.modelId ?? item.modelKey,
+                        name: item.name ?? item.modelId ?? item.modelKey,
+                        vendor: item.video.adaptation?.vendor ?? 'OneLink',
+                        available: item.video.runnable,
+                        unavailableReason: item.video.unavailableReason,
+                        supportedModes: item.video.modes,
+                      }));
+                    },
+                    capabilities: (actor, modelRef) =>
+                      videoGenerations.capabilities(actor, modelRef),
+                    createVideo: (actor, request) =>
+                      videoGenerations.create(actor, request).then((result) => result.job),
+                    getVideo: (actor, jobId) => videoGenerations.get(actor, jobId),
+                  }
+                : undefined;
             const ownedConversations =
               (conversations =
               acquired =
@@ -466,6 +562,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     conversationConfig,
                     imageTools,
                     vision,
+                    conversationVideoTools,
                   ),
                   providers,
                   vision,

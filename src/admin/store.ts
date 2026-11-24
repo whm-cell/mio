@@ -64,7 +64,7 @@ interface RouteTemplateRow {
   template_key: string;
   label: string;
   description: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   vendor: string;
   driver: string;
   route_template: Record<string, unknown>;
@@ -684,6 +684,7 @@ export class AdminStore {
         discovered_users: number;
         verified_chat_users: number;
         verified_image_users: number;
+        verified_video_users: number;
         sample_metadata: Record<string, unknown> | null;
       }>(
         `SELECT
@@ -707,6 +708,12 @@ export class AdminStore {
               AND r_img.declaration_version = v.declaration_version
               AND c.catalog_credential_version = c.credential_version
              THEN c.id END)::int AS verified_image_users,
+           COUNT(DISTINCT CASE
+             WHEN v.operation = 'video.generate'
+              AND v.verification_status = 'verified'
+              AND r_video.declaration_version = v.declaration_version
+              AND c.catalog_credential_version = c.credential_version
+             THEN c.id END)::int AS verified_video_users,
            (ARRAY_AGG(m.supplier_metadata ORDER BY m.last_seen_at DESC NULLS LAST)
              FILTER (WHERE m.metadata_source = 'onelink-v1-models'))[1] AS sample_metadata
          FROM mio_provider_models m
@@ -723,6 +730,11 @@ export class AdminStore {
           AND r_img.raw_model_id = m.raw_model_id COLLATE "C"
           AND r_img.operation = 'image.generate'
           AND r_img.enabled = true
+         LEFT JOIN mio_provider_model_routes r_video
+           ON r_video.provider_type = c.provider_type
+          AND r_video.raw_model_id = m.raw_model_id COLLATE "C"
+          AND r_video.operation = 'video.generate'
+          AND r_video.enabled = true
          WHERE m.raw_model_id IS NOT NULL
          GROUP BY m.raw_model_id`,
       ),
@@ -1073,7 +1085,7 @@ export class AdminStore {
       templateKey: string;
       label: string;
       description: string;
-      operation: 'chat' | 'image.generate';
+      operation: 'chat' | 'image.generate' | 'video.generate';
       vendor: string;
       driver: string;
       routeTemplate: Record<string, unknown>;
@@ -1130,7 +1142,7 @@ export class AdminStore {
       templateKey: string;
       label: string;
       description: string;
-      operation: 'chat' | 'image.generate';
+      operation: 'chat' | 'image.generate' | 'video.generate';
       vendor: string;
       driver: string;
       routeTemplate: Record<string, unknown>;

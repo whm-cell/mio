@@ -1,17 +1,23 @@
 import type { Broker } from './adapters/rabbitmq.ts';
 import type { Worker } from './worker.ts';
+import type { VideoProbeCommandV1 } from '@mio/compute-contracts';
 
 /** One serial maintenance window for this worker's consumer and journal. */
 export class Maintenance {
   readonly #broker: Pick<Broker, 'consuming' | 'pause' | 'consume'>;
-  readonly #worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'>;
+  readonly #worker: Pick<
+    Worker,
+    'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'
+  > &
+    Partial<Pick<Worker, 'handleVideoProbe'>>;
   readonly #failed: (error: unknown) => void;
   #active = true;
   #flight: Promise<void> | null = null;
 
   constructor(
     broker: Pick<Broker, 'consuming' | 'pause' | 'consume'>,
-    worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'>,
+    worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'> &
+      Partial<Pick<Worker, 'handleVideoProbe'>>,
     failed: (error: unknown) => void,
   ) {
     this.#broker = broker;
@@ -44,10 +50,14 @@ export class Maintenance {
     if (!this.#active) return;
     await this.#worker.reconcileOne();
     if (this.#active && this.#worker.admissionReady()) {
+      const handleProbe = this.#worker.handleVideoProbe;
       await this.#broker.consume(
         (command, ack) => this.#worker.handle(command, ack),
         this.#failed,
         () => this.#worker.admissionReady(),
+        handleProbe
+          ? (command: VideoProbeCommandV1, ack) => handleProbe.call(this.#worker, command, ack)
+          : undefined,
       );
     }
   }

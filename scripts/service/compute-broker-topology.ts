@@ -5,6 +5,8 @@ import {
   RESULT_EXCHANGE,
   RESULT_QUEUE,
   RESULT_ROUTING_KEY,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
+  VIDEO_PROBE_RESULT_ROUTING_KEY,
 } from '@mio/compute-contracts';
 
 export const computeExchanges = [
@@ -72,7 +74,9 @@ export function computeTopology(vhost: string) {
   }
   const bindings: readonly [string, string, string][] = [
     [COMMAND_EXCHANGE, COMMAND_QUEUE, COMMAND_ROUTING_KEY],
+    [COMMAND_EXCHANGE, COMMAND_QUEUE, VIDEO_PROBE_COMMAND_ROUTING_KEY],
     [RESULT_EXCHANGE, RESULT_QUEUE, RESULT_ROUTING_KEY],
+    [RESULT_EXCHANGE, RESULT_QUEUE, VIDEO_PROBE_RESULT_ROUTING_KEY],
     ['mio.compute.commands.dlx.v1', 'mio.compute.commands.dlq.v1', 'transcode.dead.v1'],
     ['mio.compute.results.dlx.v1', 'mio.compute.results.dlq.v1', 'transcode.result.dead.v1'],
   ];

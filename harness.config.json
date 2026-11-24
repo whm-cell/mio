@@ -39,7 +39,8 @@
       "src/admin/store.ts",
       "src/integrations/cos.ts",
       "src/integrations/redis.ts",
-      "src/integrations/rabbitmq-monitor.ts"
+      "src/integrations/rabbitmq-monitor.ts",
+      "src/generations/video-contracts.ts"
     ]
   },
   "documentRoots": [

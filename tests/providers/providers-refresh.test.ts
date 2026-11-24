@@ -462,6 +462,103 @@ it('requires an enabled async route for Vidu without inferring it from a discove
   });
 });
 
+it('projects declared video modes as unavailable until a runtime driver is implemented', async () => {
+  const f = await fixture(async () => metadata(['fixture-video-member']));
+  await f.service.discover(f.actor);
+  const item = (await f.service.catalog(f.actor)).items[0]!;
+  const missingRoute = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(missingRoute).toMatchObject({
+    modelRef: item.modelRef,
+    available: false,
+    unavailableReason: 'ROUTE_NOT_CONFIGURED',
+    modes: [],
+    cancellation: { supported: false },
+  });
+
+  await f.store.importRoutes([
+    {
+      rawModelId: 'fixture-video-member',
+      operation: 'video.generate',
+      vendor: 'kling',
+      driver: 'kling-videos',
+      classification: 'video',
+      submitPath: '/kling/v1/videos/text2video',
+      queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+      paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+      sourceKind: 'protocol-reference',
+      source: 'fixture video protocol',
+      sourceVersion: 'v1',
+      enabled: true,
+    },
+  ]);
+  const pending = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(pending).toMatchObject({
+    available: false,
+    unavailableReason: 'ADAPTER_PENDING',
+    modes: [
+      { mode: 'text_to_video', supported: false },
+      { mode: 'first_frame', supported: false },
+    ],
+    cancellation: { supported: false },
+  });
+  expect(pending.capabilitiesVersion).not.toBe(missingRoute.capabilitiesVersion);
+  expect(pending).not.toHaveProperty('apiKey');
+  expect(pending).not.toHaveProperty('credential');
+  await expect(f.service.snapshotVideo(f.actor, item.modelRef)).rejects.toThrow('ADAPTER_PENDING');
+
+  await f.store.importRoutes([
+    {
+      rawModelId: 'fixture-video-member',
+      operation: 'video.generate',
+      vendor: 'kling',
+      driver: 'kling-videos',
+      classification: 'video',
+      submitPath: '/kling/v1/videos/text2video',
+      queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+      paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+      sourceKind: 'protocol-reference',
+      source: 'fixture video protocol',
+      sourceVersion: 'v1',
+      enabled: false,
+    },
+  ]);
+  const disabled = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(disabled).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_ROUTE_DISABLED',
+  });
+  expect(disabled.capabilitiesVersion).not.toBe(pending.capabilitiesVersion);
+
+  const provider = await f.service.get(f.actor);
+  await pool.query(
+    `INSERT INTO mio_provider_catalog_models (
+       provider_type, raw_model_id, category, user_visible, allow_undiscovered
+     ) VALUES ('onelink', 'fixture-video-hidden', 'video', false, false)`,
+  );
+  await pool.query(
+    `INSERT INTO mio_provider_models (
+       provider_id, raw_model_id, supplier_metadata, metadata_source,
+       credential_version, catalog_version, first_seen_at, last_seen_at, membership_state
+     ) VALUES ($1, 'fixture-video-hidden', '{}', 'onelink-v1-models', 1, 1, now(), now(), 'current')`,
+    [provider!.id],
+  );
+  const hidden = await f.service.videoCapabilities(f.actor, 'onelink:video:fixture-video-hidden');
+  const unknown = await f.service.videoCapabilities(
+    f.actor,
+    'onelink:video:fixture-video-does-not-exist',
+  );
+  expect(hidden).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_NOT_AVAILABLE',
+    modes: [],
+  });
+  expect(unknown).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_NOT_AVAILABLE',
+    modes: [],
+  });
+});
+
 it('requires an explicit Volcengine route and freezes the image driver without guessing the model name', async () => {
   const f = await fixture(async () => metadata(['doubao-seedream-4.0-freeze']));
   await f.service.discover(f.actor);

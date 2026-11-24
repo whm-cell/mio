@@ -448,6 +448,10 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/compute/schema.ts',
         'src/generations/store.ts',
         'src/generations/schema.ts',
+        'src/generations/transaction.ts',
+        'src/generations/video-store.ts',
+        'src/generations/video-execution-store.ts',
+        'src/generations/video-inputs.ts',
         'src/admin/store.ts',
         'src/admin/schema.ts',
       ].includes(file);

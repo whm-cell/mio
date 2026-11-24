@@ -74,3 +74,5 @@ PostgreSQL 保存归属、创建状态、request ID、输入 SHA-256 摘要与�
 `tests/onelink/` 经公开 PiAi codec、官方 loop、隔离 PG/JSONL 和正式打包 Profile 验证 BYOK；overlay 只替换固定出站 fetch，不替换生产 adapter，并验证源码目录外的虚构精确 ID。`node tests/conversations/conversations-live.ts <authorized-private-key-file> [exact-model-id] [openai-chat|anthropic-messages]` 是显式真实入口，默认 deepseek-v4.1-flash/openai-chat。模型须精确存在于本账号当前目录，再经受控声明与用户默认、公开 API 完成两轮、SSE/终态、取消、历史和重启，输出对应目录/适配版本；失败保留实际观察，不回退模拟或目录外型号。当前验证目标与后续条件沿 PRD，已有接受按所属成果保留，不由新候选改写。
 
 精确历史仍完整读取/校验单会话日志，公开分页不等于低成本存储查询。列表按 owner/id 索引有界返回、回执按复合主键；本地证据不推导生产吞吐、任意崩溃零丢失或全模型可用。完整检查、独立审阅、真实供应商与人类接受分别判定。
+
+视频对话复用同一原生会话与工具授权边界。显式视频执行配置就绪时加入视频目录、提交和状态查询三个受控工具；每轮只提交一次持久意图，非终态任务不在同轮连续轮询。已登记视频工具卡片可跨轮和服务重启读取，原始参数及上游签名地址不进入公开历史。详见[对话 HTTP](apis/conversations.md)与[视频任务 HTTP](apis/compute.md#post-apiv1computevideos)。

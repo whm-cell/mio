@@ -43,7 +43,7 @@ export const providerStateSQL = (includeVerifications = true) => `SELECT c.*,
   COALESCE((SELECT jsonb_agg(p) FROM mio_provider_model_preferences p WHERE p.provider_id=c.id),'[]') AS preferences,
   COALESCE((SELECT jsonb_agg(r ORDER BY r.raw_model_id COLLATE "C",r.operation)
     FROM mio_provider_model_routes r
-    WHERE r.provider_type=c.provider_type AND r.enabled=true
+    WHERE r.provider_type=c.provider_type
       AND EXISTS (
         SELECT 1 FROM mio_provider_models m
         WHERE m.provider_id=c.id AND m.raw_model_id=r.raw_model_id COLLATE "C"

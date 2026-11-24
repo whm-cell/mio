@@ -5,6 +5,7 @@ import type {
   ImageOperation,
   ImageRouteConfig,
 } from '../generations/contracts.ts';
+import type { VideoDriver, VideoMode } from '../generations/video-contracts.ts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
@@ -60,7 +61,7 @@ export interface ModelPreference {
 
 export const CHAT_PROFILES = ['openai-chat', 'anthropic-messages'] as const;
 export type ChatProfile = (typeof CHAT_PROFILES)[number];
-/** Evidence for an implemented protocol route; catalog membership is deliberately absent. */
+/** Declared route evidence is separate from catalog membership and runtime implementation. */
 export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
 export interface ImageCapabilityMetadata {
   modes: ImageOperation[];
@@ -72,6 +73,10 @@ export interface ImageCapabilityMetadata {
     maxQueries: number;
     maxAgeSeconds: number;
   };
+}
+export interface VideoCapabilityMetadata {
+  readonly modes: readonly VideoMode[];
+  readonly cancellation: { readonly supported: false };
 }
 export interface ImageParameterView {
   readonly supportedOperations: ImageOperation[];
@@ -104,6 +109,7 @@ export interface AdaptationCapabilityMetadata {
   requestImagePixelBudget?: number;
   requestImageMaxBytes?: number;
   image?: ImageCapabilityMetadata;
+  video?: VideoCapabilityMetadata;
 }
 
 export interface ChatImageBudget {
@@ -137,7 +143,7 @@ export interface ModelRecord {
 export interface PlatformRouteRecord {
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   vendor: string;
   driver: string;
   classification: Category;
@@ -157,7 +163,7 @@ export interface PlatformRouteRecord {
 export interface VerificationRecord {
   provider_id: string;
   model_key: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   declaration_version: number;
   driver: string;
   verification_status: 'unverified' | 'verified';
@@ -200,7 +206,7 @@ export interface PlatformRouteRevisionRecord {
   id: string;
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   declaration_version: number;
   action: RouteRevisionAction;
   actor_type: 'admin' | 'cli';
@@ -215,9 +221,9 @@ export interface PlatformRouteRevisionRecord {
 export interface ModelRouteInput {
   providerType?: 'onelink';
   rawModelId: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   vendor: string;
-  driver: ChatProfile | ImageDriver;
+  driver: ChatProfile | ImageDriver | VideoDriver;
   classification: Category;
   submitPath: string;
   editPath?: string | null;
@@ -238,7 +244,7 @@ export interface VerificationSnapshot {
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
   readonly modelKey: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: 'chat' | 'image.generate' | 'video.generate';
   readonly profile: string;
 }
 
@@ -293,4 +299,53 @@ export interface ImageAdmissionSnapshot extends AccountCredentialSnapshot {
   readonly providerRevision: number;
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
+}
+
+/** A future outbound video admission; credential bytes stay encrypted until explicitly opened. */
+export interface VideoRouteConfig {
+  readonly driver: VideoDriver;
+  readonly vendor: string;
+  readonly submitPath: string;
+  readonly queryPathTemplate: string;
+  readonly paramSpec: {
+    readonly supportedModes: readonly VideoMode[];
+    readonly parameters?: VideoParameterSpec;
+  };
+  readonly requestDefaults: Readonly<Record<string, never>>;
+  readonly outputSpec: Readonly<Record<string, never>>;
+}
+
+/** Exact model declaration. Missing constraints keep legacy V1 routes unavailable. */
+export interface VideoParameterSpec {
+  readonly ratios: readonly string[];
+  readonly resolutions: readonly string[];
+  readonly durations: readonly number[];
+  readonly maxPromptCodepoints: number;
+  readonly maxImages: number;
+  readonly maxVideos: number;
+  readonly maxAudios: number;
+  readonly maxInputs: number;
+  readonly maxSubjects: number;
+  readonly maxSubjectImages: number;
+  readonly generateAudio: boolean;
+  readonly watermark: boolean;
+  readonly offPeak: boolean;
+  readonly audioSettings: readonly string[];
+  readonly requiresResolution: boolean;
+  readonly referenceAudioRequiresVisual: boolean;
+  readonly referenceDurations: readonly number[];
+}
+
+export interface VideoAdmissionSnapshot extends AccountCredentialSnapshot {
+  readonly modelRef: string;
+  readonly modelId: string;
+  readonly modelKey: string;
+  readonly vendor: string;
+  readonly profile: VideoDriver;
+  readonly route: VideoRouteConfig;
+  readonly defaultVideoWatermark: boolean;
+  readonly providerRevision: number;
+  readonly catalogVersion: number;
+  readonly adaptationVersion: number;
+  readonly capabilitiesVersion: string;
 }

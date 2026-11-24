@@ -49,7 +49,7 @@ export interface ModelPatch {
 export interface RouteRevisionResult {
   id: string;
   rawModelId: string;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   declarationVersion: number;
   action: RouteRevisionAction;
 }
@@ -458,7 +458,7 @@ export class ProviderStore {
   async deleteRoutes(
     rawModelId: string,
     actor: RouteRevisionActor,
-    operation?: 'chat' | 'image.generate',
+    operation?: 'chat' | 'image.generate' | 'video.generate',
   ): Promise<RouteRevisionResult[]> {
     return this.transaction(async (client) => {
       const existingRows = (
@@ -603,6 +603,8 @@ export class ProviderStore {
     snapshot: VerificationSnapshot,
     evidence: string,
   ): Promise<void> {
+    // No video driver is runtime-supported in this slice, so declarations cannot be verified.
+    if (snapshot.operation === 'video.generate') return;
     await this.transaction(async (client) => {
       const row = await this.locked(client, owner);
       if (row.id !== snapshot.providerConfigId)

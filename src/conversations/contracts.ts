@@ -4,6 +4,12 @@ import type {
   ImageOperation,
   ImageRequestParameters,
 } from '../generations/contracts.ts';
+import type {
+  VideoCapabilitiesView,
+  VideoCreateRequest,
+  VideoJobView,
+  VideoMode,
+} from '../generations/video-contracts.ts';
 import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
@@ -154,6 +160,41 @@ export interface ConversationImageTools {
   ): Promise<ConversationImageJobView>;
   getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
 }
+export type ConversationVideoToolName = 'submit_video_job' | 'get_video_job';
+export interface ConversationVideoModelSummary {
+  readonly modelRef: string;
+  readonly modelId: string;
+  readonly name: string;
+  readonly vendor: string;
+  readonly available: boolean;
+  readonly unavailableReason: string | null;
+  readonly supportedModes: { mode: VideoMode; supported: boolean }[];
+}
+export interface ConversationVideoJobOutput {
+  readonly index: number;
+  readonly assetId: string | null;
+  readonly status: string;
+  readonly errorCode: string | null;
+  readonly width: number | null;
+  readonly height: number | null;
+  readonly durationSeconds: number | null;
+  readonly hasAudio: boolean | null;
+}
+export interface ConversationVideoJobView {
+  readonly jobId: string;
+  readonly status: VideoJobView['state'];
+  readonly mode: VideoMode;
+  readonly modelRef: string;
+  readonly createdAt: string;
+  readonly errorCode: string | null;
+  readonly outputs: ConversationVideoJobOutput[];
+}
+export interface ConversationVideoTools {
+  listModels(actor: { userId: string }): Promise<ConversationVideoModelSummary[]>;
+  capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
+  createVideo(actor: { userId: string }, request: VideoCreateRequest): Promise<VideoJobView>;
+  getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
+}
 export type HistoryItem =
   | {
       seq: number;
@@ -163,6 +204,7 @@ export type HistoryItem =
       imageAssetIds?: string[];
     }
   | { seq: number; role: 'tool'; tool: ConversationImageToolName; job: ConversationImageJobView }
+  | { seq: number; role: 'tool'; tool: ConversationVideoToolName; job: ConversationVideoJobView }
   | {
       seq: number;
       role: 'status';
@@ -181,6 +223,12 @@ export type ConversationEvent =
       requestId: string;
       tool: ConversationImageToolName;
       job: ConversationImageJobView;
+    }
+  | {
+      type: 'tool';
+      requestId: string;
+      tool: ConversationVideoToolName;
+      job: ConversationVideoJobView;
     }
   | { type: 'state'; receipt: Receipt }
   | { type: 'error'; code: string };

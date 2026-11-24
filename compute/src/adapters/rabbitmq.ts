@@ -14,9 +14,16 @@ import {
   COMPUTE_MAX_MESSAGE_BYTES,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  VIDEO_PROBE_RESULT_ROUTING_KEY,
   parseComputeCommandV1,
+  parseVideoProbeCommandV1,
 } from '@mio/compute-contracts';
-import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  ComputeResultV1,
+  VideoProbeCommandV1,
+  VideoProbeResultV1,
+} from '@mio/compute-contracts';
 
 const BROKER_STARTUP_TIMEOUT_MS = 5000;
 const BROKER_CLOSE_TIMEOUT_MS = 5000;
@@ -224,9 +231,15 @@ export class Broker {
   }
 
   publish(message: ComputeResultV1): Promise<void> {
-    return this.publishMessage(message);
+    return this.publishMessage(message, RESULT_ROUTING_KEY);
   }
-  private async publishMessage(message: ComputeResultV1): Promise<void> {
+  publishVideoProbe(message: VideoProbeResultV1): Promise<void> {
+    return this.publishMessage(message, VIDEO_PROBE_RESULT_ROUTING_KEY);
+  }
+  private async publishMessage(
+    message: ComputeResultV1 | VideoProbeResultV1,
+    routingKey: string,
+  ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
     let returned = false;
     const onReturn = (result: Message) => {
@@ -246,7 +259,7 @@ export class Broker {
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.#publisher.publish(
           RESULT_EXCHANGE,
-          RESULT_ROUTING_KEY,
+          routingKey,
           Buffer.from(JSON.stringify(message)),
           {
             persistent: true,
@@ -280,6 +293,7 @@ export class Broker {
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
+    handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -317,7 +331,7 @@ export class Broker {
           report(error);
           return;
         }
-        let command: ComputeCommandV1;
+        let command: ComputeCommandV1 | VideoProbeCommandV1;
         try {
           if (
             message.properties.userId !== this.#expectedUserId ||
@@ -327,7 +341,13 @@ export class Broker {
             throw new Error('COMMAND_INVALID');
           const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
           const value: unknown = JSON.parse(body);
-          command = parseComputeCommandV1(value);
+          command =
+            value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            (value as Record<string, unknown>).type === 'video.probe'
+              ? parseVideoProbeCommandV1(value)
+              : parseComputeCommandV1(value);
           if (message.properties.messageId !== command.messageId)
             throw new Error('COMMAND_ID_MISMATCH');
         } catch {
@@ -340,7 +360,12 @@ export class Broker {
         }
         const tracked = Promise.resolve()
           .then(() => {
-            return handle(command, () => slot.channel.ack(message));
+            const ack = () => slot.channel.ack(message);
+            if (command.type === 'video.probe') {
+              if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+              return handleVideoProbe(command, ack);
+            }
+            return handle(command, ack);
           })
           .catch((error: unknown) => {
             const code = error instanceof Error ? error.message : '';

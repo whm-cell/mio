@@ -72,6 +72,7 @@ export interface AdminModelCatalogItem {
   readonly userDiscoveredCount: number;
   readonly userVerifiedChatCount: number;
   readonly userVerifiedImageCount: number;
+  readonly userVerifiedVideoCount: number;
   readonly policy: {
     readonly userVisible: boolean;
     readonly allowUndiscovered: boolean;
@@ -82,6 +83,7 @@ export interface AdminModelCatalogItem {
   };
   readonly chatRoute: Record<string, unknown> | null;
   readonly imageRoute: Record<string, unknown> | null;
+  readonly videoRoute: Record<string, unknown> | null;
   readonly chatRouteMeta: {
     readonly enabled: boolean;
     readonly declarationVersion: number;
@@ -90,6 +92,13 @@ export interface AdminModelCatalogItem {
     readonly updatedAt: string;
   } | null;
   readonly imageRouteMeta: {
+    readonly enabled: boolean;
+    readonly declarationVersion: number;
+    readonly driver: string;
+    readonly vendor: string;
+    readonly updatedAt: string;
+  } | null;
+  readonly videoRouteMeta: {
     readonly enabled: boolean;
     readonly declarationVersion: number;
     readonly driver: string;
@@ -123,7 +132,7 @@ export interface AdminRouteTemplateView {
   readonly templateKey: string;
   readonly label: string;
   readonly description: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: 'chat' | 'image.generate' | 'video.generate';
   readonly vendor: string;
   readonly driver: string;
   readonly routeTemplate: Record<string, unknown>;
@@ -188,6 +197,7 @@ export interface UnifiedModelRawSources {
     discovered_users: number;
     verified_chat_users: number;
     verified_image_users: number;
+    verified_video_users: number;
     sample_metadata: Record<string, unknown> | null;
   }[];
   readonly routeRows: readonly (PlatformRouteRecord & { updated_at: Date })[];

@@ -101,7 +101,10 @@ function brokerFixture(beforeWrite?: () => Promise<void>) {
       writes.push(path);
       await beforeWrite?.();
       const body: unknown = JSON.parse(String(init.body));
-      values.set(path, init.method === 'POST' ? [body] : body);
+      if (init.method === 'POST') {
+        const bindings = values.get(path);
+        values.set(path, [...(Array.isArray(bindings) ? bindings : []), body]);
+      } else values.set(path, body);
       return new Response(null, { status: 201 });
     }),
   );
@@ -260,7 +263,10 @@ it('preserves retired image resources and only prepares the heavy-media topology
     'apply-to': 'queues',
   });
   for (const item of computeTopology('mio-test')) {
-    state.set(item.path, item.method === 'POST' ? [item.body] : item.body);
+    if (item.method === 'POST') {
+      const bindings = state.get(item.path);
+      state.set(item.path, [...(Array.isArray(bindings) ? bindings : []), item.body]);
+    } else state.set(item.path, item.body);
   }
   const legacyImageQueue = { messages: 3, durable: true, arguments: { 'x-queue-type': 'quorum' } };
   state.set('queues/mio-test/mio.compute.image.commands.v1', legacyImageQueue);
@@ -306,7 +312,10 @@ it('preserves retired image resources and only prepares the heavy-media topology
       }
       const body = init.body ? (JSON.parse(String(init.body)) as unknown) : {};
       mutations.push({ method, path, body });
-      state.set(path, method === 'POST' ? [body] : body);
+      if (method === 'POST') {
+        const bindings = state.get(path);
+        state.set(path, [...(Array.isArray(bindings) ? bindings : []), body]);
+      } else state.set(path, body);
       return new Response(null, { status: 201 });
     }),
   );

@@ -10,14 +10,16 @@ import { outputTruncation } from '../conversations/contracts.ts';
 import type {
   ConversationEngine,
   ConversationImageTools,
+  ConversationVideoTools,
   ConversationVision,
   HistoryItem,
 } from '../conversations/contracts.ts';
 import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
+import { parseVideoJobPresentationMeta, registerConversationVideoTools } from './video-tools.ts';
 import type {} from './kernel.ts';
 import { registerOneLink, onelinkRoute } from './onelink.ts';
-import { authorizeConversationImageTools } from './policy.ts';
+import { authorizeConversationTools } from './policy.ts';
 import { conversationImageAssetId } from './vision.ts';
 import { registerVisionTool } from './vision-tool.ts';
 import type { ChatRuntimeSnapshot, ChatSelection } from '../providers/contracts.ts';
@@ -30,6 +32,7 @@ export function createDshConversationEngine(
   config: ConversationConfig,
   imageTools?: ConversationImageTools,
   vision?: ConversationVision,
+  videoTools?: ConversationVideoTools,
 ): ConversationEngine {
   const active = new Map<
     string,
@@ -113,6 +116,14 @@ export function createDshConversationEngine(
           const projected = parseImageJobPresentationMeta(event.data.meta);
           if (projected)
             items.push({ seq: event.seq, role: 'tool', tool: projected.tool, job: projected.job });
+          const videoProjected = parseVideoJobPresentationMeta(event.data.meta);
+          if (videoProjected)
+            items.push({
+              seq: event.seq,
+              role: 'tool',
+              tool: videoProjected.tool,
+              job: videoProjected.job,
+            });
         }
         if (event.type === 'turn/end') {
           const reason = event.data.reason;
@@ -169,7 +180,7 @@ export function createDshConversationEngine(
           }
         : undefined;
       let end: TurnEndReason | undefined;
-      let revokeImageTools: (() => void) | undefined;
+      let revokeTools: (() => void) | undefined;
       const entry: {
         opening: Promise<AgentHandle>;
         stop?: 'user' | 'disposed';
@@ -196,6 +207,7 @@ export function createDshConversationEngine(
             vision && observedBinding?.snapshot.inputModalities?.includes('image'),
           );
           const hasGenerationTools = Boolean(observedBinding && onelink && imageTools);
+          const hasVideoGenerationTools = Boolean(observedBinding && onelink && videoTools);
           const hasInspectionTool = Boolean(observedBinding && onelink && inspection);
           agentCtx.systemPrompt.section({
             name: PERSONA_PREFIX_SECTION,
@@ -204,14 +216,17 @@ export function createDshConversationEngine(
             text: buildConversationSystemPrompt({
               imageGeneration: hasGenerationTools,
               imageInspection: hasInspectionTool,
+              videoGeneration: hasVideoGenerationTools,
             }),
           });
-          if (observedBinding && onelink && (imageTools || inspection)) {
-            revokeImageTools = authorizeConversationImageTools(agentCtx, agent, {
-              generation: hasGenerationTools,
-              inspection: hasInspectionTool,
+          if (observedBinding && onelink && (imageTools || videoTools || inspection)) {
+            revokeTools = authorizeConversationTools(agentCtx, agent, {
+              imageGeneration: hasGenerationTools,
+              imageInspection: hasInspectionTool,
+              videoGeneration: hasVideoGenerationTools,
             });
             if (imageTools) registerConversationImageTools(agentCtx, observedBinding, imageTools);
+            if (videoTools) registerConversationVideoTools(agentCtx, observedBinding, videoTools);
             if (inspection) registerVisionTool(agentCtx, observedBinding, vision!);
           }
           agentCtx.on('agent/pre-step', (payload, next) => {
@@ -263,6 +278,10 @@ export function createDshConversationEngine(
               if (projected) {
                 emit({ type: 'tool', requestId, tool: projected.tool, job: projected.job });
               }
+              const videoProjected = parseVideoJobPresentationMeta(event.data.meta);
+              if (videoProjected) {
+                emit({ type: 'tool', requestId, tool: videoProjected.tool, job: videoProjected.job });
+              }
             }
             if (event.type === 'turn/end') end = event.data.reason;
           });
@@ -290,7 +309,7 @@ export function createDshConversationEngine(
           await ctx.mioKernel.flush(handle.agent.session);
           await durable();
           await handle.agent.whenIdle();
-          revokeImageTools?.();
+          revokeTools?.();
           await ctx.mioKernel.flush(handle.agent.session);
           if (observationFailed) return 'unknown' as const;
           // A disposed session can leave only a durable prefix, with no turn/end
@@ -304,7 +323,7 @@ export function createDshConversationEngine(
           try {
             await handle.dispose();
           } finally {
-            revokeImageTools?.();
+            revokeTools?.();
             for (const release of releases.values()) release();
           }
         }

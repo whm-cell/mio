@@ -166,6 +166,37 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         contentType: 'image/' + format,
       };
     },
+    async putVideo(Key, stream, sizeBytes, sha256, signal) {
+      signal.throwIfAborted();
+      if (
+        !Number.isSafeInteger(sizeBytes) ||
+        sizeBytes < 1 ||
+        sizeBytes > 1024 * 1024 * 1024 ||
+        !/^[a-f0-9]{64}$/.test(sha256)
+      )
+        throw new Error('VIDEO_OUTPUT_INVALID');
+      const abort = () => stream.destroy(new Error('VIDEO_UPLOAD_ABORTED'));
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        const uploaded = await cos.putObject({
+          Bucket,
+          Region,
+          Key,
+          Body: stream,
+          ContentLength: sizeBytes,
+          ContentType: 'video/mp4',
+          ACL: 'private',
+          'x-cos-meta-sha256': sha256,
+          Headers: { 'x-cos-forbid-overwrite': 'true' },
+        });
+        signal.throwIfAborted();
+        if (!uploaded.ETag) throw new Error('VIDEO_OUTPUT_MISMATCH');
+        return { key: Key, sizeBytes, sha256, etag: uploaded.ETag, contentType: 'video/mp4' };
+      } finally {
+        signal.removeEventListener('abort', abort);
+        stream.destroy();
+      }
+    },
     async copy(source, target, etag) {
       await cos.putObjectCopy({
         Bucket,

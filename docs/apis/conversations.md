@@ -40,7 +40,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：`afterSeq`（默认 -1，可原样复用空页/末页 cursor）、`limit`（默认 20、1–100）。
 
-成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
+成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job'|'submit_video_job'|'get_video_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
 
 原生日志证明轮次达到输出上限时，轮次末尾的 status 项为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。同轮助手项按原顺序返回已保存正文。跨页时使用返回的 cursor 继续读到轮次末尾。
 
@@ -61,6 +61,8 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；仅当 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
 
 视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
+
+视频执行配置就绪的会话还可在当前受控轮次内使用 `list_video_models`、`submit_video_job`、`get_video_job`。只读模型目录不代表完成生成；提交返回持久视频任务后应结束本轮，后续对话沿同一 jobId 查询。提交与查询卡片按严格 `mio.video-job` 白名单投影到 SSE 与持久历史；任务、资产和凭据归当前用户，模型不能指定 owner。模型列表或请求失败详情不写成公开卡片。视频执行边界见[计算 HTTP](compute.md#post-apiv1computevideos)。
 
 ## PUT /api/v1/conversations/:id/model
 
@@ -94,7 +96,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、tool `{requestId,tool:'submit_image_job'|'get_image_job'|'submit_video_job'|'get_video_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt}` 或 error `{code}`；每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
 截断轮次完成后，state 中的回执带 `truncation`。如果该请求是订阅建立时的最近回执，snapshot 中也包含同一标记。已发送的 text 原样保留。
 

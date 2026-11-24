@@ -3,12 +3,13 @@ import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
-import type { ComputeResultV1 } from '@mio/compute-contracts';
+import type { ComputeResultV1, VideoProbeCommandV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeBroker } from '../integrations/rabbitmq.ts';
 import type { ComputeConfig } from './config.ts';
 import { ComputeError } from './errors.ts';
 import type { ComputeStore, JobRow } from './store.ts';
+import { createVideoProbeCoordinator } from './video-probe.ts';
 const log = createLogger('app', 'compute');
 const VIDEO_OUTBOX_BATCH = 10;
 const BROKER_RETRY_INITIAL_MS = 1000;
@@ -34,6 +35,7 @@ export function createComputeService(
   objects: AssetObjectStore,
   config: ComputeConfig,
 ) {
+  const videoProbe = createVideoProbeCoordinator();
   let stopping = false;
   let closing: Promise<void> | undefined;
   let broker: ComputeBroker | undefined;
@@ -157,7 +159,7 @@ export function createComputeService(
         acquired.onClose(() => disconnect(acquired));
         if (broker !== acquired) return;
         try {
-          await acquired.consume(receive, () => disconnect(acquired));
+          await acquired.consume(receive, () => disconnect(acquired), videoProbe.receive);
         } catch (error) {
           disconnect(acquired);
           throw error;
@@ -209,6 +211,18 @@ export function createComputeService(
   timer.unref();
   poll();
   return {
+    probeVideo(command: VideoProbeCommandV1, signal: AbortSignal) {
+      return admit(() =>
+        videoProbe.run(
+          command,
+          async (message) => {
+            if (!broker) throw new Error('VIDEO_PROBE_UNAVAILABLE');
+            await broker.publish(message);
+          },
+          signal,
+        ),
+      );
+    },
     create(actor: AssetPrincipal, requestId: string, assetId: string) {
       return admit(async () => {
         if (!isUuidV4(requestId) || !isUuidV4(assetId))
@@ -260,6 +274,7 @@ export function createComputeService(
     close(): Promise<void> {
       if (closing) return closing;
       stopping = true;
+      videoProbe.close();
       pollRequested = false;
       clearInterval(timer);
       closing = (async () => {

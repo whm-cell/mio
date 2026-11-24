@@ -13,6 +13,8 @@ import type {
   ImageRouteConfig,
   ImageRouteParamSpec,
 } from '../../generations/contracts.ts';
+import type { VideoDriver, VideoMode } from '../../generations/video-contracts.ts';
+import { validateVideoRouteConfig } from './video-route.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,
@@ -29,6 +31,8 @@ import type {
   ChatImageBudget,
   PlatformRouteRecord,
   VerificationRecord,
+  VideoCapabilityMetadata,
+  VideoRouteConfig,
 } from '../contracts.ts';
 
 const MEMBERSHIP_SOURCES = new Set(['onelink-v1-models', 'legacy-complete-discovery']);
@@ -102,9 +106,9 @@ export function deriveImageParameterView(route: ImageRouteConfig): ImageParamete
 export interface ValidatedModelRoute {
   readonly providerType: 'onelink';
   readonly rawModelId: string;
-  readonly operation: 'chat' | 'image.generate';
+  readonly operation: 'chat' | 'image.generate' | 'video.generate';
   readonly vendor: string;
-  readonly driver: ChatProfile | ImageDriver;
+  readonly driver: ChatProfile | ImageDriver | VideoDriver;
   readonly classification: Category;
   readonly submitPath: string;
   readonly editPath: string | null;
@@ -141,6 +145,27 @@ const ROUTE_INPUT_FIELDS = new Set([
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validateVideoCapabilityMetadata(
+  value: unknown,
+  modes: readonly VideoMode[],
+): VideoCapabilityMetadata {
+  if (value === undefined) return { modes: [...modes], cancellation: { supported: false } };
+  if (
+    !isPlainObject(value) ||
+    Object.keys(value).some((key) => key !== 'video') ||
+    !isPlainObject(value.video) ||
+    Object.keys(value.video).some((key) => key !== 'modes' && key !== 'cancellation') ||
+    !Array.isArray(value.video.modes) ||
+    value.video.modes.length !== modes.length ||
+    value.video.modes.some((mode, index) => mode !== modes[index]) ||
+    !isPlainObject(value.video.cancellation) ||
+    Object.keys(value.video.cancellation).some((key) => key !== 'supported') ||
+    value.video.cancellation.supported !== false
+  )
+    invalidRoute();
+  return { modes: [...modes], cancellation: { supported: false } };
 }
 
 function invalidRoute(): never {
@@ -289,6 +314,46 @@ export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
       requestDefaults: {},
       outputSpec: {},
       capabilityMetadata: validateChatMetadata(value.capabilityMetadata),
+      sourceKind: value.sourceKind as AdaptationSourceKind,
+      source,
+      sourceVersion,
+      enabled,
+    };
+  }
+
+  if (value.operation === 'video.generate') {
+    if (value.classification !== 'video') invalidRoute();
+    const canonical = validateVideoRouteConfig({
+      driver: value.driver,
+      vendor: value.vendor,
+      submitPath: value.submitPath,
+      editPath: value.editPath,
+      queryPathTemplate: value.queryPathTemplate,
+      paramSpec: value.paramSpec,
+      requestDefaults: value.requestDefaults,
+      outputSpec: value.outputSpec,
+    });
+    if (!canonical) invalidRoute();
+    validateVideoCapabilityMetadata(value.capabilityMetadata, canonical.paramSpec.supportedModes);
+    return {
+      providerType: 'onelink',
+      rawModelId,
+      operation: 'video.generate',
+      vendor: canonical.vendor,
+      driver: canonical.driver,
+      classification: 'video',
+      submitPath: canonical.submitPath,
+      editPath: null,
+      queryPathTemplate: canonical.queryPathTemplate,
+      paramSpec: canonical.paramSpec as unknown as Record<string, unknown>,
+      requestDefaults: canonical.requestDefaults as Record<string, unknown>,
+      outputSpec: canonical.outputSpec as Record<string, unknown>,
+      capabilityMetadata: {
+        video: {
+          modes: [...canonical.paramSpec.supportedModes],
+          cancellation: { supported: false },
+        },
+      },
       sourceKind: value.sourceKind as AdaptationSourceKind,
       source,
       sourceVersion,
@@ -489,6 +554,20 @@ export interface ResolvedImageRoute {
   readonly capabilityMetadata: AdaptationCapabilityMetadata;
 }
 
+export interface ResolvedVideoRoute {
+  readonly operation: 'video.generate';
+  readonly vendor: string;
+  readonly profile: VideoDriver;
+  readonly classification: Category;
+  readonly route: VideoRouteConfig;
+  readonly enabled: boolean;
+  readonly declarationVersion: number;
+  readonly sourceKind: AdaptationSourceKind;
+  readonly source: string;
+  readonly sourceVersion: string;
+  readonly capabilityMetadata: AdaptationCapabilityMetadata;
+}
+
 export function resolveChatRoute(row: PlatformRouteRecord): ResolvedChatRoute | undefined {
   if (
     !row.enabled ||
@@ -592,9 +671,49 @@ export function resolveImageRoute(row: PlatformRouteRecord): ResolvedImageRoute 
   };
 }
 
+/** Resolves only the fixed, canonical declaration. Runtime support is decided separately. */
+export function resolveVideoRoute(row: PlatformRouteRecord): ResolvedVideoRoute | undefined {
+  if (row.operation !== 'video.generate' || row.classification !== 'video') return undefined;
+  const route = validateVideoRouteConfig({
+    driver: row.driver,
+    vendor: row.vendor,
+    submitPath: row.submit_path,
+    editPath: row.edit_path,
+    queryPathTemplate: row.query_path_template,
+    paramSpec: row.param_spec,
+    requestDefaults: row.request_defaults,
+    outputSpec: row.output_spec,
+  });
+  if (!route) return undefined;
+  let video: VideoCapabilityMetadata;
+  try {
+    video = validateVideoCapabilityMetadata(
+      row.capability_metadata?.video === undefined
+        ? undefined
+        : { video: row.capability_metadata.video },
+      route.paramSpec.supportedModes,
+    );
+  } catch {
+    return undefined;
+  }
+  return {
+    operation: 'video.generate',
+    vendor: route.vendor,
+    profile: route.driver,
+    classification: 'video',
+    route,
+    enabled: row.enabled,
+    declarationVersion: row.declaration_version,
+    sourceKind: row.source_kind,
+    source: row.source,
+    sourceVersion: row.source_version,
+    capabilityMetadata: { video },
+  };
+}
+
 export function resolveVerificationView(options: {
   verification: VerificationRecord | undefined;
-  operation: 'chat' | 'image.generate';
+  operation: 'chat' | 'image.generate' | 'video.generate';
   declarationVersion: number;
   profile: string;
   credentialVersion: number;

@@ -168,6 +168,162 @@
       }
     },
     {
+      "key": "media-compute-core",
+      "title": "通用媒体处理内核与基础操作",
+      "locations": [
+        {
+          "path": "src/compute/media-http.ts",
+          "purpose": "本人媒体任务的受理、幂等查询与控制"
+        },
+        {
+          "path": "src/compute/media-results.ts",
+          "purpose": "媒体 manifest 和产物核验与原子登记"
+        },
+        {
+          "path": "compute/src/media-runtime.ts",
+          "purpose": "Worker 媒体队列、执行与故障恢复"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "计算服务 HTTP 契约与操作范围"
+        }
+      ],
+      "outcomes": "提供 `/api/v1/compute/media` 受理、本人查询、取消、重试和对账恢复。事务核验结果、登记资产并裁决状态，工作端保持三次执行上限与未知副作用恢复，所有新媒体产物和 manifest 显式 private。完成探测、参考视频准备、截取、抽帧、场景检测、分割、导出及音频提取、波形、重封装和拼接共 11 种操作。合规参考仅探测并继续使用原件。返修使单任务恢复取消不打断其他任务，受阻队列不牵连健康路由，并按实际视频流末端抽帧和裁剪重封装音轨。",
+      "verification": "692e9fd／合同修订 8 本地静态检查、A/B 构建和装载检查通过，55 个测试文件合计 845 项通过。真实隔离 PostgreSQL、RabbitMQ、SQLite、FFmpeg 和本地对象协议替身覆盖 11 种操作、私有对象、取消/重投、错误分类、旧单路与音频接口和图片限制。独立操作员通过 37 组媒体判据及恢复并发场景，54 次 SDK PUT 显式 private；独立质量和规范均通过。完整检查覆盖由已留存的 072c6d4 GitHub Actions 全量基线与当前定向增量复核建立。",
+      "limitations": "验证使用合成媒体和本地对象协议替身。生产 COS、真实业务数据、长期容量与稳定性、瞬时硬磁盘配额及仓库外媒体双端运行未在本次验证。当前候选的完整检查结论采用已核对的远端全量基线和本地增量；当前业务结果待人类接受。",
+      "acceptance": {
+        "candidate": {
+          "commit": "692e9fd4fa2350f85f0eb6a7a70aeecb1b6d56fd",
+          "contractRevision": 8
+        },
+        "statement": "M1–M5 我统一验收通过。",
+        "reference": "2026-11-25 媒体计算交付对话，用户在五份草稿交回后明确统一验收，并要求登记五份验收记录。本条对应 M2。"
+      }
+    },
+    {
+      "key": "media-compute-derivatives",
+      "title": "视频自动派生与私有 HLS 播放",
+      "locations": [
+        {
+          "path": "compute/src/plans/derivatives.ts",
+          "purpose": "普通与画布视频派生、连续 AAC、逐片 TS 和运行检查点"
+        },
+        {
+          "path": "src/assets/store.ts",
+          "purpose": "原件和唯一 ordinary 意图的原子登记、状态读取"
+        },
+        {
+          "path": "src/assets/derivatives.ts",
+          "purpose": "已持久化意图的容量调度、幂等恢复"
+        },
+        {
+          "path": "src/compute/media-hls.ts",
+          "purpose": "本人主子清单与分片短签、对象完整性校验"
+        },
+        {
+          "path": "docs/apis/assets.md",
+          "purpose": "原件资产派生视图与上传完成约定"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "视频派生参数、私有 HLS 和签名时效"
+        }
+      ],
+      "outcomes": "在 wire v1 的通用媒体入口交付普通和画布视频的私有预览、封面及完整 HLS。视频原件完成时原子建立唯一普通派生意图，容量释放可续跑，计算关闭时返回 disabled。资源包的主、子清单由本人会话读取，分片仅作为短期私有签名 GET 暴露。",
+      "verification": "当前候选静态、A/B 构建、A 装载 smoke 及 51 文件 576 项隔离定向通过，含四组串行真实 RabbitMQ。独立操作员以实际 FFmpeg 和 SDK 验证 720 秒/120 片、1440 帧完整严格 HTTP 播放与 119 接缝 PCM、双档尺寸、真实短签及越权拒绝。真实隔离 PG/MQ 验证原子意图、配额满续跑和同快照跨 attempt 复用。独立审查、质量和规范对账齐全。全量覆盖由既有有效 CI、M1/M2 原件和当前定向构成。",
+      "limitations": "实证采用合成源、回环 COS 协议替身及本机常驻隔离 PG/MQ。720 秒为 96×54/2fps 的包含 AAC 样本，双尺寸使用 13 秒样本。目标部署真实 COS 权限、浏览器墙钟长时播放及并行容量需要对应环境验证。",
+      "acceptance": {
+        "candidate": {
+          "commit": "c83bb1aa226b2ef6129e3e460aafbf7f83398cfb",
+          "contractRevision": 2
+        },
+        "statement": "M1–M5 我统一验收通过。",
+        "reference": "2026-11-25 媒体计算交付对话，用户在五份草稿交回后明确统一验收，并要求登记五份验收记录。本条对应 M3。"
+      }
+    },
+    {
+      "key": "media-compute-foundation",
+      "title": "通用媒体处理共享协议、死信拓扑与统一资源准入",
+      "locations": [
+        {
+          "path": "docs/tasks/compute-service/protocol.md",
+          "purpose": "通用媒体消息、16 种操作、Worker 观测协议和资源准入"
+        },
+        {
+          "path": "docs/integrations/rabbitmq.md",
+          "purpose": "持久队列、死信、实例权限及原拓扑升级方式"
+        },
+        {
+          "path": "scripts/service/compute-broker-topology.ts",
+          "purpose": "A/B 精确授权和部署拓扑实际入口"
+        },
+        {
+          "path": "src/compute/schema.ts",
+          "purpose": "A 显式迁移及启动 schema 检查"
+        },
+        {
+          "path": "src/compute/capacity.ts",
+          "purpose": "单路视频与通用媒体合计 10/500 的事务准入"
+        }
+      ],
+      "outcomes": "M1 冻结 16 种操作与 `standard-media` 协议、Worker O0 遥测和调限消息，新增通用媒体及独立实例控制的 RabbitMQ quorum 资源、可靠死信与精确角色 ACL。PostgreSQL 和 B SQLite journal 增量建立底座，A 复用单路视频锁维持合计配额，B 共用 `total`／`encode`／`probe` 并保留 HOLD 下的原产物对账。",
+      "verification": "候选 5954f3858ce735f42130138f942d564bd95647c2，合同修订 3。静态与双产物构建通过，隔离正式回归 48 文件、598 项通过，重建后的打包插件 smoke 通过。独立业务复核实测混合 PG 准入、旧 RabbitMQ 拓扑升级和音频 stream／视频重投保留。小容量隔离探针收到三次 publisher NACK，解除目标阻塞后 179.257 秒收到原 ID、原消息体和 `x-death`。独立质量与规范审查通过。通过可信 Actions 全量基线与本次差异及受影响回归复核覆盖 pnpm check。",
+      "limitations": "当前结果覆盖 M1 和 O0 底座。M2 完整媒体执行与 HTTP、M5 遥测采集与调限运行随对应单元验证。生产管理 HTTP 凭证链、1 GiB 容量压满、持续负载、真实云服务和部署各有独立证据边界。当前远端工作流和真实人类接受待后续对应步骤。",
+      "acceptance": {
+        "candidate": {
+          "commit": "5954f3858ce735f42130138f942d564bd95647c2",
+          "contractRevision": 3
+        },
+        "statement": "M1–M5 我统一验收通过。",
+        "reference": "2026-11-25 媒体计算交付对话，用户在五份草稿交回后明确统一验收，并要求登记五份验收记录。本条对应 M1。"
+      }
+    },
+    {
+      "key": "media-compute-render",
+      "title": "多轨时间线合成、混剪、口播与中文字幕渲染",
+      "locations": [
+        {
+          "path": "compute/src/media-executor.ts",
+          "purpose": "全部计算媒体操作的 Worker 执行入口"
+        },
+        {
+          "path": "compute/src/plans/composition.ts",
+          "purpose": "六轨画面、音频和字幕及全局帧时钟"
+        },
+        {
+          "path": "compute/src/plans/mix.ts",
+          "purpose": "固定窗口和可重放顺序的混剪"
+        },
+        {
+          "path": "compute/src/plans/narration.ts",
+          "purpose": "实测口播长度、末帧补齐和背景混音"
+        },
+        {
+          "path": "compute/src/plans/subtitles.ts",
+          "purpose": "独立 ASS 烧录与中文字体布局"
+        },
+        {
+          "path": "compute/README.md",
+          "purpose": "B 端自检、封装和更新顺序"
+        },
+        {
+          "path": "docs/apis/compute.md",
+          "purpose": "已启用渲染操作的现行 HTTP 契约"
+        }
+      ],
+      "outcomes": "启用 composition.render、video.mix、video.narration_render、subtitle.burn。B 支持独立切片时钟、实际首尾流边界、VFR 冻结窗口、六轨画面/音频/字幕、实测口播时长与中文字形，随独立 B 打包 Noto Sans/Serif CJK 和 OFL。",
+      "verification": "R1 当前候选 11 项原件全通过。正式静态/构建/插件 smoke、31 项定向渲染及过程回归、580 项受影响测试、15/15 独立生产 Worker 场景、全套真实 HTTP/PG/RabbitMQ/SQLite/FFmpeg 集成、HLS/音频/图片兼容、独立审查及完整 A/B/host 仓外复制装载均实测。B 实际加载两款包内字体并编码 H.264、VP9、AAC、MP3。保留 R0 异长分片 DTS 倒退失败和后续修复原件。",
+      "limitations": "验证范围为本机合成资源、隔离 PG/RabbitMQ、存储替身和已构建仓外产物。全量覆盖沿可信历史 CI 与当前增量复核，当前候选本机全量命令执行 0 次。生产环境、长期容量、真实云及实际填盘至剩余 2 GiB 未现场验证。预验 pnpm 公开 registry 元数据请求已保留并披露，正式产物按 OS 出网限制组装。",
+      "acceptance": {
+        "candidate": {
+          "commit": "ed7f23e90f0e7e972425b685cbec5b70bcdba88a",
+          "contractRevision": 1
+        },
+        "statement": "M1–M5 我统一验收通过。",
+        "reference": "2026-11-25 媒体计算交付对话，用户在五份草稿交回后明确统一验收，并要求登记五份验收记录。本条对应 M4。"
+      }
+    },
+    {
       "key": "private-user-assets",
       "title": "登录用户私有视频资产与 COS 直传",
       "locations": [
@@ -191,6 +347,43 @@
         "candidate": "3df559f42af13d302b6634b3e8a0ffe9eb73587afc37e9903fb9e5a67cb9097b",
         "statement": "接受登录用户私有视频资产与 COS 直传这一成果及已披露的本机验证范围和限制，完成本地交付。",
         "reference": "2026-11-11 本会话用户明确回复：“这四项成果我接受，完成交付。”同步移除草稿中已过时的待接受措辞，能力、验证边界及候选保持不变；按同条消息不合并、不推送。"
+      }
+    },
+    {
+      "key": "worker-observability",
+      "title": "Worker 并发观测、占槽历史与每实例动态调限",
+      "locations": [
+        {
+          "path": "contracts/compute/src/worker-observability.ts",
+          "purpose": "Worker 遥测身份、占槽事件、间断与持久调限的共享严格式"
+        },
+        {
+          "path": "compute/src/main.ts",
+          "purpose": "三类计算消费者共用实际资源槽的独立 Worker 入口"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "A 侧历史存储、控制分发与默认关闭的操作员路由装配"
+        },
+        {
+          "path": "src/compute/ops-web/index.html",
+          "purpose": "实际占用、历史、调限与审计的同源控制台"
+        },
+        {
+          "path": "docs/apis/compute-ops.md",
+          "purpose": "可试验的登录、权限、查询与调限 HTTP 契约"
+        }
+      ],
+      "outcomes": "单路视频、独立音频检测和通用媒体共用真实总槽、编码槽、探针槽。A 保留每实例实际并发、任务占槽历史、缺口与 HOLD，运维控制台支持有权限的持久调限、排空、零上限暂停、离线待生效和可追溯审计。",
+      "verification": "同一候选的静态、A/B 双产物及官方 DSH 组包冒烟通过。91 个受影响文件的 1255 项回归通过，含真实隔离 RabbitMQ 双身份、分队列恢复、真实媒体和音频重投。独立正常 A/B 入口通过。真实 Chrome 独立检查 23/23，留 34 张原图。两个 FFmpeg 真实并行，上调、排空、暂停、三个 WebM 成功、停机断档和同卷重启修订 6 均实证。自动、行为、独立、质量及规范五项原件完整。",
+      "limitations": "运行原件使用本机隔离回环、合成媒体和本机文件对象存储适配器。目标生产服务器长稳吞吐、云链路和生产部署尚待实证，公开接受须由人类另行确认。",
+      "acceptance": {
+        "candidate": {
+          "commit": "c95afb94b5d94cbb52bebdaa52efe4dc41a7392f",
+          "contractRevision": 4
+        },
+        "statement": "M1–M5 我统一验收通过。",
+        "reference": "2026-11-25 媒体计算交付对话，用户在五份草稿交回后明确统一验收，并要求登记五份验收记录。本条对应 M5。"
       }
     }
   ]

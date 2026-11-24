@@ -32,11 +32,41 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [compute/src/adapters/cos.ts](../../../../compute/src/adapters/cos.ts) · [compute/tests/cos-recovery.test.ts](../../../../compute/tests/cos-recovery.test.ts) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/cos.md](../../../integrations/cos.md)
 
+## media-compute-core
+
+**通用媒体处理内核与基础操作**
+
+[src/compute/media-http.ts](../../../../src/compute/media-http.ts) · [src/compute/media-results.ts](../../../../src/compute/media-results.ts) · [compute/src/media-runtime.ts](../../../../compute/src/media-runtime.ts) · [docs/apis/compute.md](../../../apis/compute.md)
+
+## media-compute-derivatives
+
+**视频自动派生与私有 HLS 播放**
+
+[compute/src/plans/derivatives.ts](../../../../compute/src/plans/derivatives.ts) · [src/assets/store.ts](../../../../src/assets/store.ts) · [src/assets/derivatives.ts](../../../../src/assets/derivatives.ts) · [src/compute/media-hls.ts](../../../../src/compute/media-hls.ts) · [docs/apis/assets.md](../../../apis/assets.md) · [docs/apis/compute.md](../../../apis/compute.md)
+
+## media-compute-foundation
+
+**通用媒体处理共享协议、死信拓扑与统一资源准入**
+
+[docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/rabbitmq.md](../../../integrations/rabbitmq.md) · [scripts/service/compute-broker-topology.ts](../../../../scripts/service/compute-broker-topology.ts) · [src/compute/schema.ts](../../../../src/compute/schema.ts) · [src/compute/capacity.ts](../../../../src/compute/capacity.ts)
+
+## media-compute-render
+
+**多轨时间线合成、混剪、口播与中文字幕渲染**
+
+[compute/src/media-executor.ts](../../../../compute/src/media-executor.ts) · [compute/src/plans/composition.ts](../../../../compute/src/plans/composition.ts) · [compute/src/plans/mix.ts](../../../../compute/src/plans/mix.ts) · [compute/src/plans/narration.ts](../../../../compute/src/plans/narration.ts) · [compute/src/plans/subtitles.ts](../../../../compute/src/plans/subtitles.ts) · [compute/README.md](../../../../compute/README.md) · [docs/apis/compute.md](../../../apis/compute.md)
+
 ## private-user-assets
 
 **登录用户私有视频资产与 COS 直传**
 
 [src/assets/service.ts](../../../../src/assets/service.ts) · [src/assets/http.ts](../../../../src/assets/http.ts) · [docs/apis/assets.md](../../../apis/assets.md)
+
+## worker-observability
+
+**Worker 并发观测、占槽历史与每实例动态调限**
+
+[contracts/compute/src/worker-observability.ts](../../../../contracts/compute/src/worker-observability.ts) · [compute/src/main.ts](../../../../compute/src/main.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/compute/ops-web/index.html](../../../../src/compute/ops-web/index.html) · [docs/apis/compute-ops.md](../../../apis/compute-ops.md)
 
 ```mio-prd-results
 {

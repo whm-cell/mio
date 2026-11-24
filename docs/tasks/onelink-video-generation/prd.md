@@ -1,6 +1,6 @@
 # 万联异步视频与恢复 PRD
 
-状态：原 W4 的独立需求规划，尚未启动或接受。W6 的认证素材联动单独验收，不因视频普通模式通过而算完成。返回[任务资料与成果](../index.md)。
+状态：原 W4 的独立需求规划，尚未启动或接受；完整协议矩阵、参数/状态恢复契约与 V0–V6 本期开发单元安排见[视频生成迁移与路由设计](design.md)（其中 `design.md` V0–V6 聚焦基础视频生成闭环，编辑/数字人/多镜头等相邻能力留待后续独立单元）。W6 的认证素材联动单独验收，不因视频普通模式通过而算完成。返回[任务资料与成果](../index.md)。
 
 ## 1. 结果与范围
 
@@ -18,7 +18,7 @@
 
 ## 2. 直接依赖与 C0 缺口
 
-凭据、成员和模型身份直接沿[供应商规范](../../providers.md)，必要基线为已接受 `onelink-user-provider-catalog`（[成果入口](../onelink-integration/complete/report.md)）。任务/资产与安全恢复直接引用[共享候选设计](../onelink-image-generation/design.md)，实施前核对 W3 首个消费者实际交付的基础接口、固定代码及接受范围，不把完整图片 PRD 或其全部成果作为前置。
+凭据、成员和模型身份直接沿[供应商规范](../../providers.md)，必要基线为已接受 `onelink-user-provider-catalog`（[成果入口](../onelink-integration/complete/report.md)）。任务/资产与安全恢复直接引用[共享候选设计](../onelink-image-generation/design.md)，视频专属协议矩阵、参数与状态机契约及 V0–V6 实施单元安排见[视频生成迁移与路由设计](design.md)；本地视频探测（`media.probe`）、参考视频超规预处理（`video.reference_prepare`，按需压至 1080p、前 15 秒）与播放派生（`video.derivatives`）统一对接[通用媒体处理设计](../compute-service/media-compute.md)（开工前核对 M1–M3 实际接受范围，不在视频目录复制第二套 FFmpeg 链路）。实施前核对 W3 首个消费者实际交付的基础接口、固定代码及接受范围，不把完整图片 PRD 或其全部成果作为前置。
 
 C0 核对本视频切片实施范围与调用授权（O1）、`user_id` 与已提交任务查询/清理（O2）、单实例/轮询次数/总时限/并发/停机恢复（O4）、精确型号/模式清单（O5），按[共同决定](../onelink-image-generation/design.md#5-仍须收口的共同决定)收口。逐协议确认查询、幂等和取消：旧版只有 Seedance 有上游删除分支，其他协议不能据此宣称支持取消；不支持项明确返回限制。缺真实调用结果属于 C1，不将未来证据当规划前置。
 

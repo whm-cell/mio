@@ -7,10 +7,13 @@ import { mediaIdentity } from './media-journal.ts';
 import type { MediaFiles } from './media-files.ts';
 import { mediaName, MEDIA_TEXT_LIMIT } from './media-files.ts';
 import { waveformCapture } from './waveform.ts';
+import { bundledFontsDirectory, checkBundledFonts } from './fonts.ts';
 import { videoPacketEndCapture } from './video-packet-end.ts';
 
 // Standalone media demuxers. Playlist/concat demuxers can open a second local
 // file even when network protocols are disabled.
+const renderConcatRestriction = ['-protocol_whitelist', 'file', '-format_whitelist', 'concat,mov'];
+
 const inputRestriction = [
   '-protocol_whitelist',
   'file',
@@ -71,7 +74,18 @@ export function resolveMediaArgs(args: string[], files: MediaFiles): string[] {
       !arg.includes('@file:')
     )
       throw new Error('MEDIA_PATH_INVALID');
-    return replaced;
+    if (!/(?:@font:|fontsdir\s*=)/.test(replaced)) return replaced;
+    const subtitle = /(^|,)ass=subtitles\.ass:fontsdir=@font:bundled(?=$|[,[;])/;
+    if (!subtitle.test(replaced) || /(?:@font:|fontsdir\s*=)/.test(replaced.replace(subtitle, '')))
+      throw new Error('MEDIA_PATH_INVALID');
+    // ASS option values and the enclosing filter graph are parsed separately.
+    const directory = bundledFontsDirectory()
+      .replace(/[\\':]/g, '\\$&')
+      .replace(/[\\'\[\],;]/g, '\\$&');
+    return replaced.replace(
+      subtitle,
+      (_match, prefix: string) => prefix + 'ass=subtitles.ass:fontsdir=' + directory,
+    );
   });
 }
 
@@ -197,6 +211,9 @@ export class MediaProcessAdapter {
       stdout: result.stdout,
       diagnostic: result.diagnostic,
       ...(result.waveform ? { waveform: result.waveform } : {}),
+      ...(result.packetStartSeconds === undefined
+        ? {}
+        : { packetStartSeconds: result.packetStartSeconds }),
       ...(result.packetEndSeconds === undefined
         ? {}
         : { packetEndSeconds: result.packetEndSeconds }),
@@ -211,6 +228,7 @@ export interface ManagedProcessResult {
   signal: string | null;
   aborted: boolean;
   waveform?: number[];
+  packetStartSeconds?: number;
   packetEndSeconds?: number;
 }
 interface ManagedProcessOptions {
@@ -245,8 +263,16 @@ export async function managedProcess(
     if (arg === '-y' || arg === '-n') continue;
     if (arg === '-i') {
       normalized.push('-threads', '2');
-      if (args[index - 2] !== '-f' || args[index - 1] !== 'lavfi')
-        normalized.push(...inputRestriction);
+      if (args[index - 2] !== '-f' || args[index - 1] !== 'lavfi') {
+        // Only the fixed lists written by joinVideoSlices opt into concat.
+        const renderConcat =
+          args[index - 4] === '-f' &&
+          args[index - 3] === 'concat' &&
+          args[index - 2] === '-safe' &&
+          args[index - 1] === '1' &&
+          /^(composition|mix)\.ffconcat$/.test(args[index + 1] ?? '');
+        normalized.push(...(renderConcat ? renderConcatRestriction : inputRestriction));
+      }
     }
     normalized.push(arg);
   }
@@ -267,7 +293,16 @@ export async function managedProcess(
   if (binary === 'ffmpeg' && options.progress)
     prefix.push('-progress', 'pipe:3', '-stats_period', '1');
   const informational = normalized.some((arg) =>
-    ['-version', '-encoders', '-filters', '-formats', '-muxers', '-bsfs', '-h'].includes(arg),
+    [
+      '-version',
+      '-encoders',
+      '-filters',
+      '-formats',
+      '-muxers',
+      '-demuxers',
+      '-bsfs',
+      '-h',
+    ].includes(arg),
   );
   if (binary === 'ffprobe' && !informational) prefix.push(...inputRestriction);
   if (binary === 'ffmpeg' && normalized.length && !informational)
@@ -387,8 +422,11 @@ export async function managedProcess(
     }
     if (waveform && result.exitCode === 0 && !result.aborted) result.waveform = waveform.finish();
     if (packets && result.exitCode === 0 && !result.aborted) {
-      const end = packets.finish();
-      if (end !== undefined) result.packetEndSeconds = end;
+      const range = packets.finish();
+      if (range) {
+        result.packetStartSeconds = range.first;
+        result.packetEndSeconds = range.end;
+      }
     }
     options.checkLimits?.();
     return result;
@@ -411,6 +449,9 @@ export async function checkMediaCapabilities(
   const muxers = await managedProcess('ffmpeg', ['-muxers'], signal, undefined, {
     capture: true,
   });
+  const demuxers = await managedProcess('ffmpeg', ['-demuxers'], signal, undefined, {
+    capture: true,
+  });
   const bitstreamFilters = await managedProcess('ffmpeg', ['-bsfs'], signal, undefined, {
     capture: true,
   });
@@ -418,10 +459,11 @@ export async function checkMediaCapabilities(
   const has = (text: string, name: string) =>
     text.split('\n').some((line) => line.trim().split(/\s+/)[1] === name);
   if (
-    [encoders, filters, muxers, bitstreamFilters, probe].some(
+    [encoders, filters, muxers, demuxers, bitstreamFilters, probe].some(
       (result) => result.aborted || result.exitCode !== 0,
     ) ||
     ['hls', 'mpegts', 'segment'].some((name) => !has(muxers.stdout, name)) ||
+    !has(demuxers.stdout, 'concat') ||
     !bitstreamFilters.stdout.split(/\r?\n/).includes('noise') ||
     [
       'libx264',
@@ -450,7 +492,26 @@ export async function checkMediaCapabilities(
       'ametadata',
       'palettegen',
       'paletteuse',
+      'ass',
+      'color',
+      'anullsrc',
+      'setpts',
+      'trim',
+      'format',
+      'pad',
+      'tpad',
+      'overlay',
+      'rotate',
+      'drawbox',
+      'atempo',
+      'aformat',
+      'adelay',
+      'volume',
+      'amix',
+      'afade',
+      'loudnorm',
     ].some((name) => !has(filters.stdout, name))
   )
     throw new Error('CAPABILITY_UNAVAILABLE');
+  await checkBundledFonts();
 }

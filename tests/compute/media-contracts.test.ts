@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   MEDIA_MAX_MESSAGE_BYTES,
+  MEDIA_AVAILABLE_OPERATIONS,
   MEDIA_OPERATIONS,
   MEDIA_PROFILE,
   parseMediaRequest,
@@ -74,6 +75,11 @@ function command() {
   };
 }
 describe('media contract', () => {
+  it('registers all sixteen stable media operations in both runtimes', () => {
+    expect(MEDIA_OPERATIONS).toHaveLength(16);
+    expect([...MEDIA_AVAILABLE_OPERATIONS].sort()).toEqual([...MEDIA_OPERATIONS].sort());
+  });
+
   it('accepts exactly the sixteen application operations with typed bounded parameters', () => {
     expect(MEDIA_OPERATIONS).toHaveLength(16);
     for (const operation of MEDIA_OPERATIONS) {

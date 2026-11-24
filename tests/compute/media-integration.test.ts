@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
+  MEDIA_AVAILABLE_OPERATIONS,
   MEDIA_CONTROL_QUEUE,
   MEDIA_CORE_OPERATIONS,
   MEDIA_ENCODE_QUEUE,
@@ -240,7 +241,7 @@ async function samples(
   };
 }
 
-it('publishes the eleven base operations through real HTTP, PostgreSQL, RabbitMQ, SQLite and FFmpeg', async () => {
+it('publishes core and render operations through real HTTP, PostgreSQL, RabbitMQ, SQLite and FFmpeg', async () => {
   await withLocalTestBroker(async (broker) => {
     const database = await authDatabase();
     const pool = new Pool({ connectionString: database.url });
@@ -360,8 +361,63 @@ it('publishes the eleven base operations through real HTTP, PostgreSQL, RabbitMQ
           },
           1,
         ],
+        [
+          'composition.render',
+          [video.assetId, tone.assetId],
+          {
+            resolution: '720p',
+            durationSeconds: 0.6,
+            tracks: [
+              { kind: 'video', index: 0 },
+              { kind: 'audio', index: 0 },
+              { kind: 'subtitle', index: 0 },
+            ],
+            items: [
+              { kind: 'video', track: 0, startSeconds: 0, durationSeconds: 0.4, inputIndex: 0 },
+              { kind: 'audio', track: 0, startSeconds: 0, durationSeconds: 0.6, inputIndex: 1 },
+              { kind: 'subtitle', track: 0, startSeconds: 0, durationSeconds: 0.4, text: '时间线' },
+            ],
+          },
+          1,
+        ],
+        [
+          'video.mix',
+          [video.assetId, silent.assetId, tone.assetId],
+          {
+            seed: 17,
+            clips: [
+              { inputIndex: 0, startSeconds: 0.1, durationSeconds: 0.2 },
+              { inputIndex: 1, startSeconds: 1.6, durationSeconds: 0.2 },
+            ],
+            bgmInputIndex: 2,
+          },
+          1,
+        ],
+        [
+          'video.narration_render',
+          [silent.assetId, tone.assetId],
+          {
+            videoInputIndex: 0,
+            narrationInputIndex: 1,
+            cues: [{ startSeconds: 0, endSeconds: 0.5, text: '口播' }],
+          },
+          1,
+        ],
+        [
+          'subtitle.burn',
+          [video.assetId],
+          {
+            cues: [{ startSeconds: 0.1, endSeconds: 0.5, text: '中文字幕' }],
+            style: { font: 'serif' },
+          },
+          1,
+        ],
       ];
-      expect(cases.map(([operation]) => operation)).toEqual(MEDIA_CORE_OPERATIONS);
+      const operations = cases.map(([operation]) => operation);
+      expect(operations.slice(0, MEDIA_CORE_OPERATIONS.length)).toEqual(MEDIA_CORE_OPERATIONS);
+      expect(operations).toEqual(
+        MEDIA_AVAILABLE_OPERATIONS.filter((operation) => operation !== 'video.derivatives'),
+      );
       for (const [operation, inputs, parameters, outputs] of cases) {
         const { job, request } = await submit(operation, inputs, parameters);
         expect(job, operation).toMatchObject({
@@ -424,7 +480,7 @@ it('publishes the eleven base operations through real HTTP, PostgreSQL, RabbitMQ
         }
         if (operation === 'audio.concat')
           expect(job.data.subtitles?.[0]?.startSeconds).toBeCloseTo(3, 1);
-        console.info('M2_MEDIA', operation, job.status, outputs);
+        console.info('COMPUTE_MEDIA', operation, job.status, outputs);
       }
 
       for (const [operation, input, parameters] of [
@@ -442,15 +498,18 @@ it('publishes the eleven base operations through real HTTP, PostgreSQL, RabbitMQ
       }
       const outsider = await (await call('', undefined, 'other')).json();
       expect(outsider).toEqual({ jobs: [] });
-      const unknownOperation = await call('', {
+      const unrecognizedParameter = await call('', {
         requestId: randomUUID(),
         operation: 'subtitle.burn',
         inputs: [{ assetId: video.assetId }],
-        parameters: { cues: [{ startSeconds: 0, endSeconds: 0.5, text: '待支持' }] },
+        parameters: {
+          cues: [{ startSeconds: 0, endSeconds: 0.5, text: '无效参数' }],
+          filter: 'arbitrary',
+        },
       });
-      expect(unknownOperation.status).toBe(400);
-      expect(await unknownOperation.json()).toMatchObject({
-        error: { code: 'MEDIA_OPERATION_UNAVAILABLE' },
+      expect(unrecognizedParameter.status).toBe(400);
+      expect(await unrecognizedParameter.json()).toMatchObject({
+        error: { code: 'MEDIA_INPUT_INVALID' },
       });
 
       // Force an actual RabbitMQ connection loss while B is waiting on an encode HOLD.

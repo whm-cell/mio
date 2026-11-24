@@ -54,8 +54,8 @@ afterEach(() => {
   for (const directory of roots.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 describe('media process/files adapter with real FFmpeg', () => {
-  it.each(['asetnsamples', 'astats', 'atrim', 'ametadata'])(
-    'refuses admission when the waveform filter %s is unavailable',
+  it.each(['asetnsamples', 'astats', 'atrim', 'ametadata', 'ass', 'loudnorm'])(
+    'refuses admission when media filter %s is unavailable',
     async (filter) => {
       const originalPath = process.env.PATH!;
       const ffmpeg = originalPath
@@ -233,6 +233,78 @@ process.exit(result.status ?? 1);
       files.write('oversized.txt', new Uint8Array(MEDIA_TEXT_LIMIT + 1)),
     ).rejects.toThrow('MEDIA_WRITE_LIMIT');
   });
+  it('uses bundled fonts only for the generated ASS and limits concat to generated list identities', async () => {
+    const { adapter, files } = fixture();
+    expect(resolveMediaArgs(['ass=@file:subtitles.ass:fontsdir=@font:bundled'], files)[0]).toMatch(
+      /^ass=subtitles\.ass:fontsdir=\/.*\/compute\/fonts\/$/,
+    );
+    for (const value of [
+      'ass=@file:subtitles.ass:fontsdir=external',
+      'ass=@file:subtitles.ass:fontsdir=@font:unknown',
+      'ass=@file:subtitles.ass:fontsdir=@font:bundled/other',
+      'ass=@file:other.ass:fontsdir=@font:bundled',
+    ])
+      expect(() => resolveMediaArgs([value], files)).toThrow('MEDIA_PATH_INVALID');
+
+    await adapter.run({
+      id: 'fixture-visual',
+      tool: 'ffmpeg',
+      args: [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=red:s=16x16',
+        '-frames:v',
+        '1',
+        '-c:v',
+        'libx264',
+        '@file:segment.mp4',
+      ],
+      outputs: [{ name: 'segment.mp4', role: 'segment', contentType: 'video/mp4' }],
+    });
+    const list = "ffconcat version 1.0\nfile 'segment.mp4'\n";
+    await files.write('input-0', list);
+    await files.write('composition.ffconcat', list);
+    await adapter.run({
+      id: 'generated-concat',
+      tool: 'ffmpeg',
+      args: [
+        '-v',
+        'error',
+        '-f',
+        'concat',
+        '-safe',
+        '1',
+        '-i',
+        '@file:composition.ffconcat',
+        '-f',
+        'null',
+        '-',
+      ],
+    });
+    await expect(
+      adapter.run({
+        id: 'untrusted-concat',
+        tool: 'ffmpeg',
+        args: [
+          '-v',
+          'error',
+          '-f',
+          'concat',
+          '-safe',
+          '1',
+          '-i',
+          '@file:input-0',
+          '-f',
+          'null',
+          '-',
+        ],
+      }),
+    ).rejects.toThrow('EXECUTION_FAILED');
+  });
+
   it('does not rerun a durable launch intent and rejects changing thread limits', async () => {
     const { adapter, attempt } = fixture();
     const step = { id: 'unknown', tool: 'ffmpeg' as const, args: ['-version'] };

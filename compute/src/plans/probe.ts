@@ -131,22 +131,36 @@ export async function probeInput(
   return probeFile(`input-${index}`, `probe-input-${index}`, context);
 }
 
-/** The first actual video stream can end before the container's other streams. */
-export async function primaryVideoEnd(probe: MediaProbe, context: MediaExecutionContext) {
+export interface MediaStreamRange {
+  start: number;
+  end: number;
+}
+
+/** Report the selected stream bounds relative to the container timeline. */
+export async function primaryStreamRange(
+  probe: MediaProbe,
+  context: MediaExecutionContext,
+  inputIndex: number,
+  stream: 'V' | 'a',
+): Promise<MediaStreamRange | null> {
+  const kind = stream === 'V' ? 'video' : 'audio';
+  const suffix = inputIndex === 0 ? '' : `-${inputIndex}`;
+  const input = `@file:input-${inputIndex}`;
+  const selection = `${stream}:0`;
   const source = await context.run({
-    id: 'probe-video-timing',
+    id: `probe-${kind}-timing${suffix}`,
     tool: 'ffprobe',
     capture: 'json',
     args: [
       '-v',
       'error',
       '-select_streams',
-      'V:0',
+      selection,
       '-show_entries',
       'format=start_time:stream=start_time,duration',
       '-of',
       'json',
-      '@file:input-0',
+      input,
     ],
   });
   const timing = JSON.parse(source.stdout) as {
@@ -155,30 +169,39 @@ export async function primaryVideoEnd(probe: MediaProbe, context: MediaExecution
   };
   const overallStart = Number(timing.format?.start_time);
   const formatStart = Number.isFinite(overallStart) ? overallStart : 0;
-  const video = timing.streams?.[0];
-  const duration = Number(video?.duration);
-  const start = Number(video?.start_time);
-  if (Number.isFinite(duration) && duration > 0) {
-    const end = duration + (Number.isFinite(start) ? start - formatStart : 0);
-    if (end > 0 && end <= probe.durationSeconds + 0.35) return end;
+  const selected = timing.streams?.[0];
+  const duration = Number(selected?.duration);
+  const start = Number(selected?.start_time) - formatStart;
+  if (Number.isFinite(start) && Number.isFinite(duration) && duration > 0) {
+    const end = start + duration;
+    if (end > 0 && end <= probe.durationSeconds + 0.35) return { start: Math.max(0, start), end };
   }
-  // Some containers omit stream duration. Scan only the video packet timestamps.
-  const { packetEndSeconds } = await context.run({
-    id: 'probe-video-packet-end',
+  // Some containers omit stream duration. Scan only the selected stream's timestamps.
+  const { packetStartSeconds, packetEndSeconds } = await context.run({
+    id: `probe-${kind}-packet-end${suffix}`,
     tool: 'ffprobe',
-    packetEnd: { frameSeconds: probe.fps ? 1 / probe.fps : 0 },
+    packetEnd: { frameSeconds: stream === 'V' && probe.fps ? 1 / probe.fps : 0 },
     args: [
       '-v',
       'error',
       '-select_streams',
-      'V:0',
+      selection,
       '-show_entries',
       'packet=pts_time,duration_time',
       '-of',
       'csv=p=0',
-      '@file:input-0',
+      input,
     ],
   });
   const end = packetEndSeconds === undefined ? 0 : packetEndSeconds - formatStart;
-  return end > 0 && end <= probe.durationSeconds + 0.35 ? end : null;
+  // Pre-existing M2 checkpoints recorded the packet end only.
+  const first = packetStartSeconds === undefined ? start : packetStartSeconds - formatStart;
+  const relativeStart = Number.isFinite(first) ? Math.max(0, first) : 0;
+  if (end > relativeStart && end <= probe.durationSeconds + 0.35)
+    return { start: relativeStart, end };
+  return null;
+}
+
+export async function primaryVideoEnd(probe: MediaProbe, context: MediaExecutionContext) {
+  return (await primaryStreamRange(probe, context, 0, 'V'))?.end ?? null;
 }

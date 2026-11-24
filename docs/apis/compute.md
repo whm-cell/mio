@@ -40,13 +40,28 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 MediaJobView 含 `jobId`、`requestId`、`operation`、`profile`、`inputs`、`parameters`、`status`、`attempt`、`stage`、`progress`、`errorCode`、`cancelRequested`、`data`、`outputs`、`createdAt`、`updatedAt`。进度为 0 至 1，阶段和错误码可为空。`outputs` 在成功前为空，成功后按 manifest 顺序返回 `{assetId,name,role,contentType,sizeBytes}`；可下载产物通过本人[资产查询](assets.md)取得短期下载地址，支持的音频 MIME 同时签发播放地址。内部 HLS 清单与分片通过[私有 HLS](#私有-hls)消费。状态与产物来自同一数据库快照。私有对象键、ETag 和内部 manifest 描述保留在服务端。manifest 正文按 SHA-256 验证，每个文件核对 HEAD 中的长度、ETag、SHA-256 元数据，当前 attempt 仍匹配时同事务登记所有结果资产、结构化 `data` 和成功终态。
 
-参数和返回信息见[操作设计](../tasks/compute-service/media-compute.md#操作与参数)。当前接受 `media.probe`、`video.reference_prepare`、`video.derivatives`、`video.trim`、`frames.extract`、`scenes.detect`、`video.split`、`media.export`、`audio.extract`、`audio.waveform`、`audio.remux`、`audio.concat`。执行器根据媒体内容识别独立音视频容器，能够使用 MP4、MOV、Matroska、WebM、AVI、MPEG、常用音频及静态图像容器中的实际音视频流。输入须为单个冻结对象中的媒体，外部清单、播放列表及其他对象引用无法提交为媒体源。合规的参考视频只探测，返回 `data={compressed:false,trimmed:false}` 与空 `outputs`，继续使用原输入资产。
+参数和返回信息见[操作设计](../tasks/compute-service/media-compute.md#操作与参数)。接口支持 `media.probe`、`video.reference_prepare`、`video.derivatives`、`video.trim`、`frames.extract`、`scenes.detect`、`video.split`、`media.export`、`audio.extract`、`audio.waveform`、`audio.remux`、`audio.concat`、`composition.render`、`video.mix`、`video.narration_render`、`subtitle.burn`。执行器根据媒体内容识别独立音视频容器，能够使用 MP4、MOV、Matroska、WebM、AVI、MPEG、常用音频及静态图像容器中的实际音视频流。输入须为单个冻结对象中的媒体，外部清单、播放列表及其他对象引用无法提交为媒体源。合规的参考视频只探测，返回 `data={compressed:false,trimmed:false}` 与空 `outputs`，继续使用原输入资产。
 
 `media.probe` 的 `data.probe.width`、`height` 是应用源像素宽高比与旋转后的显示尺寸。`rotation` 报告归一化至 0–360 度的源旋转，`sampleAspectRatio` 报告源像素宽高比。编码尺寸 240×180、SAR 4:3、旋转 +90° 的源返回 `width=180`、`height=320`。显示时直接使用这对尺寸，无需重复变换。
 
 当音轨长于画面流时，`frames.extract` 的 `first_last` 返回实际最后一帧。`audio.remux` 使用首个实际视频流的结束位置裁剪较长的新音轨，较短的新音轨自然结束。`sourceDurationSeconds` 可指定更短的输出窗口，超出画面末尾的请求返回任务错误 `INPUT_INVALID`。
 
 `video.derivatives` 接受一个本人 ready 视频与 `parameters.profile` 为 `ordinary` 或 `canvas`。两档均交付私有 H.264 MP4 预览、JPEG 封面及 MPEG-TS HLS 播放包，`data.probe` 保留原件探测值。普通档以一次 FFmpeg HLS 打包步骤产生清单与全部分片，主清单使用已核对的实际编码尺寸。亚秒视频保留实测的分片时长，子清单的整数目标时长至少为 1 秒。画布档源视频最长 720 秒，按 6 秒目标独立编码，每档最多 120 片、每片不超过 4 MiB。720p/480p 沿显示方向等比适配，不放大，实际尺寸相同只保留一档。分片核对长度、时间、音轨和连续性，时间误差最多 0.35 秒。带源音轨的产物保留首条音轨为 AAC，音轨比画面短的区间补静音。画布音轨连续编码为 48 kHz AAC，各视频片按同一帧时钟复用完整音频包。末尾不足以容纳下一 AAC 帧时与前片合并，时间误差仍受 0.35 秒限制。普通档与通用探测的输入时长上限一致，为 3600 秒。
+
+四种渲染操作各返回一份 `primary` H.264 MP4。输入引用一律为冻结 `inputs` 的零基下标，时间单位为秒。
+
+| 操作                     | 参数及时间线                                                                                                                                                                                                                                                               |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `composition.render`     | `resolution` 为 `720p`、`1080p` 或 `4k`，`durationSeconds` 最长 3600 秒，支持可选 `fps`（1–60，默认 30）。`tracks` 每类画面、音频、字幕各至多六轨，`items` 共至多 256 项。按照首个可见画面的实际显示比例选画布，短边使用所选规格。纯音频、字幕或空画面时间线用 16:9 黑底。 |
+| `video.mix`              | 提交 `clips`（每项含 `inputIndex`、`startSeconds`、`durationSeconds`）和整数 `seed`，可选 `bgmInputIndex`、`bgmVolume`。源窗口冻结，种子决定重放顺序。1920×1080，保留源显示比例，合成时长由窗口长度之和决定，长背景音乐截断，短背景音乐补静音。仅显式 BGM 进入输出音轨。   |
+| `video.narration_render` | 提交 `videoInputIndex`、`narrationInputIndex`，可选 `bgmInputIndex`、`bgmVolume`、`cues` 和 `style`。1920×1080，保留源显示比例。以首条配音音轨解码后的实测时长决定输出，短画面冻结真实末帧，长画面截断。配音经过响度处理，背景音乐限于口播窗口。                           |
+| `subtitle.burn`          | 提交一个视频与 `cues`，可选 `style`。按源旋转和 SAR 规范化显示尺寸，原有音轨转 AAC。                                                                                                                                                                                       |
+
+画面、音频和字幕轨通过 `kind` 与 `index` 标识，轨号为 0–5。各项使用 `track`、`startSeconds` 和 `durationSeconds`。图片放在画面轨并保持首帧。隐藏轨和隐藏项从导出过滤，锁定轨照常导出。画面和字幕各自从低轨号向高轨号叠加，同轨按开始时间稳定排序。画面未覆盖的区间呈现黑底。视频原声和显式音轨参与归一化混音，遮挡画面不关闭原声。可设 `muted` 与增益，原声保留相对画面的音轨起始位置。`sourceStartSeconds` 与 `speed`（0.5–4）决定源窗口，源窗口完全早于所引用流的首帧或超出其实际结束位置时返回 `INPUT_INVALID`。窗口起点早于首帧且包含首帧时，混剪保持前段为黑底，合成在首帧前继续显示下层画面或黑底，音轨保留前导静音。输出帧按同一全局帧时钟量化。`transform` 以画布中心为基准，支持 `contain`、`cover` 及 `manual`，`x`、`y` 为位移，`rotation` 为角度。显式 `manual` 宽高可以非等比，并允许画布边缘裁剪。4K 使用相同的单文件 1 GiB、工作目录 10 GiB 和空闲 2 GiB 预算。
+
+字幕项提供文本与可选样式；`cues` 每项含 `startSeconds`、`endSeconds` 和 `text`。`font` 为 `sans` 或 `serif`，使用随 B 发布的 Noto CJK。字号 `fontSize`、边距 `margin` 和描边 `outline` 按 1080p 像素设置并随输出高度换算。`color`、`outlineColor`、`background` 为 `#RRGGBB` 或 `#RRGGBBAA`。`alignment` 为 `bottom`、`middle` 或 `top`。字幕烧录和带字幕的口播在 `data.subtitles` 返回原始提示文本和时间。媒体输入、参数与字幕均使用结构化字段。ASS 覆盖、FFmpeg 表达式和路径由 B 生成。
+
+启用新增操作的 A 前，应将全部媒体编码消费者 B 更新至支持该操作的版本，完成字体和 libass 能力自检后再切换 A。B 缺少必需能力时按 `CAPABILITY_UNAVAILABLE` 报告通用媒体任务。
 
 A 与 B 对同一 attempt 仲裁取消和成功。A 已提交成功时，取消返回原成功结果。取消先持久化时，后续已完成的结果结束为 `cancelled`，输出保留在内部对账中。B 收到取消后跳过未开始作业，运行中先终止并回收实际进程，再报告取消。已知回收中断、执行超时及瞬时存储失败可自动开启下一 attempt。人工重试需要 `failed` 状态，自动与人工合计最多三次。已取消及待对账的任务禁止新 attempt。
 

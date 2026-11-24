@@ -17,13 +17,14 @@ export interface MediaStep {
   capture?: 'json' | 'lines';
   /** Specialized bounded stream for FFmpeg's fixed-frame audio statistics. */
   waveform?: { points: number; samples: number; frameSamples: number };
-  /** Stream video packet times. Use the probed frame interval for missing packet durations. */
+  /** Stream the selected media stream's packet times. Use the probed frame interval for missing packet durations. */
   packetEnd?: { frameSeconds: number };
 }
 export interface MediaProcessResult {
   stdout: string;
   diagnostic: string;
   waveform?: number[];
+  packetStartSeconds?: number;
   packetEndSeconds?: number;
 }
 /** Resolve bounded, deterministic filenames from a completed tool output. */

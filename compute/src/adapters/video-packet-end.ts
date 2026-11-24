@@ -1,6 +1,7 @@
-/** FFprobe emits one timestamp and duration per packet. Retain only the largest end. */
+/** FFprobe emits one timestamp and duration per packet. Retain only the earliest start and latest end. */
 export function videoPacketEndCapture(frameSeconds: number) {
   let tail = '';
+  let first = Infinity;
   let end = -Infinity;
   let packets = 0;
   return {
@@ -13,16 +14,18 @@ export function videoPacketEndCapture(frameSeconds: number) {
         const [timestamp, duration] = line.split(',');
         const start = Number(timestamp);
         const length = Number(duration);
-        if (timestamp && Number.isFinite(start))
+        if (timestamp && Number.isFinite(start)) {
+          first = Math.min(first, start);
           end = Math.max(
             end,
             start + (length > 0 && Number.isFinite(length) ? length : frameSeconds),
           );
+        }
       }
     },
     finish() {
       if (tail) throw new Error('OUTPUT_INVALID');
-      return Number.isFinite(end) ? end : undefined;
+      return Number.isFinite(end) ? { first, end } : undefined;
     },
   };
 }

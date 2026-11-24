@@ -140,6 +140,10 @@ export const MEDIA_CORE_OPERATIONS: readonly MediaOperation[] = [
 export const MEDIA_AVAILABLE_OPERATIONS: readonly MediaOperation[] = [
   ...MEDIA_CORE_OPERATIONS,
   'video.derivatives',
+  'composition.render',
+  'video.mix',
+  'video.narration_render',
+  'subtitle.burn',
 ];
 export type MediaRequest = {
   [O in MediaOperation]: {

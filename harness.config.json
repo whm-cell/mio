@@ -94,7 +94,8 @@
         "fs": [
           "compute/src/adapters/media.ts",
           "compute/src/adapters/media-files.ts",
-          "compute/src/adapters/media-process.ts"
+          "compute/src/adapters/media-process.ts",
+          "compute/src/adapters/fonts.ts"
         ],
         "child_process": ["compute/src/adapters/media.ts", "compute/src/adapters/media-process.ts"]
       },
@@ -161,6 +162,9 @@
     "deploy/rabbitmq/compose.yaml",
     "deploy/rabbitmq/rabbitmq.conf",
     "compute/package.json",
+    "compute/fonts/NotoSansCJKsc-Regular.otf",
+    "compute/fonts/NotoSerifCJKsc-Regular.otf",
+    "compute/fonts/OFL.txt",
     "compute/tsconfig.json",
     "compute/tsconfig.build.json",
     "contracts/compute/package.json",

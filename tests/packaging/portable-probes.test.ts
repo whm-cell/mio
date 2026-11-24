@@ -25,7 +25,12 @@ async function temporaryDirectory() {
   return directory;
 }
 
-function run(probe: 'artifact' | 'migrations', directory: string, root: string, preload?: string) {
+function run(
+  probe: 'artifact' | 'migrations' | 'media',
+  directory: string,
+  root: string,
+  preload?: string,
+) {
   const entry = fileURLToPath(new URL(`./portable-${probe}-probe.ts`, import.meta.url));
   return spawnSync(process.execPath, [...(preload ? ['--import', preload] : []), entry, root], {
     cwd: directory,
@@ -40,6 +45,8 @@ function run(probe: 'artifact' | 'migrations', directory: string, root: string, 
 
 it.each([
   { probe: 'artifact', component: 'b', topLevel: true },
+  { probe: 'media', component: 'b', topLevel: true },
+  { probe: 'media', component: 'b', topLevel: false },
   { probe: 'artifact', component: 'host', topLevel: false },
   { probe: 'migrations', component: 'a', topLevel: true },
   { probe: 'migrations', component: 'a', topLevel: false },
@@ -66,10 +73,10 @@ it.each([
   },
 );
 
-it('both probes reject the source workspace when invoked from outside it', async () => {
+it('the probes reject the source workspace when invoked from outside it', async () => {
   const temporary = await temporaryDirectory();
   const workspace = fileURLToPath(new URL('../../', import.meta.url));
-  for (const probe of ['artifact', 'migrations'] as const) {
+  for (const probe of ['artifact', 'migrations', 'media'] as const) {
     const result = run(probe, temporary, workspace);
     expect(result.status, result.stderr).toBe(1);
     expect(result.stderr).toContain('PORTABLE_ROOT_MUST_BE_OUTSIDE_WORKSPACE');

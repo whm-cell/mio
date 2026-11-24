@@ -127,6 +127,17 @@ export function resolveEffectiveImage(
   return route ? resolveImageRoute(route) : undefined;
 }
 
+export function resolveEffectiveVideo(
+  state: ProviderState,
+  model: ModelRecord,
+): ResolvedVideoRoute | undefined {
+  if (!model.raw_model_id) return undefined;
+  const route = (state.routes ?? []).find(
+    (item) => item.raw_model_id === model.raw_model_id && item.operation === 'video.generate',
+  );
+  return route ? resolveVideoRoute(route) : undefined;
+}
+
 export function indexVideoRouteDeclarations(
   routes: readonly PlatformRouteRecord[] | undefined,
 ): Map<string, ResolvedVideoRoute> {

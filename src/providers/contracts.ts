@@ -301,7 +301,7 @@ export interface ImageAdmissionSnapshot extends AccountCredentialSnapshot {
   readonly adaptationVersion: number;
 }
 
-/** A future outbound video admission; credential bytes stay encrypted until explicitly opened. */
+/** Durable video admission keeps encrypted provider bytes; only an outbound action opens them. */
 export interface VideoRouteConfig {
   readonly driver: VideoDriver;
   readonly vendor: string;

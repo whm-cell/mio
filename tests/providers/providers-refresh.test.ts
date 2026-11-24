@@ -7,6 +7,7 @@ import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import type { ModelTransport } from '../../src/integrations/onelink/models.ts';
+import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { findFixtureRoute, makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
@@ -45,10 +46,10 @@ async function resolveRawIdFromRef(ref: string): Promise<string> {
   return ref;
 }
 
-async function fixture(transport: ModelTransport) {
+async function fixture(transport: ModelTransport, videoRuntime = false) {
   const config = { databaseURL: database.url, masterKey, masterKeyId: 'refresh-fixture' };
   const store = await createProviderStore(config);
-  const service = createProviderService(store, config, transport);
+  const service = createProviderService(store, config, transport, videoRuntime);
   services.push(service);
   const actor = { userId: randomUUID(), sessionId: 'fixture' };
   await service.save(actor, 0, 'synthetic-refresh-private-key');
@@ -878,4 +879,50 @@ it('does not manufacture members or verification through route data and isolates
   });
   expect(await one.service.discover(one.actor)).toMatchObject({ status: 'connected' });
   await expect(one.service.selectChat(one.actor)).rejects.toThrow('PROVIDER_DISABLED');
+});
+
+it('records only successful current video route tuples and ignores late observations after a version change', async () => {
+  const f = await fixture(async () => metadata(['vega-1.5-pro']), true);
+  await f.service.discover(f.actor);
+  const modelRef = (await f.service.catalog(f.actor)).items[0]!.modelRef;
+  const route = legacyVideoRouteEntries(['vega-1.5-pro'])[0]!;
+  await f.store.importRoutes([route]);
+
+  const original = await f.service.snapshotVideo(f.actor, modelRef);
+  const verificationSnapshot = (snapshot: typeof original) => ({
+    providerConfigId: snapshot.providerConfigId,
+    credentialVersion: snapshot.credentialVersion,
+    catalogVersion: snapshot.catalogVersion,
+    adaptationVersion: snapshot.adaptationVersion,
+    modelKey: snapshot.modelKey,
+    operation: 'video.generate' as const,
+    profile: snapshot.profile,
+  });
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(original),
+    'video:materialized-output-v1',
+  );
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'verified', evidence: 'video:materialized-output-v1' },
+  );
+
+  await f.store.importRoutes([{ ...route, sourceVersion: 'protocol-v2' }]);
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'unverified', evidence: 'video:materialized-output-v1' },
+  );
+  const current = await f.service.snapshotVideo(f.actor, modelRef);
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(current),
+    'video:materialized-output-v2',
+  );
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(original),
+    'video:late-old-output',
+  );
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'verified', evidence: 'video:materialized-output-v2' },
+  );
 });

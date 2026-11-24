@@ -87,7 +87,7 @@ function routeSnapshot(snapshot: Record<string, unknown>): Record<string, unknow
   return Object.fromEntries(Object.entries(snapshot).filter(([key]) => allowed.has(key)));
 }
 
-/** V1 exposes capability and durable job reads; admission remains closed until a driver is wired. */
+/** Exposes video capability, durable job reads, and admission through the wired executor. */
 export function createVideoGenerationService(
   store: VideoGenerationStore,
   provider: () => ProviderService | undefined,

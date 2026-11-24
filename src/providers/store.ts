@@ -25,12 +25,14 @@ import {
   membershipError,
   resolveEffectiveChat,
   resolveEffectiveImage,
+  resolveEffectiveVideo,
 } from './catalog.ts';
 import {
   canonicalRouteComparable,
   serializeRouteInputSnapshot,
   validateRouteImportPayload,
 } from './onelink/router.ts';
+import { videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 
 const log = createLogger('app', 'provider-store');
 
@@ -603,8 +605,6 @@ export class ProviderStore {
     snapshot: VerificationSnapshot,
     evidence: string,
   ): Promise<void> {
-    // No video driver is runtime-supported in this slice, so declarations cannot be verified.
-    if (snapshot.operation === 'video.generate') return;
     await this.transaction(async (client) => {
       const row = await this.locked(client, owner);
       if (row.id !== snapshot.providerConfigId)
@@ -617,12 +617,18 @@ export class ProviderStore {
       const state = (await client.query<ProviderState>(providerStateSQL(false), [owner])).rows[0];
       const model = state?.models.find((item) => item.model_key === snapshot.modelKey);
       if (!state || !model) return;
+      const video =
+        snapshot.operation === 'video.generate' ? resolveEffectiveVideo(state, model) : undefined;
       const effective =
         snapshot.operation === 'chat'
           ? resolveEffectiveChat(state, model)
-          : resolveEffectiveImage(state, model);
+          : snapshot.operation === 'image.generate'
+            ? resolveEffectiveImage(state, model)
+            : video;
       if (
         !effective ||
+        (snapshot.operation === 'video.generate' &&
+          (!video?.enabled || !videoRouteRuntimeAvailable(video.route))) ||
         effective.declarationVersion !== snapshot.adaptationVersion ||
         effective.profile !== snapshot.profile
       )

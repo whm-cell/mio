@@ -88,10 +88,15 @@
       "capabilities": {
         "sqlite": [
           "compute/src/adapters/journal.ts",
+          "compute/src/adapters/media-journal.ts",
           "compute/src/adapters/media-journal-schema.ts"
         ],
-        "fs": ["compute/src/adapters/media.ts"],
-        "child_process": ["compute/src/adapters/media.ts"]
+        "fs": [
+          "compute/src/adapters/media.ts",
+          "compute/src/adapters/media-files.ts",
+          "compute/src/adapters/media-process.ts"
+        ],
+        "child_process": ["compute/src/adapters/media.ts", "compute/src/adapters/media-process.ts"]
       },
       "packageAdapters": {
         "amqplib": ["compute/src/adapters/rabbitmq.ts"],

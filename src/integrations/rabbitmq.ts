@@ -14,16 +14,29 @@ import {
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
   COMPUTE_MAX_MESSAGE_BYTES,
+  MEDIA_CONTROL_ROUTING_KEY,
+  MEDIA_ENCODE_ROUTING_KEY,
+  MEDIA_MAX_MESSAGE_BYTES,
+  MEDIA_PROBE_ROUTING_KEY,
+  MEDIA_RESULT_QUEUE,
   RESULT_QUEUE,
+  mediaResourceClass,
   parseAudioInspectResultV1,
   parseComputeResultV1,
+  parseMediaResult,
 } from '@mio/compute-contracts';
 import type {
   AudioInspectCommandV1,
   AudioInspectResultV1,
   ComputeCommandV1,
   ComputeResultV1,
+  MediaCommand,
+  MediaControl,
+  MediaResult,
 } from '@mio/compute-contracts';
+
+/** The broker resolved this individual command as rejected. Connection state is independent. */
+export class MediaPublishRejected extends Error {}
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -213,9 +226,24 @@ export class ComputeBroker {
     return this.publishCommand(AUDIO_COMMAND_ROUTING_KEY, message);
   }
 
+  publishMedia(message: MediaCommand | MediaControl): Promise<void> {
+    const routingKey =
+      message.type === 'media.control'
+        ? MEDIA_CONTROL_ROUTING_KEY
+        : mediaResourceClass(message.operation) === 'encode'
+          ? MEDIA_ENCODE_ROUTING_KEY
+          : MEDIA_PROBE_ROUTING_KEY;
+    return this.publishCommand(routingKey, message).catch((error: unknown) => {
+      // amqplib 2.2.1 uses "message nacked" for the confirm callback on Basic.Nack.
+      if (error instanceof Error && ['message nacked', 'MESSAGE_RETURNED'].includes(error.message))
+        throw new MediaPublishRejected(error.message, { cause: error });
+      throw error;
+    });
+  }
+
   private async publishCommand(
     routingKey: string,
-    message: ComputeCommandV1 | AudioInspectCommandV1,
+    message: ComputeCommandV1 | AudioInspectCommandV1 | MediaCommand | MediaControl,
   ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
@@ -284,6 +312,21 @@ export class ComputeBroker {
       handle,
       failed,
       AbortSignal.any([stop, this.transport.signal]),
+    );
+  }
+
+  async consumeMedia(
+    handle: (result: MediaResult) => Promise<void>,
+    failed: () => void,
+  ): Promise<void> {
+    // Media progress has no wire sequence field. Keep dispatch order through
+    // the inbox of this dedicated media result consumer.
+    await untilAborted(this.consumer.prefetch(1), this.transport.signal);
+    return this.consumeResults(
+      { queue: MEDIA_RESULT_QUEUE, maxBytes: MEDIA_MAX_MESSAGE_BYTES, parse: parseMediaResult },
+      handle,
+      failed,
+      this.transport.signal,
     );
   }
 

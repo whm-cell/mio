@@ -16,6 +16,8 @@
 
 A 仅写命令交换机 `mio.compute.commands.v1`，读取视频结果、音频结果 stream、媒体结果及 Worker 遥测队列。B 仅写结果交换机 `mio.compute.results.v1`，读取视频、音频、媒体命令与所属实例控制队列。两者独立密码、无管理标签、无 configure 权限；管理密码只用于部署入口，不传给 A/B。[管理后台 RabbitMQ 只读监控](../../src/integrations/rabbitmq-monitor.ts)可选通过 `MIO_ADMIN_RABBITMQ_MONITOR_URL` 使用独立 `mio-<env>-monitor` 账号（`tags="monitoring"`，对 `mio-<env>` 的 `configure/write/read` 均为 `^$`，无权收发消息或修改拓扑）只读采集 Management HTTP 概览、节点告警与队列/死信积压指标。Worker 启动只接收 B 的 MQ 和本环境 COS 配置，不能继承 A 的数据库、认证秘密或管理配置。
 
+通用媒体的 encode、probe、control 待发命令分别认领并保留各自退避。收到某一路由的确定 publisher NACK 或 mandatory return 时释放当前租约，在该路由按原消息 ID 重投，其他路由继续排空。确认结果不明或连接关闭时重建连接。每轮每路最多认领 10 条，确认和释放必须匹配当前租约。详见[通用媒体协议](../tasks/compute-service/protocol.md#通用媒体处理与-worker-观测协议)。
+
 音频检测使用独立的 `mio.compute.audio.commands.v1` quorum 队列（`audio.inspect.v1` 路由），沿用命令交换机及 1 GiB 容量策略。无效命令经 `audio.inspect.dead.v1` 进入专用 `mio.compute.audio.commands.dlq.v1`。B 在结果获发布确认后 ACK 原命令。读对象期间中断或结果确认失败会留下原命令供重投。
 
 音频结果经 `audio.inspect.result.v1` 路由进入持久的 `mio.compute.audio.results.v1` stream。每个 A 实例先从 `next` 注册自己的消费游标，再提交请求，按命令、检测和业务任务三个 ID 关联结果。断线和停机会结束本实例的在途等待，下一次业务恢复可重新检查同一对象。结果只含检测证据和关联 ID。stream 以 64 MiB 和 1 小时为保留配置，按 8 MiB 分段回收，至少保留最新非空段。其精确匹配的 operator policy 优先于现有 quorum 容量策略。[RabbitMQ Streams](https://www.rabbitmq.com/docs/streams)

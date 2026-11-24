@@ -43,3 +43,26 @@ it('does not bypass a HOLD, permits the other class, and removes cancelled waite
   releaseProbe();
   expect(slots.available('encode')).toBe(true);
 });
+
+it('lets output-only reconciliation bypass a process HOLD while sharing the real class budget', async () => {
+  const slots = new ResourceSlots();
+  const releaseExecution = slots.acquire('encode')!;
+  slots.setHold('encode', 'prior-process', true);
+  let acquired = false;
+  const recovery = slots
+    .waitForOutputRecovery('encode', AbortSignal.timeout(1000))
+    .then((release) => {
+      acquired = true;
+      return release;
+    });
+  await Promise.resolve();
+  expect(acquired).toBe(false);
+  releaseExecution();
+  const releaseRecovery = await recovery;
+  expect(acquired).toBe(true);
+  expect(slots.acquireOutputRecovery('encode')).toBeNull();
+  releaseRecovery();
+  expect(slots.acquire('encode')).toBeNull();
+  slots.setHold('encode', 'prior-process', false);
+  expect(slots.available('encode')).toBe(true);
+});

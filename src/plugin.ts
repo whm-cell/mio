@@ -58,6 +58,9 @@ import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
+import { createMediaHandler } from './compute/media-http.ts';
+import { createMediaService } from './compute/media-service.ts';
+import { createMediaStore } from './compute/media-store.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
 import { createMaterialStore } from './materials/store.ts';
@@ -276,6 +279,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       } catch (error) {
         await (ownedCompute ? ownedCompute.close() : store.close());
+        throw error;
+      }
+    }
+    if (computeConfig && assetConfig && assetResources) {
+      const store = await createMediaStore(assetConfig.databaseURL);
+      let media: ReturnType<typeof createMediaService> | undefined;
+      try {
+        const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
+        ctx.effect(() => () => acquired.close());
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/media',
+            handler: createMediaHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await (media ? media.close() : store.close());
         throw error;
       }
     }

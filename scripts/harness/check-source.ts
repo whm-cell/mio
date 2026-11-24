@@ -447,6 +447,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/compute/store.ts',
         'src/compute/schema.ts',
         'src/compute/media-schema.ts',
+        'src/compute/media-store.ts',
+        'src/compute/database.ts',
         'src/compute/capacity.ts',
         'src/generations/store.ts',
         'src/generations/schema.ts',

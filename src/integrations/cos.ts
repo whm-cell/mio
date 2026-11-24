@@ -191,6 +191,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     },
     head,
     readImage: readObject,
+    readMedia: readObject,
     readAudio: readObject,
     putImage(Key, bytes, format, sha256, signal) {
       if (!['png', 'jpeg', 'webp'].includes(format)) throw new Error('IMAGE_OUTPUT_INVALID');

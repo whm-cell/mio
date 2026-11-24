@@ -122,6 +122,20 @@ export const MEDIA_OPERATIONS: readonly MediaOperation[] = [
   'audio.remux',
   'audio.concat',
 ];
+/** Operations implemented by the base media runtime. */
+export const MEDIA_CORE_OPERATIONS: readonly MediaOperation[] = [
+  'media.probe',
+  'video.reference_prepare',
+  'video.trim',
+  'frames.extract',
+  'scenes.detect',
+  'video.split',
+  'media.export',
+  'audio.extract',
+  'audio.waveform',
+  'audio.remux',
+  'audio.concat',
+];
 export type MediaRequest = {
   [O in MediaOperation]: {
     requestId: string;

@@ -2,7 +2,7 @@
 
 仓库内开发、人工测试优先使用[常驻环境](../docs/local-environments.md)的 `compute:init:dev/test` 与 `compute:start:dev/test`；初始化只做一次，启动在前台运行，使用该环境独立的 broker 身份和 journal。`start:dev/test` 启动主服务 A，不会同时启动 B。MQ 权限与部署边界见 [RabbitMQ 契约](../docs/integrations/rabbitmq.md)；下列原始入口仍用于独立部署产物。
 
-本进程使用受限 B 身份消费视频转码及 `audio.inspect.v1` 命令并发送结果。需要 Node 24、`ffmpeg`（含 libx264、AAC）和 `ffprobe`。先用仓库根 `pnpm build` 构建共享基础库、协议和 Worker，独立产物须提供这两个工作区运行时依赖，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`；临时凭据还需 `MIO_COS_SESSION_TOKEN`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
+本进程使用受限 B 身份消费视频转码、`audio.inspect.v1` 及通用媒体命令并发送结果。需要 Node 24、`ffmpeg` 和 `ffprobe`。通用媒体启动检查 x264、AAC、VP9、Opus、MP3、PCM、JPEG、PNG、GIF 编码及实际使用的滤镜。缺少能力时通用媒体返回 `CAPABILITY_UNAVAILABLE`。先用仓库根 `pnpm build` 构建共享基础库、协议和 Worker，独立产物须提供这两个工作区运行时依赖，并准备由运行身份拥有、其他用户不可访问的独占持久目录。环境提供 `MIO_COMPUTE_DIRECTORY`、持久不变的 `MIO_COMPUTE_INSTANCE_ID`、B 专用 `RABBITMQ_URL` 和 `MIO_COMPUTE_BROKER_USER`、A 专用发送身份 `MIO_COMPUTE_EXPECTED_COMMAND_USER`，以及 `MIO_COS_BUCKET`、`MIO_COS_REGION`、`MIO_COS_SECRET_ID`、`MIO_COS_SECRET_KEY`；临时凭据还需 `MIO_COS_SESSION_TOKEN`。不要把凭据写入日志或仓库。非回环 RabbitMQ 连接须使用 TLS。
 
 首次新建卷时显式运行 `node compute/dist/main.js init`，其后运行 `node compute/dist/main.js start`。已有卷丢失、损坏或实例身份不一致时，停止消费并调查；不要对已有卷重新初始化。journal、WAL、SHM 和未确认的输入/输出都须保留在一起。目录是单实例独占的；SQLite 的锁在进程退出后释放，各事件和状态独立提交。
 
@@ -21,3 +21,15 @@ B 的视频转码命令通道保持单并发（`prefetch=1`）。云端图片生
 视频上传结果未知时保留原输出和 journal，继续按固定 attempt 键对账。连接或读写无进度的 60 秒超时与总预算不同；本地超时不证明远端 PUT 已取消。视频未知上传恢复通过 GET 流式校验完整内容，未知对象内容不符或本地输出缺失时保持待对账，不删除 COS 资产。
 
 图片产物与恢复目录归属 A，见[图片接口与恢复约定](../docs/apis/compute.md)。
+
+## 通用媒体执行与恢复
+
+[通用媒体 HTTP](../docs/apis/compute.md#通用媒体处理)的 11 种基础操作使用独立的 encode、probe、control 通道，共用单路转码和独立音频检测的 total/encode/probe 槽。单次 attempt 实际执行预算为 60 分钟。FFmpeg 解码、编码与滤镜线程配置为 2。进度按事件流合并，诊断只保存有界尾部。波形按原采样率在 FFmpeg 内产生不超过 1024 个样本一帧的能量统计，B 流式合并到最多 4096 个桶，保留原采样率的高频能量与各声道能量。跨桶帧按重叠样本数分摊，桶边界是近似值。以 192 kHz、单小时为例，最多产生 675000 个统计帧，按每帧 256 字节的解析预算约 173 MB。常驻聚合状态最多为 4096 个数值和一条未完成记录，最终回执最多 4096 点。
+
+运行实例使用 10 GiB 工作目录预算并保留至少 2 GiB 空闲。收到输入时在文件打开前、写入期间每 8 MiB 及结束后检查，FFmpeg 运行中以一秒为间隔轮询并在收尾时核对。文件和存储流按 1 GiB 限制核验。部署也须用容器或宿主机的 CPU、内存和磁盘配额限制最坏瞬时用量，轮询有检查间隔。
+
+每步先写启动意图、再写 PID 和进程身份，等进程结束后保存退出结果并核验输出摘要。未知进程在相应类别保持 HOLD。人工已经按前文确认未落 PID 的媒体进程终止后，可执行 `node compute/dist/main.js resolve-media-no-pid <attempt-id> --confirmed-process-terminated '<确认依据>'`，与单路转码使用各自的 journal 记录。
+
+已持久化的产物和 manifest 使用同一 attempt 前缀并在每次 PUT 显式设置 `private` ACL。每次 PUT 前记录意图。结果未知时按原对象键核验长度、ETag 和真实字节 SHA-256。旧键仍缺失时保持待对账，保留本地文件。publish confirm 后标记结果确认，再 ACK 命令。连接中断时待槽 attempt 保留为已接收，重新连接后可继续接纳取消，并让原命令在同一次 attempt 中重投。
+
+正在等待输出恢复槽的任务收到取消后，只取消自己的等待。未确定的旧 PUT 仍须按原对象键对账。抽帧与音频重封装按实际画面流寻找末尾，流时长缺失时可逐包扫描时间戳。末帧尾窗无法产出时逐帧解码并只保留最后一张图。

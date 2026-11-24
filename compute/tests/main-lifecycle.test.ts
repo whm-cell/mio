@@ -25,6 +25,8 @@ vi.mock('../src/worker.ts', () => ({
   },
 }));
 vi.mock('../src/audio-runtime.ts', () => ({ runAudioRuntime: async () => {} }));
+vi.mock('../src/media-runtime.ts', () => ({ runMediaRuntime: async () => {} }));
+vi.mock('../src/adapters/media-process.ts', () => ({ checkMediaCapabilities: async () => {} }));
 vi.mock('../src/maintenance.ts', () => ({
   Maintenance: class {
     async tick() {}

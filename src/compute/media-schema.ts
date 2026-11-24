@@ -27,6 +27,9 @@ CREATE INDEX IF NOT EXISTS mio_media_outbox_pending ON mio_media_outbox(created_
 CREATE TABLE IF NOT EXISTS mio_media_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS mio_media_inbox_recovery
+  ON mio_media_inbox ((payload->>'jobId'),(payload->>'attemptId'),(payload->>'commandId'),created_at,id)
+  WHERE payload ? '_verificationErrors';
 CREATE TABLE IF NOT EXISTS mio_media_retries (
   owner_id text NOT NULL, request_id uuid NOT NULL, job_id uuid NOT NULL REFERENCES mio_media_jobs(id),
   attempt_id uuid NOT NULL, PRIMARY KEY(owner_id,request_id)
@@ -41,7 +44,9 @@ CREATE TABLE IF NOT EXISTS mio_media_files (
   name text NOT NULL, role text NOT NULL, object_key text NOT NULL UNIQUE,
   size_bytes bigint NOT NULL, etag text NOT NULL, sha256 text NOT NULL, content_type text NOT NULL,
   UNIQUE(job_id,name)
-);`;
+);
+ALTER TABLE mio_media_files ADD COLUMN IF NOT EXISTS ordinal integer NOT NULL DEFAULT 0
+  CHECK (ordinal >= 0);`;
 
 export async function checkMediaSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await pool.query(
@@ -52,7 +57,7 @@ export async function checkMediaSchema(pool: Pick<Pool, 'query'>): Promise<void>
   );
   await pool.query('SELECT id,payload,created_at FROM mio_media_inbox LIMIT 0');
   await pool.query(
-    'SELECT asset_id,job_id,name,role,object_key,size_bytes,etag,sha256,content_type FROM mio_media_files LIMIT 0',
+    'SELECT asset_id,job_id,name,role,object_key,size_bytes,etag,sha256,content_type,ordinal FROM mio_media_files LIMIT 0',
   );
   await pool.query('SELECT owner_id,request_id,job_id,attempt_id FROM mio_media_retries LIMIT 0');
   await pool.query('SELECT job_id,attempt_id,action,message_id FROM mio_media_controls LIMIT 0');

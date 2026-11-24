@@ -10,6 +10,7 @@ import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import type { Attempt, PendingEvent, Phase } from '../types.ts';
 import { prepareJournalFile } from './media.ts';
 import { checkMediaJournal, migrateMediaJournal } from './media-journal-schema.ts';
+import { MediaJournal } from './media-journal.ts';
 
 type Row = Record<string, unknown>;
 
@@ -78,6 +79,7 @@ function asAttempt(row: Row): Attempt {
 /** One long-lived connection owns SQLite's exclusive lock; each mutation commits. */
 export class Journal {
   readonly #db: DatabaseSync;
+  readonly media: MediaJournal;
 
   constructor(directory: string, instanceId: string, initialize = false) {
     const path = prepareJournalFile(directory, initialize);
@@ -180,6 +182,7 @@ export class Journal {
       if (Number(meta[0]?.schema_version) < 7) migrateMediaJournal(db);
       checkMediaJournal(db);
       this.#db = db;
+      this.media = new MediaJournal(db);
     } catch (error) {
       db.close();
       throw error;

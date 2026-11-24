@@ -8,6 +8,9 @@ import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
 import { runAudioRuntime } from './audio-runtime.ts';
 import { ResourceSlots } from './resource-slots.ts';
+import { checkMediaCapabilities } from './adapters/media-process.ts';
+import { executeMedia } from './media-executor.ts';
+import { runMediaRuntime } from './media-runtime.ts';
 
 const log = createLogger('worker', 'main');
 
@@ -25,7 +28,7 @@ async function start(): Promise<void> {
     journal.close();
     return;
   }
-  if (process.argv[2] === 'resolve-no-pid') {
+  if (process.argv[2] === 'resolve-no-pid' || process.argv[2] === 'resolve-media-no-pid') {
     if (
       process.argv[4] !== '--confirmed-process-terminated' ||
       !process.argv[3] ||
@@ -34,7 +37,9 @@ async function start(): Promise<void> {
       throw new Error('RESOLUTION_ARGUMENTS_REQUIRED');
     const journal = new Journal(directory, instance);
     try {
-      journal.resolveNoPid(process.argv[3], process.argv[5]);
+      if (process.argv[2] === 'resolve-media-no-pid')
+        journal.media.resolveNoPid(process.argv[3], process.argv[5]);
+      else journal.resolveNoPid(process.argv[3], process.argv[5]);
     } finally {
       journal.close();
     }
@@ -73,6 +78,30 @@ async function start(): Promise<void> {
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  const mediaCapabilities = checkMediaCapabilities(
+    AbortSignal.any([stopping.signal, AbortSignal.timeout(30_000)]),
+  ).then(
+    () => true,
+    () => {
+      if (!stopping.signal.aborted) log.error('CAPABILITY_UNAVAILABLE');
+      return false;
+    },
+  );
+  const media = runMediaRuntime(
+    { url, userId: username, expectedUserId: expectedUser, directory },
+    store,
+    journal,
+    async (command, context) => {
+      if (!(await mediaCapabilities)) throw new Error('CAPABILITY_UNAVAILABLE');
+      return executeMedia(command, context);
+    },
+    stopping.signal,
+    slots,
+  ).catch(() => {
+    stop();
+    log.error('MEDIA_JOURNAL_CONSUMPTION_STOPPED');
+    process.exitCode = 1;
+  });
   const audio = runAudioRuntime(
     { url, username, expectedUser, directory },
     store,
@@ -131,7 +160,7 @@ async function start(): Promise<void> {
     }
   } finally {
     stop();
-    await audio;
+    await Promise.all([audio, media]);
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
     journal.close();

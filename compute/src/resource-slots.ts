@@ -3,6 +3,7 @@ import type { WorkerLimits, WorkerResourceClass } from '@mio/compute-contracts';
 
 interface Waiter {
   resource: WorkerResourceClass;
+  outputRecovery: boolean;
   admit: (release: () => void) => void;
 }
 
@@ -60,8 +61,20 @@ export class ResourceSlots {
   }
 
   wait(resource: WorkerResourceClass, signal: AbortSignal): Promise<() => void> {
+    return this.#wait(resource, signal, false);
+  }
+
+  waitForOutputRecovery(resource: WorkerResourceClass, signal: AbortSignal): Promise<() => void> {
+    return this.#wait(resource, signal, true);
+  }
+
+  #wait(
+    resource: WorkerResourceClass,
+    signal: AbortSignal,
+    outputRecovery: boolean,
+  ): Promise<() => void> {
     if (signal.aborted) return Promise.reject(signal.reason);
-    const release = this.acquire(resource);
+    const release = outputRecovery ? this.acquireOutputRecovery(resource) : this.acquire(resource);
     if (release) return Promise.resolve(release);
     return new Promise((resolve, reject) => {
       const abort = () => {
@@ -70,6 +83,7 @@ export class ResourceSlots {
       };
       const waiter: Waiter = {
         resource,
+        outputRecovery,
         admit: (release) => {
           signal.removeEventListener('abort', abort);
           resolve(release);
@@ -82,7 +96,9 @@ export class ResourceSlots {
 
   #drain(): void {
     for (const waiter of this.#waiting) {
-      const release = this.acquire(waiter.resource);
+      const release = waiter.outputRecovery
+        ? this.acquireOutputRecovery(waiter.resource)
+        : this.acquire(waiter.resource);
       if (release) {
         this.#waiting.delete(waiter);
         waiter.admit(release);

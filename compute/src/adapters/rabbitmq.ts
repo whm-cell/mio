@@ -15,16 +15,28 @@ import {
   AUDIO_RESULT_ROUTING_KEY,
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
+  MEDIA_CONTROL_QUEUE,
+  MEDIA_ENCODE_QUEUE,
+  MEDIA_MAX_MESSAGE_BYTES,
+  MEDIA_PROBE_QUEUE,
+  MEDIA_RESULT_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  mediaResourceClass,
   parseAudioInspectCommandV1,
   parseComputeCommandV1,
+  parseMediaCommand,
+  parseMediaControl,
 } from '@mio/compute-contracts';
 import type {
   AudioInspectCommandV1,
   AudioInspectResultV1,
   ComputeCommandV1,
   ComputeResultV1,
+  MediaCommand,
+  MediaControl,
+  MediaResult,
+  WorkerResourceClass,
 } from '@mio/compute-contracts';
 
 const BROKER_STARTUP_TIMEOUT_MS = 5000;
@@ -44,6 +56,12 @@ interface ConsumerSlot {
 interface ConsumerGate {
   open: boolean;
   slot: ConsumerSlot;
+}
+
+interface CommandProtocol<T> {
+  queue: string;
+  maxBytes: number;
+  parse(value: unknown): T;
 }
 
 async function closeConnection(
@@ -109,6 +127,8 @@ export class Broker {
   #handling: Promise<void> | null = null;
   #pause: Promise<void> | null = null;
   #handlerFailure: unknown = null;
+  readonly #mediaHandling = new Set<Promise<void>>();
+  #mediaClosing = false;
 
   private constructor(
     consumerConnection: ChannelModel,
@@ -240,8 +260,12 @@ export class Broker {
     return this.publishMessage(message, AUDIO_RESULT_ROUTING_KEY);
   }
 
+  publishMedia(message: MediaResult): Promise<void> {
+    return this.publishMessage(message, MEDIA_RESULT_ROUTING_KEY);
+  }
+
   private async publishMessage(
-    message: ComputeResultV1 | AudioInspectResultV1,
+    message: ComputeResultV1 | AudioInspectResultV1 | MediaResult,
     routingKey: string,
   ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
@@ -323,8 +347,105 @@ export class Broker {
     );
   }
 
+  consumeMedia(
+    resource: WorkerResourceClass,
+    handle: (command: MediaCommand, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeMediaChannel(
+      {
+        queue: resource === 'encode' ? MEDIA_ENCODE_QUEUE : MEDIA_PROBE_QUEUE,
+        maxBytes: MEDIA_MAX_MESSAGE_BYTES,
+        parse(value) {
+          const command = parseMediaCommand(value);
+          if (mediaResourceClass(command.operation) !== resource)
+            throw new Error('COMMAND_RESOURCE_MISMATCH');
+          return command;
+        },
+      },
+      handle,
+      failed,
+    );
+  }
+
+  consumeMediaControl(
+    handle: (command: MediaControl, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeMediaChannel(
+      { queue: MEDIA_CONTROL_QUEUE, maxBytes: MEDIA_MAX_MESSAGE_BYTES, parse: parseMediaControl },
+      handle,
+      failed,
+    );
+  }
+
+  async #consumeMediaChannel<T extends { messageId: string }>(
+    protocol: CommandProtocol<T>,
+    handle: (command: T, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    if (this.#state.closed || this.#mediaClosing) throw new Error('BROKER_CLOSED');
+    const channel = await this.#consumerConnection.createChannel();
+    watchConsumer(channel, this.#state);
+    await channel.prefetch(1);
+    await channel.consume(
+      protocol.queue,
+      (message) => {
+        if (this.#state.closed || this.#mediaClosing) return;
+        if (!message) {
+          failed(new Error('CONSUMER_CANCELLED'));
+          return;
+        }
+        let command: T;
+        try {
+          command = this.#decodeCommand(protocol, message);
+        } catch {
+          try {
+            channel.reject(message, false);
+          } catch (error) {
+            failed(error);
+          }
+          return;
+        }
+        const tracked = handle(command, () => channel.ack(message))
+          .catch((error: unknown) => {
+            if (error instanceof Error && error.message === 'ATTEMPT_CONFLICT') {
+              try {
+                channel.reject(message, false);
+              } catch (rejectError) {
+                failed(rejectError);
+              }
+            } else failed(error);
+          })
+          .finally(() => {
+            this.#mediaHandling.delete(tracked);
+          });
+        this.#mediaHandling.add(tracked);
+      },
+      { noAck: false, consumerTag: `mio-${createId()}` },
+    );
+  }
+
+  #decodeCommand<T extends { messageId: string }>(
+    protocol: CommandProtocol<T>,
+    message: ConsumeMessage,
+  ): T {
+    if (
+      message.properties.userId !== this.#expectedUserId ||
+      message.properties.contentType !== 'application/json' ||
+      message.content.length > protocol.maxBytes
+    )
+      throw new Error('COMMAND_INVALID');
+    const value: unknown = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(message.content),
+    );
+    const command = protocol.parse(value);
+    if (message.properties.messageId !== command.messageId) throw new Error('COMMAND_ID_MISMATCH');
+    return command;
+  }
+
   private async consumeCommands<T extends { messageId: string }>(
-    protocol: { queue: string; maxBytes: number; parse: (value: unknown) => T },
+    protocol: CommandProtocol<T>,
     handle: (command: T, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
@@ -367,17 +488,7 @@ export class Broker {
         }
         let command: T;
         try {
-          if (
-            message.properties.userId !== this.#expectedUserId ||
-            message.properties.contentType !== 'application/json' ||
-            message.content.length > protocol.maxBytes
-          )
-            throw new Error('COMMAND_INVALID');
-          const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
-          const value: unknown = JSON.parse(body);
-          command = protocol.parse(value);
-          if (message.properties.messageId !== command.messageId)
-            throw new Error('COMMAND_ID_MISMATCH');
+          command = this.#decodeCommand(protocol, message);
         } catch {
           try {
             slot.channel.reject(message, false);
@@ -456,8 +567,10 @@ export class Broker {
 
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
+    this.#mediaClosing = true;
     // Preserve journal ownership until admitted transcodes finish.
     if (this.#handling) await this.#handling;
+    await Promise.allSettled(this.#mediaHandling);
     this.#state.markClosed();
     const deadline = setTimeout(() => this.#transport.abort(), BROKER_CLOSE_TIMEOUT_MS);
     try {

@@ -1,8 +1,11 @@
 import COS from 'cos-nodejs-sdk-v5';
-import type { ComputeCommandV1 } from '@mio/compute-contracts';
+import type { ComputeCommandV1, MediaInputSnapshot } from '@mio/compute-contracts';
+import { PassThrough } from 'node:stream';
 import type { Readable } from 'node:stream';
 import type { ObjectInfo } from '../types.ts';
 import { digestStream, drainInput, fileDigest, paths, readOutput } from './media.ts';
+import type { MediaFiles } from './media-files.ts';
+import type { MediaDigest } from './media-journal.ts';
 
 export interface CosConfig {
   bucket: string;
@@ -25,6 +28,32 @@ async function within<T>(operation: () => Promise<T>, signal: AbortSignal): Prom
   } finally {
     signal.removeEventListener('abort', abort);
   }
+}
+
+const temporaryReadErrors = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ESOCKETTIMEDOUT',
+  'ERR_STREAM_PREMATURE_CLOSE',
+]);
+
+function storageReadError(error: unknown): unknown {
+  const { code, statusCode } = (error ?? {}) as { code?: string; statusCode?: number };
+  if (statusCode === 412) return new Error('INPUT_CHANGED', { cause: error });
+  if (
+    statusCode === 408 ||
+    statusCode === 429 ||
+    (statusCode !== undefined && statusCode >= 500 && statusCode < 600) ||
+    (statusCode === undefined && temporaryReadErrors.has(code ?? ''))
+  )
+    return new Error('STORAGE_FAILURE', { cause: error });
+  return error;
 }
 
 export class ObjectStore {
@@ -64,6 +93,91 @@ export class ObjectStore {
       IfMatch: command.input.etag,
     }) as Readable;
     await drainInput(stream, directory, command.attemptId, command.input.sizeBytes, signal);
+  }
+
+  async #readMedia<T>(
+    key: string,
+    etag: string,
+    signal: AbortSignal,
+    consume: (stream: Readable) => Promise<T>,
+  ): Promise<T> {
+    signal.throwIfAborted();
+    const stream = new PassThrough();
+    // Keep late SDK errors contained even when local admission or the caller has stopped.
+    stream.on('error', () => {});
+    stream.once('pipe', (sender: NodeJS.ReadableStream) => {
+      sender.once('response', (response: { statusCode?: number }) => {
+        if (response.statusCode !== 200)
+          stream.destroy(
+            Object.assign(new Error('MEDIA_OBJECT_RESPONSE'), {
+              statusCode: response.statusCode,
+            }),
+          );
+      });
+    });
+    const completed = new Promise<void>((resolve, reject) => {
+      this.#client.getObject(
+        { Bucket: this.#bucket, Region: this.#region, Key: key, IfMatch: etag, Output: stream },
+        (error, result) => {
+          if (error || result.statusCode !== 200) {
+            const failure = Object.assign(new Error('MEDIA_OBJECT_RESPONSE'), {
+              statusCode: error?.statusCode ?? result?.statusCode,
+              code: error?.code,
+            });
+            stream.destroy(failure);
+            reject(failure);
+          } else resolve();
+        },
+      );
+    });
+    void completed.catch(() => {});
+    try {
+      const value = await consume(stream);
+      await within(() => completed, signal);
+      return value;
+    } catch (error) {
+      throw storageReadError(error);
+    } finally {
+      stream.destroy();
+    }
+  }
+
+  downloadMedia(
+    input: MediaInputSnapshot,
+    files: MediaFiles,
+    name: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    return this.#readMedia(input.key, input.etag, signal, (stream) =>
+      files.receive(name, stream, input.sizeBytes, signal),
+    );
+  }
+
+  async headMedia(key: string, signal: AbortSignal): Promise<ObjectInfo | null> {
+    try {
+      return await this.head(key, signal);
+    } catch (error) {
+      throw storageReadError(error);
+    }
+  }
+
+  async verifyMedia(
+    key: string,
+    etag: string,
+    expectedSize: number,
+    expectedSha256: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      const actual = await this.#readMedia(key, etag, signal, (stream) =>
+        digestStream(stream, expectedSize, signal),
+      );
+      return actual.size === expectedSize && actual.sha256 === expectedSha256;
+    } catch (error) {
+      if (error instanceof Error && ['INPUT_CHANGED', 'OBJECT_TOO_LARGE'].includes(error.message))
+        return false;
+      throw error;
+    }
   }
 
   async head(key: string, signal: AbortSignal): Promise<ObjectInfo | null> {
@@ -116,7 +230,40 @@ export class ObjectStore {
     const actual = await fileDigest(paths(directory, attemptId).output, signal);
     if (actual.size !== size || actual.sha256 !== sha256) throw new Error('OUTPUT_MISMATCH');
     if (signal.aborted) throw new Error('UPLOAD_UNKNOWN');
-    const body = readOutput(directory, attemptId);
+    await this.#put(key, readOutput(directory, attemptId), actual, 'video/mp4', signal);
+  }
+
+  async uploadMedia(
+    key: string,
+    files: MediaFiles,
+    name: string,
+    digest: MediaDigest,
+    contentType: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#waitForUpload(key, signal);
+    const actual = await fileDigest(files.path(name), signal);
+    if (actual.size !== digest.size || actual.sha256 !== digest.sha256)
+      throw new Error('OUTPUT_MISMATCH');
+    signal.throwIfAborted();
+    try {
+      await this.#put(key, files.stream(name), actual, contentType, signal, 'private');
+    } catch (error) {
+      const status = (error as { statusCode?: number } | undefined)?.statusCode;
+      if ([400, 401, 403, 404].includes(status ?? 0))
+        throw new Error('STORAGE_WRITE_REJECTED', { cause: error });
+      throw error;
+    }
+  }
+
+  async #put(
+    key: string,
+    body: Readable,
+    digest: MediaDigest & { md5: string },
+    contentType: string,
+    signal: AbortSignal,
+    acl?: 'private',
+  ): Promise<void> {
     const abort = () => body.destroy();
     signal.addEventListener('abort', abort, { once: true });
     try {
@@ -126,10 +273,11 @@ export class ObjectStore {
         Region: this.#region,
         Key: key,
         Body: body,
-        ContentLength: size,
-        ContentType: 'video/mp4',
-        'x-cos-meta-sha256': sha256,
-        Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': actual.md5 },
+        ContentLength: digest.size,
+        ContentType: contentType,
+        'x-cos-meta-sha256': digest.sha256,
+        ...(acl ? { ACL: acl } : {}),
+        Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': digest.md5 },
       });
       const settled = request.then(
         () => {},

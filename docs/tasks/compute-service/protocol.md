@@ -68,7 +68,7 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 
 Worker 控制使用 `worker.limits.command.<instanceId>` 绑定到对应实例的独立命令队列。`worker.telemetry` 结果路由同时承载 `worker.telemetry` 和 `worker.limits.result` 两种消息。两类回报均有 `instanceId`、`bootId`、`bootSequence`、`sequence` 和采样时间；遥测可携带实际执行身份、类别、占槽、待槽、HOLD 和事件。调限命令包含正整数 `revision`、操作者、请求时间和三维上限，回报绑定 `commandId` 及所处理的 `revision`。`applied` 的 `reason` 为 null，`rejected` 的 `reason` 使用枚举。Worker 协议消息以原始 UTF-8 字节计最多 64 KiB。发布与接收仍需 AMQP 身份校验，实例归属由实际接收方与部署身份核对。详见 [RabbitMQ 契约](../../integrations/rabbitmq.md#拓扑与权限)。
 
-M1 提供协议、拓扑、资源槽和存储基础。媒体收发与恢复属于 M2；遥测采集与持久调限属于 M5。
+[通用媒体 HTTP](../../apis/compute.md#通用媒体处理)使用单独的媒体结果消费者，按发布顺序处理进度与终态。B 的媒体 encode、probe 和 control 各有自己的预取为一的通道。连接中断撤回该轮尚未占槽的等待并保留原任务身份，重新投递可继续原 attempt。待对账的早期副作用由同一 journal 接管。恢复已有输出占用同类容量，无需启动 FFmpeg。运行时遥测采集与持久调限的实现见相应开发单元。
 
 ## 历史图片链路
 

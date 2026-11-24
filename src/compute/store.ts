@@ -2,12 +2,12 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
-import type { PoolClient } from 'pg';
 import { COMPUTE_PROFILE, COMPUTE_VERSION } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
 import { ComputeError } from './errors.ts';
 import { checkComputeCapacity, lockComputeCapacity } from './capacity.ts';
+import { computeTransaction } from './database.ts';
 const log = createLogger('app', 'compute-store');
 
 export interface JobRow {
@@ -44,21 +44,6 @@ function command(job: JobRow): ComputeCommandV1 {
       etag: job.input_etag,
     },
   };
-}
-
-async function transaction<T>(pool: Pool, run: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await run(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
 }
 
 const retryable = new Set([
@@ -111,7 +96,7 @@ export class ComputeStore {
     size: number,
     etag: string,
   ): Promise<{ job: JobRow; created: boolean }> {
-    return transaction(this.pool, async (client) => {
+    return computeTransaction(this.pool, async (client) => {
       await lockComputeCapacity(client);
       const existing = (
         await client.query<JobRow>(
@@ -166,7 +151,7 @@ export class ComputeStore {
   }
 
   async sent(message: ComputeCommandV1, lease: string): Promise<void> {
-    await transaction(this.pool, async (client) => {
+    await computeTransaction(this.pool, async (client) => {
       const sent = await client.query(
         'UPDATE mio_compute_outbox SET sent_at=now(),lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL RETURNING id',
         [message.messageId, lease],
@@ -199,7 +184,7 @@ export class ComputeStore {
   }
 
   async accept(result: ComputeResultV1): Promise<void> {
-    await transaction(this.pool, async (client) => {
+    await computeTransaction(this.pool, async (client) => {
       const recorded = await client.query(
         'INSERT INTO mio_compute_inbox(id,payload) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id',
         [result.messageId, JSON.stringify(result)],

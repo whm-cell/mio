@@ -1,5 +1,9 @@
 import type { Pool } from 'pg';
 import { checkMediaSchema, mediaSchemaSQL } from './media-schema.ts';
+import {
+  checkWorkerObservabilitySchema,
+  workerObservabilitySchemaSQL,
+} from './worker-observability-schema.ts';
 
 /** Incremental media-domain migration; existing original assets remain intact. */
 export const computeSchemaSQL = `
@@ -29,9 +33,13 @@ CREATE INDEX IF NOT EXISTS mio_compute_outbox_pending ON mio_compute_outbox(crea
 CREATE TABLE IF NOT EXISTS mio_compute_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
-${mediaSchemaSQL}`;
+${mediaSchemaSQL}
+${workerObservabilitySchemaSQL}`;
 
-export async function checkComputeSchema(database: Pick<Pool, 'query'>): Promise<void> {
+export async function checkComputeSchema(
+  database: Pick<Pool, 'query'>,
+  verifyObservations = false,
+): Promise<void> {
   await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
   await database.query(
     'SELECT id,owner_id,request_id,input_asset_id,input_key,input_size,input_etag,state,attempt,attempt_id,command_id,result_asset_id,error_code,created_at,updated_at FROM mio_compute_jobs LIMIT 0',
@@ -41,4 +49,5 @@ export async function checkComputeSchema(database: Pick<Pool, 'query'>): Promise
   );
   await database.query('SELECT id,payload,created_at FROM mio_compute_inbox LIMIT 0');
   await checkMediaSchema(database);
+  if (verifyObservations) await checkWorkerObservabilitySchema(database);
 }

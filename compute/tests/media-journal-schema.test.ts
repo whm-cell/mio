@@ -34,7 +34,9 @@ it('opens a prior SQLite journal additively, preserving attempts and retired ima
       // Model the version 6 floor in this fixture only, retaining every legacy table and fact.
       previous.exec(`DROP TABLE media_events; DROP TABLE media_cancellations;
         DROP TABLE media_manual_resolutions; DROP TABLE media_attempts;
-        UPDATE metadata SET schema_version = 6;
+        DROP TABLE worker_observation_outbox;
+      DROP TABLE worker_observation_state;
+      UPDATE metadata SET schema_version = 6;
         INSERT INTO image_attempts VALUES('old-image', 'old-identity', 'unknown', '{}');
         CREATE TABLE media_events (incompatible TEXT);`);
     } finally {
@@ -62,7 +64,7 @@ it('opens a prior SQLite journal additively, preserving attempts and retired ima
     }
     const upgraded = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(upgraded.prepare('SELECT schema_version FROM metadata').get()?.schema_version).toBe(7);
+      expect(upgraded.prepare('SELECT schema_version FROM metadata').get()?.schema_version).toBe(8);
       expect(upgraded.prepare('SELECT phase FROM image_attempts').get()?.phase).toBe('unknown');
       for (const table of [
         'media_attempts',

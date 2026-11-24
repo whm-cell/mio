@@ -52,6 +52,7 @@ export function createAudioMediaClient(config: ComputeConfig) {
         config.brokerUser,
         config.expectedResultUser,
         startup,
+        config.workerUsers,
       );
       let connected = true;
       const disconnected = () => {

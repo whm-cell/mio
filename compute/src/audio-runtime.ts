@@ -13,6 +13,7 @@ export async function runAudioRuntime(
   store: ObjectStore,
   stop: AbortSignal,
   slots: ResourceSlots,
+  buffered = false,
 ): Promise<void> {
   const scratch = prepareAudioDirectory(config.directory);
   while (!stop.aborted) {
@@ -26,12 +27,12 @@ export async function runAudioRuntime(
       broker = await Broker.connect(config.url, config.username, config.expectedUser, round);
       const closed = broker.closed().then(() => disconnected.abort());
       const worker = new AudioWorker(store, broker, config.directory, scratch, round, slots);
+      const handle = worker.handle.bind(worker);
+      const fail = (error: unknown) => disconnected.abort(error);
       await Promise.race([
-        broker.consumeAudio(
-          (command, ack) => worker.handle(command, ack),
-          (error) => disconnected.abort(error),
-          () => !round.aborted,
-        ),
+        buffered
+          ? broker.consumeAudioInspections(handle, fail)
+          : broker.consumeAudio(handle, fail, () => !round.aborted),
         stopped,
       ]);
       await Promise.race([closed, stopped]);

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>计算运维 · Mio</title>
+    <link rel="stylesheet" href="/ops/compute/styles.css" />
+    <script src="/ops/compute/app.js" defer></script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="wrap masthead">
+        <div class="brand" aria-label="Mio 计算运维">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span
+            ><strong>Mio</strong
+            ><span class="brand-divider" aria-hidden="true"></span>计算运维</span
+          >
+        </div>
+        <span class="sync" id="sync">正在连接</span>
+      </div>
+      <nav class="wrap navigation" aria-label="控制台">
+        <a href="#overview">总览</a>
+        <a href="#workers">Worker</a>
+        <a href="#executions">任务占槽</a>
+        <a href="#limits">调限审计</a>
+      </nav>
+    </header>
+    <main class="wrap workspace" id="root" aria-busy="true">
+      <p class="notice">正在读取计算状态…</p>
+    </main>
+    <template id="chart-template">
+      <section class="panel chart">
+        <div class="panel-heading">
+          <div>
+            <h2>最近一小时并发</h2>
+            <p class="chart-note muted">实际占用与当时的运行上限</p>
+          </div>
+          <fieldset class="segmented" aria-label="资源类别">
+            <label><input type="radio" name="metric" value="total" checked />总槽</label>
+            <label><input type="radio" name="metric" value="encode" />编码</label>
+            <label><input type="radio" name="metric" value="probe" />探测</label>
+          </fieldset>
+        </div>
+        <div class="plot"></div>
+        <div class="legend">
+          <span><i class="key usage"></i>实际占用</span>
+          <span><i class="key applied"></i>已生效上限</span>
+          <span><i class="key hard"></i>部署硬上限</span>
+        </div>
+        <p class="quality muted"></p>
+      </section>
+    </template>
+    <template id="worker-template">
+      <article class="worker-layout">
+        <div class="worker-main">
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2 class="worker-name"></h2>
+                <p class="muted heartbeat"></p>
+              </div>
+              <span class="status-pill worker-status"></span>
+            </div>
+            <div class="worker-metrics"></div>
+            <div class="worker-warning"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading"><h2>当前执行</h2></div>
+            <div class="worker-active"></div>
+          </section>
+        </div>
+        <section class="panel controls">
+          <div class="panel-heading">
+            <div>
+              <h2>调整上限</h2>
+              <p class="edit-revision muted"></p>
+            </div>
+          </div>
+          <form class="limit-form">
+            <label
+              >总槽<input
+                name="total"
+                type="number"
+                min="0"
+                step="1"
+                inputmode="numeric"
+                required
+                disabled
+            /></label>
+            <label
+              >编码<input
+                name="encode"
+                type="number"
+                min="0"
+                step="1"
+                inputmode="numeric"
+                required
+                disabled
+            /></label>
+            <label
+              >探测<input
+                name="probe"
+                type="number"
+                min="0"
+                step="1"
+                inputmode="numeric"
+                required
+                disabled
+            /></label>
+            <p class="muted form-help">0 暂停相应资源的新任务。已运行的任务会继续完成。</p>
+            <div class="actions">
+              <button class="primary" type="submit" disabled>保存上限</button>
+              <button type="button" class="reset" hidden>取消修改</button>
+            </div>
+          </form>
+          <p class="status-message" role="status"></p>
+        </section>
+      </article>
+    </template>
+  </body>
+</html>

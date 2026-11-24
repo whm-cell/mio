@@ -11,6 +11,11 @@ import type { Attempt, PendingEvent, Phase } from '../types.ts';
 import { prepareJournalFile } from './media.ts';
 import { checkMediaJournal, migrateMediaJournal } from './media-journal-schema.ts';
 import { MediaJournal } from './media-journal.ts';
+import {
+  checkWorkerObservabilityJournal,
+  migrateWorkerObservabilityJournal,
+  WorkerObservabilityJournal,
+} from './worker-observability-journal.ts';
 
 type Row = Record<string, unknown>;
 
@@ -80,6 +85,7 @@ function asAttempt(row: Row): Attempt {
 export class Journal {
   readonly #db: DatabaseSync;
   readonly media: MediaJournal;
+  readonly observability: WorkerObservabilityJournal;
 
   constructor(directory: string, instanceId: string, initialize = false) {
     const path = prepareJournalFile(directory, initialize);
@@ -117,7 +123,7 @@ export class Journal {
       if (
         meta.length !== 1 ||
         meta[0]?.instance_id !== instanceId ||
-        ![3, 4, 5, 6, 7].includes(Number(meta[0]?.schema_version))
+        ![3, 4, 5, 6, 7, 8].includes(Number(meta[0]?.schema_version))
       ) {
         throw new Error('JOURNAL_IDENTITY_MISMATCH');
       }
@@ -181,8 +187,11 @@ export class Journal {
       db.prepare('SELECT job_id, identity, phase, payload FROM image_attempts LIMIT 0').all();
       if (Number(meta[0]?.schema_version) < 7) migrateMediaJournal(db);
       checkMediaJournal(db);
+      if (Number(meta[0]?.schema_version) < 8) migrateWorkerObservabilityJournal(db);
+      checkWorkerObservabilityJournal(db);
       this.#db = db;
       this.media = new MediaJournal(db);
+      this.observability = new WorkerObservabilityJournal(db);
     } catch (error) {
       db.close();
       throw error;
@@ -361,14 +370,15 @@ export class Journal {
     }
   }
 
-  hasUnknownProcess(): boolean {
-    return Boolean(
-      this.#db
-        .prepare(
-          "SELECT 1 FROM attempts WHERE phase IN ('launching', 'running', 'unknown_process') LIMIT 1",
-        )
-        .get(),
+  hasUnknownProcess(owned?: ReadonlySet<string>): boolean {
+    const candidates = this.#db.prepare(
+      "SELECT attempt_id,phase FROM attempts WHERE phase IN ('launching', 'running', 'unknown_process')",
     );
+    for (const attempt of candidates.iterate()) {
+      if (attempt.phase === 'unknown_process' || !owned?.has(String(attempt.attempt_id)))
+        return true;
+    }
+    return false;
   }
 
   recoverableAfter(cursor: string): Attempt | null {

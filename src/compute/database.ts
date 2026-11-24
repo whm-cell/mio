@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-export type { PoolClient } from 'pg';
+export type { Pool, PoolClient } from 'pg';
 
 export async function computeTransaction<T>(
   pool: Pool,

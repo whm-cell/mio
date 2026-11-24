@@ -20,6 +20,11 @@ import {
   MEDIA_PROBE_ROUTING_KEY,
   MEDIA_RESULT_QUEUE,
   RESULT_QUEUE,
+  WORKER_TELEMETRY_QUEUE,
+  WORKER_MAX_MESSAGE_BYTES,
+  parseWorkerTelemetry,
+  parseWorkerLimitsResult,
+  workerControlRoutingKey,
   mediaResourceClass,
   parseAudioInspectResultV1,
   parseComputeResultV1,
@@ -33,10 +38,14 @@ import type {
   MediaCommand,
   MediaControl,
   MediaResult,
+  WorkerTelemetry,
+  WorkerLimitsResult,
+  WorkerLimitsCommand,
 } from '@mio/compute-contracts';
 
 /** The broker resolved this individual command as rejected. Connection state is independent. */
 export class MediaPublishRejected extends Error {}
+export class WorkerControlPublishRejected extends Error {}
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -93,6 +102,8 @@ export class ComputeBroker {
   private readonly publisher: ConfirmChannel;
   private readonly userId: string;
   private readonly expectedUserId: string;
+  private readonly workerUsers: ReadonlyMap<string, string>;
+  private readonly trustedWorkerUsers: ReadonlySet<string>;
   private readonly lifecycle: { closed: boolean; callback: (() => void) | undefined };
   private readonly closedConnections: WeakSet<ChannelModel>;
   private readonly transport: AbortController;
@@ -109,6 +120,7 @@ export class ComputeBroker {
     lifecycle: { closed: boolean; callback: (() => void) | undefined },
     closedConnections: WeakSet<ChannelModel>,
     transport: AbortController,
+    workerUsers: ReadonlyMap<string, string>,
   ) {
     this.consumerConnection = consumerConnection;
     this.publisherConnection = publisherConnection;
@@ -116,6 +128,8 @@ export class ComputeBroker {
     this.publisher = publisher;
     this.userId = userId;
     this.expectedUserId = expectedUserId;
+    this.workerUsers = workerUsers;
+    this.trustedWorkerUsers = new Set(workerUsers.values());
     this.lifecycle = lifecycle;
     this.closedConnections = closedConnections;
     this.transport = transport;
@@ -126,6 +140,7 @@ export class ComputeBroker {
     userId: string,
     expectedUserId: string,
     stop?: AbortSignal,
+    workerUsers: ReadonlyMap<string, string> = new Map(),
   ): Promise<ComputeBroker> {
     const parsed = new URL(url);
     if (
@@ -197,6 +212,7 @@ export class ComputeBroker {
         lifecycle,
         closedConnections,
         transport,
+        workerUsers,
       );
     };
     const onStop = () => transport.abort(stop?.reason);
@@ -241,9 +257,23 @@ export class ComputeBroker {
     });
   }
 
+  publishWorkerControl(command: WorkerLimitsCommand): Promise<void> {
+    return this.publishCommand(workerControlRoutingKey(command.instanceId), command).catch(
+      (error: unknown) => {
+        if (
+          error instanceof Error &&
+          ['message nacked', 'MESSAGE_RETURNED'].includes(error.message)
+        )
+          throw new WorkerControlPublishRejected(error.message, { cause: error });
+        throw error;
+      },
+    );
+  }
+
   private async publishCommand(
     routingKey: string,
-    message: ComputeCommandV1 | AudioInspectCommandV1 | MediaCommand | MediaControl,
+    message:
+      ComputeCommandV1 | AudioInspectCommandV1 | MediaCommand | MediaControl | WorkerLimitsCommand,
   ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
@@ -330,8 +360,37 @@ export class ComputeBroker {
     );
   }
 
+  consumeWorker(
+    handle: (message: WorkerTelemetry | WorkerLimitsResult) => Promise<void>,
+    failed: () => void,
+  ): Promise<void> {
+    return this.consumeResults(
+      {
+        queue: WORKER_TELEMETRY_QUEUE,
+        maxBytes: WORKER_MAX_MESSAGE_BYTES,
+        parse(value) {
+          return (value as { type?: string } | null)?.type === 'worker.limits.result'
+            ? parseWorkerLimitsResult(value)
+            : parseWorkerTelemetry(value);
+        },
+        authenticated: (value, peer) =>
+          this.workerUsers.size === 0
+            ? peer === this.expectedUserId
+            : this.workerUsers.get(value.instanceId) === peer,
+      },
+      handle,
+      failed,
+      this.transport.signal,
+    );
+  }
+
   private async consumeResults<T extends { messageId: string }>(
-    protocol: { queue: string; maxBytes: number; parse: (value: unknown) => T },
+    protocol: {
+      queue: string;
+      maxBytes: number;
+      parse: (value: unknown) => T;
+      authenticated?: (result: T, peer: string) => boolean;
+    },
     handle: (result: T) => Promise<void>,
     failed: () => void,
     stop: AbortSignal,
@@ -350,7 +409,9 @@ export class ComputeBroker {
           let result: T;
           try {
             if (
-              message.properties.userId !== this.expectedUserId ||
+              !message.properties.userId ||
+              (message.properties.userId !== this.expectedUserId &&
+                !this.trustedWorkerUsers.has(message.properties.userId)) ||
               message.properties.contentType !== 'application/json' ||
               message.content.length > protocol.maxBytes
             )
@@ -359,6 +420,11 @@ export class ComputeBroker {
               new TextDecoder('utf-8', { fatal: true }).decode(message.content),
             );
             result = protocol.parse(value);
+            if (
+              protocol.authenticated &&
+              !protocol.authenticated(result, message.properties.userId)
+            )
+              throw new Error('RESULT_USER_MISMATCH');
             if (message.properties.messageId !== result.messageId)
               throw new Error('RESULT_ID_MISMATCH');
           } catch {

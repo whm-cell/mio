@@ -62,6 +62,18 @@ import { createComputeHandler } from './compute/http.ts';
 import { createMediaHandler } from './compute/media-http.ts';
 import { createMediaService } from './compute/media-service.ts';
 import { createMediaStore } from './compute/media-store.ts';
+import { createComputeOpsHandler } from './compute/ops-http.ts';
+import { createComputeOpsWebHandler } from './compute/ops-web.ts';
+import {
+  openWorkerObservabilityPool,
+  WorkerObservabilityStore,
+} from './compute/worker-observability-store.ts';
+import { WorkerObservabilityQueries } from './compute/worker-observability-queries.ts';
+import {
+  startWorkerObservability,
+  WorkerControlStore,
+} from './compute/worker-observability-control.ts';
+import { ComputeBroker } from './integrations/rabbitmq.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
 import { createMaterialStore } from './materials/store.ts';
@@ -312,6 +324,56 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           () => scheduler,
         );
         throw error;
+      }
+    }
+    if (computeConfig?.workerInstances?.length && assetConfig) {
+      const pool = await openWorkerObservabilityPool(assetConfig.databaseURL);
+      const instances = computeConfig.workerInstances;
+      const operators = computeConfig.opsUserIds;
+      const observations = new WorkerObservabilityStore(pool, instances);
+      const control = operators ? new WorkerControlStore(pool, instances) : undefined;
+      const telemetry = startWorkerObservability(
+        (stop) =>
+          ComputeBroker.connect(
+            computeConfig.brokerURL,
+            computeConfig.brokerUser,
+            computeConfig.expectedResultUser,
+            stop,
+            computeConfig.workerUsers,
+          ),
+        observations,
+        control,
+      );
+      ctx.effect(
+        () => () =>
+          closeMioResources(
+            () => telemetry.close(),
+            () => pool.end(),
+          ),
+      );
+      if (operators && control) {
+        const view = new WorkerObservabilityQueries(pool, instances);
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/ops/compute',
+            handler: createComputeOpsHandler(
+              view,
+              control,
+              auth.identity,
+              authConfig.origins,
+              operators,
+              telemetry.wake,
+            ),
+          }),
+        );
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/ops/compute',
+            handler: createComputeOpsWebHandler(auth.identity, operators),
+          }),
+        );
       }
     }
     if (providerConfig) {

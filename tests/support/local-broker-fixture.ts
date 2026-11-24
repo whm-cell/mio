@@ -29,6 +29,7 @@ type TestBroker = {
   restrictWorkerToObservation?: () => Promise<string>;
   userA: string;
   userB: string;
+  otherWorker?: { url: string; user: string };
 };
 
 type MissingObject = { code: number; stderr: string };
@@ -115,11 +116,17 @@ async function testBrokerTarget() {
   };
 }
 
-type WorkerScope = { instanceId: string; instanceIds: readonly string[]; observeQueue?: string };
+type WorkerScope = {
+  instanceId: string;
+  instanceIds: readonly string[];
+  observeQueue?: string;
+  secondaryInstanceId?: string;
+};
+type TestRole = { role: 'a' | 'b'; name: string; password: string; instanceId?: string };
 
 function testDefinitions(
   vhost: string,
-  users: readonly { role: 'a' | 'b'; name: string }[],
+  users: readonly TestRole[],
   scope?: WorkerScope,
   limitMediaEncode = false,
 ) {
@@ -149,10 +156,10 @@ function testDefinitions(
     exchanges,
     queues,
     bindings,
-    permissions: users.map(({ role, name }) => ({
+    permissions: users.map(({ role, name, instanceId }) => ({
       vhost,
       user: name,
-      ...computePermissions(role, scope?.instanceId),
+      ...computePermissions(role, instanceId),
     })),
   });
 }
@@ -174,9 +181,25 @@ export async function withLocalTestBroker<T>(
   const b = {
     role: 'b',
     name: `${vhost}-b`,
+    ...(scope ? { instanceId: scope.instanceId } : {}),
     password: randomBytes(24).toString('base64url'),
   } as const;
-  const users = [a, b];
+  const other: TestRole | undefined = scope?.secondaryInstanceId
+    ? {
+        role: 'b',
+        name: `${vhost}-b2`,
+        password: randomBytes(24).toString('base64url'),
+        instanceId: scope.secondaryInstanceId,
+      }
+    : undefined;
+  if (other)
+    assert(
+      scope &&
+        other.instanceId &&
+        other.instanceId !== scope.instanceId &&
+        scope.instanceIds.includes(other.instanceId),
+    );
+  const users: TestRole[] = other ? [a, b, other] : [a, b];
   const amqpUrl = ({ name, password }: (typeof users)[number]) =>
     `amqp://${name}:${password}@127.0.0.1:${port}/${vhost}`;
   const userExists = async (name: string) =>
@@ -301,6 +324,7 @@ export async function withLocalTestBroker<T>(
         : {}),
       userA: a.name,
       userB: b.name,
+      ...(other ? { otherWorker: { url: amqpUrl(other), user: other.name } } : {}),
     });
   } catch (error) {
     try {

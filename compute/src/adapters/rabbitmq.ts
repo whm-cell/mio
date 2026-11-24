@@ -22,6 +22,10 @@ import {
   MEDIA_RESULT_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  WORKER_TELEMETRY_ROUTING_KEY,
+  WORKER_MAX_MESSAGE_BYTES,
+  parseWorkerLimitsCommand,
+  workerControlQueue,
   mediaResourceClass,
   parseAudioInspectCommandV1,
   parseComputeCommandV1,
@@ -37,7 +41,12 @@ import type {
   MediaControl,
   MediaResult,
   WorkerResourceClass,
+  WorkerTelemetry,
+  WorkerLimitsResult,
+  WorkerLimitsCommand,
 } from '@mio/compute-contracts';
+
+export class WorkerTelemetryPublishRejected extends Error {}
 
 const BROKER_STARTUP_TIMEOUT_MS = 5000;
 const BROKER_CLOSE_TIMEOUT_MS = 5000;
@@ -127,8 +136,8 @@ export class Broker {
   #handling: Promise<void> | null = null;
   #pause: Promise<void> | null = null;
   #handlerFailure: unknown = null;
-  readonly #mediaHandling = new Set<Promise<void>>();
-  #mediaClosing = false;
+  readonly #concurrentHandling = new Set<Promise<void>>();
+  #concurrentClosing = false;
 
   private constructor(
     consumerConnection: ChannelModel,
@@ -264,8 +273,17 @@ export class Broker {
     return this.publishMessage(message, MEDIA_RESULT_ROUTING_KEY);
   }
 
+  publishWorker(message: WorkerTelemetry | WorkerLimitsResult): Promise<void> {
+    return this.publishMessage(message, WORKER_TELEMETRY_ROUTING_KEY).catch((error: unknown) => {
+      if (error instanceof Error && ['message nacked', 'MESSAGE_RETURNED'].includes(error.message))
+        throw new WorkerTelemetryPublishRejected(error.message, { cause: error });
+      throw error;
+    });
+  }
+
   private async publishMessage(
-    message: ComputeResultV1 | AudioInspectResultV1 | MediaResult,
+    message:
+      ComputeResultV1 | AudioInspectResultV1 | MediaResult | WorkerTelemetry | WorkerLimitsResult,
     routingKey: string,
   ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
@@ -347,12 +365,60 @@ export class Broker {
     );
   }
 
+  consumeTranscodes(
+    handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: COMMAND_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse: parseComputeCommandV1,
+      },
+      handle,
+      failed,
+      32,
+    );
+  }
+
+  consumeAudioInspections(
+    handle: (command: AudioInspectCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: AUDIO_COMMAND_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectCommandV1,
+      },
+      handle,
+      failed,
+      32,
+    );
+  }
+
+  consumeWorkerControl(
+    instanceId: string,
+    handle: (command: WorkerLimitsCommand, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: workerControlQueue(instanceId),
+        maxBytes: WORKER_MAX_MESSAGE_BYTES,
+        parse: parseWorkerLimitsCommand,
+      },
+      handle,
+      failed,
+    );
+  }
+
   consumeMedia(
     resource: WorkerResourceClass,
     handle: (command: MediaCommand, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
   ): Promise<void> {
-    return this.#consumeMediaChannel(
+    return this.#consumeConcurrentChannel(
       {
         queue: resource === 'encode' ? MEDIA_ENCODE_QUEUE : MEDIA_PROBE_QUEUE,
         maxBytes: MEDIA_MAX_MESSAGE_BYTES,
@@ -365,6 +431,7 @@ export class Broker {
       },
       handle,
       failed,
+      32,
     );
   }
 
@@ -372,26 +439,27 @@ export class Broker {
     handle: (command: MediaControl, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
   ): Promise<void> {
-    return this.#consumeMediaChannel(
+    return this.#consumeConcurrentChannel(
       { queue: MEDIA_CONTROL_QUEUE, maxBytes: MEDIA_MAX_MESSAGE_BYTES, parse: parseMediaControl },
       handle,
       failed,
     );
   }
 
-  async #consumeMediaChannel<T extends { messageId: string }>(
+  async #consumeConcurrentChannel<T extends { messageId: string }>(
     protocol: CommandProtocol<T>,
     handle: (command: T, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
+    prefetch = 1,
   ): Promise<void> {
-    if (this.#state.closed || this.#mediaClosing) throw new Error('BROKER_CLOSED');
+    if (this.#state.closed || this.#concurrentClosing) throw new Error('BROKER_CLOSED');
     const channel = await this.#consumerConnection.createChannel();
     watchConsumer(channel, this.#state);
-    await channel.prefetch(1);
+    await channel.prefetch(prefetch);
     await channel.consume(
       protocol.queue,
       (message) => {
-        if (this.#state.closed || this.#mediaClosing) return;
+        if (this.#state.closed || this.#concurrentClosing) return;
         if (!message) {
           failed(new Error('CONSUMER_CANCELLED'));
           return;
@@ -418,9 +486,9 @@ export class Broker {
             } else failed(error);
           })
           .finally(() => {
-            this.#mediaHandling.delete(tracked);
+            this.#concurrentHandling.delete(tracked);
           });
-        this.#mediaHandling.add(tracked);
+        this.#concurrentHandling.add(tracked);
       },
       { noAck: false, consumerTag: `mio-${createId()}` },
     );
@@ -567,10 +635,10 @@ export class Broker {
 
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
-    this.#mediaClosing = true;
+    this.#concurrentClosing = true;
     // Preserve journal ownership until admitted transcodes finish.
     if (this.#handling) await this.#handling;
-    await Promise.allSettled(this.#mediaHandling);
+    await Promise.allSettled(this.#concurrentHandling);
     this.#state.markClosed();
     const deadline = setTimeout(() => this.#transport.abort(), BROKER_CLOSE_TIMEOUT_MS);
     try {

@@ -117,3 +117,49 @@ it('checks exact instances, config revisions, and result reason discriminants', 
     'WORKER_MESSAGE_INVALID',
   );
 });
+
+it('accepts optional durable loss ranges and phase events while retaining the original wire shape', () => {
+  const { acquiredAt: _at, ...execution } = active;
+  void _at;
+  const base = {
+    ...envelope,
+    ...observation,
+    type: 'worker.telemetry',
+    limits: { hard: WORKER_DEFAULT_LIMITS, applied: WORKER_DEFAULT_LIMITS, revision: 0 },
+    usage: { total: 1, encode: 0, probe: 1 },
+    waiting: { total: 0, encode: 0, probe: 0 },
+    holds: { encode: [], probe: [] },
+    active: [active],
+    event: null,
+  };
+  expect(parseWorkerTelemetry(base)).toEqual(base);
+  const gap = {
+    first: { bootSequence: 2, sequence: 1, at: 40 },
+    last: { bootSequence: 2, sequence: 2, at: 50 },
+    count: 2,
+  };
+  expect(
+    parseWorkerTelemetry({
+      ...base,
+      gap,
+      event: { kind: 'phase', phase: 'processing', at: 98, execution },
+    }),
+  ).toMatchObject({
+    gap,
+    event: { kind: 'phase', phase: 'processing', execution },
+  });
+  for (const invalid of [
+    { ...gap, count: 0 },
+    { ...gap, count: 3 },
+    { ...gap, first: gap.last, last: gap.first },
+    { ...gap, last: { ...gap.last, sequence: 3 } },
+    { ...gap, last: { ...gap.last, bootSequence: 3 } },
+  ])
+    expect(() => parseWorkerTelemetry({ ...base, gap: invalid })).toThrow('WORKER_MESSAGE_INVALID');
+  expect(() =>
+    parseWorkerTelemetry({
+      ...base,
+      event: { kind: 'phase', phase: 'arbitrary', at: 98, execution },
+    }),
+  ).toThrow('WORKER_MESSAGE_INVALID');
+});

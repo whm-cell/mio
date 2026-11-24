@@ -51,6 +51,7 @@ export function mediaDispatch(
           config.brokerUser,
           config.expectedResultUser,
           stop.signal,
+          config.workerUsers,
         );
         if (stopping) {
           await acquired.close();

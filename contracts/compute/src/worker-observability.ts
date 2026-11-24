@@ -24,7 +24,14 @@ export interface WorkerExecutionIdentity {
 export interface WorkerActiveExecution extends WorkerExecutionIdentity {
   acquiredAt: number;
 }
+export type WorkerExecutionPhase = 'downloading' | 'processing' | 'uploading' | 'finalizing';
+export interface WorkerTelemetryGap {
+  first: { bootSequence: number; sequence: number; at: number };
+  last: { bootSequence: number; sequence: number; at: number };
+  count: number;
+}
 export type WorkerTelemetryEvent =
+  | { kind: 'phase'; phase: WorkerExecutionPhase; at: number; execution: WorkerExecutionIdentity }
   | {
       kind: 'execution';
       state: 'queued' | 'acquired' | 'released' | 'cancelled';
@@ -54,6 +61,7 @@ export interface WorkerTelemetry {
   holds: { encode: string[]; probe: string[] };
   active: WorkerActiveExecution[];
   event: WorkerTelemetryEvent | null;
+  gap?: WorkerTelemetryGap;
 }
 export interface WorkerLimitsCommand {
   version: 1;
@@ -195,6 +203,15 @@ function event(value: unknown): WorkerTelemetryEvent | null {
       execution: execution(item.execution),
     };
   }
+  if (item.kind === 'phase') {
+    fields(item, ['kind', 'phase', 'at', 'execution']);
+    return {
+      kind: 'phase',
+      phase: choice(item.phase, ['downloading', 'processing', 'uploading', 'finalizing'] as const),
+      at: integer(item.at, 1, 8.64e15),
+      execution: execution(item.execution),
+    };
+  }
   if (item.kind === 'hold') {
     fields(item, ['kind', 'state', 'at', 'resource', 'identity']);
     if (item.state !== 'blocked' && item.state !== 'unblocked') invalid();
@@ -229,6 +246,34 @@ function envelope(value: Record<string, unknown>, type: string) {
     observedAt: integer(value.observedAt, 1, 8.64e15),
   };
 }
+function telemetryGap(value: unknown, bootSequence: number, sequence: number): WorkerTelemetryGap {
+  const item = object(value);
+  fields(item, ['first', 'last', 'count']);
+  const position = (value: unknown) => {
+    const point = object(value);
+    fields(point, ['bootSequence', 'sequence', 'at']);
+    return {
+      bootSequence: integer(point.bootSequence, 1),
+      sequence: integer(point.sequence, 1),
+      at: integer(point.at, 1, 8.64e15),
+    };
+  };
+  const first = position(item.first),
+    last = position(item.last);
+  const count = integer(item.count, 1);
+  const ordered =
+    first.bootSequence < last.bootSequence ||
+    (first.bootSequence === last.bootSequence && first.sequence <= last.sequence);
+  if (
+    !ordered ||
+    last.bootSequence > bootSequence ||
+    (last.bootSequence === bootSequence && last.sequence >= sequence) ||
+    (first.bootSequence === last.bootSequence && count > last.sequence - first.sequence + 1)
+  )
+    invalid();
+  return { first, last, count };
+}
+
 export function parseWorkerTelemetry(value: unknown): WorkerTelemetry {
   const message = object(boundedJson(value, WORKER_MAX_MESSAGE_BYTES, invalid));
   fields(message, [
@@ -246,6 +291,7 @@ export function parseWorkerTelemetry(value: unknown): WorkerTelemetry {
     'holds',
     'active',
     'event',
+    ...(Object.hasOwn(message, 'gap') ? ['gap'] : []),
   ]);
   const base = envelope(message, 'worker.telemetry');
   const limits = object(message.limits);
@@ -331,6 +377,9 @@ export function parseWorkerTelemetry(value: unknown): WorkerTelemetry {
     holds: { encode: holdList(holds.encode), probe: holdList(holds.probe) },
     active,
     event: event(message.event),
+    ...(Object.hasOwn(message, 'gap')
+      ? { gap: telemetryGap(message.gap, base.bootSequence, base.sequence) }
+      : {}),
   };
 }
 export function parseWorkerLimitsCommand(value: unknown): WorkerLimitsCommand {

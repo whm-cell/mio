@@ -45,3 +45,25 @@ it.each(['null', '[]', '[{"x":1,"x":2}]'])(
     );
   },
 );
+
+it('admits only explicit browser assets inside production roots', () => {
+  const config = legacyHarness();
+  expect(
+    parseHarnessConfig(
+      JSON.stringify({
+        ...config,
+        sourceAssets: ['src/ops/index.html', 'src/ops/styles.css', 'src/ops/app.js'],
+      }),
+    ).sourceAssets,
+  ).toHaveLength(3);
+  for (const invalid of [
+    'src/ops/app.ts',
+    'scripts/service/probe.js',
+    'outside/app.js',
+    'src/ops/bad.py',
+  ]) {
+    expect(() =>
+      parseHarnessConfig(JSON.stringify({ ...config, sourceAssets: [invalid] })),
+    ).toThrow('SOURCE_ASSET_INVALID');
+  }
+});

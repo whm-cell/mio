@@ -39,14 +39,20 @@ export async function inventory(root: string, config: HarnessConfig) {
     }
   };
   await visit('');
+  const assets = new Set(config.sourceAssets);
   for (const file of files) {
     const sourceRoot = Object.keys(config.sourceRoots).find((base) => beneath(file, base));
     const document = config.documentRoots.some((base) => beneath(file, base));
     const configuration =
       config.configurationFiles.includes(file) || /^\.github\/workflows\/[^/]+\.ya?ml$/.test(file);
-    if (sourceRoot && !file.endsWith('.ts') && !(document && file.endsWith('.md'))) {
+    if (
+      sourceRoot &&
+      !file.endsWith('.ts') &&
+      !(document && file.endsWith('.md')) &&
+      !assets.has(file)
+    ) {
       errors.push(
-        `SOURCE_UNSUPPORTED ${file}: source roots support TypeScript and explicitly declared Markdown only`,
+        `SOURCE_UNSUPPORTED ${file}: source roots support TypeScript, declared Markdown and explicit browser assets`,
       );
     } else if (document && !file.endsWith('.md') && !recordsFile(file) && !taskRegistryFile(file)) {
       errors.push(`DOCUMENT_UNCLASSIFIED ${file}: declare the asset's purpose`);
@@ -54,5 +60,7 @@ export async function inventory(root: string, config: HarnessConfig) {
       errors.push(`FILE_UNCLASSIFIED ${file}: declare its source/configuration/document role`);
     }
   }
+  const found = new Set(files);
+  for (const asset of assets) if (!found.has(asset)) errors.push(`SOURCE_ASSET_MISSING ${asset}`);
   return { files, errors };
 }

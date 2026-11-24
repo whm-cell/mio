@@ -65,3 +65,9 @@ node --input-type=module -e 'import { computePermissions } from "./scripts/servi
 [常规协议回归](../../tests/integrations/rabbitmq-protocol.test.ts)真实验证 A 发布重媒体命令、B 收取并 ACK、B 发布关联结果、A 收取并 ACK、关闭各自消费通道后原消息不重投，以及反向读取返回 AMQP `403 ACCESS_REFUSED`。成功与故意失败的用例都检查临时 vhost 和 A/B 用户是否删除。运行条件见[测试导航](../engineering/testing.md#按变更定位测试)。
 
 [音频隔离回归](../../tests/audio/media-rabbitmq.test.ts)使用同一隔离设施，验证两个 A 实例收到反序发布的各自结果、错误关联无法结算、未 ACK 命令重投，以及 stream 的生效保留策略。
+
+### Worker 遥测与控制
+
+A 只消费已配置的实例及已验证的 AMQP `userId`。设置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 预置每实例的 `mio.compute.worker.control.<instanceId>` 及相应 DLQ。单实例沿用 `MIO_COMPUTE_EXPECTED_RESULT_USER`，多实例在 A 传入 `MIO_COMPUTE_WORKER_RESULT_USERS` 的 JSON 实例到 B 用户一对一映射。每个 B 用户仅获得自己的控制队列读权限及原计算队列，使用同一个已授权的 A 命令用户。新建拓扑脚本为多实例写出分别的 B 私有环境文件。已有部署先增量预置各角色和队列，再更新 A 映射，避免复用其他 B 的账户。
+
+`worker.telemetry` 与 `worker.limits.result` 都发到独立遥测队列，A 控制按实例路由并持久化去重。消息同时校验 `userId`、messageId、大小和严格协议。先升级 A 再启用新版 B 的阶段和明确 gap 字段。无 gap、无新阶段的旧 Worker 消息仍具相同形状。遥测、按实例控制、既有单路/音频/媒体消费分别管理连接与确认。

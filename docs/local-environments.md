@@ -180,3 +180,7 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 新的 `live-image-loop.ts dev` 只启动 A，并在进程中安装单次生成 POST 审计；入口不配置 RabbitMQ 或启动 B，继续走正式登录、目录刷新、图片 HTTP、资产下载、重启和幂等读取。用户指示推进开发或验收时，默认允许复用常驻 `mio_dev` 既有账号／凭据与私有测试 COS 执行单次有界、最小规格的真实供应商验收（脚本的 `MIO_RUN_LIVE_IMAGE=yes` 环境变量保留为防普通测试误触发的脚本安全阀，不再要求为此二次索要口令），正式验收取证仍须基于干净候选且未执行不算通过；若传入新 `apiKey` 覆盖既有凭据或改写影响他人的全局路由，仍须最小必要触发或由用户明确指定。该入口保留测试用户、业务任务、COS 产物及私有审计证据。
 
 临时手机验收可使用 Cloudflare Quick Tunnel，但 tunnel 只能指向本任务回环过滤代理 `scripts/service/material-auth-proxy.ts`。代理在转发前只允许精确 `GET /api/v1/materials/auth-sessions/{UUID}/launch` 与 `/complete`，其余登录、metadata、health、恢复 POST、管理端及其他方法一律拒绝；不转发 Cookie/Authorization/Origin，不记录 query/token，单代理最多 4 个在途。隧道的 HTTPS origin 明确注入当前候选，不改 DNS 或既有生产路由；Cloudflare 转发属于用户已选择的本次临时暴露边界，验收后关闭任务隧道/代理。公开 origin 不能通过这段说明获得任意生产部署授权。
+
+### Worker 观测与调限
+
+启用前先执行计算增量迁移，再用部署拓扑入口预置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 中的准确实例。A 即使不挂运维路由也保存这些实例的遥测。需要控制台时，A 另设 `MIO_COMPUTE_OPS_ENABLED=true` 与操作员 Mio 用户 ID 清单 `MIO_COMPUTE_OPS_USER_IDS`。Ops 使用正常 Cookie 和精确 Origin。PG 保留样本 7 天、执行或事件 30 天、调限审计 90 天。仍待投递的控制及必要审计保留到可安全清理。隔离回归使用本机专属 PG schema 和 RabbitMQ 临时 vhost。更多见[计算运维](apis/compute-ops.md)。

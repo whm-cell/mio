@@ -16,10 +16,13 @@ import type {
   MediaFile,
   MediaResult,
   MediaFailureCode,
+  WorkerExecutionIdentity,
+  WorkerExecutionPhase,
 } from '@mio/compute-contracts';
 import type { ObjectStore } from './adapters/cos.ts';
 import type { Journal } from './adapters/journal.ts';
 import { isJournalFailure } from './adapters/journal.ts';
+import { mediaIdentity } from './adapters/media-journal.ts';
 import type { MediaAttempt, MediaJournal, MediaPhase } from './adapters/media-journal.ts';
 import { MediaFiles } from './adapters/media-files.ts';
 import { MediaProcessAdapter, mediaProcessGone } from './adapters/media-process.ts';
@@ -72,6 +75,18 @@ export function reserveMediaProcesses(journal: MediaJournal, slots: ResourceSlot
 }
 
 /** Lifecycle and durable side effects only; operation plans enter through MediaExecutor. */
+function executionIdentity(command: MediaCommand): WorkerExecutionIdentity {
+  return {
+    executionId: createId(),
+    protocol: 'media',
+    jobId: command.jobId,
+    attemptId: command.attemptId,
+    inspectionId: null,
+    resource: mediaResourceClass(command.operation),
+    slots: 1,
+  };
+}
+
 export class MediaWorker {
   readonly #store: MediaStore;
   readonly #publisher: MediaPublisher;
@@ -81,6 +96,8 @@ export class MediaWorker {
   readonly #stop: AbortSignal;
   readonly #slots: ResourceSlots;
   readonly #active = new Map<string, AbortController>();
+  readonly #deliveries = new Map<string, { command: MediaCommand; task: Promise<void> }>();
+  readonly #executionIds = new Map<string, string>();
   readonly #publishing = new Map<string, Promise<void>>();
   readonly #background = new Map<string, Promise<void>>();
   readonly #failed: (error: unknown) => void;
@@ -155,6 +172,30 @@ export class MediaWorker {
   async handle(command: MediaCommand, ack: () => void): Promise<void> {
     command = parseMediaCommand(command);
     if (!this.#healthy || this.#closing || this.#stop.aborted) throw new Error('WORKER_NOT_READY');
+    const id = command.attemptId;
+    const existing = this.#deliveries.get(id);
+    if (existing) {
+      if (mediaIdentity(existing.command) !== mediaIdentity(command))
+        throw new Error('ATTEMPT_CONFLICT');
+      await existing.task;
+      ack();
+      return;
+    }
+    const task = this.#handleDelivery(command, ack);
+    this.#deliveries.set(id, { command, task });
+    try {
+      await task;
+    } finally {
+      this.#deliveries.delete(id);
+    }
+  }
+
+  #phase(attemptId: string, phase: WorkerExecutionPhase): void {
+    const id = this.#executionIds.get(attemptId);
+    if (id) this.#slots.phase(id, phase);
+  }
+
+  async #handleDelivery(command: MediaCommand, ack: () => void): Promise<void> {
     await this.#background.get(command.attemptId);
     if (this.#active.has(command.attemptId)) throw new Error('WORKER_NOT_READY');
     const controller = new AbortController();
@@ -176,11 +217,14 @@ export class MediaWorker {
           errorCode: 'CAPABILITY_UNAVAILABLE',
         });
       } else if (!terminal(attempt.phase)) {
+        const execution = executionIdentity(command);
         try {
           release = await this.#slots.wait(
             mediaResourceClass(command.operation),
             AbortSignal.any([this.#stop, controller.signal]),
+            execution,
           );
+          this.#executionIds.set(command.attemptId, execution.executionId);
         } catch (error) {
           if (!controller.signal.aborted) throw error;
           this.#settleError(attempt, error);
@@ -191,6 +235,7 @@ export class MediaWorker {
         }
       }
       await this.#flush(command.attemptId);
+      this.#phase(command.attemptId, 'finalizing');
       ack();
       attempt.ackDispatched = true;
       this.#journal.save(attempt);
@@ -200,6 +245,7 @@ export class MediaWorker {
       throw error;
     } finally {
       this.#active.delete(command.attemptId);
+      this.#executionIds.delete(command.attemptId);
       release?.();
     }
   }
@@ -318,11 +364,10 @@ export class MediaWorker {
   }
   async #recoverOutputs(attempt: MediaAttempt, signal: AbortSignal): Promise<void> {
     let release: (() => void) | undefined;
+    const execution = executionIdentity(attempt.command);
     try {
-      release = await this.#slots.waitForOutputRecovery(
-        mediaResourceClass(attempt.command.operation),
-        signal,
-      );
+      release = await this.#slots.waitForOutputRecovery(execution.resource, signal, execution);
+      this.#executionIds.set(attempt.command.attemptId, execution.executionId);
       for (const upload of Object.values(attempt.uploads)) {
         if (upload.state !== 'intent') continue;
         upload.object = await this.#verifyObject(upload.key, upload.file, upload.digest, signal);
@@ -337,6 +382,7 @@ export class MediaWorker {
       if (this.#stop.aborted) throw error;
       this.#settleError(attempt, error);
     } finally {
+      this.#executionIds.delete(attempt.command.attemptId);
       release?.();
     }
   }
@@ -390,6 +436,7 @@ export class MediaWorker {
       if (attempt.phase === 'received') await this.#reuseCheckpoints(attempt, files, signal);
       attempt.phase = 'downloading';
       this.#journal.save(attempt);
+      this.#phase(attempt.command.attemptId, 'downloading');
       for (const [index, input] of attempt.command.inputs.entries()) {
         const name = `input-${index}`;
         const prior = attempt.inputs[name];
@@ -402,6 +449,7 @@ export class MediaWorker {
         this.#journal.save(attempt);
       }
       this.#transition(attempt, 'executing', { state: 'running', stage: 'execute', progress: 0 });
+      this.#phase(attempt.command.attemptId, 'processing');
       let lastProgress = 0,
         lastStage = '';
       const progress = (stage: string, fraction: number) => {
@@ -599,6 +647,7 @@ export class MediaWorker {
       }
     attempt.phase = 'uploading';
     this.#journal.save(attempt);
+    this.#phase(command.attemptId, 'uploading');
     const uploaded: MediaFile[] = [];
     for (const file of attempt.result.files) {
       if (this.#journal.cancelled(command.attemptId)) throw new Error('MEDIA_CANCELLED');

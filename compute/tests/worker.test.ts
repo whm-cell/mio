@@ -1,7 +1,10 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFileSync,
+  chmodSync,
+  mkdirSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -264,6 +267,8 @@ describe('worker journal and real ffmpeg', () => {
       DROP INDEX attempts_cleanup;
       ALTER TABLE attempts RENAME COLUMN ack_dispatched TO acknowledged;
       CREATE INDEX attempts_cleanup ON attempts(attempt_id) WHERE phase IN ('succeeded','failed') AND acknowledged = 1 AND cleaned = 0;
+      DROP TABLE worker_observation_outbox;
+      DROP TABLE worker_observation_state;
       UPDATE metadata SET schema_version = 3;
       COMMIT;`);
     old.close();
@@ -1028,4 +1033,124 @@ describe('worker journal and real ffmpeg', () => {
     expect(worker.admissionReady()).toBe(true);
     journal.close();
   });
+});
+
+it('raises encode parallelism when the first owned transcode is already in SQLite running', async () => {
+  const root = directory();
+  const file = fixture(root);
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const executable = join(bin, 'ffmpeg');
+  const actual = execFileSync('which', ['ffmpeg'], { encoding: 'utf8' }).trim();
+  writeFileSync(executable, '#!/bin/sh\nexec "$MIO_TEST_REAL_FFMPEG" -readrate 0.35 "$@"\n');
+  chmodSync(executable, 0o700);
+  vi.stubEnv('MIO_TEST_REAL_FFMPEG', actual);
+  vi.stubEnv('PATH', bin + ':' + process.env.PATH);
+  const journal = new Journal(root, 'instance', true);
+  const slots = new ResourceSlots({ total: 2, encode: 2, probe: 1 });
+  slots.setLimits({ total: 1, encode: 1, probe: 1 });
+  const worker = new Worker(
+    journal,
+    {
+      async download(value, base) {
+        copyFileSync(file, paths(base, value.attemptId).input);
+      },
+      async head() {
+        return null;
+      },
+      async upload() {},
+      async verify() {
+        return false;
+      },
+    },
+    { async publish() {} },
+    root,
+    slots,
+  );
+  const first = command(file);
+  const second = command(file);
+  const ack = vi.fn();
+  const tasks = [worker.handle(first, ack, true)];
+  try {
+    await vi.waitFor(() => expect(journal.get(first.attemptId)?.phase).toBe('running'));
+    tasks.push(worker.handle(second, ack, true));
+    await vi.waitFor(() => expect(slots.snapshot().waiting.encode).toBe(1));
+    slots.setLimits({ total: 2, encode: 2, probe: 1 });
+    await vi.waitFor(() => expect(journal.get(second.attemptId)?.phase).toBe('running'));
+    expect(journal.get(first.attemptId)?.phase).toBe('running');
+    expect(slots.snapshot()).toMatchObject({
+      usage: { total: 2, encode: 2 },
+      holds: { encode: [] },
+    });
+    await Promise.all(tasks);
+    expect(ack).toHaveBeenCalledTimes(2);
+  } finally {
+    worker.stop();
+    await Promise.allSettled(tasks);
+    journal.close();
+    vi.unstubAllEnvs();
+  }
+}, 14000);
+
+it('lets redelivery check a prior process without consuming capacity or clearing HOLD early', async () => {
+  const root = directory();
+  const commandFile = fixture(root);
+  const task = command(commandFile);
+  const journal = new Journal(root, 'instance', true);
+  const processChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
+    stdio: 'ignore',
+  });
+  await once(processChild, 'spawn');
+  const exited = once(processChild, 'exit');
+  journal.accept(task);
+  journal.transition(task.attemptId, 'launching');
+  journal.recordPid(task.attemptId, processChild.pid!, processIdentity()!);
+  const slots = new ResourceSlots();
+  slots.setLimits({ total: 0, encode: 0, probe: 0 });
+  const download = vi.fn();
+  const worker = new Worker(
+    journal,
+    {
+      download,
+      async head() {
+        return null;
+      },
+      async upload() {},
+      async verify() {
+        return false;
+      },
+    },
+    { async publish() {} },
+    root,
+    slots,
+  );
+  const ack = vi.fn();
+  try {
+    await worker.reconcileOne();
+    const delivering = worker.handle(task, ack, true);
+    try {
+      await vi.waitFor(() => expect(ack).toHaveBeenCalledOnce());
+      await delivering;
+      expect(journal.get(task.attemptId)?.phase).toBe('unknown_process');
+      expect(slots.snapshot()).toMatchObject({
+        usage: { total: 0 },
+        waiting: { total: 0 },
+        holds: { encode: ['transcode'] },
+      });
+      processChild.kill('SIGTERM');
+      await exited;
+      await worker.reconcileOne();
+      expect(journal.get(task.attemptId)?.phase).toBe('failed');
+      expect(slots.snapshot().holds.encode).toEqual([]);
+      expect(download).not.toHaveBeenCalled();
+    } finally {
+      worker.stop();
+      await Promise.allSettled([delivering]);
+    }
+  } finally {
+    if (processChild.exitCode === null && processChild.signalCode === null)
+      processChild.kill('SIGTERM');
+    await exited;
+    journal.close();
+  }
 });

@@ -202,3 +202,5 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 A 使用 `MIO_GENERATIONS_ENABLED=true` 和绝对持久目录 `MIO_GENERATIONS_DATA_DIR`；身份、媒体数据库、COS 及 provider master key 仍须配置。先迁移 assets，再显式执行 `pnpm generations:migrate --apply`（本地为 `pnpm migrate:dev generations --apply`）。历史任务及输出原表继续使用；没有 A 执行记录的旧 B 任务只读查询，不被 A 重新提交。内部密文、上游 ID、执行阶段和文件定位不进入公开视图。
 
 切换沿[常驻环境](../local-environments.md#图片生成迁移与切换)先暂停新提交、排空并对账旧任务/outbox/MQ/B journal 和未确认上传，再停旧图片执行器、启动 A 并恢复接单。未对账 unknown、恢复数据缺失、存储权限不足阻止切换。A 接过新任务后先对账新任务，不能直接交旧 B 重跑。成功 COS/DB 对账后清理已确认临时图。进程在已完成提交后中断时，后台按确切完成检查点和 COS 输出补清；只处理全部完成且尝试键无歧义的文件，清理可幂等续接，失败项分页推进并后续回访。失败、部分完成与未知检查点保留；磁盘不足停止新任务准入，不自动删除恢复数据。
+
+跨任务的 Worker 容量、占槽历史和调限使用独立的[计算运维 API](compute-ops.md)，由 Mio 操作员使用。本人任务接口和结果归属规则不变。

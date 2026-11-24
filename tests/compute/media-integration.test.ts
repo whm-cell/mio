@@ -444,9 +444,9 @@ it('publishes the eleven base operations through real HTTP, PostgreSQL, RabbitMQ
       expect(outsider).toEqual({ jobs: [] });
       const unknownOperation = await call('', {
         requestId: randomUUID(),
-        operation: 'video.derivatives',
+        operation: 'subtitle.burn',
         inputs: [{ assetId: video.assetId }],
-        parameters: { profile: 'ordinary' },
+        parameters: { cues: [{ startSeconds: 0, endSeconds: 0.5, text: '待支持' }] },
       });
       expect(unknownOperation.status).toBe(400);
       expect(await unknownOperation.json()).toMatchObject({

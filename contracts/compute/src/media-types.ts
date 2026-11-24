@@ -136,6 +136,11 @@ export const MEDIA_CORE_OPERATIONS: readonly MediaOperation[] = [
   'audio.remux',
   'audio.concat',
 ];
+/** Keep admission and Worker capability checks aligned during the incremental rollout. */
+export const MEDIA_AVAILABLE_OPERATIONS: readonly MediaOperation[] = [
+  ...MEDIA_CORE_OPERATIONS,
+  'video.derivatives',
+];
 export type MediaRequest = {
   [O in MediaOperation]: {
     requestId: string;

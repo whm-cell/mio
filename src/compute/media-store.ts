@@ -15,6 +15,7 @@ import type {
 import { checkComputeCapacity, lockComputeCapacity } from './capacity.ts';
 import { computeTransaction } from './database.ts';
 import { MediaError, mediaRequestHash } from './media-model.ts';
+import type { MediaHlsPackage } from './media-hls.ts';
 import type {
   MediaCommandLane,
   MediaInputRow,
@@ -50,6 +51,21 @@ export class MediaStore {
     return (
       await this.pool.query<MediaJobViewRow>(
         viewSQL('SELECT * FROM mio_media_jobs WHERE id=$1 AND owner_id=$2'),
+        [id, owner],
+      )
+    ).rows[0];
+  }
+  async hlsPackage(id: string, owner: string): Promise<MediaHlsPackage | undefined> {
+    return (
+      await this.pool.query<MediaHlsPackage>(
+        `SELECT j.attempt_id AS "attemptId",jsonb_agg(jsonb_build_object(
+          'asset_id',f.asset_id,'name',f.name,'role',f.role,'content_type',f.content_type,
+          'object_key',f.object_key,'size_bytes',f.size_bytes::text,'etag',f.etag,'sha256',f.sha256
+        )) AS files
+        FROM mio_media_jobs j JOIN mio_media_files f ON f.job_id=j.id
+        WHERE j.id=$1 AND j.owner_id=$2 AND j.state='succeeded' AND j.operation='video.derivatives'
+          AND f.role IN ('hls','segment')
+        GROUP BY j.id`,
         [id, owner],
       )
     ).rows[0];

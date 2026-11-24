@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { processIdentity } from './media.ts';
-import type { MediaProcessResult, MediaStep } from '../media-execution.ts';
+import type { DiscoverMediaOutputs, MediaProcessResult, MediaStep } from '../media-execution.ts';
 import type { MediaAttempt, MediaJournal, MediaStepCheckpoint } from './media-journal.ts';
 import { mediaIdentity } from './media-journal.ts';
 import type { MediaFiles } from './media-files.ts';
@@ -95,7 +95,7 @@ export class MediaProcessAdapter {
     this.#signal = signal;
     this.#progress = progress;
   }
-  async run(step: MediaStep): Promise<MediaProcessResult> {
+  async run(step: MediaStep, discoverOutputs?: DiscoverMediaOutputs): Promise<MediaProcessResult> {
     if (this.#running) throw new Error('MEDIA_STEP_CONCURRENT');
     if (
       !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(step.id) ||
@@ -109,12 +109,15 @@ export class MediaProcessAdapter {
     this.#running = true;
     try {
       this.#progress(step.id, 0);
-      return await this.#run(step);
+      return await this.#run(step, discoverOutputs);
     } finally {
       this.#running = false;
     }
   }
-  async #run(step: MediaStep): Promise<MediaProcessResult> {
+  async #run(
+    step: MediaStep,
+    discoverOutputs: DiscoverMediaOutputs | undefined,
+  ): Promise<MediaProcessResult> {
     const identity = mediaIdentity(step);
     const previous = this.#attempt.steps[step.id];
     if (previous) {
@@ -145,7 +148,8 @@ export class MediaProcessAdapter {
     this.#attempt.steps[step.id] = checkpoint;
     this.#journal.save(this.#attempt);
     const result = await this.#spawn(step, args, checkpoint);
-    for (const { name } of step.outputs ?? []) {
+    const outputs = [...(step.outputs ?? []), ...((await discoverOutputs?.()) ?? [])];
+    for (const { name } of outputs) {
       const digest = await this.#files.digest(name, this.#signal);
       if (digest.size < 1) throw new Error('OUTPUT_INVALID');
       checkpoint.outputs[name] = digest;
@@ -263,7 +267,7 @@ export async function managedProcess(
   if (binary === 'ffmpeg' && options.progress)
     prefix.push('-progress', 'pipe:3', '-stats_period', '1');
   const informational = normalized.some((arg) =>
-    ['-version', '-encoders', '-filters', '-formats', '-h'].includes(arg),
+    ['-version', '-encoders', '-filters', '-formats', '-muxers', '-bsfs', '-h'].includes(arg),
   );
   if (binary === 'ffprobe' && !informational) prefix.push(...inputRestriction);
   if (binary === 'ffmpeg' && normalized.length && !informational)
@@ -404,11 +408,21 @@ export async function checkMediaCapabilities(
   const filters = await managedProcess('ffmpeg', ['-filters'], signal, undefined, {
     capture: true,
   });
+  const muxers = await managedProcess('ffmpeg', ['-muxers'], signal, undefined, {
+    capture: true,
+  });
+  const bitstreamFilters = await managedProcess('ffmpeg', ['-bsfs'], signal, undefined, {
+    capture: true,
+  });
   const probe = await managedProcess('ffprobe', ['-version'], signal);
   const has = (text: string, name: string) =>
     text.split('\n').some((line) => line.trim().split(/\s+/)[1] === name);
   if (
-    [encoders, filters, probe].some((result) => result.aborted || result.exitCode !== 0) ||
+    [encoders, filters, muxers, bitstreamFilters, probe].some(
+      (result) => result.aborted || result.exitCode !== 0,
+    ) ||
+    ['hls', 'mpegts', 'segment'].some((name) => !has(muxers.stdout, name)) ||
+    !bitstreamFilters.stdout.split(/\r?\n/).includes('noise') ||
     [
       'libx264',
       'aac',
@@ -428,6 +442,8 @@ export async function checkMediaCapabilities(
       'metadata',
       'asetpts',
       'atrim',
+      'apad',
+      'aresample',
       'concat',
       'asetnsamples',
       'astats',

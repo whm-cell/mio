@@ -26,9 +26,16 @@ export interface MediaProcessResult {
   waveform?: number[];
   packetEndSeconds?: number;
 }
+/** Resolve bounded, deterministic filenames from a completed tool output. */
+export type DiscoverMediaOutputs = () => Promise<LocalMediaFile[]>;
+
 export interface MediaExecutionContext {
   /** Adapter replaces each @file:<name> argument (and filter path) with a trusted path. */
-  run(step: MediaStep): Promise<MediaProcessResult>;
+  run(step: MediaStep, discoverOutputs?: DiscoverMediaOutputs): Promise<MediaProcessResult>;
+}
+export interface MediaFileExecutionContext extends MediaExecutionContext {
+  read(name: string, maxBytes: number): Promise<Uint8Array>;
+  write(name: string, value: string | Uint8Array): Promise<void>;
 }
 export interface MediaExecutionResult {
   files: LocalMediaFile[];
@@ -36,5 +43,5 @@ export interface MediaExecutionResult {
 }
 export type MediaExecutor = (
   command: MediaCommand,
-  context: MediaExecutionContext,
+  context: MediaFileExecutionContext,
 ) => Promise<MediaExecutionResult>;

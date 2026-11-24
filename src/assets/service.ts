@@ -2,6 +2,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { createHash } from 'node:crypto';
+import { HLS_PLAYLIST_CONTENT_TYPE } from '../compute/media-hls.ts';
 import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
 import {
   AssetError,
@@ -31,6 +32,9 @@ const playableAudio = new Set([
 
 function view(row: AssetRow, objects: AssetObjectStore) {
   const rawKey = row.state === 'ready' ? row.raw_key : null;
+  const hlsObject =
+    rawKey?.startsWith('mio/media/') &&
+    [HLS_PLAYLIST_CONTENT_TYPE, 'video/mp2t'].includes(row.content_type);
   return {
     assetId: row.id,
     status: row.state !== 'ready' && row.upload_expired ? 'expired' : row.state,
@@ -38,7 +42,7 @@ function view(row: AssetRow, objects: AssetObjectStore) {
     contentType: row.content_type,
     size: Number(row.size_bytes),
     createdAt: row.created_at.toISOString(),
-    ...(rawKey ? { downloadUrl: objects.downloadUrl(rawKey) } : {}),
+    ...(rawKey && !hlsObject ? { downloadUrl: objects.downloadUrl(rawKey) } : {}),
     ...(rawKey && objects.audioPlaybackUrl && playableAudio.has(row.content_type.toLowerCase())
       ? { playbackUrl: objects.audioPlaybackUrl(rawKey, row.content_type) }
       : {}),
@@ -52,6 +56,22 @@ function statusCode(error: unknown): number | undefined {
 
 /** Serial cleanup bounds each pass and deletes only stored, expired staging keys. */
 export function createAssetService(store: AssetStore, objects: AssetObjectStore) {
+  const present = async (
+    row: AssetRow,
+  ): Promise<
+    ReturnType<typeof view> & {
+      derivatives?: Awaited<ReturnType<AssetStore['derivativeView']>>;
+    }
+  > => {
+    const base = view(row, objects);
+    if (
+      row.state !== 'ready' ||
+      !row.raw_key?.startsWith(`mio/raw/${row.id}/`) ||
+      !row.content_type.toLowerCase().startsWith('video/')
+    )
+      return base;
+    return { ...base, derivatives: await store.derivativeView(row.id, row.owner_id) };
+  };
   const active = new Set<Promise<unknown>>();
   const stop = new AbortController();
   let cleanup: Promise<void> | undefined;
@@ -241,7 +261,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         const row = await store.owned(id, actor.userId);
         if (stop.signal.aborted)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
-        return view(row, objects);
+        return present(row);
       });
     },
     readVisionSource(
@@ -300,7 +320,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         let row = await store.owned(id, actor.userId);
         if (stop.signal.aborted)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
-        if (row.state === 'ready') return view(row, objects);
+        if (row.state === 'ready') return present(row);
         if (row.state === 'expired' || row.upload_expired)
           throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_EXPIRED');
         const stagingKey = `mio/staging/${id}`;
@@ -322,7 +342,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         const claimed = await store.claim(id, actor.userId, head.etag, lease);
         if (!claimed) {
           row = await store.owned(id, actor.userId);
-          if (row.state === 'ready') return view(row, objects);
+          if (row.state === 'ready') return present(row);
           if (row.upload_expired || row.state === 'expired')
             throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_EXPIRED');
           if (row.source_etag && row.source_etag !== head.etag)
@@ -353,9 +373,9 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
           throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
         }
         const saved = await store.commit(id, actor.userId, lease, rawKey);
-        if (saved) return view(saved, objects);
+        if (saved) return present(saved);
         row = await store.owned(id, actor.userId);
-        if (row.state === 'ready') return view(row, objects);
+        if (row.state === 'ready') return present(row);
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_FINALIZE_SUPERSEDED');
       });
     },

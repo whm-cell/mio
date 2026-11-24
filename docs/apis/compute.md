@@ -38,13 +38,15 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 同一 owner 和 `requestId` 的相同操作及有序输入与参数返回原任务，参数对象字段顺序不影响比较。同键异参返回 409 `REQUEST_CONFLICT`。重试使用独立请求身份，重复请求返回同一任务，输入沿用原快照。计算的 `accepted`、`queued`、`running`、`reconciling`、`cancel_requested` 合计占用每人 10、全局 500 个活动任务，与单路转码共用。
 
-MediaJobView 含 `jobId`、`requestId`、`operation`、`profile`、`inputs`、`parameters`、`status`、`attempt`、`stage`、`progress`、`errorCode`、`cancelRequested`、`data`、`outputs`、`createdAt`、`updatedAt`。进度为 0 至 1，阶段和错误码可为空。`outputs` 在成功前为空，成功后按 manifest 顺序返回 `{assetId,name,role,contentType,sizeBytes}`；调用本人[资产查询](assets.md)获得短期下载地址，支持的音频 MIME 同时签发播放地址。状态与产物来自同一数据库快照。私有对象键、ETag 和内部 manifest 描述保留在服务端。manifest 正文按 SHA-256 验证，每个文件核对 HEAD 中的长度、ETag、SHA-256 元数据，当前 attempt 仍匹配时同事务登记所有结果资产、结构化 `data` 和成功终态。
+MediaJobView 含 `jobId`、`requestId`、`operation`、`profile`、`inputs`、`parameters`、`status`、`attempt`、`stage`、`progress`、`errorCode`、`cancelRequested`、`data`、`outputs`、`createdAt`、`updatedAt`。进度为 0 至 1，阶段和错误码可为空。`outputs` 在成功前为空，成功后按 manifest 顺序返回 `{assetId,name,role,contentType,sizeBytes}`；可下载产物通过本人[资产查询](assets.md)取得短期下载地址，支持的音频 MIME 同时签发播放地址。内部 HLS 清单与分片通过[私有 HLS](#私有-hls)消费。状态与产物来自同一数据库快照。私有对象键、ETag 和内部 manifest 描述保留在服务端。manifest 正文按 SHA-256 验证，每个文件核对 HEAD 中的长度、ETag、SHA-256 元数据，当前 attempt 仍匹配时同事务登记所有结果资产、结构化 `data` 和成功终态。
 
-参数和返回信息见[操作设计](../tasks/compute-service/media-compute.md#操作与参数)。当前接受 `media.probe`、`video.reference_prepare`、`video.trim`、`frames.extract`、`scenes.detect`、`video.split`、`media.export`、`audio.extract`、`audio.waveform`、`audio.remux`、`audio.concat`。执行器根据媒体内容识别独立音视频容器，能够使用 MP4、MOV、Matroska、WebM、AVI、MPEG、常用音频及静态图像容器中的实际音视频流。输入须为单个冻结对象中的媒体，外部清单、播放列表及其他对象引用无法提交为媒体源。合规的参考视频只探测，返回 `data={compressed:false,trimmed:false}` 与空 `outputs`，继续使用原输入资产。
+参数和返回信息见[操作设计](../tasks/compute-service/media-compute.md#操作与参数)。当前接受 `media.probe`、`video.reference_prepare`、`video.derivatives`、`video.trim`、`frames.extract`、`scenes.detect`、`video.split`、`media.export`、`audio.extract`、`audio.waveform`、`audio.remux`、`audio.concat`。执行器根据媒体内容识别独立音视频容器，能够使用 MP4、MOV、Matroska、WebM、AVI、MPEG、常用音频及静态图像容器中的实际音视频流。输入须为单个冻结对象中的媒体，外部清单、播放列表及其他对象引用无法提交为媒体源。合规的参考视频只探测，返回 `data={compressed:false,trimmed:false}` 与空 `outputs`，继续使用原输入资产。
 
 `media.probe` 的 `data.probe.width`、`height` 是应用源像素宽高比与旋转后的显示尺寸。`rotation` 报告归一化至 0–360 度的源旋转，`sampleAspectRatio` 报告源像素宽高比。编码尺寸 240×180、SAR 4:3、旋转 +90° 的源返回 `width=180`、`height=320`。显示时直接使用这对尺寸，无需重复变换。
 
 当音轨长于画面流时，`frames.extract` 的 `first_last` 返回实际最后一帧。`audio.remux` 使用首个实际视频流的结束位置裁剪较长的新音轨，较短的新音轨自然结束。`sourceDurationSeconds` 可指定更短的输出窗口，超出画面末尾的请求返回任务错误 `INPUT_INVALID`。
+
+`video.derivatives` 接受一个本人 ready 视频与 `parameters.profile` 为 `ordinary` 或 `canvas`。两档均交付私有 H.264 MP4 预览、JPEG 封面及 MPEG-TS HLS 播放包，`data.probe` 保留原件探测值。普通档以一次 FFmpeg HLS 打包步骤产生清单与全部分片，主清单使用已核对的实际编码尺寸。亚秒视频保留实测的分片时长，子清单的整数目标时长至少为 1 秒。画布档源视频最长 720 秒，按 6 秒目标独立编码，每档最多 120 片、每片不超过 4 MiB。720p/480p 沿显示方向等比适配，不放大，实际尺寸相同只保留一档。分片核对长度、时间、音轨和连续性，时间误差最多 0.35 秒。带源音轨的产物保留首条音轨为 AAC，音轨比画面短的区间补静音。画布音轨连续编码为 48 kHz AAC，各视频片按同一帧时钟复用完整音频包。末尾不足以容纳下一 AAC 帧时与前片合并，时间误差仍受 0.35 秒限制。普通档与通用探测的输入时长上限一致，为 3600 秒。
 
 A 与 B 对同一 attempt 仲裁取消和成功。A 已提交成功时，取消返回原成功结果。取消先持久化时，后续已完成的结果结束为 `cancelled`，输出保留在内部对账中。B 收到取消后跳过未开始作业，运行中先终止并回收实际进程，再报告取消。已知回收中断、执行超时及瞬时存储失败可自动开启下一 attempt。人工重试需要 `failed` 状态，自动与人工合计最多三次。已取消及待对账的任务禁止新 attempt。
 
@@ -123,6 +125,14 @@ A 与 B 对同一 attempt 仲裁取消和成功。A 已提交成功时，取消�
 错误：活动任务尚未进入对账或取消时返回 409 `MEDIA_RECOVER_NOT_ALLOWED`，其余见[通用媒体约定](#通用媒体处理)。
 
 副作用：沿当前 attempt 持久化对账控制。A 若已保存待核验成功回报，会重新核对其 manifest。
+
+### 私有 HLS
+
+`GET /api/v1/compute/media/{id}/hls` 返回本人成功的 `video.derivatives` 主清单。`GET /api/v1/compute/media/{id}/hls/{assetId}` 返回该主清单所列的本人子清单。两条路由只接受任务和子清单 UUID，使用登录 Cookie 和本组 GET Origin 规则，返回 `application/vnd.apple.mpegurl` 与 `Cache-Control: private, no-store`。没有成功播放包、非本人任务或未列出的子清单返回 404 `MEDIA_HLS_NOT_FOUND`。
+
+A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主清单的变体引用改写成本组鉴权子路径。子清单只可引用同一任务和 attempt 已登记的本档 MPEG-TS 分片，所有引用通过后才重写成短期私有 COS inline GET。循环、外部引用、未知 URI 标签以及登记内容不符返回 409 `MEDIA_HLS_INVALID`。
+
+每个分片的签名寿命为在子清单中累计的播放开始秒数向上取整后加 300 秒。普通档最多 3900 秒，画布档最多 1020 秒，并受临时 COS 凭据剩余寿命限制。连续 1× 播放可按同一子清单在不同时间取得分片。长时间暂停、延迟播放或过期后回放时可重新请求本人子清单取得新签名。签名不得公开或写入日志。
 
 ## POST /api/v1/compute/images
 

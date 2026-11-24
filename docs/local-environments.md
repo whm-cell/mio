@@ -59,6 +59,8 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets`、`compute`、`generations`、`materials` 或 `admin`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算、生成或素材迁移，供应商迁移先于或随 `admin` 迁移执行，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。管理后台在设置 `MIO_ADMIN_ENABLED=true`（及可选前端 Origin 白名单 `MIO_ADMIN_ALLOWED_ORIGINS`）并完成 `pnpm migrate:dev admin --apply` 后启用，超级管理员账号通过 `pnpm admin:dev --username <name> --password-stdin` 显式初始化，RabbitMQ 与 Redis 完整档只读监控账号通过 `pnpm monitor:init:dev`（或 `pnpm monitor:init:test`）一键生成最小权限监控凭据并完成探针核验，详见[管理后台 HTTP](apis/admin.md)。未启用域不自动迁移。
 
+视频上传自动派生随计算开关启用。已有媒体数据库升级时先显式执行 `pnpm migrate:dev assets --apply`，为资产库增设派生意图表。启用了资产服务的部署都需要此迁移，含计算关闭的部署。计算启用时再核对通用媒体计算迁移、A/B 配置及媒体队列；test 环境使用对应 `migrate:test`。升级保留既有资产和任务，启动不回填历史上传。升级计算服务时先部署支持视频派生的新 Worker B，并排空旧 Worker B 的在途任务、停止旧进程，再启动会自动派生的新 A。旧 A 的通用媒体基础命令可由新 B 继续执行。旧 B 若先收到 `video.derivatives`，会以 `CAPABILITY_UNAVAILABLE` 结束该次派生，已登记原件仍可读取和下载。计算未启用时，新视频上传仍可登记、读取和下载，派生状态为 disabled。真实 COS 的 HLS 读取与浏览器跨域条件见[私有 HLS 存储契约](integrations/cos.md#私有-hls-读取)。
+
 [语音任务和音色](apis/audio.md)沿供应商库迁移。认证和供应商启用后可读取本地音色库。执行配音及复刻还需具备资产库、私有 COS 和包含音频队列的计算服务配置。启用前预览供应商和会话迁移，备份实际的供应商与资产库，并在隔离现场恢复和重跑。先完成两域结构，再为确认过的本人模型受控导入语音路由和登记音色。已有音色和成功作品继续按原引用查询，待处理任务按原输出检查点恢复。
 
 语音回归使用隔离的模型、音色、COS 协议替身和测试队列。开发环境的真实验证可以用本机私有旁库和临时 vhost 限定一名测试用户，并沿用其现成供应商配置和私有 COS。用可识别的最小测试任务记录实际供应商提交次数和回执，断线继续原任务，发布后通过原 assetId 重新签发地址。上游操作范围、音色导入和回退边界分别见[供应商配置](providers.md)和[语音 PRD](tasks/onelink-audio-generation/prd.md#53-验证启用与回退)。

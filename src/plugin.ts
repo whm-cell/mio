@@ -52,6 +52,7 @@ import { createAudioJobService } from './audio/jobs/service.ts';
 import type { AudioJobService } from './audio/jobs/service.ts';
 import { createAudioMediaClient } from './audio/media.ts';
 import { createAssetService } from './assets/service.ts';
+import { startAssetDerivatives } from './assets/derivatives.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
 import { readComputeConfig } from './compute/config.ts';
@@ -202,6 +203,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let generations: GenerationService | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
     let audio: AudioJobService | undefined;
     let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
@@ -223,7 +225,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     };
     const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
     if (assetConfig) {
-      const store = await createAssetStore(assetConfig.databaseURL);
+      const store = await createAssetStore(assetConfig.databaseURL, Boolean(computeConfig));
       try {
         const objects = createCosStorage(assetConfig);
         assetResources = { store, objects };
@@ -237,6 +239,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => conversations?.close(),
               () => materials?.close(),
               () => audio?.close(),
+              () => derivatives?.close(),
               () => acquired.close(),
             ),
         );
@@ -287,7 +290,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       let media: ReturnType<typeof createMediaService> | undefined;
       try {
         const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
-        ctx.effect(() => () => acquired.close());
+        derivatives = startAssetDerivatives(assetResources.store, acquired);
+        ctx.effect(() => () => {
+          const scheduler = derivatives?.close();
+          return closeMioResources(
+            () => acquired.close(),
+            () => scheduler,
+          );
+        });
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -296,7 +306,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
-        await (media ? media.close() : store.close());
+        const scheduler = derivatives?.close();
+        await closeMioResources(
+          () => (media ? media.close() : store.close()),
+          () => scheduler,
+        );
         throw error;
       }
     }

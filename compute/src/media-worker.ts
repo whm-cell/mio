@@ -2,7 +2,7 @@ import { MEDIA_VERSION } from '@mio/compute-contracts';
 import { createId } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
 import {
-  MEDIA_CORE_OPERATIONS,
+  MEDIA_AVAILABLE_OPERATIONS,
   mediaObjectPrefix,
   mediaResourceClass,
   parseMediaCommand,
@@ -167,7 +167,10 @@ export class MediaWorker {
         await this.#recover(attempt);
       } else if (!terminal(attempt.phase) && this.#journal.cancelled(command.attemptId)) {
         this.#transition(attempt, 'cancelled', { state: 'cancelled' });
-      } else if (!terminal(attempt.phase) && !MEDIA_CORE_OPERATIONS.includes(command.operation)) {
+      } else if (
+        !terminal(attempt.phase) &&
+        !MEDIA_AVAILABLE_OPERATIONS.includes(command.operation)
+      ) {
         this.#transition(attempt, 'failed', {
           state: 'failed',
           errorCode: 'CAPABILITY_UNAVAILABLE',
@@ -415,7 +418,9 @@ export class MediaWorker {
       };
       const process = new MediaProcessAdapter(files, this.#journal, attempt, signal, progress);
       attempt.result = await this.#executor(attempt.command, {
-        run: (step) => process.run(step),
+        run: (step, discoverOutputs) => process.run(step, discoverOutputs),
+        read: (name, maxBytes) => files.read(name, maxBytes),
+        write: (name, value) => files.write(name, value),
       });
       signal.throwIfAborted();
       attempt.phase = 'output_ready';

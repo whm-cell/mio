@@ -5,6 +5,7 @@ import { MEDIA_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
 import type { AssetPrincipal } from '../assets/contracts.ts';
 import { readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import { HLS_PLAYLIST_CONTENT_TYPE } from './media-hls.ts';
 import { MediaError } from './media-model.ts';
 import { ComputeError } from './errors.ts';
 import type { createMediaService } from './media-service.ts';
@@ -32,14 +33,17 @@ export function createMediaHandler(
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       if (url.search) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       const match =
-        /^\/api\/v1\/compute\/media(?:\/([a-f0-9-]+)(?:\/(cancel|retry|recover))?)?$/.exec(
+        /^\/api\/v1\/compute\/media(?:\/([a-f0-9-]+)(?:\/(cancel|retry|recover|hls)(?:\/([a-f0-9-]+))?)?)?$/.exec(
           url.pathname,
         );
       if (!match || (match[1] && !isUuidV4(match[1])))
         return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      const [, id, action] = match;
+      const [, id, action, assetId] = match;
+      if (assetId && (action !== 'hls' || !isUuidV4(assetId)))
+        return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const collection = !id;
-      const methods = collection ? 'GET, POST' : action ? 'POST' : 'GET';
+      const hls = action === 'hls';
+      const methods = collection ? 'GET, POST' : action && !hls ? 'POST' : 'GET';
       if (request.method === 'OPTIONS') {
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
         response
@@ -62,6 +66,11 @@ export function createMediaHandler(
       if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
       let actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+      if (hls) {
+        const text = await service.hls(actor, id!, assetId);
+        response.writeHead(HTTP_STATUS.OK, { 'content-type': HLS_PLAYLIST_CONTENT_TYPE }).end(text);
+        return;
+      }
       let result: unknown;
       let status: number = HTTP_STATUS.OK;
       if (write) {

@@ -2,7 +2,11 @@ import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MAX_ASSET_BYTES } from '../assets/contracts.ts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
-import { MEDIA_CORE_OPERATIONS, parseMediaRequest, parseMediaResult } from '@mio/compute-contracts';
+import {
+  MEDIA_AVAILABLE_OPERATIONS,
+  parseMediaRequest,
+  parseMediaResult,
+} from '@mio/compute-contracts';
 import type { MediaInputSnapshot, MediaManifest, MediaResult } from '@mio/compute-contracts';
 import type { ComputeConfig } from './config.ts';
 import { MediaError, mediaRequestHash } from './media-model.ts';
@@ -11,6 +15,7 @@ import type { MediaStore } from './media-store.ts';
 import { mediaDispatch } from './media-dispatch.ts';
 import { mediaHead } from './media-objects.ts';
 import { verifyMediaManifest } from './media-manifest.ts';
+import { mediaHls } from './media-hls.ts';
 
 export function createMediaService(
   store: MediaStore,
@@ -98,7 +103,7 @@ export function createMediaService(
         } catch {
           throw new MediaError(HTTP_STATUS.BAD_REQUEST, 'MEDIA_INPUT_INVALID');
         }
-        if (!MEDIA_CORE_OPERATIONS.includes(request.operation))
+        if (!MEDIA_AVAILABLE_OPERATIONS.includes(request.operation))
           throw new MediaError(HTTP_STATUS.BAD_REQUEST, 'MEDIA_OPERATION_UNAVAILABLE');
         const previous = await store.request(actor.userId, request.requestId);
         if (previous) {
@@ -141,6 +146,22 @@ export function createMediaService(
     },
     get(actor: AssetPrincipal, id: string) {
       return admit(() => owned(actor, id));
+    },
+    hls(actor: AssetPrincipal, id: string, assetId?: string) {
+      return admit((signal) => {
+        const sign = objects.hlsSegmentUrl;
+        if (!sign)
+          throw new MediaError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
+        return mediaHls(
+          store,
+          objects,
+          (key, expiresIn) => sign.call(objects, key, expiresIn),
+          actor.userId,
+          id,
+          assetId,
+          signal,
+        );
+      });
     },
     list(actor: AssetPrincipal) {
       return admit(async () => ({

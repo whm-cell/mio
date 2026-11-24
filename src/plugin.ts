@@ -550,6 +550,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     createVideo: (actor, request) =>
                       videoGenerations.create(actor, request).then((result) => result.job),
                     getVideo: (actor, jobId) => videoGenerations.get(actor, jobId),
+                    recoverVideo: (actor, jobId) => videoGenerations.recover(actor, jobId),
                   }
                 : undefined;
             const ownedConversations =

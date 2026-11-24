@@ -26,6 +26,7 @@ interface VideoJobRow {
   query_attempt: number;
   async_max_queries: number | null;
   async_deadline: Date | null;
+  checkpoint: { videos?: unknown; cleaned?: boolean } | null;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -85,6 +86,31 @@ export class VideoGenerationStore {
     return row ? { jobId: row.id, inputHash: row.input_hash } : undefined;
   }
 
+  async recover(ownerId: string, jobId: string): Promise<void> {
+    await transaction(this.pool, async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+      const result = await client.query<{ state: string; phase: string; checkpoint: unknown }>(
+        `SELECT j.state,e.phase,e.checkpoint FROM mio_video_jobs j
+         JOIN mio_video_executions e ON e.job_id=j.id
+         WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j,e`, [jobId, ownerId],
+      );
+      const row = result.rows[0];
+      if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
+      if (row.state === 'completed' || (row.state === 'materializing' && row.phase === 'materializing')) return;
+      const checkpoint = row.checkpoint as { videos?: unknown; cleaned?: boolean } | null;
+      if (row.state !== 'materialization_failed' || row.phase !== 'done' ||
+          !checkpoint || checkpoint.cleaned || !Array.isArray(checkpoint.videos) ||
+          checkpoint.videos.length < 1 || checkpoint.videos.length > 16)
+        throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
+      await capacity(client, ownerId);
+      await client.query(`UPDATE mio_video_executions SET phase='materializing',claim_id=NULL,
+        next_query_at=NULL,checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','0'::jsonb),updated_at=now()
+        WHERE job_id=$1`, [jobId]);
+      await client.query(`UPDATE mio_video_jobs SET state='materializing',error_code=NULL,
+        completed_at=NULL,updated_at=now() WHERE id=$1`, [jobId]);
+    });
+  }
+
   async create(
     ownerId: string,
     request: VideoCreateRequest,
@@ -134,7 +160,7 @@ export class VideoGenerationStore {
       await this.pool.query<VideoJobRow>(
         `SELECT j.id,j.request_id,j.command,j.state,j.error_code,
           j.cancellation_requested,j.cancellation_supported,j.cancellation_status,
-          e.phase,e.upstream_task_id,e.query_attempt,e.async_max_queries,e.async_deadline,
+          e.phase,e.upstream_task_id,e.query_attempt,e.async_max_queries,e.async_deadline,e.checkpoint,
           j.created_at,j.updated_at,j.completed_at,
           COALESCE((
             SELECT jsonb_agg(jsonb_build_object(
@@ -151,9 +177,9 @@ export class VideoGenerationStore {
     ).rows[0];
     if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
     const request = row.command.request;
-    const recoverable = Boolean(
-      row.upstream_task_id && row.async_deadline && row.async_max_queries,
-    );
+    const recoverable = row.state === 'materialization_failed' && row.phase === 'done' &&
+      !row.checkpoint?.cleaned && Array.isArray(row.checkpoint?.videos) &&
+      row.checkpoint.videos.length > 0 && row.checkpoint.videos.length <= 16;
     return {
       id: row.id,
       requestId: row.request_id,
@@ -186,12 +212,8 @@ export class VideoGenerationStore {
         status: row.cancellation_status,
       },
       recovery: {
-        available: recoverable && row.query_attempt < row.async_max_queries!,
-        reason: recoverable
-          ? row.query_attempt < row.async_max_queries!
-            ? null
-            : 'QUERY_BUDGET_EXHAUSTED'
-          : 'NO_SAFE_UPSTREAM_ID',
+        available: recoverable,
+        reason: recoverable ? null : 'NO_RECOVERABLE_RESULT',
       },
     };
   }

@@ -223,6 +223,15 @@ export function createVideoGenerationService(
         return store.get(actor.userId, jobId);
       });
     },
+    recover(actor: Pick<ProviderPrincipal, 'userId'>, jobId: string) {
+      return admit(async () => {
+        if (!isUuidV4(jobId)) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
+        if (!executor) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+        await store.recover(actor.userId, jobId);
+        executor.wake();
+        return store.get(actor.userId, jobId);
+      });
+    },
     list(actor: Pick<ProviderPrincipal, 'userId'>, limit: number, cursor?: string) {
       return admit(async () => {
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)

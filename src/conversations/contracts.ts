@@ -194,6 +194,7 @@ export interface ConversationVideoTools {
   capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
   createVideo(actor: { userId: string }, request: VideoCreateRequest): Promise<VideoJobView>;
   getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
+  recoverVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
 }
 export type HistoryItem =
   | {

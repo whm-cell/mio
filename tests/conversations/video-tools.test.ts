@@ -108,7 +108,9 @@ function bridge(): ConversationVideoTools {
         vendor: 'Volcengine',
         available: true,
         unavailableReason: null,
-        supportedModes: [{ mode: 'text_to_video' as const, supported: true }],
+        supportedModes: [
+          { mode: 'text_to_video' as const, supported: true, parameters: { duration: [5] } },
+        ],
       },
       {
         modelRef: 'onelink:model:pending-model',
@@ -123,6 +125,7 @@ function bridge(): ConversationVideoTools {
     capabilities: vi.fn(async () => caps()),
     createVideo: vi.fn(async () => job()),
     getVideo: vi.fn(async () => job('completed')),
+    recoverVideo: vi.fn(async () => job('processing')),
   };
 }
 
@@ -132,6 +135,7 @@ it('registers the current-user video tools and exposes unavailable models withou
   expect([...definitions.keys()]).toEqual([
     'list_video_models',
     'submit_video_job',
+    'recover_video_job',
     'get_video_job',
   ]);
   for (const definition of definitions.values()) {
@@ -140,8 +144,14 @@ it('registers the current-user video tools and exposes unavailable models withou
 
   const list = definitions.get('list_video_models')!;
   const result = (await list.execute({}, exec())) as {
-    models: { modelRef: string; available: boolean; unavailableReason: string | null }[];
+    models: {
+      modelRef: string;
+      available: boolean;
+      unavailableReason: string | null;
+      supportedModes: unknown[];
+    }[];
   };
+  expect(result.models[0]!.supportedModes).toEqual([{ mode: 'text_to_video', supported: true }]);
   expect(
     result.models.map(({ modelRef, available, unavailableReason }) => ({
       modelRef,
@@ -157,6 +167,9 @@ it('registers the current-user video tools and exposes unavailable models withou
     },
   ]);
   expect(service.listModels).toHaveBeenCalledWith({ userId: USER_ID });
+  const recovered = await definitions.get('recover_video_job')!.execute({ jobId: JOB_ID }, exec());
+  expect(recovered).toMatchObject({ jobId: JOB_ID, status: 'processing' });
+  expect(service.recoverVideo).toHaveBeenCalledWith({ userId: USER_ID }, JOB_ID);
   await expect(list.execute({ extra: true }, exec())).rejects.toBeInstanceOf(ToolArgsError);
 });
 

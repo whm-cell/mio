@@ -129,6 +129,21 @@ async function fixture() {
 }
 
 describe('durable video execution', () => {
+  it('recovers an owner result from the checkpoint without submitting another video', async () => {
+    const f = await fixture();
+    await f.run(await f.next());
+    f.materialize.mockRejectedValueOnce(new Error('temporary storage error'));
+    await f.run(await f.next());
+    await f.pool.query("UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','3'::jsonb) WHERE job_id=$1", [f.job.jobId]);
+    await f.run(await f.next());
+    expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('materialization_failed');
+    await expect(f.store.recover('another-owner', f.job.jobId)).rejects.toMatchObject({ code: 'JOB_NOT_FOUND' });
+    await Promise.all([f.store.recover(f.actor.userId, f.job.jobId), f.store.recover(f.actor.userId, f.job.jobId)]);
+    await f.run(await f.next());
+    expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('completed');
+    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+    await f.store.recover(f.actor.userId, f.job.jobId);
+  });
   it('submits once, retains its upstream identity, and atomically registers the owner video asset', async () => {
     const f = await fixture();
     await f.run(await f.next());

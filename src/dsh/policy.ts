@@ -10,6 +10,7 @@ const ALLOWED_CONVERSATION_TOOLS = [
   'list_video_models',
   'submit_video_job',
   'get_video_job',
+  'recover_video_job',
 ] as const;
 
 const MAX_TOOL_CALLS_PER_TURN = 12;
@@ -60,7 +61,7 @@ export function authorizeConversationTools(
   const allowed = new Set<string>([
     ...(options.imageGeneration ? ['list_image_models', 'submit_image_job', 'get_image_job'] : []),
     ...(options.imageInspection ? ['inspect_image_asset'] : []),
-    ...(options.videoGeneration ? ['list_video_models', 'submit_video_job', 'get_video_job'] : []),
+    ...(options.videoGeneration ? ['list_video_models', 'submit_video_job', 'get_video_job', 'recover_video_job'] : []),
   ]);
   const grant: TurnToolGrant = {
     active: true,

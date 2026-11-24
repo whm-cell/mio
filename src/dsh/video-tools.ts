@@ -266,7 +266,7 @@ export function registerConversationVideoTools(
               ...model,
               supportedModes: model.supportedModes.filter(
                 (entry) => typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
-              ),
+              ).map(({ mode, supported }) => ({ mode, supported })),
             })) };
           } catch (error) {
             return sanitizedError(error);
@@ -341,6 +341,37 @@ export function registerConversationVideoTools(
             };
             const job = sanitizeVideoJob(await bridge.createVideo(actor, request));
             if (NON_TERMINAL_STATES.has(job.status)) submittedPendingJobs.add(job.jobId);
+            return job;
+          } catch (error) {
+            return sanitizedError(error);
+          }
+        },
+      }),
+    ),
+  );
+
+  agentCtx.tools.register(
+    closedParametersTool(
+      defineTool({
+        name: 'recover_video_job',
+        description: 'When the user requests recovery, resume saving a previous owner-scoped video job from its existing result. Never resubmits generation. Report the returned state and finish this turn.',
+        parameters: {
+          jobId: { type: 'string', required: true, description: 'The previous Mio video job UUID.' },
+        },
+        isConcurrencySafe: () => false,
+        output: {
+          schema: videoJobSchema,
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+          presentationMeta: (_args, value) => ({ kind: 'mio.video-job', tool: 'get_video_job', job: value }),
+        },
+        execute: async (args, exec) => {
+          assertAllowedArguments(args, GET_KEYS);
+          if (typeof args.jobId !== 'string' || !isUuidV4(args.jobId))
+            throw new HarnessError('MIO_VIDEO_TOOL_ERROR: JOB_NOT_FOUND', 'JOB_NOT_FOUND');
+          exec.signal.throwIfAborted();
+          try {
+            const job = sanitizeVideoJob(await bridge.recoverVideo(actor, args.jobId));
+            if (NON_TERMINAL_STATES.has(job.status)) polledPendingJobs.add(job.jobId);
             return job;
           } catch (error) {
             return sanitizedError(error);

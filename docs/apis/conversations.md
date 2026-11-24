@@ -62,7 +62,7 @@ BYOK 选模、一次绑定和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGUR
 
 视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
 
-视频执行配置就绪的会话还可在当前受控轮次内使用 `list_video_models`、`submit_video_job`、`get_video_job`。只读模型目录不代表完成生成；提交返回持久视频任务后应结束本轮，后续对话沿同一 jobId 查询。提交与查询卡片按严格 `mio.video-job` 白名单投影到 SSE 与持久历史；任务、资产和凭据归当前用户，模型不能指定 owner。模型列表或请求失败详情不写成公开卡片。视频执行边界见[计算 HTTP](compute.md#post-apiv1computevideos)。
+视频执行配置就绪的会话还可在当前受控轮次内使用 `list_video_models`、`submit_video_job`、`get_video_job`、`recover_video_job`。用户要求找回保存失败的历史视频时，恢复工具仅对本人带结果检查点的任务重新执行物化，不重新提交生成；返回后结束本轮，后续轮次查询同一 jobId。已完成或正在恢复的任务返回当前状态；没有可恢复检查点时拒绝恢复。只读模型目录不代表完成生成；提交返回持久视频任务后应结束本轮。提交、查询和恢复卡片按严格 `mio.video-job` 白名单投影到 SSE 与持久历史；任务、资产和凭据归当前用户，模型不能指定 owner。模型列表或请求失败详情不写成公开卡片。视频执行边界见[计算 HTTP](compute.md#post-apiv1computevideos)。
 
 ## PUT /api/v1/conversations/:id/model
 

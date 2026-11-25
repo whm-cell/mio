@@ -19,6 +19,7 @@ import {
   rmSync,
   statfsSync,
 } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -120,13 +121,17 @@ export function removeProbeFile(directory: string, messageId: string): void {
   }
 }
 
-function directoryBytes(path: string): number {
+function directoryBytes(path: string, onFile?: (path: string, stat: Stats) => void): number {
   let size = 0;
   for (const entry of readdirSync(path)) {
     const child = join(path, entry);
     const stat = lstatSync(child);
     if (stat.isSymbolicLink()) throw new Error('WORK_DIRECTORY_SYMLINK');
-    size += stat.isDirectory() ? directoryBytes(child) : stat.size;
+    if (stat.isDirectory()) size += directoryBytes(child, onFile);
+    else {
+      size += stat.size;
+      if (onFile && stat.isFile()) onFile(child, stat);
+    }
   }
   return size;
 }
@@ -145,7 +150,7 @@ export function requireSpace(directory: string, incomingBytes = 0): void {
 export function requireProbeSpace(
   directory: string,
   expectedBytes: number,
-  pendingBytes: number,
+  activeDownloads: ReadonlyMap<string, number>,
 ): void {
   if (
     !Number.isSafeInteger(expectedBytes) ||
@@ -155,11 +160,22 @@ export function requireProbeSpace(
     throw new MediaError(
       expectedBytes > COMPUTE_MAX_MEDIA_BYTES ? 'SOURCE_TOO_LARGE' : 'SOURCE_INVALID',
     );
+  let unwrittenBytes = expectedBytes;
+  for (const bytes of activeDownloads.values()) unwrittenBytes += bytes;
+  let unallocatedBytes = unwrittenBytes;
+  const currentDirectoryBytes = directoryBytes(resolve(directory), (path, stat) => {
+    const reserved = activeDownloads.get(path);
+    if (reserved === undefined) return;
+    const written = Math.min(reserved, stat.size);
+    unwrittenBytes -= written;
+    // lstat reports allocated blocks in 512-byte units.
+    unallocatedBytes -= Math.min(written, stat.blocks * 512);
+  });
+  // Sample free space last so it reflects writes that raced with the walk.
   const fs = statfsSync(directory);
-  const incomingBytes = pendingBytes + expectedBytes;
   if (
-    directoryBytes(directory) + incomingBytes > MAX_DIRECTORY_BYTES ||
-    fs.bavail * fs.bsize < MIN_FREE_BYTES + incomingBytes
+    currentDirectoryBytes + unwrittenBytes > MAX_DIRECTORY_BYTES ||
+    fs.bavail * fs.bsize < MIN_FREE_BYTES + unallocatedBytes
   )
     throw new MediaError('DISK_FULL');
 }

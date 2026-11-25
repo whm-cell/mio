@@ -1,6 +1,9 @@
-import { ToolArgsError } from '@deepseek-ai/dsh-tools';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
+import Tools, { ToolArgsError } from '@deepseek-ai/dsh-tools';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
-import type { Context } from '@deepseek-ai/cordis';
 import { expect, it, vi } from 'vitest';
 import type {
   ConversationRun,
@@ -176,6 +179,7 @@ it('registers the current-user video tools and exposes unavailable models withou
 it('submits only a current text-to-video capability, then defers same-turn polling and supports later history reads', async () => {
   const service = bridge();
   const firstTurn = setup(service, run('turn-1'));
+  const submission = exec('call-submit-1');
   const submitted = (await firstTurn.get('submit_video_job')!.execute(
     {
       modelRef: MODEL_REF,
@@ -184,12 +188,13 @@ it('submits only a current text-to-video capability, then defers same-turn polli
       durationSeconds: 4,
       generateAudio: false,
     },
-    exec('call-submit-1'),
+    submission,
   )) as ConversationVideoJobView;
 
   expect(service.capabilities).toHaveBeenCalledWith({ userId: USER_ID }, MODEL_REF);
   expect(service.createVideo).toHaveBeenCalledTimes(1);
   const request = vi.mocked(service.createVideo).mock.calls[0]![1];
+  expect(vi.mocked(service.createVideo).mock.calls[0]![2]).toBe(submission.signal);
   expect(request).toMatchObject({
     modelRef: MODEL_REF,
     expectedCapabilitiesVersion: 'caps-v1',
@@ -242,6 +247,76 @@ it('submits only a current text-to-video capability, then defers same-turn polli
   });
   expect(service.getVideo).toHaveBeenLastCalledWith({ userId: USER_ID }, JOB_ID);
 });
+
+it.each(['tool policy', 'video capabilities', 'admission bridge'] as const)(
+  'honors real DSH turn cancellation during %s',
+  async (stage) => {
+    const ctx = new Context();
+    const service = bridge();
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const pause = async () => {
+      entered.resolve();
+      await resume.promise;
+    };
+    const controller = new AbortController();
+    let admissionSignal: AbortSignal | undefined;
+    try {
+      await ctx.plugin(SystemPrompt);
+      await ctx.plugin(Tools);
+      await ctx.plugin(NativeExecutor);
+      registerConversationVideoTools(ctx, run(), service);
+      if (stage === 'tool policy') {
+        ctx.on('tools/pre-execute', async () => {
+          await pause();
+          return { kind: 'allow' };
+        });
+      } else if (stage === 'video capabilities') {
+        vi.mocked(service.capabilities).mockImplementationOnce(async () => {
+          await pause();
+          return caps();
+        });
+      } else {
+        vi.mocked(service.createVideo).mockImplementationOnce(async (_actor, _request, signal) => {
+          admissionSignal = signal;
+          await pause();
+          signal?.throwIfAborted();
+          return job();
+        });
+      }
+
+      const pending = ctx.tools.execute({
+        calls: [
+          {
+            type: 'tool-call',
+            id: ToolCallId('cancel-video-submit'),
+            name: 'submit_video_job',
+            arguments: JSON.stringify({ modelRef: MODEL_REF, prompt: 'A quiet dawn' }),
+          },
+        ],
+        signal: controller.signal,
+      });
+      await Promise.race([
+        entered.promise,
+        pending.then(() => {
+          throw new Error('DSH tool settled before the cancellation barrier');
+        }),
+      ]);
+
+      controller.abort();
+      resume.resolve();
+      const result = (await pending).results[0]?.result;
+      expect(result?.isError).toBe(true);
+      expect(result?.meta).toBeUndefined();
+      expect(service.capabilities).toHaveBeenCalledTimes(stage === 'tool policy' ? 0 : 1);
+      expect(service.createVideo).toHaveBeenCalledTimes(stage === 'admission bridge' ? 1 : 0);
+      if (stage === 'admission bridge') expect(admissionSignal?.aborted).toBe(true);
+    } finally {
+      resume.resolve();
+      await ctx.fiber.dispose();
+    }
+  },
+);
 
 it('fails closed on unavailable modes, invalid parameters and forged presentation metadata', async () => {
   const unavailable = bridge();

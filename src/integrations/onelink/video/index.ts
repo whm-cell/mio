@@ -24,8 +24,14 @@ const KLING_QUERY_PATHS = new Set([
   '/kling/v1/videos/omni-video',
 ]);
 
-function queryPath(route: VideoRouteConfig, taskId: string): string | undefined {
-  if (route.driver === 'veo-videos') return operationPath(taskId);
+function queryTarget(
+  route: VideoRouteConfig,
+  taskId: string,
+): { path: string; expectedId: string } | undefined {
+  if (route.driver === 'veo-videos') {
+    const path = operationPath(taskId);
+    return path ? { path, expectedId: path } : undefined;
+  }
   if (route.driver === 'kling-videos') {
     try {
       const token: unknown = JSON.parse(taskId);
@@ -39,13 +45,16 @@ function queryPath(route: VideoRouteConfig, taskId: string): string | undefined 
         !TASK_ID.test(value.id)
       )
         return;
-      return value.path + '/' + encodeURIComponent(value.id);
+      return { path: value.path + '/' + encodeURIComponent(value.id), expectedId: value.id };
     } catch {
       return;
     }
   }
   if (!TASK_ID.test(taskId)) return;
-  return route.queryPathTemplate.replace('{task_id}', encodeURIComponent(taskId));
+  return {
+    path: route.queryPathTemplate.replace('{task_id}', encodeURIComponent(taskId)),
+    expectedId: taskId,
+  };
 }
 
 function rejection(status: number): string {
@@ -103,11 +112,11 @@ export function createVideoProtocol(
       }
     },
     async query(taskId, key, signal): Promise<VideoQueryResult> {
-      const path = queryPath(validated, taskId);
-      if (!path) return { state: 'failed', code: 'VIDEO_TASK_INVALID' };
+      const target = queryTarget(validated, taskId);
+      if (!target) return { state: 'failed', code: 'VIDEO_TASK_INVALID' };
       try {
         signal.throwIfAborted();
-        const response = await transport(endpoint(path), {
+        const response = await transport(endpoint(target.path), {
           method: 'GET',
           redirect: 'error',
           signal,
@@ -119,7 +128,7 @@ export function createVideoProtocol(
             return { state: 'processing' };
           return { state: 'failed', code: rejection(response.status) };
         }
-        return videoQueryResult(validated.driver, await readJson(response));
+        return videoQueryResult(validated.driver, await readJson(response), target.expectedId);
       } catch {
         return { state: 'processing' };
       }

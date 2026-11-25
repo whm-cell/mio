@@ -4,6 +4,22 @@ import { object, operationPath, resultUrls, TASK_ID, ONELINK_ORIGIN } from './sh
 
 const invalid: VideoQueryResult = { state: 'failed', code: 'VIDEO_RESPONSE_INVALID' };
 const failed: VideoQueryResult = { state: 'failed', code: 'VIDEO_UPSTREAM_FAILED' };
+const identityInvalid: VideoQueryResult = {
+  state: 'unknown',
+  code: 'VIDEO_QUERY_IDENTITY_INVALID',
+};
+const KLING_TASK_FIELDS = [
+  'task_id',
+  'task_status',
+  'task_status_msg',
+  'task_info',
+  'task_result',
+  'watermark_info',
+  'final_unit_deduction',
+  'final_balance_deduction',
+  'created_at',
+  'updated_at',
+];
 
 export function submissionTask(
   driver: VideoDriver,
@@ -27,8 +43,18 @@ function returned(values: unknown[]): VideoQueryResult {
   return videos ? { state: 'returned', videos } : invalid;
 }
 
-function ark(data: Record<string, unknown>): VideoQueryResult {
-  const task = typeof data.status === 'string' ? data : object(data.data);
+function identityConflicts(expectedId: string, ids: unknown[]): boolean {
+  return ids.some((id) => id !== undefined && id !== expectedId);
+}
+
+function ark(data: Record<string, unknown>, expectedId: string): VideoQueryResult {
+  const inner = object(data.data);
+  const task = typeof data.status === 'string' ? data : inner;
+  if (
+    (task.id ?? task.task_id) !== expectedId ||
+    identityConflicts(expectedId, [data.id, data.task_id, inner.id, inner.task_id])
+  )
+    return identityInvalid;
   if (['queued', 'pending', 'running', 'processing'].includes(String(task.status)))
     return { state: 'processing' };
   if (['failed', 'cancelled', 'canceled', 'expired'].includes(String(task.status))) return failed;
@@ -36,9 +62,20 @@ function ark(data: Record<string, unknown>): VideoQueryResult {
   return returned([object(task.content).video_url]);
 }
 
-function kling(data: Record<string, unknown>): VideoQueryResult {
-  if (data.code !== 0) return failed;
+function kling(data: Record<string, unknown>, expectedId: string): VideoQueryResult {
   const task = object(data.data);
+  const { code, task_id: envelopeId } = data;
+  const hasTask = KLING_TASK_FIELDS.some(
+    (field) =>
+      Object.hasOwn(task, field) || (field.startsWith('task_') && Object.hasOwn(data, field)),
+  );
+  if (
+    ((code === 0 || hasTask) && task.task_id !== expectedId) ||
+    (envelopeId !== undefined && envelopeId !== expectedId)
+  )
+    return identityInvalid;
+  if (!Number.isInteger(code)) return invalid;
+  if (code !== 0) return failed;
   if (['submitted', 'processing', 'running'].includes(String(task.task_status)))
     return { state: 'processing' };
   if (['failed', 'cancelled', 'canceled'].includes(String(task.task_status))) return failed;
@@ -47,7 +84,9 @@ function kling(data: Record<string, unknown>): VideoQueryResult {
   return Array.isArray(videos) ? returned(videos.map((video) => object(video).url)) : invalid;
 }
 
-function vidu(data: Record<string, unknown>): VideoQueryResult {
+function vidu(data: Record<string, unknown>, expectedId: string): VideoQueryResult {
+  // Vidu may omit the task ID. IDs inside creations are scoped to the output.
+  if (identityConflicts(expectedId, [data.id, data.task_id])) return identityInvalid;
   if (['created', 'queueing', 'queued', 'processing', 'running'].includes(String(data.state)))
     return { state: 'processing' };
   if (['failed', 'cancelled', 'canceled'].includes(String(data.state))) return failed;
@@ -57,15 +96,17 @@ function vidu(data: Record<string, unknown>): VideoQueryResult {
   );
 }
 
-function happyhorse(data: Record<string, unknown>): VideoQueryResult {
+function happyhorse(data: Record<string, unknown>, expectedId: string): VideoQueryResult {
   const output = object(data.output);
-  const status = output.task_status ?? data.task_status;
-  if (['PENDING', 'RUNNING', 'QUEUED', 'PROCESSING'].includes(String(status).toUpperCase()))
+  const task = output.task_status === undefined || output.task_status === null ? data : output;
+  if (task.task_id !== expectedId || identityConflicts(expectedId, [output.task_id, data.task_id]))
+    return identityInvalid;
+  const status = String(task.task_status).toUpperCase();
+  if (['PENDING', 'RUNNING', 'QUEUED', 'PROCESSING'].includes(status))
     return { state: 'processing' };
-  if (['FAILED', 'CANCELED', 'CANCELLED', 'UNKNOWN'].includes(String(status).toUpperCase()))
-    return failed;
-  if (String(status).toUpperCase() !== 'SUCCEEDED') return invalid;
-  return returned([output.video_url ?? data.video_url]);
+  if (['FAILED', 'CANCELED', 'CANCELLED', 'UNKNOWN'].includes(status)) return failed;
+  if (status !== 'SUCCEEDED') return invalid;
+  return returned([task.video_url]);
 }
 
 function veo(data: Record<string, unknown>): VideoQueryResult {
@@ -101,10 +142,11 @@ function veo(data: Record<string, unknown>): VideoQueryResult {
 export function videoQueryResult(
   driver: VideoDriver,
   data: Record<string, unknown>,
+  expectedId: string,
 ): VideoQueryResult {
-  if (driver === 'volcengine-ark-videos') return ark(data);
-  if (driver === 'kling-videos') return kling(data);
-  if (driver === 'vidu-videos') return vidu(data);
+  if (driver === 'volcengine-ark-videos') return ark(data, expectedId);
+  if (driver === 'kling-videos') return kling(data, expectedId);
+  if (driver === 'vidu-videos') return vidu(data, expectedId);
   if (driver === 'veo-videos') return veo(data);
-  return happyhorse(data);
+  return happyhorse(data, expectedId);
 }

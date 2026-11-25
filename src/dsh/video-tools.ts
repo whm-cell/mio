@@ -313,6 +313,7 @@ export function registerConversationVideoTools(
           exec.signal.throwIfAborted();
           try {
             const capabilities = await bridge.capabilities(actor, args.modelRef);
+            exec.signal.throwIfAborted();
             if (!capabilities.available) throw new ApplicationError('VIDEO_UNAVAILABLE');
             if (
               !capabilities.modes.some((entry) => entry.mode === 'text_to_video' && entry.supported)
@@ -334,10 +335,11 @@ export function registerConversationVideoTools(
                 ...(args.watermark !== undefined ? { watermark: args.watermark } : {}),
               },
             };
-            const job = sanitizeVideoJob(await bridge.createVideo(actor, request));
+            const job = sanitizeVideoJob(await bridge.createVideo(actor, request, exec.signal));
             if (NON_TERMINAL_STATES.has(job.status)) submittedPendingJobs.add(job.jobId);
             return job;
           } catch (error) {
+            exec.signal.throwIfAborted();
             return sanitizedMediaToolError(error, 'video');
           }
         },

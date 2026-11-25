@@ -4,12 +4,12 @@ import { createId } from '@mio/foundation/identifiers';
 import { GenerationError } from '../errors.ts';
 import { transaction } from '../transaction.ts';
 import { VideoExecutionStore } from './execution-store.ts';
+import { VIDEO_QUOTA_LOCK } from './execution.ts';
 import type { VideoJobCommand } from './execution.ts';
 export type { VideoJobCommand } from './execution.ts';
 import { VIDEO_GLOBAL_QUOTA, VIDEO_USER_QUOTA } from './contracts.ts';
 import type { VideoCreateRequest, VideoJobView } from './contracts.ts';
 
-const VIDEO_QUOTA_LOCK = 672049926;
 const ACTIVE_STATES = "'accepted','submitted','processing','materializing'";
 
 interface VideoJobRow {
@@ -69,7 +69,7 @@ export class VideoGenerationStore {
 
   constructor(pool: Pool) {
     this.pool = pool;
-    this.execution = new VideoExecutionStore(pool);
+    this.execution = new VideoExecutionStore(pool, capacity);
   }
 
   executorStore() {
@@ -136,40 +136,49 @@ export class VideoGenerationStore {
     admitted: Record<string, unknown>,
     snapshot: Record<string, unknown>,
     routeSnapshot: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{ jobId: string; created: boolean }> {
-    return transaction(this.pool, async (client) => {
-      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
-      const existing = await client.query<{ id: string; input_hash: string }>(
-        'SELECT id,input_hash FROM mio_video_jobs WHERE owner_id=$1 AND request_id=$2',
-        [ownerId, request.requestId],
-      );
-      if (existing.rows[0]) {
-        if (existing.rows[0].input_hash !== inputHash)
-          throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
-        return { jobId: existing.rows[0].id, created: false };
-      }
-      await capacity(client, ownerId);
-      const jobId = createId();
-      await client.query(
-        `INSERT INTO mio_video_jobs
+    return transaction(
+      this.pool,
+      async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+        signal?.throwIfAborted();
+        const existing = await client.query<{ id: string; input_hash: string }>(
+          'SELECT id,input_hash FROM mio_video_jobs WHERE owner_id=$1 AND request_id=$2',
+          [ownerId, request.requestId],
+        );
+        signal?.throwIfAborted();
+        if (existing.rows[0]) {
+          if (existing.rows[0].input_hash !== inputHash)
+            throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
+          return { jobId: existing.rows[0].id, created: false };
+        }
+        await capacity(client, ownerId);
+        signal?.throwIfAborted();
+        const jobId = createId();
+        await client.query(
+          `INSERT INTO mio_video_jobs
           (id,owner_id,request_id,input_hash,command,admitted,route_snapshot,state)
          VALUES($1,$2,$3,$4,$5,$6,$7,'accepted')`,
-        [
-          jobId,
-          ownerId,
-          request.requestId,
-          inputHash,
-          JSON.stringify(command),
-          JSON.stringify(admitted),
-          JSON.stringify(routeSnapshot),
-        ],
-      );
-      await client.query(
-        "INSERT INTO mio_video_executions(job_id,phase,snapshot) VALUES($1,'ready',$2)",
-        [jobId, JSON.stringify(snapshot)],
-      );
-      return { jobId, created: true };
-    });
+          [
+            jobId,
+            ownerId,
+            request.requestId,
+            inputHash,
+            JSON.stringify(command),
+            JSON.stringify(admitted),
+            JSON.stringify(routeSnapshot),
+          ],
+        );
+        signal?.throwIfAborted();
+        await client.query(
+          "INSERT INTO mio_video_executions(job_id,phase,snapshot) VALUES($1,'ready',$2)",
+          [jobId, JSON.stringify(snapshot)],
+        );
+        return { jobId, created: true };
+      },
+      signal,
+    );
   }
 
   async get(ownerId: string, jobId: string): Promise<VideoJobView> {

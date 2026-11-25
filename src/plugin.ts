@@ -608,6 +608,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                   row.command.inputObjects,
                 ),
             },
+            generationConfig.dataDirectory,
           );
         }
         const admission = createVideoGenerationService(
@@ -754,8 +755,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     },
                     capabilities: (actor, modelRef) =>
                       videoGenerations.capabilities(actor, modelRef),
-                    createVideo: (actor, request) =>
-                      videoGenerations.create(actor, request).then((result) => result.job),
+                    createVideo: (actor, request, signal) =>
+                      videoGenerations.create(actor, request, signal).then((result) => result.job),
                     getVideo: (actor, jobId) => videoGenerations.get(actor, jobId),
                     recoverVideo: (actor, jobId) => videoGenerations.recover(actor, jobId),
                   }

@@ -4,11 +4,15 @@ import type { Pool, PoolClient } from 'pg';
 export async function transaction<T>(
   pool: Pool,
   run: (client: PoolClient) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    signal?.throwIfAborted();
     const result = await run(client);
+    // Once COMMIT is sent, PostgreSQL decides whether the durable job exists.
+    signal?.throwIfAborted();
     await client.query('COMMIT');
     return result;
   } catch (error) {

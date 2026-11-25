@@ -1,13 +1,21 @@
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
+import { GenerationError } from '../errors.ts';
 import { transaction } from '../transaction.ts';
 import type { VideoJobState } from './contracts.ts';
-import type { VideoExecution, VideoMaterializedOutput, VideoResultSource } from './execution.ts';
+import type {
+  VideoExecution,
+  VideoMaterializedOutput,
+  VideoResultSource,
+  VideoSubmissionDisposition,
+  VideoSubmissionReceipt,
+} from './execution.ts';
 import {
   VIDEO_EXECUTOR_MAX_AGE_SECONDS,
   VIDEO_EXECUTOR_MAX_QUERIES,
   VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VIDEO_QUOTA_LOCK,
 } from './execution.ts';
 
 const EXECUTOR_LOCK = 672049927;
@@ -20,11 +28,12 @@ const selection = `SELECT j.id,j.owner_id,j.state,j.command,j.admitted,j.route_s
 export class VideoExecutionStore {
   private executor: PoolClient | undefined;
   private executorFailure: (() => void) | undefined;
-
   private readonly pool: Pool;
+  private readonly capacity: (client: PoolClient, ownerId: string) => Promise<void>;
 
-  constructor(pool: Pool) {
+  constructor(pool: Pool, capacity: (client: PoolClient, ownerId: string) => Promise<void>) {
     this.pool = pool;
+    this.capacity = capacity;
   }
 
   async startExecutor(onLost: () => void): Promise<void> {
@@ -125,21 +134,89 @@ export class VideoExecutionStore {
     );
   }
 
-  async submitted(row: VideoExecution, taskId: string): Promise<void> {
-    await transaction(this.pool, async (client) => {
-      const changed = await client.query(
-        `UPDATE mio_video_executions
-        SET phase='waiting',claim_id=NULL,upstream_task_id=$3,
-        next_query_at=statement_timestamp()+$4*interval '1 millisecond',updated_at=now()
-        WHERE job_id=$1 AND claim_id=$2 AND phase='submitting' RETURNING job_id`,
-        [row.id, row.claim_id, taskId, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
+  async receive(
+    receipt: VideoSubmissionReceipt,
+    canReplay: boolean,
+  ): Promise<VideoSubmissionDisposition> {
+    return transaction(this.pool, async (client) => {
+      // Match the admission lock order before touching either job row.
+      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+      const execution = (
+        await client.query<{
+          phase: VideoExecution['phase'];
+          upstream_task_id: string | null;
+          has_intent: boolean;
+          can_query: boolean | null;
+        }>(
+          `SELECT phase,upstream_task_id,
+            (checkpoint IS NULL AND async_max_queries IS NOT NULL AND async_deadline IS NOT NULL)
+              AS has_intent,
+            (query_attempt<async_max_queries AND async_deadline>statement_timestamp()) AS can_query
+           FROM mio_video_executions WHERE job_id=$1 FOR UPDATE`,
+          [receipt.jobId],
+        )
+      ).rows[0];
+      if (!execution) return 'ineligible';
+      const job = (
+        await client.query<{ state: VideoJobState; error_code: string | null }>(
+          `SELECT state,error_code FROM mio_video_jobs
+           WHERE id=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE`,
+          [receipt.jobId, receipt.ownerId, receipt.requestId],
+        )
+      ).rows[0];
+      if (!job) return 'ineligible';
+      const submitting = execution.phase === 'submitting' && job.state === 'accepted';
+      const submissionUnknown =
+        execution.phase === 'done' &&
+        job.state === 'unknown' &&
+        job.error_code === 'VIDEO_SUBMISSION_UNKNOWN';
+      let canQuery = execution.can_query === true;
+      if (execution.upstream_task_id !== null) {
+        if (execution.upstream_task_id !== receipt.upstreamTaskId) return 'ineligible';
+        // A volatile fallback may have logged the ID while the published file was still unsynced.
+        if (!(canReplay && submissionUnknown && execution.has_intent && canQuery))
+          return 'confirmed';
+      }
+      if (!execution.has_intent || (!submitting && !submissionUnknown)) return 'ineligible';
+      if (canQuery && submissionUnknown) {
+        try {
+          await this.capacity(client, receipt.ownerId);
+        } catch (error) {
+          if (!(error instanceof GenerationError) || error.code !== 'VIDEO_QUOTA_EXCEEDED')
+            throw error;
+          if (canReplay) return 'deferred';
+          canQuery = false;
+        }
+      }
+      // Keep an expired ID or a volatile ID without quota for reconciliation only.
+      const changed = await client.query<{ phase: 'waiting' | 'done' }>(
+        `WITH recovery AS (
+           SELECT ($4::boolean AND async_deadline>statement_timestamp()) AS can_query
+           FROM mio_video_executions WHERE job_id=$1
+         )
+         UPDATE mio_video_executions e
+         SET phase=CASE WHEN recovery.can_query THEN 'waiting' ELSE 'done' END,
+           snapshot=CASE WHEN recovery.can_query THEN e.snapshot ELSE '{}'::jsonb END,
+           claim_id=NULL,upstream_task_id=$2,
+           next_query_at=CASE WHEN NOT recovery.can_query THEN NULL
+             WHEN e.phase='done' THEN statement_timestamp()
+             ELSE statement_timestamp()+$3*interval '1 millisecond' END,updated_at=now()
+         FROM recovery WHERE e.job_id=$1 RETURNING e.phase`,
+        [receipt.jobId, receipt.upstreamTaskId, VIDEO_EXECUTOR_QUERY_INTERVAL_MS, canQuery],
       );
-      if (changed.rowCount)
+      const waiting = changed.rows[0]!.phase === 'waiting';
+      if (waiting || submitting)
         await client.query(
-          `UPDATE mio_video_jobs
-        SET state='submitted',error_code=NULL,updated_at=now() WHERE id=$1`,
-          [row.id],
+          `UPDATE mio_video_jobs SET state=$2,error_code=$3,
+            completed_at=CASE WHEN $2='submitted' THEN NULL ELSE now() END,updated_at=now()
+           WHERE id=$1`,
+          [
+            receipt.jobId,
+            waiting ? 'submitted' : 'unknown',
+            waiting ? null : 'VIDEO_SUBMISSION_UNKNOWN',
+          ],
         );
+      return 'confirmed';
     });
   }
 

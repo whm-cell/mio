@@ -4,6 +4,7 @@ import type { VideoGenerationStore } from './store.ts';
 import type { VideoMaterializer } from './execution.ts';
 import { createVideoRunner } from './runner.ts';
 import type { VideoExecutorProvider, VideoTransports } from './runner.ts';
+import { VideoSubmissionReceipts } from './submission-receipts.ts';
 
 const log = createLogger('app', 'video-executor');
 const NETWORK_CONCURRENCY = 4;
@@ -14,16 +15,26 @@ export async function createVideoExecutor(
   provider: () => VideoExecutorProvider | undefined,
   materialize: VideoMaterializer,
   transports: VideoTransports,
+  dataDirectory: string,
 ) {
   const execution = store.executorStore();
+  const receipts = new VideoSubmissionReceipts(dataDirectory);
   let stopping = false;
   let closing: Promise<void> | undefined;
   let pumping: Promise<void> | undefined;
   let cleaning: Promise<void> | undefined;
+  let replaying: Promise<void> | undefined;
   let retryAt = 0;
   const stop = new AbortController();
   const active = new Set<Promise<void>>();
-  const run = createVideoRunner(execution, provider, materialize, stop.signal, transports);
+  const run = createVideoRunner(
+    execution,
+    provider,
+    materialize,
+    stop.signal,
+    transports,
+    receipts,
+  );
   const pump = () => {
     if (stopping || pumping || epochMs() < retryAt) return;
     pumping = (async () => {
@@ -82,13 +93,24 @@ export async function createVideoExecutor(
         cleaning = undefined;
       });
   };
+  const replay = () => {
+    if (stopping || replaying || epochMs() < retryAt) return;
+    replaying = receipts
+      .replay((receipt, canReplay) => execution.receive(receipt, canReplay), stop.signal)
+      .catch(() => log.error('VIDEO_SUBMISSION_RECONCILIATION_PENDING'))
+      .finally(() => {
+        replaying = undefined;
+      });
+  };
   const timer = setInterval(() => {
     pump();
     clean();
+    replay();
   }, 1000);
   timer.unref();
   pump();
   clean();
+  replay();
   return {
     wake() {
       setImmediate(pump);
@@ -101,8 +123,13 @@ export async function createVideoExecutor(
         closing = (async () => {
           await pumping;
           await cleaning;
+          await replaying;
           await Promise.allSettled([...active]);
-          await execution.close();
+          try {
+            await receipts.close();
+          } finally {
+            await execution.close();
+          }
         })();
       }
       return closing;

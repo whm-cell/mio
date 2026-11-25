@@ -11,6 +11,7 @@ import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
+import { VideoSubmissionReceipts } from '../../src/generations/video/submission-receipts.ts';
 import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
 import type { VideoExecution, VideoProtocol } from '../../src/generations/video/execution.ts';
@@ -346,6 +347,7 @@ it('recovers a lost copy acknowledgement to one owner asset in PostgreSQL after 
       throw new Error('lost copy acknowledgement');
     });
     const protocol = vi.fn<() => VideoProtocol>();
+    const receipts = new VideoSubmissionReceipts(f.directory);
     const signal = AbortSignal.timeout(5000);
     const due = async () => {
       await pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
@@ -353,7 +355,14 @@ it('recovers a lost copy acknowledgement to one owner asset in PostgreSQL after 
       ]);
       return (await execution.claim())!;
     };
-    await createVideoRunner(execution, () => undefined, f.run, signal, { protocol })(await due());
+    await createVideoRunner(
+      execution,
+      () => undefined,
+      f.run,
+      signal,
+      { protocol },
+      receipts,
+    )(await due());
     expect((await store.get(owner, jobId)).state).toBe('materializing');
     expect((await pool.query('SELECT count(*) FROM mio_assets')).rows[0].count).toBe('0');
     const receipt = JSON.parse(await readFile(join(f.directory, 'video', jobId, '0.json'), 'utf8'));
@@ -363,9 +372,14 @@ it('recovers a lost copy acknowledgement to one owner asset in PostgreSQL after 
     await unlink(join(f.directory, 'video', jobId, '0.media'));
     await execution.close();
     await execution.startExecutor(() => {});
-    await createVideoRunner(execution, () => undefined, f.start(), signal, { protocol })(
-      await due(),
-    );
+    await createVideoRunner(
+      execution,
+      () => undefined,
+      f.start(),
+      signal,
+      { protocol },
+      receipts,
+    )(await due());
     expect(await store.get(owner, jobId)).toMatchObject({
       state: 'completed',
       outputs: [{ assetId: receipt.assetId, status: 'registered' }],

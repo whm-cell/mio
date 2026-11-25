@@ -8,7 +8,10 @@ import type {
   VideoMaterializer,
   VideoProtocolFactory,
   VideoResultSource,
+  VideoSubmissionReceipt,
 } from './execution.ts';
+import { isVideoUpstreamTaskId } from './execution.ts';
+import type { VideoSubmissionReceipts } from './submission-receipts.ts';
 
 const log = createLogger('app', 'video-runner');
 
@@ -32,7 +35,10 @@ export function createVideoRunner(
   materialize: VideoMaterializer,
   stop: AbortSignal,
   transports: VideoTransports,
+  receipts: VideoSubmissionReceipts,
 ) {
+  const receive = (receipt: VideoSubmissionReceipt, canReplay: boolean) =>
+    store.receive(receipt, canReplay);
   const verify = async (row: VideoExecution) => {
     const admitted = row.admitted;
     if (
@@ -102,23 +108,32 @@ export function createVideoRunner(
       return;
     }
     const bounded = AbortSignal.any([stop, AbortSignal.timeout(180_000)]);
+    const route = row.route_snapshot;
+    const protocol = transports.protocol(route.route, route.modelId, async (url, options) => {
+      bounded.throwIfAborted();
+      return (transports.transport ?? fetch)(url, options);
+    });
     let refs: Record<string, string>;
     let key: string;
     try {
+      await receipts.prepare();
+      bounded.throwIfAborted();
+      refs = transports.references ? await transports.references(row, bounded) : {};
+      bounded.throwIfAborted();
+      if (row.command.inputSnapshot.some((input) => !refs[input.assetId]))
+        throw new Error('VIDEO_INPUT_UNAVAILABLE');
+      // Signing may wait on COS. Check the owner's current admission after it finishes.
       const current = await providers.snapshotVideo(
         { userId: row.owner_id },
         row.command.request.modelRef,
       );
+      bounded.throwIfAborted();
       if (
         current.capabilitiesVersion !== row.command.request.expectedCapabilitiesVersion ||
         current.credentialVersion !== row.snapshot.credentialVersion
       )
         throw new Error('VIDEO_ADMISSION_CHANGED');
       key = providers.openImageSnapshot(row.owner_id, row.snapshot);
-      refs = transports.references ? await transports.references(row, bounded) : {};
-      bounded.throwIfAborted();
-      if (row.command.inputSnapshot.some((input) => !refs[input.assetId]))
-        throw new Error('VIDEO_INPUT_UNAVAILABLE');
     } catch {
       if (stop.aborted) await store.release(row);
       else await store.terminal(row, 'rejected', 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE');
@@ -128,24 +143,31 @@ export function createVideoRunner(
       await store.release(row);
       return;
     }
-    const route = row.route_snapshot;
-    const protocol = transports.protocol(route.route, route.modelId, async (url, options) => {
-      bounded.throwIfAborted();
-      return (transports.transport ?? fetch)(url, options);
-    });
-    // This transition commits before protocol.submit; every resumed submitting row is unknown.
+    // This transition commits before protocol.submit. A resumed intent only reconciles receipts.
     if (!(await store.submitting(row))) return;
     let result;
     try {
+      bounded.throwIfAborted();
       result = await protocol.submit(row.command.request.parameters, refs, key, bounded);
     } catch {
       await store.terminal(row, 'unknown', 'VIDEO_SUBMISSION_UNKNOWN');
       return;
     }
     if (result.state === 'submitted') {
-      if (!result.upstreamTaskId || result.upstreamTaskId.length > 1024)
+      if (
+        !isVideoUpstreamTaskId(result.upstreamTaskId) ||
+        !(await receipts.record(
+          {
+            version: 1,
+            jobId: row.id,
+            ownerId: row.owner_id,
+            requestId: row.command.request.requestId,
+            upstreamTaskId: result.upstreamTaskId,
+          },
+          receive,
+        ))
+      )
         await store.terminal(row, 'unknown', 'VIDEO_SUBMISSION_UNKNOWN');
-      else await store.submitted(row, result.upstreamTaskId);
     } else await store.terminal(row, result.state, result.code);
   };
 
@@ -168,11 +190,12 @@ export function createVideoRunner(
       await store.release(row);
       return;
     }
-    const deadline = row.async_deadline!.getTime();
-    const bounded = AbortSignal.any([
-      stop,
-      AbortSignal.timeout(Math.max(1, Math.min(60_000, deadline - epochMs()))),
-    ]);
+    const remaining = row.async_deadline!.getTime() - epochMs();
+    if (remaining <= 0) {
+      await store.terminal(row, 'failed', 'VIDEO_QUERY_LIMIT');
+      return;
+    }
+    const bounded = AbortSignal.any([stop, AbortSignal.timeout(Math.min(60_000, remaining))]);
     const route = row.route_snapshot;
     const protocol = transports.protocol(route.route, route.modelId, transports.transport);
     let result;
@@ -184,6 +207,7 @@ export function createVideoRunner(
       return;
     }
     if (result.state === 'returned') await returned(row, result.videos);
+    else if (result.state === 'unknown') await store.terminal(row, 'unknown', result.code);
     else if (stop.aborted) await store.release(row);
     else if (result.state === 'processing') await store.processing(row);
     else await store.terminal(row, 'failed', result.code);
@@ -197,7 +221,7 @@ export function createVideoRunner(
     if (row.phase === 'ready') await submit(row);
     else if (row.phase === 'waiting') await query(row);
     else if (row.phase === 'materializing') await materializeResult(row);
-    else if (row.phase === 'submitting')
+    else if (row.phase === 'submitting' && !(await receipts.recover(row.id, receive)))
       await store.terminal(row, 'unknown', 'VIDEO_SUBMISSION_UNKNOWN');
   };
 }

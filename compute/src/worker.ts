@@ -21,13 +21,14 @@ import {
   MediaError,
   fileDigest,
   paths,
+  probePath,
+  probeVideoFile,
   processGone,
   processIdentity,
   removeFiles,
   removeProbeFile,
   requireProbeSpace,
   requireSpace,
-  probeVideoFile,
   transcode,
 } from './adapters/media.ts';
 import type { ObjectStore } from './adapters/cos.ts';
@@ -116,13 +117,13 @@ export class Worker {
     string,
     { command: VideoProbeCommandV1; task: Promise<void> }
   >();
+  readonly #probeDownloads = new Map<string, number>();
   readonly #executionIds = new Map<string, string>();
   readonly #ownedProcesses = new Set<string>();
   #maintenance: Promise<void> | undefined;
   #maintenanceAttempt: string | undefined;
   #cursor = '';
   #stopped = false;
-  #probeDownloadBytes = 0;
   readonly #stopController = new AbortController();
 
   constructor(
@@ -538,15 +539,16 @@ export class Worker {
       let result: VideoProbeResultV1;
       try {
         removeProbeFile(this.#directory, command.messageId);
+        const downloadPath = probePath(this.#directory, command.messageId);
         const bytes = command.source.sizeBytes;
-        requireProbeSpace(this.#directory, bytes, this.#probeDownloadBytes);
-        this.#probeDownloadBytes += bytes;
-        this.#slots.phase(execution.executionId, 'downloading');
+        requireProbeSpace(this.#directory, bytes, this.#probeDownloads);
+        this.#probeDownloads.set(downloadPath, bytes);
         let path: string;
         try {
+          this.#slots.phase(execution.executionId, 'downloading');
           path = await download.call(this.#store, command, this.#directory, signal);
         } finally {
-          this.#probeDownloadBytes -= bytes;
+          this.#probeDownloads.delete(downloadPath);
         }
         this.#slots.phase(execution.executionId, 'processing');
         const media = await probeVideoFile(path, signal);

@@ -1,25 +1,38 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { chmod, mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Client, Pool } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
+import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
+import { AssetStore } from '../../src/assets/store.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
+import { createVideoExecutor } from '../../src/generations/video/executor.ts';
+import { createVideoInputResolver } from '../../src/generations/video/inputs.ts';
+import { VideoSubmissionReceipts } from '../../src/generations/video/submission-receipts.ts';
 import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
-import type { VideoExecutorProvider } from '../../src/generations/video/runner.ts';
+import type { VideoExecutorProvider, VideoTransports } from '../../src/generations/video/runner.ts';
 import type {
+  VideoJobCommand,
   VideoMaterializedOutput,
   VideoMaterializer,
   VideoProtocol,
+  VideoSubmitResult,
 } from '../../src/generations/video/execution.ts';
 import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
+import { VIDEO_USER_QUOTA } from '../../src/generations/video/contracts.ts';
+import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function fixture() {
+async function fixture(reference?: 'frozen' | 'legacy') {
   const database = await authDatabase();
   cleanups.push(database.close);
   const pool = new Pool({ connectionString: database.url });
@@ -30,40 +43,86 @@ async function fixture() {
   const execution = store.executorStore();
   cleanups.push(() => execution.close());
   await execution.startExecutor(() => {});
+  const directory = await mkdtemp(join(tmpdir(), 'mio-video-lifecycle-'));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
+  const receipts = new VideoSubmissionReceipts(directory);
+  cleanups.push(() => receipts.close());
   const actor = { userId: randomUUID(), sessionId: 'video-lifecycle' };
+  const assetId = randomUUID();
+  const key = 'mio/raw/' + assetId;
+  const etag = 'frozen-image-etag';
+  if (reference)
+    await pool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,raw_key,state,expires_at,source_etag)
+       VALUES ($1,$2,'first.png','image/png',256,$3,'ready',now(),$4)`,
+      [assetId, actor.userId, key, etag],
+    );
   const request: VideoCreateRequest = {
     requestId: randomUUID(),
     modelRef: 'onelink:model:' + randomUUID(),
     expectedCapabilitiesVersion: 'video-capability-test',
-    parameters: { mode: 'text_to_video', prompt: 'a tiny movie', durationSeconds: 4 },
+    parameters: reference
+      ? { mode: 'first_frame', firstFrame: { assetId }, prompt: 'a tiny movie', durationSeconds: 4 }
+      : { mode: 'text_to_video', prompt: 'a tiny movie', durationSeconds: 4 },
   };
-  const job = await store.create(
-    actor.userId,
-    request,
-    'stable-input-hash',
-    { request, inputSnapshot: [] },
-    {
-      providerConfigId: randomUUID(),
-      modelKey: randomUUID(),
-      credentialVersion: 1,
-      catalogVersion: 1,
-      adaptationVersion: 1,
-      driver: 'volcengine-ark-videos',
-    },
-    { providerConfigId: randomUUID(), credentialVersion: 1, credential: {} },
-    {
-      modelId: 'doubao-seedance-1.5-pro',
-      route: {
+  const create = (command: VideoJobCommand, owner = actor.userId) =>
+    store.create(
+      owner,
+      command.request,
+      'stable-input-hash',
+      command,
+      {
+        providerConfigId: randomUUID(),
+        modelKey: randomUUID(),
+        credentialVersion: 1,
+        catalogVersion: 1,
+        adaptationVersion: 1,
         driver: 'volcengine-ark-videos',
-        vendor: 'volcengine',
-        submitPath: '/volc/api/v3/contents/generations/tasks',
-        queryPathTemplate: '/volc/api/v3/contents/generations/tasks/{task_id}',
-        paramSpec: { supportedModes: ['text_to_video'] },
-        requestDefaults: {},
-        outputSpec: {},
       },
-    },
-  );
+      {
+        providerConfigId: randomUUID(),
+        credentialVersion: 1,
+        credential: {},
+      },
+      {
+        modelId: 'doubao-seedance-1.5-pro',
+        route: {
+          driver: 'volcengine-ark-videos',
+          vendor: 'volcengine',
+          submitPath: '/volc/api/v3/contents/generations/tasks',
+          queryPathTemplate: '/volc/api/v3/contents/generations/tasks/{task_id}',
+          paramSpec: {
+            supportedModes: ['text_to_video', 'first_frame'],
+            parameters: {
+              ratios: [],
+              resolutions: [],
+              durations: [4],
+              maxPromptCodepoints: 5000,
+              maxImages: 1,
+              maxVideos: 0,
+              maxAudios: 0,
+              maxInputs: 1,
+              maxSubjects: 0,
+              maxSubjectImages: 0,
+              generateAudio: false,
+              watermark: false,
+              offPeak: false,
+              audioSettings: [],
+              requiresResolution: false,
+              referenceAudioRequiresVisual: false,
+              referenceDurations: [],
+            },
+          },
+          requestDefaults: {},
+          outputSpec: {},
+        },
+      },
+    );
+  const job = await create({
+    request,
+    inputSnapshot: reference ? [{ assetId, mediaType: 'image', role: 'first_frame' }] : [],
+    ...(reference === 'frozen' ? { inputObjects: { [assetId]: { key, etag } } } : {}),
+  });
   const protocol: VideoProtocol = {
     submit: vi
       .fn<VideoProtocol['submit']>()
@@ -96,26 +155,54 @@ async function fixture() {
     hasAudio: false,
   };
   const materialize = vi.fn<VideoMaterializer>().mockResolvedValue([output]);
-  const run = createVideoRunner(
-    execution,
-    () => provider,
-    materialize,
-    new AbortController().signal,
-    { protocol: () => protocol },
-  );
-  const next = async () => {
+  const runner = (
+    overrides: Partial<VideoTransports> = {},
+    target = execution,
+    durable = receipts,
+  ) =>
+    createVideoRunner(
+      target,
+      () => provider,
+      materialize,
+      new AbortController().signal,
+      { protocol: () => protocol, ...overrides },
+      durable,
+    );
+  const next = async (target = execution) => {
     await pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
       job.jobId,
     ]);
-    const row = await execution.claim();
+    const row = await target.claim();
     expect(row).toBeDefined();
     return row!;
   };
+  const durableState = async () =>
+    (
+      await pool.query(
+        `SELECT j.state,j.error_code,j.completed_at,e.phase,e.claim_id,e.upstream_task_id,
+       e.async_deadline,e.async_max_queries,e.query_attempt,e.next_query_at,e.checkpoint
+       FROM mio_video_jobs j JOIN mio_video_executions e ON e.job_id=j.id WHERE j.id=$1`,
+        [job.jobId],
+      )
+    ).rows[0];
+  const receiptPath = join(directory, 'video-submissions', job.jobId + '.json');
+  const expectedReceipt = {
+    version: 1 as const,
+    jobId: job.jobId,
+    ownerId: actor.userId,
+    requestId: request.requestId,
+    upstreamTaskId: 'safe-task',
+  };
   return {
-    database,
     pool,
     store,
     execution,
+    directory,
+    receiptPath,
+    expectedReceipt,
+    receipts,
+    create,
+    asset: { assetId, key, etag },
     actor,
     request,
     job,
@@ -123,8 +210,10 @@ async function fixture() {
     provider,
     output,
     materialize,
-    run,
+    run: runner(),
+    runner,
     next,
+    durableState,
   };
 }
 
@@ -282,21 +371,480 @@ describe('durable video execution', () => {
   });
 });
 
-// A durable intent is not permission to use a replaced key or disabled model.
-it('rejects a ready intent when its current admission changes, without one POST', async () => {
+it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy'] as const)(
+  'checks the current admission after resolving the frozen input when %s',
+  async (scenario) => {
+    const f = await fixture(scenario === 'legacy' ? 'legacy' : 'frozen');
+    const headStarted = Promise.withResolvers<void>();
+    const headRelease = Promise.withResolvers<void>();
+    const objects: AssetObjectStore = {
+      uploadUrl: vi.fn(),
+      downloadUrl: vi.fn(),
+      copy: vi.fn(),
+      delete: vi.fn(),
+      materialUrl: vi.fn(() => 'https://cos.fixture/first-frame'),
+      head: vi.fn(async () => {
+        headStarted.resolve();
+        await headRelease.promise;
+        return {
+          size: 256,
+          etag: scenario === 'asset-changed' ? 'changed-etag' : f.asset.etag,
+        };
+      }),
+    };
+    const inputs = createVideoInputResolver(new AssetStore(f.pool), objects);
+    const run = f.runner({
+      references: (row, signal) =>
+        inputs.resolve(row.owner_id, row.command.inputSnapshot, signal, row.command.inputObjects),
+    });
+    const row = await f.next();
+    const accepted = scenario === 'unchanged' || scenario === 'legacy';
+    const pending = accepted ? Promise.all([run(row), run(row)]) : run(row);
+    try {
+      await headStarted.promise;
+      expect(f.provider.snapshotVideo).not.toHaveBeenCalled();
+      expect(f.provider.openImageSnapshot).not.toHaveBeenCalled();
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+      expect(await f.durableState()).toMatchObject({ phase: 'ready', async_deadline: null });
+      if (scenario === 'rotated')
+        f.provider.snapshotVideo.mockResolvedValueOnce({
+          capabilitiesVersion: f.request.expectedCapabilitiesVersion,
+          credentialVersion: 2,
+        } as Awaited<ReturnType<VideoExecutorProvider['snapshotVideo']>>);
+      if (scenario === 'disabled')
+        f.provider.snapshotVideo.mockRejectedValueOnce(new Error('MODEL_DISABLED'));
+    } finally {
+      headRelease.resolve();
+      await pending;
+    }
+    expect(objects.head).toHaveBeenCalledWith(f.asset.key, expect.any(AbortSignal));
+    if (scenario === 'asset-changed') {
+      expect(f.provider.snapshotVideo).not.toHaveBeenCalled();
+      expect(objects.materialUrl).not.toHaveBeenCalled();
+    } else {
+      expect(f.provider.snapshotVideo).toHaveBeenCalledWith(
+        { userId: f.actor.userId },
+        f.request.modelRef,
+      );
+      expect(vi.mocked(objects.materialUrl!).mock.invocationCallOrder[0]).toBeLessThan(
+        f.provider.snapshotVideo.mock.invocationCallOrder[0]!,
+      );
+    }
+    if (accepted) {
+      expect(f.provider.openImageSnapshot).toHaveBeenCalledWith(f.actor.userId, row.snapshot);
+      expect(f.protocol.submit).toHaveBeenCalledExactlyOnceWith(
+        f.request.parameters,
+        { [f.asset.assetId]: 'https://cos.fixture/first-frame' },
+        'frozen-test-key',
+        expect.any(AbortSignal),
+      );
+      expect(await f.durableState()).toMatchObject({ state: 'submitted', phase: 'waiting' });
+    } else {
+      expect(f.provider.openImageSnapshot).not.toHaveBeenCalled();
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+      expect(await f.durableState()).toMatchObject({
+        state: 'rejected',
+        phase: 'done',
+        async_deadline: null,
+        async_max_queries: null,
+        upstream_task_id: null,
+      });
+    }
+  },
+);
+
+it('rejects before submission when its receipt directory is already unusable', async () => {
   const f = await fixture();
-  f.provider.snapshotVideo.mockRejectedValueOnce(new Error('MODEL_DISABLED'));
+  const submissions = join(f.directory, 'video-submissions');
+  await mkdir(submissions);
+  await chmod(submissions, 0o755);
   await f.run(await f.next());
   expect(f.protocol.submit).not.toHaveBeenCalled();
-  expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('rejected');
+  expect(await f.durableState()).toMatchObject({
+    state: 'rejected',
+    async_deadline: null,
+    upstream_task_id: null,
+  });
 });
-it('rejects a ready intent when its credential generation changes', async () => {
-  const f = await fixture();
-  f.provider.snapshotVideo.mockResolvedValueOnce({
-    capabilitiesVersion: 'rotated',
-    credentialVersion: 2,
-  } as Awaited<ReturnType<VideoExecutorProvider['snapshotVideo']>>);
-  await f.run(await f.next());
-  expect(f.protocol.submit).not.toHaveBeenCalled();
-  expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('rejected');
+
+async function reopen(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.execution.close();
+  const execution = new VideoGenerationStore(f.pool).executorStore();
+  await execution.startExecutor(() => {});
+  cleanups.push(() => execution.close());
+  const receipts = new VideoSubmissionReceipts(f.directory);
+  cleanups.push(() => receipts.close());
+  return {
+    execution,
+    receipts,
+    replay: () => receipts.replay(execution.receive.bind(execution), new AbortController().signal),
+    run: f.runner({}, execution, receipts),
+  };
+}
+
+async function observeDirectorySync(directory: string, beforeSync: () => Promise<void>) {
+  const handle = await open(directory, 'r');
+  const { ino, dev } = await handle.stat();
+  const prototype = Object.getPrototypeOf(handle) as FileHandle;
+  await handle.close();
+  const sync = prototype.sync;
+  return vi.spyOn(prototype, 'sync').mockImplementation(async function (this: FileHandle) {
+    const current = await this.stat();
+    if (current.ino === ino && current.dev === dev) await beforeSync();
+    await sync.call(this);
+  });
+}
+
+describe('paid video submission receipt', () => {
+  it('keeps a private received ID when PostgreSQL declines it and the executor restarts', async () => {
+    const f = await fixture();
+    await f.pool.query(`
+      CREATE FUNCTION decline_fixture_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'fixture declined the receipt'; END;
+      $$;
+      CREATE TRIGGER decline_fixture_receipt BEFORE UPDATE OF upstream_task_id
+      ON mio_video_executions FOR EACH ROW EXECUTE FUNCTION decline_fixture_receipt()
+    `);
+    await expect(f.run(await f.next())).rejects.toThrow('fixture declined the receipt');
+    const submitting = await f.durableState();
+    expect(submitting).toMatchObject({
+      state: 'accepted',
+      phase: 'submitting',
+      upstream_task_id: null,
+    });
+    expect(await stat(f.receiptPath).then((info) => info.mode & 0o777)).toBe(0o600);
+    expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+
+    const competing = vi.fn(async () => 'deferred' as const);
+    await expect(
+      f.receipts.record({ ...f.expectedReceipt, upstreamTaskId: 'different-task' }, competing),
+    ).resolves.toBe(true);
+    expect(competing).toHaveBeenCalledWith(f.expectedReceipt, true);
+    expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+
+    await f.pool.query('DROP TRIGGER decline_fixture_receipt ON mio_video_executions');
+    await f.execution.close();
+    const restarted = await createVideoExecutor(
+      new VideoGenerationStore(f.pool),
+      () => f.provider,
+      f.materialize,
+      { protocol: () => f.protocol },
+      f.directory,
+    );
+    cleanups.push(() => restarted.close());
+    await vi.waitFor(
+      async () => {
+        expect(await f.durableState()).toMatchObject({
+          state: 'submitted',
+          phase: 'waiting',
+          upstream_task_id: f.expectedReceipt.upstreamTaskId,
+          query_attempt: submitting.query_attempt,
+          async_deadline: submitting.async_deadline,
+          async_max_queries: submitting.async_max_queries,
+        });
+        await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      },
+      { timeout: 3000 },
+    );
+    await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
+      f.job.jobId,
+    ]);
+    restarted.wake();
+    await vi.waitFor(
+      async () => expect(await f.durableState()).toMatchObject({ state: 'completed' }),
+      {
+        timeout: 3000,
+      },
+    );
+    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+    expect(f.protocol.query).toHaveBeenCalledExactlyOnceWith(
+      'safe-task',
+      'current-test-key',
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('does not write PostgreSQL before replay has synced a newly published receipt name', async () => {
+    const f = await fixture();
+    const publisher = Promise.withResolvers<void>();
+    const replay = Promise.withResolvers<void>();
+    const publisherResume = Promise.withResolvers<void>();
+    const replayResume = Promise.withResolvers<void>();
+    let syncingParent = 0;
+    const observeSync = await observeDirectorySync(f.directory, async () => {
+      if (++syncingParent === 1) {
+        publisher.resolve();
+        await publisherResume.promise;
+        throw new Error('fixture directory sync failed');
+      }
+      replay.resolve();
+      await replayResume.promise;
+    });
+    const receive = vi.spyOn(f.execution, 'receive');
+    const row = await f.next();
+    const incoming = f.run(row);
+    const other = new VideoSubmissionReceipts(f.directory);
+    cleanups.push(() => other.close());
+    let restore: Promise<void> | undefined;
+    try {
+      await publisher.promise;
+      expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+      restore = other.replay(f.execution.receive.bind(f.execution), new AbortController().signal);
+      await replay.promise;
+      expect(receive).not.toHaveBeenCalled();
+      expect(await f.durableState()).toMatchObject({ phase: 'submitting', upstream_task_id: null });
+      replayResume.resolve();
+      await restore;
+      expect(receive).toHaveBeenCalledExactlyOnceWith(f.expectedReceipt, true);
+      expect(await f.durableState()).toMatchObject({
+        phase: 'waiting',
+        upstream_task_id: 'safe-task',
+      });
+    } finally {
+      publisherResume.resolve();
+      replayResume.resolve();
+      await Promise.all([incoming, restore]);
+      observeSync.mockRestore();
+      receive.mockRestore();
+    }
+    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms an already committed ID after a lost COMMIT reply without resetting query progress', async () => {
+    const f = await fixture();
+    const original = Client.prototype.query;
+    const acknowledgementLost = new Error('fixture discarded COMMIT reply');
+    let armed = false;
+    const query = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
+      this: Client,
+      ...args: unknown[]
+    ) {
+      const result = Reflect.apply(original, this, args);
+      if (armed && args[0] === 'COMMIT') {
+        armed = false;
+        return Promise.resolve(result).then(() => {
+          throw acknowledgementLost;
+        });
+      }
+      return result;
+    });
+    vi.mocked(f.protocol.submit).mockImplementationOnce(async () => {
+      armed = true;
+      return { state: 'submitted', upstreamTaskId: 'safe-task' };
+    });
+    try {
+      await expect(f.run(await f.next())).rejects.toBe(acknowledgementLost);
+    } finally {
+      query.mockRestore();
+    }
+    expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+    expect(await f.durableState()).toMatchObject({
+      state: 'submitted',
+      upstream_task_id: 'safe-task',
+    });
+
+    vi.mocked(f.protocol.query).mockResolvedValueOnce({ state: 'processing' });
+    await f.run(await f.next());
+    const beforeReplay = await f.durableState();
+    expect(beforeReplay).toMatchObject({ query_attempt: 1, phase: 'waiting' });
+    const restarted = await reopen(f);
+    await restarted.replay();
+    expect(await f.durableState()).toEqual(beforeReplay);
+    await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await restarted.run(await f.next(restarted.execution));
+    expect(await f.durableState()).toMatchObject({ state: 'completed', query_attempt: 2 });
+    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(f.protocol.query).mock.calls.map(([id]) => id)).toEqual([
+      'safe-task',
+      'safe-task',
+    ]);
+  });
+
+  it.each(['release', 'expire', 'lost-volume', 'repaired-sync'] as const)(
+    'handles a late ID after claim replacement at full owner quota when %s',
+    async (scenario) => {
+      const f = await fixture();
+      const upstreamEntered = Promise.withResolvers<void>();
+      const upstreamReply = Promise.withResolvers<VideoSubmitResult>();
+      vi.mocked(f.protocol.submit).mockImplementationOnce(async () => {
+        upstreamEntered.resolve();
+        return upstreamReply.promise;
+      });
+      const original = await f.next();
+      const pending = f.run(original);
+      await upstreamEntered.promise;
+      const intent = await f.durableState();
+      let repair: Awaited<ReturnType<typeof observeDirectorySync>> | undefined;
+      let restarted: Awaited<ReturnType<typeof reopen>>;
+      try {
+        restarted = await reopen(f);
+        const current = await f.next(restarted.execution);
+        expect(current.claim_id).not.toBe(original.claim_id);
+        await restarted.run(current);
+        expect(await f.durableState()).toMatchObject({
+          state: 'unknown',
+          phase: 'done',
+          upstream_task_id: null,
+        });
+        for (let index = 0; index < VIDEO_USER_QUOTA; index++)
+          await f.create({ request: { ...f.request, requestId: randomUUID() }, inputSnapshot: [] });
+        if (scenario === 'lost-volume')
+          await rm(join(f.directory, 'video-submissions'), { recursive: true, force: true });
+        if (scenario === 'repaired-sync')
+          repair = await observeDirectorySync(f.directory, async () => {
+            throw new Error('fixture volume cannot sync directories');
+          });
+      } finally {
+        upstreamReply.resolve({ state: 'submitted', upstreamTaskId: 'safe-task' });
+        await pending.finally(() => repair?.mockRestore());
+      }
+      const volatile = scenario === 'lost-volume' || scenario === 'repaired-sync';
+      const unknown = await f.durableState();
+      expect(unknown).toMatchObject({
+        state: 'unknown',
+        phase: 'done',
+        query_attempt: intent.query_attempt,
+        async_deadline: intent.async_deadline,
+        async_max_queries: intent.async_max_queries,
+        upstream_task_id: volatile ? 'safe-task' : null,
+      });
+      if (scenario === 'lost-volume')
+        await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      else expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+      await restarted.replay();
+      expect(await f.durableState()).toEqual(unknown);
+      if (scenario !== 'lost-volume')
+        expect(JSON.parse(await readFile(f.receiptPath, 'utf8'))).toEqual(f.expectedReceipt);
+      expect(
+        (await f.pool.query("SELECT count(*) FROM mio_video_jobs WHERE state='accepted'")).rows[0]
+          .count,
+      ).toBe(String(VIDEO_USER_QUOTA));
+
+      if (scenario === 'expire') {
+        const expired = (
+          await f.pool.query(
+            `UPDATE mio_video_executions SET async_deadline=now()-interval '1 second'
+             WHERE job_id=$1 RETURNING async_deadline`,
+            [f.job.jobId],
+          )
+        ).rows[0].async_deadline;
+        await restarted.replay();
+        expect(await f.durableState()).toEqual({
+          ...unknown,
+          async_deadline: expired,
+          upstream_task_id: 'safe-task',
+        });
+      } else {
+        const occupying = (await restarted.execution.claim())!;
+        await restarted.execution.terminal(occupying, 'failed', 'FIXTURE_SLOT_RELEASED');
+        await restarted.replay();
+        if (scenario === 'lost-volume') expect(await f.durableState()).toEqual(unknown);
+        else {
+          expect(await f.durableState()).toMatchObject({
+            state: 'submitted',
+            phase: 'waiting',
+            upstream_task_id: 'safe-task',
+            query_attempt: intent.query_attempt,
+            async_deadline: intent.async_deadline,
+            async_max_queries: intent.async_max_queries,
+          });
+          await restarted.run(await f.next(restarted.execution));
+          expect(await f.durableState()).toMatchObject({ state: 'completed', query_attempt: 1 });
+        }
+      }
+      await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+      expect(f.protocol.query).toHaveBeenCalledTimes(
+        scenario === 'release' || scenario === 'repaired-sync' ? 1 : 0,
+      );
+    },
+  );
+
+  it('does not attach a receipt with a different owner, request, ID, or terminal disposition', async () => {
+    const f = await fixture();
+    vi.mocked(f.protocol.submit).mockResolvedValueOnce({
+      state: 'unknown',
+      code: 'VIDEO_SUBMISSION_UNKNOWN',
+    });
+    await f.run(await f.next());
+    const unknown = await f.durableState();
+    const receive = f.execution.receive.bind(f.execution);
+    for (const discrepancy of [{ ownerId: randomUUID() }, { requestId: randomUUID() }]) {
+      expect(await f.receipts.record({ ...f.expectedReceipt, ...discrepancy }, receive)).toBe(
+        false,
+      );
+      expect(await f.durableState()).toEqual(unknown);
+    }
+    expect(await f.receipts.record(f.expectedReceipt, receive)).toBe(true);
+    await f.run(await f.next());
+    const completed = await f.durableState();
+    expect(completed).toMatchObject({ state: 'completed', upstream_task_id: 'safe-task' });
+    expect(
+      await f.receipts.record({ ...f.expectedReceipt, upstreamTaskId: 'different-task' }, receive),
+    ).toBe(false);
+    expect(await f.receipts.record(f.expectedReceipt, receive)).toBe(true);
+    expect(await f.durableState()).toEqual(completed);
+    await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+    expect(f.protocol.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('cannot adopt an ID for a rejected submission with no upstream ID', async () => {
+    const f = await fixture();
+    vi.mocked(f.protocol.submit).mockResolvedValueOnce({ state: 'rejected', code: 'VIDEO_AUTH' });
+    await f.run(await f.next());
+    const rejected = await f.durableState();
+    expect(rejected).toMatchObject({ state: 'rejected', upstream_task_id: null });
+    expect(await f.receipts.record(f.expectedReceipt, f.execution.receive.bind(f.execution))).toBe(
+      false,
+    );
+    expect(await f.durableState()).toEqual(rejected);
+    expect(await f.execution.claim()).toBeUndefined();
+    expect(f.protocol.query).not.toHaveBeenCalled();
+  });
 });
+
+it.each([undefined, 'other-task'])(
+  'keeps the original ID and produces no asset when actual Ark query reports identity %s',
+  async (id) => {
+    const f = await fixture();
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(async () => Response.json({ id: 'safe-task' }))
+      .mockImplementationOnce(async () =>
+        Response.json({
+          id,
+          status: 'succeeded',
+          content: { video_url: 'https://media.fixture/unrelated.mp4' },
+        }),
+      );
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    const submitted = await f.durableState();
+    expect(submitted).toMatchObject({ state: 'submitted', upstream_task_id: 'safe-task' });
+    await run(await f.next());
+    expect(await f.durableState()).toMatchObject({
+      state: 'unknown',
+      error_code: 'VIDEO_QUERY_IDENTITY_INVALID',
+      phase: 'done',
+      upstream_task_id: 'safe-task',
+      query_attempt: 1,
+      async_deadline: submitted.async_deadline,
+      async_max_queries: submitted.async_max_queries,
+      checkpoint: null,
+    });
+    expect((await f.store.get(f.actor.userId, f.job.jobId)).outputs).toEqual([]);
+    expect((await f.pool.query('SELECT count(*) FROM mio_assets')).rows[0].count).toBe('0');
+    expect(f.materialize).not.toHaveBeenCalled();
+    expect(await f.execution.claim()).toBeUndefined();
+    expect(
+      transport.mock.calls.map(([url, options]) => [
+        new URL(String(url)).pathname,
+        options?.method,
+      ]),
+    ).toEqual([
+      ['/volc/api/v3/contents/generations/tasks', 'POST'],
+      ['/volc/api/v3/contents/generations/tasks/safe-task', 'GET'],
+    ]);
+  },
+);

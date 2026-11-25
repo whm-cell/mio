@@ -273,7 +273,11 @@ export interface ConversationVideoJobView {
 export interface ConversationVideoTools {
   listModels(actor: { userId: string }): Promise<ConversationVideoModelSummary[]>;
   capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
-  createVideo(actor: { userId: string }, request: VideoCreateRequest): Promise<VideoJobView>;
+  createVideo(
+    actor: { userId: string },
+    request: VideoCreateRequest,
+    signal?: AbortSignal,
+  ): Promise<VideoJobView>;
   getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
   recoverVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
 }

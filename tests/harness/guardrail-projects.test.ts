@@ -864,6 +864,11 @@ it('permits only exact service adapters for builtins, COS and AMQP', async () =>
   );
   await put(
     root,
+    'src/generations/video/submission-receipts.ts',
+    "export { open } from 'node:fs/promises';\n",
+  );
+  await put(
+    root,
     'node_modules/amqplib/package.json',
     JSON.stringify({ name: 'amqplib', types: 'index.d.ts' }),
   );

@@ -3,12 +3,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
+  linkSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  statfsSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
+import type * as Fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -18,11 +24,21 @@ import type {
   VideoProbeResultV1,
   WorkerTelemetryEvent,
 } from '@mio/compute-contracts';
+import type { ObjectStore } from '../src/adapters/cos.ts';
 import { Journal } from '../src/adapters/journal.ts';
-import { probePath } from '../src/adapters/media.ts';
+import { probePath, requireProbeSpace } from '../src/adapters/media.ts';
+import type { Broker } from '../src/adapters/rabbitmq.ts';
 import { ResourceSlots } from '../src/resource-slots.ts';
 import { Worker } from '../src/worker.ts';
 
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof Fs>();
+  return { ...fs, statfsSync: vi.fn(fs.statfsSync) };
+});
+
+const MIB = 1024 ** 2;
+const GIB = 1024 * MIB;
+const STATFS_BLOCK_BYTES = 4096;
 const directories: string[] = [];
 
 function directory(): string {
@@ -62,7 +78,7 @@ function fixture(root: string): string {
   return path;
 }
 
-function command(file: string): VideoProbeCommandV1 {
+function command(file: string, sizeBytes?: number): VideoProbeCommandV1 {
   const jobId = randomUUID();
   const outputIndex = 0;
   const attemptId = randomUUID();
@@ -77,15 +93,57 @@ function command(file: string): VideoProbeCommandV1 {
     attempt: 1,
     source: {
       stagingKey: `mio/staging/video/${jobId}/${outputIndex}/${attemptId}.media`,
-      sizeBytes: bytes.length,
+      sizeBytes: sizeBytes ?? bytes.length,
       etag: '"staging-etag"',
       sha256: createHash('sha256').update(bytes).digest('hex'),
     },
   });
 }
 
+function probeWorker(
+  journal: Journal,
+  root: string,
+  slots: ResourceSlots,
+  downloadVideoProbe: ObjectStore['downloadVideoProbe'],
+  publishVideoProbe: Broker['publishVideoProbe'],
+): Worker {
+  return new Worker(
+    journal,
+    {
+      async download() {},
+      async head() {
+        return null;
+      },
+      async verify() {
+        return false;
+      },
+      async upload() {},
+      downloadVideoProbe,
+    },
+    { async publish() {}, publishVideoProbe },
+    root,
+    slots,
+  );
+}
+
+function mockFreeSpace(bytes: number): void {
+  const bsize = STATFS_BLOCK_BYTES;
+  const bavail = bytes / bsize;
+  vi.mocked(statfsSync).mockReturnValue({
+    type: 0,
+    bsize,
+    frsize: bsize,
+    bavail,
+    bfree: bavail + 1024,
+    blocks: (16 * GIB) / bsize,
+    files: 0,
+    ffree: 0,
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.mocked(statfsSync).mockReset();
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -121,29 +179,10 @@ it('probes the streamed local file and returns source identity and media metadat
     copyFileSync(file, destination);
     return destination;
   });
-  const worker = new Worker(
-    journal,
-    {
-      async download() {},
-      async head() {
-        return null;
-      },
-      async verify() {
-        return false;
-      },
-      async upload() {},
-      downloadVideoProbe,
-    },
-    {
-      async publish() {},
-      async publishVideoProbe(message) {
-        event.push(parseVideoProbeResultV1(message));
-        await confirmed;
-      },
-    },
-    root,
-    slots,
-  );
+  const worker = probeWorker(journal, root, slots, downloadVideoProbe, async (message) => {
+    event.push(parseVideoProbeResultV1(message));
+    await confirmed;
+  });
   const ack = vi.fn();
   const duplicateAck = vi.fn();
   const handling = worker.handleVideoProbe(input, ack);
@@ -232,29 +271,16 @@ it('cleans up on an unconfirmed result, accepts redelivery, and cancels a waitin
     })
     .mockRejectedValueOnce(new Error('CONFIRM_TIMEOUT'));
   const slots = new ResourceSlots();
-  const worker = new Worker(
+  const worker = probeWorker(
     journal,
-    {
-      async download() {},
-      async head() {
-        return null;
-      },
-      async verify() {
-        return false;
-      },
-      async upload() {},
-      async downloadVideoProbe(command, directory) {
-        const destination = probePath(directory, command.messageId);
-        writeFileSync(destination, Buffer.from('not media'));
-        return destination;
-      },
-    },
-    {
-      async publish() {},
-      publishVideoProbe,
-    },
     root,
     slots,
+    async (command, directory) => {
+      const destination = probePath(directory, command.messageId);
+      writeFileSync(destination, Buffer.from('not media'));
+      return destination;
+    },
+    publishVideoProbe,
   );
   const ack = vi.fn();
   try {
@@ -276,6 +302,214 @@ it('cleans up on an unconfirmed result, accepts redelivery, and cancels a waitin
     expect(slots.snapshot().waiting.probe).toBe(0);
     await worker.waitIdle();
   } finally {
+    journal.close();
+  }
+});
+
+it('admits a second download with 128 MiB left in the probe directory budget', async () => {
+  const root = directory();
+  const file = fixture(directory());
+  const first = command(file, 512 * MIB);
+  const second = command(file, 512 * MIB);
+  const firstPath = probePath(root, first.messageId);
+  const journal = new Journal(root, 'probe-test', true);
+  const finishFirst = Promise.withResolvers<void>();
+  const confirmFirst = Promise.withResolvers<void>();
+  const slots = new ResourceSlots({ total: 2, encode: 1, probe: 2 });
+  const publish = vi.fn(async (message: VideoProbeResultV1) => {
+    if (message.commandId === first.messageId) await confirmFirst.promise;
+  });
+  const download = vi.fn(async (input: VideoProbeCommandV1, directory: string) => {
+    const destination = probePath(directory, input.messageId);
+    if (input.messageId === first.messageId) {
+      writeFileSync(destination, '');
+      truncateSync(destination, 384 * MIB);
+      await finishFirst.promise;
+      throw new Error('SOURCE_CHANGED');
+    }
+    copyFileSync(file, destination);
+    truncateSync(destination, input.source.sizeBytes);
+    return destination;
+  });
+  const worker = probeWorker(journal, root, slots, download, publish);
+  const ballast = join(root, 'existing-media');
+  const journalBytes = readdirSync(root).reduce(
+    (size, name) => size + statSync(join(root, name)).size,
+    0,
+  );
+  const baseline = 9088 * MIB - journalBytes;
+  writeFileSync(ballast, '');
+  truncateSync(ballast, baseline);
+  mockFreeSpace(4 * GIB);
+  const firstAck = vi.fn();
+  const pending = worker.handleVideoProbe(first, firstAck);
+  const settled = Promise.allSettled([pending]);
+  try {
+    await vi.waitFor(() => expect(statSync(firstPath).size).toBe(384 * MIB));
+    const secondAck = vi.fn();
+    await worker.handleVideoProbe(second, secondAck);
+    expect(publish).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandId: second.messageId, state: 'succeeded' }),
+    );
+    expect(secondAck).toHaveBeenCalledOnce();
+    expect(firstAck).not.toHaveBeenCalled();
+
+    finishFirst.resolve();
+    await vi.waitFor(() =>
+      expect(publish).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commandId: first.messageId, errorCode: 'SOURCE_CHANGED' }),
+      ),
+    );
+    expect(firstAck).not.toHaveBeenCalled();
+    expect(existsSync(firstPath)).toBe(true);
+
+    truncateSync(ballast, baseline + 384 * MIB);
+    await worker.handleVideoProbe(second, vi.fn());
+    expect(publish).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandId: second.messageId, errorCode: 'STORAGE_FAILURE' }),
+    );
+    expect(download).toHaveBeenCalledTimes(2);
+
+    truncateSync(ballast, baseline);
+    mockFreeSpace(2 * GIB + second.source.sizeBytes);
+    await worker.handleVideoProbe(second, vi.fn());
+    expect(publish).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandId: second.messageId, state: 'succeeded' }),
+    );
+
+    confirmFirst.resolve();
+    await pending;
+    expect(firstAck).toHaveBeenCalledOnce();
+    expect(existsSync(firstPath)).toBe(false);
+  } finally {
+    finishFirst.resolve();
+    confirmFirst.resolve();
+    worker.stop();
+    await settled;
+    journal.close();
+  }
+});
+
+it('caps rounded allocated blocks at the number of written bytes', () => {
+  const root = directory();
+  const path = probePath(root, randomUUID());
+  const written = STATFS_BLOCK_BYTES - 1;
+  writeFileSync(path, Buffer.alloc(written, 1), { flush: true });
+  expect(statSync(path).blocks * 512).toBeGreaterThan(written);
+
+  const reserved = 512 * MIB;
+  const incoming = reserved + written;
+  const active = new Map([[path, reserved]]);
+  mockFreeSpace(2 * GIB + 2 * reserved);
+  expect(() => requireProbeSpace(root, incoming, active)).not.toThrow();
+  expect(() => requireProbeSpace(root, incoming + 1, active)).toThrow('DISK_FULL');
+});
+
+it('credits only allocated blocks at the free-volume floor and only for the active path', () => {
+  const root = directory();
+  const messageId = randomUUID();
+  const path = probePath(root, messageId);
+  const nested = join(root, 'nested');
+  mkdirSync(nested);
+  writeFileSync(path, Buffer.alloc(STATFS_BLOCK_BYTES, 1), { flush: true });
+  truncateSync(path, 384 * MIB);
+  const alias = probePath(nested, messageId);
+  linkSync(path, alias);
+  const allocated = statSync(path).blocks * 512;
+  expect(allocated).toBeGreaterThan(0);
+  expect(allocated).toBeLessThan(statSync(path).size);
+
+  const reserved = 512 * MIB;
+  const incoming = 512 * MIB + (allocated % STATFS_BLOCK_BYTES);
+  const atFloor = 2 * GIB + reserved + incoming - allocated;
+  const active = new Map([[path, reserved]]);
+  mockFreeSpace(atFloor);
+  expect(() => requireProbeSpace(root, incoming, active)).not.toThrow();
+  mockFreeSpace(atFloor - STATFS_BLOCK_BYTES);
+  expect(() => requireProbeSpace(root, incoming, active)).toThrow('DISK_FULL');
+
+  // The same inode has space on the volume, but the active download has no file at its path.
+  rmSync(path);
+  expect(existsSync(alias)).toBe(true);
+  mockFreeSpace(atFloor);
+  expect(() => requireProbeSpace(root, incoming, active)).toThrow('DISK_FULL');
+});
+
+it('releases a disk-aborted download and waits for its result confirm before the next probe', async () => {
+  const root = directory();
+  const file = fixture(directory());
+  const first = command(file);
+  const second = command(file);
+  const firstPath = probePath(root, first.messageId);
+  const journal = new Journal(root, 'probe-test', true);
+  const confirmFirst = Promise.withResolvers<void>();
+  const slots = new ResourceSlots();
+  const publish = vi.fn(async (message: VideoProbeResultV1) => {
+    if (message.commandId === first.messageId) await confirmFirst.promise;
+  });
+  const download = vi.fn(
+    async (input: VideoProbeCommandV1, directory: string, signal: AbortSignal) => {
+      const destination = probePath(directory, input.messageId);
+      copyFileSync(file, destination);
+      if (input.messageId === first.messageId) {
+        signal.throwIfAborted();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
+      return destination;
+    },
+  );
+  const worker = probeWorker(journal, root, slots, download, publish);
+  const firstAck = vi.fn();
+  const secondAck = vi.fn();
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  mockFreeSpace(4 * GIB);
+  const handling = [
+    worker.handleVideoProbe(first, firstAck),
+    worker.handleVideoProbe(second, secondAck),
+  ];
+  const settled = Promise.allSettled(handling);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(download).toHaveBeenCalledOnce();
+    expect(slots.snapshot().waiting.probe).toBe(1);
+    expect(existsSync(firstPath)).toBe(true);
+
+    mockFreeSpace(2 * GIB - STATFS_BLOCK_BYTES);
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(publish).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ commandId: first.messageId, errorCode: 'STORAGE_FAILURE' }),
+    );
+    expect(firstAck).not.toHaveBeenCalled();
+    expect(secondAck).not.toHaveBeenCalled();
+    expect(download).toHaveBeenCalledOnce();
+    expect(slots.snapshot().waiting.probe).toBe(1);
+    expect(existsSync(firstPath)).toBe(true);
+
+    const secondBlocks = Math.ceil(second.source.sizeBytes / STATFS_BLOCK_BYTES);
+    mockFreeSpace(2 * GIB + secondBlocks * STATFS_BLOCK_BYTES);
+    confirmFirst.resolve();
+    await Promise.all(handling);
+    expect(firstAck).toHaveBeenCalledOnce();
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(firstAck.mock.invocationCallOrder[0]).toBeLessThan(
+      download.mock.invocationCallOrder[1]!,
+    );
+    expect(publish).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandId: second.messageId, state: 'succeeded' }),
+    );
+    expect(secondAck).toHaveBeenCalledOnce();
+    expect(existsSync(firstPath)).toBe(false);
+    expect(existsSync(probePath(root, second.messageId))).toBe(false);
+    expect(slots.snapshot().usage.probe).toBe(0);
+  } finally {
+    confirmFirst.resolve();
+    worker.stop();
+    await settled;
+    vi.useRealTimers();
     journal.close();
   }
 });

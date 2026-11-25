@@ -279,9 +279,11 @@ async function check(root: string, env?: NodeJS.ProcessEnv) {
 it.each([
   ['src/generations/image/files.ts', "export { readFile } from 'fs';", 0],
   ['src/generations/video/media.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/video/submission-receipts.ts', "export { open } from 'node:fs/promises';", 0],
   ['src/generations/files.ts', "export { readFile } from 'fs';", 1],
   ['src/generations/video-media.ts', "export { readFile } from 'fs';", 1],
   ['src/generations/video/media-extra.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video/submission-receipts-extra.ts', "export { open } from 'node:fs';", 1],
   ['src/generations/image/files.ts', "export { readFile } from 'node:fs/promises';", 0],
   ['src/generations/image/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
   [

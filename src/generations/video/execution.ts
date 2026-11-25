@@ -15,6 +15,22 @@ export interface VideoJobCommand {
 export const VIDEO_EXECUTOR_MAX_QUERIES = 360;
 export const VIDEO_EXECUTOR_MAX_AGE_SECONDS = 1800;
 export const VIDEO_EXECUTOR_QUERY_INTERVAL_MS = 5000;
+export const VIDEO_QUOTA_LOCK = 672049926;
+
+export interface VideoSubmissionReceipt {
+  version: 1;
+  jobId: string;
+  ownerId: string;
+  requestId: string;
+  upstreamTaskId: string;
+}
+
+export type VideoSubmissionDisposition = 'confirmed' | 'deferred' | 'ineligible';
+
+// The adapter validates the protocol identity. Keep only bounded, printable identifiers on disk.
+export function isVideoUpstreamTaskId(value: unknown): value is string {
+  return typeof value === 'string' && /^[\x21-\x7E]{1,1024}$/.test(value) && !value.includes('://');
+}
 
 export interface VideoResultSource {
   url: string;
@@ -69,6 +85,7 @@ export type VideoSubmitResult =
 export type VideoQueryResult =
   | { state: 'processing' }
   | { state: 'returned'; videos: VideoResultSource[] }
+  | { state: 'unknown'; code: 'VIDEO_QUERY_IDENTITY_INVALID' }
   | { state: 'failed'; code: string };
 export interface VideoProtocol {
   submit(

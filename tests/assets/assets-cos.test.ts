@@ -1,5 +1,6 @@
 import COS from 'cos-nodejs-sdk-v5';
 import { createServer } from 'node:http';
+import type { IncomingMessage } from 'node:http';
 import { once } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
@@ -7,7 +8,33 @@ import { expect, it, vi } from 'vitest';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { readAssetConfig } from '../../src/assets/config.ts';
 import { createAssetService } from '../../src/assets/service.ts';
+import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import type { AssetStore } from '../../src/assets/store.ts';
+
+const copyFixture = {
+  databaseURL: 'postgresql://example.invalid/media',
+  bucket: 'mio-test-1234567890',
+  region: 'ap-shanghai',
+  secretId: 'example-id',
+  secretKey: 'example-key',
+};
+
+function redirectCosRequests(port: number, onSend?: () => void) {
+  const original = COS.prototype.request;
+  const redirect = (options: { url: string }) => {
+    const url = new URL(options.url);
+    options.url = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+    onSend?.();
+  };
+  return vi.spyOn(COS.prototype, 'request').mockImplementation(function (
+    this: COS,
+    params: COS.RequestParams,
+  ) {
+    this.off('before-send', redirect);
+    this.on('before-send', redirect);
+    return original.call(this, params);
+  });
+}
 
 it('uses a supplied temporary session token in signed URLs without changing long-term key support', () => {
   const token = 'synthetic+token=/&%#?';
@@ -233,26 +260,9 @@ it.each(['acknowledged', 'xml-error', 'connection-reset'] as const)(
     await once(server, 'listening');
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('COS fixture address missing');
-    const sdkRequest = COS.prototype.request;
-    const requestSpy = vi.spyOn(COS.prototype, 'request').mockImplementation(function (
-      this: COS,
-      params: COS.RequestParams,
-    ) {
-      this.on('before-send', (options: { url: string }) => {
-        const url = new URL(options.url);
-        options.url = `http://127.0.0.1:${address.port}${url.pathname}${url.search}`;
-      });
-      return sdkRequest.call(this, params);
-    });
+    const requestSpy = redirectCosRequests(address.port);
     try {
-      const storage = createCosStorage({
-        databaseURL: 'postgresql://example.invalid/media',
-        bucket: 'mio-test-1234567890',
-        region: 'ap-shanghai',
-        secretId: 'example-id',
-        secretKey: 'example-key',
-        sessionToken: token,
-      });
+      const storage = createCosStorage({ ...copyFixture, sessionToken: token });
       const result = storage.copy(source, target, '"source"', 'private', {
         contentType: 'video/mp4',
         sha256,
@@ -296,6 +306,130 @@ it.each(['acknowledged', 'xml-error', 'connection-reset'] as const)(
     }
   },
 );
+
+it.each(['PUT', 'DELETE'] as const)(
+  'cancels the COS %s sender before request EOF and after EOF while waiting for a reply',
+  async (method) => {
+    const seen: (string | undefined)[] = [];
+    const server = createServer((request) => {
+      seen.push(request.method);
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('COS fixture address missing');
+    let sends = 0;
+    const active = new AbortController();
+    const beforeSend = new AbortController();
+    const reason = Object.freeze(new Error('fixture cancellation'));
+    const requestSpy = redirectCosRequests(address.port, () => {
+      sends += 1;
+      if (sends === 1) beforeSend.abort(reason);
+    });
+    const storage = createCosStorage(copyFixture);
+    const operation = (signal: AbortSignal) =>
+      method === 'PUT'
+        ? storage.copy('staging/source', 'raw/target', '"source"', 'private', {
+            contentType: 'video/mp4',
+            sha256: 'a'.repeat(64),
+            signal,
+          })
+        : storage.delete('staging/source', signal);
+    try {
+      await expect(operation(AbortSignal.abort(reason))).rejects.toBe(reason);
+      expect(requestSpy).not.toHaveBeenCalled();
+
+      await expect(operation(beforeSend.signal)).rejects.toBe(reason);
+      const earlyBody = requestSpy.mock.calls[0]?.[0].Body;
+      expect(earlyBody).toMatchObject({ readableEnded: false, destroyed: true });
+      expect(sends).toBe(1);
+
+      const deadline = AbortSignal.timeout(3000);
+      const received = once(server, 'request', { signal: deadline });
+      const remove = vi.spyOn(active.signal, 'removeEventListener');
+      const pending = operation(active.signal);
+      void pending.catch(() => {});
+      const [request] = (await received) as [IncomingMessage];
+      const ended = once(request, 'end', { signal: deadline });
+      const disconnected = once(request.socket, 'close', { signal: deadline });
+      void disconnected.catch(() => {});
+      request.resume();
+      await ended;
+      const body = requestSpy.mock.calls[1]?.[0].Body;
+      expect(body).toMatchObject({ readableEnded: true, destroyed: false });
+      active.abort(reason);
+      await Promise.all([expect(pending).rejects.toBe(reason), disconnected]);
+      deadline.throwIfAborted();
+      expect(body).toMatchObject({ readableEnded: true, destroyed: true });
+      expect(remove).toHaveBeenCalledExactlyOnceWith('abort', expect.any(Function));
+      expect(seen).toEqual([method]);
+      expect(sends).toBe(2);
+    } finally {
+      active.abort(reason);
+      requestSpy.mockRestore();
+      server.closeAllConnections();
+      server.close();
+      await once(server, 'close');
+    }
+  },
+);
+
+it('preserves signalled asset copy headers and distinguishes missing deletes from other COS failures', async () => {
+  const seen: IncomingMessage['headers'][] = [];
+  const server = createServer((request, response) => {
+    seen.push(request.headers);
+    if (request.url === '/raw/target')
+      response.end('<CopyObjectResult><ETag>&quot;raw&quot;</ETag></CopyObjectResult>');
+    else if (request.url === '/raw/false-ack')
+      response.end('<Error><Code>InternalError</Code><Message>fixture</Message></Error>');
+    else if (request.url === '/raw/source-changed') response.writeHead(412).end();
+    else if (request.url === '/staging/deleted') response.writeHead(204).end();
+    else if (request.url === '/staging/missing') response.writeHead(404).end();
+    else response.writeHead(403).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('COS fixture address missing');
+  const requestSpy = redirectCosRequests(address.port);
+  const storage = createCosStorage(copyFixture);
+  const signal = AbortSignal.timeout(3000);
+  const remove = vi.spyOn(signal, 'removeEventListener');
+  try {
+    await expect(
+      storage.copy('staging/source', 'raw/target', '"source"', 'private', { signal }),
+    ).resolves.toBeUndefined();
+    expect(seen[0]).toMatchObject({
+      'cache-control': '',
+      'content-length': '0',
+      'content-type': 'application/octet-stream',
+      'x-cos-copy-source': 'mio-test-1234567890.cos.ap-shanghai.myqcloud.com/staging%2Fsource',
+      'x-cos-copy-source-if-match': '"source"',
+      'x-cos-metadata-directive': 'Replaced',
+      'x-cos-acl': 'private',
+      'x-cos-forbid-overwrite': 'true',
+    });
+    expect(seen[0]?.['x-cos-meta-sha256']).toBeUndefined();
+    await expect(
+      storage.copy('staging/source', 'raw/false-ack', '"source"', undefined, { signal }),
+    ).rejects.toThrow('COS_COPY_ACK_INVALID');
+    await expect(
+      storage.copy('staging/source', 'raw/source-changed', '"source"', undefined, { signal }),
+    ).rejects.toMatchObject({ statusCode: 412 });
+    await expect(storage.delete('staging/deleted', signal)).resolves.toBeUndefined();
+    await expect(storage.delete('staging/missing', signal)).resolves.toBeUndefined();
+    await expect(storage.delete('staging/denied', signal)).rejects.toMatchObject({
+      statusCode: 403,
+    });
+    expect(seen).toHaveLength(6);
+    expect(remove).toHaveBeenCalledTimes(6);
+  } finally {
+    requestSpy.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
 
 it('aborts the SDK sender on oversized and cancelled image streams and forwards If-Match', async () => {
   const seen = Promise.withResolvers<string | undefined>();
@@ -905,7 +1039,9 @@ it('returns the private upload header and conditionally publishes audio from onl
     close: async () => {},
   } as unknown as AssetStore;
   const uploadUrl = vi.fn(() => 'https://example.invalid/upload');
-  const ensureAudioPrivate = vi.fn(async () => {});
+  const ensureAudioPrivate = vi.fn<NonNullable<AssetObjectStore['ensureAudioPrivate']>>(
+    async () => {},
+  );
   const copy = vi.fn(async () => {});
   const service = createAssetService(store, {
     uploadUrl,
@@ -937,6 +1073,7 @@ it('returns the private upload header and conditionally publishes audio from onl
       expect.stringMatching(new RegExp(`^mio/raw/${id}/[a-f0-9-]{36}$`)),
       '"frozen"',
       'private',
+      { signal: ensureAudioPrivate.mock.calls[0]?.[2] },
     );
   } finally {
     await service.close();

@@ -18,6 +18,7 @@ import {
   renameSync,
   rmSync,
   statfsSync,
+  unlinkSync,
 } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -34,6 +35,8 @@ import type { VideoDisplayStream } from '../video-display.ts';
 
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
+const VIDEO_PROBE_PREFIX = '.video-probe-';
+const VIDEO_PROBE_SUFFIX = '.media';
 
 export class MediaError extends ApplicationError<
   | 'INPUT_INVALID'
@@ -106,19 +109,33 @@ export function paths(
 
 export function probePath(directory: string, messageId: string): string {
   if (!isUuidV4(messageId)) throw new Error('VIDEO_PROBE_ID_INVALID');
-  return join(resolve(directory), `.video-probe-${messageId}.media`);
+  return join(resolve(directory), `${VIDEO_PROBE_PREFIX}${messageId}${VIDEO_PROBE_SUFFIX}`);
 }
 
 /** Remove only the regular probe file derived from a UUID in the private worker directory. */
 export function removeProbeFile(directory: string, messageId: string): void {
-  const path = probePath(directory, messageId);
+  if (!unlinkRegularProbeFile(probePath(directory, messageId)))
+    throw new Error('VIDEO_PROBE_FILE_INVALID');
+}
+
+/** Sweep under the instance journal lock before starting any consumers. */
+export function removeOrphanProbeFiles(directory: string): void {
+  const root = resolve(directory);
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith(VIDEO_PROBE_PREFIX) || !name.endsWith(VIDEO_PROBE_SUFFIX)) continue;
+    const messageId = name.slice(VIDEO_PROBE_PREFIX.length, -VIDEO_PROBE_SUFFIX.length);
+    if (isUuidV4(messageId)) unlinkRegularProbeFile(join(root, name));
+  }
+}
+
+function unlinkRegularProbeFile(path: string): boolean {
   try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('VIDEO_PROBE_FILE_INVALID');
-    rmSync(path);
+    if (!lstatSync(path).isFile()) return false;
+    unlinkSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  return true;
 }
 
 function directoryBytes(path: string, onFile?: (path: string, stat: Stats) => void): number {

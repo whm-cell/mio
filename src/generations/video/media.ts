@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { createId, isUuidV4 } from '@mio/foundation/identifiers';
-import { constants } from 'node:fs';
-import { link, mkdir, open, readFile, rename, statfs, lstat, unlink } from 'node:fs/promises';
+import { createLogger } from '@mio/foundation/logging';
+import { constants, lstatSync, realpathSync, statfsSync } from 'node:fs';
+import { link, mkdir, open, readFile, rename, lstat, unlink } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { VideoProbeCommandV1, VideoProbeMetadataV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore } from '../../assets/contracts.ts';
@@ -11,9 +13,18 @@ import { VideoResultUrlExpired } from './execution.ts';
 import type { VideoExecution, VideoMaterializer } from './execution.ts';
 
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+const MIN_FREE_BYTES = 64 * 1024 * 1024;
 const VIDEO_CONTENT_TYPE = 'video/mp4';
 const VIDEO_IO_TIMEOUT_MS = 180_000;
 const READ_CHECKPOINT_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const log = createLogger('app', 'video-media');
+
+interface VideoDownload {
+  path: string;
+  owned: boolean;
+}
+
+const activeDownloads = new Map<string, Set<VideoDownload>>();
 
 interface SavedVideo {
   jobId: string;
@@ -137,6 +148,66 @@ async function digestFile(file: string, signal: AbortSignal) {
   }
 }
 
+function reserveVideoDownload(directory: string, pending: VideoDownload) {
+  const active = activeDownloads.get(directory) ?? new Set<VideoDownload>();
+  let requiredBytes = MIN_FREE_BYTES + MAX_VIDEO_BYTES;
+  for (const current of active) {
+    requiredBytes += MAX_VIDEO_BYTES;
+    if (!current.owned) continue;
+    const info = lstatSync(current.path, { throwIfNoEntry: false });
+    // Free space already excludes allocated blocks, including from a partial write.
+    if (info?.isFile()) requiredBytes -= Math.min(MAX_VIDEO_BYTES, info.size, info.blocks * 512);
+  }
+  // Sample last and register without yielding to another download in this executor.
+  const space = statfsSync(directory, { bigint: true });
+  if (space.bavail * space.bsize < BigInt(requiredBytes)) throw new Error('VIDEO_DISK_FULL');
+  active.add(pending);
+  activeDownloads.set(directory, active);
+  return () => {
+    if (active.delete(pending) && !active.size) activeDownloads.delete(directory);
+  };
+}
+
+async function writeDownloadedVideo(
+  url: string,
+  handle: FileHandle,
+  signal: AbortSignal,
+  download: typeof withPublicHttps,
+) {
+  signal.throwIfAborted();
+  const hash = createHash('sha256');
+  const md5 = createHash('md5');
+  let sizeBytes = 0;
+  await download(new URL(url), signal, async (response) => {
+    signal.throwIfAborted();
+    if ([401, 403, 404, 410].includes(response.status)) throw new VideoResultUrlExpired();
+    if (response.status !== 200 || !response.body) throw new Error('VIDEO_DOWNLOAD_FAILED');
+    const declared = response.headers.get('content-length');
+    if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_VIDEO_BYTES))
+      throw new Error('VIDEO_TOO_LARGE');
+    for await (const part of response.body) {
+      signal.throwIfAborted();
+      const bytes = Buffer.from(part);
+      sizeBytes += bytes.length;
+      if (sizeBytes > MAX_VIDEO_BYTES) throw new Error('VIDEO_TOO_LARGE');
+      hash.update(bytes);
+      md5.update(bytes);
+      let offset = 0;
+      while (offset < bytes.length) {
+        signal.throwIfAborted();
+        const written = await handle.write(bytes, offset, bytes.length - offset);
+        if (!written.bytesWritten) throw new Error('VIDEO_STORAGE_FAILED');
+        offset += written.bytesWritten;
+      }
+    }
+    if (sizeBytes < 1 || (declared !== null && sizeBytes !== Number(declared)))
+      throw new Error('VIDEO_DOWNLOAD_INCOMPLETE');
+  });
+  signal.throwIfAborted();
+  await handle.sync();
+  return { sizeBytes, sha256: hash.digest('hex'), contentMd5: md5.digest('base64') };
+}
+
 async function downloadVideo(
   url: string,
   file: string,
@@ -145,53 +216,32 @@ async function downloadVideo(
   expected?: Pick<SavedVideo, 'sizeBytes' | 'sha256'>,
 ) {
   signal.throwIfAborted();
-  const space = await statfs(dirname(file), { bigint: true });
-  if (space.bavail * space.bsize < BigInt(MAX_VIDEO_BYTES + 64 * 1024 * 1024))
-    throw new Error('VIDEO_DISK_FULL');
+  const directory = realpathSync(dirname(dirname(file)));
   const temporary = file + '.' + createId();
-  const handle = await open(temporary, 'wx', 0o600);
-  const hash = createHash('sha256');
-  const md5 = createHash('md5');
-  let sizeBytes = 0;
+  const pending: VideoDownload = { path: temporary, owned: false };
+  const release = reserveVideoDownload(directory, pending);
   try {
-    signal.throwIfAborted();
-    await download(new URL(url), signal, async (response) => {
-      signal.throwIfAborted();
-      if ([401, 403, 404, 410].includes(response.status)) throw new VideoResultUrlExpired();
-      if (response.status !== 200 || !response.body) throw new Error('VIDEO_DOWNLOAD_FAILED');
-      const declared = response.headers.get('content-length');
-      if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_VIDEO_BYTES))
-        throw new Error('VIDEO_TOO_LARGE');
-      for await (const part of response.body) {
-        signal.throwIfAborted();
-        const bytes = Buffer.from(part);
-        sizeBytes += bytes.length;
-        if (sizeBytes > MAX_VIDEO_BYTES) throw new Error('VIDEO_TOO_LARGE');
-        hash.update(bytes);
-        md5.update(bytes);
-        let offset = 0;
-        while (offset < bytes.length) {
-          signal.throwIfAborted();
-          const written = await handle.write(bytes, offset, bytes.length - offset);
-          if (!written.bytesWritten) throw new Error('VIDEO_STORAGE_FAILED');
-          offset += written.bytesWritten;
-        }
-      }
-      if (sizeBytes < 1 || (declared !== null && sizeBytes !== Number(declared)))
-        throw new Error('VIDEO_DOWNLOAD_INCOMPLETE');
-    });
-    signal.throwIfAborted();
-    await handle.sync();
+    const handle = await open(temporary, 'wx', 0o600);
+    pending.owned = true;
+    const actual = await writeDownloadedVideo(url, handle, signal, download).finally(() =>
+      handle.close(),
+    );
+    if (expected && (actual.sizeBytes !== expected.sizeBytes || actual.sha256 !== expected.sha256))
+      throw new Error('VIDEO_CHECKPOINT_INVALID');
+    // From here publication only links and unlinks already allocated bytes.
+    release();
+    if (!(await publish(temporary, file, 'create', signal))) return;
+    return actual;
+  } catch (error) {
+    // Preserve the original error and any canonical name already installed.
+    if (pending.owned)
+      await unlink(temporary).catch((cleanupError: NodeJS.ErrnoException) => {
+        if (cleanupError.code !== 'ENOENT') log.error('VIDEO_DOWNLOAD_CLEANUP_FAILED');
+      });
+    throw error;
   } finally {
-    await handle.close();
+    release();
   }
-  const sha256 = hash.digest('hex');
-  if (expected && (sizeBytes !== expected.sizeBytes || sha256 !== expected.sha256)) {
-    await unlink(temporary);
-    throw new Error('VIDEO_CHECKPOINT_INVALID');
-  }
-  if (!(await publish(temporary, file, 'create', signal))) return;
-  return { sizeBytes, sha256, contentMd5: md5.digest('base64') };
 }
 
 async function putStagingVideo(
@@ -421,8 +471,9 @@ export function createVideoCleanup(objects: AssetObjectStore, dataDirectory: str
         const value = await waitForObjectHead(() => objects.head(staging, signal), signal);
         verifyVideoObject(value, saved, saved.etag);
         signal.throwIfAborted();
-        await objects.delete(staging);
+        await objects.delete(staging, signal);
       } catch (error) {
+        signal.throwIfAborted();
         if ((error as { statusCode?: number }).statusCode !== 404) throw error;
       }
       signal.throwIfAborted();
@@ -431,6 +482,7 @@ export function createVideoCleanup(objects: AssetObjectStore, dataDirectory: str
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
+      signal.throwIfAborted();
       await unlink(receipt);
     }
   };

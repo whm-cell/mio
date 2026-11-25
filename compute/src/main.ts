@@ -8,7 +8,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isJournalFailure, Journal } from './adapters/journal.ts';
 import { ObjectStore } from './adapters/cos.ts';
-import { processIdentity } from './adapters/media.ts';
+import { processIdentity, removeOrphanProbeFiles } from './adapters/media.ts';
 import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
@@ -90,7 +90,6 @@ async function start(): Promise<void> {
       : {}),
   });
   const journal = new Journal(directory, instance);
-  slots.setHold('encode', 'transcode', journal.hasUnknownProcess());
   const stopping = new AbortController();
   let worker: Worker | null = null;
   const stop = () => {
@@ -99,8 +98,10 @@ async function start(): Promise<void> {
   };
   let observability: ReturnType<typeof createWorkerObservability> | undefined;
   try {
+    slots.setHold('encode', 'transcode', journal.hasUnknownProcess());
     if (monitored)
       observability = createWorkerObservability(instance, journal.observability, slots);
+    removeOrphanProbeFiles(directory);
   } catch (error) {
     journal.close();
     throw error;

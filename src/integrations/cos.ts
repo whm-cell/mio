@@ -18,6 +18,35 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     Timeout: 60_000,
     FollowRedirect: false,
   });
+  const requestWithoutBody = async (
+    Key: string,
+    Method: 'PUT' | 'DELETE',
+    signal: AbortSignal,
+    headers?: Record<string, string>,
+  ) => {
+    signal.throwIfAborted();
+    // Pinned SDK 3.0.0 aborts the sender on input stream error and does not retry streams.
+    // Keep the empty stream destroyable after EOF while COS may still be preparing its reply.
+    const body = Readable.from([], { autoDestroy: false });
+    const abort = () => body.destroy(new Error('COS_REQUEST_ABORTED'));
+    signal.addEventListener('abort', abort, { once: true });
+    try {
+      return await cos.request({
+        Bucket,
+        Region,
+        Key,
+        Method,
+        Body: body,
+        Headers: { ...headers, 'Content-Length': '0' },
+      });
+    } catch (error) {
+      signal.throwIfAborted();
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', abort);
+      body.destroy();
+    }
+  };
   // This SDK appends the session token after signing without URL-encoding it.
   // Encode only that parameter; the signed query and the token used by SDK requests stay intact.
   const encodeUrlToken = (url: string) => {
@@ -263,9 +292,9 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         stream.destroy();
       }
     },
-    async copy(source, target, etag, acl, replacement) {
+    async copy(source, target, etag, acl, options) {
       const sourcePath = `${Bucket}.cos.${Region}.myqcloud.com/${encodeURIComponent(source)}`;
-      if (!replacement) {
+      if (!options) {
         await cos.putObjectCopy({
           Bucket,
           Region,
@@ -279,35 +308,40 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         });
         return;
       }
-      replacement.signal.throwIfAborted();
-      // The SDK replays ordinary copy requests on ambiguous transport errors.
-      // Its stream path sends this empty request once so the caller can reconcile first.
-      const copied = await cos.request({
-        Bucket,
-        Region,
-        Key: target,
-        Method: 'PUT',
-        Body: Readable.from([]),
-        Headers: {
-          'Content-Length': '0',
-          'Content-Type': replacement.contentType,
-          'x-cos-copy-source': sourcePath,
-          'x-cos-copy-source-If-Match': etag,
-          'x-cos-metadata-directive': 'Replaced',
-          'x-cos-meta-sha256': replacement.sha256,
-          ...(acl ? { 'x-cos-acl': acl } : {}),
-          'x-cos-forbid-overwrite': 'true',
-        },
+      const { signal, contentType = 'application/octet-stream', sha256 } = options;
+      const copied = await requestWithoutBody(target, 'PUT', signal, {
+        'Content-Type': contentType,
+        'x-cos-copy-source': sourcePath,
+        'x-cos-copy-source-If-Match': etag,
+        'x-cos-metadata-directive': 'Replaced',
+        ...(sha256 === undefined ? { 'Cache-Control': '' } : { 'x-cos-meta-sha256': sha256 }),
+        ...(acl ? { 'x-cos-acl': acl } : {}),
+        'x-cos-forbid-overwrite': 'true',
       });
-      replacement.signal.throwIfAborted();
+      signal.throwIfAborted();
       // COS can return HTTP 200 with an XML Error instead of CopyObjectResult.
+      if (sha256 === undefined) {
+        if (copied.Error) throw new Error('COS_COPY_ACK_INVALID');
+        return;
+      }
       const copiedEtag: unknown = copied.CopyObjectResult?.ETag;
-      if (typeof copiedEtag !== 'string' || !copiedEtag)
+      if (copied.Error || typeof copiedEtag !== 'string' || !copiedEtag)
         throw new Error('COS_VIDEO_COPY_ACK_INVALID');
       return { etag: copiedEtag };
     },
-    async delete(Key) {
-      await cos.deleteObject({ Bucket, Region, Key });
+    async delete(Key, signal) {
+      if (!signal) {
+        await cos.deleteObject({ Bucket, Region, Key });
+        return;
+      }
+      try {
+        await requestWithoutBody(Key, 'DELETE', signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        // Match deleteObject's treatment of an already missing object or bucket.
+        if ((error as COS.CosError | undefined)?.statusCode !== HTTP_STATUS.NOT_FOUND) throw error;
+      }
+      signal.throwIfAborted();
     },
   };
 }

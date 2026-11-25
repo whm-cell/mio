@@ -87,8 +87,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
     );
     return action;
   };
-  // The SDK does not expose cancellation for these calls. Stop waiting after the drain
-  // deadline; a late copy has a unique key and cannot register through this operation.
+  // Keep a bounded wait for object calls, including adapters that ignore cancellation.
   const waitObject = <T>(start: () => Promise<T>, signal = stop.signal): Promise<T> => {
     if (signal.aborted)
       return Promise.reject(new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE'));
@@ -206,7 +205,8 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
             log.error('ASSET_STAGING_KEY_INVALID');
             continue;
           }
-          await waitObject(() => objects.delete(row.staging_key));
+          await waitObject(() => objects.delete(row.staging_key, stop.signal));
+          stop.signal.throwIfAborted();
           await store.stagingDeleted(row.id, row.staging_key);
         } catch {
           log.error('ASSET_STAGING_CLEANUP_FAILED');
@@ -355,17 +355,19 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         }
         const rawKey = `mio/raw/${id}/${createId()}`;
         try {
-          if (playableAudio.has(claimed.content_type.toLowerCase())) {
+          const acl = playableAudio.has(claimed.content_type.toLowerCase()) ? 'private' : undefined;
+          if (acl) {
             const ensurePrivate = objects.ensureAudioPrivate;
             if (!ensurePrivate)
               throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
             await waitObject(() =>
               ensurePrivate(stagingKey, { sizeBytes: head.size, etag: head.etag }, stop.signal),
             );
-            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag, 'private'));
-          } else {
-            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag));
           }
+          await waitObject(() =>
+            objects.copy(stagingKey, rawKey, head.etag, acl, { signal: stop.signal }),
+          );
+          stop.signal.throwIfAborted();
         } catch (error) {
           await store.release(id, lease).catch(() => {});
           if (statusCode(error) === 412)

@@ -1,9 +1,11 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import {
   copyFileSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,6 +13,7 @@ import {
   rmSync,
   statSync,
   statfsSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
 } from 'node:fs';
@@ -31,7 +34,7 @@ import type {
 } from '@mio/compute-contracts';
 import type { ObjectStore } from '../src/adapters/cos.ts';
 import { Journal } from '../src/adapters/journal.ts';
-import { probePath, requireProbeSpace } from '../src/adapters/media.ts';
+import { paths, probePath, requireProbeSpace } from '../src/adapters/media.ts';
 import type { Broker } from '../src/adapters/rabbitmq.ts';
 import { ResourceSlots } from '../src/resource-slots.ts';
 import { Worker } from '../src/worker.ts';
@@ -50,6 +53,32 @@ function directory(): string {
   const path = mkdtempSync(join(tmpdir(), 'mio-video-probe-'));
   directories.push(path);
   return path;
+}
+
+function runWorkerCommand(root: string, action: 'init' | 'start') {
+  const mainUrl = new URL('../src/main.ts', import.meta.url).href;
+  const script = `
+    process.argv = [process.execPath, 'worker', ${JSON.stringify(action)}];
+    await import(${JSON.stringify(mainUrl)});
+    process.emit('SIGTERM');
+  `;
+  return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: {
+      PATH: root,
+      MIO_COMPUTE_DIRECTORY: root,
+      MIO_COMPUTE_INSTANCE_ID: 'probe-test',
+      // Broker rejects this protocol locally, before opening any sockets.
+      RABBITMQ_URL: 'fixture://worker@127.0.0.1/fixture',
+      MIO_COMPUTE_BROKER_USER: 'worker',
+      MIO_COMPUTE_EXPECTED_COMMAND_USER: 'app',
+      MIO_COS_BUCKET: 'fixture',
+      MIO_COS_REGION: 'fixture',
+      MIO_COS_SECRET_ID: 'fixture',
+      MIO_COS_SECRET_KEY: 'fixture',
+    },
+  });
 }
 
 function fixture(root: string): string {
@@ -150,6 +179,71 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.mocked(statfsSync).mockReset();
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+it('sweeps orphaned probe files only on worker start after acquiring the journal lock', async () => {
+  const root = directory();
+  const messageId = randomUUID();
+  const orphan = probePath(root, messageId);
+  const nested = probePath(root, randomUUID());
+  const outside = join(directory(), 'outside.media');
+  const link = probePath(root, randomUUID());
+  mkdirSync(nested);
+  const preserved = [
+    ...Object.values(paths(root, randomUUID())),
+    probePath(nested, randomUUID()),
+    join(root, '.video-probe-00000000-0000-1000-8000-000000000000.media'),
+    probePath(root, randomUUID()) + '.bak',
+    outside,
+  ];
+  for (const path of preserved) writeFileSync(path, 'keep');
+  symlinkSync(outside, link);
+  writeFileSync(orphan, 'init marker', { mode: 0o600 });
+  const initialized = runWorkerCommand(root, 'init');
+  expect(initialized.status, initialized.stderr).toBe(0);
+  expect(readFileSync(orphan, 'utf8')).toBe('init marker');
+
+  const journalUrl = new URL('../src/adapters/journal.ts', import.meta.url).href;
+  const mediaUrl = new URL('../src/adapters/media.ts', import.meta.url).href;
+  const script = `
+    import { PassThrough } from 'node:stream';
+    import { Journal } from ${JSON.stringify(journalUrl)};
+    import { drainProbeInput } from ${JSON.stringify(mediaUrl)};
+    const [root, messageId] = process.argv.slice(1);
+    const journal = new Journal(root, 'probe-test');
+    const input = new PassThrough();
+    void drainProbeInput(input, root, messageId, 100, 'a'.repeat(64), new AbortController().signal);
+    input.write('in-flight probe bytes');
+    process.on('SIGTERM', () => journal.close());
+    setInterval(() => {}, 1000);
+  `;
+  const owner = spawn(process.execPath, ['--input-type=module', '-e', script, root, messageId], {
+    env: {},
+    stdio: 'ignore',
+    timeout: 12_000,
+    killSignal: 'SIGKILL',
+  });
+  const exited = once(owner, 'exit');
+  try {
+    await vi.waitFor(() => expect(readFileSync(orphan, 'utf8')).toBe('in-flight probe bytes'), {
+      timeout: 5_000,
+    });
+    const contender = runWorkerCommand(root, 'start');
+    expect(contender.status, contender.stderr).toBe(1);
+    expect(contender.stderr).toContain('WORKER_STARTUP_FAILED');
+    expect(readFileSync(orphan, 'utf8')).toBe('in-flight probe bytes');
+  } finally {
+    owner.kill('SIGKILL');
+    await exited;
+  }
+  expect(await exited).toEqual([null, 'SIGKILL']);
+
+  const restarted = runWorkerCommand(root, 'start');
+  expect(restarted.status, restarted.stderr).toBe(0);
+  expect(existsSync(orphan)).toBe(false);
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  for (const path of preserved) expect(readFileSync(path, 'utf8')).toBe('keep');
+  new Journal(root, 'probe-test').close();
 });
 
 it('accepts only a small v1 identity envelope with a fixed private staging key', () => {

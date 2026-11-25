@@ -1,5 +1,8 @@
 import { randomUUID, createHash } from 'node:crypto';
+import { lstatSync, statfsSync } from 'node:fs';
+import type * as FileSystem from 'node:fs';
 import {
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -10,9 +13,11 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
+import type * as AsyncFileSystem from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import COS from 'cos-nodejs-sdk-v5';
@@ -21,6 +26,7 @@ import { createVideoMaterializer, createVideoCleanup } from '../../src/generatio
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
+import { createVideoExecutor } from '../../src/generations/video/executor.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
 import { VideoSubmissionReceipts } from '../../src/generations/video/submission-receipts.ts';
 import { VideoGenerationStore } from '../../src/generations/video/store.ts';
@@ -31,8 +37,63 @@ import type { withPublicHttps } from '../../src/integrations/onelink/public-http
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
+vi.mock('node:fs', async (original) => {
+  const fs = await original<typeof FileSystem>();
+  return { ...fs, lstatSync: vi.fn(fs.lstatSync), statfsSync: vi.fn(fs.statfsSync) };
+});
+
+vi.mock('node:fs/promises', async (original) => {
+  const fs = await original<typeof AsyncFileSystem>();
+  return { ...fs, link: vi.fn(fs.link), open: vi.fn(fs.open), unlink: vi.fn(fs.unlink) };
+});
+
 const video = { url: 'https://video.fixture/result.mp4' };
 const videos = [video];
+const MiB = 1024 * 1024;
+
+const cosFixture = () =>
+  createCosStorage({
+    databaseURL: 'postgresql://example.invalid/media',
+    bucket: 'mio-test-1234567890',
+    region: 'ap-shanghai',
+    secretId: 'fixture',
+    secretKey: 'fixture',
+  });
+
+function holdCosResponse(params: COS.RequestParams) {
+  const reply = Promise.withResolvers<COS.RequestResult>();
+  const body = params.Body as Readable;
+  body.once('error', reply.reject);
+  body.resume();
+  return reply;
+}
+
+function pauseVideoBody(bytes: Buffer) {
+  const finish = Promise.withResolvers<void>();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+    },
+    async pull(controller) {
+      try {
+        await finish.promise;
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+  return { response: new Response(body), finish };
+}
+
+function mockFreeSpace(directory: string, availableMiB: number) {
+  const space = {
+    ...statfsSync(directory, { bigint: true }),
+    bavail: BigInt(availableMiB * MiB),
+    bsize: 1n,
+  };
+  return vi.mocked(statfsSync).mockReturnValue(space);
+}
 
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'mio-video-media-'));
@@ -99,7 +160,7 @@ async function fixture() {
     audioCodec: null,
   }));
   const row = { id: randomUUID(), owner_id: randomUUID() } as VideoExecution;
-  const start = () => createVideoMaterializer(objects, directory, probe, download);
+  const start = (root = directory) => createVideoMaterializer(objects, root, probe, download);
   return {
     bytes,
     directory,
@@ -230,6 +291,10 @@ describe('durable video materialization', () => {
         await expect(older).resolves.toEqual(newer);
         expect(await readFile(receipt, 'utf8')).toBe(winner);
         expect(await readFile(file)).toEqual(f.bytes);
+        expect((await readdir(f.checkpoint(''))).sort()).toEqual([
+          `${index}.json`,
+          `${index}.media`,
+        ]);
         const probe = f.probe.mock.calls[0]![0];
         expect(newer.key).toBe(`mio/raw/${newer.assetId}/${probe.attemptId}`);
         expect([...f.saved.keys()]).toEqual([probe.source.stagingKey, newer.key]);
@@ -269,6 +334,9 @@ describe('durable video materialization', () => {
         const signal = AbortSignal.timeout(5000);
         await expect(f.run(f.row, video, index, signal)).rejects.toBe(error);
         expect(await readFile(f.checkpoint(`${index}.media`))).toEqual(f.bytes);
+        expect((await readdir(directory)).sort()).toEqual(
+          extension === 'media' ? [`${index}.media`] : [`${index}.json`, `${index}.media`],
+        );
         const firstReceipt = readFile(f.checkpoint(`${index}.json`), 'utf8');
         if (extension === 'media')
           await expect(firstReceipt).rejects.toMatchObject({ code: 'ENOENT' });
@@ -308,8 +376,8 @@ describe('durable video materialization', () => {
       try {
         const index = 3;
         await mkdir(f.checkpoint(''), { recursive: true });
-        const fragment = f.checkpoint(`${index}.media.${randomUUID()}`);
-        await writeFile(fragment, f.bytes);
+        const fragment = `${index}.media.${randomUUID()}`;
+        await writeFile(f.checkpoint(fragment), f.bytes);
         vi.mocked(f.download).mockImplementationOnce(async (_url, _signal, consume) =>
           consume(new Response(null, { status })),
         );
@@ -318,8 +386,289 @@ describe('durable video materialization', () => {
         else await expect(output).rejects.toBeInstanceOf(VideoResultUrlExpired);
         expect(f.download).toHaveBeenCalledTimes(1);
         expect(f.objects.putVideo).not.toHaveBeenCalled();
-        expect(await readFile(fragment)).toEqual(f.bytes);
+        expect(await readFile(f.checkpoint(fragment))).toEqual(f.bytes);
+        expect(await readdir(f.checkpoint(''))).toEqual([fragment]);
       } finally {
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['disconnect', 'shutdown'])(
+    'removes its partly written download after %s and leaves an overlapping winner intact',
+    async (failure) => {
+      const f = await fixture();
+      const stop = new AbortController();
+      const reason = new Error(failure);
+      const previous = `0.media.${randomUUID()}`;
+      await mkdir(f.checkpoint(''), { recursive: true });
+      await writeFile(f.checkpoint(previous), 'older fragment');
+      const { response, finish } = pauseVideoBody(Buffer.from('interrupted source bytes'));
+      vi.mocked(f.download).mockImplementationOnce((_url, _signal, consume) => consume(response));
+      const operation = f.run(f.row, video, 0, stop.signal).catch((error: unknown) => error);
+      try {
+        await vi.waitFor(async () => {
+          const names = (await readdir(f.checkpoint(''))).filter((name) => name !== previous);
+          expect(names).toHaveLength(1);
+          expect(await readFile(f.checkpoint(names[0]!), 'utf8')).toBe('interrupted source bytes');
+        });
+        await f.start()(f.row, video, 0, AbortSignal.timeout(5000));
+        const winner = await readFile(f.checkpoint('0.json'));
+        if (failure === 'disconnect') finish.reject(reason);
+        else {
+          stop.abort(reason);
+          finish.resolve();
+        }
+        expect(await operation).toBe(reason);
+        expect((await readdir(f.checkpoint(''))).sort()).toEqual(['0.json', '0.media', previous]);
+        expect(await readFile(f.checkpoint('0.media'))).toEqual(f.bytes);
+        expect(await readFile(f.checkpoint('0.json'))).toEqual(winner);
+        expect(await readFile(f.checkpoint(previous), 'utf8')).toBe('older fragment');
+        expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+      } finally {
+        finish.resolve();
+        await operation;
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['length mismatch', 'ENOSPC', 'link failure'])(
+    'reclaims a download without publishing it after %s',
+    async (failure) => {
+      const f = await fixture();
+      const reason = new Error(
+        failure === 'length mismatch' ? 'VIDEO_DOWNLOAD_INCOMPLETE' : failure,
+      );
+      const sys = await vi.importActual<typeof AsyncFileSystem>('node:fs/promises');
+      const opened = vi.mocked(open);
+      const linked = vi.mocked(link);
+      const previous = `0.media.${randomUUID()}`;
+      try {
+        await mkdir(f.checkpoint(''), { recursive: true });
+        await writeFile(f.checkpoint(previous), 'older fragment');
+        if (failure === 'length mismatch') {
+          vi.mocked(f.download).mockImplementationOnce((_url, _signal, consume) =>
+            consume(
+              new Response(f.bytes, { headers: { 'content-length': String(f.bytes.length + 1) } }),
+            ),
+          );
+        } else if (failure === 'ENOSPC') {
+          Object.assign(reason, { code: 'ENOSPC' });
+          opened.mockImplementation(async (path, ...options) => {
+            const handle = await sys.open(path, ...options);
+            if (String(path).startsWith(f.checkpoint('0.media.'))) {
+              const write = handle.write.bind(handle);
+              vi.spyOn(handle, 'write').mockImplementationOnce(async () => {
+                await write(f.bytes, 0, 7);
+                throw reason;
+              });
+            }
+            return handle;
+          });
+        } else linked.mockRejectedValueOnce(reason);
+        await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toThrow(reason);
+        expect(await readdir(f.checkpoint(''))).toEqual([previous]);
+        expect(await readFile(f.checkpoint(previous), 'utf8')).toBe('older fragment');
+        expect(f.objects.putVideo).not.toHaveBeenCalled();
+      } finally {
+        opened.mockReset();
+        linked.mockReset();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['unlink error', 'shutdown'])(
+    'retains the canonical download after the hard link followed by %s',
+    async (failure) => {
+      const f = await fixture();
+      const stop = new AbortController();
+      const reason = new Error(failure);
+      const sys = await vi.importActual<typeof AsyncFileSystem>('node:fs/promises');
+      const removed = vi.mocked(unlink);
+      const linked = vi.mocked(link);
+      try {
+        if (failure === 'unlink error') removed.mockRejectedValueOnce(reason);
+        else {
+          linked.mockImplementationOnce(async (...args) => {
+            await sys.link(...args);
+            stop.abort(reason);
+          });
+        }
+        await expect(f.run(f.row, video, 0, stop.signal)).rejects.toBe(reason);
+        expect(await readdir(f.checkpoint(''))).toEqual(['0.media']);
+        expect(await readFile(f.checkpoint('0.media'))).toEqual(f.bytes);
+        expect(f.objects.putVideo).not.toHaveBeenCalled();
+        await expect(f.start()(f.row, video, 0, AbortSignal.timeout(5000))).resolves.toMatchObject({
+          index: 0,
+        });
+        expect(f.download).toHaveBeenCalledTimes(1);
+      } finally {
+        removed.mockReset();
+        linked.mockReset();
+        await f.close();
+      }
+    },
+  );
+
+  it('keeps a randomized path whose exclusive open collides and releases its reservation', async () => {
+    const f = await fixture();
+    const disk = mockFreeSpace(f.directory, 650);
+    const sys = await vi.importActual<typeof AsyncFileSystem>('node:fs/promises');
+    const opened = vi.mocked(open);
+    let existing = '';
+    try {
+      opened.mockImplementation(async (path, ...options) => {
+        if (String(path).startsWith(f.checkpoint('0.media.'))) {
+          existing = String(path);
+          await writeFile(path, 'existing unowned file', { flag: 'wx' });
+        }
+        return sys.open(path, ...options);
+      });
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toMatchObject({
+        code: 'EEXIST',
+      });
+      expect(await readFile(existing, 'utf8')).toBe('existing unowned file');
+      expect(f.download).not.toHaveBeenCalled();
+      opened.mockReset();
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).resolves.toMatchObject({
+        index: 0,
+      });
+      expect(await readFile(existing, 'utf8')).toBe('existing unowned file');
+    } finally {
+      opened.mockReset();
+      disk.mockReset();
+      await f.close();
+    }
+  });
+
+  it('reports a failed temporary unlink without exposing the path or losing the expiry error', async () => {
+    const f = await fixture();
+    const failure = Object.assign(new Error(f.checkpoint('private-fault-path')), { code: 'EIO' });
+    const removed = vi.mocked(unlink).mockClear().mockRejectedValueOnce(failure);
+    let logged = '';
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      logged += String(chunk);
+      return true;
+    });
+    try {
+      vi.mocked(f.download).mockImplementationOnce((_url, _signal, consume) =>
+        consume(new Response(null, { status: 404 })),
+      );
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toBeInstanceOf(
+        VideoResultUrlExpired,
+      );
+      expect(JSON.parse(logged)).toMatchObject({ event: 'VIDEO_DOWNLOAD_CLEANUP_FAILED' });
+      expect(logged).not.toContain('private-fault-path');
+      expect(removed.mock.calls[0]![0]).toMatch(/^.*\/0\.media\.[a-f0-9-]+$/);
+      expect(await readdir(f.checkpoint(''))).toHaveLength(1);
+    } finally {
+      output.mockRestore();
+      removed.mockReset();
+      await f.close();
+    }
+  });
+
+  it.each(['shutdown', 'failure'])(
+    'admits one of four downloads with 650 MiB free and releases it on %s',
+    async (failure) => {
+      const f = await fixture();
+      const alias = join(f.directory, 'alias');
+      await symlink(f.directory, alias, 'dir');
+      const disk = mockFreeSpace(f.directory, 650);
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const stop = new AbortController();
+      const reason = new Error(failure);
+      vi.mocked(f.download).mockImplementationOnce(async (_url, signal, consume) => {
+        entered.resolve();
+        await resume.promise;
+        signal.throwIfAborted();
+        if (failure === 'failure') throw reason;
+        return consume(new Response(f.bytes));
+      });
+      const settled: unknown[] = [];
+      const calls = Array.from({ length: 4 }, (_, index) => {
+        const row = { ...f.row, id: randomUUID() };
+        return f
+          .start(index % 2 ? alias : f.directory)(row, video, index, stop.signal)
+          .catch((error: unknown) => error)
+          .then((outcome) => settled.push(outcome));
+      });
+      try {
+        await entered.promise;
+        await vi.waitFor(() => expect(settled).toHaveLength(3));
+        for (const outcome of settled)
+          expect(outcome).toMatchObject({ message: 'VIDEO_DISK_FULL' });
+        expect(f.download).toHaveBeenCalledTimes(1);
+        expect(f.objects.putVideo).not.toHaveBeenCalled();
+        if (failure === 'shutdown') stop.abort(reason);
+        resume.resolve();
+        await Promise.all(calls);
+        expect(settled[3]).toBe(reason);
+        await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).resolves.toMatchObject({
+          index: 0,
+        });
+        expect(f.download).toHaveBeenCalledTimes(2);
+      } finally {
+        resume.resolve();
+        await Promise.all(calls);
+        disk.mockReset();
+        await f.close();
+      }
+    },
+  );
+
+  it.each([
+    { size: 450, allocated: 450, admits: true },
+    { size: 450, allocated: 400, admits: false },
+    { size: 400, allocated: 450, admits: false },
+  ])(
+    'uses both length $size MiB and allocation $allocated MiB before sampling free bytes',
+    async ({ size, allocated, admits }) => {
+      const f = await fixture();
+      const disk = mockFreeSpace(f.directory, 650);
+      const space = statfsSync(f.directory, { bigint: true });
+      const inspect = vi.mocked(lstatSync);
+      const { response, finish } = pauseVideoBody(f.bytes);
+      vi.mocked(f.download).mockImplementationOnce((_url, _signal, consume) => consume(response));
+      const first = f.run(f.row, video, 0, AbortSignal.timeout(5000));
+      try {
+        const temporary = await vi.waitFor(async () => {
+          const names = await readdir(f.checkpoint(''));
+          expect(names).toHaveLength(1);
+          const path = f.checkpoint(names[0]!);
+          expect(await readFile(path)).toEqual(f.bytes);
+          return path;
+        });
+        const info = lstatSync(temporary);
+        const observed: string[] = [];
+        inspect.mockImplementation((path) => {
+          expect(path).toBe(temporary);
+          observed.push('allocated');
+          return Object.assign(info, { size: size * MiB, blocks: (allocated * MiB) / 512 });
+        });
+        disk.mockImplementation(() => {
+          observed.push('free');
+          return space;
+        });
+        const second = f.start()(
+          { ...f.row, id: randomUUID() },
+          video,
+          0,
+          AbortSignal.timeout(5000),
+        );
+        if (admits) await expect(second).resolves.toMatchObject({ index: 0 });
+        else await expect(second).rejects.toThrow('VIDEO_DISK_FULL');
+        expect(observed).toEqual(['allocated', 'free']);
+        finish.resolve();
+        await expect(first).resolves.toMatchObject({ index: 0 });
+      } finally {
+        finish.resolve();
+        await first.catch(() => {});
+        inspect.mockReset();
+        disk.mockReset();
         await f.close();
       }
     },
@@ -353,6 +702,8 @@ describe('durable video materialization', () => {
       const path = f.checkpoint(`${index}.json`);
       const firstReceipt = await readFile(path, 'utf8');
       await unlink(f.checkpoint(`${index}.media`));
+      const fragment = `${index}.media.${randomUUID()}`;
+      await writeFile(f.checkpoint(fragment), 'unrelated bytes');
 
       const restored = f.start();
       vi.mocked(f.download).mockImplementationOnce(async (_url, _signal, consume) =>
@@ -369,6 +720,8 @@ describe('durable video materialization', () => {
         'VIDEO_CHECKPOINT_INVALID',
       );
       expect(await readFile(path, 'utf8')).toBe(firstReceipt);
+      expect((await readdir(f.checkpoint(''))).sort()).toEqual([`${index}.json`, fragment]);
+      expect(await readFile(f.checkpoint(fragment), 'utf8')).toBe('unrelated bytes');
       expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
       const { assetId, attemptId, sha256 } = JSON.parse(firstReceipt);
       expect(await restored(f.row, refreshed, index, signal)).toMatchObject({
@@ -524,13 +877,7 @@ describe('durable video materialization', () => {
       started.resolve();
       return reply.promise;
     });
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'fixture',
-      secretKey: 'fixture',
-    });
+    const storage = cosFixture();
     const stop = new AbortController();
     const reason = new Error('fixture shutdown');
     try {
@@ -592,30 +939,43 @@ describe('durable video materialization', () => {
 
   it('reconciles an in-flight copy after shutdown without a second write', async () => {
     const f = await fixture();
-    const started = Promise.withResolvers<void>();
-    const reply = Promise.withResolvers<void>();
     const stop = new AbortController();
     const reason = new Error('fixture shutdown');
+    let reply: ReturnType<typeof holdCosResponse> | undefined;
+    const request = vi.spyOn(COS.prototype, 'request').mockImplementation(async (params) => {
+      expect(params.Method).toBe('PUT');
+      const stage = f.probe.mock.calls[0]![0].source.stagingKey;
+      f.saved.set(params.Key!, { ...f.saved.get(stage)!, etag: 'copied-before-shutdown' });
+      reply = holdCosResponse(params);
+      return reply.promise;
+    });
+    const fallback = vi
+      .spyOn(COS.prototype, 'putObjectCopy')
+      .mockRejectedValue(new Error('unexpected uninterruptible copy'));
     try {
-      const copy = vi.mocked(f.objects.copy).getMockImplementation()!;
-      vi.mocked(f.objects.copy).mockImplementationOnce(async (...args) => {
-        const result = await copy(...args);
-        started.resolve();
-        await reply.promise;
-        return result;
-      });
-      const pending = f.run(f.row, video, 0, stop.signal);
-      await started.promise;
+      vi.mocked(f.objects.copy).mockImplementationOnce(cosFixture().copy);
+      const finished = vi.fn();
+      const pending = f.run(f.row, video, 0, stop.signal).then(finished, finished);
+      await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1));
       stop.abort(reason);
-      reply.resolve();
-      await expect(pending).rejects.toBe(reason);
+      await vi.waitFor(() => expect(finished).toHaveBeenCalledExactlyOnceWith(reason));
+      await pending;
+      expect(fallback).not.toHaveBeenCalled();
       const original = vi.mocked(f.objects.copy).mock.calls[0]!;
+      expect(f.saved.get(original[1])?.etag).toBe('copied-before-shutdown');
+      expect(JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8')).rawEtag).toBeUndefined();
+      const head = vi.mocked(f.objects.head).mockClear();
       const restored = await f.start()(f.row, video, 0, AbortSignal.timeout(5000));
-      expect(restored.key).toBe(original[1]);
+      expect(restored).toMatchObject({ key: original[1], etag: 'copied-before-shutdown' });
+      expect(head.mock.calls.map(([key]) => key)).toEqual([original[1]]);
       expect(f.objects.copy).toHaveBeenCalledTimes(1);
       expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
       expect(f.probe).toHaveBeenCalledTimes(1);
     } finally {
+      stop.abort(reason);
+      reply?.reject(reason);
+      request.mockRestore();
+      fallback.mockRestore();
       await f.close();
     }
   });
@@ -732,7 +1092,7 @@ describe('durable video materialization', () => {
   });
 });
 
-it('recovers a lost copy acknowledgement to one owner asset in PostgreSQL after restart', async () => {
+it('reconciles a lost copy acknowledgement and cleanup interrupted by executor shutdown', async () => {
   const f = await fixture();
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
@@ -819,6 +1179,64 @@ it('recovers a lost copy acknowledgement to one owner asset in PostgreSQL after 
     expect(f.objects.copy).toHaveBeenCalledTimes(1);
     expect(f.probe).toHaveBeenCalledTimes(1);
     expect(protocol).not.toHaveBeenCalled();
+
+    // Exercise cleanup with the same completed row and both recovery artifacts present.
+    await execution.close();
+    const mediaFile = join(f.directory, 'video', jobId, '0.media');
+    const receiptFile = join(f.directory, 'video', jobId, '0.json');
+    await writeFile(mediaFile, f.bytes);
+    const durableReceipt = await readFile(receiptFile);
+    const history = await store.list(owner, 10);
+    const stage = f.probe.mock.calls[0]![0].source.stagingKey;
+    let reply: ReturnType<typeof holdCosResponse> | undefined;
+    const deleteRequest = vi.spyOn(COS.prototype, 'request').mockImplementation(async (params) => {
+      expect(params).toMatchObject({ Key: stage, Method: 'DELETE' });
+      expect(f.saved.delete(stage)).toBe(true);
+      reply = holdCosResponse(params);
+      return reply.promise;
+    });
+    const fallback = vi
+      .spyOn(COS.prototype, 'deleteObject')
+      .mockRejectedValue(new Error('unexpected uninterruptible delete'));
+    let executor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined;
+    const startExecutor = () =>
+      createVideoExecutor(
+        store,
+        () => undefined,
+        f.run,
+        { protocol, cleanup: createVideoCleanup(f.objects, f.directory) },
+        f.directory,
+      );
+    try {
+      vi.mocked(f.objects.delete).mockImplementationOnce(cosFixture().delete);
+      executor = await startExecutor();
+      await vi.waitFor(() => expect(deleteRequest).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      const stopped = vi.fn();
+      const closing = executor.close().then(stopped);
+      await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), { timeout: 3000 });
+      await closing;
+      expect(fallback).not.toHaveBeenCalled();
+      expect(await readFile(mediaFile)).toEqual(f.bytes);
+      expect(await readFile(receiptFile)).toEqual(durableReceipt);
+      expect((await execution.completedCleanup()).map((row) => row.id)).toEqual([jobId]);
+
+      executor = await startExecutor();
+      await vi.waitFor(async () => expect(await execution.completedCleanup()).toEqual([]), {
+        timeout: 5000,
+      });
+      expect(await readdir(join(f.directory, 'video', jobId))).toEqual([]);
+      expect(f.objects.delete).toHaveBeenCalledTimes(1);
+      expect([...f.saved.keys()]).toEqual([rawKey]);
+      expect(await store.list(owner, 10)).toEqual(history);
+      expect(
+        (await pool.query('SELECT id,owner_id,raw_key,source_etag FROM mio_assets')).rows,
+      ).toEqual(rows);
+    } finally {
+      reply?.reject(new Error('fixture cleanup'));
+      await executor?.close();
+      deleteRequest.mockRestore();
+      fallback.mockRestore();
+    }
   } finally {
     await execution.close();
     await pool.end();

@@ -6,7 +6,11 @@ import type { ResourceSlots } from '../src/resource-slots.ts';
 const fixture = vi.hoisted(() => ({
   connect: vi.fn(),
   consumeVideoProbes: vi.fn(async () => {}),
+  openJournal: vi.fn(),
   closeJournal: vi.fn(),
+  sweep: vi.fn(),
+  runAudio: vi.fn(async () => {}),
+  runMedia: vi.fn(async () => {}),
   slots: vi.fn(),
   backoffListeners: [] as number[],
 }));
@@ -15,11 +19,17 @@ vi.mock('../src/adapters/journal.ts', () => ({
   Journal: class {
     close = fixture.closeJournal;
     hasUnknownProcess = () => false;
+    constructor(directory: string, instance: string) {
+      fixture.openJournal(directory, instance);
+    }
   },
   isJournalFailure: () => false,
 }));
 vi.mock('../src/adapters/cos.ts', () => ({ ObjectStore: class {} }));
-vi.mock('../src/adapters/media.ts', () => ({ processIdentity: () => 'test-process' }));
+vi.mock('../src/adapters/media.ts', () => ({
+  processIdentity: () => 'test-process',
+  removeOrphanProbeFiles: fixture.sweep,
+}));
 vi.mock('../src/adapters/rabbitmq.ts', () => ({ Broker: { connect: fixture.connect } }));
 vi.mock('../src/worker.ts', () => ({
   Worker: class {
@@ -36,8 +46,8 @@ vi.mock('../src/worker.ts', () => ({
     async waitIdle() {}
   },
 }));
-vi.mock('../src/audio-runtime.ts', () => ({ runAudioRuntime: async () => {} }));
-vi.mock('../src/media-runtime.ts', () => ({ runMediaRuntime: async () => {} }));
+vi.mock('../src/audio-runtime.ts', () => ({ runAudioRuntime: fixture.runAudio }));
+vi.mock('../src/media-runtime.ts', () => ({ runMediaRuntime: fixture.runMedia }));
 vi.mock('../src/adapters/media-process.ts', () => ({ checkMediaCapabilities: async () => {} }));
 vi.mock('../src/maintenance.ts', () => ({
   Maintenance: class {
@@ -58,6 +68,7 @@ vi.mock('node:timers/promises', async (original) => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.resetModules();
 });
@@ -107,6 +118,10 @@ it('unsubscribes each reconnect lifetime before backoff and still stops the acti
   try {
     await import('../src/main.ts');
     await vi.waitFor(() => expect(rounds).toHaveLength(1));
+    expect(fixture.openJournal).toHaveBeenCalledBefore(fixture.sweep);
+    expect(fixture.sweep).toHaveBeenCalledBefore(fixture.runMedia);
+    expect(fixture.sweep).toHaveBeenCalledBefore(fixture.runAudio);
+    expect(fixture.sweep).toHaveBeenCalledBefore(fixture.connect);
     expect(fixture.slots).toHaveBeenCalledWith({ total: 3, encode: 2, probe: 1 });
     stop = process.listeners('SIGTERM').find((listener) => !previous.has(listener)) as
       (() => void) | undefined;
@@ -117,6 +132,7 @@ it('unsubscribes each reconnect lifetime before backoff and still stops the acti
       await vi.waitFor(() => expect(rounds).toHaveLength(index + 2));
     }
     expect(fixture.backoffListeners).toHaveLength(24);
+    expect(fixture.sweep).toHaveBeenCalledExactlyOnceWith('/unused-fixture');
     expect(fixture.consumeVideoProbes).toHaveBeenCalledTimes(25);
     expect(fixture.consumeVideoProbes).lastCalledWith(
       expect.any(Function),
@@ -130,6 +146,28 @@ it('unsubscribes each reconnect lifetime before backoff and still stops the acti
     expect(process.listeners('SIGTERM').filter((listener) => !previous.has(listener))).toEqual([]);
   } finally {
     stop?.();
+    process.argv = originalArgv;
+  }
+});
+
+it('closes the journal if orphan file cleanup fails before consumers start', async () => {
+  const originalArgv = process.argv;
+  const originalExitCode = process.exitCode;
+  process.argv = [originalArgv[0]!, 'worker', 'start'];
+  process.exitCode = undefined;
+  stubWorkerEnvironment();
+  fixture.sweep.mockImplementationOnce(() => {
+    throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+  });
+  try {
+    await import('../src/main.ts');
+    await vi.waitFor(() => expect(process.exitCode).toBe(1));
+    expect(fixture.closeJournal).toHaveBeenCalledOnce();
+    expect(fixture.runMedia).not.toHaveBeenCalled();
+    expect(fixture.runAudio).not.toHaveBeenCalled();
+    expect(fixture.connect).not.toHaveBeenCalled();
+  } finally {
+    process.exitCode = originalExitCode;
     process.argv = originalArgv;
   }
 });

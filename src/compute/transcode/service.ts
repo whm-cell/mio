@@ -196,9 +196,9 @@ export function createComputeService(
       return admit(() =>
         videoProbe.run(
           command,
-          async (message) => {
+          async (message, admitBy) => {
             if (!broker) throw new Error('VIDEO_PROBE_UNAVAILABLE');
-            await broker.publish(message);
+            await broker.publish(message, admitBy);
           },
           signal,
         ),

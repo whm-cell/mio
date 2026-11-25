@@ -229,7 +229,17 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 回包任务身份冲突或所需身份无效时进入 `unknown`，错误码为 `VIDEO_QUERY_IDENTITY_INVALID`。Kling 或 HappyHorse 回包中的任务身份相符且返回非空的未识别状态时，任务进入 `unknown`，错误码为 `VIDEO_QUERY_STATUS_UNKNOWN`。身份已通过核验且所需状态字段缺失或无效时为 `failed`，错误码为 `VIDEO_RESPONSE_INVALID`。上游明确失败或取消时为 `failed`，错误码为 `VIDEO_UPSTREAM_FAILED`。
 
-成功 URL 先持久化，再流式下载到恢复目录，以 Content-MD5 上传私有 staging。B 按实际 staging ETag 核验容器、视频流、尺寸、时长与声音。A 按探测绑定的 ETag 将同一对象在 COS 桶内条件复制到不可覆盖的私有 raw 键，核对长度、SHA-256 元数据、MIME 和已知复制 ETag，再在同一数据库事务登记本人 derived Asset 与输出。单输出最多 512 MiB，物化最多三次。复制回执丢失按原 raw 键对账，重用已核验的同一资产身份。
+有可用结果时，按供应商原始数组索引 (0–15) 持久化结果地址。混合数组的无效项保留原索引并记录 `VIDEO_RESULT_INVALID`。结果结构无效、数组为空或超限、没有任何有效地址时，维持 `failed` 和 `VIDEO_RESPONSE_INVALID`。地址持久化后，A 将视频流式下载到恢复目录，以 Content-MD5 上传私有 staging。单输出最多 512 MiB。B 按实际 staging ETag 核验容器、视频流、尺寸、时长与声音。A 按绑定的 ETag 条件复制同一对象到不可覆盖的私有 raw 键，核对长度、SHA-256 元数据、MIME 和已知复制 ETag。
+
+A 在每个索引的独立数据库事务中登记任务所有者的 derived Asset 和输出，任何单项失败保留该索引及错误码；后来成功的索引继续登记。已登记的索引在重启、取消处理或恢复后直接复用。全部登记为 `completed`，部分登记为 `partial`，上游已返回可用地址但所有输出物化失败时为 `materialization_failed`。每次执行或手动恢复允许最多三轮普通物化。恢复优先核对与该索引绑定的私有 raw、staging 对象和本地文件。复制回执丢失时按原 raw 键对账，沿用已核验的资产身份。本地恢复文件和回执以文件及目录同步保留。失败、部分完成和未知任务的恢复资料保留供对账。
+
+每次 A/B 探测最多等待 640 秒，包含 120 秒命令准入、300 秒 Worker 下载和探测、220 秒结果回传余量。准入的绝对期限经可选 AMQP header `x-mio-video-probe-admit-by` 传递，沿用已有 v1 正文和队列路由。新 Worker 拒绝超过准入期限的命令，无此头的旧命令按 Worker 本地时限处理。命令发布后若确认结果不明，A 在有界窗口内等待同一探测的结果。A 在探测前和探测后分别给予媒体 I/O 最多 180 秒。
+
+内部手动恢复仅限任务所有者。历史检查点仍可用。`partial` 或 `materialization_failed` 任务需至少有一个未登记且保留有效地址的索引才能恢复，原本无效的索引保持原状。优先处理所有可用恢复检查点。只有确认为缺少本地和自有 COS 媒体、且原有效公网结果地址返回 401、403、404 或 410 时，该索引记录 `VIDEO_RESULT_URL_EXPIRED`，本轮停止访问同一地址。若已探测记录保存了长度和 SHA-256，原 staging 对象确认缺失且尚无 raw ETag 时，可以用匹配的字节重新上传 staging。B 须按新 staging ETag 重新探测，通过后 A 才复制。已有 raw ETag 时须按原对象对账。
+
+满足上述过期条件后，每次明确发起的内部恢复最多预留一次同任务 GET，从任务所有者的当前 Key、原路由、原模型和原任务身份查询。Key 不可用时无出站请求。首次手动 GET 和自动成功回包至少相隔 5 秒，未保存此时间的旧检查点从执行记录最后更新时间起算。每次手动 GET 有持久预留的 5 秒出站窗口和最长 60 秒查询时间，下一次手动 GET 须在该窗口结束至少 5 秒后才可发送。预留跨重启保持。手动 GET 独立于原自动查询次数和截止时间，也可在原期限已过时执行。生成 POST 仍至多一次。
+
+手动查询沿用自动查询的身份及 HTTP 校验。只有通过校验且结果数量相同，才在对应已过期索引保存新地址。回包受阻、处理中、身份或数量不匹配、地址无效或未变化时保留原输出和过期证据。每个确切替换的地址获得一次独立、可跨重启续接的物化机会，其他索引沿原次数上限执行。自动轮询和生成提交均不会重开。
 
 错误：400 `VIDEO_INPUT_INVALID`（包括媒体类型不符）或 `VIDEO_MODE_UNSUPPORTED`，401 `UNAUTHORIZED`，403 `ORIGIN_DENIED` 或 `ORIGIN_REQUIRED`，404 `ASSET_NOT_FOUND`（引用资产不存在、不属于本人或未就绪），409 `REQUEST_CONFLICT`、`VIDEO_CAPABILITIES_STALE` 或 `VIDEO_INPUT_CHANGED`（已登记的对象缺失、长度或可核对的 ETag 不符），429 `VIDEO_QUOTA_EXCEEDED`，503 `VIDEO_UNAVAILABLE`（包括执行器不可用、PostgreSQL 或 COS 调用故障）；读取正文可能返回 408 或 413。已受理任务在发送前复核失败时以 `rejected` / `VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE` 结束，生成 POST 为零。失败、未知和物化失败分别呈现，不能当作完成。
 
@@ -255,7 +265,7 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 输入：服务端任务 UUID，无查询参数。
 
-成功：200 VideoJobView，包含有效参数、输入快照、状态、阶段、任务错误和已登记输出元数据。assetId 可经本人资产接口取得短期下载地址。内部密文、签名输入 URL、上游任务 ID 和对象键不公开。恢复文件及未知任务保留供对账。
+成功：200 VideoJobView，包含有效参数、输入快照、状态、阶段、任务错误和按原索引排序的输出。已登记输出带 `assetId`，可经本人资产接口取得短期下载地址。失败项带错误码，`assetId` 为空。内部密文、签名输入和输出 URL、上游任务 ID、对象键均为私有资料。
 
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND、503 VIDEO_UNAVAILABLE；未知和他人任务统一404。
 

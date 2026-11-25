@@ -16,6 +16,7 @@ export interface VideoJobCommand {
 export const VIDEO_EXECUTOR_MAX_QUERIES = 360;
 export const VIDEO_EXECUTOR_MAX_AGE_SECONDS = 1800;
 export const VIDEO_EXECUTOR_QUERY_INTERVAL_MS = 5000;
+export const VIDEO_MATERIALIZATION_MAX_ATTEMPTS = 3;
 export const VIDEO_QUOTA_LOCK = 672049926;
 
 export interface VideoSubmissionReceipt {
@@ -33,8 +34,24 @@ export function isVideoUpstreamTaskId(value: unknown): value is string {
   return typeof value === 'string' && /^[\x21-\x7E]{1,1024}$/.test(value) && !value.includes('://');
 }
 
-export interface VideoResultSource {
-  url: string;
+export type VideoResultSource = { url: string } | { errorCode: 'VIDEO_RESULT_INVALID' };
+
+export function hasVideoResultUrl(value: unknown): value is { url: string } {
+  return (
+    value !== null && typeof value === 'object' && 'url' in value && typeof value.url === 'string'
+  );
+}
+
+export class VideoResultUrlExpired extends Error {
+  constructor() {
+    super('VIDEO_RESULT_URL_EXPIRED');
+  }
+}
+
+export interface VideoRecoveryQuery {
+  state: 'available' | 'reserved';
+  errorCode?: string;
+  refreshed?: Record<number, 'pending' | 'finished'>;
 }
 
 /** The checkpoint contains media locators, never a supplier credential. */
@@ -42,6 +59,9 @@ export interface VideoCheckpoint {
   videos: VideoResultSource[];
   materializationAttempts: number;
   cleaned?: boolean;
+  expired?: Record<number, true>;
+  refreshAt?: string;
+  recoveryQuery?: VideoRecoveryQuery;
 }
 
 export interface VideoExecution {
@@ -85,9 +105,10 @@ export interface VideoMaterializedOutput {
 
 export type VideoMaterializer = (
   row: VideoExecution,
-  videos: VideoResultSource[],
+  video: { url: string },
+  index: number,
   signal: AbortSignal,
-) => Promise<VideoMaterializedOutput[]>;
+) => Promise<VideoMaterializedOutput>;
 
 export type VideoSubmitResult =
   { state: 'submitted'; upstreamTaskId: string } | { state: 'rejected' | 'unknown'; code: string };

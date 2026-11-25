@@ -7,7 +7,10 @@ import { expect, it, vi } from 'vitest';
 import {
   COMMAND_QUEUE,
   RESULT_QUEUE,
+  VIDEO_PROBE_ADMISSION_HEADER,
+  VIDEO_PROBE_ADMISSION_MS,
   VIDEO_PROBE_COMMAND_QUEUE,
+  parseVideoProbeCommandV1,
   type ComputeCommandV1,
   type ComputeResultV1,
   type VideoProbeCommandV1,
@@ -130,6 +133,9 @@ it.each([
             sha256: 'a'.repeat(64),
           },
         };
+        const expired = { ...command, messageId: randomUUID() };
+        const expiredDeadline = Date.now() - 1;
+        const admitBy = Date.now() + VIDEO_PROBE_ADMISSION_MS;
         const received = vi.fn<(value: VideoProbeResultV1) => void>();
         const transcodeResult = vi.fn();
         const failed = vi.fn();
@@ -197,6 +203,7 @@ it.each([
                 if (legacyVideoProbeBinding) {
                   // A previously routed delivery survives closing its unacknowledged consumer.
                   await app.publish(command);
+                  await app.publish(expired, expiredDeadline);
                   const old = await connect(workerBrokerUrl);
                   old.on('error', () => {});
                   try {
@@ -205,6 +212,14 @@ it.each([
                     expect(delivery).toMatchObject({
                       properties: { messageId: command.messageId },
                     });
+                    const marked = await channel.get(COMMAND_QUEUE, { noAck: false });
+                    if (!marked) throw new Error('Expected marked probe on the legacy queue');
+                    expect(marked.properties.headers?.[VIDEO_PROBE_ADMISSION_HEADER]).toBe(
+                      expiredDeadline,
+                    );
+                    expect(parseVideoProbeCommandV1(JSON.parse(marked.content.toString()))).toEqual(
+                      expired,
+                    );
                   } finally {
                     await old.close();
                   }
@@ -227,12 +242,18 @@ it.each([
                     messageId: randomUUID(),
                     source: { ...command.source, stagingKey: 'mio/staging/video/foreign' },
                   });
-                  await app.publish(command);
+                  await app.publish(command, admitBy);
+                  await app.publish(expired, expiredDeadline);
                 }
                 await vi.waitFor(
                   () => {
-                    expect(downloadVideoProbe).toHaveBeenCalledOnce();
-                    expect(received).toHaveBeenCalledExactlyOnceWith(
+                    expect(downloadVideoProbe).toHaveBeenCalledExactlyOnceWith(
+                      legacyVideoProbeBinding ? command : { ...command, admitBy },
+                      directory,
+                      expect.any(AbortSignal),
+                    );
+                    expect(received).toHaveBeenCalledTimes(2);
+                    expect(received).toHaveBeenCalledWith(
                       expect.objectContaining({
                         type: 'video.probe.result',
                         commandId: command.messageId,
@@ -243,6 +264,14 @@ it.each([
                         source: command.source,
                         state: 'failed',
                         errorCode: 'SOURCE_CHANGED',
+                      }),
+                    );
+                    expect(received).toHaveBeenCalledWith(
+                      expect.objectContaining({
+                        commandId: expired.messageId,
+                        source: expired.source,
+                        state: 'failed',
+                        errorCode: 'EXECUTION_TIMEOUT',
                       }),
                     );
                   },

@@ -18,7 +18,12 @@ import type * as Fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { parseVideoProbeCommandV1, parseVideoProbeResultV1 } from '@mio/compute-contracts';
+import {
+  parseVideoProbeCommandV1,
+  parseVideoProbeResultV1,
+  VIDEO_PROBE_ADMISSION_MS,
+  VIDEO_PROBE_EXECUTION_MS,
+} from '@mio/compute-contracts';
 import type {
   VideoProbeCommandV1,
   VideoProbeResultV1,
@@ -256,6 +261,150 @@ it('probes the streamed local file and returns source identity and media metadat
     worker.stop();
     await Promise.allSettled([handling, duplicate]);
     unsubscribe();
+    journal.close();
+  }
+});
+
+it('gives a probe admitted near the queue deadline its full execution budget', async () => {
+  const root = directory();
+  const file = fixture(root);
+  const journal = new Journal(root, 'probe-test', true);
+  const slots = new ResourceSlots();
+  slots.setHold('probe', 'other-probe', true);
+  const finishDownload = Promise.withResolvers<void>();
+  const download = vi.fn(async (input: VideoProbeCommandV1, directory: string) => {
+    await finishDownload.promise;
+    const path = probePath(directory, input.messageId);
+    copyFileSync(file, path);
+    return path;
+  });
+  const publish = vi.fn(async () => {});
+  const worker = probeWorker(journal, root, slots, download, publish);
+  vi.useFakeTimers();
+  const input = { ...command(file), admitBy: Date.now() + VIDEO_PROBE_ADMISSION_MS };
+  const ack = vi.fn();
+  const handling = worker.handleVideoProbe(input, ack);
+  try {
+    await vi.advanceTimersByTimeAsync(VIDEO_PROBE_ADMISSION_MS - 1);
+    expect(download).not.toHaveBeenCalled();
+    slots.setHold('probe', 'other-probe', false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(download).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(VIDEO_PROBE_EXECUTION_MS - 1);
+    expect(publish).not.toHaveBeenCalled();
+    finishDownload.resolve();
+    await handling;
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ commandId: input.messageId, state: 'succeeded' }),
+    );
+    expect(ack).toHaveBeenCalledOnce();
+    expect(slots.snapshot().usage.total).toBe(0);
+    expect(existsSync(probePath(root, input.messageId))).toBe(false);
+  } finally {
+    finishDownload.resolve();
+    worker.stop();
+    await Promise.allSettled([handling]);
+    vi.useRealTimers();
+    journal.close();
+  }
+});
+
+it.each(['already expired', 'held until timeout', 'granted at deadline'] as const)(
+  'publishes a timeout without download when a delivery is %s',
+  async (admission) => {
+    const root = directory();
+    const file = fixture(root);
+    const journal = new Journal(root, 'probe-test', true);
+    const slots = new ResourceSlots();
+    slots.setHold('probe', 'other-probe', true);
+    const download = vi.fn();
+    const publish = vi.fn(async () => {});
+    const worker = probeWorker(journal, root, slots, download, publish);
+    vi.useFakeTimers();
+    // Most of the admission window was already spent in the broker before delivery.
+    const remaining = 100;
+    const input = {
+      ...command(file),
+      admitBy: Date.now() + (admission === 'already expired' ? 0 : remaining),
+    };
+    const ack = vi.fn();
+    const handling = worker.handleVideoProbe(input, ack);
+    try {
+      if (admission === 'held until timeout') {
+        await vi.advanceTimersByTimeAsync(remaining - 1);
+        expect(slots.snapshot().waiting.probe).toBe(1);
+        expect(publish).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      if (admission === 'granted at deadline') {
+        vi.setSystemTime(input.admitBy);
+        slots.setHold('probe', 'other-probe', false);
+      }
+      await handling;
+      expect(download).not.toHaveBeenCalled();
+      expect(publish).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ commandId: input.messageId, errorCode: 'EXECUTION_TIMEOUT' }),
+      );
+      expect(ack).toHaveBeenCalledOnce();
+      expect(slots.snapshot()).toMatchObject({ waiting: { probe: 0 }, usage: { total: 0 } });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      worker.stop();
+      await Promise.allSettled([handling]);
+      vi.useRealTimers();
+      journal.close();
+    }
+  },
+);
+
+it('aborts the download at the execution deadline and releases the slot and file', async () => {
+  const root = directory();
+  const file = fixture(root);
+  const journal = new Journal(root, 'probe-test', true);
+  const slots = new ResourceSlots();
+  const input = command(file);
+  const path = probePath(root, input.messageId);
+  const abort = vi.fn();
+  const download = vi.fn(
+    async (_input: VideoProbeCommandV1, _root: string, signal: AbortSignal) => {
+      copyFileSync(file, path);
+      return new Promise<string>((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            abort();
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      });
+    },
+  );
+  const publish = vi.fn(async () => {});
+  const worker = probeWorker(journal, root, slots, download, publish);
+  vi.useFakeTimers();
+  const ack = vi.fn();
+  const handling = worker.handleVideoProbe(input, ack);
+  try {
+    await vi.advanceTimersByTimeAsync(VIDEO_PROBE_EXECUTION_MS - 1);
+    expect(existsSync(path)).toBe(true);
+    expect(slots.snapshot().usage.probe).toBe(1);
+    expect(abort).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await handling;
+    expect(abort).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ commandId: input.messageId, errorCode: 'EXECUTION_TIMEOUT' }),
+    );
+    expect(ack).toHaveBeenCalledOnce();
+    expect(existsSync(path)).toBe(false);
+    expect(slots.snapshot().usage.total).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    worker.stop();
+    await Promise.allSettled([handling]);
+    vi.useRealTimers();
     journal.close();
   }
 });

@@ -4,8 +4,12 @@ import { createId } from '@mio/foundation/identifiers';
 import { GenerationError } from '../errors.ts';
 import { transaction } from '../transaction.ts';
 import { VideoExecutionStore } from './execution-store.ts';
-import { VIDEO_QUOTA_LOCK } from './execution.ts';
-import type { VideoJobCommand } from './execution.ts';
+import {
+  hasVideoResultUrl,
+  VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VIDEO_QUOTA_LOCK,
+} from './execution.ts';
+import type { VideoCheckpoint, VideoJobCommand } from './execution.ts';
 export type { VideoJobCommand } from './execution.ts';
 import { VIDEO_GLOBAL_QUOTA, VIDEO_USER_QUOTA } from './contracts.ts';
 import type { VideoCreateRequest, VideoJobView } from './contracts.ts';
@@ -26,7 +30,7 @@ interface VideoJobRow {
   query_attempt: number;
   async_max_queries: number | null;
   async_deadline: Date | null;
-  checkpoint: { videos?: unknown; cleaned?: boolean } | null;
+  checkpoint: VideoCheckpoint | null;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -47,6 +51,22 @@ interface VideoJobRow {
 export interface VideoJobCursor {
   createdAt: string;
   id: string;
+}
+
+function canRecoverResult(
+  { state, phase, checkpoint }: Pick<VideoJobRow, 'state' | 'phase' | 'checkpoint'>,
+  registered: number[],
+): boolean {
+  return (
+    (state === 'materialization_failed' || state === 'partial') &&
+    phase === 'done' &&
+    !checkpoint?.cleaned &&
+    Array.isArray(checkpoint?.videos) &&
+    checkpoint.videos.length <= 16 &&
+    checkpoint.videos.some(
+      (video, index) => hasVideoResultUrl(video) && !registered.includes(index),
+    )
+  );
 }
 
 async function capacity(client: PoolClient, ownerId: string): Promise<void> {
@@ -101,8 +121,12 @@ export class VideoGenerationStore {
         );
         signal?.throwIfAborted();
         if (!execution.rowCount) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
-        const result = await client.query<{ state: string; phase: string; checkpoint: unknown }>(
-          `SELECT j.state,e.phase,e.checkpoint FROM mio_video_jobs j
+        const result = await client.query<
+          Pick<VideoJobRow, 'state' | 'phase' | 'checkpoint'> & { registered: number[] }
+        >(
+          `SELECT j.state,e.phase,e.checkpoint,ARRAY(
+            SELECT output_index FROM mio_video_outputs WHERE job_id=j.id AND phase='registered'
+           ) AS registered FROM mio_video_jobs j
            JOIN mio_video_executions e ON e.job_id=j.id
            WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j`,
           [jobId, ownerId],
@@ -115,24 +139,20 @@ export class VideoGenerationStore {
           (row.state === 'materializing' && row.phase === 'materializing')
         )
           return;
-        const checkpoint = row.checkpoint as { videos?: unknown; cleaned?: boolean } | null;
-        if (
-          row.state !== 'materialization_failed' ||
-          row.phase !== 'done' ||
-          !checkpoint ||
-          checkpoint.cleaned ||
-          !Array.isArray(checkpoint.videos) ||
-          checkpoint.videos.length < 1 ||
-          checkpoint.videos.length > 16
-        )
+        if (!canRecoverResult(row, row.registered))
           throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
         await capacity(client, ownerId);
         signal?.throwIfAborted();
+        // Legacy terminal rows did not keep the query window. Their last execution update
+        // followed the automatic reply, so it is a conservative anchor for the first refresh.
         await client.query(
           `UPDATE mio_video_executions SET phase='materializing',claim_id=NULL,
-          next_query_at=NULL,checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','0'::jsonb),updated_at=now()
+          next_query_at=NULL,checkpoint=(checkpoint-'expired')||jsonb_build_object(
+            'materializationAttempts',0,'recoveryQuery','{"state":"available"}'::jsonb,
+            'refreshAt',COALESCE(checkpoint->'refreshAt',to_jsonb(updated_at+$2*interval '1 millisecond'))
+          ),updated_at=now()
           WHERE job_id=$1`,
-          [jobId],
+          [jobId, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
         );
         signal?.throwIfAborted();
         await client.query(
@@ -220,13 +240,10 @@ export class VideoGenerationStore {
     ).rows[0];
     if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
     const request = row.command.request;
-    const recoverable =
-      row.state === 'materialization_failed' &&
-      row.phase === 'done' &&
-      !row.checkpoint?.cleaned &&
-      Array.isArray(row.checkpoint?.videos) &&
-      row.checkpoint.videos.length > 0 &&
-      row.checkpoint.videos.length <= 16;
+    const recoverable = canRecoverResult(
+      row,
+      row.outputs.filter((output) => output.status === 'registered').map((output) => output.index),
+    );
     return {
       id: row.id,
       requestId: row.request_id,

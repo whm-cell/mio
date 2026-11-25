@@ -7,6 +7,7 @@ import type {
   VideoExecution,
   VideoMaterializedOutput,
   VideoQueryRetryCode,
+  VideoRecoveryQuery,
   VideoResultSource,
   VideoSubmissionDisposition,
   VideoSubmissionReceipt,
@@ -16,6 +17,7 @@ import {
   VIDEO_EXECUTOR_MAX_AGE_SECONDS,
   VIDEO_EXECUTOR_MAX_QUERIES,
   VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VIDEO_MATERIALIZATION_MAX_ATTEMPTS,
   VIDEO_QUERY_RETRY_CODES,
   VIDEO_QUOTA_LOCK,
 } from './execution.ts';
@@ -323,9 +325,16 @@ export class VideoExecutionStore {
     return transaction(this.pool, async (client) => {
       const changed = await client.query(
         `UPDATE mio_video_executions SET phase='materializing',
-        checkpoint=$3,next_query_at=NULL,updated_at=now()
+        checkpoint=$3::jsonb||jsonb_build_object(
+          'refreshAt',clock_timestamp()+$4*interval '1 millisecond'),
+        next_query_at=NULL,updated_at=now()
         WHERE job_id=$1 AND claim_id=$2 RETURNING job_id`,
-        [row.id, row.claim_id, JSON.stringify({ videos, materializationAttempts: 0 })],
+        [
+          row.id,
+          row.claim_id,
+          JSON.stringify({ videos, materializationAttempts: 0 }),
+          VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+        ],
       );
       if (changed.rowCount)
         await client.query(
@@ -337,101 +346,175 @@ export class VideoExecutionStore {
     });
   }
 
-  async beginMaterialization(row: VideoExecution): Promise<boolean> {
-    return Boolean(
-      (
-        await this.pool.query(
-          `UPDATE mio_video_executions
-      SET checkpoint=jsonb_set(checkpoint,'{materializationAttempts}',
-        to_jsonb(COALESCE((checkpoint->>'materializationAttempts')::integer,0)+1)),updated_at=now()
+  async beginMaterialization(row: VideoExecution, needsAttempt: boolean) {
+    const { rows } = await this.pool.query<{ attempts: number; reserved: boolean }>(
+      `WITH current_attempt AS (
+        SELECT COALESCE((checkpoint->>'materializationAttempts')::integer,0) AS attempts
+        FROM mio_video_executions WHERE job_id=$1 AND claim_id=$2 AND phase='materializing'
+        FOR UPDATE
+      ), reservation AS (
+        SELECT attempts,($3::boolean AND attempts<$4) AS reserved FROM current_attempt
+      )
+      UPDATE mio_video_executions e SET checkpoint=CASE WHEN reservation.reserved
+        THEN jsonb_set(checkpoint,'{materializationAttempts}',to_jsonb(reservation.attempts+1))
+        ELSE checkpoint END,updated_at=now()
+      FROM reservation WHERE job_id=$1 AND claim_id=$2 AND phase='materializing'
+      RETURNING reservation.attempts+reservation.reserved::integer AS attempts, reservation.reserved`,
+      [row.id, row.claim_id, needsAttempt, VIDEO_MATERIALIZATION_MAX_ATTEMPTS],
+    );
+    return rows[0];
+  }
+
+  async reserveRecoveryQuery(row: VideoExecution, taskId: string): Promise<Date | undefined> {
+    const { rows } = await this.pool.query<{ dispatch_before: Date }>(
+      `WITH reservation AS (SELECT clock_timestamp() AS start_at)
+      UPDATE mio_video_executions e SET checkpoint=checkpoint||jsonb_build_object(
+        'recoveryQuery','{"state":"reserved"}'::jsonb,
+        'refreshAt',reservation.start_at+2*$4*interval '1 millisecond'),updated_at=now()
+      FROM reservation WHERE job_id=$1 AND claim_id=$2 AND phase='materializing'
+        AND upstream_task_id=$3 AND checkpoint#>>'{recoveryQuery,state}'='available'
+        AND COALESCE((checkpoint->>'refreshAt')::timestamptz,'-infinity')<=reservation.start_at
+      RETURNING reservation.start_at+$4*interval '1 millisecond' AS dispatch_before`,
+      [row.id, row.claim_id, taskId, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
+    );
+    return rows[0]?.dispatch_before;
+  }
+
+  async finishRecoveryQuery(
+    row: VideoExecution,
+    videos: VideoResultSource[],
+    recoveryQuery: VideoRecoveryQuery,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE mio_video_executions SET checkpoint=checkpoint||$4::jsonb,updated_at=now()
       WHERE job_id=$1 AND claim_id=$2 AND phase='materializing'
-      AND COALESCE((checkpoint->>'materializationAttempts')::integer,0)<3`,
+        AND upstream_task_id=$3 AND checkpoint#>>'{recoveryQuery,state}'='reserved'`,
+      [row.id, row.claim_id, row.upstream_task_id, JSON.stringify({ videos, recoveryQuery })],
+    );
+    return Boolean(result.rowCount);
+  }
+
+  async terminal(
+    row: VideoExecution,
+    state: VideoJobState,
+    code: string | null,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return transaction(
+      this.pool,
+      async (client) => {
+        const changed = await client.query(
+          `UPDATE mio_video_executions SET phase='done',claim_id=NULL,
+          snapshot='{}'::jsonb,next_query_at=NULL,updated_at=now()
+          WHERE job_id=$1 AND claim_id=$2 RETURNING job_id`,
           [row.id, row.claim_id],
-        )
-      ).rowCount,
+        );
+        if (!changed.rowCount) return false;
+        await client.query(
+          `UPDATE mio_video_jobs SET state=$2,error_code=$3,
+          completed_at=now(),updated_at=now() WHERE id=$1`,
+          [row.id, state, code],
+        );
+        return true;
+      },
+      signal,
     );
   }
 
-  async terminal(row: VideoExecution, state: VideoJobState, code: string | null): Promise<void> {
-    await transaction(this.pool, async (client) => {
-      const changed = await client.query(
-        `UPDATE mio_video_executions SET phase='done',claim_id=NULL,
-        snapshot='{}'::jsonb,next_query_at=NULL,updated_at=now()
-        WHERE job_id=$1 AND claim_id=$2 RETURNING job_id`,
-        [row.id, row.claim_id],
-      );
-      if (changed.rowCount)
-        await client.query(
-          `UPDATE mio_video_jobs SET state=$2,error_code=$3,
-        completed_at=now(),updated_at=now() WHERE id=$1`,
-          [row.id, state, code],
-        );
-    });
+  async outputProgress(id: string) {
+    const { rows } = await this.pool.query<{
+      output_index: number;
+      phase: 'registered' | 'failed';
+    }>(
+      `SELECT output_index,phase FROM mio_video_outputs
+      WHERE job_id=$1 AND phase IN ('registered','failed')`,
+      [id],
+    );
+    return new Map(rows.map((output) => [output.output_index, output.phase]));
   }
 
-  async complete(row: VideoExecution, outputs: VideoMaterializedOutput[]): Promise<boolean> {
-    return transaction(this.pool, async (client) => {
-      const locked = await client.query(
-        `SELECT job_id FROM mio_video_executions
+  async writeOutput(
+    row: VideoExecution,
+    index: number,
+    result: VideoMaterializedOutput | string,
+    signal: AbortSignal,
+  ): Promise<'registered' | 'failed' | undefined> {
+    if (!row.checkpoint?.videos[index]) throw new Error('VIDEO_RESULT_INVALID');
+    const output = typeof result === 'string' ? null : result;
+    if (output && output.index !== index) throw new Error('VIDEO_RESULT_INVALID');
+    const phase = output ? 'registered' : 'failed';
+    return transaction(
+      this.pool,
+      async (client) => {
+        // Take the execution lock before an output FK can acquire a job row lock.
+        const locked = await client.query(
+          `SELECT job_id FROM mio_video_executions
         WHERE job_id=$1 AND claim_id=$2 AND phase='materializing' FOR UPDATE`,
-        [row.id, row.claim_id],
-      );
-      if (!locked.rowCount) return false;
-      if (
-        !outputs.length ||
-        outputs.length !== row.checkpoint?.videos.length ||
-        new Set(outputs.map((output) => output.index)).size !== outputs.length ||
-        outputs.some(
-          (output) =>
-            !Number.isInteger(output.index) || output.index < 0 || output.index >= outputs.length,
-        )
-      )
-        throw new Error('VIDEO_RESULT_INVALID');
-      for (const output of outputs) {
-        await client.query(
-          `INSERT INTO mio_assets
+          [row.id, row.claim_id],
+        );
+        if (!locked.rowCount) return;
+        const registered = await client.query(
+          `SELECT job_id FROM mio_video_outputs WHERE job_id=$1 AND output_index=$2
+        AND phase='registered'`,
+          [row.id, index],
+        );
+        if (registered.rowCount) return 'registered';
+        if (output)
+          await client.query(
+            `INSERT INTO mio_assets
           (id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,
            expires_at,staging_deleted_at,asset_kind,source_etag)
           VALUES($1,$2,$3,$4,$5,NULL,$6,'ready',now(),now(),'derived',$7)`,
-          [
-            output.assetId,
-            row.owner_id,
-            'video-' + output.index + '.mp4',
-            output.contentType,
-            output.sizeBytes,
-            output.key,
-            output.etag,
-          ],
-        );
+            [
+              output.assetId,
+              row.owner_id,
+              'video-' + index + '.mp4',
+              output.contentType,
+              output.sizeBytes,
+              output.key,
+              output.etag,
+            ],
+          );
         await client.query(
           `INSERT INTO mio_video_outputs
-          (job_id,output_index,asset_id,phase,content_type,size_bytes,sha256,width,height,duration_ms,has_audio)
-          VALUES($1,$2,$3,'registered',$4,$5,$6,$7,$8,$9,$10)`,
+        (job_id,output_index,asset_id,phase,error_code,content_type,size_bytes,sha256,width,height,duration_ms,has_audio)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        ON CONFLICT(job_id,output_index) DO UPDATE SET asset_id=excluded.asset_id,
+          phase=excluded.phase,error_code=excluded.error_code,content_type=excluded.content_type,
+          size_bytes=excluded.size_bytes,sha256=excluded.sha256,width=excluded.width,
+          height=excluded.height,duration_ms=excluded.duration_ms,has_audio=excluded.has_audio`,
           [
             row.id,
-            output.index,
-            output.assetId,
-            output.contentType,
-            output.sizeBytes,
-            output.sha256,
-            output.width,
-            output.height,
-            output.durationMs,
-            output.hasAudio,
+            index,
+            output?.assetId ?? null,
+            phase,
+            typeof result === 'string' ? result : null,
+            output?.contentType ?? null,
+            output?.sizeBytes ?? null,
+            output?.sha256 ?? null,
+            output?.width ?? null,
+            output?.height ?? null,
+            output?.durationMs ?? null,
+            output?.hasAudio ?? null,
           ],
         );
-      }
-      await client.query(
-        `UPDATE mio_video_executions SET phase='done',claim_id=NULL,
-        snapshot='{}'::jsonb,next_query_at=NULL,updated_at=now() WHERE job_id=$1`,
-        [row.id],
-      );
-      await client.query(
-        `UPDATE mio_video_jobs SET state='completed',error_code=NULL,
-        completed_at=now(),updated_at=now() WHERE id=$1`,
-        [row.id],
-      );
-      return true;
-    });
+        if (row.checkpoint?.recoveryQuery?.refreshed?.[index] === 'pending')
+          await client.query(
+            `UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,
+            ARRAY['recoveryQuery','refreshed',$2::text],'"finished"'::jsonb),updated_at=now()
+          WHERE job_id=$1`,
+            [row.id, index],
+          );
+        else if (result === 'VIDEO_RESULT_URL_EXPIRED')
+          await client.query(
+            `UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,'{expired}',
+            COALESCE(checkpoint->'expired','{}'::jsonb)||jsonb_build_object($2::text,true)),updated_at=now()
+          WHERE job_id=$1`,
+            [row.id, index],
+          );
+        return phase;
+      },
+      signal,
+    );
   }
 }

@@ -12,6 +12,11 @@ export const RESULT_ROUTING_KEY = 'transcode.result.v1';
 export const VIDEO_PROBE_COMMAND_QUEUE = 'mio.compute.video.probe.commands.v1';
 export const VIDEO_PROBE_COMMAND_ROUTING_KEY = 'video.probe.v1';
 export const VIDEO_PROBE_RESULT_ROUTING_KEY = 'video.probe.result.v1';
+export const VIDEO_PROBE_ADMISSION_HEADER = 'x-mio-video-probe-admit-by';
+export const VIDEO_PROBE_ADMISSION_MS = 120_000;
+export const VIDEO_PROBE_EXECUTION_MS = 300_000;
+// One in-flight COS HEAD wave on A (180s), B's result confirm (30s), and 10s delivery slack.
+export const VIDEO_PROBE_REPLY_MS = 220_000;
 
 export type ComputeAttempt = 1 | 2 | 3;
 export type ComputeProfileV1 = typeof COMPUTE_PROFILE;

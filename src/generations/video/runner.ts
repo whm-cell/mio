@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
 import type { AccountCredentialSnapshot } from '../../providers/contracts.ts';
@@ -7,13 +8,46 @@ import type {
   VideoExecution,
   VideoMaterializer,
   VideoProtocolFactory,
+  VideoQueryResult,
+  VideoRecoveryQuery,
   VideoResultSource,
   VideoSubmissionReceipt,
 } from './execution.ts';
-import { hasVideoQueryBudget, isVideoUpstreamTaskId } from './execution.ts';
+import {
+  hasVideoQueryBudget,
+  hasVideoResultUrl,
+  isVideoUpstreamTaskId,
+  VIDEO_MATERIALIZATION_MAX_ATTEMPTS,
+  VideoResultUrlExpired,
+} from './execution.ts';
 import type { VideoSubmissionReceipts } from './submission-receipts.ts';
 
 const log = createLogger('app', 'video-runner');
+const MATERIALIZATION_ERRORS = new Set([
+  'VIDEO_CHECKPOINT_INVALID',
+  'VIDEO_DIRECTORY_INVALID',
+  'VIDEO_DISK_FULL',
+  'VIDEO_DOWNLOAD_FAILED',
+  'VIDEO_DOWNLOAD_INCOMPLETE',
+  'VIDEO_EXECUTION_TIMEOUT',
+  'VIDEO_FILE_INVALID',
+  'VIDEO_MEDIA_INVALID',
+  'VIDEO_OBJECT_MISMATCH',
+  'VIDEO_PROBE_BUSY',
+  'VIDEO_PROBE_FAILED',
+  'VIDEO_PROBE_PUBLISH_FAILED',
+  'VIDEO_PROBE_RESULT_MISMATCH',
+  'VIDEO_PROBE_TIMEOUT',
+  'VIDEO_RESULT_INVALID',
+  'VIDEO_SOURCE_CHANGED',
+  'VIDEO_SOURCE_INVALID',
+  'VIDEO_SOURCE_TOO_LARGE',
+  'VIDEO_STORAGE_FAILED',
+  'VIDEO_STORAGE_FAILURE',
+  'VIDEO_STORAGE_UNAVAILABLE',
+  'VIDEO_TOO_LARGE',
+  'VIDEO_WORKER_INTERRUPTED',
+]);
 
 export type VideoExecutorProvider = Pick<
   ProviderService,
@@ -67,34 +101,168 @@ export function createVideoRunner(
       .catch(() => log.error('VIDEO_VERIFICATION_UNAVAILABLE'));
   };
 
-  const materializeResult = async (row: VideoExecution) => {
-    if (stop.aborted) {
+  const materializeOutput = async (row: VideoExecution, video: { url: string }, index: number) => {
+    let expired = false;
+    let code = 'VIDEO_MATERIALIZATION_FAILED';
+    try {
+      const output = await materialize(row, video, index, stop);
+      const phase = await store.writeOutput(row, index, output, stop);
+      return { phase, expired };
+    } catch (error) {
+      stop.throwIfAborted();
+      expired = error instanceof VideoResultUrlExpired;
+      if (expired) code = 'VIDEO_RESULT_URL_EXPIRED';
+      else if (error instanceof Error && MATERIALIZATION_ERRORS.has(error.message))
+        code = error.message;
+    }
+    const phase = await store.writeOutput(row, index, code, stop);
+    return { phase, expired: phase === 'failed' && expired };
+  };
+
+  const recoveryQuery = async (
+    row: VideoExecution,
+    taskId: string,
+    key: string,
+    dispatchBefore: Date,
+  ) => {
+    const bounded = AbortSignal.any([stop, AbortSignal.timeout(60_000)]);
+    const { route, modelId } = row.route_snapshot;
+    let sent = false;
+    let dispatchExpired = false;
+    try {
+      const protocol = transports.protocol(route, modelId, async (url, options) => {
+        if (sent || options?.method !== 'GET' || epochMs() >= dispatchBefore.getTime()) {
+          dispatchExpired = true;
+          throw new Error('VIDEO_RECOVERY_QUERY_DISPATCH_EXPIRED');
+        }
+        bounded.throwIfAborted();
+        sent = true;
+        return (transports.transport ?? fetch)(url, options);
+      });
+      const result = await protocol.query(taskId, key, bounded);
+      stop.throwIfAborted();
+      if (bounded.aborted) return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' } as const;
+      if (!dispatchExpired) return result;
+    } catch {
+      stop.throwIfAborted();
+      if (!dispatchExpired) return { state: 'retry', code: 'VIDEO_QUERY_NETWORK_ERROR' } as const;
+    }
+    return { state: 'failed', code: 'VIDEO_RECOVERY_QUERY_DISPATCH_EXPIRED' } as const;
+  };
+
+  const refreshExpired = async (
+    row: VideoExecution,
+    videos: VideoResultSource[],
+    expired: Set<number>,
+  ) => {
+    const taskId = row.upstream_task_id;
+    if (
+      !expired.size ||
+      row.checkpoint?.recoveryQuery?.state !== 'available' ||
+      !isVideoUpstreamTaskId(taskId)
+    )
+      return false;
+    const refreshAt = row.checkpoint.refreshAt;
+    const wait = refreshAt ? Date.parse(refreshAt) - epochMs() + 1 : 0;
+    if (wait > 0) await delay(wait, undefined, { signal: stop });
+    stop.throwIfAborted();
+    const key = await provider()
+      ?.resolveImageTaskCredential(row.owner_id)
+      .catch(() => undefined);
+    stop.throwIfAborted();
+    if (!key) return false;
+    const dispatchBefore = await store.reserveRecoveryQuery(row, taskId);
+    if (!dispatchBefore) return false;
+    stop.throwIfAborted();
+    const result: VideoQueryResult = await recoveryQuery(row, taskId, key, dispatchBefore);
+    const nextVideos = [...videos];
+    const recovery: VideoRecoveryQuery = { state: 'reserved' };
+    if (result.state === 'processing') recovery.errorCode = 'VIDEO_RECOVERY_NOT_READY';
+    else if (result.state !== 'returned') recovery.errorCode = result.code;
+    else if (result.videos.length !== videos.length)
+      recovery.errorCode = 'VIDEO_RECOVERY_RESULT_MISMATCH';
+    else {
+      for (const index of expired) {
+        const previous = videos[index];
+        const replacement = result.videos[index];
+        if (
+          hasVideoResultUrl(previous) &&
+          hasVideoResultUrl(replacement) &&
+          previous.url !== replacement.url
+        ) {
+          nextVideos[index] = replacement;
+          (recovery.refreshed ??= {})[index] = 'pending';
+        }
+      }
+      if (!recovery.refreshed) recovery.errorCode = 'VIDEO_RECOVERY_RESULT_UNCHANGED';
+    }
+    const saved = await store.finishRecoveryQuery(row, nextVideos, recovery);
+    return saved && recovery.refreshed !== undefined;
+  };
+
+  const materializePass = async (row: VideoExecution, videos: VideoResultSource[]) => {
+    const progress = await store.outputProgress(row.id);
+    const refreshed = row.checkpoint?.recoveryQuery?.refreshed;
+    const expired = new Set(Object.keys(row.checkpoint?.expired ?? {}).map(Number));
+    const needsPass = (video: VideoResultSource, index: number) =>
+      hasVideoResultUrl(video) &&
+      progress.get(index) !== 'registered' &&
+      !refreshed?.[index] &&
+      !expired.has(index);
+    const attempt = await store.beginMaterialization(row, videos.some(needsPass));
+    if (!attempt) return;
+    for (const [index, video] of videos.entries()) {
+      stop.throwIfAborted();
+      if (progress.get(index) === 'registered' || refreshed?.[index] === 'finished') continue;
+      const hasUrl = hasVideoResultUrl(video);
+      if (
+        hasUrl &&
+        (refreshed?.[index] === 'pending' || (attempt.reserved && needsPass(video, index)))
+      ) {
+        const output = await materializeOutput(row, video, index);
+        if (!output.phase) return;
+        progress.set(index, output.phase);
+        if (output.expired) expired.add(index);
+      } else if (!progress.has(index)) {
+        const code = hasUrl ? 'VIDEO_MATERIALIZATION_LIMIT' : 'VIDEO_RESULT_INVALID';
+        const phase = await store.writeOutput(row, index, code, stop);
+        if (!phase) return;
+        progress.set(index, phase);
+      }
+    }
+    if (
+      (await refreshExpired(row, videos, expired)) ||
+      (attempt.attempts < VIDEO_MATERIALIZATION_MAX_ATTEMPTS && videos.some(needsPass))
+    ) {
       await store.release(row);
       return;
     }
-    if (!row.checkpoint?.videos.length || !(await store.beginMaterialization(row))) {
-      await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED');
-      return;
-    }
-    const bounded = AbortSignal.any([stop, AbortSignal.timeout(180_000)]);
+    const registered = videos.filter(
+      (_video, index) => progress.get(index) === 'registered',
+    ).length;
+    if (registered === videos.length) {
+      if (await store.terminal(row, 'completed', null, stop)) await verify(row);
+    } else if (registered > 0) await store.terminal(row, 'partial', null, stop);
+    else await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED', stop);
+  };
+
+  const materializeResult = async (row: VideoExecution) => {
     try {
-      bounded.throwIfAborted();
-      const outputs = await materialize(row, row.checkpoint.videos, bounded);
-      bounded.throwIfAborted();
-      if (await store.complete(row, outputs)) await verify(row);
+      stop.throwIfAborted();
+      const videos = row.checkpoint?.videos;
+      if (Array.isArray(videos) && videos.length > 0 && videos.length <= 16)
+        await materializePass(row, videos);
+      else
+        await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED', stop);
     } catch {
-      // The persisted URL checkpoint survives restarts; the store limits attempts to three.
+      // Committed indices survive claim release. The next claim uses the existing checkpoints.
       await store.release(row);
       if (!stop.aborted) log.error('VIDEO_MATERIALIZATION_PENDING');
     }
   };
 
   const returned = async (row: VideoExecution, videos: VideoResultSource[]) => {
-    if (
-      !videos.length ||
-      videos.length > 16 ||
-      videos.some((video) => typeof video.url !== 'string')
-    ) {
+    if (!videos.length || videos.length > 16 || !videos.some(hasVideoResultUrl)) {
       await store.terminal(row, 'failed', 'VIDEO_RESULT_INVALID');
       return;
     }

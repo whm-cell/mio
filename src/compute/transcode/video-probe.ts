@@ -1,8 +1,15 @@
+import {
+  VIDEO_PROBE_ADMISSION_MS,
+  VIDEO_PROBE_EXECUTION_MS,
+  VIDEO_PROBE_REPLY_MS,
+} from '@mio/compute-contracts';
 import type {
   VideoProbeCommandV1,
   VideoProbeMetadataV1,
   VideoProbeResultV1,
 } from '@mio/compute-contracts';
+import { epochMs } from '@mio/foundation/time';
+import { VideoProbePublishUnconfirmed } from '../../integrations/rabbitmq.ts';
 
 /** Read-only inspections can be repeated after restart; generation POSTs cannot. */
 export function createVideoProbeCoordinator() {
@@ -35,7 +42,7 @@ export function createVideoProbeCoordinator() {
     },
     async run(
       command: VideoProbeCommandV1,
-      publish: (command: VideoProbeCommandV1) => Promise<void>,
+      publish: (command: VideoProbeCommandV1, admitBy: number) => Promise<void>,
       signal: AbortSignal,
     ) {
       signal.throwIfAborted();
@@ -43,11 +50,18 @@ export function createVideoProbeCoordinator() {
       const { promise, resolve, reject } = Promise.withResolvers<VideoProbeMetadataV1>();
       const abort = () => reject(new Error('VIDEO_PROBE_ABORTED'));
       signal.addEventListener('abort', abort, { once: true });
-      const timer = setTimeout(() => reject(new Error('VIDEO_PROBE_TIMEOUT')), 120_000);
+      const admitBy = epochMs() + VIDEO_PROBE_ADMISSION_MS;
+      const timer = setTimeout(
+        () => reject(new Error('VIDEO_PROBE_TIMEOUT')),
+        VIDEO_PROBE_ADMISSION_MS + VIDEO_PROBE_EXECUTION_MS + VIDEO_PROBE_REPLY_MS,
+      );
       timer.unref();
       pending.set(command.messageId, { command, resolve, reject });
-      void publish(command).catch(() => reject(new Error('VIDEO_PROBE_PUBLISH_FAILED')));
       try {
+        void publish(command, admitBy).catch((error: unknown) => {
+          if (!(error instanceof VideoProbePublishUnconfirmed))
+            reject(new Error('VIDEO_PROBE_PUBLISH_FAILED', { cause: error }));
+        });
         return await promise;
       } finally {
         clearTimeout(timer);

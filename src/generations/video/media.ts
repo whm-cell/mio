@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto';
 import { createId, isUuidV4 } from '@mio/foundation/identifiers';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, rename, statfs, lstat, unlink } from 'node:fs/promises';
+import { link, mkdir, open, readFile, rename, statfs, lstat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { VideoProbeCommandV1, VideoProbeMetadataV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore } from '../../assets/contracts.ts';
 import { waitForObjectHead } from '../../assets/contracts.ts';
 import { withPublicHttps } from '../../integrations/onelink/public-https.ts';
-import type { VideoExecution, VideoMaterializer, VideoMaterializedOutput } from './execution.ts';
+import { VideoResultUrlExpired } from './execution.ts';
+import type { VideoExecution, VideoMaterializer } from './execution.ts';
 
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
 const VIDEO_CONTENT_TYPE = 'video/mp4';
+const VIDEO_IO_TIMEOUT_MS = 180_000;
+const READ_CHECKPOINT_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 interface SavedVideo {
   jobId: string;
@@ -28,7 +31,47 @@ export type VideoProbe = (
   signal: AbortSignal,
 ) => Promise<VideoProbeMetadataV1>;
 
-async function save(path: string, saved: SavedVideo) {
+async function syncDirectory(directory: string) {
+  const handle = await open(directory, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function publish(
+  temporary: string,
+  path: string,
+  mode: 'create' | 'update',
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  let installed = true;
+  if (mode === 'create') {
+    try {
+      // An overlapping claim may already have published this name.
+      await link(temporary, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      installed = false;
+    }
+    await unlink(temporary);
+  } else {
+    await rename(temporary, path);
+  }
+  await syncDirectory(dirname(path));
+  signal.throwIfAborted();
+  return installed;
+}
+
+async function save(
+  path: string,
+  saved: SavedVideo,
+  signal: AbortSignal,
+  mode: 'create' | 'update' = 'update',
+) {
+  signal.throwIfAborted();
   const temporary = path + '.' + createId();
   const handle = await open(temporary, 'wx', 0o600);
   try {
@@ -37,18 +80,21 @@ async function save(path: string, saved: SavedVideo) {
   } finally {
     await handle.close();
   }
-  await rename(temporary, path);
+  return publish(temporary, path, mode, signal);
 }
 
-async function readReceipt(path: string, jobId: string, index: number) {
+async function readReceipt(path: string, jobId: string, index: number, signal: AbortSignal) {
   let saved: SavedVideo;
   try {
-    saved = JSON.parse(await readFile(path, 'utf8')) as SavedVideo;
+    saved = JSON.parse(
+      await readFile(path, { encoding: 'utf8', flag: READ_CHECKPOINT_FLAGS, signal }),
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
   if (
+    !saved ||
     saved.jobId !== jobId ||
     saved.index !== index ||
     !isUuidV4(saved.assetId) ||
@@ -64,19 +110,28 @@ async function readReceipt(path: string, jobId: string, index: number) {
 }
 
 async function digestFile(file: string, signal: AbortSignal) {
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  signal.throwIfAborted();
+  const handle = await open(file, READ_CHECKPOINT_FLAGS).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (!handle) return;
   try {
     const info = await handle.stat();
     if (!info.isFile() || info.size < 1 || info.size > MAX_VIDEO_BYTES)
       throw new Error('VIDEO_FILE_INVALID');
     const hash = createHash('sha256');
     const md5 = createHash('md5');
-    for await (const bytes of handle.createReadStream({ autoClose: false })) {
+    let sizeBytes = 0;
+    for await (const bytes of handle.createReadStream({ autoClose: false, signal })) {
       signal.throwIfAborted();
+      sizeBytes += bytes.length;
+      if (sizeBytes > info.size) throw new Error('VIDEO_FILE_INVALID');
       hash.update(bytes);
       md5.update(bytes);
     }
-    return { sizeBytes: info.size, sha256: hash.digest('hex'), contentMd5: md5.digest('base64') };
+    signal.throwIfAborted();
+    if (sizeBytes !== info.size) throw new Error('VIDEO_FILE_INVALID');
+    return { sizeBytes, sha256: hash.digest('hex'), contentMd5: md5.digest('base64') };
   } finally {
     await handle.close();
   }
@@ -89,6 +144,7 @@ async function downloadVideo(
   download: typeof withPublicHttps,
   expected?: Pick<SavedVideo, 'sizeBytes' | 'sha256'>,
 ) {
+  signal.throwIfAborted();
   const space = await statfs(dirname(file), { bigint: true });
   if (space.bavail * space.bsize < BigInt(MAX_VIDEO_BYTES + 64 * 1024 * 1024))
     throw new Error('VIDEO_DISK_FULL');
@@ -98,7 +154,10 @@ async function downloadVideo(
   const md5 = createHash('md5');
   let sizeBytes = 0;
   try {
+    signal.throwIfAborted();
     await download(new URL(url), signal, async (response) => {
+      signal.throwIfAborted();
+      if ([401, 403, 404, 410].includes(response.status)) throw new VideoResultUrlExpired();
       if (response.status !== 200 || !response.body) throw new Error('VIDEO_DOWNLOAD_FAILED');
       const declared = response.headers.get('content-length');
       if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_VIDEO_BYTES))
@@ -112,6 +171,7 @@ async function downloadVideo(
         md5.update(bytes);
         let offset = 0;
         while (offset < bytes.length) {
+          signal.throwIfAborted();
           const written = await handle.write(bytes, offset, bytes.length - offset);
           if (!written.bytesWritten) throw new Error('VIDEO_STORAGE_FAILED');
           offset += written.bytesWritten;
@@ -120,6 +180,7 @@ async function downloadVideo(
       if (sizeBytes < 1 || (declared !== null && sizeBytes !== Number(declared)))
         throw new Error('VIDEO_DOWNLOAD_INCOMPLETE');
     });
+    signal.throwIfAborted();
     await handle.sync();
   } finally {
     await handle.close();
@@ -129,8 +190,37 @@ async function downloadVideo(
     await unlink(temporary);
     throw new Error('VIDEO_CHECKPOINT_INVALID');
   }
-  await rename(temporary, file);
+  if (!(await publish(temporary, file, 'create', signal))) return;
   return { sizeBytes, sha256, contentMd5: md5.digest('base64') };
+}
+
+async function putStagingVideo(
+  objects: AssetObjectStore,
+  key: string,
+  file: string,
+  saved: SavedVideo,
+  contentMd5: string,
+  signal: AbortSignal,
+) {
+  if (!objects.putVideo) throw new Error('VIDEO_STORAGE_UNAVAILABLE');
+  signal.throwIfAborted();
+  const handle = await open(file, READ_CHECKPOINT_FLAGS);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size !== saved.sizeBytes) throw new Error('VIDEO_FILE_INVALID');
+    const stream = handle.createReadStream({ autoClose: false, end: info.size - 1 });
+    stream.on('error', () => {});
+    try {
+      signal.throwIfAborted();
+      return (
+        await objects.putVideo(key, stream, saved.sizeBytes, saved.sha256, contentMd5, signal)
+      ).etag;
+    } finally {
+      stream.destroy();
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 function verifyVideoObject(
@@ -163,132 +253,153 @@ export function createVideoMaterializer(
       if ((error as { statusCode?: number } | null)?.statusCode === 404) return;
       throw error;
     });
-  return async (row, videos, signal) => {
-    if (!objects.putVideo) throw new Error('VIDEO_STORAGE_UNAVAILABLE');
-    const directory = join(dataDirectory, 'video', row.id);
+  const existingRaw = async (key: string, saved: SavedVideo, signal: AbortSignal) => {
+    const object = await existingObject(key, signal);
+    if (object) verifyVideoObject(object, saved, saved.rawEtag);
+    else if (saved.rawEtag) throw new Error('VIDEO_OBJECT_MISMATCH');
+    return object;
+  };
+  return async (row, video, index, stop) => {
+    const stagingSignal = AbortSignal.any([stop, AbortSignal.timeout(VIDEO_IO_TIMEOUT_MS)]);
+    stagingSignal.throwIfAborted();
+    const videoDirectory = join(dataDirectory, 'video');
+    const directory = join(videoDirectory, row.id);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const info = await lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('VIDEO_DIRECTORY_INVALID');
-    const outputs: VideoMaterializedOutput[] = [];
-    for (const [index, video] of videos.entries()) {
-      signal.throwIfAborted();
-      const file = join(directory, String(index) + '.media');
-      const receipt = join(directory, String(index) + '.json');
-      let saved = await readReceipt(receipt, row.id, index);
-      let contentMd5: string | undefined;
-      if (saved) {
-        const actual = await digestFile(file, signal).catch((error: NodeJS.ErrnoException) => {
-          if (error.code === 'ENOENT') return;
-          throw error;
-        });
-        if (actual && (actual.sha256 !== saved.sha256 || actual.sizeBytes !== saved.sizeBytes))
-          throw new Error('VIDEO_CHECKPOINT_INVALID');
-        contentMd5 = actual?.contentMd5;
-      } else {
-        const { contentMd5: md5, ...actual } = await downloadVideo(
-          video.url,
-          file,
-          signal,
-          download,
-        );
-        contentMd5 = md5;
-        saved = { jobId: row.id, index, assetId: createId(), attemptId: createId(), ...actual };
-        await save(receipt, saved);
+    const file = join(directory, `${index}.media`);
+    const receipt = join(directory, `${index}.json`);
+    let saved = await readReceipt(receipt, row.id, index, stagingSignal);
+    let contentMd5: string | undefined;
+    if (!saved) {
+      // Persist new directory entries before storing output identity or bytes in them.
+      await syncDirectory(dataDirectory);
+      await syncDirectory(videoDirectory);
+      let actual =
+        (await digestFile(file, stagingSignal)) ??
+        (await downloadVideo(video.url, file, stagingSignal, download));
+      if (!actual) {
+        // Another claim published the bytes. Prefer its receipt when it is already visible.
+        saved = await readReceipt(receipt, row.id, index, stagingSignal);
+        if (!saved) actual = await digestFile(file, stagingSignal);
       }
-      const key = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
-      if (!saved.media) {
-        let object = await existingObject(key, signal);
-        signal.throwIfAborted();
-        let uploadedEtag: string | undefined;
-        if (!object) {
-          contentMd5 ??= (await downloadVideo(video.url, file, signal, download, saved)).contentMd5;
-          const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-          const stream = handle.createReadStream({ autoClose: false });
-          stream.on('error', () => {});
-          try {
-            const uploaded = await objects.putVideo(
-              key,
-              stream,
-              saved.sizeBytes,
-              saved.sha256,
-              contentMd5,
-              signal,
-            );
-            uploadedEtag = uploaded.etag;
-          } finally {
-            stream.destroy();
-            await handle.close();
-          }
-          object = await readHead(key, signal);
+      if (actual) {
+        const { contentMd5: md5, ...identity } = actual;
+        const proposed = {
+          jobId: row.id,
+          index,
+          assetId: createId(),
+          attemptId: createId(),
+          ...identity,
+        };
+        if (await save(receipt, proposed, stagingSignal, 'create')) {
+          contentMd5 = md5;
+          saved = proposed;
+        } else {
+          saved = await readReceipt(receipt, row.id, index, stagingSignal);
         }
-        verifyVideoObject(object, saved, uploadedEtag);
-        signal.throwIfAborted();
-        saved.media = await probe(
-          {
-            version: 1,
-            type: 'video.probe',
-            messageId: createId(),
-            jobId: row.id,
-            outputIndex: index,
-            attemptId: saved.attemptId,
-            attempt: 1,
-            source: {
-              stagingKey: key,
-              sizeBytes: saved.sizeBytes,
-              sha256: saved.sha256,
-              etag: object.etag,
-            },
-          },
-          signal,
-        );
-        saved.etag = object.etag;
-        await save(receipt, saved);
       }
-      const media = saved.media;
-      if (
-        !media.container.split(',').some((container) => ['mov', 'mp4'].includes(container)) ||
-        !Number.isFinite(media.durationSeconds) ||
-        media.durationSeconds <= 0
-      )
-        throw new Error('VIDEO_MEDIA_INVALID');
-      const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
-      let rawObject = await existingObject(rawKey, signal);
-      signal.throwIfAborted();
-      if (!rawObject) {
-        if (saved.rawEtag || !saved.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
-        const copied = await objects.copy(key, rawKey, saved.etag, 'private', {
-          contentType: VIDEO_CONTENT_TYPE,
-          sha256: saved.sha256,
-          signal,
-        });
-        signal.throwIfAborted();
-        if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
-        saved.rawEtag = copied.etag;
-        await save(receipt, saved);
-        rawObject = await readHead(rawKey, signal);
-      }
-      verifyVideoObject(rawObject, saved, saved.rawEtag);
-      signal.throwIfAborted();
-      if (!saved.rawEtag) {
-        saved.rawEtag = rawObject.etag;
-        await save(receipt, saved);
-      }
-      signal.throwIfAborted();
-      outputs.push({
-        index,
-        assetId: saved.assetId,
-        key: rawKey,
-        etag: rawObject.etag,
-        sha256: saved.sha256,
-        sizeBytes: saved.sizeBytes,
-        contentType: VIDEO_CONTENT_TYPE,
-        width: media.width,
-        height: media.height,
-        durationMs: Math.round(media.durationSeconds * 1000),
-        hasAudio: media.hasAudio,
-      });
     }
-    return outputs;
+    if (!saved) throw new Error('VIDEO_CHECKPOINT_INVALID');
+    const createdReceipt = contentMd5 !== undefined;
+    // The name may be visible before its publisher finishes syncing the directory.
+    if (!createdReceipt) await syncDirectory(directory);
+    const key = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
+    const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
+    let rawObject = createdReceipt ? undefined : await existingRaw(rawKey, saved, stagingSignal);
+    let finalizingSignal = stagingSignal;
+    let object = !saved.media || !rawObject ? await existingObject(key, stagingSignal) : undefined;
+    if (object && saved.media) verifyVideoObject(object, saved, saved.etag);
+    const rebuildStage = !!saved.media && !rawObject && !object;
+    if (!saved.media || rebuildStage) {
+      let uploadedEtag: string | undefined;
+      if (!object) {
+        if (rawObject) throw new Error('VIDEO_CHECKPOINT_INVALID');
+        if (contentMd5 === undefined) {
+          const actual =
+            (await digestFile(file, stagingSignal)) ??
+            (await downloadVideo(video.url, file, stagingSignal, download, saved)) ??
+            (await digestFile(file, stagingSignal));
+          if (!actual || actual.sha256 !== saved.sha256 || actual.sizeBytes !== saved.sizeBytes)
+            throw new Error('VIDEO_CHECKPOINT_INVALID');
+          contentMd5 = actual.contentMd5;
+        }
+        if (rebuildStage) {
+          // The old source was confirmed absent. Persist the pending probe before the PUT.
+          delete saved.media;
+          delete saved.etag;
+          await save(receipt, saved, stagingSignal);
+        }
+        uploadedEtag = await putStagingVideo(objects, key, file, saved, contentMd5, stagingSignal);
+        object = await readHead(key, stagingSignal);
+      }
+      verifyVideoObject(object, saved, uploadedEtag);
+      stagingSignal.throwIfAborted();
+      // Compute owns its queue, execution, and reply deadlines.
+      saved.media = await probe(
+        {
+          version: 1,
+          type: 'video.probe',
+          messageId: createId(),
+          jobId: row.id,
+          outputIndex: index,
+          attemptId: saved.attemptId,
+          attempt: 1,
+          source: {
+            stagingKey: key,
+            sizeBytes: saved.sizeBytes,
+            sha256: saved.sha256,
+            etag: object.etag,
+          },
+        },
+        stop,
+      );
+      finalizingSignal = AbortSignal.any([stop, AbortSignal.timeout(VIDEO_IO_TIMEOUT_MS)]);
+      saved.etag = object.etag;
+      await save(receipt, saved, finalizingSignal);
+    }
+    const media = saved.media;
+    if (
+      !media.container.split(',').some((container) => ['mov', 'mp4'].includes(container)) ||
+      !Number.isFinite(media.durationSeconds) ||
+      media.durationSeconds <= 0
+    )
+      throw new Error('VIDEO_MEDIA_INVALID');
+    if (createdReceipt || rebuildStage)
+      rawObject = await existingRaw(rawKey, saved, finalizingSignal);
+    if (!rawObject) {
+      if (!saved.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
+      finalizingSignal.throwIfAborted();
+      const copied = await objects.copy(key, rawKey, saved.etag, 'private', {
+        contentType: VIDEO_CONTENT_TYPE,
+        sha256: saved.sha256,
+        signal: finalizingSignal,
+      });
+      finalizingSignal.throwIfAborted();
+      if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
+      saved.rawEtag = copied.etag;
+      await save(receipt, saved, finalizingSignal);
+      rawObject = await readHead(rawKey, finalizingSignal);
+      verifyVideoObject(rawObject, saved, saved.rawEtag);
+    }
+    if (!saved.rawEtag) {
+      saved.rawEtag = rawObject.etag;
+      await save(receipt, saved, finalizingSignal);
+    }
+    finalizingSignal.throwIfAborted();
+    return {
+      index,
+      assetId: saved.assetId,
+      key: rawKey,
+      etag: rawObject.etag,
+      sha256: saved.sha256,
+      sizeBytes: saved.sizeBytes,
+      contentType: VIDEO_CONTENT_TYPE,
+      width: media.width,
+      height: media.height,
+      durationMs: Math.round(media.durationSeconds * 1000),
+      hasAudio: media.hasAudio,
+    };
   };
 }
 
@@ -299,7 +410,7 @@ export function createVideoCleanup(objects: AssetObjectStore, dataDirectory: str
     for (let index = 0; index < (row.checkpoint?.videos.length ?? 0); index++) {
       signal.throwIfAborted();
       const receipt = join(directory, String(index) + '.json');
-      const saved = await readReceipt(receipt, row.id, index);
+      const saved = await readReceipt(receipt, row.id, index, signal);
       if (!saved) continue;
       const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
       const raw = await waitForObjectHead(() => objects.head(rawKey, signal), signal);

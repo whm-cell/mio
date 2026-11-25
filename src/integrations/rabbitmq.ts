@@ -30,6 +30,7 @@ import {
   parseComputeResultV1,
   parseMediaResult,
   parseVideoProbeResultV1,
+  VIDEO_PROBE_ADMISSION_HEADER,
   VIDEO_PROBE_COMMAND_ROUTING_KEY,
 } from '@mio/compute-contracts';
 import type {
@@ -50,6 +51,8 @@ import type {
 /** The broker resolved this individual command as rejected. Connection state is independent. */
 export class MediaPublishRejected extends Error {}
 export class WorkerControlPublishRejected extends Error {}
+/** A video probe was dispatched but its acceptance could not be confirmed. */
+export class VideoProbePublishUnconfirmed extends Error {}
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -238,10 +241,14 @@ export class ComputeBroker {
     }
   }
 
-  publish(message: ComputeCommandV1 | VideoProbeCommandV1): Promise<void> {
+  publish(
+    message: ComputeCommandV1 | VideoProbeCommandV1,
+    videoProbeAdmitBy?: number,
+  ): Promise<void> {
     return this.publishCommand(
       message.type === 'video.probe' ? VIDEO_PROBE_COMMAND_ROUTING_KEY : COMMAND_ROUTING_KEY,
       message,
+      message.type === 'video.probe' ? videoProbeAdmitBy : undefined,
     );
   }
 
@@ -286,8 +293,14 @@ export class ComputeBroker {
       | MediaCommand
       | MediaControl
       | WorkerLimitsCommand,
+    videoProbeAdmitBy?: number,
   ): Promise<void> {
+    const videoProbe = message.type === 'video.probe';
+    if (videoProbe && (!this.accepting || this.lifecycle.closed))
+      throw new Error('BROKER_CHANNEL_CLOSED');
     let returned = false;
+    let nacked: Error | undefined;
+    let dispatched = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
     };
@@ -307,10 +320,18 @@ export class ComputeBroker {
             contentType: 'application/json',
             messageId: message.messageId,
             userId: this.userId,
+            ...(videoProbeAdmitBy === undefined
+              ? {}
+              : { headers: { [VIDEO_PROBE_ADMISSION_HEADER]: videoProbeAdmitBy } }),
           },
-          (error) =>
-            error ? reject(error) : returned ? reject(new Error('MESSAGE_RETURNED')) : resolve(),
+          (error) => {
+            if (error?.message === 'message nacked') nacked = error;
+            if (error) reject(error);
+            else if (returned) reject(new Error('MESSAGE_RETURNED'));
+            else resolve();
+          },
         );
+        dispatched = true;
         if (!writable)
           drain = new Promise<void>((resolveDrain) => {
             onDrain = resolveDrain;
@@ -324,6 +345,12 @@ export class ComputeBroker {
         Promise.race([Promise.all([confirmation, drain]), timeout]),
         this.transport.signal,
       );
+    } catch (error) {
+      if (!videoProbe || !dispatched) throw error;
+      if (nacked) throw nacked;
+      if (returned) throw new Error('MESSAGE_RETURNED', { cause: error });
+      // A lost confirm, including a channel close, may leave a valid command queued.
+      throw new VideoProbePublishUnconfirmed('VIDEO_PROBE_PUBLISH_UNCONFIRMED', { cause: error });
     } finally {
       if (timer) clearTimeout(timer);
       this.publisher.off('return', onReturn);

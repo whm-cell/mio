@@ -24,6 +24,7 @@ import {
   RESULT_ROUTING_KEY,
   WORKER_TELEMETRY_ROUTING_KEY,
   WORKER_MAX_MESSAGE_BYTES,
+  VIDEO_PROBE_ADMISSION_HEADER,
   VIDEO_PROBE_COMMAND_QUEUE,
   VIDEO_PROBE_RESULT_ROUTING_KEY,
   parseWorkerLimitsCommand,
@@ -75,10 +76,23 @@ interface ConsumerGate {
 interface CommandProtocol<T> {
   queue: string;
   maxBytes: number;
-  parse(value: unknown): T;
+  parse(value: unknown, properties: ConsumeMessage['properties']): T;
 }
 
-type VideoCommand = ComputeCommandV1 | VideoProbeCommandV1;
+export type VideoProbeDelivery = VideoProbeCommandV1 & { admitBy?: number };
+type VideoCommand = ComputeCommandV1 | VideoProbeDelivery;
+
+function parseVideoProbeDelivery(
+  value: unknown,
+  properties: ConsumeMessage['properties'],
+): VideoProbeDelivery {
+  const command = parseVideoProbeCommandV1(value);
+  const admitBy: unknown = properties.headers?.[VIDEO_PROBE_ADMISSION_HEADER];
+  if (admitBy === undefined) return command;
+  if (typeof admitBy !== 'number' || !Number.isSafeInteger(admitBy) || admitBy <= 0)
+    throw new Error('COMMAND_INVALID');
+  return { ...command, admitBy };
+}
 
 async function closeConnection(
   connection: ChannelModel,
@@ -354,14 +368,14 @@ export class Broker {
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: ((command: VideoCommand) => boolean) | undefined,
-    handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
+    handleVideoProbe?: (command: VideoProbeDelivery, ack: () => void) => Promise<void>,
   ): Promise<void> {
     const protocol: CommandProtocol<VideoCommand> = {
       queue: COMMAND_QUEUE,
       maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-      parse(value) {
+      parse(value, properties) {
         return (value as { type?: unknown } | null)?.type === 'video.probe'
-          ? parseVideoProbeCommandV1(value)
+          ? parseVideoProbeDelivery(value, properties)
           : parseComputeCommandV1(value);
       },
     };
@@ -395,7 +409,7 @@ export class Broker {
   }
 
   consumeVideoProbes(
-    handle: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
+    handle: (command: VideoProbeDelivery, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     buffered: boolean,
   ): Promise<void> {
@@ -403,7 +417,7 @@ export class Broker {
       {
         queue: VIDEO_PROBE_COMMAND_QUEUE,
         maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-        parse: parseVideoProbeCommandV1,
+        parse: parseVideoProbeDelivery,
       },
       handle,
       failed,
@@ -537,7 +551,7 @@ export class Broker {
     const value: unknown = JSON.parse(
       new TextDecoder('utf-8', { fatal: true }).decode(message.content),
     );
-    const command = protocol.parse(value);
+    const command = protocol.parse(value, message.properties);
     if (message.properties.messageId !== command.messageId) throw new Error('COMMAND_ID_MISMATCH');
     return command;
   }

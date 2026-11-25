@@ -266,10 +266,13 @@ async function assetHttpFixture(withExecutor = false) {
   );
   const stop = new AbortController();
   const receipts = new VideoSubmissionReceipts(directory);
+  let expiredResult = false;
+  let downloads = 0;
   const download: typeof withPublicHttps = async (url, signal, consume) => {
     expect(url.href).toBe(generatedVideo);
     signal.throwIfAborted();
-    return consume(new Response(outputBytes));
+    downloads++;
+    return consume(expiredResult ? new Response(null, { status: 410 }) : new Response(outputBytes));
   };
   const materialize = createVideoMaterializer(
     objects,
@@ -356,6 +359,10 @@ async function assetHttpFixture(withExecutor = false) {
     heads,
     objects,
     upstream,
+    expireResult: () => {
+      expiredResult = true;
+    },
+    downloadCount: () => downloads,
     wake,
     closeAdmissions: service.close,
     stopRunner: (reason?: unknown) => stop.abort(reason),
@@ -433,6 +440,52 @@ async function assetHttpFixture(withExecutor = false) {
     },
   };
 }
+
+it('recovers the private video from its downloaded checkpoint after the supplier URL expires', async () => {
+  const f = await assetHttpFixture();
+  try {
+    const asset = await f.addAsset();
+    const accepted = await f.post([{ assetId: asset.assetId }]);
+    expect(accepted.status).toBe(202);
+    const { id } = await accepted.json();
+    await f.runNext();
+    const due = () =>
+      f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [id]);
+    await due();
+    f.objects.putVideo.mockRejectedValueOnce(new Error('fixture upload outage'));
+    await f.runNext();
+    expect(f.downloadCount()).toBe(1);
+    await f.pool.query(
+      `UPDATE mio_video_executions SET checkpoint=checkpoint||'{"materializationAttempts":3}'::jsonb
+      WHERE job_id=$1`,
+      [id],
+    );
+    await due();
+    await f.runNext();
+    const failed = await f.get(id);
+    expect(await failed.json()).toMatchObject({
+      state: 'materialization_failed',
+      recovery: { available: true },
+      outputs: [{ index: 0, status: 'failed', assetId: null }],
+    });
+    f.expireResult();
+    await f.service.recover(actor, id);
+    await f.runNext();
+    const detail = await f.get(id);
+    expect(detail.status).toBe(200);
+    const completed = await detail.json();
+    expect(completed).toMatchObject({
+      state: 'completed',
+      recovery: { available: false },
+      outputs: [{ index: 0, status: 'registered', width: 640, height: 360 }],
+    });
+    expect(JSON.stringify(completed)).not.toContain('https://video.fixture/');
+    expect(f.downloadCount()).toBe(1);
+    expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+  } finally {
+    await f.close();
+  }
+});
 
 describe('video admission cancellation', () => {
   const expectUnadmitted = async (f: Awaited<ReturnType<typeof assetHttpFixture>>) => {

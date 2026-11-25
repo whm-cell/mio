@@ -118,7 +118,7 @@ async function fixture() {
     durationMs: 4000,
     hasAudio: false,
   };
-  const materialize: VideoMaterializer = async () => [output];
+  const materialize: VideoMaterializer = async () => output;
   const run = createVideoRunner(
     execution,
     () => provider,
@@ -237,11 +237,11 @@ it('completes a video through its output foreign key while competing recoveries 
   const race = await raceRecovery(
     f,
     'CREATE TRIGGER pause_video_write BEFORE INSERT ON mio_video_outputs FOR EACH ROW EXECUTE FUNCTION pause_video_write()',
-    () => f.execution.complete(row, [f.output]),
+    () => f.run(row),
   );
   expect(race.firstWait).toBe('transactionid');
   expect(race.outcomes).toEqual([
-    { status: 'fulfilled', value: true },
+    { status: 'fulfilled', value: undefined },
     { status: 'fulfilled', value: undefined },
     { status: 'fulfilled', value: undefined },
   ]);
@@ -296,7 +296,10 @@ it('settles the original video receipt while competing recoveries wait for quota
 it('enforces both quotas before competing recoveries resume the original checkpoint', async () => {
   const f = await fixture();
   const row = await prepareCompletion(f);
-  expect(await f.execution.beginMaterialization(row)).toBe(true);
+  expect(await f.execution.beginMaterialization(row, true)).toEqual({
+    attempts: 1,
+    reserved: true,
+  });
   await f.execution.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED');
   const failed = await f.durable();
   const freeSlot = async () => {
@@ -317,7 +320,11 @@ it('enforces both quotas before competing recoveries resume the original checkpo
 
   await Promise.all([recover(), f.competing.store.recover(f.ownerId, f.jobId)]);
   const resumed = await f.next();
-  expect(resumed.checkpoint).toEqual({ videos, materializationAttempts: 0 });
+  expect(resumed.checkpoint).toMatchObject({
+    videos,
+    materializationAttempts: 0,
+    recoveryQuery: { state: 'available' },
+  });
   expect(
     (
       await f.pool.query(

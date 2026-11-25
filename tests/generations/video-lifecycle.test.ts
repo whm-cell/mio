@@ -26,7 +26,10 @@ import type {
   VideoProtocolFactory,
   VideoSubmitResult,
 } from '../../src/generations/video/execution.ts';
-import { VIDEO_EXECUTOR_QUERY_INTERVAL_MS } from '../../src/generations/video/execution.ts';
+import {
+  VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VideoResultUrlExpired,
+} from '../../src/generations/video/execution.ts';
 import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
 import { VIDEO_USER_QUOTA } from '../../src/generations/video/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
@@ -59,6 +62,10 @@ const queryRoutes = {
     queryPathTemplate: '/happyhorse/v1/tasks/{task_id}',
   },
 } as const;
+
+function klingSuccess(videos: unknown[], taskId = 'safe-task') {
+  return { code: 0, data: { task_id: taskId, task_status: 'succeed', task_result: { videos } } };
+}
 
 async function fixture(reference?: 'frozen' | 'legacy', family: keyof typeof queryRoutes = 'ark') {
   const { modelId, ...route } = queryRoutes[family];
@@ -180,7 +187,7 @@ async function fixture(reference?: 'frozen' | 'legacy', family: keyof typeof que
     durationMs: 4000,
     hasAudio: false,
   };
-  const materialize = vi.fn<VideoMaterializer>().mockResolvedValue([output]);
+  const materialize = vi.fn<VideoMaterializer>().mockResolvedValue(output);
   const runner = (
     overrides: Partial<VideoTransports> = {},
     target = execution,
@@ -258,11 +265,17 @@ describe('durable video execution', () => {
     f.materialize.mockRejectedValueOnce(new Error('temporary storage error'));
     await f.run(await f.next());
     await f.pool.query(
-      "UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','3'::jsonb) WHERE job_id=$1",
+      `UPDATE mio_video_executions SET checkpoint=checkpoint||
+        '{"materializationAttempts":3}'::jsonb WHERE job_id=$1`,
       [f.job.jobId],
     );
     await f.run(await f.next());
     expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('materialization_failed');
+    await f.pool.query(
+      `UPDATE mio_video_executions SET checkpoint=checkpoint-'refreshAt',
+      updated_at=clock_timestamp()-interval '1 minute' WHERE job_id=$1`,
+      [f.job.jobId],
+    );
     await expect(f.store.recover('another-owner', f.job.jobId)).rejects.toMatchObject({
       code: 'JOB_NOT_FOUND',
     });
@@ -273,8 +286,59 @@ describe('durable video execution', () => {
     await f.run(await f.next());
     expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('completed');
     expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+    expect(f.protocol.query).toHaveBeenCalledTimes(1);
     await f.store.recover(f.actor.userId, f.job.jobId);
   });
+
+  it.each(['recent', 'aged'] as const)(
+    'enforces the manual query interval for a %s legacy checkpoint',
+    async (age) => {
+      const f = await fixture();
+      await f.run(await f.next());
+      f.materialize.mockRejectedValueOnce(new Error('VIDEO_STORAGE_UNAVAILABLE'));
+      await f.run(await f.next());
+      await f.execution.terminal(
+        await f.next(),
+        'materialization_failed',
+        'VIDEO_MATERIALIZATION_FAILED',
+      );
+      const before = await f.durableState();
+      const legacy = { videos: before.checkpoint.videos, materializationAttempts: 3 };
+      const updated = await f.pool.query<{ updated_at: Date }>(
+        `UPDATE mio_video_executions SET checkpoint=$2,
+          updated_at=clock_timestamp()-$3*interval '1 second' WHERE job_id=$1
+          RETURNING updated_at`,
+        [f.job.jobId, legacy, age === 'recent' ? 0 : 60],
+      );
+      expect(await f.durableState()).toMatchObject({ checkpoint: legacy, next_query_at: null });
+
+      await f.store.recover(f.actor.userId, f.job.jobId);
+      const armed = await f.durableState();
+      expect(armed).toMatchObject({
+        checkpoint: {
+          videos: legacy.videos,
+          materializationAttempts: 0,
+          recoveryQuery: { state: 'available' },
+        },
+        next_query_at: null,
+        query_attempt: before.query_attempt,
+        async_deadline: before.async_deadline,
+        async_max_queries: before.async_max_queries,
+        upstream_task_id: before.upstream_task_id,
+      });
+      expect(Date.parse(armed.checkpoint.refreshAt)).toBe(
+        updated.rows[0]!.updated_at.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      const row = await f.next();
+      const reservation = await f.execution.reserveRecoveryQuery(row, before.upstream_task_id);
+      if (age === 'recent') expect(reservation).toBeUndefined();
+      else expect(reservation).toBeInstanceOf(Date);
+      expect(f.protocol.submit).toHaveBeenCalledTimes(1);
+      expect(f.protocol.query).toHaveBeenCalledTimes(1);
+      await f.execution.release(row);
+    },
+  );
+
   it('submits once, retains its upstream identity, and atomically registers the owner video asset', async () => {
     const f = await fixture();
     await f.run(await f.next());
@@ -313,6 +377,313 @@ describe('durable video execution', () => {
     });
     expect(await f.execution.claim()).toBeUndefined();
   });
+
+  it('preserves the original slots and later outputs when one asset transaction rolls back', async () => {
+    const f = await fixture(undefined, 'kling');
+    const videos = [
+      { url: 'https://media.fixture/first.mp4' },
+      { url: 'http://malformed.fixture/skip.mp4' },
+      { url: 'https://media.fixture/cannot-register.mp4' },
+      { url: 'https://media.fixture/last.mp4' },
+    ];
+    const outputs = videos.map((_, index) => ({
+      ...f.output,
+      index,
+      assetId: randomUUID(),
+      key: 'mio/raw/' + randomUUID(),
+    }));
+    f.materialize.mockImplementation(async (_, video, index) => {
+      expect(video).toEqual(videos[index]);
+      return outputs[index]!;
+    });
+    const transport = vi.fn<typeof fetch>(async (_url, options) =>
+      Response.json(
+        options?.method === 'POST'
+          ? { code: 0, data: { task_id: 'safe-task' } }
+          : klingSuccess(videos),
+      ),
+    );
+    await f.pool.query(`
+      CREATE FUNCTION fail_video_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'fixture insert interruption'; END $$;
+      CREATE TRIGGER fail_video_registration BEFORE INSERT ON mio_video_outputs
+      FOR EACH ROW WHEN (NEW.output_index=2 AND NEW.phase='registered')
+      EXECUTE FUNCTION fail_video_registration()
+    `);
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    await run(await f.next());
+    const actorId = f.actor.userId;
+    const view = () => f.store.get(actorId, f.job.jobId);
+    const firstPass = (await view()).outputs;
+    expect(firstPass).toMatchObject([
+      { index: 0, status: 'registered', assetId: outputs[0]!.assetId },
+      { index: 1, status: 'failed', assetId: null, errorCode: 'VIDEO_RESULT_INVALID' },
+      { index: 2, status: 'failed', assetId: null, errorCode: 'VIDEO_MATERIALIZATION_FAILED' },
+      { index: 3, status: 'registered', assetId: outputs[3]!.assetId },
+    ]);
+    const assets = () => f.pool.query('SELECT id,owner_id FROM mio_assets ORDER BY filename');
+    expect((await assets()).rows).toEqual([
+      { id: outputs[0]!.assetId, owner_id: actorId },
+      { id: outputs[3]!.assetId, owner_id: actorId },
+    ]);
+
+    await f.execution.close();
+    const restarted = new VideoGenerationStore(f.pool).executorStore();
+    cleanups.push(() => restarted.close());
+    await restarted.startExecutor(() => {});
+    const resume = f.runner({ protocol: createVideoProtocol, transport }, restarted);
+    for (let pass = 0; pass < 2; pass++) await resume(await f.next(restarted));
+    expect(await view()).toMatchObject({
+      state: 'partial',
+      recovery: { available: true },
+      outputs: firstPass,
+    });
+    expect(f.materialize.mock.calls.map(([, , index]) => index)).toEqual([0, 2, 3, 2, 2]);
+    expect((await assets()).rows).toHaveLength(2);
+
+    await f.pool.query('DROP TRIGGER fail_video_registration ON mio_video_outputs');
+    await f.store.recover(actorId, f.job.jobId);
+    await resume(await f.next(restarted));
+    expect(await view()).toMatchObject({
+      state: 'partial',
+      recovery: { available: false },
+      outputs: [
+        firstPass[0],
+        firstPass[1],
+        { index: 2, status: 'registered', assetId: outputs[2]!.assetId },
+        firstPass[3],
+      ],
+    });
+    expect((await assets()).rows).toHaveLength(3);
+    await expect(f.store.recover(actorId, f.job.jobId)).rejects.toMatchObject({
+      code: 'RESULT_CONFLICT',
+    });
+    expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+    expect(f.materialize.mock.calls.map(([, , index]) => index)).toEqual([0, 2, 3, 2, 2, 2]);
+  });
+
+  it('preserves a replacement from the last pass across restart without materializing on a stale claim', async () => {
+    const f = await fixture(undefined, 'kling');
+    const videos = [
+      { url: 'https://media.fixture/already-registered.mp4' },
+      { url: 'https://media.fixture/expired.mp4' },
+      { url: 'https://media.fixture/owned-checkpoint.mp4' },
+    ];
+    const replacement = { url: 'https://media.fixture/new-address.mp4' };
+    const route = queryRoutes.kling.submitPath + '/safe-task';
+    const ownerId = f.actor.userId;
+    const view = () => f.store.get(ownerId, f.job.jobId);
+    let queries = 0;
+    let callsAtQuery = 0;
+    let ownerCheckpointAvailable = false;
+    let dispatchAt = 0;
+    const transport = vi.fn<typeof fetch>(async (url, options) => {
+      if (options?.method === 'POST')
+        return Response.json({ code: 0, data: { task_id: 'safe-task' } });
+      queries++;
+      if (queries === 1) return Response.json(klingSuccess(videos));
+      expect(new URL(String(url)).pathname).toBe(route);
+      expect(options?.method).toBe('GET');
+      expect(options?.redirect).toBe('error');
+      expect(new Headers(options?.headers).get('authorization')).toBe('Bearer rotated-key');
+      callsAtQuery = f.materialize.mock.calls.length;
+      dispatchAt = await f.databaseNow();
+      expect(
+        (await view()).outputs
+          .filter((output) => output.status === 'registered')
+          .map((output) => output.index),
+      ).toEqual([0, 2]);
+      return Response.json(
+        klingSuccess([
+          { url: 'https://media.fixture/do-not-overwrite-first.mp4' },
+          replacement,
+          { url: 'https://media.fixture/do-not-overwrite-checkpoint.mp4' },
+        ]),
+      );
+    });
+    const outputs = videos.map((_, index) => ({
+      ...f.output,
+      index,
+      assetId: randomUUID(),
+      key: 'mio/raw/' + randomUUID(),
+    }));
+    f.materialize.mockImplementation(async (_, video, index) => {
+      if (index === 1 && video.url !== replacement.url) throw new VideoResultUrlExpired();
+      if (index === 2 && !ownerCheckpointAvailable) throw new Error('VIDEO_STORAGE_UNAVAILABLE');
+      return outputs[index]!;
+    });
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    await run(await f.next());
+    for (let pass = 0; pass < 2; pass++) await run(await f.next());
+    expect(await view()).toMatchObject({ state: 'partial', recovery: { available: true } });
+    expect(f.materialize.mock.calls.map(([, , index]) => index)).toEqual([0, 1, 2, 2, 2]);
+    expect(queries).toBe(1);
+    await f.pool.query(
+      `UPDATE mio_video_executions SET query_attempt=async_max_queries,
+      async_deadline=clock_timestamp()-interval '1 minute' WHERE job_id=$1`,
+      [f.job.jobId],
+    );
+    const original = await f.durableState();
+    await f.store.recover(ownerId, f.job.jobId);
+    await f.pool.query(
+      `UPDATE mio_video_executions SET checkpoint=checkpoint||
+       jsonb_build_object('materializationAttempts',2,'refreshAt',clock_timestamp()-interval '1 second')
+       WHERE job_id=$1`,
+      [f.job.jobId],
+    );
+    ownerCheckpointAvailable = true;
+    f.provider.resolveImageTaskCredential.mockResolvedValueOnce('rotated-key');
+    await run(await f.next());
+    const refreshed = await f.durableState();
+    expect(callsAtQuery).toBe(7);
+    expect(f.materialize).toHaveBeenCalledTimes(callsAtQuery);
+    expect(refreshed).toMatchObject({
+      state: 'materializing',
+      query_attempt: original.query_attempt,
+      async_deadline: original.async_deadline,
+      async_max_queries: original.async_max_queries,
+      upstream_task_id: original.upstream_task_id,
+      checkpoint: {
+        videos: [videos[0], replacement, videos[2]],
+        materializationAttempts: 3,
+        recoveryQuery: { state: 'reserved', refreshed: { 1: 'pending' } },
+      },
+    });
+    expect(Date.parse(refreshed.checkpoint.refreshAt) - dispatchAt).toBeGreaterThanOrEqual(
+      VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+    );
+
+    const stale = await f.next();
+    await f.execution.close();
+    const restarted = new VideoGenerationStore(f.pool).executorStore();
+    cleanups.push(() => restarted.close());
+    await restarted.startExecutor(() => {});
+    const resume = f.runner({ protocol: createVideoProtocol, transport }, restarted);
+    const current = await f.next(restarted);
+    await resume(stale);
+    expect(f.materialize).toHaveBeenCalledTimes(callsAtQuery);
+    await resume(current);
+    expect(f.materialize.mock.calls[7]?.slice(1, 3)).toEqual([replacement, 1]);
+    expect(await view()).toMatchObject({
+      state: 'completed',
+      outputs: outputs.map(({ index, assetId }) => ({ index, assetId, status: 'registered' })),
+    });
+    expect(await f.durableState()).toMatchObject({
+      query_attempt: original.query_attempt,
+      async_deadline: original.async_deadline,
+      upstream_task_id: original.upstream_task_id,
+      checkpoint: {
+        videos: [videos[0], replacement, videos[2]],
+        materializationAttempts: 3,
+        recoveryQuery: { state: 'reserved', refreshed: { 1: 'finished' } },
+      },
+    });
+    expect(f.provider.snapshotVideo).toHaveBeenCalledTimes(1);
+    expect(f.provider.resolveImageTaskCredential.mock.calls).toEqual([[ownerId], [ownerId]]);
+    expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual([
+      'POST',
+      'GET',
+      'GET',
+    ]);
+  });
+
+  it.each([
+    ['identity changed', 'VIDEO_QUERY_IDENTITY_INVALID'],
+    ['length changed', 'VIDEO_RECOVERY_RESULT_MISMATCH'],
+    ['same addresses', 'VIDEO_RECOVERY_RESULT_UNCHANGED'],
+    ['credential unauthorized', 'VIDEO_QUERY_AUTH'],
+    ['interrupted before replacement commit', undefined],
+  ] as const)(
+    'keeps expiry factual and preserves one recovery GET when %s',
+    async (scenario, code) => {
+      const f = await fixture(undefined, 'kling');
+      const videos = [
+        { url: 'https://media.fixture/ready.mp4' },
+        { url: 'https://media.fixture/expired.mp4' },
+        { url: 'https://media.fixture/storage-error.mp4' },
+      ];
+      const replacement = { url: 'https://media.fixture/replacement.mp4' };
+      let lookups = 0;
+      const transport = vi.fn<typeof fetch>(async (_url, options) => {
+        if (options?.method === 'POST')
+          return Response.json({ code: 0, data: { task_id: 'safe-task' } });
+        if (++lookups === 1) return Response.json(klingSuccess(videos));
+        if (scenario === 'same addresses') return Response.json(klingSuccess(videos));
+        if (scenario === 'length changed') return Response.json(klingSuccess([replacement]));
+        if (scenario === 'credential unauthorized') return new Response('', { status: 401 });
+        if (scenario === 'identity changed')
+          return Response.json(klingSuccess([videos[0], replacement, videos[2]], 'other-task'));
+        return Response.json(klingSuccess([videos[0], replacement, videos[2]]));
+      });
+      f.materialize.mockImplementation(async (_, _video, index) => {
+        if (index === 1) throw new VideoResultUrlExpired();
+        if (index === 2) throw new Error('VIDEO_STORAGE_UNAVAILABLE');
+        return f.output;
+      });
+      const ownerId = f.actor.userId;
+      const view = () => f.store.get(ownerId, f.job.jobId);
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      for (let pass = 0; pass < 3; pass++) await run(await f.next());
+      const original = await f.durableState();
+      await f.store.recover(ownerId, f.job.jobId);
+      const beforeDue = await f.next();
+      expect(
+        await f.execution.reserveRecoveryQuery(beforeDue, original.upstream_task_id),
+      ).toBeUndefined();
+      await f.execution.release(beforeDue);
+      await f.pool.query(
+        `UPDATE mio_video_executions SET checkpoint=checkpoint||
+       jsonb_build_object('refreshAt',clock_timestamp()-interval '1 second') WHERE job_id=$1`,
+        [f.job.jobId],
+      );
+      if (scenario === 'interrupted before replacement commit')
+        vi.spyOn(f.execution, 'finishRecoveryQuery').mockRejectedValueOnce(
+          new Error('interrupted'),
+        );
+      await run(await f.next());
+      await f.execution.close();
+      const restarted = new VideoGenerationStore(f.pool).executorStore();
+      cleanups.push(() => restarted.close());
+      await restarted.startExecutor(() => {});
+      const resume = f.runner({ protocol: createVideoProtocol, transport }, restarted);
+      for (let pass = 0; pass < 2; pass++) await resume(await f.next(restarted));
+      expect(await view()).toMatchObject({
+        state: 'partial',
+        outputs: [
+          { index: 0, status: 'registered', assetId: f.output.assetId },
+          { index: 1, status: 'failed', errorCode: 'VIDEO_RESULT_URL_EXPIRED' },
+          { index: 2, status: 'failed', errorCode: 'VIDEO_STORAGE_UNAVAILABLE' },
+        ],
+      });
+      expect(await f.durableState()).toMatchObject({
+        upstream_task_id: original.upstream_task_id,
+        query_attempt: original.query_attempt,
+        async_deadline: original.async_deadline,
+        checkpoint: {
+          videos,
+          recoveryQuery: { state: 'reserved', ...(code ? { errorCode: code } : {}) },
+        },
+      });
+      expect(f.materialize.mock.calls.map(([, , index]) => index)).toEqual([
+        0, 1, 2, 2, 2, 1, 2, 2, 2,
+      ]);
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual([
+        'POST',
+        'GET',
+        'GET',
+      ]);
+      await f.store.recover(ownerId, f.job.jobId);
+      const nextRecovery = await f.next(restarted);
+      expect(
+        await restarted.reserveRecoveryQuery(nextRecovery, original.upstream_task_id),
+      ).toBeUndefined();
+      expect(nextRecovery.checkpoint?.recoveryQuery).toEqual({ state: 'available' });
+      await restarted.release(nextRecovery);
+    },
+  );
 
   it('never resubmits a POST whose response is unknown, including after restart', async () => {
     const f = await fixture();
@@ -431,9 +802,12 @@ describe('durable video execution', () => {
     f.materialize.mockRejectedValue(new Error('private media store offline'));
     await f.run(await f.next());
     await f.run(await f.next());
-    for (let attempt = 0; attempt < 3; attempt++) await f.run(await f.next());
+    for (let attempt = 0; attempt < 2; attempt++) await f.run(await f.next());
     const result = await f.store.get(f.actor.userId, f.job.jobId);
     expect(result.state).toBe('materialization_failed');
+    expect(result.outputs).toMatchObject([
+      { index: 0, status: 'failed', assetId: null, errorCode: 'VIDEO_MATERIALIZATION_FAILED' },
+    ]);
     expect(f.materialize).toHaveBeenCalledTimes(3);
     expect(f.protocol.submit).toHaveBeenCalledTimes(1);
     expect(f.protocol.query).toHaveBeenCalledTimes(1);
@@ -2057,12 +2431,17 @@ describe('video executor ownership and capacity', () => {
       });
       signal.throwIfAborted();
     };
-    const materialize: VideoMaterializer = async (row, _sources, signal) => {
+    const materialize: VideoMaterializer = async (row, _source, index, signal) => {
       await hold('runner:' + row.id, async () => {
         closeSignals.push(signal);
       });
       signal.throwIfAborted();
-      return [{ ...f.output, assetId: randomUUID(), key: 'mio/derived/video/' + row.id + '.mp4' }];
+      return {
+        ...f.output,
+        index,
+        assetId: randomUUID(),
+        key: 'mio/derived/video/' + row.id + '.mp4',
+      };
     };
     const executor = await createVideoExecutor(
       f.store,

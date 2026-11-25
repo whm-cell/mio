@@ -248,6 +248,51 @@ describe('bounded OneLink video protocol', () => {
     });
   });
 
+  it('retains Kling supplier ordinals for mixed results and rejects invalid envelopes', async () => {
+    const taskId = JSON.stringify({ path: '/kling/v1/videos/image2video', id: 'old-task' });
+    const result = (videos: unknown) => ({
+      code: 0,
+      data: {
+        task_id: 'old-task',
+        task_status: 'succeed',
+        task_result: { videos },
+      },
+    });
+    const good = { url: 'https://cdn.fixture/video.mp4' };
+    const last = { url: 'https://cdn.fixture/another.mp4?token=fixture' };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json(result([good, null, { url: 'http://cdn.fixture/insecure.mp4' }, last])),
+      );
+    const protocol = createVideoProtocol(route('kling-videos'), 'fixture-model', fetcher);
+    await expect(protocol.query(taskId, key, signal)).resolves.toEqual({
+      state: 'returned',
+      videos: [
+        good,
+        { errorCode: 'VIDEO_RESULT_INVALID' },
+        { errorCode: 'VIDEO_RESULT_INVALID' },
+        last,
+      ],
+    });
+    for (const bad of [
+      null,
+      { 0: good },
+      [],
+      [{ url: 'https://user:pass@cdn.fixture/video.mp4' }, 'https://cdn.fixture/not-a-slot.mp4'],
+      Array.from({ length: 17 }, () => good),
+    ]) {
+      fetcher.mockResolvedValueOnce(Response.json(result(bad)));
+      await expect(protocol.query(taskId, key, signal)).resolves.toEqual({
+        state: 'failed',
+        code: 'VIDEO_RESPONSE_INVALID',
+      });
+    }
+    expect(
+      fetcher.mock.calls.map(([url, options]) => [new URL(String(url)).pathname, options?.method]),
+    ).toEqual(Array.from({ length: 6 }, () => ['/kling/v1/videos/image2video/old-task', 'GET']));
+  });
+
   it('rejects turbo tail frames and explicit sound before POST', async () => {
     const fetcher = transport({}, {});
     const protocol = createVideoProtocol(

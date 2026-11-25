@@ -493,6 +493,32 @@ CREATE TABLE IF NOT EXISTS mio_admin_global_settings (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS mio_admin_onelink_sso_config (
+  environment text PRIMARY KEY
+    CHECK (environment ~ '^[A-Za-z0-9_.-]{1,32}$'),
+  enabled boolean NOT NULL DEFAULT false,
+  client_name text NOT NULL DEFAULT 'miioo'
+    CHECK (char_length(client_name) BETWEEN 1 AND 50 AND client_name !~ '[[:space:][:cntrl:]]' AND client_name <> 'routerClientId'),
+  client_id text NULL
+    CHECK (client_id IS NULL OR (char_length(client_id) BETWEEN 1 AND 128 AND client_id !~ '[[:space:][:cntrl:]]' AND client_id <> 'routerClientId')),
+  expected_client_id text NULL
+    CHECK (expected_client_id IS NULL OR (char_length(expected_client_id) BETWEEN 1 AND 128 AND expected_client_id !~ '[[:space:][:cntrl:]]' AND expected_client_id <> 'routerClientId')),
+  registration_status text NOT NULL DEFAULT 'unregistered'
+    CHECK (registration_status IN ('unregistered', 'registered', 'trusted_existing')),
+  registration_source text NULL
+    CHECK (registration_source IS NULL OR registration_source IN ('register_200', 'register_362_trusted')),
+  last_register_code integer NULL,
+  last_register_trace_id text NULL
+    CHECK (last_register_trace_id IS NULL OR char_length(last_register_trace_id) <= 128),
+  last_register_message text NULL
+    CHECK (last_register_message IS NULL OR char_length(last_register_message) <= 256),
+  last_registered_at timestamptz NULL,
+  revision integer NOT NULL DEFAULT 1
+    CHECK (revision >= 1),
+  updated_by text NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM mio_admin_seed_history WHERE seed_key = 'route_templates_v1') THEN
@@ -575,6 +601,10 @@ export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void>
     [
       'SELECT setting_key,value,revision,updated_by,created_at,updated_at FROM mio_admin_global_settings LIMIT 0',
       [25, 3802, 23, 25, 1184, 1184],
+    ],
+    [
+      'SELECT environment,enabled,client_name,client_id,expected_client_id,registration_status,registration_source,last_register_code,last_register_trace_id,last_register_message,last_registered_at,revision,updated_by,created_at,updated_at FROM mio_admin_onelink_sso_config LIMIT 0',
+      [25, 16, 25, 25, 25, 25, 25, 23, 25, 25, 1184, 23, 25, 1184, 1184],
     ],
   ] as const) {
     const result = await pool.query(sql);

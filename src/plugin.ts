@@ -7,8 +7,13 @@ import type {} from '@deepseek-ai/dsh-system-prompt';
 import type {} from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { createHandler } from './http.ts';
-import { AUTH_BASE_PATH, readAuthConfig, readAuthRateLimitBackend } from './auth/config.ts';
-import type { AuthRuntimePolicy } from './auth/config.ts';
+import {
+  AUTH_BASE_PATH,
+  readAuthConfig,
+  readAuthRateLimitBackend,
+  resolveAllowedOneLinkClientIds,
+} from './auth/config.ts';
+import type { AuthRuntimePolicy, OneLinkSsoPolicyReader } from './auth/config.ts';
 import { createAuthentication } from './auth/service.ts';
 import { createAuthHandler } from './auth/http.ts';
 import { createRedisRateLimit } from './auth/rate-limit.ts';
@@ -83,6 +88,7 @@ import {
   createMaterialUpstream,
   createMaterialAuthUpstream,
 } from './integrations/onelink/materials.ts';
+import { readOneLinkSsoConfig } from './integrations/onelink/sso.ts';
 import { readGenerationConfig } from './generations/config.ts';
 import { createGenerationStore } from './generations/store.ts';
 import { createGenerationService } from './generations/service.ts';
@@ -160,9 +166,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
   const generationConfig = readGenerationConfig();
   const adminConfig = readAdminConfig(process.env, authConfig?.origins);
+  const oneLinkSsoConfig = readOneLinkSsoConfig();
   const rabbitmqMonitorConfig = adminConfig ? readRabbitmqMonitorConfig() : undefined;
   const redisMonitorConfig = adminConfig ? readRedisMonitorConfig() : undefined;
   const imageEnabled = Boolean(generationConfig);
+  if (oneLinkSsoConfig && !authConfig)
+    throw new Error('ONELINK_SSO_CONFIG: authentication required');
   if (adminConfig && (!authConfig || !providerConfig))
     throw new Error('ADMIN_CONFIG: authentication and providers required');
   if (materialConfig && (!authConfig || !providerConfig))
@@ -193,6 +202,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         smsMode: 'live',
         smsBypassCode: null,
       };
+    const defaultOneLinkClientName = oneLinkSsoConfig?.clientName ?? 'miioo';
+    const getOneLinkSsoPolicy: OneLinkSsoPolicyReader = () =>
+      admin?.getOneLinkSsoPolicy() ?? {
+        enabled: false,
+        clientName: defaultOneLinkClientName,
+        allowedClientIds: resolveAllowedOneLinkClientIds(defaultOneLinkClientName, null, null),
+      };
     const redisConfig = backend === 'redis' ? readRedisConfig() : undefined;
     const deadline = monotonicMs() + 5000;
     const redis = redisConfig ? await createRedisResource(redisConfig, deadline) : undefined;
@@ -200,7 +216,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     try {
       const rateLimit =
         redis && (await createRedisRateLimit(redis, redisConfig!.namespace, deadline));
-      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy);
+      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy, {
+        ...(oneLinkSsoConfig ? { config: oneLinkSsoConfig } : {}),
+        getPolicy: getOneLinkSsoPolicy,
+      });
       const acquired = auth;
       ctx.effect(() => async () => {
         await Promise.all([acquired.close(), redis?.close()]);
@@ -428,7 +447,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     if (adminConfig && providers && providerConfig) {
-      const store = await createAdminStore(adminConfig);
+      const store = await createAdminStore(adminConfig, oneLinkSsoConfig?.environment);
       let ownedAdmin: AdminService | undefined;
       try {
         const acquired =
@@ -446,6 +465,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               {
                 emailPasswordEnabled: authConfig.emailPasswordEnabled,
                 smsProviderConfigured: Boolean(authConfig.sms),
+              },
+              {
+                ...(oneLinkSsoConfig ? { config: oneLinkSsoConfig } : {}),
+                authBaseURL: authConfig.baseURL,
               },
             ));
         ctx.effect(() => () => acquired.close());

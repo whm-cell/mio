@@ -1,8 +1,11 @@
+const ONELINK_SSO_ENV_PATTERN = /^[A-Za-z0-9_.-]{1,32}$/;
+
 export interface AdminConfig {
   readonly databaseURL: string;
   readonly conversationsDatabaseURL?: string;
   readonly mediaDatabaseURL?: string;
   readonly allowedOrigins: readonly string[];
+  readonly oneLinkSsoEnv?: string;
 }
 
 function parseOrigins(raw: string | undefined): string[] {
@@ -48,10 +51,17 @@ export function readAdminConfig(
     env.MIO_GENERATIONS_ENABLED === 'true' || env.MIO_COMPUTE_ENABLED === 'true'
       ? env.MIO_ASSETS_DATABASE_URL?.trim() || undefined
       : undefined;
+  const oneLinkSsoEnv =
+    env.MIO_ONELINK_SSO_ENV === undefined
+      ? env.MIO_ENVIRONMENT?.trim() || 'dev'
+      : env.MIO_ONELINK_SSO_ENV;
+  if (!ONELINK_SSO_ENV_PATTERN.test(oneLinkSsoEnv))
+    throw new Error('ADMIN_CONFIG: invalid MIO_ONELINK_SSO_ENV');
   return {
     databaseURL,
     ...(conversationsDatabaseURL ? { conversationsDatabaseURL } : {}),
     ...(mediaDatabaseURL ? { mediaDatabaseURL } : {}),
     allowedOrigins,
+    oneLinkSsoEnv,
   };
 }

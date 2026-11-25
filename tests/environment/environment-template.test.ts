@@ -14,6 +14,7 @@ import { readAssetConfig } from '../../src/assets/config.ts';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { readComputeConfig } from '../../src/compute/config.ts';
 import { readConversationConfig } from '../../src/conversations/config.ts';
+import { readOneLinkSsoConfig } from '../../src/integrations/onelink/sso.ts';
 import { readRabbitmqMonitorConfig } from '../../src/integrations/rabbitmq-monitor.ts';
 import { readRedisMonitorConfig } from '../../src/integrations/redis.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from '../../src/materials/config.ts';
@@ -39,6 +40,14 @@ const smsSettings = {
 const wechatSettings = {
   MIO_AUTH_WECHAT_APP_ID: 'fixture-app',
   MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
+};
+const oneLinkSsoSettings = {
+  MIO_ONELINK_SSO_ENC_KEY: 'fixture-onelink-enc-key-32-chars',
+  MIO_ONELINK_SSO_AUTHORIZE_URL: 'https://scenic.wanlian.cloud/authorize',
+  MIO_ONELINK_SSO_REGISTER_URL: 'https://api-test.wanlian.cloud/sso/client/register',
+  MIO_ONELINK_SSO_CLIENT_NAME: 'miioo',
+  MIO_ONELINK_SSO_APP_NAME: 'Miioo',
+  MIO_ONELINK_SSO_ENV: 'dev',
 };
 const providerSettings = {
   MIO_PROVIDERS_DATABASE_URL: 'postgresql://fixture.invalid/providers',
@@ -128,6 +137,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   const optIns = {
     ...smsSettings,
     ...wechatSettings,
+    ...oneLinkSsoSettings,
     ...providerSettings,
     ...conversationSettings,
     ...fixedRoute,
@@ -212,12 +222,18 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(readRedisMonitorConfig(configured) !== undefined, 'MIO_ADMIN_REDIS_MONITOR_URL').toBe(
     true,
   );
+  expect(readOneLinkSsoConfig(configured), 'MIO_ONELINK_SSO_ENC_KEY').toMatchObject({
+    clientName: 'miioo',
+    appName: 'Miioo',
+    environment: 'dev',
+  });
 });
 
 it('keeps optional domains off after initialization and preserves switch semantics', async () => {
   const { runtime } = await initialize('test');
   expect(runtime.NODE_ENV === 'production', 'NODE_ENV').toBe(true);
   expect(readAuthConfig(runtime) !== undefined, 'MIO_AUTH_DATABASE_URL').toBe(true);
+  expect(readOneLinkSsoConfig(runtime) === undefined, 'MIO_ONELINK_SSO_ENC_KEY').toBe(true);
   expect(readProviderConfig(runtime) === undefined, 'MIO_PROVIDERS_DATABASE_URL').toBe(true);
   expect(readConversationConfig(runtime) === undefined, 'MIO_CONVERSATIONS_DATABASE_URL').toBe(
     true,

@@ -30,6 +30,7 @@ export interface UserProfile {
   phoneNumber: string | null;
   phoneNumberVerified: boolean;
   wechatBound: boolean;
+  onelinkBound: boolean;
 }
 
 export interface UserProfilePatch {
@@ -52,6 +53,7 @@ interface ProfileRow {
   phoneNumber: string | null;
   phoneNumberVerified: boolean | null;
   wechatBound: boolean;
+  onelinkBound: boolean;
 }
 
 const accountSchema = {
@@ -71,7 +73,7 @@ export function isUserDisabled(user: unknown): boolean {
   );
 }
 
-async function generateUniqueDisplayId(exists: (candidate: string) => Promise<boolean>) {
+export async function generateUniqueDisplayId(exists: (candidate: string) => Promise<boolean>) {
   for (let attempt = 0; attempt < DISPLAY_ID_MAX_ATTEMPTS; attempt += 1) {
     const candidate = `${DISPLAY_ID_PREFIX}${String(randomInt(0, 1_000_000)).padStart(6, '0')}`;
     if (!(await exists(candidate))) return candidate;
@@ -194,7 +196,10 @@ const PROFILE_SELECT = `
   SELECT u.id, u."displayId", u.name, u."avatarAssetId", u."phoneNumber", u."phoneNumberVerified",
          EXISTS (
            SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'wechat'
-         ) AS "wechatBound"
+         ) AS "wechatBound",
+         EXISTS (
+           SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'onelink'
+         ) AS "onelinkBound"
   FROM "user" u
   WHERE u.id = $1 AND COALESCE(u.disabled, false) = false
 `;
@@ -208,6 +213,7 @@ function toProfile(row: ProfileRow): UserProfile {
     phoneNumber: row.phoneNumber,
     phoneNumberVerified: Boolean(row.phoneNumberVerified),
     wechatBound: Boolean(row.wechatBound),
+    onelinkBound: Boolean(row.onelinkBound),
   };
 }
 

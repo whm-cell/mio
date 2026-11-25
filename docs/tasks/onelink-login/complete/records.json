@@ -1,0 +1,133 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/onelink-login/prd.md",
+  "results": [
+    {
+      "key": "admin-onelink-sso",
+      "title": "万联 OneLink SSO 管理端配置、运行期热开关与客户端注册",
+      "locations": [
+        {
+          "path": "src/integrations/onelink/sso.ts",
+          "purpose": "OneLink SSO 环境变量 fail-closed 校验与固定出站客户端注册"
+        },
+        {
+          "path": "src/admin/service.ts",
+          "purpose": "按环境万联 SSO 配置乐观锁读写、单飞注册与内存只读策略快照刷新"
+        },
+        {
+          "path": "src/admin/http.ts",
+          "purpose": "GET/PATCH /api/v1/admin/onelink/sso 与 POST /api/v1/admin/onelink/sso/register 管理接口"
+        },
+        {
+          "path": "src/plugin.ts",
+          "purpose": "向认证域注入只读 OneLinkSsoPolicyReader（严守 src/auth 不导入 src/admin）"
+        },
+        {
+          "path": "docs/apis/admin.md",
+          "purpose": "管理后台万联 SSO 接口与错误码契约"
+        },
+        {
+          "path": "docs/integrations/onelink-sso.md",
+          "purpose": "万联 OneLink SSO 集成契约与安全边界声明"
+        }
+      ],
+      "outcomes": "交付服务端 OneLink SSO 环境变量严格 32 位 ASCII 密钥与 URL 校验、mio_admin_onelink_sso_config 显式迁移、按环境乐观锁运行期热开关（默认关闭）与预期 clientId 管理、单飞受控客户端注册（处理 200/362/363/364 及异常保留）、脱敏审计与经 plugin.ts 注入认证域的只读策略快照。",
+      "verification": "集成候选 2fb2f146345b102e623e952ba9f3c2cd254b2ac0（已合并 origin/main e318edc）真实执行 pnpm check:static、pnpm work documents、OneLink 集成/管理/插件与环境模板回归测试、pnpm test:smoke 及质量/三方规范复核均通过；并在本地 mio_dev 与 mio-admin-web 经 Cloudflare Quick Tunnel HTTPS 对接真实万联测试环境完成客户端注册与热开关实测。",
+      "limitations": "v1 保持 payload_sub_unverified 安全边界且各环境热开关默认关闭；生产环境启用前须另行落实生产 .env、老用户迁移映射与正式验签/自省策略评审；远端 GitHub Actions 全量 CI 待 PR 推送后核验。",
+      "acceptance": {
+        "candidate": {
+          "commit": "2fb2f146345b102e623e952ba9f3c2cd254b2ac0",
+          "contractRevision": 2
+        },
+        "statement": "接受万联 OneLink SSO 管理端配置、运行期热开关与客户端注册交付及已披露的 v1 安全边界与限制，完成本地公共成果发布。",
+        "reference": "2026-11-25 对话 2336144c-85b3-4d33-b6de-8c72b1560798 中用户在 Cloudflare Quick Tunnel + 万联测试环境实测通过后明确回复：“功能已经完成，看还有是否还未complete的关键护栏内容，继续完成……完成后，准备将代码合并至远端的main，包括（mio和mio-admin-web）”。"
+      }
+    },
+    {
+      "key": "onelink-account-binding",
+      "title": "万联 OneLink 账号创建、已有手机号绑定、当前会话绑定与全站短信 bypass 策略对齐",
+      "locations": [
+        {
+          "path": "src/auth/onelink.ts",
+          "purpose": "POST /api/auth/onelink/existing/send-otp 与 POST /api/auth/onelink/complete（create/link_existing/bind_current，支持 live/bypass/disabled 短信模式）"
+        },
+        {
+          "path": "src/auth/onelink-store.ts",
+          "purpose": "事务性建人/绑号、全局行锁序防死锁与锁后过期校验"
+        },
+        {
+          "path": "src/auth/phone.ts",
+          "purpose": "/api/auth/phone-number/* 与 /api/auth/phone-binding/* 统一遵循全局 smsMode（live/bypass/disabled）"
+        },
+        {
+          "path": "src/auth/phone-store.ts",
+          "purpose": "onelink_existing 专用短信挑战及 bypass 模式原子手机绑定事务 bindPhoneWithoutChallenge"
+        },
+        {
+          "path": "src/auth/account.ts",
+          "purpose": "GET/PATCH /api/v1/me/profile 只读 onelinkBound 字段"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "认证底座短信模式策略、万联账号归属事务与全局锁序规范"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "万联绑定、手机补绑与用户资料 HTTP 契约"
+        }
+      ],
+      "outcomes": "交付 action=create（事务原子建人写关联、冲突零孤儿）、action=link_existing（专用 onelink_existing 短信挑战与全站 smsMode live/bypass/disabled 支持、无注册枚举、零自动建号）、action=bind_current（10 分钟近期会话复核、锁定展示候选与同用户幂等）、/api/auth/phone-binding/* 同步支持全局 bypass 模式以及 GET/PATCH /api/v1/me/profile 只读 onelinkBound 字段。",
+      "verification": "候选 cc39762306a4b672ac791412ed6f975b16194468（基于集成提交 2fb2f14 仅增量记录 Unit 1–2 公开接受结果）真实执行 pnpm check:static、pnpm work documents、9 套件认证/管理/插件全量回归、pnpm test:smoke 及质量/三方规范复核均通过；并在本地 mio_dev 与 mio-admin-web 经 Cloudflare Quick Tunnel HTTPS 对接真实万联测试环境及真实/固定码短信完成实测通过。",
+      "limitations": "smsMode='bypass' 为高风险开发/测试能力，覆盖登录与全部手机号绑定入口，严禁在公开生产环境长期开启；v1 仍保持 payload_sub_unverified 安全边界，公网生产开放前须另行完成验真/自省与老用户迁移映射评审；远端 GitHub Actions 全量 CI 待 PR 推送后核验。",
+      "acceptance": {
+        "candidate": {
+          "commit": "cc39762306a4b672ac791412ed6f975b16194468",
+          "contractRevision": 3
+        },
+        "statement": "接受万联 OneLink 账号创建、已有手机号绑定、当前会话绑定与方案 A 全站短信 bypass 对齐交付及已披露的安全边界与限制，完成本地公共成果发布。",
+        "reference": "2026-11-25 对话 2336144c-85b3-4d33-b6de-8c72b1560798 中用户先确认方案 A，随后在 Cloudflare Quick Tunnel + 万联测试环境实测通过后明确回复：“功能已经完成，看还有是否还未complete的关键护栏内容，继续完成……完成后，准备将代码合并至远端的main，包括（mio和mio-admin-web）”。原集成受验代码候选 2fb2f146345b102e623e952ba9f3c2cd254b2ac0 至当前候选 cc39762306a4b672ac791412ed6f975b16194468 仅新增同批 Unit 1–2 接受记录，并已完成重新执行与复核。"
+      }
+    },
+    {
+      "key": "onelink-auth-callback",
+      "title": "万联 OneLink 授权发起、AES-256-GCM 跳转、回调解析与待处理候选存储",
+      "locations": [
+        {
+          "path": "src/integrations/onelink/sso.ts",
+          "purpose": "6 字段 AES-256-GCM 授权地址构造、v1 Base64URL JWT payload 解析与主体脱敏"
+        },
+        {
+          "path": "src/auth/onelink-store.ts",
+          "purpose": "mioOneLinkPending 短时存储、原子状态迁移与并发 CAS 保护"
+        },
+        {
+          "path": "src/auth/onelink.ts",
+          "purpose": "POST /api/auth/onelink/start、GET /api/auth/callback/onelink、GET /api/auth/onelink/pending 与 POST /api/auth/onelink/cancel"
+        },
+        {
+          "path": "src/auth/http.ts",
+          "purpose": "认证路由白名单、限流规则与回调 no-store/no-referrer 安全响应头"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "认证底座万联 OneLink 登录与回调规范及安全边界声明"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "万联发起、回调、待处理查询与取消 HTTP 契约"
+        }
+      ],
+      "outcomes": "交付 6 字段 AES-256-GCM 加密授权跳转、Base64URL JWT payload 结构/过期/client_id 解析（显式拒绝 routerClientId）、mioOneLinkPending 无条件迁移表与 HttpOnly 待处理 Cookie、start/callback/pending/cancel 四接口、已绑定活跃用户直登签发会话、未绑定登录与绑定路径 GET 零永久写入且并发 CAS 保护 candidate_ready，以及 303 干净跳转与安全响应头。",
+      "verification": "候选 0c4643046a644a7a4ac9fe4f56d0e15fa9e63c7f（基于集成提交 2fb2f14 仅增量记录 Unit 1 公开接受结果）真实执行 pnpm check:static、pnpm work documents、9 套件认证/管理/插件全量回归、pnpm test:smoke 及质量/三方规范复核均通过；并在本地 mio_dev 与 mio-admin-web 经 Cloudflare Quick Tunnel HTTPS 对接真实万联测试环境实测授权发起与回调闭环通过。",
+      "limitations": "v1 采用 payload_sub_unverified 令牌解析模式（不做密码学验签或在线自省），各环境默认关闭热开关；公网生产环境开放前须补充正式验签/自省或完成风险评审，并另行核实老用户迁移映射；远端 GitHub Actions 全量 CI 待 PR 推送后核验。",
+      "acceptance": {
+        "candidate": {
+          "commit": "0c4643046a644a7a4ac9fe4f56d0e15fa9e63c7f",
+          "contractRevision": 2
+        },
+        "statement": "接受万联 OneLink 授权发起、回调解析与待处理候选存储交付及已披露的 v1 安全边界与限制，完成本地公共成果发布。",
+        "reference": "2026-11-25 对话 2336144c-85b3-4d33-b6de-8c72b1560798 中用户在 Cloudflare Quick Tunnel + 万联测试环境实测通过后明确回复：“功能已经完成，看还有是否还未complete的关键护栏内容，继续完成……完成后，准备将代码合并至远端的main，包括（mio和mio-admin-web）”。原集成受验代码候选 2fb2f146345b102e623e952ba9f3c2cd254b2ac0 至当前候选 0c4643046a644a7a4ac9fe4f56d0e15fa9e63c7f 仅新增同批 Unit 1 接受记录，并已完成重新执行与复核。"
+      }
+    }
+  ]
+}

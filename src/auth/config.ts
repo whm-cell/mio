@@ -1,8 +1,11 @@
 import type { BetterAuthOptions } from 'better-auth';
 import type { Pool } from 'pg';
+import type { OneLinkSsoConfig } from '../integrations/onelink/sso.ts';
 import type { TencentSmsConfig } from '../integrations/tencent-sms.ts';
 import type { WechatConfig } from '../integrations/wechat.ts';
 import { accountPlugin, isUserDisabled } from './account.ts';
+import { oneLinkPlugin } from './onelink.ts';
+import type { OneLinkSsoPolicyReader, OneLinkSsoRuntimePolicy } from './onelink.ts';
 import { phonePlugin } from './phone.ts';
 import type { AuthSmsMode, PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
@@ -13,13 +16,50 @@ import { AuthPostgresDialect } from './database.ts';
 export const AUTH_BASE_PATH = '/api/auth';
 export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
 
-export type { AuthSmsMode };
+export type { AuthSmsMode, OneLinkSsoPolicyReader, OneLinkSsoRuntimePolicy };
 
 export interface AuthRuntimePolicy extends PhoneSmsPolicy {
   readonly emailPasswordEnabled: boolean;
 }
 
 export type AuthPolicyReader = () => AuthRuntimePolicy;
+
+export interface OneLinkAuthRuntime {
+  readonly config?: OneLinkSsoConfig;
+  readonly getPolicy: OneLinkSsoPolicyReader;
+}
+
+const DISABLED_ONELINK_POLICY: OneLinkSsoPolicyReader = () => ({
+  enabled: false,
+  clientName: 'miioo',
+  allowedClientIds: [],
+});
+
+const ONELINK_ROUTER_CLIENT_ID = 'routerClientId';
+
+export function resolveAllowedOneLinkClientIds(
+  clientName: string,
+  clientId: string | null,
+  expectedClientId: string | null,
+): readonly string[] {
+  if (expectedClientId !== null) {
+    const trimmed = expectedClientId.trim();
+    return trimmed && trimmed !== ONELINK_ROUTER_CLIENT_ID ? [trimmed] : [];
+  }
+  const normalizedClientName = clientName.trim();
+  const candidates = [
+    clientId?.trim() ?? '',
+    normalizedClientName,
+    normalizedClientName ? `${normalizedClientName}ClientId` : '',
+  ];
+  const allowed: string[] = [];
+  for (const candidate of candidates) {
+    if (candidate && candidate !== ONELINK_ROUTER_CLIENT_ID && !allowed.includes(candidate)) {
+      allowed.push(candidate);
+    }
+  }
+  return allowed;
+}
 
 export interface AuthConfig {
   baseURL: string;
@@ -164,6 +204,7 @@ export function authOptions(
   pool: Pool,
   sms?: PhoneSmsRuntime,
   getPolicy?: AuthPolicyReader,
+  oneLink?: OneLinkAuthRuntime,
 ): BetterAuthOptions {
   return {
     appName: 'Mio',
@@ -177,6 +218,15 @@ export function authOptions(
       phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
+      oneLinkPlugin(
+        config,
+        pool,
+        oneLink?.config,
+        oneLink?.getPolicy ?? DISABLED_ONELINK_POLICY,
+        sms,
+        AUTH_PLACEHOLDER_EMAIL_DOMAIN,
+        getPolicy,
+      ),
     ],
     user: {
       async validateUserInfo(data, context) {
@@ -235,6 +285,11 @@ export function authOptions(
         '/link-social': { window: 60, max: 10 },
         '/wechat/qr-session': { window: 60, max: 20 },
         '/wechat/qr-session/*/poll': { window: 60, max: 300 },
+        '/onelink/start': { window: 60, max: 20 },
+        '/onelink/pending': { window: 60, max: 60 },
+        '/onelink/cancel': { window: 60, max: 30 },
+        '/onelink/existing/send-otp': { window: 60, max: 100 },
+        '/onelink/complete': { window: 60, max: 10 },
       },
     },
     advanced: {

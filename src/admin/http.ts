@@ -26,6 +26,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   TEMPLATE_KEY_TAKEN: 'Template key already exists',
   TEMPLATE_NOT_FOUND: 'Target route template was not found',
   SETTINGS_CONFLICT: 'Global settings were modified concurrently; reload and retry',
+  ONELINK_SSO_NOT_CONFIGURED: 'OneLink SSO environment configuration is incomplete',
+  ONELINK_REGISTER_IN_PROGRESS: 'A OneLink SSO client registration is already in progress',
+  ONELINK_SSO_UNAVAILABLE: 'OneLink SSO is not configured on this server',
   PROBE_KEY_REQUIRED: 'Provide an API key or save a probe key first',
   PROBE_CREDENTIAL_UNAVAILABLE: 'Saved probe credential cannot be decrypted',
   PROVIDER_KEY_INVALID: 'OneLink API key format is invalid',
@@ -129,6 +132,8 @@ const KNOWN_ROUTES: Record<string, readonly string[]> = {
   '/onelink/probe': ['GET', 'DELETE'],
   '/onelink/discover': ['POST'],
   '/onelink/candidates': ['GET'],
+  '/onelink/sso': ['GET', 'PATCH'],
+  '/onelink/sso/register': ['POST'],
   '/models': ['GET', 'POST', 'PATCH', 'DELETE'],
   '/models/import': ['POST'],
   '/routes': ['POST', 'DELETE'],
@@ -234,6 +239,26 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
     assertAllowedQuery(url, []);
     await requireAdmin();
     sendJson(response, HTTP_STATUS.OK, await service.listDiscoveryCandidates());
+  },
+
+  'GET /onelink/sso': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getOneLinkSso());
+  },
+
+  'PATCH /onelink/sso': async ({ response, service, readAuthJson }) => {
+    const { principal, body } = await readAuthJson([
+      'expectedRevision',
+      'enabled',
+      'expectedClientId',
+    ]);
+    sendJson(response, HTTP_STATUS.OK, await service.updateOneLinkSso(principal, body));
+  },
+
+  'POST /onelink/sso/register': async ({ response, service, readAuthJson }) => {
+    const { principal } = await readAuthJson([]);
+    sendJson(response, HTTP_STATUS.OK, await service.registerOneLinkSso(principal));
   },
 
   'GET /models': async ({ response, url, service, requireAdmin }) => {

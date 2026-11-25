@@ -13,10 +13,11 @@ import type { Pool } from 'pg';
 import type { SmsSender } from '../integrations/tencent-sms.ts';
 import {
   activatePhoneChallenge,
+  bindPhoneWithoutChallenge,
   consumePhoneChallenge,
   reservePhoneChallenge,
 } from './phone-store.ts';
-import type { BindingIdentity, PhonePurpose } from './phone-store.ts';
+import type { BindingIdentity } from './phone-store.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import type { SmsBudgetTables } from './phone-budget-schema.ts';
 
@@ -32,7 +33,17 @@ export interface PhoneSmsRuntime {
   tables: SmsBudgetTables;
 }
 
+const MAINLAND_PHONE = /^(?:\+86)?1[3-9]\d{9}$/;
 const SIX_DIGIT_CODE = /^\d{6}$/;
+
+export function normalizeMainlandPhone(value: unknown): string | null {
+  if (typeof value !== 'string' || !MAINLAND_PHONE.test(value)) return null;
+  return value.startsWith('+86') ? value : `+86${value}`;
+}
+
+export function isSixDigitCode(value: unknown): value is string {
+  return typeof value === 'string' && SIX_DIGIT_CODE.test(value);
+}
 
 const schema = {
   user: {
@@ -62,20 +73,20 @@ const schema = {
   },
 } as const;
 
-function parseInput(body: unknown, needsCode: boolean) {
+export function parsePhoneInput(body: unknown, needsCode: boolean) {
   if (!body || typeof body !== 'object' || Array.isArray(body))
     throw new APIError('BAD_REQUEST', { code: 'INVALID_INPUT', message: 'Invalid input' });
   const input = body as Record<string, unknown>;
   const keys = needsCode ? ['phoneNumber', 'code'] : ['phoneNumber'];
+  const phone = normalizeMainlandPhone(input.phoneNumber);
   if (
     Object.keys(input).some((key) => !keys.includes(key)) ||
-    typeof input.phoneNumber !== 'string' ||
-    !/^(?:\+86)?1[3-9]\d{9}$/.test(input.phoneNumber) ||
-    (needsCode && (typeof input.code !== 'string' || !/^\d{6}$/.test(input.code)))
+    !phone ||
+    (needsCode && !isSixDigitCode(input.code))
   )
     throw new APIError('BAD_REQUEST', { code: 'INVALID_INPUT', message: 'Invalid input' });
   return {
-    phone: input.phoneNumber.startsWith('+86') ? input.phoneNumber : `+86${input.phoneNumber}`,
+    phone,
     code: needsCode ? (input.code as string) : '',
   };
 }
@@ -107,17 +118,21 @@ export function phonePlugin(
 ) {
   const readPolicy: () => PhoneSmsPolicy =
     getPolicy ?? (() => ({ smsMode: 'live', smsBypassCode: null }));
-  const send = (purpose: PhonePurpose) =>
+  const send = (purpose: 'login' | 'bind') =>
     createAuthEndpoint(
       purpose === 'login' ? '/phone-number/send-otp' : '/phone-binding/send-otp',
       { method: 'POST' },
       async (ctx) => {
-        const { phone } = parseInput(ctx.body, false);
+        const { phone } = parsePhoneInput(ctx.body, false);
         const policy = readPolicy();
         if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
-        if (purpose === 'login' && policy.smsMode === 'bypass') {
-          if (!policy.smsBypassCode || !SIX_DIGIT_CODE.test(policy.smsBypassCode))
-            return failure('SMS_UNAVAILABLE');
+        if (policy.smsMode === 'bypass') {
+          if (!isSixDigitCode(policy.smsBypassCode)) return failure('SMS_UNAVAILABLE');
+          if (purpose === 'bind') {
+            const session = await getAuthoritativeSessionFromCtx(ctx);
+            if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
+              return failure('SESSION_REQUIRED');
+          }
           const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
           if (!ip) return failure('SMS_UNAVAILABLE');
           return ctx.json({ status: true });
@@ -152,17 +167,31 @@ export function phonePlugin(
         return ctx.json({ status: true });
       },
     );
-  const verify = (purpose: PhonePurpose) =>
+  const verify = (purpose: 'login' | 'bind') =>
     createAuthEndpoint(
       purpose === 'login' ? '/phone-number/verify' : '/phone-binding/confirm',
       { method: 'POST' },
       async (ctx) => {
-        const { phone, code } = parseInput(ctx.body, true);
+        const { phone, code } = parsePhoneInput(ctx.body, true);
         const policy = readPolicy();
         if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
-        if (purpose === 'login' && policy.smsMode === 'bypass') {
+        if (policy.smsMode === 'bypass') {
           const expected = policy.smsBypassCode;
-          if (!expected || !SIX_DIGIT_CODE.test(expected)) return failure('SMS_UNAVAILABLE');
+          if (!isSixDigitCode(expected)) return failure('SMS_UNAVAILABLE');
+          if (purpose === 'bind') {
+            const session = await getAuthoritativeSessionFromCtx(ctx);
+            if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
+              return failure('SESSION_REQUIRED');
+            if (!timingSafeEqual(Buffer.from(code, 'utf8'), Buffer.from(expected, 'utf8')))
+              return failure('INVALID_OTP');
+            const bound = await bindPhoneWithoutChallenge(pool, phone, {
+              userId: session.user.id,
+              sessionId: session.session.id,
+            });
+            if (bound !== 'ok')
+              return failure(bound === 'conflict' ? 'PHONE_CONFLICT' : 'SESSION_REQUIRED');
+            return ctx.json({ status: true });
+          }
           if (!timingSafeEqual(Buffer.from(code, 'utf8'), Buffer.from(expected, 'utf8')))
             return failure('INVALID_OTP');
         } else {

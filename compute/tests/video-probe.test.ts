@@ -530,6 +530,46 @@ it('checks fragment declarations for a complete or truncated open-ended final MP
   }
 });
 
+it('rejects an indexed MP4 that ends before a declared fragment', async () => {
+  const root = directory();
+  const file = join(root, 'indexed.mp4');
+  execFileSync('ffmpeg', [
+    '-nostdin',
+    '-v',
+    'error',
+    '-i',
+    fixture(root),
+    '-c',
+    'copy',
+    '-movflags',
+    '+frag_keyframe+empty_moov+default_base_moof+global_sidx+skip_trailer',
+    file,
+  ]);
+  const bytes = readFileSync(file);
+  const fragmentOffsets: number[] = [];
+  let hasIndex = false;
+  for (let offset = 0; offset < bytes.length;) {
+    const size = bytes.readUInt32BE(offset);
+    const type = bytes.toString('ascii', offset + 4, offset + 8);
+    expect(size).toBeGreaterThanOrEqual(8);
+    expect(offset + size).toBeLessThanOrEqual(bytes.length);
+    if (type === 'sidx') hasIndex = true;
+    if (type === 'moof') fragmentOffsets.push(offset);
+    offset += size;
+  }
+  expect(hasIndex).toBe(true);
+  expect(fragmentOffsets.length).toBeGreaterThanOrEqual(2);
+  expect(await inspectFixture(directory(), file)).toMatchObject({
+    state: 'succeeded',
+    media: { container: 'mp4', width: 320, height: 240 },
+  });
+  writeFileSync(file, bytes.subarray(0, fragmentOffsets.at(-1)));
+  expect(await inspectFixture(directory(), file)).toMatchObject({
+    state: 'failed',
+    errorCode: 'SOURCE_INVALID',
+  });
+});
+
 it.each(['mp4', 'corrupt-mp4'] as const)(
   'uses the first non-cover video stream’s absolute index in a multi-video %s file',
   async (kind) => {

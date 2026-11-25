@@ -63,7 +63,7 @@ B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/�
 
 B 检查实际 `ftyp` 品牌和 MP4 顶层 box 边界，要求完整的 `moov` 和非空 `mdat`，拒绝主品牌为 QuickTime 或 3GP/3G2 的文件。B 按 `media.probe` 相同的规则选择首个非附图视频流，按该流的实际索引解码；只有封面的音频文件判为无视频。B 流式扫描媒体包并拒绝损坏标志或读失败。若 `mdat` 声明延伸至文件结束，或最后一个分片声明后缺少媒体载荷，B 按轨道核对原始样本表和可见分片声明中的音视频样本数；例如 PCM 合并进同一初始媒体包的样本按采样数累计。
 
-定点解码须取得选中视频流的开头帧，再从可寻址的尾部位置解码至结束，取得达到该流最后一个显示时间戳的实际帧。音轨更长、可变帧率或分片封装时，尾帧判断仍按所选视频流。探测覆盖文件中可见的容器边界、包读取以及上述两处视频解码。分片封装的边界判断依据文件中实际可见的片段与索引。
+定点解码须取得选中视频流的开头帧，再从可寻址的尾部位置解码至结束，取得达到该流最后一个显示时间戳的实际帧。音轨更长、可变帧率或分片封装时，尾帧判断仍按所选视频流。探测覆盖文件中可见的容器边界、包读取以及上述两处视频解码。顶层分片索引 `sidx` 声明的字节范围须全部落在实际文件内。
 
 成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份。`media` 包含已验证的 `container: "mp4"` 及 `videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。宽高使用与 `media.probe` 一致的显示尺寸算法，对选中视频流应用 SAR 和旋转后取最近的整数，返回 1–65536 的安全整数。时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
 

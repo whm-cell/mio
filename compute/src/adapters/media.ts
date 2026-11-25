@@ -541,6 +541,42 @@ async function* mp4Boxes(file: FileHandle, start: number, end: number, signal: A
   }
 }
 
+/** A segment index can declare more whole fragments even when the file ends on a box boundary. */
+async function requireSegmentIndexExtent(
+  file: FileHandle,
+  payload: number,
+  end: number,
+  fileEnd: number,
+  signal: AbortSignal,
+): Promise<void> {
+  const header = Buffer.alloc(32);
+  const headerBytes = Math.min(header.length, end - payload);
+  if (
+    headerBytes < 24 ||
+    (await file.read(header, 0, headerBytes, payload)).bytesRead !== headerBytes
+  )
+    throw new MediaError('SOURCE_INVALID');
+  const version = header.readUInt8();
+  const headerSize = version === 0 ? 24 : 32;
+  if (version > 1 || headerBytes < headerSize) throw new MediaError('SOURCE_INVALID');
+  const rowSize = 12;
+  const tableSize = header.readUInt16BE(headerSize - 2) * rowSize;
+  if (tableSize === 0) return;
+  const tableStart = payload + headerSize;
+  const firstOffset = version === 0 ? BigInt(header.readUInt32BE(16)) : header.readBigUInt64BE(20);
+  if (tableSize > end - tableStart || firstOffset > BigInt(fileEnd - end))
+    throw new MediaError('SOURCE_INVALID');
+  signal.throwIfAborted();
+  const references = Buffer.alloc(tableSize);
+  if ((await file.read(references, 0, tableSize, tableStart)).bytesRead !== tableSize)
+    throw new MediaError('SOURCE_INVALID');
+  let referencedEnd = end + Number(firstOffset);
+  for (let row = 0; row < tableSize; row += rowSize) {
+    referencedEnd += references.readUInt32BE(row) & 0x7fffffff;
+  }
+  if (referencedEnd > fileEnd) throw new MediaError('SOURCE_INVALID');
+}
+
 interface OpenMp4Media {
   end: number;
   firstFragment: number;
@@ -572,6 +608,7 @@ async function requireMp4File(path: string, signal: AbortSignal): Promise<OpenMp
         identified = true;
       }
       if (type === 'moov' && end > payload) movie = true;
+      if (type === 'sidx') await requireSegmentIndexExtent(file, payload, end, stat.size, signal);
       if (type === 'moof') {
         if (firstFragment === stat.size) firstFragment = offset;
         fragmentAwaitingMedia = true;

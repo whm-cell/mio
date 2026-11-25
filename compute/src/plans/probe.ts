@@ -1,6 +1,6 @@
 import type { MediaFailureCode, MediaProbe } from '@mio/compute-contracts';
 import type { MediaExecutionContext } from '../media-execution.ts';
-import { probeRatio, videoDisplayGeometry } from '../video-display.ts';
+import { isVideoTrack, probeRatio, videoDisplayGeometry } from '../video-display.ts';
 import type { VideoDisplayStream } from '../video-display.ts';
 
 export function mediaError(code: MediaFailureCode): Error {
@@ -8,13 +8,11 @@ export function mediaError(code: MediaFailureCode): Error {
 }
 
 interface ProbeStream extends VideoDisplayStream {
-  codec_type?: string;
   codec_name?: string;
   duration?: string;
   avg_frame_rate?: string;
   sample_rate?: string;
   channels?: number;
-  disposition?: { attached_pic?: number };
 }
 
 /** Shared by output verification; only the adapter can resolve the local name. */
@@ -56,9 +54,7 @@ export async function probeFile(
     throw mediaError('INPUT_INVALID');
   }
   if (!parsed || !Array.isArray(parsed.streams)) throw mediaError('INPUT_INVALID');
-  const video = parsed.streams.find(
-    (s) => s.codec_type === 'video' && !s.disposition?.attached_pic,
-  );
+  const video = parsed.streams.find(isVideoTrack);
   const audio = parsed.streams.find((s) => s.codec_type === 'audio');
   if (!video && !audio) throw mediaError('INPUT_INVALID');
   const durations = [parsed.format?.duration, video?.duration, audio?.duration]

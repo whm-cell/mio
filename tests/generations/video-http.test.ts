@@ -1,5 +1,5 @@
 import { createHash, randomInt, randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
 import COS from 'cos-nodejs-sdk-v5';
 import { describe, expect, it, vi } from 'vitest';
+import { probeVideoFile } from '../../compute/src/adapters/media.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { createAssetStore } from '../../src/assets/store.ts';
@@ -17,6 +18,7 @@ import { VIDEO_QUOTA_LOCK } from '../../src/generations/video/execution.ts';
 import { createVideoGenerationHandler } from '../../src/generations/video/http.ts';
 import { createVideoInputResolver } from '../../src/generations/video/inputs.ts';
 import { createVideoMaterializer } from '../../src/generations/video/media.ts';
+import type { VideoProbe } from '../../src/generations/video/media.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
 import type { VideoTransports } from '../../src/generations/video/runner.ts';
 import { createVideoGenerationService } from '../../src/generations/video/service.ts';
@@ -25,6 +27,7 @@ import { VideoSubmissionReceipts } from '../../src/generations/video/submission-
 import type {
   VideoAssetReference,
   VideoCreateRequest,
+  VideoJobView,
 } from '../../src/generations/video/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
@@ -33,6 +36,7 @@ import { ProviderError } from '../../src/providers/contracts.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
 
 const actor = { userId: randomUUID(), sessionId: 'video-http-test' };
 const origin = 'https://demo.fixture';
@@ -152,7 +156,7 @@ describe('video generation HTTP boundary', () => {
   });
 });
 
-async function assetHttpFixture(withExecutor = false) {
+async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayBuffer>) {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
@@ -173,7 +177,8 @@ async function assetHttpFixture(withExecutor = false) {
   const directory = await mkdtemp(join(tmpdir(), 'mio-video-http-'));
   const heads = new Map<string, Awaited<ReturnType<AssetObjectStore['head']>>>();
   const generatedVideo = 'https://video.fixture/render.mp4';
-  const outputBytes = Buffer.from('video for a fixture Worker');
+  const outputBytes = realOutput ?? Buffer.from('video for a fixture Worker');
+  const probePath = realOutput && join(directory, 'worker-input.media');
   const objects = {
     uploadUrl: vi.fn(),
     downloadUrl: vi.fn(),
@@ -196,7 +201,9 @@ async function assetHttpFixture(withExecutor = false) {
       async (key, stream, sizeBytes, sha256) => {
         const chunks: Buffer[] = [];
         for await (const chunk of stream) chunks.push(Buffer.from(chunk));
-        if (!Buffer.concat(chunks).equals(outputBytes)) throw new Error('unexpected video bytes');
+        const bytes = Buffer.concat(chunks);
+        if (!bytes.equals(outputBytes)) throw new Error('unexpected video bytes');
+        if (probePath) await writeFile(probePath, bytes, { mode: 0o600 });
         const etag = 'fixture-staging-etag';
         const contentType = 'video/mp4';
         heads.set(key, { size: sizeBytes, etag, sha256, contentType });
@@ -274,20 +281,31 @@ async function assetHttpFixture(withExecutor = false) {
     downloads++;
     return consume(expiredResult ? new Response(null, { status: 410 }) : new Response(outputBytes));
   };
-  const materialize = createVideoMaterializer(
-    objects,
-    directory,
-    async () => ({
-      container: 'mov,mp4,m4a,3gp,3g2,mj2',
+  const probe = vi.fn<VideoProbe>(async ({ source }, signal) => {
+    if (probePath) {
+      expect(heads.get(source.stagingKey)).toMatchObject({
+        size: source.sizeBytes,
+        sha256: source.sha256,
+        etag: source.etag,
+      });
+      try {
+        return await probeVideoFile(probePath, signal);
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== 'SOURCE_INVALID') throw error;
+        throw new Error('VIDEO_SOURCE_INVALID', { cause: error });
+      }
+    }
+    return {
+      container: 'mp4',
       videoCodec: 'h264',
       width: 640,
       height: 360,
       durationSeconds: 4,
       hasAudio: false,
       audioCodec: null,
-    }),
-    download,
-  );
+    };
+  });
+  const materialize = createVideoMaterializer(objects, directory, probe, download);
   const transports: VideoTransports = {
     protocol: createVideoProtocol,
     transport: upstream,
@@ -358,6 +376,7 @@ async function assetHttpFixture(withExecutor = false) {
     snapshotVideo,
     heads,
     objects,
+    probe,
     upstream,
     expireResult: () => {
       expiredResult = true;
@@ -440,6 +459,102 @@ async function assetHttpFixture(withExecutor = false) {
     },
   };
 }
+
+it.each(['mp4', 'attached-cover', 'truncated-mp4', 'corrupt-mp4', 'mov', '3gp'] as const)(
+  'publishes only verified MP4 from actual staged %s bytes',
+  async (kind) => {
+    const directory = await mkdtemp(join(tmpdir(), 'mio-video-http-fixture-'));
+    let bytes: Buffer<ArrayBuffer>;
+    try {
+      bytes = await readFile(writeVideoProbeFixture(directory, kind));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+    const f = await assetHttpFixture(false, bytes);
+    try {
+      const reference = await f.addAsset();
+      const accepted = await f.post([{ assetId: reference.assetId }]);
+      expect(accepted.status).toBe(202);
+      const { id } = await accepted.json();
+      await f.runNext();
+
+      const passes = kind === 'mp4' ? 1 : 3;
+      for (let attempt = 0; attempt < passes; attempt++) {
+        await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
+          id,
+        ]);
+        await f.runNext();
+      }
+      expect(f.downloadCount()).toBe(1);
+      expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+      expect(f.probe).toHaveBeenCalledTimes(passes);
+      expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+
+      const response = await f.get(id);
+      expect(response.status).toBe(200);
+      const view: VideoJobView = await response.json();
+      const { rows } = await f.pool.query(
+        `SELECT id,owner_id,filename,content_type,raw_key,source_etag,state
+         FROM mio_assets WHERE asset_kind='derived'`,
+      );
+      const raw = [...f.heads.keys()].filter(
+        (key) => key !== reference.key && key.startsWith('mio/raw/'),
+      );
+      if (kind === 'mp4') {
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        expect(view).toMatchObject({
+          state: 'completed',
+          outputs: [
+            {
+              index: 0,
+              status: 'registered',
+              width: 320,
+              height: 240,
+              assetId: expect.any(String),
+              sizeBytes: bytes.length,
+              sha256,
+            },
+          ],
+        });
+        const assetId = view.outputs[0]!.assetId;
+        const command = f.probe.mock.calls[0]![0];
+        const rawKey = `mio/raw/${assetId}/${command.attemptId}`;
+        expect(raw).toEqual([rawKey]);
+        expect(f.heads.get(rawKey)).toMatchObject({ contentType: 'video/mp4', sha256 });
+        expect(rows).toEqual([
+          {
+            id: assetId,
+            owner_id: actor.userId,
+            filename: 'video-0.mp4',
+            content_type: 'video/mp4',
+            raw_key: rawKey,
+            source_etag: 'fixture-raw-etag',
+            state: 'ready',
+          },
+        ]);
+        expect(f.objects.copy).toHaveBeenCalledExactlyOnceWith(
+          command.source.stagingKey,
+          rawKey,
+          command.source.etag,
+          'private',
+          { contentType: 'video/mp4', sha256, signal: expect.any(AbortSignal) },
+        );
+      } else {
+        expect(view).toMatchObject({
+          state: 'materialization_failed',
+          outputs: [
+            { index: 0, status: 'failed', assetId: null, errorCode: 'VIDEO_SOURCE_INVALID' },
+          ],
+        });
+        expect(rows).toEqual([]);
+        expect(raw).toEqual([]);
+        expect(f.objects.copy).not.toHaveBeenCalled();
+      }
+    } finally {
+      await f.close();
+    }
+  },
+);
 
 it('recovers the private video from its downloaded checkpoint after the supplier URL expires', async () => {
   const f = await assetHttpFixture();

@@ -39,7 +39,7 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 
 ## 只读视频媒体探测 `video.probe` v1
 
-`video.probe` 仅对 A 已准备的私有 COS staging 媒体进行限时字节完整性校验和 ffprobe；不执行任何转码/写入 COS/供应商调用，不经消息传递媒体字节或供应商凭据。字段集严格封闭；身份为 `(jobId, outputIndex, attemptId, attempt)`，`outputIndex` 为 0–15，`attempt` 为 1–3。`source.stagingKey` 必须精确是 `mio/staging/video/<jobId>/<outputIndex>/<attemptId>.media`；不接收 URL、bucket、命令行或本机路径。`source.sizeBytes` 限为 1 至 1073741824；`etag` 为最长 256 且不含控制字符的原样值；`sha256` 为小写 64 位十六进制。
+`video.probe` 仅对 A 已准备的私有 COS staging 媒体执行限时字节校验、MP4 容器及媒体包检查和视频帧抽检。解码帧丢弃，探测全程只读。字段集严格封闭；身份为 `(jobId, outputIndex, attemptId, attempt)`，`outputIndex` 为 0–15，`attempt` 为 1–3。`source.stagingKey` 必须精确是 `mio/staging/video/<jobId>/<outputIndex>/<attemptId>.media`；不接收 URL、bucket、命令行、本机路径、媒体字节或供应商凭据。`source.sizeBytes` 限为 1 至 1073741824；`etag` 为最长 256 且不含控制字符的原样值；`sha256` 为小写 64 位十六进制。
 
 ```json
 {
@@ -59,9 +59,13 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 }
 ```
 
-B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/可用的 SHA-256 元数据，再用条件 GET `If-Match: <etag>` 流式下载到 worker 受限临时目录（目录 0700，文件 0600）。过流逐块累计实际字节并计算 SHA-256，必须与消息 size/digest 完全相同才启动 ffprobe；失配、过大、超时或 worker 停机均不返回可消费媒体。COS 下载和 ffprobe 共用 300 秒本地 AbortSignal 上限，取消时销毁流/子进程并清除这个 UUID 推导的临时文件。ffprobe 只从固定本地文件路径运行，使用固定参数和已有文件格式 whitelist，不使用 shell。保留当前 1800 秒视频时长上限；JSON 输出限 64 KiB，错误输出限 256 KiB。
+B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/可用的 SHA-256 元数据，再用条件 GET `If-Match: <etag>` 流式下载到 worker 受限临时目录（目录 0700，文件 0600）。实际流的 size/digest 与消息完全一致后才开始媒体检查。下载和所有媒体检查共用 300 秒本地 AbortSignal 上限，取消时销毁流/子进程并清除这个 UUID 推导的临时文件。FFprobe 和 FFmpeg 使用固定参数直接读取该本地文件，协议仅允许 `file`，解复用仅允许 `mov`，禁用外部媒体引用。元数据 JSON 限 64 KiB，各子进程的错误输出限 256 KiB。
 
-成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份；`media` 只包含 ffprobe 得出的 `container`/`videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。宽高使用与 `media.probe` 一致的显示尺寸算法，对选中视频流应用 SAR 和旋转后取最近的整数，返回 1–65536 的安全整数。时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
+B 检查实际 `ftyp` 品牌和 MP4 顶层 box 边界，要求完整的 `moov` 和非空 `mdat`，拒绝主品牌为 QuickTime 或 3GP/3G2 的文件。B 按 `media.probe` 相同的规则选择首个非附图视频流，按该流的实际索引解码；只有封面的音频文件判为无视频。B 流式扫描媒体包并拒绝损坏标志或读失败。若 `mdat` 声明延伸至文件结束，或最后一个分片声明后缺少媒体载荷，B 按轨道核对原始样本表和可见分片声明中的音视频样本数；例如 PCM 合并进同一初始媒体包的样本按采样数累计。
+
+定点解码须取得选中视频流的开头帧，再从可寻址的尾部位置解码至结束，取得达到该流最后一个显示时间戳的实际帧。音轨更长、可变帧率或分片封装时，尾帧判断仍按所选视频流。探测覆盖文件中可见的容器边界、包读取以及上述两处视频解码。分片封装的边界判断依据文件中实际可见的片段与索引。
+
+成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份。`media` 包含已验证的 `container: "mp4"` 及 `videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。宽高使用与 `media.probe` 一致的显示尺寸算法，对选中视频流应用 SAR 和旋转后取最近的整数，返回 1–65536 的安全整数。时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
 
 普通与启用观测的 B 都有独立探测命令消费通道。探测与独立音频检测和通用媒体探测共用 `total`/`probe` 准入与相应 HOLD，转码使用 `total`/`encode`。原视频命令通道保留对已路由探测的严格解析和分发，以便迁移后排空。一个 Worker 上在途的相同探测命令只操作一份本地临时文件，各投递在同一结果获确认后 ACK。相同 `messageId` 携带不同内容时按冲突拒收。
 

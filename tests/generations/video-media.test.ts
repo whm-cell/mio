@@ -21,6 +21,7 @@ import type { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
 import COS from 'cos-nodejs-sdk-v5';
+import { probeVideoFile } from '../../compute/src/adapters/media.ts';
 import type { VideoProbe } from '../../src/generations/video/media.ts';
 import { createVideoMaterializer, createVideoCleanup } from '../../src/generations/video/media.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
@@ -36,6 +37,7 @@ import type { VideoExecution, VideoProtocol } from '../../src/generations/video/
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
 
 vi.mock('node:fs', async (original) => {
   const fs = await original<typeof FileSystem>();
@@ -50,6 +52,16 @@ vi.mock('node:fs/promises', async (original) => {
 const video = { url: 'https://video.fixture/result.mp4' };
 const videos = [video];
 const MiB = 1024 * 1024;
+const legacyContainer = 'mov,mp4,m4a,3gp,3g2,mj2';
+const mp4ProbeMetadata = {
+  container: 'mp4',
+  videoCodec: 'h264',
+  width: 640,
+  height: 360,
+  durationSeconds: 4,
+  hasAudio: false,
+  audioCodec: null,
+};
 
 const cosFixture = () =>
   createCosStorage({
@@ -150,15 +162,7 @@ async function fixture() {
     async (_url: URL, _signal: AbortSignal, consume: (response: Response) => Promise<unknown>) =>
       consume(new Response(bytes)),
   ) as unknown as typeof withPublicHttps;
-  const probe = vi.fn<VideoProbe>(async () => ({
-    container: 'mov,mp4,m4a,3gp,3g2,mj2',
-    videoCodec: 'h264',
-    width: 640,
-    height: 360,
-    durationSeconds: 4,
-    hasAudio: false,
-    audioCodec: null,
-  }));
+  const probe = vi.fn<VideoProbe>(async () => ({ ...mp4ProbeMetadata }));
   const row = { id: randomUUID(), owner_id: randomUUID() } as VideoExecution;
   const start = (root = directory) => createVideoMaterializer(objects, root, probe, download);
   return {
@@ -869,6 +873,160 @@ describe('durable video materialization', () => {
     }
   });
 
+  it('rejects a new ambiguous container verdict before saving a probe receipt or copying', async () => {
+    const f = await fixture();
+    try {
+      const signal = AbortSignal.timeout(5000);
+      f.probe.mockResolvedValueOnce({ ...mp4ProbeMetadata, container: legacyContainer });
+      await expect(f.run(f.row, video, 0, signal)).rejects.toThrow('VIDEO_MEDIA_INVALID');
+      const receipt = JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8'));
+      expect(receipt.media).toBeUndefined();
+      expect(receipt.etag).toBeUndefined();
+      expect(f.objects.copy).not.toHaveBeenCalled();
+      expect(await readFile(f.checkpoint('0.media'))).toEqual(f.bytes);
+
+      const output = await f.start()(f.row, video, 0, signal);
+      expect(output.key).toBe(`mio/raw/${receipt.assetId}/${receipt.attemptId}`);
+      expect(f.probe.mock.calls[1]![0].source).toEqual(f.probe.mock.calls[0]![0].source);
+      expect(f.download).toHaveBeenCalledTimes(1);
+      expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+      expect(f.objects.copy).toHaveBeenCalledTimes(1);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('rechecks a legacy staging receipt with its original ETag and preserves it on failure', async () => {
+    const f = await fixture();
+    try {
+      const signal = AbortSignal.timeout(5000);
+      vi.mocked(f.objects.copy).mockRejectedValueOnce(new Error('interrupted before copy'));
+      await expect(f.run(f.row, video, 0, signal)).rejects.toThrow('interrupted before copy');
+      const path = f.checkpoint('0.json');
+      const receipt = JSON.parse(await readFile(path, 'utf8'));
+      const old = JSON.stringify({
+        ...receipt,
+        media: { ...receipt.media, container: legacyContainer },
+      });
+      await writeFile(path, old);
+      const { source } = f.probe.mock.calls[0]![0];
+      const original = f.saved.get(source.stagingKey)!;
+      f.saved.set(source.stagingKey, { ...original, etag: 'different-staging-etag' });
+      await expect(f.start()(f.row, video, 0, signal)).rejects.toThrow('VIDEO_OBJECT_MISMATCH');
+      expect(f.probe).toHaveBeenCalledTimes(1);
+      expect(await readFile(path, 'utf8')).toBe(old);
+
+      f.saved.set(source.stagingKey, original);
+      f.probe.mockResolvedValueOnce({ ...mp4ProbeMetadata, container: legacyContainer });
+      await expect(f.start()(f.row, video, 0, signal)).rejects.toThrow('VIDEO_MEDIA_INVALID');
+      expect(await readFile(path, 'utf8')).toBe(old);
+      expect(f.objects.copy).toHaveBeenCalledTimes(1);
+      expect(await f.start()(f.row, video, 0, signal)).toMatchObject({
+        assetId: receipt.assetId,
+        key: `mio/raw/${receipt.assetId}/${receipt.attemptId}`,
+      });
+      expect(f.probe.mock.calls.map(([command]) => command.source)).toEqual([
+        source,
+        source,
+        source,
+      ]);
+      expect(f.download).toHaveBeenCalledTimes(1);
+      expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+      expect(f.objects.copy).toHaveBeenCalledTimes(2);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([undefined, 'legacy-raw-etag'])(
+    'restores a lost legacy stage from verified raw with recorded ETag %s and reconciles a lost reply',
+    async (rawEtag) => {
+      const f = await fixture();
+      try {
+        const signal = AbortSignal.timeout(5000);
+        const bytes = await readFile(writeVideoProbeFixture(f.directory, 'mp4'));
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        const jobId = f.row.id;
+        const index = 3;
+        const assetId = randomUUID();
+        const attemptId = randomUUID();
+        const rawKey = `mio/raw/${assetId}/${attemptId}`;
+        const stagingKey = `mio/staging/video/${jobId}/${index}/${attemptId}.media`;
+        const contentType = 'video/mp4';
+        const raw = { bytes, sha256, etag: 'legacy-raw-etag', contentType };
+        const identity = { jobId, index, assetId, attemptId, sha256, sizeBytes: bytes.length };
+        const path = f.checkpoint(`${index}.json`);
+        await mkdir(f.checkpoint(''), { recursive: true });
+        await writeFile(
+          path,
+          JSON.stringify({
+            ...identity,
+            etag: 'missing-staging-etag',
+            rawEtag,
+            media: { ...mp4ProbeMetadata, container: legacyContainer },
+          }),
+        );
+        f.saved.set(rawKey, raw);
+
+        const copy = vi.mocked(f.objects.copy);
+        const copyObject = copy.getMockImplementation()!;
+        const pending = { ...identity, rawEtag: raw.etag };
+        copy.mockImplementationOnce(async (...args) => {
+          expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(pending);
+          await copyObject(...args);
+          throw new Error('lost staging copy acknowledgement');
+        });
+        await expect(f.run(f.row, video, index, signal)).rejects.toThrow(
+          'lost staging copy acknowledgement',
+        );
+        expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(pending);
+        const stage = f.saved.get(stagingKey)!;
+        expect(stage.bytes).toEqual(bytes);
+        expect(stage.etag).not.toBe('missing-staging-etag');
+        expect(f.probe).not.toHaveBeenCalled();
+
+        f.probe.mockImplementation(async (command, signal) => {
+          expect(command).toMatchObject({
+            jobId,
+            outputIndex: index,
+            attemptId,
+            source: { stagingKey, sizeBytes: bytes.length, sha256, etag: stage.etag },
+          });
+          const probePath = join(f.directory, 'restored-worker-input.media');
+          await writeFile(probePath, f.saved.get(command.source.stagingKey)!.bytes, {
+            mode: 0o600,
+          });
+          return probeVideoFile(probePath, signal);
+        });
+        expect(await f.start()(f.row, video, index, signal)).toMatchObject({
+          index,
+          assetId,
+          key: rawKey,
+          etag: raw.etag,
+          width: 320,
+          height: 240,
+          contentType,
+        });
+        expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+          ...pending,
+          etag: stage.etag,
+          media: { container: 'mp4' },
+        });
+        expect(f.saved.get(rawKey)).toBe(raw);
+        expect(f.download).not.toHaveBeenCalled();
+        expect(f.objects.putVideo).not.toHaveBeenCalled();
+        expect(copy).toHaveBeenCalledExactlyOnceWith(rawKey, stagingKey, raw.etag, 'private', {
+          sha256,
+          contentType,
+          signal: expect.any(AbortSignal),
+        });
+        expect(f.probe).toHaveBeenCalledTimes(1);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+
   it('stops materialization while staging HEAD is hung and ignores a late response', async () => {
     const f = await fixture();
     const started = Promise.withResolvers<void>();
@@ -1245,16 +1403,24 @@ it('reconciles a lost copy acknowledgement and cleanup interrupted by executor s
   }
 });
 
-it('cleans committed staging and recovery files only after reconciling the reusable raw object', async () => {
+it('cleans committed legacy staging and recovery files after reconciling the reusable raw object', async () => {
   const f = await fixture();
   try {
     const output = await f.run(f.row, video, 0, AbortSignal.timeout(5000));
+    const path = f.checkpoint('0.json');
+    const receipt = JSON.parse(await readFile(path, 'utf8'));
+    await writeFile(
+      path,
+      JSON.stringify({ ...receipt, media: { ...receipt.media, container: legacyContainer } }),
+    );
     const row = { ...f.row, checkpoint: { videos, materializationAttempts: 1 } };
     const clean = createVideoCleanup(f.objects, f.directory);
     await clean(row, AbortSignal.timeout(5000));
     expect([...f.saved.keys()]).toEqual([output.key]);
+    expect(await readdir(f.checkpoint(''))).toEqual([]);
     await clean(row, AbortSignal.timeout(5000));
     expect(f.objects.delete).toHaveBeenCalledTimes(1);
+    expect(f.probe).toHaveBeenCalledTimes(1);
   } finally {
     await f.close();
   }

@@ -288,6 +288,16 @@ function verifyVideoObject(
     throw new Error('VIDEO_OBJECT_MISMATCH');
 }
 
+function requireVerifiedMp4(media: VideoProbeMetadataV1 | undefined) {
+  if (
+    media?.container !== 'mp4' ||
+    !Number.isFinite(media.durationSeconds) ||
+    media.durationSeconds <= 0
+  )
+    throw new Error('VIDEO_MEDIA_INVALID');
+  return media;
+}
+
 /** Keep the durable media receipt until its asset transaction has committed. */
 export function createVideoMaterializer(
   objects: AssetObjectStore,
@@ -308,6 +318,23 @@ export function createVideoMaterializer(
     if (object) verifyVideoObject(object, saved, saved.rawEtag);
     else if (saved.rawEtag) throw new Error('VIDEO_OBJECT_MISMATCH');
     return object;
+  };
+  const copyVideo = async (
+    source: string,
+    target: string,
+    etag: string,
+    sha256: string,
+    signal: AbortSignal,
+  ) => {
+    signal.throwIfAborted();
+    const copied = await objects.copy(source, target, etag, 'private', {
+      contentType: VIDEO_CONTENT_TYPE,
+      sha256,
+      signal,
+    });
+    signal.throwIfAborted();
+    if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
+    return copied.etag;
   };
   return async (row, video, index, stop) => {
     const stagingSignal = AbortSignal.any([stop, AbortSignal.timeout(VIDEO_IO_TIMEOUT_MS)]);
@@ -358,14 +385,14 @@ export function createVideoMaterializer(
     const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
     let rawObject = createdReceipt ? undefined : await existingRaw(rawKey, saved, stagingSignal);
     let finalizingSignal = stagingSignal;
-    let object = !saved.media || !rawObject ? await existingObject(key, stagingSignal) : undefined;
-    if (object && saved.media) verifyVideoObject(object, saved, saved.etag);
+    const needsProbe = saved.media?.container !== 'mp4';
+    let object = needsProbe || !rawObject ? await existingObject(key, stagingSignal) : undefined;
+    if (object) verifyVideoObject(object, saved, saved.etag);
     const rebuildStage = !!saved.media && !rawObject && !object;
-    if (!saved.media || rebuildStage) {
-      let uploadedEtag: string | undefined;
+    let media: VideoProbeMetadataV1;
+    if (needsProbe || rebuildStage) {
       if (!object) {
-        if (rawObject) throw new Error('VIDEO_CHECKPOINT_INVALID');
-        if (contentMd5 === undefined) {
+        if (!rawObject && contentMd5 === undefined) {
           const actual =
             (await digestFile(file, stagingSignal)) ??
             (await downloadVideo(video.url, file, stagingSignal, download, saved)) ??
@@ -374,19 +401,26 @@ export function createVideoMaterializer(
             throw new Error('VIDEO_CHECKPOINT_INVALID');
           contentMd5 = actual.contentMd5;
         }
-        if (rebuildStage) {
-          // The old source was confirmed absent. Persist the pending probe before the PUT.
+        if (saved.media) {
+          // Persist the pending probe before restoring the missing key, even if the write reply is lost.
+          if (rawObject) saved.rawEtag = rawObject.etag;
           delete saved.media;
           delete saved.etag;
           await save(receipt, saved, stagingSignal);
         }
-        uploadedEtag = await putStagingVideo(objects, key, file, saved, contentMd5, stagingSignal);
+        let stagedEtag: string;
+        if (rawObject && saved.rawEtag) {
+          stagedEtag = await copyVideo(rawKey, key, saved.rawEtag, saved.sha256, stagingSignal);
+        } else {
+          if (contentMd5 === undefined) throw new Error('VIDEO_CHECKPOINT_INVALID');
+          stagedEtag = await putStagingVideo(objects, key, file, saved, contentMd5, stagingSignal);
+        }
         object = await readHead(key, stagingSignal);
+        verifyVideoObject(object, saved, stagedEtag);
       }
-      verifyVideoObject(object, saved, uploadedEtag);
       stagingSignal.throwIfAborted();
       // Compute owns its queue, execution, and reply deadlines.
-      saved.media = await probe(
+      const result = await probe(
         {
           version: 1,
           type: 'video.probe',
@@ -404,30 +438,19 @@ export function createVideoMaterializer(
         },
         stop,
       );
+      media = requireVerifiedMp4(result);
       finalizingSignal = AbortSignal.any([stop, AbortSignal.timeout(VIDEO_IO_TIMEOUT_MS)]);
+      saved.media = media;
       saved.etag = object.etag;
       await save(receipt, saved, finalizingSignal);
+    } else {
+      media = requireVerifiedMp4(saved.media);
     }
-    const media = saved.media;
-    if (
-      !media.container.split(',').some((container) => ['mov', 'mp4'].includes(container)) ||
-      !Number.isFinite(media.durationSeconds) ||
-      media.durationSeconds <= 0
-    )
-      throw new Error('VIDEO_MEDIA_INVALID');
     if (createdReceipt || rebuildStage)
       rawObject = await existingRaw(rawKey, saved, finalizingSignal);
     if (!rawObject) {
       if (!saved.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
-      finalizingSignal.throwIfAborted();
-      const copied = await objects.copy(key, rawKey, saved.etag, 'private', {
-        contentType: VIDEO_CONTENT_TYPE,
-        sha256: saved.sha256,
-        signal: finalizingSignal,
-      });
-      finalizingSignal.throwIfAborted();
-      if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
-      saved.rawEtag = copied.etag;
+      saved.rawEtag = await copyVideo(key, rawKey, saved.etag, saved.sha256, finalizingSignal);
       await save(receipt, saved, finalizingSignal);
       rawObject = await readHead(rawKey, finalizingSignal);
       verifyVideoObject(rawObject, saved, saved.rawEtag);

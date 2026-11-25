@@ -1,9 +1,15 @@
 export interface VideoDisplayStream {
+  codec_type?: string;
+  disposition?: { attached_pic?: number };
   width?: number;
   height?: number;
   sample_aspect_ratio?: string;
   tags?: { rotate?: string };
   side_data_list?: { rotation?: number }[];
+}
+
+export function isVideoTrack(stream: VideoDisplayStream): boolean {
+  return stream.codec_type === 'video' && !stream.disposition?.attached_pic;
 }
 
 export function probeRatio(value: string | undefined, separator: ':' | '/'): number | null {

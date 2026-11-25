@@ -1,8 +1,10 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import type * as ChildProcess from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import {
   copyFileSync,
+  createReadStream,
   existsSync,
   linkSync,
   lstatSync,
@@ -32,9 +34,10 @@ import type {
   VideoProbeResultV1,
   WorkerTelemetryEvent,
 } from '@mio/compute-contracts';
+import { writeVideoProbeFixture } from '../../tests/support/video-probe-fixtures.ts';
 import type { ObjectStore } from '../src/adapters/cos.ts';
 import { Journal } from '../src/adapters/journal.ts';
-import { paths, probePath, requireProbeSpace } from '../src/adapters/media.ts';
+import { drainProbeInput, paths, probePath, requireProbeSpace } from '../src/adapters/media.ts';
 import type { Broker } from '../src/adapters/rabbitmq.ts';
 import { ResourceSlots } from '../src/resource-slots.ts';
 import { Worker } from '../src/worker.ts';
@@ -42,6 +45,11 @@ import { Worker } from '../src/worker.ts';
 vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof Fs>();
   return { ...fs, statfsSync: vi.fn(fs.statfsSync) };
+});
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const childProcess = await importOriginal<typeof ChildProcess>();
+  return { ...childProcess, spawn: vi.fn(childProcess.spawn) };
 });
 
 const MIB = 1024 ** 2;
@@ -82,34 +90,39 @@ function runWorkerCommand(root: string, action: 'init' | 'start') {
 }
 
 function fixture(root: string): string {
-  const path = join(root, 'fixture.mp4');
-  execFileSync('ffmpeg', [
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-f',
-    'lavfi',
-    '-i',
-    'color=black:size=320x240:rate=24',
-    '-f',
-    'lavfi',
-    '-i',
-    'sine=frequency=1000:sample_rate=48000',
-    '-t',
-    '1.25',
-    '-c:v',
-    'libx264',
-    '-threads',
-    '1',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-movflags',
-    '+faststart',
-    path,
-  ]);
-  return path;
+  return writeVideoProbeFixture(root, 'mp4');
+}
+
+function openEndedMedia(file: string) {
+  const bytes = readFileSync(file);
+  const mediaBox = bytes.lastIndexOf('mdat') - 4;
+  expect(mediaBox).toBeGreaterThanOrEqual(0);
+  expect(bytes.readUInt32BE(mediaBox)).toBe(bytes.length - mediaBox);
+  bytes.writeUInt32BE(0, mediaBox);
+  return { bytes, mediaBox };
+}
+
+function lastAudioPacketOffset(file: string): number {
+  const { packets } = JSON.parse(
+    execFileSync(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'a:0',
+        '-show_entries',
+        'packet=pos,size',
+        '-of',
+        'json',
+        file,
+      ],
+      { encoding: 'utf8' },
+    ),
+  ) as { packets: { pos: string; size: string }[] };
+  const last = packets.at(-1)!;
+  expect(Number(last.pos) + Number(last.size)).toBe(statSync(file).size);
+  return Number(last.pos);
 }
 
 function command(file: string, sizeBytes?: number): VideoProbeCommandV1 {
@@ -160,6 +173,43 @@ function probeWorker(
   );
 }
 
+async function inspectFixture(root: string, file: string) {
+  const journal = new Journal(root, 'probe-test', true);
+  const slots = new ResourceSlots();
+  const input = command(file);
+  const events: VideoProbeResultV1[] = [];
+  const ack = vi.fn();
+  const worker = probeWorker(
+    journal,
+    root,
+    slots,
+    (command, directory, signal) =>
+      drainProbeInput(
+        createReadStream(file),
+        directory,
+        command.messageId,
+        command.source.sizeBytes,
+        command.source.sha256,
+        signal,
+      ),
+    async (message) => {
+      events.push(parseVideoProbeResultV1(message));
+    },
+  );
+  try {
+    await worker.handleVideoProbe(input, ack);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(events).toHaveLength(1);
+    expect(events[0]?.source).toEqual(input.source);
+    expect(slots.snapshot().usage.total).toBe(0);
+    expect(existsSync(probePath(root, input.messageId))).toBe(false);
+    return events[0];
+  } finally {
+    worker.stop();
+    journal.close();
+  }
+}
+
 function mockFreeSpace(bytes: number): void {
   const bsize = STATFS_BLOCK_BYTES;
   const bavail = bytes / bsize;
@@ -178,6 +228,7 @@ function mockFreeSpace(bytes: number): void {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.mocked(statfsSync).mockReset();
+  vi.mocked(spawn).mockReset();
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -338,7 +389,7 @@ it('probes the streamed local file and returns source identity and media metadat
       source: input.source,
       state: 'succeeded',
       media: {
-        container: expect.stringContaining('mp4'),
+        container: 'mp4',
         videoCodec: 'h264',
         width: 320,
         height: 240,
@@ -355,6 +406,286 @@ it('probes the streamed local file and returns source identity and media metadat
     worker.stop();
     await Promise.allSettled([handling, duplicate]);
     unsubscribe();
+    journal.close();
+  }
+});
+
+it.each(['attached-cover', 'truncated-mp4', 'corrupt-mp4', 'mov', '3gp'] as const)(
+  'rejects a real %s fixture whose FFprobe header still looks like video',
+  async (kind) => {
+    const root = directory();
+    const file = writeVideoProbeFixture(root, kind);
+    const metadata = execFileSync(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        '-show_entries',
+        'stream=codec_type:format=format_name',
+        '-of',
+        'compact',
+        file,
+      ],
+      { encoding: 'utf8' },
+    );
+    expect(metadata).toContain('codec_type=video');
+    expect(metadata).toContain('format_name=mov,mp4,m4a,3gp,3g2,mj2');
+    expect(await inspectFixture(root, file)).toMatchObject({
+      state: 'failed',
+      errorCode: 'SOURCE_INVALID',
+    });
+  },
+);
+
+it.each(['short', 'missing'] as const)(
+  'detects a %s final packet when the MP4 media box is declared to extend to EOF',
+  async (damage) => {
+    const root = directory();
+    const file = fixture(root);
+    const { bytes } = openEndedMedia(file);
+    const lastPacket = lastAudioPacketOffset(file);
+    writeFileSync(file, bytes.subarray(0, damage === 'short' ? lastPacket + 1 : lastPacket));
+    expect(await inspectFixture(root, file)).toMatchObject({
+      state: 'failed',
+      errorCode: 'SOURCE_INVALID',
+    });
+  },
+);
+
+it('checks an open-ended MP4 with edited video start and PCM packets covering multiple samples', async () => {
+  const root = directory();
+  const file = join(root, 'edited.mp4');
+  execFileSync('ffmpeg', [
+    '-nostdin',
+    '-v',
+    'error',
+    '-itsoffset',
+    '1.75',
+    '-i',
+    fixture(root),
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=900:sample_rate=48000:duration=4',
+    '-map',
+    '0:v',
+    '-map',
+    '1:a',
+    '-c:v',
+    'copy',
+    '-c:a',
+    'pcm_s16le',
+    '-movflags',
+    '+faststart',
+    file,
+  ]);
+  const cutAt = lastAudioPacketOffset(file);
+  const { bytes } = openEndedMedia(file);
+  writeFileSync(file, bytes);
+  expect(await inspectFixture(directory(), file)).toMatchObject({
+    state: 'succeeded',
+    media: {
+      container: 'mp4',
+      width: 320,
+      height: 240,
+      audioCodec: 'pcm_s16le',
+      durationSeconds: 4,
+    },
+  });
+  writeFileSync(file, bytes.subarray(0, cutAt));
+  expect(await inspectFixture(directory(), file)).toMatchObject({
+    state: 'failed',
+    errorCode: 'SOURCE_INVALID',
+  });
+});
+
+it('checks fragment declarations for a complete or truncated open-ended final MP4 fragment', async () => {
+  const root = directory();
+  const file = join(root, 'fragmented.mp4');
+  execFileSync('ffmpeg', [
+    '-nostdin',
+    '-v',
+    'error',
+    '-i',
+    fixture(root),
+    '-c',
+    'copy',
+    '-movflags',
+    '+frag_keyframe+empty_moov+default_base_moof+skip_trailer',
+    file,
+  ]);
+  const audioTail = lastAudioPacketOffset(file);
+  const { bytes, mediaBox } = openEndedMedia(file);
+  writeFileSync(file, bytes);
+  expect(await inspectFixture(directory(), file)).toMatchObject({
+    state: 'succeeded',
+    media: { container: 'mp4', width: 320, height: 240, audioCodec: 'aac' },
+  });
+  for (const cutAt of [audioTail, mediaBox + 8, mediaBox]) {
+    writeFileSync(file, bytes.subarray(0, cutAt));
+    expect(await inspectFixture(directory(), file)).toMatchObject({
+      state: 'failed',
+      errorCode: 'SOURCE_INVALID',
+    });
+  }
+});
+
+it.each(['mp4', 'corrupt-mp4'] as const)(
+  'uses the first non-cover video stream’s absolute index in a multi-video %s file',
+  async (kind) => {
+    const root = directory();
+    const file = join(root, 'multiple.mp4');
+    const primary = writeVideoProbeFixture(root, kind);
+    execFileSync('ffmpeg', [
+      '-nostdin',
+      '-v',
+      'error',
+      '-fflags',
+      '+noparse+nofillin',
+      '-i',
+      primary,
+      '-f',
+      'lavfi',
+      '-i',
+      'color=blue:size=96x64:rate=12:duration=0.5',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=red:size=32x32:rate=1:duration=1',
+      '-map',
+      '0:a',
+      '-map',
+      '0:v',
+      '-map',
+      '1:v',
+      '-map',
+      '2:v',
+      '-c:a',
+      'copy',
+      '-c:v:0',
+      'copy',
+      '-c:v:1',
+      'libx264',
+      '-c:v:2',
+      'mjpeg',
+      '-threads',
+      '1',
+      '-disposition:v:0',
+      '0',
+      '-disposition:v:1',
+      'default',
+      '-disposition:v:2',
+      'attached_pic',
+      '-movflags',
+      '+faststart',
+      file,
+    ]);
+    expect(await inspectFixture(root, file)).toMatchObject(
+      kind === 'mp4'
+        ? { state: 'succeeded', media: { container: 'mp4', width: 320, height: 240 } }
+        : { state: 'failed', errorCode: 'SOURCE_INVALID' },
+    );
+  },
+);
+
+it.each(['single-frame', 'fragmented-vfr'] as const)(
+  'verifies the selected video’s own tail in a %s MP4',
+  async (kind) => {
+    const root = directory();
+    const file = join(root, 'video.mp4');
+    const single = kind === 'single-frame';
+    execFileSync('ffmpeg', [
+      '-nostdin',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      single
+        ? 'color=black:size=96x64:rate=1:duration=1'
+        : 'color=black:size=96x64:rate=12:duration=3',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=900:sample_rate=48000:duration=4',
+      '-c:v',
+      'libx264',
+      '-threads',
+      '1',
+      '-g',
+      '6',
+      '-c:a',
+      'aac',
+      '-brand',
+      single ? 'mp42' : 'dash',
+      ...(single
+        ? []
+        : [
+            '-vf',
+            'select=not(between(n\\,4\\,31))',
+            '-fps_mode',
+            'vfr',
+            '-movflags',
+            '+frag_keyframe+empty_moov+default_base_moof',
+          ]),
+      file,
+    ]);
+    expect(await inspectFixture(root, file)).toMatchObject({
+      state: 'succeeded',
+      media: {
+        container: 'mp4',
+        width: 96,
+        height: 64,
+        hasAudio: true,
+        audioCodec: 'aac',
+        durationSeconds: expect.closeTo(4, 0),
+      },
+    });
+  },
+);
+
+it('kills a running late-decode subprocess and releases its Worker slot and file on stop', async () => {
+  const root = directory();
+  const file = fixture(root);
+  const input = command(file);
+  const journal = new Journal(root, 'probe-test', true);
+  const slots = new ResourceSlots();
+  const publish = vi.fn(async () => {});
+  const worker = probeWorker(
+    journal,
+    root,
+    slots,
+    async (command, directory) => {
+      const destination = probePath(directory, command.messageId);
+      copyFileSync(file, destination);
+      return destination;
+    },
+    publish,
+  );
+  const original = await vi.importActual<typeof ChildProcess>('node:child_process');
+  let decoderCount = 0;
+  let exited: Promise<unknown[]> | undefined;
+  vi.mocked(spawn).mockImplementation((binary, args, options) => {
+    const child = original.spawn(binary, args, options);
+    if (binary === 'ffmpeg' && ++decoderCount === 2) {
+      exited = once(child, 'exit');
+      child.once('spawn', () => worker.stop());
+    }
+    return child;
+  });
+  const ack = vi.fn();
+  try {
+    await worker.handleVideoProbe(input, ack);
+    expect(decoderCount).toBe(2);
+    expect(await exited).toEqual([null, 'SIGKILL']);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ state: 'failed', errorCode: 'WORKER_INTERRUPTED' }),
+    );
+    expect(ack).toHaveBeenCalledOnce();
+    expect(slots.snapshot().usage.total).toBe(0);
+    expect(existsSync(probePath(root, input.messageId))).toBe(false);
+  } finally {
+    worker.stop();
     journal.close();
   }
 });

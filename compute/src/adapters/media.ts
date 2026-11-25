@@ -21,6 +21,8 @@ import {
   unlinkSync,
 } from 'node:fs';
 import type { Stats } from 'node:fs';
+import { open } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -30,13 +32,22 @@ import {
   COMPUTE_MAX_MEDIA_BYTES,
 } from '@mio/compute-contracts';
 import type { AudioInspectCommandV1, AudioInspection } from '@mio/compute-contracts';
-import { videoDisplayGeometry } from '../video-display.ts';
+import { isVideoTrack, videoDisplayGeometry } from '../video-display.ts';
 import type { VideoDisplayStream } from '../video-display.ts';
 
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
 const VIDEO_PROBE_PREFIX = '.video-probe-';
 const VIDEO_PROBE_SUFFIX = '.media';
+const PROCESS_STDOUT_LIMIT = 64 * 1024;
+const MP4_PROBE_INPUT = [
+  '-protocol_whitelist',
+  'file',
+  '-format_whitelist',
+  'mov',
+  '-enable_drefs',
+  '0',
+];
 
 export class MediaError extends ApplicationError<
   | 'INPUT_INVALID'
@@ -351,21 +362,38 @@ export async function drainProbeInput(
   }
 }
 
-type ProcessResult = { stdout: string; exitCode: number | null; aborted: boolean };
+type ProcessResult = {
+  stdout: string;
+  stderrBytes: number;
+  exitCode: number | null;
+  aborted: boolean;
+};
 
 async function runProcess(
   binary: string,
   args: string[],
   signal: AbortSignal,
   onSpawn?: (pid: number) => void,
+  captureStdout?: (data: Buffer) => void,
 ): Promise<ProcessResult> {
   if (signal.aborted) throw new MediaError('EXECUTION_TIMEOUT');
   const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
   let stdout = '';
+  let captureError: unknown;
   let stderrBytes = 0;
   child.stdout.on('data', (data: Buffer) => {
+    if (captureStdout) {
+      if (captureError !== undefined) return;
+      try {
+        captureStdout(data);
+      } catch (error) {
+        captureError = error;
+        child.kill('SIGKILL');
+      }
+      return;
+    }
     stdout += data.toString('utf8');
-    if (stdout.length > 64 * 1024) child.kill('SIGKILL');
+    if (stdout.length > PROCESS_STDOUT_LIMIT) child.kill('SIGKILL');
   });
   child.stderr.on('data', (data: Buffer) => {
     stderrBytes += data.length;
@@ -380,10 +408,12 @@ async function runProcess(
   if (signal.aborted) abort();
   try {
     if (child.pid && onSpawn) onSpawn(child.pid);
-    return await new Promise<ProcessResult>((resolvePromise, reject) => {
+    const result = await new Promise<ProcessResult>((resolvePromise, reject) => {
       child.once('error', reject);
-      child.once('close', (exitCode) => resolvePromise({ stdout, exitCode, aborted }));
+      child.once('close', (exitCode) => resolvePromise({ stdout, stderrBytes, exitCode, aborted }));
     });
+    if (captureError !== undefined) throw captureError;
+    return result;
   } catch (error) {
     child.kill('SIGKILL');
     throw error;
@@ -393,7 +423,6 @@ async function runProcess(
 }
 
 interface ProbeStream extends VideoDisplayStream {
-  codec_type?: string;
   codec_name?: string;
   r_frame_rate?: string;
   avg_frame_rate?: string;
@@ -401,7 +430,6 @@ interface ProbeStream extends VideoDisplayStream {
 
 interface Probe {
   duration: number;
-  container: string;
   streams: ProbeStream[];
 }
 
@@ -429,12 +457,7 @@ function transcodeDisplaySize(stream: ProbeStream | undefined) {
   };
 }
 
-async function probe(
-  path: string,
-  signal: AbortSignal,
-  includeSampleAspectRatio = false,
-): Promise<Probe> {
-  const aspectField = includeSampleAspectRatio ? ',sample_aspect_ratio' : '';
+async function probe(path: string, signal: AbortSignal): Promise<Probe> {
   const result = await runProcess(
     'ffprobe',
     [
@@ -445,7 +468,7 @@ async function probe(
       '-format_whitelist',
       'mov,matroska,webm,avi,mpegts',
       '-show_entries',
-      `format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate${aspectField}:stream_side_data=rotation:stream_tags=rotate`,
+      'format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate:stream_side_data=rotation:stream_tags=rotate',
       '-of',
       'json',
       path,
@@ -470,11 +493,11 @@ async function probe(
   if (duration > 1800) throw new MediaError('INPUT_TOO_LONG');
   if (!value.streams.some((stream) => stream.codec_type === 'video'))
     throw new MediaError('INPUT_INVALID');
-  return { duration, container: value.format.format_name, streams: value.streams };
+  return { duration, streams: value.streams };
 }
 
 export interface VideoProbeMetadata {
-  container: string;
+  container: 'mp4';
   videoCodec: string;
   width: number;
   height: number;
@@ -483,17 +506,381 @@ export interface VideoProbeMetadata {
   audioCodec: string | null;
 }
 
-/** Probe fixed local media paths with the worker's bounded ffprobe invocation. */
+async function hasMp4Brand(file: FileHandle, offset: number, length: number): Promise<boolean> {
+  if (length < 8 || length > PROCESS_STDOUT_LIMIT || length % 4 !== 0) return false;
+  const brands = Buffer.alloc(length);
+  if ((await file.read(brands, 0, length, offset)).bytesRead !== length) return false;
+  const major = brands.toString('latin1', 0, 4);
+  if (major === 'qt  ' || major.startsWith('3g')) return false;
+  if (/^(?:iso[m2-9abc]|mp4[12]|avc1|av01|dash|cmfc|M4V )$/.test(major)) return true;
+  for (let position = 8; position < length; position += 4) {
+    const compatible = brands.toString('latin1', position, position + 4);
+    if (compatible === 'mp41' || compatible === 'mp42') return true;
+  }
+  return false;
+}
+
+async function* mp4Boxes(file: FileHandle, start: number, end: number, signal: AbortSignal) {
+  const header = Buffer.alloc(8);
+  for (let offset = start; offset < end;) {
+    signal.throwIfAborted();
+    if (end - offset < 8 || (await file.read(header, 0, 8, offset)).bytesRead !== 8)
+      throw new MediaError('SOURCE_INVALID');
+    const type = header.toString('latin1', 4);
+    const declared = header.readUInt32BE(0);
+    const headerSize = declared === 1 ? 16 : 8;
+    let size = declared === 0 ? end - offset : declared;
+    if (declared === 1) {
+      if (end - offset < 16 || (await file.read(header, 0, 8, offset + 8)).bytesRead !== 8)
+        throw new MediaError('SOURCE_INVALID');
+      size = Number(header.readBigUInt64BE());
+    }
+    if (size < headerSize || size > end - offset) throw new MediaError('SOURCE_INVALID');
+    yield { type, offset, payload: offset + headerSize, end: offset + size, toEnd: declared === 0 };
+    offset += size;
+  }
+}
+
+interface OpenMp4Media {
+  end: number;
+  firstFragment: number;
+  hasInitialMedia: boolean;
+}
+
+/** Check physical box extents before relying on metadata from the shared MOV demuxer. */
+async function requireMp4File(path: string, signal: AbortSignal): Promise<OpenMp4Media | null> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new MediaError('SOURCE_INVALID');
+    let identified = false;
+    let movie = false;
+    let media = false;
+    let openMedia = false;
+    let fragmentAwaitingMedia = false;
+    let hasInitialMedia = false;
+    let firstFragment = stat.size;
+    for await (const { type, offset, payload, end, toEnd } of mp4Boxes(
+      file,
+      0,
+      stat.size,
+      signal,
+    )) {
+      if (type === 'ftyp') {
+        if (identified || !(await hasMp4Brand(file, payload, end - payload)))
+          throw new MediaError('SOURCE_INVALID');
+        identified = true;
+      }
+      if (type === 'moov' && end > payload) movie = true;
+      if (type === 'moof') {
+        if (firstFragment === stat.size) firstFragment = offset;
+        fragmentAwaitingMedia = true;
+      }
+      if (type === 'mdat') {
+        openMedia ||= toEnd;
+        if (end > payload) {
+          media = true;
+          fragmentAwaitingMedia = false;
+          hasInitialMedia ||= firstFragment === stat.size;
+        }
+      }
+    }
+    if (!identified || !movie || !media) throw new MediaError('SOURCE_INVALID');
+    return openMedia || fragmentAwaitingMedia
+      ? { end: stat.size, firstFragment, hasInitialMedia }
+      : null;
+  } finally {
+    await file.close();
+  }
+}
+
+async function fragmentTrackSamples(
+  file: FileHandle,
+  start: number,
+  end: number,
+  signal: AbortSignal,
+) {
+  const body = Buffer.alloc(8);
+  let id = 0;
+  let count = 0;
+  for await (const box of mp4Boxes(file, start, end, signal)) {
+    if (box.type !== 'tfhd' && box.type !== 'trun') continue;
+    if (box.end - box.payload < 8 || (await file.read(body, 0, 8, box.payload)).bytesRead !== 8)
+      throw new MediaError('SOURCE_INVALID');
+    const value = body.readUInt32BE(4);
+    if (box.type === 'tfhd') {
+      if (id !== 0 || value === 0) throw new MediaError('SOURCE_INVALID');
+      id = value;
+    } else {
+      count += value;
+    }
+  }
+  if (id === 0 || !Number.isSafeInteger(count)) throw new MediaError('SOURCE_INVALID');
+  return { id, count };
+}
+
+/** Count declared samples from the visible fragment headers. */
+async function readFragmentSampleCounts(
+  path: string,
+  layout: OpenMp4Media,
+  trackIds: ReadonlySet<number>,
+  signal: AbortSignal,
+): Promise<ReadonlyMap<number, number>> {
+  const counts = new Map<number, number>();
+  if (layout.firstFragment === layout.end) return counts;
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    for await (const fragment of mp4Boxes(file, layout.firstFragment, layout.end, signal)) {
+      if (fragment.type !== 'moof') continue;
+      for await (const track of mp4Boxes(file, fragment.payload, fragment.end, signal)) {
+        if (track.type !== 'traf') continue;
+        const { id, count } = await fragmentTrackSamples(file, track.payload, track.end, signal);
+        if (!trackIds.has(id)) continue;
+        const total = (counts.get(id) ?? 0) + count;
+        if (!Number.isSafeInteger(total)) throw new MediaError('SOURCE_INVALID');
+        counts.set(id, total);
+      }
+    }
+    return counts;
+  } finally {
+    await file.close();
+  }
+}
+
+function requireCleanProbe(result: ProcessResult): void {
+  if (result.aborted) throw new MediaError('EXECUTION_TIMEOUT');
+  if (
+    result.exitCode !== 0 ||
+    result.stderrBytes !== 0 ||
+    result.stdout.length > PROCESS_STDOUT_LIMIT
+  )
+    throw new MediaError('SOURCE_INVALID');
+}
+
+interface VideoPacketTime {
+  pts: number;
+  seconds: number;
+}
+
+async function scanMp4Packets(
+  path: string,
+  signal: AbortSignal,
+  entries: string,
+  readRecord: (line: string) => void,
+  raw = false,
+): Promise<void> {
+  let remainder = '';
+  const result = await runProcess(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      ...MP4_PROBE_INPUT,
+      ...(raw ? ['-ignore_editlist', '1'] : []),
+      '-fflags',
+      raw ? '+noparse+nofillin+discardcorrupt' : '+noparse+nofillin',
+      '-show_entries',
+      entries,
+      '-of',
+      'compact',
+      path,
+    ],
+    signal,
+    undefined,
+    (chunk) => {
+      const lines = (remainder + chunk.toString('utf8')).split('\n');
+      remainder = lines.pop()!;
+      if (remainder.length > 128) throw new MediaError('SOURCE_INVALID');
+      for (const line of lines) readRecord(line);
+    },
+  );
+  requireCleanProbe(result);
+  if (remainder) throw new MediaError('SOURCE_INVALID');
+}
+
+/** Demux every packet for short reads and retain only the last presentation timestamp. */
+async function lastVideoPacket(
+  path: string,
+  streamIndex: number,
+  signal: AbortSignal,
+): Promise<VideoPacketTime> {
+  let last: VideoPacketTime | undefined;
+  await scanMp4Packets(
+    path,
+    signal,
+    'packet=stream_index,pts,pts_time,flags:packet_side_data=',
+    (line) => {
+      const packet =
+        /^packet\|stream_index=(\d+)\|pts=(-?\d+|N\/A)\|pts_time=([^|]+)\|flags=([A-Z_]+)\|*$/.exec(
+          line,
+        );
+      if (!packet || packet[4]!.includes('C')) throw new MediaError('SOURCE_INVALID');
+      if (Number(packet[1]) !== streamIndex || packet[4]!.includes('D')) return;
+      const pts = Number(packet[2]);
+      const seconds = Number(packet[3]);
+      if (!Number.isSafeInteger(pts) || !Number.isFinite(seconds))
+        throw new MediaError('SOURCE_INVALID');
+      if (!last || pts > last.pts) last = { pts, seconds };
+    },
+  );
+  if (!last) throw new MediaError('SOURCE_INVALID');
+  return last;
+}
+
+/** A missing sample at EOF can leave the demuxer with a clean exit. */
+async function requireDeclaredMp4Samples(
+  path: string,
+  layout: OpenMp4Media,
+  trackIds: ReadonlySet<number>,
+  signal: AbortSignal,
+): Promise<void> {
+  const fragments = await readFragmentSampleCounts(path, layout, trackIds, signal);
+  const reads = new Map<
+    number,
+    { packets: number; initialPackets: number; initialDuration: number }
+  >();
+  await scanMp4Packets(
+    path,
+    signal,
+    'packet=stream_index,duration,pos,flags:packet_side_data=:stream=index,codec_name,codec_type,id,duration_ts,nb_frames',
+    (line) => {
+      const packet =
+        /^packet\|stream_index=(\d+)\|duration=(\d+|N\/A)\|pos=(\d+|N\/A)\|flags=([A-Z_]+)\|*$/.exec(
+          line,
+        );
+      if (packet) {
+        if (packet[4]!.includes('C')) throw new MediaError('SOURCE_INVALID');
+        const index = Number(packet[1]);
+        const read = reads.get(index) ?? { packets: 0, initialPackets: 0, initialDuration: 0 };
+        read.packets++;
+        if (Number(packet[3]) < layout.firstFragment) {
+          read.initialPackets++;
+          read.initialDuration += Number(packet[2]) || 0;
+        }
+        reads.set(index, read);
+        return;
+      }
+      // FFprobe emits the stream summaries after the packet records.
+      const track =
+        /^stream\|index=(\d+)\|codec_name=([^|]+)\|codec_type=(\w+)\|id=(0x[\da-f]+|N\/A)\|duration_ts=(-?\d+|N\/A)\|nb_frames=(\d+|N\/A)$/.exec(
+          line,
+        );
+      if (!track) throw new MediaError('SOURCE_INVALID');
+      if (track[3] !== 'video' && track[3] !== 'audio') return;
+      // With no initial media box, fragment headers account for all samples.
+      const initial = layout.hasInitialMedia ? Number(track[6]) || 0 : 0;
+      const fragmented = fragments.get(Number(track[4])) ?? 0;
+      const read = reads.get(Number(track[1]));
+      const packets = read?.packets ?? 0;
+      // MOV groups initial PCM-style samples. Fragment runs describe their own packets.
+      const groupedAudio =
+        initial > 0 &&
+        track[3] === 'audio' &&
+        (track[2]?.startsWith('pcm_') || Number(track[5]) <= initial);
+      const initialPackets = read?.initialPackets ?? 0;
+      const enough = groupedAudio
+        ? Math.max(initialPackets, read?.initialDuration ?? 0) >= initial &&
+          packets - initialPackets >= fragmented
+        : packets >= initial + fragmented;
+      if (!enough) throw new MediaError('SOURCE_INVALID');
+    },
+    true,
+  );
+}
+
+async function decodeVideoProbe(
+  path: string,
+  streamIndex: number,
+  timeBase: string,
+  signal: AbortSignal,
+  tail?: VideoPacketTime,
+): Promise<void> {
+  const seek = Math.max(0, (tail?.seconds ?? 0) - 0.5);
+  const result = await runProcess(
+    'ffmpeg',
+    [
+      '-nostdin',
+      '-hide_banner',
+      '-v',
+      'error',
+      '-xerror',
+      '-abort_on',
+      'empty_output',
+      '-copyts',
+      '-filter_threads',
+      '1',
+      ...(seek > 0 ? ['-noaccurate_seek', '-seek_timestamp', '1', '-ss', seek.toFixed(6)] : []),
+      '-noautorotate',
+      '-err_detect',
+      'explode',
+      '-threads',
+      '1',
+      ...MP4_PROBE_INPUT,
+      '-i',
+      path,
+      '-map',
+      `0:${streamIndex}`,
+      // An earlier frame after the seek cannot satisfy the tail check.
+      ...(tail ? ['-vf', `trim=start_pts=${tail.pts}`] : ['-frames:v', '1']),
+      '-fps_mode',
+      'passthrough',
+      '-enc_time_base',
+      timeBase,
+      '-c:v',
+      'wrapped_avframe',
+      '-f',
+      'null',
+      '-',
+    ],
+    signal,
+  );
+  requireCleanProbe(result);
+}
+
+/** Inspect the staged MP4 using one signal for box reads, demux and frame checks. */
 export async function probeVideoFile(
   path: string,
   signal: AbortSignal,
 ): Promise<VideoProbeMetadata> {
   try {
-    const media = await probe(path, signal, true);
-    const video = media.streams.find((stream) => stream.codec_type === 'video');
+    signal.throwIfAborted();
+    const openMedia = await requireMp4File(path, signal);
+    const metadata = await runProcess(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        ...MP4_PROBE_INPUT,
+        '-show_entries',
+        'format=duration:stream=index,id,codec_type,codec_name,width,height,time_base,sample_aspect_ratio:stream_side_data=rotation:stream_tags=rotate:stream_disposition=attached_pic',
+        '-of',
+        'json',
+        path,
+      ],
+      signal,
+    );
+    requireCleanProbe(metadata);
+    const media = JSON.parse(metadata.stdout) as {
+      streams?: (ProbeStream & { index?: number; id?: string; time_base?: string })[];
+      format?: { duration?: string };
+    };
+    const duration = Number(media.format?.duration);
+    if (
+      !Number.isFinite(duration) ||
+      duration <= 0 ||
+      duration > 1800 ||
+      !Array.isArray(media.streams)
+    )
+      throw new MediaError('SOURCE_INVALID');
+    const video = media.streams.find(isVideoTrack);
     const size = video ? videoDisplayGeometry(video) : null;
     if (
       !video?.codec_name ||
+      typeof video.index !== 'number' ||
+      !Number.isSafeInteger(video.index) ||
+      video.index < 0 ||
+      !video.time_base ||
+      !/^[1-9]\d{0,9}\/[1-9]\d{0,9}$/.test(video.time_base) ||
       video.codec_name.length > 128 ||
       !/^[A-Za-z0-9_,.+-]+$/.test(video.codec_name) ||
       !size ||
@@ -509,23 +896,28 @@ export async function probeVideoFile(
     const audioCodec = audio?.codec_name ?? null;
     if (audioCodec !== null && (audioCodec.length > 128 || !/^[A-Za-z0-9_,.+-]+$/.test(audioCodec)))
       throw new MediaError('SOURCE_INVALID');
-    if (media.container.length === 0 || !/^[A-Za-z0-9_,.+-]+$/.test(media.container))
-      throw new MediaError('SOURCE_INVALID');
+    const timeBase = video.time_base.replace('/', ':');
+    await decodeVideoProbe(path, video.index, timeBase, signal);
+    const tail = await lastVideoPacket(path, video.index, signal);
+    if (openMedia) {
+      const trackIds = new Set(
+        media.streams.map((stream) => Number(stream.id)).filter(Number.isSafeInteger),
+      );
+      await requireDeclaredMp4Samples(path, openMedia, trackIds, signal);
+    }
+    await decodeVideoProbe(path, video.index, timeBase, signal, tail);
     return {
-      container: media.container,
+      container: 'mp4',
       videoCodec: video.codec_name,
       width: size.width,
       height: size.height,
-      durationSeconds: media.duration,
+      durationSeconds: duration,
       hasAudio: Boolean(audio),
       audioCodec,
     };
   } catch (error) {
-    if (error instanceof MediaError) {
-      if (error.code === 'INPUT_INVALID') throw new MediaError('SOURCE_INVALID');
-      if (error.code === 'INPUT_TOO_LONG') throw new MediaError('SOURCE_INVALID');
-      throw error;
-    }
+    if (signal.aborted) throw new MediaError('EXECUTION_TIMEOUT');
+    if (error instanceof MediaError) throw error;
     throw new MediaError('PROBE_FAILED');
   }
 }

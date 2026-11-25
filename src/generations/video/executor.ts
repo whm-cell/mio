@@ -1,9 +1,9 @@
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
-import type { VideoGenerationStore } from './video-store.ts';
-import type { VideoMaterializer } from './video-execution.ts';
-import { createVideoRunner } from './video-runner.ts';
-import type { VideoExecutorProvider, VideoTransports } from './video-runner.ts';
+import type { VideoGenerationStore } from './store.ts';
+import type { VideoMaterializer } from './execution.ts';
+import { createVideoRunner } from './runner.ts';
+import type { VideoExecutorProvider, VideoTransports } from './runner.ts';
 
 const log = createLogger('app', 'video-executor');
 const NETWORK_CONCURRENCY = 4;

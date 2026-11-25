@@ -21,14 +21,14 @@ import type {
   ImageOperation,
   ImageRequestParameters,
 } from './contracts.ts';
-import { ProviderError } from '../providers/contracts.ts';
-import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
-import type { ProviderService } from '../providers/service.ts';
-import type { AssetObjectStore } from '../assets/contracts.ts';
+import { ProviderError } from '../../providers/contracts.ts';
+import type { ImageAdmissionSnapshot } from '../../providers/contracts.ts';
+import type { ProviderService } from '../../providers/service.ts';
+import type { AssetObjectStore } from '../../assets/contracts.ts';
 import type { GenerationRequest } from './execution.ts';
 import type { GenerationStore, ImageInputAsset, ImageRequestRecord } from './store.ts';
 import type { GenerationFiles } from './files.ts';
-import { GenerationError } from './errors.ts';
+import { GenerationError } from '../errors.ts';
 
 const parameterKinds = {
   prompt: 'string',

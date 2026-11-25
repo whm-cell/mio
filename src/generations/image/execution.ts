@@ -1,6 +1,6 @@
 import type { ImageDriver, ImageInput, ImageRouteConfig } from './contracts.ts';
-import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
-import type { AssetObjectStore } from '../assets/contracts.ts';
+import type { ImageAdmissionSnapshot } from '../../providers/contracts.ts';
+import type { AssetObjectStore } from '../../assets/contracts.ts';
 
 export interface GenerationRequest {
   version: 1;

@@ -4,15 +4,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
-import { VideoGenerationStore } from '../../src/generations/video-store.ts';
-import { createVideoRunner } from '../../src/generations/video-runner.ts';
-import type { VideoExecutorProvider } from '../../src/generations/video-runner.ts';
+import { VideoGenerationStore } from '../../src/generations/video/store.ts';
+import { createVideoRunner } from '../../src/generations/video/runner.ts';
+import type { VideoExecutorProvider } from '../../src/generations/video/runner.ts';
 import type {
   VideoMaterializedOutput,
   VideoMaterializer,
   VideoProtocol,
-} from '../../src/generations/video-execution.ts';
-import type { VideoCreateRequest } from '../../src/generations/video-contracts.ts';
+} from '../../src/generations/video/execution.ts';
+import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {

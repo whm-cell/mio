@@ -1,10 +1,10 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AssetPrincipal } from '../assets/contracts.ts';
-import { ProviderError } from '../providers/contracts.ts';
-import { RequestBodyError } from '../http-request.ts';
-import { startHttpResponse, writeApiError } from '../http-response.ts';
+import type { AssetPrincipal } from '../../assets/contracts.ts';
+import { ProviderError } from '../../providers/contracts.ts';
+import { RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
 import {
   allowJsonWrite,
   allowRouteMethod,
@@ -12,10 +12,10 @@ import {
   readJsonAndRecheck,
   replyToPreflight,
   requestCookieHeaders,
-} from '../http-route-guard.ts';
-import { GenerationError } from './errors.ts';
-import { decodeVideoCreateRequest, VIDEO_MAX_HTTP_BODY_BYTES } from './video-contracts.ts';
-import type { createVideoGenerationService } from './video-service.ts';
+} from '../../http-route-guard.ts';
+import { GenerationError } from '../errors.ts';
+import { decodeVideoCreateRequest, VIDEO_MAX_HTTP_BODY_BYTES } from './contracts.ts';
+import type { createVideoGenerationService } from './service.ts';
 
 type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;
 const CAPABILITIES = '/api/v1/compute/video-capabilities/';

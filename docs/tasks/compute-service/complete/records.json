@@ -86,7 +86,7 @@
       "locations": [
         {
           "path": "scripts/service/compute-broker-topology.ts",
-          "purpose": "独立图片命令队列 mio.compute.image.commands.v1（image.v1）、独立 DLX/DLQ（image.dead.v1）及 B 双队列读权限拓扑定义"
+          "purpose": "原接受的拓扑定义独立图片队列 mio.compute.image.commands.v1（image.v1）、DLX/DLQ（image.dead.v1）和 B 双队列读权限。现行拓扑将旧图片资源留给迁移排空对账。"
         },
         {
           "path": "scripts/service/local-broker.ts",
@@ -94,15 +94,15 @@
         },
         {
           "path": "src/compute/transcode/store.ts",
-          "purpose": "现行单路转码的任务配额事务与出站扫描，旧图片活动任务锁属于迁移前实现。"
+          "purpose": "原接受的活动任务配额分离采用视频锁 672049923（10/500）和图片锁 672049924（32/1000，accepted/materializing），并以 SKIP LOCKED 扫描出站。现行入口继续承接转码的配额事务和出站扫描。"
         },
         {
           "path": "src/compute/transcode/service.ts",
-          "purpose": "现行单路转码的任务唤醒、轮询与关闭入口，旧图片执行链见迁移说明。"
+          "purpose": "原接受候选按单轮 32 图片/10 视频有界排空，落库唤醒后合并续跑，并保留指数退避与关闭收敛。现行入口承接单路转码的唤醒、发布与关闭。"
         },
         {
           "path": "src/integrations/rabbitmq.ts",
-          "purpose": "transcode.v1 与 image.v1 路由分流、RESULT_QUEUE prefetch(4) 及关闭前排空全部在途结果处理（含 COS head）"
+          "purpose": "原接受候选实现 transcode.v1 和 image.v1 路由分流、RESULT_QUEUE prefetch(4) 与关闭前排空全部在途结果（含 COS HEAD）。现行适配器服务转码及媒体计算，图片 AMQP 路由随执行链迁入 A 退役。"
         },
         {
           "path": "docs/tasks/compute-service/changes/image-io-concurrency/change.md",
@@ -114,7 +114,7 @@
         },
         {
           "path": "docs/integrations/rabbitmq.md",
-          "purpose": "RabbitMQ 双命令队列拓扑、A/B 权限正则与本地 broker:init 无损幂等升级契约"
+          "purpose": "现行重媒体 RabbitMQ 拓扑、A/B 权限与本地 broker:init 无损升级契约，以及旧图片队列和权限的排空对账边界。"
         },
         {
           "path": "docs/apis/compute.md",
@@ -122,11 +122,15 @@
         },
         {
           "path": "tests/compute/image-concurrency.test.ts",
-          "purpose": "隔离 PostgreSQL、mio-test 临时 vhost RabbitMQ 与真实 Service A/Worker B 在满 10 视频阻塞下 15 并发图片物化、33 活动图片精确 429 与通道隔离重投零重复 POST 端到端测试"
+          "purpose": "原接受的隔离 PG、临时 vhost 和 A/Worker B 回归覆盖满 10 视频下 15 并发图片、33 活动图片精确 429 与通道重投零重复 POST。现行测试核对 A 图片并发与 B 视频准入配额独立。"
         },
         {
           "path": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md",
           "purpose": "记录旧图片执行链的排空、对账与迁入 A。"
+        },
+        {
+          "path": "src/generations/image/store.ts",
+          "purpose": "现行 A 图片存储继续用 672049924 锁独立核算图片活动配额，并在同一短事务内完成准入写入。"
         }
       ],
       "outcomes": "在不改变视频转码队列 mio.compute.commands.v1 单并发（prefetch 1）与 10/500 配额、且保持已接受对话生图工具能力完全兼容的前提下，落地独立图片命令队列 mio.compute.image.commands.v1（routing key image.v1，配持久 quorum DLX/DLQ image.dead.v1）及本地 broker:init 针对精确旧版 v1 B 权限的无损幂等升级；在 Service A 解耦视频与图片活动任务配额及事务锁（图片每用户 32 / 全局 1000，统计 accepted 与 materializing），升级 RESULT_QUEUE prefetch=4 与关闭在途结果排空，提供准入落库后 wakePoll 立即唤醒与单轮最多 32 图片 / 10 视频的有界批量排空；在 Worker B（compute/src/{adapters/rabbitmq,maintenance,main}.ts）新增独立图片消费通道（prefetch 4），按 jobId 做进程内串行互斥并保留旧队列遗留图片兼容，对 IMAGE_COMMAND_CONFLICT / IMAGE_QUERY_UNKNOWN 毒消息直接死信，对单条图片可重试异常执行图片通道级隔离排空与有界重开而不中断慢速 FFmpeg 视频转码或其他并发健康图片，同步全部受影响公共规范与任务文档。",

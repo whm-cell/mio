@@ -1,4 +1,4 @@
-import type { VideoRequestParameters } from '../../../generations/video-contracts.ts';
+import type { VideoRequestParameters } from '../../../generations/video/contracts.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
 import { resultUrls } from './shared.ts';
 

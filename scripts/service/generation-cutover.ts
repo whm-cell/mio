@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { Client, Pool } from 'pg';
 import { readAssetConfig, readAssetDatabaseURL } from '../../src/assets/config.ts';
-import { imageOutputIndex } from '../../src/generations/contracts.ts';
+import { imageOutputIndex } from '../../src/generations/image/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 
 const legacyPlainRejections = new Set([

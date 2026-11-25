@@ -4,7 +4,7 @@ import {
   decodeVideoCreateRequest,
   videoRequestHash,
   VIDEO_MAX_PROMPT_CODEPOINTS,
-} from '../../src/generations/video-contracts.ts';
+} from '../../src/generations/video/contracts.ts';
 
 const modelRef = `onelink:model:${randomUUID()}`;
 

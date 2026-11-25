@@ -1,10 +1,10 @@
-import { VIDEO_DRIVERS, VIDEO_MODES } from '../../generations/video-contracts.ts';
+import { VIDEO_DRIVERS, VIDEO_MODES } from '../../generations/video/contracts.ts';
 import type {
   VideoDriver,
   VideoMode,
   VideoRequestParameters,
-} from '../../generations/video-contracts.ts';
-import { isSafeRouteIdentifier } from '../../generations/contracts.ts';
+} from '../../generations/video/contracts.ts';
+import { isSafeRouteIdentifier } from '../../generations/image/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../contracts.ts';
 
 /** Enabled only when the matching executor and result materializer have been assembled. */

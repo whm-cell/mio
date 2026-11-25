@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { validateImageRouteConfig } from '../../src/generations/contracts.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { validateImageRouteConfig } from '../../src/generations/image/contracts.ts';
 import { ProviderError } from '../../src/providers/contracts.ts';
 import type { ImageAdmissionSnapshot } from '../../src/providers/contracts.ts';
 import { generationFixture } from '../generations/fixture.ts';

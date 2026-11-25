@@ -2,9 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { checkGenerationSchema, generationSchemaSQL } from '../../src/generations/schema.ts';
 import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { imageOutputKey } from '../../src/generations/contracts.ts';
-import { GenerationStore } from '../../src/generations/store.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { imageOutputKey } from '../../src/generations/image/contracts.ts';
+import { GenerationStore } from '../../src/generations/image/store.ts';
 import { generationFixture } from '../generations/fixture.ts';
 
 it('migrates existing media tables incrementally and reads historical B jobs without claiming them', async () => {

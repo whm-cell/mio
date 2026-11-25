@@ -23,11 +23,11 @@
           "purpose": "pnpm providers:route <--stdin | routes.json>（64 KiB 有界普通文件/stdin 读取）幂等平台路由导入入口"
         },
         {
-          "path": "src/generations/admission.ts",
+          "path": "src/generations/image/admission.ts",
           "purpose": "现行图片准入按模型路由合成有效水印并冻结标准化 ImageRouteConfig，旧 MQ 信封见迁移说明。"
         },
         {
-          "path": "src/generations/store.ts",
+          "path": "src/generations/image/store.ts",
           "purpose": "现行 A 图片任务在准入持久化 route_snapshot，旧 MQ 路由异常处理见迁移说明。"
         },
         {

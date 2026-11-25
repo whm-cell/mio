@@ -10,14 +10,17 @@ import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
-import { GenerationStore } from '../../src/generations/store.ts';
-import { GenerationFiles } from '../../src/generations/files.ts';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { createGenerationService } from '../../src/generations/service.ts';
-import type { GenerationService } from '../../src/generations/service.ts';
-import type { GenerationObjects } from '../../src/generations/execution.ts';
-import type { GenerationTransports } from '../../src/generations/runner.ts';
-import type { ImageAssetRef, ImageRequestParameters } from '../../src/generations/contracts.ts';
+import { GenerationStore } from '../../src/generations/image/store.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { createGenerationService } from '../../src/generations/image/service.ts';
+import type { GenerationService } from '../../src/generations/image/service.ts';
+import type { GenerationObjects } from '../../src/generations/image/execution.ts';
+import type { GenerationTransports } from '../../src/generations/image/runner.ts';
+import type {
+  ImageAssetRef,
+  ImageRequestParameters,
+} from '../../src/generations/image/contracts.ts';
 import type { AsyncImageTransport } from '../../src/integrations/onelink/shared/index.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { findFixtureRoute } from '../providers/fixtures/onelink-routes-fixture.ts';

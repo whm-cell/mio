@@ -1,4 +1,4 @@
-import { createImageDecoder } from '../../src/generations/decode.ts';
+import { createImageDecoder } from '../../src/generations/image/decode.ts';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';

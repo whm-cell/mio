@@ -2,8 +2,12 @@ import {
   IMAGE_OPERATIONS,
   validateImageInputByRoute,
   validateImageRouteConfig,
-} from '../../generations/contracts.ts';
-import type { ImageInput, ImageOperation, ImageRouteConfig } from '../../generations/contracts.ts';
+} from '../../generations/image/contracts.ts';
+import type {
+  ImageInput,
+  ImageOperation,
+  ImageRouteConfig,
+} from '../../generations/image/contracts.ts';
 import { withPublicHttps } from './public-https.ts';
 import { createRoutedKlingImageProtocol } from './kling/index.ts';
 import { submitOpenAiImage } from './openai/index.ts';

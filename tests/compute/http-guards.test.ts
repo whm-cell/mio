@@ -5,7 +5,7 @@ import { expect, it, vi } from 'vitest';
 import { createComputeHandler } from '../../src/compute/transcode/http.ts';
 import { createMediaHandler } from '../../src/compute/media/http.ts';
 import { createComputeOpsHandler } from '../../src/compute/observability/http.ts';
-import { createVideoGenerationHandler } from '../../src/generations/video-http.ts';
+import { createVideoGenerationHandler } from '../../src/generations/video/http.ts';
 
 const origin = 'http://127.0.0.1:4400';
 const requestId = '00000000-0000-4000-8000-000000000001';

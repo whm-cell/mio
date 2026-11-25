@@ -1,19 +1,19 @@
 import { epochMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
-import type { ProviderService } from '../providers/service.ts';
+import type { ProviderService } from '../../providers/service.ts';
 import { imageReferencesWithinBudget, validateImageInputByRoute } from './contracts.ts';
 import type { ImageAssetRef } from './contracts.ts';
 import {
   createRoutedImageProtocol,
   defaultRouteAsyncTransport,
-} from '../integrations/onelink/router.ts';
-import { matchesImageSignature } from '../integrations/onelink/shared/index.ts';
+} from '../../integrations/onelink/router.ts';
+import { matchesImageSignature } from '../../integrations/onelink/shared/index.ts';
 import type {
   AsyncImageTransport,
   ImageResult,
   ReadImage,
-} from '../integrations/onelink/shared/index.ts';
-import { withPublicHttps } from '../integrations/onelink/public-https.ts';
+} from '../../integrations/onelink/shared/index.ts';
+import { withPublicHttps } from '../../integrations/onelink/public-https.ts';
 import { createImageDecoder } from './decode.ts';
 import type { GenerationExecution, GenerationObjects } from './execution.ts';
 import type { GenerationStore } from './store.ts';

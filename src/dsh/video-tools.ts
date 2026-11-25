@@ -7,8 +7,8 @@ import {
   VIDEO_JOB_STATES,
   VIDEO_MAX_PROMPT_CODEPOINTS,
   VIDEO_MODES,
-} from '../generations/video-contracts.ts';
-import type { VideoJobView } from '../generations/video-contracts.ts';
+} from '../generations/video/contracts.ts';
+import type { VideoJobView } from '../generations/video/contracts.ts';
 import type {
   ConversationRun,
   ConversationVideoJobOutput,

@@ -1,10 +1,10 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { MAX_ASSET_BYTES, waitForObjectHead } from '../assets/contracts.ts';
-import type { AssetObjectStore } from '../assets/contracts.ts';
-import type { AssetStore } from '../assets/store.ts';
-import { GenerationError } from './errors.ts';
-import type { VideoAssetReference } from './video-contracts.ts';
-import type { VideoJobCommand } from './video-execution.ts';
+import { MAX_ASSET_BYTES, waitForObjectHead } from '../../assets/contracts.ts';
+import type { AssetObjectStore } from '../../assets/contracts.ts';
+import type { AssetStore } from '../../assets/store.ts';
+import { GenerationError } from '../errors.ts';
+import type { VideoAssetReference } from './contracts.ts';
+import type { VideoJobCommand } from './execution.ts';
 
 /** Resolve only ready objects owned by the requesting user. Sign after all checks pass. */
 export function createVideoInputResolver(

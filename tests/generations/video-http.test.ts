@@ -9,15 +9,15 @@ import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { createAssetStore } from '../../src/assets/store.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
-import { createVideoGenerationHandler } from '../../src/generations/video-http.ts';
-import { createVideoInputResolver } from '../../src/generations/video-inputs.ts';
-import { createVideoRunner } from '../../src/generations/video-runner.ts';
-import { createVideoGenerationService } from '../../src/generations/video-service.ts';
-import { VideoGenerationStore } from '../../src/generations/video-store.ts';
+import { createVideoGenerationHandler } from '../../src/generations/video/http.ts';
+import { createVideoInputResolver } from '../../src/generations/video/inputs.ts';
+import { createVideoRunner } from '../../src/generations/video/runner.ts';
+import { createVideoGenerationService } from '../../src/generations/video/service.ts';
+import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import type {
   VideoAssetReference,
   VideoCreateRequest,
-} from '../../src/generations/video-contracts.ts';
+} from '../../src/generations/video/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';

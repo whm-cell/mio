@@ -1,10 +1,10 @@
-import type { AccountCredentialSnapshot, VideoRouteConfig } from '../providers/contracts.ts';
+import type { AccountCredentialSnapshot, VideoRouteConfig } from '../../providers/contracts.ts';
 import type {
   VideoAssetReference,
   VideoCreateRequest,
   VideoJobState,
   VideoRequestParameters,
-} from './video-contracts.ts';
+} from './contracts.ts';
 
 export interface VideoJobCommand {
   request: VideoCreateRequest;

@@ -4,14 +4,10 @@ import { constants } from 'node:fs';
 import { mkdir, open, readFile, rename, statfs, lstat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { VideoProbeCommandV1, VideoProbeMetadataV1 } from '@mio/compute-contracts';
-import type { AssetObjectStore } from '../assets/contracts.ts';
-import { waitForObjectHead } from '../assets/contracts.ts';
-import { withPublicHttps } from '../integrations/onelink/public-https.ts';
-import type {
-  VideoExecution,
-  VideoMaterializer,
-  VideoMaterializedOutput,
-} from './video-execution.ts';
+import type { AssetObjectStore } from '../../assets/contracts.ts';
+import { waitForObjectHead } from '../../assets/contracts.ts';
+import { withPublicHttps } from '../../integrations/onelink/public-https.ts';
+import type { VideoExecution, VideoMaterializer, VideoMaterializedOutput } from './execution.ts';
 
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
 const VIDEO_CONTENT_TYPE = 'video/mp4';

@@ -2,7 +2,7 @@ import { createProviderAudioService } from './audio.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
 import { createHash } from 'node:crypto';
-import type { VideoCapabilitiesView } from '../generations/video-contracts.ts';
+import type { VideoCapabilitiesView } from '../generations/video/contracts.ts';
 import { ProviderError, categories, supportsChatReasoning } from './contracts.ts';
 import type {
   Category,

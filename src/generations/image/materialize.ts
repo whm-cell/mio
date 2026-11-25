@@ -1,5 +1,5 @@
 import { createId } from '@mio/foundation/identifiers';
-import { waitForObjectHead } from '../assets/contracts.ts';
+import { waitForObjectHead } from '../../assets/contracts.ts';
 import { imageOutputIndex, imageOutputKey } from './contracts.ts';
 import type { GenerationFiles } from './files.ts';
 import type { GenerationStore } from './store.ts';

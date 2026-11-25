@@ -1,7 +1,7 @@
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { GenerationError } from './errors.ts';
+import { GenerationError } from '../errors.ts';
 
 export const VIDEO_MAX_HTTP_BODY_BYTES = 256 * 1024;
 export const VIDEO_MAX_PROMPT_CODEPOINTS = 5_000;

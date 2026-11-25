@@ -10,17 +10,17 @@ import {
   imageOutputIndex,
   validateImageRouteConfig,
 } from './contracts.ts';
-import type { ImageAdmissionSnapshot } from '../providers/contracts.ts';
+import type { ImageAdmissionSnapshot } from '../../providers/contracts.ts';
 import type {
   CheckpointRef,
   GeneratedObject,
   GenerationExecution,
   GenerationRequest,
 } from './execution.ts';
-import { GenerationError } from './errors.ts';
-import { checkGenerationSchema } from './schema.ts';
-import { VideoGenerationStore } from './video-store.ts';
-import { transaction } from './transaction.ts';
+import { GenerationError } from '../errors.ts';
+import { checkGenerationSchema } from '../schema.ts';
+import { VideoGenerationStore } from '../video/store.ts';
+import { transaction } from '../transaction.ts';
 
 const log = createLogger('app', 'generation-store');
 const QUOTA_LOCK = 672049924;

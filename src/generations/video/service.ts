@@ -1,15 +1,15 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import type { ProviderPrincipal } from '../providers/contracts.ts';
-import type { ProviderService } from '../providers/service.ts';
-import type { VideoGenerationStore } from './video-store.ts';
-import { GenerationError } from './errors.ts';
-import { videoRequestHash } from './video-contracts.ts';
-import { validateVideoParameters } from '../providers/onelink/video-route.ts';
-import type { createVideoInputResolver } from './video-inputs.ts';
-import type { VideoCreateRequest, VideoCapabilitiesView } from './video-contracts.ts';
-import type { VideoJobCommand } from './video-store.ts';
-import type { VideoJobCursor } from './video-store.ts';
+import type { ProviderPrincipal } from '../../providers/contracts.ts';
+import type { ProviderService } from '../../providers/service.ts';
+import type { VideoGenerationStore } from './store.ts';
+import { GenerationError } from '../errors.ts';
+import { videoRequestHash } from './contracts.ts';
+import { validateVideoParameters } from '../../providers/onelink/video-route.ts';
+import type { createVideoInputResolver } from './inputs.ts';
+import type { VideoCreateRequest, VideoCapabilitiesView } from './contracts.ts';
+import type { VideoJobCommand } from './store.ts';
+import type { VideoJobCursor } from './store.ts';
 
 function parseCursor(value: string | undefined): VideoJobCursor | undefined {
   if (value === undefined) return;

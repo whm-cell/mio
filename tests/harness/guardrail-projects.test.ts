@@ -852,7 +852,16 @@ it('requires exports to select emitted JavaScript and matching declarations', as
 
 it('permits only exact service adapters for builtins, COS and AMQP', async () => {
   const root = await fixture();
-  await put(root, 'src/generations/files.ts', "export { readFile } from 'node:fs/promises';\n");
+  await put(
+    root,
+    'src/generations/image/files.ts',
+    "export { readFile } from 'node:fs/promises';\n",
+  );
+  await put(
+    root,
+    'src/generations/video/media.ts',
+    "export { createReadStream } from 'node:fs';\n",
+  );
   await put(
     root,
     'node_modules/amqplib/package.json',
@@ -892,13 +901,13 @@ it('permits only exact service adapters for builtins, COS and AMQP', async () =>
   expect(check(root).status).toBe(0);
   await put(
     root,
-    'src/generations/files.ts',
+    'src/generations/image/files.ts',
     "export const fs = globalThis['process']['getBuiltinModule']('node:fs');\n",
   );
   expect(check(root).status).toBe(0);
-  await put(root, 'src/generations/service.ts', "export { readFile } from 'node:fs';\n");
-  expect(check(root).output).toContain('RUNTIME_CAPABILITY src/generations/service.ts');
-  await rm(join(root, 'src/generations/service.ts'));
+  await put(root, 'src/generations/image/service.ts', "export { readFile } from 'node:fs';\n");
+  expect(check(root).output).toContain('RUNTIME_CAPABILITY src/generations/image/service.ts');
+  await rm(join(root, 'src/generations/image/service.ts'));
   await json(root, 'compute/tsconfig.json', (config) => {
     config.compilerOptions.paths = {
       'cos-alias': [require.resolve('cos-nodejs-sdk-v5')],

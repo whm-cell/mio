@@ -7,11 +7,11 @@
       "title": "异步图片提交、查询与重启恢复",
       "locations": [
         {
-          "path": "src/generations/service.ts",
+          "path": "src/generations/image/service.ts",
           "purpose": "现行 A 图片任务准入、归属检查和恢复入口。"
         },
         {
-          "path": "src/generations/store.ts",
+          "path": "src/generations/image/store.ts",
           "purpose": "现行图片任务身份、查询预算、期限和恢复记录，旧 outbox 随 A→B 图片执行链退役。"
         },
         {
@@ -49,11 +49,11 @@
       "title": "将图片生成与恢复迁入 A",
       "locations": [
         {
-          "path": "src/generations/service.ts",
+          "path": "src/generations/image/service.ts",
           "purpose": "A 的图片任务准入与独立执行队列"
         },
         {
-          "path": "src/generations/runner.ts",
+          "path": "src/generations/image/runner.ts",
           "purpose": "供应商提交、查询、恢复与结果状态收束"
         },
         {
@@ -86,7 +86,7 @@
       "title": "OneLink Kling 异步文生图（kling-image-v1）提交、有界查询与重启恢复",
       "locations": [
         {
-          "path": "src/generations/service.ts",
+          "path": "src/generations/image/service.ts",
           "purpose": "现行 A 图片任务入口，承接可灵异步生图的受理、恢复和 Asset 物化。"
         },
         {
@@ -178,7 +178,7 @@
       "title": "Seedream 4.0 真实同步生图闭环与场景化图片 Live 验收入口",
       "locations": [
         {
-          "path": "src/generations/service.ts",
+          "path": "src/generations/image/service.ts",
           "purpose": "现行 A 图片任务入口，承接 Seedream 生图受理、归属检查和 Asset 物化。"
         },
         {

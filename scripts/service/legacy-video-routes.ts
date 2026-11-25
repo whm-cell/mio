@@ -1,4 +1,4 @@
-import type { VideoMode } from '../../src/generations/video-contracts.ts';
+import type { VideoMode } from '../../src/generations/video/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../../src/providers/contracts.ts';
 
 // Frozen source observation; does not create catalog membership or verification.

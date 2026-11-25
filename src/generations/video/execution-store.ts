@@ -1,18 +1,14 @@
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
-import { transaction } from './transaction.ts';
-import type { VideoJobState } from './video-contracts.ts';
-import type {
-  VideoExecution,
-  VideoMaterializedOutput,
-  VideoResultSource,
-} from './video-execution.ts';
+import { transaction } from '../transaction.ts';
+import type { VideoJobState } from './contracts.ts';
+import type { VideoExecution, VideoMaterializedOutput, VideoResultSource } from './execution.ts';
 import {
   VIDEO_EXECUTOR_MAX_AGE_SECONDS,
   VIDEO_EXECUTOR_MAX_QUERIES,
   VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
-} from './video-execution.ts';
+} from './execution.ts';
 
 const EXECUTOR_LOCK = 672049927;
 const selection = `SELECT j.id,j.owner_id,j.state,j.command,j.admitted,j.route_snapshot,

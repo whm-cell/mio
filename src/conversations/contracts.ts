@@ -4,14 +4,14 @@ import type {
   VideoCreateRequest,
   VideoJobView,
   VideoMode,
-} from '../generations/video-contracts.ts';
+} from '../generations/video/contracts.ts';
 import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HttpError } from '@mio/foundation/errors';
 import type {
   ImageDriver,
   ImageOperation,
   ImageRequestParameters,
-} from '../generations/contracts.ts';
+} from '../generations/image/contracts.ts';
 import type {
   ChatReasoningEffort,
   ChatRuntimeSnapshot,

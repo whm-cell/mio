@@ -27,7 +27,7 @@
           "purpose": "零联网零解密的 listImageModels 与 inspectImageRoute 动态目录与单轨路由能力读取"
         },
         {
-          "path": "src/generations/admission.ts",
+          "path": "src/generations/image/admission.ts",
           "purpose": "现行图片准入复用共享对象键协议，只接受本人的 ready 图片原件或 derived 资产。"
         },
         {

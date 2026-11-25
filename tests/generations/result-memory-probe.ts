@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { downloadResultImage } from '../../src/integrations/onelink/shared/index.ts';
 import type { ImageResult, ImageResultMode } from '../../src/integrations/onelink/shared/index.ts';
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
-import { GenerationFiles } from '../../src/generations/files.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
 
 // Explicit synthetic transport/receipt probe; full pixel validation has separate regression coverage.
 const [requestedMode = 'deferred', requestedParallel = '4'] = process.argv.slice(2);

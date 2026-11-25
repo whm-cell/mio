@@ -24,7 +24,7 @@
       "src/materials/schema.ts",
       "src/materials/auth-schema.ts",
       "src/compute/schema.ts",
-      "src/generations/contracts.ts",
+      "src/generations/image/contracts.ts",
       "src/generations/schema.ts",
       "src/integrations/rabbitmq.ts",
       "contracts/compute/dist/index.d.ts",
@@ -44,7 +44,7 @@
       "src/integrations/cos.ts",
       "src/integrations/redis.ts",
       "src/integrations/rabbitmq-monitor.ts",
-      "src/generations/video-contracts.ts"
+      "src/generations/video/contracts.ts"
     ]
   },
   "documentRoots": [

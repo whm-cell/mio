@@ -6,14 +6,14 @@ import {
   isSafeRouteIdentifier,
   isValidImageRoutePath,
   validateImageRouteConfig,
-} from '../../generations/contracts.ts';
+} from '../../generations/image/contracts.ts';
 import type {
   ImageDriver,
   ImageOperation,
   ImageRouteConfig,
   ImageRouteParamSpec,
-} from '../../generations/contracts.ts';
-import type { VideoDriver, VideoMode } from '../../generations/video-contracts.ts';
+} from '../../generations/image/contracts.ts';
+import type { VideoDriver, VideoMode } from '../../generations/video/contracts.ts';
 import { AUDIO_ROUTES, audioCapabilities, validAudioRoute } from './audio.ts';
 import { VOICE_DRIVER, VOICE_OPERATION, VOICE_PATH, validVoiceRoute } from './voices.ts';
 import { validateVideoRouteConfig } from './video-route.ts';

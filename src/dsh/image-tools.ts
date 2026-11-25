@@ -1,6 +1,6 @@
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import { IMAGE_DRIVERS } from '../generations/contracts.ts';
-import type { ImageRequestParameters } from '../generations/contracts.ts';
+import { IMAGE_DRIVERS } from '../generations/image/contracts.ts';
+import type { ImageRequestParameters } from '../generations/image/contracts.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
 import { defineTool, isPlainJsonRecord } from '@deepseek-ai/dsh-tools';

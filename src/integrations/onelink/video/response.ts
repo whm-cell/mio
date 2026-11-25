@@ -1,5 +1,5 @@
-import type { VideoDriver } from '../../../generations/video-contracts.ts';
-import type { VideoQueryResult } from '../../../generations/video-execution.ts';
+import type { VideoDriver } from '../../../generations/video/contracts.ts';
+import type { VideoQueryResult } from '../../../generations/video/execution.ts';
 import { object, operationPath, resultUrls, TASK_ID, ONELINK_ORIGIN } from './shared.ts';
 
 const invalid: VideoQueryResult = { state: 'failed', code: 'VIDEO_RESPONSE_INVALID' };

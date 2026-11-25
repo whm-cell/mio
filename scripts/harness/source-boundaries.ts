@@ -40,7 +40,7 @@ export function allowsCapability(
 ): boolean {
   if (
     name === 'fs' &&
-    ['src/generations/files.ts', 'src/generations/video-media.ts'].includes(file) &&
+    ['src/generations/image/files.ts', 'src/generations/video/media.ts'].includes(file) &&
     (!project || project.declaration.packageRoot === '.')
   )
     return true;

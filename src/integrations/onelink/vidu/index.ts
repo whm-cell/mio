@@ -1,4 +1,4 @@
-import type { ImageRouteConfig } from '../../../generations/contracts.ts';
+import type { ImageRouteConfig } from '../../../generations/image/contracts.ts';
 import { withPublicHttps } from '../public-https.ts';
 import {
   ASYNC_TASK_ID,

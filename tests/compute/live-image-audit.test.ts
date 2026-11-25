@@ -15,7 +15,7 @@ import {
 } from '../../src/integrations/onelink/router.ts';
 
 const mocks = vi.hoisted(() => ({ validateImage: vi.fn(async () => {}) }));
-vi.mock('../../src/generations/decode.ts', () => ({
+vi.mock('../../src/generations/image/decode.ts', () => ({
   createImageDecoder: () => mocks.validateImage,
 }));
 import {

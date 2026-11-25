@@ -1,4 +1,4 @@
-import type { VideoResultSource } from '../../../generations/video-execution.ts';
+import type { VideoResultSource } from '../../../generations/video/execution.ts';
 
 export const ONELINK_ORIGIN = 'https://api.onelinkai.cloud';
 const MAX_VIDEO_RESPONSE_BYTES = 1024 * 1024;

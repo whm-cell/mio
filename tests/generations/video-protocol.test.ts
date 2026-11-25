@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import type { VideoDriver, VideoMode } from '../../src/generations/video-contracts.ts';
+import type { VideoDriver, VideoMode } from '../../src/generations/video/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../../src/providers/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 

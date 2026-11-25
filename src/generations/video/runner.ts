@@ -1,14 +1,14 @@
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
-import type { AccountCredentialSnapshot } from '../providers/contracts.ts';
-import type { ProviderService } from '../providers/service.ts';
-import type { VideoExecutionStore } from './video-execution-store.ts';
+import type { AccountCredentialSnapshot } from '../../providers/contracts.ts';
+import type { ProviderService } from '../../providers/service.ts';
+import type { VideoExecutionStore } from './execution-store.ts';
 import type {
   VideoExecution,
   VideoMaterializer,
   VideoProtocolFactory,
   VideoResultSource,
-} from './video-execution.ts';
+} from './execution.ts';
 
 const log = createLogger('app', 'video-runner');
 

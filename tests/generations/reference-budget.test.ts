@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { expect, it, vi } from 'vitest';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { createGenerationHandler } from '../../src/generations/http.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
 import {
   IMAGE_MAX_REFERENCE_BYTES,
   IMAGE_MAX_TOTAL_REFERENCE_BYTES,
   type ImageRequestParameters,
-} from '../../src/generations/contracts.ts';
+} from '../../src/generations/image/contracts.ts';
 import { generationFixture } from './fixture.ts';
 
 type Fixture = Awaited<ReturnType<typeof generationFixture>>;

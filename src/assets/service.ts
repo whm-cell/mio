@@ -3,7 +3,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { sha256Bytes, sha256Utf8 } from '@mio/foundation/hash';
 import { HLS_PLAYLIST_CONTENT_TYPE } from '../compute/media/hls.ts';
-import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
+import { isValidImageAssetObjectKey } from '../generations/image/contracts.ts';
 import {
   AssetError,
   MAX_ASSET_BYTES,

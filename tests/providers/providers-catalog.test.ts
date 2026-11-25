@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { expect, it } from 'vitest';
-import { IMAGE_DRIVERS } from '../../src/generations/contracts.ts';
-import { VIDEO_DRIVERS } from '../../src/generations/video-contracts.ts';
+import { IMAGE_DRIVERS } from '../../src/generations/image/contracts.ts';
+import { VIDEO_DRIVERS } from '../../src/generations/video/contracts.ts';
 import { catalogView, legacyReference } from '../../src/providers/catalog.ts';
 import {
   deriveImageCapabilityMetadata,

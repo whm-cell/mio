@@ -7,7 +7,7 @@ import type {
   ConversationVideoJobView,
   ConversationVideoTools,
 } from '../../src/conversations/contracts.ts';
-import type { VideoCapabilitiesView, VideoJobView } from '../../src/generations/video-contracts.ts';
+import type { VideoCapabilitiesView, VideoJobView } from '../../src/generations/video/contracts.ts';
 import {
   parseVideoJobPresentationMeta,
   registerConversationVideoTools,

@@ -182,10 +182,15 @@ it.each([
   ['src/compute-extra/capacity.ts', 1],
   ['src/compute/transcode/service.ts', 1],
   ['src/compute-extra/transcode/store.ts', 1],
-  ['src/generations/store.ts', 0],
+  ['src/generations/image/store.ts', 0],
+  ['src/generations/video/store.ts', 0],
+  ['src/generations/video/execution-store.ts', 0],
+  ['src/generations/transaction.ts', 0],
   ['src/generations/schema.ts', 0],
-  ['src/generations/service.ts', 1],
-  ['src/generations-extra/store.ts', 1],
+  ['src/generations/store.ts', 1],
+  ['src/generations/video/service.ts', 1],
+  ['src/generations/image/service.ts', 1],
+  ['src/generations-extra/image/store.ts', 1],
   ['src/admin/store.ts', 0],
   ['src/admin/schema.ts', 0],
   ['src/admin/service.ts', 1],
@@ -212,10 +217,10 @@ it.each([
   ['src/compute/transcode/store.ts', 'database-alias', 'pg', 0],
   ['src/compute/transcode/store.ts', 'pg', 'better-auth', 1],
   ['src/compute/transcode/service.ts', 'database-alias', 'pg', 1],
-  ['src/generations/store.ts', 'database-alias', 'pg', 0],
+  ['src/generations/image/store.ts', 'database-alias', 'pg', 0],
   ['src/generations/schema.ts', 'database-alias', 'pg', 0],
-  ['src/generations/service.ts', 'database-alias', 'pg', 1],
-  ['src/generations/store.ts', 'pg', 'better-auth', 1],
+  ['src/generations/image/service.ts', 'database-alias', 'pg', 1],
+  ['src/generations/image/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/store.ts', 'database-alias', 'pg', 0],
   ['src/admin/schema.ts', 'database-alias', 'pg', 0],
   ['src/admin/service.ts', 'database-alias', 'pg', 1],
@@ -272,19 +277,23 @@ async function check(root: string, env?: NodeJS.ProcessEnv) {
 }
 
 it.each([
-  ['src/generations/files.ts', "export { readFile } from 'fs';", 0],
-  ['src/generations/files.ts', "export { readFile } from 'node:fs/promises';", 0],
-  ['src/generations/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
+  ['src/generations/image/files.ts', "export { readFile } from 'fs';", 0],
+  ['src/generations/video/media.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/files.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video-media.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video/media-extra.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/image/files.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/image/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
   [
-    'src/generations/files.ts',
+    'src/generations/image/files.ts',
     "export const fs = globalThis['process']['getBuiltinModule']('node:fs');",
     0,
   ],
-  ['src/generations/files-extra.ts', "export { readFile } from 'fs/promises';", 1],
-  ['src/generations-extra/files.ts', "export { readFile } from 'node:fs';", 1],
-  ['src/generations/service.ts', "export const fs = process.getBuiltinModule('fs');", 1],
-  ['src/generations/files.ts', "export { spawn } from 'node:child_process';", 1],
-  ['src/generations/files.ts', "export { DatabaseSync } from 'node:sqlite';", 1],
+  ['src/generations/image/files-extra.ts', "export { readFile } from 'fs/promises';", 1],
+  ['src/generations-extra/image/files.ts', "export { readFile } from 'node:fs';", 1],
+  ['src/generations/image/service.ts', "export const fs = process.getBuiltinModule('fs');", 1],
+  ['src/generations/image/files.ts', "export { spawn } from 'node:child_process';", 1],
+  ['src/generations/image/files.ts', "export { DatabaseSync } from 'node:sqlite';", 1],
 ] as const)(
   'confines A durable filesystem access to the exact adapter: %s %s',
   async (file, code, status) => {
@@ -606,6 +615,28 @@ it('accepts same-module development imports and rejects harness/service/type-exp
   await writeFile(join(root, 'scripts/harness/use.ts'), "export { value } from './value.ts';");
   await writeFile(join(root, 'scripts/service/use.ts'), "import '../harness/value.ts';");
   expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
+});
+
+it('keeps service tooling access to generation contracts exact in the checked-in configuration', async () => {
+  const cutover = 'scripts/service/generation-cutover.ts';
+  const root = await fixture({
+    [cutover]: "import '../../src/generations/image/contracts.ts';",
+    'scripts/service/legacy-video-routes.ts': "import '../../src/generations/video/contracts.ts';",
+    'src/generations/image/contracts.ts': 'export const version = 1;',
+    'src/generations/video/contracts.ts': 'export const version = 1;',
+    'src/generations/image/service.ts': 'export const service = 1;',
+    'src/generations/contracts.ts': 'export const version = 1;',
+  });
+  const config = legacyHarness();
+  config.developmentDependencies = (await loadConfig(project)).developmentDependencies;
+  await writeFile(join(root, 'harness.config.json'), JSON.stringify(config));
+  const allowed = await check(root);
+  expect(allowed.status, allowed.output).toBe(0);
+  for (const path of ['src/generations/image/service.ts', 'src/generations/contracts.ts']) {
+    await writeFile(join(root, cutover), "import '../../" + path + "';");
+    const forbidden = await check(root);
+    expect(forbidden.output).toContain('DEVELOPMENT_DEPENDENCY ' + cutover + ': ' + path);
+  }
 });
 
 it('checks aliases and dynamic targets across development boundaries, and includes development cycles', async () => {

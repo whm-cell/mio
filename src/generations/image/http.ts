@@ -2,11 +2,11 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { IMAGE_MAX_MESSAGE_BYTES } from './contracts.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AssetPrincipal } from '../assets/contracts.ts';
-import { ProviderError } from '../providers/contracts.ts';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
-import { startHttpResponse, writeApiError } from '../http-response.ts';
-import { GenerationError } from './errors.ts';
+import type { AssetPrincipal } from '../../assets/contracts.ts';
+import { ProviderError } from '../../providers/contracts.ts';
+import { readJsonBody, RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
+import { GenerationError } from '../errors.ts';
 import type { GenerationService } from './service.ts';
 
 type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;

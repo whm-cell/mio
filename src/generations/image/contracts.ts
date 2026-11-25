@@ -1,6 +1,6 @@
-import type { ImageInput } from './image-routes.ts';
+import type { ImageInput } from './routes.ts';
 
-export * from './image-routes.ts';
+export * from './routes.ts';
 
 const uuidText = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
 const uuid = new RegExp(`^${uuidText}$`);

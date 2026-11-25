@@ -11,10 +11,10 @@ vi.mock('node:fs/promises', async (original) => ({
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import sharp from 'sharp';
-import { createGenerationHandler } from '../../src/generations/http.ts';
-import type { GenerationTransports } from '../../src/generations/runner.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
+import type { GenerationTransports } from '../../src/generations/image/runner.ts';
 import { generationFixture } from './fixture.ts';
-import { GenerationFiles } from '../../src/generations/files.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
 
 it('closes image admission while a legacy HEAD is hung without creating a job', async () => {
   const f = await generationFixture();

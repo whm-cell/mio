@@ -7,7 +7,7 @@ import {
   validateVideoRouteConfig,
   videoRouteRuntimeAvailable,
 } from '../../src/providers/onelink/video-route.ts';
-import type { VideoRequestParameters } from '../../src/generations/video-contracts.ts';
+import type { VideoRequestParameters } from '../../src/generations/video/contracts.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
 
 const MODELS = [

@@ -60,6 +60,29 @@ export interface AssetObjectStore {
   delete(key: string): Promise<void>;
 }
 
+/** Bound caller wait even when a HEAD implementation ignores the optional signal. */
+export async function waitForObjectHead<T>(
+  read: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return read();
+  signal.throwIfAborted();
+  const aborted = Promise.withResolvers<never>();
+  const abort = () => aborted.reject(signal.reason);
+  signal.addEventListener('abort', abort, { once: true });
+  try {
+    const pending = Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return read();
+    });
+    const result = await Promise.race([pending, aborted.promise]);
+    signal.throwIfAborted();
+    return result;
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
+
 export type AssetErrorCode =
   | 'ASSET_NOT_FOUND'
   | 'ASSET_UNAVAILABLE'

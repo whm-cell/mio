@@ -1,4 +1,5 @@
 import { createId } from '@mio/foundation/identifiers';
+import { waitForObjectHead } from '../assets/contracts.ts';
 import { imageOutputIndex, imageOutputKey } from './contracts.ts';
 import type { GenerationFiles } from './files.ts';
 import type { GenerationStore } from './store.ts';
@@ -86,7 +87,7 @@ async function findAttempt(
 ): Promise<GeneratedObject | undefined> {
   for (const key of checkpoint.attemptedKeys[image.index] ?? []) {
     try {
-      const head = await objects.head(key, signal);
+      const head = await waitForObjectHead(() => objects.head(key, signal), signal);
       signal.throwIfAborted();
       if (!head) continue;
       if (!matches(head, image)) throw new Error('IMAGE_OUTPUT_MISMATCH');
@@ -115,8 +116,8 @@ async function materializeImage(
 ): Promise<GeneratedObject> {
   const saved = checkpoint.outputs[image.index];
   if (saved) {
-    if (!matches(await objects.head(saved.key, signal), image, saved.etag))
-      throw new Error('IMAGE_OUTPUT_MISMATCH');
+    const head = await waitForObjectHead(() => objects.head(saved.key, signal), signal);
+    if (!matches(head, image, saved.etag)) throw new Error('IMAGE_OUTPUT_MISMATCH');
     signal.throwIfAborted();
     return saved;
   }
@@ -137,7 +138,7 @@ async function materializeImage(
     uploaded.sizeBytes !== image.sizeBytes ||
     uploaded.sha256 !== image.sha256 ||
     uploaded.contentType !== 'image/' + image.format ||
-    !matches(await objects.head(key, signal), image, uploaded.etag)
+    !matches(await waitForObjectHead(() => objects.head(key, signal), signal), image, uploaded.etag)
   )
     throw new Error('IMAGE_OUTPUT_MISMATCH');
   signal.throwIfAborted();

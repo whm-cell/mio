@@ -271,6 +271,45 @@ it('rejects invalid body, unauthorized assets, origins and methods before side e
   expect(await store.list(actor.userId)).toHaveLength(0);
   expect(publish).not.toHaveBeenCalled();
 });
+
+it('ends a legacy HEAD at the media deadline and preserves HTTP storage errors', async () => {
+  head.mockRejectedValueOnce(new Error('fixture storage rejection'));
+  const unavailable = await call('', body());
+  expect(unavailable.status).toBe(503);
+  expect(await unavailable.json()).toMatchObject({
+    error: { code: 'COMPUTE_STORAGE_UNAVAILABLE' },
+  });
+  const started = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<{ size: number; etag: string }>();
+  head.mockImplementationOnce(async (objectKey: string) => {
+    expect(objectKey).toBe(key);
+    started.resolve();
+    return reply.promise;
+  });
+  const deadline = new AbortController();
+  const normalTimeout = AbortSignal.timeout;
+  const timeout = vi
+    .spyOn(AbortSignal, 'timeout')
+    .mockImplementation((ms) => (ms === 180_000 ? deadline.signal : normalTimeout(ms)));
+  try {
+    const finished = vi.fn((response: Response) => response);
+    const response = call('', body()).then(finished);
+    await started.promise;
+    expect(timeout).toHaveBeenCalledWith(180_000);
+    deadline.abort(new DOMException('fixture deadline', 'TimeoutError'));
+    await vi.waitFor(() => expect(finished).toHaveBeenCalledOnce());
+    const rejected = await response;
+    expect(rejected.status).toBe(503);
+    expect(await rejected.json()).toMatchObject({ error: { code: 'COMPUTE_UNAVAILABLE' } });
+    reply.resolve({ size: 3, etag: 'etag' });
+    await reply.promise;
+    expect((await observer.query('SELECT count(*) FROM mio_media_jobs')).rows[0].count).toBe('0');
+    expect(publish).not.toHaveBeenCalled();
+  } finally {
+    reply.resolve({ size: 3, etag: 'etag' });
+    timeout.mockRestore();
+  }
+});
 it('rechecks the session after reading mutations and rejects oversized JSON', async () => {
   identity.mockResolvedValueOnce(actor).mockResolvedValueOnce(null);
   expect((await call('', body())).status).toBe(401);

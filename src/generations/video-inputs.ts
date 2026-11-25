@@ -1,5 +1,5 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { MAX_ASSET_BYTES } from '../assets/contracts.ts';
+import { MAX_ASSET_BYTES, waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 import type { AssetStore } from '../assets/store.ts';
 import { GenerationError } from './errors.ts';
@@ -34,12 +34,14 @@ export function createVideoInputResolver(
     for (const id of ids) {
       signal.throwIfAborted();
       const asset = byId.get(id)!;
-      const head = await objects.head(asset.raw_key, signal).catch((error: unknown) => {
-        signal.throwIfAborted();
-        if ((error as { statusCode?: number } | null)?.statusCode === HTTP_STATUS.NOT_FOUND)
-          throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
-        throw error;
-      });
+      const head = await waitForObjectHead(() => objects.head(asset.raw_key, signal), signal).catch(
+        (error: unknown) => {
+          signal.throwIfAborted();
+          if ((error as { statusCode?: number } | null)?.statusCode === HTTP_STATUS.NOT_FOUND)
+            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
+          throw error;
+        },
+      );
       signal.throwIfAborted();
       const frozen = expected?.[id];
       if (

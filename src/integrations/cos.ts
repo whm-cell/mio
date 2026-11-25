@@ -3,7 +3,7 @@ import { sha256Bytes } from '@mio/foundation/hash';
 import COS from 'cos-nodejs-sdk-v5';
 import { PassThrough, Readable } from 'node:stream';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { AssetError } from '../assets/contracts.ts';
+import { AssetError, waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetConfig } from '../assets/config.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 
@@ -136,25 +136,8 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     };
   };
   const head: AssetObjectStore['head'] = async (Key, signal) => {
-    const read = () => cos.headObject({ Bucket, Region, Key });
-    let object: COS.HeadObjectResult;
-    if (signal) {
-      signal.throwIfAborted();
-      const aborted = Promise.withResolvers<never>();
-      const abort = () => aborted.reject(signal.reason);
-      signal.addEventListener('abort', abort, { once: true });
-      try {
-        // HEAD has no SDK cancel handle. A late response is observed only by this race.
-        const pending = Promise.resolve().then(() => {
-          signal.throwIfAborted();
-          return read();
-        });
-        object = await Promise.race([pending, aborted.promise]);
-        signal.throwIfAborted();
-      } finally {
-        signal.removeEventListener('abort', abort);
-      }
-    } else object = await read();
+    // The SDK can still return a late reply after the caller stops waiting.
+    const object = await waitForObjectHead(() => cos.headObject({ Bucket, Region, Key }), signal);
     const size = Number(object.headers?.['content-length']);
     if (!Number.isSafeInteger(size) || size < 0 || !object.ETag)
       throw new Error('COS_INVALID_HEAD');

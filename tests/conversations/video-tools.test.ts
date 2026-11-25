@@ -18,10 +18,11 @@ import {
   parseVideoJobPresentationMeta,
   registerConversationVideoTools,
 } from '../../src/dsh/video-tools.ts';
-import type { VideoAdmissionSnapshot } from '../../src/providers/contracts.ts';
+import type { VideoAdmissionSnapshot, VideoRouteConfig } from '../../src/providers/contracts.ts';
 import {
   validateVideoRouteConfig,
   videoModeParameters,
+  videoRouteRuntimeAvailable,
 } from '../../src/providers/onelink/video-route.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
 
@@ -185,22 +186,33 @@ it('registers the current-user video tools and exposes unavailable models withou
   await expect(list.execute({ extra: true }, exec())).rejects.toBeInstanceOf(ToolArgsError);
 });
 
-it('publishes the seeded Vega submit options through DSH and admits the selected values', async () => {
-  const declaration = legacyVideoRouteEntries(['vega-1.5-pro'])[0]!;
-  const route = validateVideoRouteConfig({
-    ...declaration,
-    editPath: null,
-    requestDefaults: {},
-    outputSpec: {},
-  })!;
-  const modes = route.paramSpec.supportedModes.map((mode) => ({
-    mode,
-    supported: true,
-    parameters: videoModeParameters(route, mode)!,
-  }));
+it('publishes distinct seeded submit options through DSH and admits the selected Vega values', async () => {
+  const vegaId = 'vega-1.5-pro';
+  const klingId = 'kling-v2-5-turbo';
+  const routes = new Map(
+    legacyVideoRouteEntries([vegaId, klingId]).map((declaration) => [
+      declaration.rawModelId,
+      validateVideoRouteConfig({
+        ...declaration,
+        editPath: null,
+        requestDefaults: {},
+        outputSpec: {},
+      })!,
+    ]),
+  );
+  const catalogModes = (route: VideoRouteConfig) => {
+    const supported = videoRouteRuntimeAvailable(route);
+    return route.paramSpec.supportedModes.map((mode) => ({
+      mode,
+      supported,
+      parameters: videoModeParameters(route, mode)!,
+    }));
+  };
+  const route = routes.get(vegaId)!;
+  const modes = catalogModes(route);
   const snapshot: VideoAdmissionSnapshot = {
     modelRef: MODEL_REF,
-    modelId: declaration.rawModelId,
+    modelId: vegaId,
     modelKey: 'vega-1-5-pro',
     vendor: route.vendor,
     profile: route.driver,
@@ -241,7 +253,7 @@ it('publishes the seeded Vega submit options through DSH and admits the selected
   );
   const model = {
     modelRef: MODEL_REF,
-    modelId: declaration.rawModelId,
+    modelId: vegaId,
     name: 'Vega 1.5 Pro',
     vendor: route.vendor,
     available: true,
@@ -257,6 +269,15 @@ it('publishes the seeded Vega submit options through DSH and admits the selected
       parameters: { ...parameters, privateOptions: { token: 'private-route-token' } },
     })),
   };
+  const klingRoute = routes.get(klingId)!;
+  const klingModel = {
+    ...model,
+    modelRef: `onelink:model:${klingId}`,
+    modelId: klingId,
+    name: 'Kling 2.5 Turbo',
+    vendor: klingRoute.vendor,
+    available: videoRouteRuntimeAvailable(klingRoute),
+  };
   const disabled = {
     ...model,
     modelRef: 'onelink:model:disabled-model',
@@ -267,12 +288,16 @@ it('publishes the seeded Vega submit options through DSH and admits the selected
   };
   const service: ConversationVideoTools = {
     ...bridge(),
-    listModels: vi.fn(async () => [catalogModel, { ...catalogModel, ...disabled }]),
+    listModels: vi.fn(async () => [
+      catalogModel,
+      { ...klingModel, supportedModes: catalogModes(klingRoute) },
+      { ...catalogModel, ...disabled },
+    ]),
     capabilities: admission.capabilities,
     createVideo: (actor, request, signal) =>
       admission.create(actor, request, signal).then((result) => result.job),
   };
-  const expected = {
+  const expectedVega = {
     ...model,
     supportedModes: [
       {
@@ -315,13 +340,33 @@ it('publishes the seeded Vega submit options through DSH and admits the selected
     expect(provider.snapshotVideo).not.toHaveBeenCalled();
     const content = listed.content[0];
     if (content?.type !== 'text') throw new Error('Expected rendered model list text');
-    const result = JSON.parse(content.text) as { models: [typeof expected, unknown] };
+    const result = JSON.parse(content.text) as { models: [typeof expectedVega, unknown, unknown] };
     expect(result).toEqual({
       models: [
-        expected,
+        expectedVega,
+        {
+          ...klingModel,
+          available: true,
+          supportedModes: [
+            {
+              mode: 'text_to_video',
+              supported: true,
+              submitParameters: {
+                required: ['modelRef', 'prompt'],
+                maxPromptCodepoints: 2500,
+                ratios: ['16:9', '9:16', '1:1'],
+                resolutions: ['720p', '1080p'],
+                durationSeconds: [5, 10],
+                supportsGenerateAudio: false,
+                supportsWatermark: false,
+              },
+            },
+            { mode: 'first_frame', supported: true },
+          ],
+        },
         {
           ...disabled,
-          supportedModes: expected.supportedModes.map(({ mode, supported }) => ({
+          supportedModes: expectedVega.supportedModes.map(({ mode, supported }) => ({
             mode,
             supported,
           })),

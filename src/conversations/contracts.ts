@@ -1,6 +1,7 @@
 import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
 import type {
   VideoCapabilitiesView,
+  VideoCapabilityMode,
   VideoCreateRequest,
   VideoJobView,
   VideoMode,
@@ -249,7 +250,7 @@ export interface ConversationVideoModelSummary {
   readonly vendor: string;
   readonly available: boolean;
   readonly unavailableReason: string | null;
-  readonly supportedModes: { mode: VideoMode; supported: boolean }[];
+  readonly supportedModes: VideoCapabilityMode[];
 }
 export interface ConversationVideoJobOutput {
   readonly index: number;

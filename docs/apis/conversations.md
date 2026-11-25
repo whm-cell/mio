@@ -106,6 +106,8 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 视频执行配置就绪的会话还可在当前受控轮次内使用 `list_video_models`、`submit_video_job`、`get_video_job`、`recover_video_job`。用户要求找回保存失败的历史视频时，恢复工具仅对本人带结果检查点的任务重新执行物化，不重新提交生成；返回后结束本轮，后续轮次查询同一 jobId。已完成或正在恢复的任务返回当前状态；没有可恢复检查点时拒绝恢复。只读模型目录不代表完成生成；提交返回持久视频任务后应结束本轮。提交、查询和恢复卡片按严格 `mio.video-job` 白名单投影到 SSE 与持久历史；任务、资产和凭据归当前用户，模型不能指定 owner。模型列表或请求失败详情不写成公开卡片。视频执行边界见[计算 HTTP](compute.md#post-apiv1computevideos)。
 
+`list_video_models` 保留模型可用状态及各模式的 `mode`、`supported`。当前可用且支持 `text_to_video` 的模型在目录约束齐备时，才在该模式下返回 `submitParameters`。`required` 列出提交时必传的 `modelRef`、`prompt`，以及该型号要求的 `resolution`。`maxPromptCodepoints` 给出提示词的有效 Unicode 码点上限。`ratios`、`resolutions`、`durationSeconds` 分别列出 `ratio`、`resolution`、`durationSeconds` 的精确可选值，空列表表示对应字段应省略。`supportsGenerateAudio`、`supportsWatermark` 为 `true` 时对应字段可传 `true` 或 `false`，为 `false` 时应省略该字段。`submit_video_job` 只受理文生视频，提交时仍以当前能力校验为准。
+
 ## POST /api/v1/conversations/:id/compact
 
 身份：当前登录用户与对话 owner。

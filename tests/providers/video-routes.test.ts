@@ -349,6 +349,49 @@ it('checks total and per-type media limits without dropping repeated positions',
   expect(validateVideoParameters(input({ prompt: '😀'.repeat(3001) }), mixed)).toBe(false);
 });
 
+it.each([
+  ['happyhorse-1.1-t2v', input({ prompt: '海🌊' })],
+  [
+    'happyhorse-1.0-i2v',
+    input({ mode: 'first_frame', prompt: '海🌊', firstFrame: { assetId: 'image-a' } }),
+  ],
+  [
+    'happyhorse-1.0-video-edit',
+    input({
+      mode: 'video_edit',
+      prompt: '海🌊',
+      references: [{ assetId: 'video-a', mediaType: 'video' }],
+    }),
+  ],
+  [
+    'video-vidu-q2',
+    input({
+      mode: 'reference_subjects',
+      prompt: '[@领队🐎] 看向海🌊',
+      subjects: [{ name: '领队🐎', images: [{ assetId: 'image-a' }] }],
+    }),
+  ],
+] as const)(
+  'keeps the caller prompt limit for %s outside HappyHorse reference subjects',
+  (model, request) => {
+    const base = route(model);
+    const current = {
+      ...base,
+      paramSpec: {
+        ...base.paramSpec,
+        parameters: {
+          ...base.paramSpec.parameters!,
+          maxPromptCodepoints: [...request.prompt].length,
+        },
+      },
+    };
+    expect(validateVideoParameters(request, current)).toBe(true);
+    expect(validateVideoParameters({ ...request, prompt: request.prompt + '潮' }, current)).toBe(
+      false,
+    );
+  },
+);
+
 it('restricts Veo to eight seconds and HappyHorse editing to its own parameters', () => {
   expect(
     validateVideoParameters(input({ durationSeconds: 8, resolution: '1080p' }), route('veo-3.1')),

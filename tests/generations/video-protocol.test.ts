@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import type { VideoDriver, VideoMode } from '../../src/generations/video/contracts.ts';
+import type {
+  VideoDriver,
+  VideoMode,
+  VideoRequestParameters,
+} from '../../src/generations/video/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../../src/providers/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 
@@ -580,7 +584,94 @@ describe('bounded OneLink video protocol', () => {
     }
   });
 
-  it('encodes HappyHorse exact i2v and video-edit media forms with async header', async () => {
+  it('maps every HappyHorse subject name to its own ordered image slots', async () => {
+    const fetcher = transport({ output: { task_id: 'horse-1' } }, {});
+    const protocol = createVideoProtocol(
+      route('happyhorse-videos', ['reference_subjects']),
+      'happyhorse-1.1-r2v',
+      fetcher,
+    );
+    const prompt = '领队看向旅人和[Image 3]后方。';
+    for (const [lead, traveler] of [
+      ['领队', '旅人'],
+      ['旅人', '领队'],
+    ] as const) {
+      expect(
+        await protocol.submit(
+          {
+            mode: 'reference_subjects',
+            prompt,
+            subjects: [
+              { name: lead, images: [{ assetId: first }, { assetId: last }] },
+              { name: traveler, images: [{ assetId: first }] },
+            ],
+          },
+          refs,
+          key,
+          signal,
+        ),
+      ).toEqual({ state: 'submitted', upstreamTaskId: 'horse-1' });
+    }
+    const media = [
+      { type: 'reference_image', url: refs[first] },
+      { type: 'reference_image', url: refs[last] },
+      { type: 'reference_image', url: refs[first] },
+    ];
+    expect(fetcher.mock.calls.map(([, request]) => JSON.parse(String(request?.body)))).toEqual([
+      {
+        model: 'happyhorse-1.1-r2v',
+        input: {
+          prompt: '[Image 1]、[Image 2] 为 "领队"；[Image 3] 为 "旅人"。\n' + prompt,
+          media,
+        },
+        parameters: {},
+      },
+      {
+        model: 'happyhorse-1.1-r2v',
+        input: {
+          prompt: '[Image 1]、[Image 2] 为 "旅人"；[Image 3] 为 "领队"。\n' + prompt,
+          media,
+        },
+        parameters: {},
+      },
+    ]);
+  });
+
+  it('escapes HappyHorse names and applies the exact wire prompt limit to frozen submissions', async () => {
+    const fetcher = transport({ output: { task_id: 'horse-1' } }, {});
+    const name = '阿"岚\\车\n[Image 9]\u2028🐎';
+    const quotedName = '"阿\\"岚\\\\车\\n\\u005bImage 9\\u005d\\u2028🐎"';
+    expect(JSON.parse(quotedName)).toBe(name);
+    const prompt = '追上云🚀\n转身';
+    const expected = '[Image 1] 为 ' + quotedName + '。\n' + prompt;
+    const protocol = createVideoProtocol(
+      route('happyhorse-videos', ['reference_subjects'], {
+        maxPromptCodepoints: [...expected].length,
+      }),
+      'happyhorse-1.0-r2v',
+      fetcher,
+    );
+    const input: VideoRequestParameters = {
+      mode: 'reference_subjects',
+      prompt,
+      subjects: [{ name, images: [{ assetId: first }] }],
+    };
+    expect(await protocol.submit({ ...input, prompt: prompt + '😀' }, refs, key, signal)).toEqual({
+      state: 'rejected',
+      code: 'VIDEO_INPUT_INVALID',
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await protocol.submit(input, refs, key, signal)).toEqual({
+      state: 'submitted',
+      upstreamTaskId: 'horse-1',
+    });
+    expect(body(fetcher).input).toEqual({
+      prompt: expected,
+      media: [{ type: 'reference_image', url: refs[first] }],
+    });
+  });
+
+  it('encodes HappyHorse video-edit media and the async header', async () => {
     const fetcher = transport(
       { output: { task_id: 'horse-1' } },
       {

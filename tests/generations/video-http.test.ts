@@ -290,19 +290,20 @@ async function assetHttpFixture(
     openImageSnapshot: vi.fn(() => 'fixture-key'),
     resolveImageTaskCredential: vi.fn(async () => 'fixture-key'),
   } as unknown as ProviderService;
-  const upstream = vi.fn<typeof fetch>(async (_url, options) =>
-    options?.method === 'POST'
-      ? Response.json(
-          route.driver === 'kling-videos'
-            ? { code: 0, data: { task_id: 'fixture-task' } }
-            : { id: 'fixture-task' },
-        )
-      : Response.json({
-          id: 'fixture-task',
-          status: 'succeeded',
-          content: { video_url: generatedVideo },
-        }),
-  );
+  const upstream = vi.fn<typeof fetch>(async (_url, options) => {
+    if (options?.method === 'POST') {
+      if (route.driver === 'kling-videos')
+        return Response.json({ code: 0, data: { task_id: 'fixture-task' } });
+      if (route.driver === 'happyhorse-videos')
+        return Response.json({ output: { task_id: 'fixture-task' } });
+      return Response.json({ id: 'fixture-task' });
+    }
+    return Response.json({
+      id: 'fixture-task',
+      status: 'succeeded',
+      content: { video_url: generatedVideo },
+    });
+  });
   const stop = new AbortController();
   const receipts = new VideoSubmissionReceipts(directory);
   let expiredResult = false;
@@ -1429,6 +1430,73 @@ it.each([true, false])(
     }
   },
 );
+
+it('rejects an over-budget HappyHorse prompt before admission and submits the exact limit', async () => {
+  const modelId = 'happyhorse-1.1-r2v';
+  const route = validateVideoRouteConfig({
+    ...legacyVideoRouteEntries([modelId])[0]!,
+    editPath: null,
+    requestDefaults: {},
+    outputSpec: {},
+  })!;
+  const limit = route.paramSpec.parameters!.maxPromptCodepoints;
+  const header = '[Image 1]、[Image 2] 为 "领队🐎"；[Image 3] 为 "旅人"。\n';
+  const prompt = '跃' + '😀'.repeat(limit - [...header].length - 1);
+  const f = await assetHttpFixture(false, undefined, { route, modelId });
+  try {
+    const first = await f.addAsset();
+    const second = await f.addAsset();
+    const subjects = [
+      { name: '领队🐎', images: [{ assetId: first.assetId }, { assetId: second.assetId }] },
+      { name: '旅人', images: [{ assetId: first.assetId }] },
+    ];
+    const request: VideoCreateRequest = {
+      ...f.request([]),
+      parameters: { mode: 'reference_subjects', prompt, subjects },
+    };
+    const over = prompt + '潮';
+    expect([...over].length).toBeLessThan(limit);
+    expect([...(header + over)].length).toBe(limit + 1);
+    const rejected = await f.postRequest({
+      ...request,
+      parameters: { ...request.parameters, prompt: over },
+    });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({ error: { code: 'VIDEO_INPUT_INVALID' } });
+    const { rows } = await f.pool.query(
+      'SELECT (SELECT count(*) FROM mio_video_jobs) AS jobs,' +
+        ' (SELECT count(*) FROM mio_video_executions) AS executions',
+    );
+    expect(rows).toEqual([{ jobs: '0', executions: '0' }]);
+    expect(f.wake).not.toHaveBeenCalled();
+    expect(f.objects.head).not.toHaveBeenCalled();
+    expect(f.objects.readPrefix).not.toHaveBeenCalled();
+    expect(f.objects.materialUrl).not.toHaveBeenCalled();
+    expect(f.upstream).not.toHaveBeenCalled();
+
+    const accepted = await f.postRequest(request);
+    expect(accepted.status).toBe(202);
+    const job: VideoJobView = await accepted.json();
+    expect(job).toMatchObject({ state: 'accepted', effectiveParameters: { prompt, subjects } });
+    expect((await f.runNext()).id).toBe(job.id);
+    expect(f.upstream).toHaveBeenCalledOnce();
+    const [endpoint, outbound] = f.upstream.mock.calls[0]!;
+    expect(new URL(String(endpoint)).pathname).toBe(route.submitPath);
+    expect(outbound?.method).toBe('POST');
+    const body = JSON.parse(String(outbound?.body));
+    expect(body.input).toEqual({
+      prompt: header + prompt,
+      media: [first, second, first].map(({ key }) => ({
+        type: 'reference_image',
+        url: 'https://cos.fixture/' + key + '?signature=fixture',
+      })),
+    });
+    expect([...body.input.prompt].length).toBe(limit);
+    expect(await (await f.get(job.id)).json()).toMatchObject({ state: 'submitted' });
+  } finally {
+    await f.close();
+  }
+});
 
 describe('video asset admission over HTTP', () => {
   it('checks real PNG, WAV and MP4 bytes over conditional COS reads at both boundaries', async () => {

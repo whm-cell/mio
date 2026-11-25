@@ -10,6 +10,7 @@ import {
   KLING_TURBO_MODEL,
 } from '../../generations/video/driver-capabilities.ts';
 import { isSafeRouteIdentifier } from '../../generations/image/contracts.ts';
+import { happyhorsePrompt } from '../../integrations/onelink/video/happyhorse-prompt.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../contracts.ts';
 
 /** Enabled only when the matching executor and result materializer have been assembled. */
@@ -277,7 +278,8 @@ export function validateVideoParameters(
 ): boolean {
   const spec = route.paramSpec.parameters;
   if (!spec || !route.paramSpec.supportedModes.includes(input.mode)) return false;
-  if (Array.from(input.prompt).length > spec.maxPromptCodepoints) return false;
+  const prompt = route.driver === 'happyhorse-videos' ? happyhorsePrompt(input) : input.prompt;
+  if (Array.from(prompt).length > spec.maxPromptCodepoints) return false;
   if (
     input.ratio !== undefined &&
     (!spec.ratios.includes(input.ratio) ||

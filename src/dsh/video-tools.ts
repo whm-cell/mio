@@ -8,7 +8,7 @@ import {
   VIDEO_MAX_PROMPT_CODEPOINTS,
   VIDEO_MODES,
 } from '../generations/video/contracts.ts';
-import type { VideoJobView } from '../generations/video/contracts.ts';
+import type { VideoCapabilityMode, VideoJobView } from '../generations/video/contracts.ts';
 import type {
   ConversationRun,
   ConversationVideoJobOutput,
@@ -38,6 +38,7 @@ const SUBMIT_KEYS = new Set([
   'generateAudio',
   'watermark',
 ]);
+const VIDEO_SUBMIT_REQUIRED_FIELDS = ['modelRef', 'prompt', 'resolution'] as const;
 
 const modelSchema = {
   type: 'object',
@@ -57,6 +58,23 @@ const modelSchema = {
         properties: {
           mode: { type: 'string', required: true },
           supported: { type: 'boolean', required: true },
+          submitParameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              required: {
+                type: 'array',
+                items: { type: 'string', enum: VIDEO_SUBMIT_REQUIRED_FIELDS },
+                required: true,
+              },
+              maxPromptCodepoints: { type: 'integer', required: true },
+              ratios: { type: 'array', items: { type: 'string' }, required: true },
+              resolutions: { type: 'array', items: { type: 'string' }, required: true },
+              durationSeconds: { type: 'array', items: { type: 'integer' }, required: true },
+              supportsGenerateAudio: { type: 'boolean', required: true },
+              supportsWatermark: { type: 'boolean', required: true },
+            },
+          },
         },
       },
       required: true,
@@ -94,6 +112,47 @@ const videoJobSchema = {
     },
   },
 } as const;
+
+function projectVideoSubmitParameters(parameters: VideoCapabilityMode['parameters']) {
+  const {
+    ratios,
+    resolutions,
+    durations,
+    maxPromptCodepoints,
+    requiresResolution,
+    generateAudio,
+    watermark,
+  } = parameters ?? {};
+  if (
+    !Array.isArray(ratios) ||
+    !ratios.every((ratio) => typeof ratio === 'string') ||
+    !Array.isArray(resolutions) ||
+    !resolutions.every((resolution) => typeof resolution === 'string') ||
+    !Array.isArray(durations) ||
+    !durations.every(
+      (duration) => typeof duration === 'number' && Number.isSafeInteger(duration),
+    ) ||
+    typeof maxPromptCodepoints !== 'number' ||
+    !Number.isSafeInteger(maxPromptCodepoints) ||
+    maxPromptCodepoints < 1 ||
+    typeof requiresResolution !== 'boolean' ||
+    typeof generateAudio !== 'boolean' ||
+    typeof watermark !== 'boolean'
+  )
+    return;
+
+  const required: (typeof VIDEO_SUBMIT_REQUIRED_FIELDS)[number][] = ['modelRef', 'prompt'];
+  if (requiresResolution) required.push('resolution');
+  return {
+    required,
+    maxPromptCodepoints: Math.min(maxPromptCodepoints, VIDEO_MAX_PROMPT_CODEPOINTS),
+    ratios,
+    resolutions,
+    durationSeconds: durations,
+    supportsGenerateAudio: generateAudio,
+    supportsWatermark: watermark,
+  };
+}
 
 function codepointCount(value: string): number {
   let count = 0;
@@ -219,7 +278,7 @@ export function registerConversationVideoTools(
       defineTool({
         name: 'list_video_models',
         description:
-          'List the current user video models and exact runnable modes. Only models reported available may be submitted; never infer support from a model name.',
+          'List the current user video models and exact runnable modes. For submit_video_job, choose an available model with supported text_to_video. Follow its submitParameters to include every required field, select listed values, and omit optional fields with empty option lists or false support flags. Missing submitParameters means the limits are unknown.',
         parameters: {},
         isConcurrencySafe: (args) => hasAllowedArguments(args, LIST_KEYS),
         output: {
@@ -239,13 +298,24 @@ export function registerConversationVideoTools(
             const models = await bridge.listModels(actor);
             return {
               models: models.map((model: ConversationVideoModelSummary) => ({
-                ...model,
+                modelRef: model.modelRef,
+                modelId: model.modelId,
+                name: model.name,
+                vendor: model.vendor,
+                available: model.available,
+                unavailableReason: model.unavailableReason,
                 supportedModes: model.supportedModes
                   .filter(
                     (entry) =>
                       typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
                   )
-                  .map(({ mode, supported }) => ({ mode, supported })),
+                  .map(({ mode, supported, parameters }) => {
+                    const submitParameters =
+                      model.available && supported && mode === 'text_to_video'
+                        ? projectVideoSubmitParameters(parameters)
+                        : undefined;
+                    return { mode, supported, ...(submitParameters ? { submitParameters } : {}) };
+                  }),
               })),
             };
           } catch (error) {
@@ -261,7 +331,7 @@ export function registerConversationVideoTools(
       defineTool({
         name: 'submit_video_job',
         description:
-          'Submit one text-to-video job for the current user. Check list_video_models first and use only an available model. After the job handle is returned, report its ID and state and finish this turn; never poll it in the same turn.',
+          'Submit one text-to-video job for the current user. Check list_video_models first and follow submitParameters for an available model with supported text_to_video. After the job handle is returned, report its ID and state and finish this turn. Poll only in later turns.',
         parameters: {
           modelRef: {
             type: 'string',

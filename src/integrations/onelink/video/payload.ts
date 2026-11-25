@@ -5,6 +5,7 @@ import {
   KLING_OMNI_SUBMIT_PATH,
 } from '../../../generations/video/driver-capabilities.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
+import { happyhorsePrompt } from './happyhorse-prompt.ts';
 import { resultUrls } from './shared.ts';
 
 interface Submission {
@@ -221,16 +222,12 @@ function happyhorse(
   for (const subject of input.subjects ?? [])
     for (const image of subject.images)
       media.push({ type: 'reference_image', url: reference(refs, image.assetId) });
-  const prompt =
-    input.mode === 'reference_subjects'
-      ? media.map((_item, index) => '[Image ' + (index + 1) + ']').join(' ') + '\n' + input.prompt
-      : input.prompt;
   return {
     path: '/happyhorse/v1/services/aigc/video-generation/video-synthesis',
     headers: { 'X-DashScope-Async': 'enable' },
     body: {
       model,
-      input: { prompt, ...(media.length ? { media } : {}) },
+      input: { prompt: happyhorsePrompt(input), ...(media.length ? { media } : {}) },
       parameters: {
         ...(input.mode !== 'video_edit' && input.durationSeconds !== undefined
           ? { duration: input.durationSeconds }

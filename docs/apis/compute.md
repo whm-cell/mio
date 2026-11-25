@@ -219,6 +219,8 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 输入：`{requestId,modelRef,expectedCapabilitiesVersion,parameters}`。requestId 为 UUID v4；modelRef 必须属于本人当前目录。parameters 接受封闭模式、本人 ready Asset 引用及分型号参数，不接受任意 URL、对象键或上游任务 ID。提示词最多 5000 码点，正文 256 KiB，总媒体引用最多 16；路由可施加更小限制。
 
+HappyHorse `reference_subjects` 提交时先按 `subjects` 及每个主体的 `images` 顺序生成图片槽位和角色名的对应关系，再换行接上调用方提示词。同一角色可对应多张图，例如 `[Image 1]、[Image 2] 为 "领队"`。角色名采用带转义的 JSON 字符串表示，名字中的方括号也会转义以免被识别为槽位。准入和提交都按完整提示词的 Unicode 码点数核对路由 `maxPromptCodepoints`，上限包含角色名、槽位、转义、标点和换行。恰好达到上限可提交，首次受理时超出返回 400 `VIDEO_INPUT_INVALID`。 [HappyHorse 参考生视频 API](https://help.aliyun.com/zh/model-studio/happyhorse-reference-to-video-api-reference)
+
 首次准入核对归属、ready 状态、MIME 和实际长度。MIME 不区分大小写。服务对每个不同的对象使用 HEAD 返回的 ETag 发出条件范围 GET，流式读取至多 1 KiB 的开头字节。读取须返回 206，范围须与请求相符，总长度须与 HEAD 和资产登记相同。实际收到的字节数须与范围相符，响应携带 ETag 时须与条件值相同。服务按声明 MIME 比对文件签名或容器标识。例如声明为 PNG 的资产须含 PNG 签名，MP4 和 MOV 分别核对文件品牌。确认共享容器的具体音轨、视频轨及可播放性仍需完整媒体探测。
 
 准入后内部冻结实际原件键和 ETag。生成 POST 前按同一份对象身份重新执行上述验证，全部验证通过才签发私有地址。请求中的引用顺序保留。缺少对象快照的旧任务同样校验本人当前 ready 资产的实际对象字节。准入阶段，对象身份或长度变化返回 `VIDEO_INPUT_CHANGED`。忽略范围、范围响应格式不符或 COS 读失败返回 `VIDEO_UNAVAILABLE`。MIME 或字节签名不匹配返回 `VIDEO_INPUT_INVALID`。

@@ -141,7 +141,13 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     if (!Number.isSafeInteger(size) || size < 0 || !object.ETag)
       throw new Error('COS_INVALID_HEAD');
     const sha256 = object.headers?.['x-cos-meta-sha256'];
-    return { size, etag: object.ETag, ...(typeof sha256 === 'string' ? { sha256 } : {}) };
+    const contentType = object.headers?.['content-type'];
+    return {
+      size,
+      etag: object.ETag,
+      ...(typeof sha256 === 'string' ? { sha256 } : {}),
+      ...(typeof contentType === 'string' ? { contentType } : {}),
+    };
   };
   const inlinePlaybackUrl = (Key: string, contentType: string, expiresIn = 300) =>
     encodeUrlToken(
@@ -223,13 +229,14 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       if ((await cos.getObjectAcl(scope)).ACL !== 'private')
         throw new Error('COS_AUDIO_ACL_NOT_PRIVATE');
     },
-    async putVideo(Key, stream, sizeBytes, sha256, signal) {
+    async putVideo(Key, stream, sizeBytes, sha256, contentMd5, signal) {
       signal.throwIfAborted();
       if (
         !Number.isSafeInteger(sizeBytes) ||
         sizeBytes < 1 ||
         sizeBytes > 1024 * 1024 * 1024 ||
-        !/^[a-f0-9]{64}$/.test(sha256)
+        !/^[a-f0-9]{64}$/.test(sha256) ||
+        !/^[A-Za-z0-9+/]{22}==$/.test(contentMd5)
       )
         throw new Error('VIDEO_OUTPUT_INVALID');
       const abort = () => stream.destroy(new Error('VIDEO_UPLOAD_ABORTED'));
@@ -244,7 +251,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
           ContentType: 'video/mp4',
           ACL: 'private',
           'x-cos-meta-sha256': sha256,
-          Headers: { 'x-cos-forbid-overwrite': 'true' },
+          Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': contentMd5 },
         });
         signal.throwIfAborted();
         if (!uploaded.ETag) throw new Error('VIDEO_OUTPUT_MISMATCH');
@@ -254,18 +261,48 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         stream.destroy();
       }
     },
-    async copy(source, target, etag, acl) {
-      await cos.putObjectCopy({
+    async copy(source, target, etag, acl, replacement) {
+      const sourcePath = `${Bucket}.cos.${Region}.myqcloud.com/${encodeURIComponent(source)}`;
+      if (!replacement) {
+        await cos.putObjectCopy({
+          Bucket,
+          Region,
+          Key: target,
+          CopySource: sourcePath,
+          CopySourceIfMatch: etag,
+          MetadataDirective: 'Replaced',
+          ContentType: 'application/octet-stream',
+          ...(acl ? { ACL: acl } : {}),
+          Headers: { 'x-cos-forbid-overwrite': 'true' },
+        });
+        return;
+      }
+      replacement.signal.throwIfAborted();
+      // The SDK replays ordinary copy requests on ambiguous transport errors.
+      // Its stream path sends this empty request once so the caller can reconcile first.
+      const copied = await cos.request({
         Bucket,
         Region,
         Key: target,
-        CopySource: `${Bucket}.cos.${Region}.myqcloud.com/${encodeURIComponent(source)}`,
-        CopySourceIfMatch: etag,
-        MetadataDirective: 'Replaced',
-        ContentType: 'application/octet-stream',
-        ...(acl ? { ACL: acl } : {}),
-        Headers: { 'x-cos-forbid-overwrite': 'true' },
+        Method: 'PUT',
+        Body: Readable.from([]),
+        Headers: {
+          'Content-Length': '0',
+          'Content-Type': replacement.contentType,
+          'x-cos-copy-source': sourcePath,
+          'x-cos-copy-source-If-Match': etag,
+          'x-cos-metadata-directive': 'Replaced',
+          'x-cos-meta-sha256': replacement.sha256,
+          ...(acl ? { 'x-cos-acl': acl } : {}),
+          'x-cos-forbid-overwrite': 'true',
+        },
       });
+      replacement.signal.throwIfAborted();
+      // COS can return HTTP 200 with an XML Error instead of CopyObjectResult.
+      const copiedEtag: unknown = copied.CopyObjectResult?.ETag;
+      if (typeof copiedEtag !== 'string' || !copiedEtag)
+        throw new Error('COS_VIDEO_COPY_ACK_INVALID');
+      return { etag: copiedEtag };
     },
     async delete(Key) {
       await cos.deleteObject({ Bucket, Region, Key });

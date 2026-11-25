@@ -16,7 +16,7 @@ export interface AssetObjectStore {
   audioPlaybackUrl?(key: string, contentType: string): string;
   hlsSegmentUrl?(key: string, expiresIn: number): string;
   materialUrl?(key: string): string;
-  head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
+  head(key: string): Promise<{ size: number; etag: string; sha256?: string; contentType?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   readMedia?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   putImage?(
@@ -31,6 +31,7 @@ export interface AssetObjectStore {
     stream: Readable,
     sizeBytes: number,
     sha256: string,
+    contentMd5: string,
     signal: AbortSignal,
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
   readAudio?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
@@ -46,7 +47,13 @@ export interface AssetObjectStore {
     expected: { sizeBytes: number; etag: string; sha256?: string },
     signal: AbortSignal,
   ): Promise<void>;
-  copy(source: string, target: string, etag: string, acl?: 'private'): Promise<void>;
+  copy(
+    source: string,
+    target: string,
+    etag: string,
+    acl?: 'private',
+    replacement?: { contentType: string; sha256: string; signal: AbortSignal },
+  ): Promise<{ etag: string } | void>;
   delete(key: string): Promise<void>;
 }
 

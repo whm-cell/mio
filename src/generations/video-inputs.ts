@@ -1,57 +1,71 @@
-import { Pool } from 'pg';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { MAX_ASSET_BYTES } from '../assets/contracts.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
+import type { AssetStore } from '../assets/store.ts';
+import { GenerationError } from './errors.ts';
 import type { VideoAssetReference } from './video-contracts.ts';
+import type { VideoJobCommand } from './video-execution.ts';
 
-/** A signed reference is issued only after rechecking the persisted owner's ready asset. */
-export function createVideoInputResolver(databaseURL: string, objects: AssetObjectStore) {
-  const pool = new Pool({ connectionString: databaseURL, max: 2 });
-  let closing: Promise<void> | undefined;
+/** Resolve only ready objects owned by the requesting user. Sign after all checks pass. */
+export function createVideoInputResolver(
+  store: Pick<AssetStore, 'readyOwned'>,
+  objects: AssetObjectStore,
+) {
+  const inspect = async (
+    ownerId: string,
+    references: readonly VideoAssetReference[],
+    signal: AbortSignal,
+    expected?: VideoJobCommand['inputObjects'],
+  ): Promise<NonNullable<VideoJobCommand['inputObjects']>> => {
+    if (!references.length) return {};
+    signal.throwIfAborted();
+    const ids = [...new Set(references.map((input) => input.assetId))];
+    const assets = await store.readyOwned(ownerId, ids);
+    const byId = new Map(assets.map((asset) => [asset.id, asset]));
+    for (const reference of references) {
+      const asset = byId.get(reference.assetId);
+      if (!asset) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
+      if (!asset.content_type.startsWith(`${reference.mediaType ?? 'image'}/`))
+        throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
+    }
+    if (!objects.materialUrl)
+      throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+    const identities: NonNullable<VideoJobCommand['inputObjects']> = {};
+    for (const id of ids) {
+      signal.throwIfAborted();
+      const asset = byId.get(id)!;
+      const head = await objects.head(asset.raw_key).catch((error: unknown) => {
+        if ((error as { statusCode?: number } | null)?.statusCode === HTTP_STATUS.NOT_FOUND)
+          throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
+        throw error;
+      });
+      signal.throwIfAborted();
+      const frozen = expected?.[id];
+      if (
+        head.size !== Number(asset.size_bytes) ||
+        head.size < 1 ||
+        head.size > MAX_ASSET_BYTES ||
+        !head.etag ||
+        (asset.raw_etag && asset.raw_etag !== head.etag) ||
+        (expected && (frozen?.key !== asset.raw_key || frozen.etag !== head.etag))
+      )
+        throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
+      identities[id] = { key: asset.raw_key, etag: head.etag };
+    }
+    return identities;
+  };
   return {
+    inspect,
     async resolve(
       ownerId: string,
       references: readonly VideoAssetReference[],
       signal: AbortSignal,
+      expected?: VideoJobCommand['inputObjects'],
     ) {
-      const urls: Record<string, string> = {};
-      if (!references.length) return urls;
-      if (!objects.materialUrl) throw new Error('VIDEO_INPUT_UNAVAILABLE');
-      const ids = [...new Set(references.map((input) => input.assetId))];
-      const assets = (
-        await pool.query<{
-          id: string;
-          raw_key: string;
-          content_type: string;
-          size_bytes: string;
-        }>(
-          `SELECT id,raw_key,content_type,size_bytes FROM mio_assets
-          WHERE owner_id=$1 AND id=ANY($2::uuid[]) AND state='ready' AND raw_key IS NOT NULL`,
-          [ownerId, ids],
-        )
-      ).rows;
-      for (const reference of references) {
-        signal.throwIfAborted();
-        const asset = assets.find((item) => item.id === reference.assetId);
-        if (!asset) throw new Error('VIDEO_INPUT_UNAVAILABLE');
-        const type = asset.content_type.split('/')[0];
-        if (
-          !['image', 'audio', 'video'].includes(type!) ||
-          (reference.mediaType ?? 'image') !== type
-        )
-          throw new Error('VIDEO_INPUT_INVALID');
-        const actual = await objects.head(asset.raw_key);
-        if (
-          actual.size !== Number(asset.size_bytes) ||
-          actual.size < 1 ||
-          actual.size > 1024 * 1024 * 1024 ||
-          !actual.etag
-        )
-          throw new Error('VIDEO_INPUT_CHANGED');
-        urls[asset.id] = objects.materialUrl(asset.raw_key);
-      }
-      return urls;
-    },
-    close() {
-      return (closing ??= pool.end());
+      const identities = await inspect(ownerId, references, signal, expected);
+      return Object.fromEntries(
+        Object.entries(identities).map(([id, { key }]) => [id, objects.materialUrl!(key)]),
+      );
     },
   };
 }

@@ -5,8 +5,8 @@ import type {
   WorkerResourceClass,
   WorkerTelemetryEvent,
 } from '@mio/compute-contracts';
-import type { Pool } from './database.ts';
-import type { WorkerInstanceRow } from './worker-observability-store.ts';
+import type { Pool } from 'pg';
+import type { WorkerInstanceRow } from './store.ts';
 
 const STALE_MS = 15_000;
 const OFFLINE_MS = 60_000;

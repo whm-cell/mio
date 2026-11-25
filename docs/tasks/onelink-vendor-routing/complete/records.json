@@ -23,12 +23,12 @@
           "purpose": "pnpm providers:route <--stdin | routes.json>（64 KiB 有界普通文件/stdin 读取）幂等平台路由导入入口"
         },
         {
-          "path": "src/compute/service.ts",
-          "purpose": "图片任务必填 ImageRouteConfig 动态校验、defaultImageWatermark 合成、canonicalImageRouteConfig 信封 AAD 绑定与单用户验证落库"
+          "path": "src/generations/admission.ts",
+          "purpose": "现行图片准入按模型路由合成有效水印并冻结标准化 ImageRouteConfig，旧 MQ 信封见迁移说明。"
         },
         {
-          "path": "src/compute/store.ts",
-          "purpose": "图片任务 route_snapshot 持久化，以及对缺失合法路由的存量未发 image.request（rejected / IMAGE_HANDLER_UNAVAILABLE）与在途 image.query（failed / IMAGE_QUERY_FAILED）双向 fail-closed 拦截"
+          "path": "src/generations/store.ts",
+          "purpose": "现行 A 图片任务在准入持久化 route_snapshot，旧 MQ 路由异常处理见迁移说明。"
         },
         {
           "path": "src/dsh/onelink.ts",
@@ -45,6 +45,10 @@
         {
           "path": "docs/integrations/onelink.md",
           "purpose": "src/providers/onelink/router.ts 与 compute/src/providers/onelink/{shared,openai,volcengine,vidu,kling,router} 四原厂纯驱动边界及 Kling referenceFormat 显式编码规范"
+        },
+        {
+          "path": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md",
+          "purpose": "记录旧图片 MQ 命令、查询和凭据信封的退役与切换。"
         }
       ],
       "outcomes": "按 DESIGN-OVER-001 单轨落地平台级模型路由表 `mio_provider_model_routes` 与单用户验证表 `mio_provider_model_verifications`（主键 `(provider_id, model_key, operation)`；保持用户 Key `/v1/models` 动态发现为唯一目录成员权威，退役运行时 `mio_provider_model_adaptations` 读取、`providers:adapt`、内置种子表及旧 4-profile 硬编码枚举，同时非破坏性保留历史 `mio_provider_model_adaptations` 表并幂等回填命中有效路由的 `verified` 记录，源码、脚本、配置与 `dist` 编译产物零模型/系列名硬编码）；提供 `pnpm providers:route <--stdin | routes.json>`（64 KiB 有界输入读取，内容未变不递增 `declaration_version`）；将 `ImageCommandV1` 与 `ImageQueryCommandV1` 的 `route: ImageRouteConfig` 设为必填并纳入信封加密 AAD 绑定及 `imageOutputIndex` `0..15` 上界；在 Service A 将有效路由注入文本对话与图片动态准入（`catalogView` 预建 `verifications` Map 实现严格 `O(M+P+R+V)`），并在对话回执与图片材料化完成后按 `(config_id, model_key, credential_version, catalog_version, declaration_version)` 元组幂等登记当前用户 `verified`；将 Worker B 单体图片协议拆分为 `compute/src/providers/onelink/{shared,openai,volcengine,vidu,kling,router}` 四原厂纯协议驱动，对缺失合法路由的存量未发 `image.request` 与在途 `image.query` 分别 fail-closed 结算 `rejected` / `IMAGE_HANDLER_UNAVAILABLE` 与 `failed` / `IMAGE_QUERY_FAILED`。",

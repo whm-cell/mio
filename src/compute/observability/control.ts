@@ -10,10 +10,10 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createId } from '@mio/foundation/identifiers';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
-import type { Pool } from './database.ts';
-import { computeTransaction } from './database.ts';
-import { WorkerControlPublishRejected } from '../integrations/rabbitmq.ts';
-import type { WorkerInstanceRow, WorkerObservabilityStore } from './worker-observability-store.ts';
+import type { Pool } from 'pg';
+import { computeTransaction } from '../database.ts';
+import { WorkerControlPublishRejected } from '../../integrations/rabbitmq.ts';
+import type { WorkerInstanceRow, WorkerObservabilityStore } from './store.ts';
 
 export class WorkerOpsError extends HttpError {}
 

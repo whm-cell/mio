@@ -13,13 +13,13 @@ import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import {
   startWorkerObservability,
   WorkerControlStore,
-} from '../../src/compute/worker-observability-control.ts';
-import { WorkerObservabilityQueries } from '../../src/compute/worker-observability-queries.ts';
+} from '../../src/compute/observability/control.ts';
+import { WorkerObservabilityQueries } from '../../src/compute/observability/queries.ts';
 import {
   checkWorkerObservabilitySchema,
   workerObservabilitySchemaSQL,
-} from '../../src/compute/worker-observability-schema.ts';
-import { WorkerObservabilityStore } from '../../src/compute/worker-observability-store.ts';
+} from '../../src/compute/observability/schema.ts';
+import { WorkerObservabilityStore } from '../../src/compute/observability/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 const ids = ['worker-a', 'worker-b', 'worker-c', 'worker-unknown'];

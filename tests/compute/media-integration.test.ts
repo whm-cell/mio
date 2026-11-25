@@ -26,9 +26,9 @@ import type { MediaStore as WorkerObjects } from '../../compute/src/media-worker
 import { ResourceSlots } from '../../compute/src/resource-slots.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
-import { createMediaHandler } from '../../src/compute/media-http.ts';
-import { createMediaService } from '../../src/compute/media-service.ts';
-import { MediaStore } from '../../src/compute/media-store.ts';
+import { createMediaHandler } from '../../src/compute/media/http.ts';
+import { createMediaService } from '../../src/compute/media/service.ts';
+import { MediaStore } from '../../src/compute/media/store.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeBroker, MediaPublishRejected } from '../../src/integrations/rabbitmq.ts';
 import { authDatabase } from '../support/auth-database.ts';

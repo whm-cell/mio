@@ -1,4 +1,4 @@
-import type { Pool } from './database.ts';
+import type { Pool } from 'pg';
 
 export const workerObservabilitySchemaSQL = `
 CREATE TABLE IF NOT EXISTS mio_compute_worker_instances (

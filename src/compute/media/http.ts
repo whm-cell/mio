@@ -2,9 +2,9 @@ import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { MEDIA_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
-import type { AssetPrincipal } from '../assets/contracts.ts';
-import { RequestBodyError } from '../http-request.ts';
-import { startHttpResponse, writeApiError } from '../http-response.ts';
+import type { AssetPrincipal } from '../../assets/contracts.ts';
+import { RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
 import {
   allowJsonWrite,
   allowRouteMethod,
@@ -12,11 +12,11 @@ import {
   readJsonAndRecheck,
   replyToPreflight,
   requestCookieHeaders,
-} from '../http-route-guard.ts';
-import { HLS_PLAYLIST_CONTENT_TYPE } from './media-hls.ts';
-import { MediaError } from './media-model.ts';
-import { ComputeError } from './errors.ts';
-import type { createMediaService } from './media-service.ts';
+} from '../../http-route-guard.ts';
+import { HLS_PLAYLIST_CONTENT_TYPE } from './hls.ts';
+import { MediaError } from './model.ts';
+import { ComputeError } from '../errors.ts';
+import type { createMediaService } from './service.ts';
 
 export function createMediaHandler(
   service: ReturnType<typeof createMediaService>,

@@ -22,10 +22,10 @@ import { Pool } from 'pg';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import type { ComputeConfig } from '../../src/compute/config.ts';
-import { createComputeHandler } from '../../src/compute/http.ts';
+import { createComputeHandler } from '../../src/compute/transcode/http.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
-import { createComputeService } from '../../src/compute/service.ts';
-import { createComputeStore } from '../../src/compute/store.ts';
+import { createComputeService } from '../../src/compute/transcode/service.ts';
+import { createComputeStore } from '../../src/compute/transcode/store.ts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { authDatabase } from '../support/auth-database.ts';
 

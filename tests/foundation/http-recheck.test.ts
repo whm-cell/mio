@@ -3,7 +3,7 @@ import type { Server } from 'node:http';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createProviderHandler } from '../../src/providers/http.ts';
 import { createConversationHandler } from '../../src/conversations/http.ts';
-import { createComputeHandler } from '../../src/compute/http.ts';
+import { createComputeHandler } from '../../src/compute/transcode/http.ts';
 import { createHandler } from '../../src/http.ts';
 
 let server: Server | undefined;

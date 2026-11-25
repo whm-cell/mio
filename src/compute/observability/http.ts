@@ -3,8 +3,8 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { RequestBodyError } from '../http-request.ts';
-import { startHttpResponse, writeApiError } from '../http-response.ts';
+import { RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
 import {
   allowJsonWrite,
   allowRouteMethod,
@@ -12,14 +12,11 @@ import {
   readJsonAndRecheck,
   replyToPreflight,
   requestCookieHeaders,
-} from '../http-route-guard.ts';
-import { WorkerOpsError } from './worker-observability-control.ts';
-import type { WorkerControlStore } from './worker-observability-control.ts';
-import { workerExecutionStates } from './worker-observability-queries.ts';
-import type {
-  WorkerExecutionFilters,
-  WorkerObservabilityQueries,
-} from './worker-observability-queries.ts';
+} from '../../http-route-guard.ts';
+import { WorkerOpsError } from './control.ts';
+import type { WorkerControlStore } from './control.ts';
+import { workerExecutionStates } from './queries.ts';
+import type { WorkerExecutionFilters, WorkerObservabilityQueries } from './queries.ts';
 
 const base = '/api/v1/admin/compute';
 const prefix = `${base}/`;

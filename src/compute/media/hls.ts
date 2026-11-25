@@ -1,9 +1,9 @@
 import { sha256Bytes } from '@mio/foundation/hash';
 import { MEDIA_MAX_FILES, mediaObjectPrefix } from '@mio/compute-contracts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { AssetError } from '../assets/contracts.ts';
-import type { AssetObjectStore } from '../assets/contracts.ts';
-import { MediaError } from './media-model.ts';
+import { AssetError } from '../../assets/contracts.ts';
+import type { AssetObjectStore } from '../../assets/contracts.ts';
+import { MediaError } from './model.ts';
 
 export const HLS_PLAYLIST_CONTENT_TYPE = 'application/vnd.apple.mpegurl';
 const PLAYLIST_LIMIT = 256 * 1024;

@@ -12,9 +12,9 @@ import { COMMAND_EXCHANGE, COMMAND_ROUTING_KEY } from '@mio/compute-contracts';
 import type { ComputeCommandV1 } from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
-import { createComputeService } from '../../src/compute/service.ts';
+import { createComputeService } from '../../src/compute/transcode/service.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
-import type { ComputeStore, JobRow } from '../../src/compute/store.ts';
+import type { ComputeStore, JobRow } from '../../src/compute/transcode/store.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 
 vi.mock('amqplib', () => ({ connect: vi.fn() }));

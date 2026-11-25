@@ -2,9 +2,9 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { RequestListener } from 'node:http';
 import { expect, it, vi } from 'vitest';
-import { createComputeHandler } from '../../src/compute/http.ts';
-import { createMediaHandler } from '../../src/compute/media-http.ts';
-import { createComputeOpsHandler } from '../../src/compute/ops-http.ts';
+import { createComputeHandler } from '../../src/compute/transcode/http.ts';
+import { createMediaHandler } from '../../src/compute/media/http.ts';
+import { createComputeOpsHandler } from '../../src/compute/observability/http.ts';
 import { createVideoGenerationHandler } from '../../src/generations/video-http.ts';
 
 const origin = 'http://127.0.0.1:4400';

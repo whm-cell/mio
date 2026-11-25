@@ -15,10 +15,10 @@ import type { AssetObjectStore, AssetPrincipal } from '../../src/assets/contract
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
-import { createMediaHandler } from '../../src/compute/media-http.ts';
-import { createMediaService } from '../../src/compute/media-service.ts';
-import { MediaStore } from '../../src/compute/media-store.ts';
-import type { MediaJobRow } from '../../src/compute/media-model.ts';
+import { createMediaHandler } from '../../src/compute/media/http.ts';
+import { createMediaService } from '../../src/compute/media/service.ts';
+import { MediaStore } from '../../src/compute/media/store.ts';
+import type { MediaJobRow } from '../../src/compute/media/model.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;

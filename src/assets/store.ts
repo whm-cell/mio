@@ -3,7 +3,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import { checkAssetSchema } from './schema.ts';
 import { AssetError } from './contracts.ts';
-import { mediaHlsPath } from '../compute/media-hls.ts';
+import { mediaHlsPath } from '../compute/media/hls.ts';
 
 const log = createLogger('app', 'asset-store');
 

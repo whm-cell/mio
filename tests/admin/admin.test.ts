@@ -16,7 +16,7 @@ import { AUTH_BASE_PATH, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
-import { createComputeOpsHandler } from '../../src/compute/ops-http.ts';
+import { createComputeOpsHandler } from '../../src/compute/observability/http.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';

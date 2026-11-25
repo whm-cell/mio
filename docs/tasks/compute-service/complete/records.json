@@ -7,11 +7,11 @@
       "title": "A 侧计算任务与可靠投递、结果登记",
       "locations": [
         {
-          "path": "src/compute/service.ts",
+          "path": "src/compute/transcode/service.ts",
           "purpose": "任务受理、幂等与用户资源校验"
         },
         {
-          "path": "src/compute/store.ts",
+          "path": "src/compute/transcode/store.ts",
           "purpose": "事务 outbox/inbox、任务和结果登记"
         },
         {
@@ -93,12 +93,12 @@
           "purpose": "broker:init 仅针对精确旧版 v1 B 权限的无损幂等增量升级与未知漂移 LOCAL_BROKER_CONFLICT 保护"
         },
         {
-          "path": "src/compute/store.ts",
-          "purpose": "视频活动任务锁（672049923，10/500）与图片活动任务锁（672049924，32/1000，accepted/materializing）彻底分离及 SKIP LOCKED 出站扫描"
+          "path": "src/compute/transcode/store.ts",
+          "purpose": "现行单路转码的任务配额事务与出站扫描，旧图片活动任务锁属于迁移前实现。"
         },
         {
-          "path": "src/compute/service.ts",
-          "purpose": "单轮有界批量排空（32 图片/10 视频）、准入落库立即 wakePoll 合并续跑、指数退避与优雅关闭收敛"
+          "path": "src/compute/transcode/service.ts",
+          "purpose": "现行单路转码的任务唤醒、轮询与关闭入口，旧图片执行链见迁移说明。"
         },
         {
           "path": "src/integrations/rabbitmq.ts",
@@ -123,6 +123,10 @@
         {
           "path": "tests/compute/image-concurrency.test.ts",
           "purpose": "隔离 PostgreSQL、mio-test 临时 vhost RabbitMQ 与真实 Service A/Worker B 在满 10 视频阻塞下 15 并发图片物化、33 活动图片精确 429 与通道隔离重投零重复 POST 端到端测试"
+        },
+        {
+          "path": "docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md",
+          "purpose": "记录旧图片执行链的排空、对账与迁入 A。"
         }
       ],
       "outcomes": "在不改变视频转码队列 mio.compute.commands.v1 单并发（prefetch 1）与 10/500 配额、且保持已接受对话生图工具能力完全兼容的前提下，落地独立图片命令队列 mio.compute.image.commands.v1（routing key image.v1，配持久 quorum DLX/DLQ image.dead.v1）及本地 broker:init 针对精确旧版 v1 B 权限的无损幂等升级；在 Service A 解耦视频与图片活动任务配额及事务锁（图片每用户 32 / 全局 1000，统计 accepted 与 materializing），升级 RESULT_QUEUE prefetch=4 与关闭在途结果排空，提供准入落库后 wakePoll 立即唤醒与单轮最多 32 图片 / 10 视频的有界批量排空；在 Worker B（compute/src/{adapters/rabbitmq,maintenance,main}.ts）新增独立图片消费通道（prefetch 4），按 jobId 做进程内串行互斥并保留旧队列遗留图片兼容，对 IMAGE_COMMAND_CONFLICT / IMAGE_QUERY_UNKNOWN 毒消息直接死信，对单条图片可重试异常执行图片通道级隔离排空与有界重开而不中断慢速 FFmpeg 视频转码或其他并发健康图片，同步全部受影响公共规范与任务文档。",
@@ -172,12 +176,12 @@
       "title": "通用媒体处理内核与基础操作",
       "locations": [
         {
-          "path": "src/compute/media-http.ts",
+          "path": "src/compute/media/http.ts",
           "purpose": "本人媒体任务的受理、幂等查询与控制"
         },
         {
-          "path": "src/compute/media-results.ts",
-          "purpose": "媒体 manifest 和产物核验与原子登记"
+          "path": "src/compute/media/store.ts",
+          "purpose": "在事务中登记经过核验的媒体结果与产物并裁决终态。"
         },
         {
           "path": "compute/src/media-runtime.ts",
@@ -186,6 +190,10 @@
         {
           "path": "docs/apis/compute.md",
           "purpose": "计算服务 HTTP 契约与操作范围"
+        },
+        {
+          "path": "src/compute/media/service.ts",
+          "purpose": "核验媒体 manifest 和引用对象的完整性。"
         }
       ],
       "outcomes": "提供 `/api/v1/compute/media` 受理、本人查询、取消、重试和对账恢复。事务核验结果、登记资产并裁决状态，工作端保持三次执行上限与未知副作用恢复，所有新媒体产物和 manifest 显式 private。完成探测、参考视频准备、截取、抽帧、场景检测、分割、导出及音频提取、波形、重封装和拼接共 11 种操作。合规参考仅探测并继续使用原件。返修使单任务恢复取消不打断其他任务，受阻队列不牵连健康路由，并按实际视频流末端抽帧和裁剪重封装音轨。",
@@ -217,7 +225,7 @@
           "purpose": "已持久化意图的容量调度、幂等恢复"
         },
         {
-          "path": "src/compute/media-hls.ts",
+          "path": "src/compute/media/hls.ts",
           "purpose": "本人主子清单与分片短签、对象完整性校验"
         },
         {
@@ -366,7 +374,7 @@
           "purpose": "A 侧持续遥测落盘与挂载至 /api/v1/admin 的计算管理路由装配"
         },
         {
-          "path": "src/compute/ops-http.ts",
+          "path": "src/compute/observability/http.ts",
           "purpose": "复用超级管理员会话 mio.admin_session 的纯 JSON 计算运维接口（/api/v1/admin/compute/*）"
         },
         {

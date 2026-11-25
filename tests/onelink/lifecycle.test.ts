@@ -7,7 +7,7 @@ import WebServer from '@deepseek-ai/dsh-host-webserver';
 import { expect, it, vi } from 'vitest';
 import * as Mio from '../../src/plugin.ts';
 import * as Engines from '../../src/dsh/conversations.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
+import { ComputeStore } from '../../src/compute/transcode/store.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
 import { ConversationStore } from '../../src/conversations/store.ts';
 import { authDatabase } from '../support/auth-database.ts';

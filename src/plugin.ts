@@ -61,22 +61,19 @@ import { startAssetDerivatives } from './assets/derivatives.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
 import { readComputeConfig } from './compute/config.ts';
-import { createComputeStore } from './compute/store.ts';
-import { createComputeService } from './compute/service.ts';
-import { createComputeHandler } from './compute/http.ts';
-import { createMediaHandler } from './compute/media-http.ts';
-import { createMediaService } from './compute/media-service.ts';
-import { createMediaStore } from './compute/media-store.ts';
-import { createComputeOpsHandler } from './compute/ops-http.ts';
+import { createComputeStore } from './compute/transcode/store.ts';
+import { createComputeService } from './compute/transcode/service.ts';
+import { createComputeHandler } from './compute/transcode/http.ts';
+import { createMediaHandler } from './compute/media/http.ts';
+import { createMediaService } from './compute/media/service.ts';
+import { createMediaStore } from './compute/media/store.ts';
+import { createComputeOpsHandler } from './compute/observability/http.ts';
 import {
   openWorkerObservabilityPool,
   WorkerObservabilityStore,
-} from './compute/worker-observability-store.ts';
-import { WorkerObservabilityQueries } from './compute/worker-observability-queries.ts';
-import {
-  startWorkerObservability,
-  WorkerControlStore,
-} from './compute/worker-observability-control.ts';
+} from './compute/observability/store.ts';
+import { WorkerObservabilityQueries } from './compute/observability/queries.ts';
+import { startWorkerObservability, WorkerControlStore } from './compute/observability/control.ts';
 import { ComputeBroker } from './integrations/rabbitmq.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';

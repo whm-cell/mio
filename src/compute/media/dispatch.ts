@@ -1,10 +1,10 @@
 import { epochMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
 import type { MediaResult } from '@mio/compute-contracts';
-import { ComputeBroker, MediaPublishRejected } from '../integrations/rabbitmq.ts';
-import type { ComputeConfig } from './config.ts';
-import type { MediaStore } from './media-store.ts';
-import type { MediaCommandLane } from './media-model.ts';
+import { ComputeBroker, MediaPublishRejected } from '../../integrations/rabbitmq.ts';
+import type { ComputeConfig } from '../config.ts';
+import type { MediaStore } from './store.ts';
+import type { MediaCommandLane } from './model.ts';
 
 const log = createLogger('app', 'media-dispatch');
 

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { expect, it, vi } from 'vitest';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
+import { ComputeStore } from '../../src/compute/transcode/store.ts';
 import { generationFixture } from '../generations/fixture.ts';
 
 it('runs 15 images through A while ten video jobs occupy the independent B admission quota', async () => {

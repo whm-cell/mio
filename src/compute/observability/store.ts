@@ -7,10 +7,10 @@ import type {
   WorkerTelemetryGap,
 } from '@mio/compute-contracts';
 import { Pool } from 'pg';
-import type { PoolClient } from './database.ts';
-import { checkWorkerObservabilitySchema } from './worker-observability-schema.ts';
+import type { PoolClient } from 'pg';
+import { checkWorkerObservabilitySchema } from './schema.ts';
 import { createLogger } from '@mio/foundation/logging';
-import { computeTransaction } from './database.ts';
+import { computeTransaction } from '../database.ts';
 
 type WorkerMessage = WorkerTelemetry | WorkerLimitsResult;
 type LimitStatus = WorkerLimitsResult['status'] | 'pending';

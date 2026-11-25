@@ -1,8 +1,8 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { RequestBodyError } from '../http-request.ts';
-import { startHttpResponse, writeApiError } from '../http-response.ts';
+import { RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
 import {
   allowJsonWrite,
   allowRouteMethod,
@@ -10,9 +10,9 @@ import {
   readJsonAndRecheck,
   replyToPreflight,
   requestCookieHeaders,
-} from '../http-route-guard.ts';
-import type { AssetPrincipal } from '../assets/contracts.ts';
-import { ComputeError } from './errors.ts';
+} from '../../http-route-guard.ts';
+import type { AssetPrincipal } from '../../assets/contracts.ts';
+import { ComputeError } from '../errors.ts';
 import type { createComputeService } from './service.ts';
 
 type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;

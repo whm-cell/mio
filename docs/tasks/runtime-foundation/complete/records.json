@@ -23,7 +23,7 @@
           "purpose": "从数据库实现解耦的计算领域异常"
         },
         {
-          "path": "src/compute/service.ts",
+          "path": "src/compute/transcode/service.ts",
           "purpose": "A侧计算日志关联、时间工具消费、结果拒绝和恢复语义的应用入口"
         },
         {

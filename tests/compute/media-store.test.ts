@@ -5,12 +5,10 @@ import { MEDIA_PROFILE, MEDIA_VERSION, mediaObjectPrefix } from '@mio/compute-co
 import type { MediaManifest, MediaRequest, MediaResult } from '@mio/compute-contracts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
+import { ComputeStore } from '../../src/compute/transcode/store.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
-import { MediaStore } from '../../src/compute/media-store.ts';
-import { acceptMedia } from '../../src/compute/media-results.ts';
-import { controlMedia } from '../../src/compute/media-mutations.ts';
-import type { MediaJobRow } from '../../src/compute/media-model.ts';
+import { acceptMedia, controlMedia, MediaStore } from '../../src/compute/media/store.ts';
+import type { MediaJobRow } from '../../src/compute/media/model.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;

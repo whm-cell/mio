@@ -4,10 +4,10 @@ import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import { COMPUTE_PROFILE, COMPUTE_VERSION } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
-import { checkComputeSchema } from './schema.ts';
-import { ComputeError } from './errors.ts';
-import { checkComputeCapacity, lockComputeCapacity } from './capacity.ts';
-import { computeTransaction } from './database.ts';
+import { checkComputeSchema } from '../schema.ts';
+import { ComputeError } from '../errors.ts';
+import { checkComputeCapacity, lockComputeCapacity } from '../capacity.ts';
+import { computeTransaction } from '../database.ts';
 const log = createLogger('app', 'compute-store');
 
 export interface JobRow {

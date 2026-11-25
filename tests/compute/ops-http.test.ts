@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createAdminHandler, readAdminSessionCookie } from '../../src/admin/http.ts';
 import type { AdminService } from '../../src/admin/service.ts';
-import { createComputeOpsHandler } from '../../src/compute/ops-http.ts';
+import { createComputeOpsHandler } from '../../src/compute/observability/http.ts';
 
 const servers: ReturnType<typeof createServer>[] = [];
 afterEach(async () => {

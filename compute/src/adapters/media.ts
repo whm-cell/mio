@@ -31,7 +31,11 @@ import {
   AUDIO_MIME_TYPES,
   COMPUTE_MAX_MEDIA_BYTES,
 } from '@mio/compute-contracts';
-import type { AudioInspectCommandV1, AudioInspection } from '@mio/compute-contracts';
+import type {
+  AudioInspectCommandV1,
+  AudioInspection,
+  VideoProbeMetadataV1,
+} from '@mio/compute-contracts';
 import { isVideoTrack, videoDisplayGeometry } from '../video-display.ts';
 import type { VideoDisplayStream } from '../video-display.ts';
 
@@ -497,16 +501,6 @@ async function probe(path: string, signal: AbortSignal): Promise<Probe> {
   return { duration, streams: value.streams };
 }
 
-export interface VideoProbeMetadata {
-  container: 'mp4';
-  videoCodec: string;
-  width: number;
-  height: number;
-  durationSeconds: number;
-  hasAudio: boolean;
-  audioCodec: string | null;
-}
-
 async function hasMp4Brand(file: FileHandle, offset: number, length: number): Promise<boolean> {
   if (length < 8 || length > PROCESS_STDOUT_LIMIT || length % 4 !== 0) return false;
   const brands = Buffer.alloc(length);
@@ -878,7 +872,7 @@ async function decodeVideoProbe(
 export async function probeVideoFile(
   path: string,
   signal: AbortSignal,
-): Promise<VideoProbeMetadata> {
+): Promise<VideoProbeMetadataV1> {
   try {
     signal.throwIfAborted();
     const openMedia = await requireMp4File(path, signal);

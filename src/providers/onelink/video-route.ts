@@ -14,7 +14,7 @@ import { happyhorsePrompt } from '../../integrations/onelink/video/happyhorse-pr
 import type { VideoParameterSpec, VideoRouteConfig } from '../contracts.ts';
 
 /** Enabled only when the matching executor and result materializer have been assembled. */
-export const VIDEO_RUNTIME_SUPPORTED_DRIVERS: ReadonlySet<VideoDriver> = new Set([
+const VIDEO_RUNTIME_SUPPORTED_DRIVERS: ReadonlySet<VideoDriver> = new Set([
   'volcengine-ark-videos',
   'kling-videos',
   'vidu-videos',

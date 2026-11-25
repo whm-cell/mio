@@ -6,7 +6,7 @@ import { GenerationError } from '../errors.ts';
 export const VIDEO_MAX_HTTP_BODY_BYTES = 256 * 1024;
 export const VIDEO_MAX_PROMPT_CODEPOINTS = 5_000;
 /** Parser-level array cap; a model route may impose a smaller value. */
-export const VIDEO_MAX_INPUT_ITEMS = 16;
+const VIDEO_MAX_INPUT_ITEMS = 16;
 export const VIDEO_USER_QUOTA = 5;
 export const VIDEO_GLOBAL_QUOTA = 50;
 
@@ -47,7 +47,8 @@ export const VIDEO_JOB_STATES = [
 ] as const;
 export type VideoJobState = (typeof VIDEO_JOB_STATES)[number];
 
-export const VIDEO_EXECUTION_PHASES = [
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Execution phases define the VideoJobView stage type.
+const VIDEO_EXECUTION_PHASES = [
   'ready',
   'submitting',
   'waiting',
@@ -55,16 +56,11 @@ export const VIDEO_EXECUTION_PHASES = [
   'materializing',
   'done',
 ] as const;
-export type VideoExecutionPhase = (typeof VIDEO_EXECUTION_PHASES)[number];
+type VideoExecutionPhase = (typeof VIDEO_EXECUTION_PHASES)[number];
 
-export const VIDEO_OUTPUT_PHASES = [
-  'pending',
-  'staging',
-  'probed',
-  'registered',
-  'failed',
-] as const;
-export type VideoOutputPhase = (typeof VIDEO_OUTPUT_PHASES)[number];
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Output phases define the VideoOutputView status type.
+const VIDEO_OUTPUT_PHASES = ['pending', 'staging', 'probed', 'registered', 'failed'] as const;
+type VideoOutputPhase = (typeof VIDEO_OUTPUT_PHASES)[number];
 
 export interface VideoAssetReference {
   assetId: string;
@@ -140,7 +136,7 @@ export interface VideoJobView {
   recovery: { available: boolean; reason: string | null };
 }
 
-export interface VideoOutputView {
+interface VideoOutputView {
   index: number;
   assetId: string | null;
   mediaType: 'video';

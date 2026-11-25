@@ -46,10 +46,7 @@ export function createVideoInputResolver(
         head.size < 1 ||
         head.size > MAX_ASSET_BYTES ||
         !head.etag ||
-        // Uploaded originals store their staging ETag. The raw ETag comes from HEAD.
-        (!asset.raw_key.startsWith('mio/raw/') &&
-          asset.source_etag &&
-          asset.source_etag !== head.etag) ||
+        (asset.raw_etag && asset.raw_etag !== head.etag) ||
         (expected && (frozen?.key !== asset.raw_key || frozen.etag !== head.etag))
       )
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');

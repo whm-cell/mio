@@ -81,6 +81,7 @@ export class AssetStore {
     return row;
   }
 
+  /** Uploaded originals carry a staging ETag. Generated raw assets have no separate staging key. */
   async readyOwned(ownerId: string, ids: readonly string[]) {
     return (
       await this.pool.query<{
@@ -88,9 +89,12 @@ export class AssetStore {
         raw_key: string;
         content_type: string;
         size_bytes: string;
-        source_etag: string | null;
+        raw_etag: string | null;
       }>(
-        `SELECT id,raw_key,content_type,size_bytes,source_etag FROM mio_assets
+        `SELECT id,raw_key,content_type,size_bytes,
+         CASE WHEN raw_key LIKE 'mio/raw/%' AND staging_key<>raw_key THEN NULL
+              ELSE source_etag END AS raw_etag
+         FROM mio_assets
          WHERE owner_id=$1 AND id=ANY($2::uuid[]) AND state='ready' AND raw_key IS NOT NULL`,
         [ownerId, ids],
       )

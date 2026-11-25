@@ -247,22 +247,23 @@ async function assetHttpFixture() {
       derived = false,
     ) {
       const assetId = randomUUID();
-      const key = derived ? `mio/derived/${assetId}` : `mio/raw/${assetId}`;
+      const key = `mio/raw/${assetId}/${randomUUID()}`;
       const head = { size: 100, etag: 'raw-etag' };
       heads.set(key, head);
       await pool.query(
         `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,
-         raw_key,state,source_etag,expires_at,staging_deleted_at)
-         VALUES($1,$2,'fixture',$3,$4,$5,$6,$7,$8,now(),now())`,
+         raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind)
+         VALUES($1,$2,'fixture',$3,$4,$5,$6,$7,$8,now(),now(),$9)`,
         [
           assetId,
           assetOwner,
           contentType,
           head.size,
-          `mio/staging/${assetId}`,
+          derived ? null : `mio/staging/${assetId}`,
           key,
           state,
           derived ? head.etag : 'staging-etag',
+          derived ? 'derived' : 'original',
         ],
       );
       return { assetId, key, head };
@@ -311,7 +312,7 @@ describe('video asset admission over HTTP', () => {
       const outside = await f.addAsset(randomUUID());
       const pending = await f.addAsset(actor.userId, 'pending');
       const original = await f.addAsset();
-      const derived = await f.addAsset(actor.userId, 'ready', 'image/png', true);
+      const derived = await f.addAsset(actor.userId, 'ready', 'video/mp4', true);
       const missing = await f.addAsset();
       f.heads.delete(missing.key);
       f.heads.set(derived.key, { ...derived.head, etag: 'replaced-etag' });
@@ -328,7 +329,7 @@ describe('video asset admission over HTTP', () => {
       await rejected({ assetId: original.assetId, mediaType: 'video' }, 400, 'VIDEO_INPUT_INVALID');
       expect(f.objects.head).not.toHaveBeenCalled();
       await rejected({ assetId: missing.assetId }, 409, 'VIDEO_INPUT_CHANGED');
-      await rejected({ assetId: derived.assetId }, 409, 'VIDEO_INPUT_CHANGED');
+      await rejected({ assetId: derived.assetId, mediaType: 'video' }, 409, 'VIDEO_INPUT_CHANGED');
       f.objects.head.mockResolvedValueOnce({ ...original.head, size: original.head.size + 1 });
       await rejected({ assetId: original.assetId }, 409, 'VIDEO_INPUT_CHANGED');
       f.objects.head.mockRejectedValueOnce(

@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -10,7 +11,10 @@ import COS from 'cos-nodejs-sdk-v5';
  */
 export function apply(ctx: Context) {
   const onelinkOrigin = process.env.MIO_TEST_ONELINK_ORIGIN ?? '';
-  const cosOrigin = process.env.MIO_TEST_COS_ORIGIN ?? '';
+  const cosUrl = new URL(process.env.MIO_TEST_COS_ORIGIN ?? '');
+  if (cosUrl.protocol !== 'http:' || cosUrl.hostname !== '127.0.0.1')
+    throw new Error('COS_FIXTURE_REQUIRES_LOOPBACK');
+  const cosOrigin = cosUrl.origin;
   let countedFixtureExecutions = 0;
   const negativeToolErrors: { toolCallId: string; code: string | null }[] = [];
 
@@ -41,6 +45,74 @@ export function apply(ctx: Context) {
   const originalHeadObject = COS.prototype.headObject;
   const originalPutObjectCopy = COS.prototype.putObjectCopy;
   const originalDeleteObject = COS.prototype.deleteObject;
+  const originalRequest = COS.prototype.request;
+
+  const copyObject = async (target: string, copySource: string, ifMatch?: string) => {
+    const slashIndex = copySource.indexOf('/');
+    const source = slashIndex >= 0 ? decodeURIComponent(copySource.slice(slashIndex + 1)) : '';
+    const response = await originalFetch(`${cosOrigin}/copy`, {
+      method: 'POST',
+      redirect: 'error',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source, target, ifMatch: ifMatch ?? null }),
+    });
+    if (!response.ok) {
+      throw Object.assign(new Error(`COS_COPY_${response.status}`), {
+        statusCode: response.status,
+      });
+    }
+    return { statusCode: 200, ETag: response.headers.get('etag') ?? '"copied"' };
+  };
+  const deleteObject = (key: string) =>
+    originalFetch(`${cosOrigin}/object/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+      redirect: 'error',
+    });
+
+  const requestObject = async ({
+    Key,
+    Method,
+    Body,
+    Headers: sentHeaders,
+  }: COS.RequestParams): Promise<COS.RequestResult> => {
+    if (Method !== 'PUT' && Method !== 'DELETE') throw new Error('COS_FIXTURE_UNSUPPORTED_REQUEST');
+    if (!Key) throw new Error('COS_FIXTURE_REQUEST_KEY_REQUIRED');
+    // SDK requests carry a zero-length stream. Consume it within the stub as the SDK would.
+    if (Body instanceof Readable) {
+      for await (const chunk of Body) {
+        if (chunk.length) throw new Error('COS_FIXTURE_REQUEST_BODY_NOT_EMPTY');
+      }
+    }
+    if (Method === 'PUT') {
+      const headers = new Headers(sentHeaders);
+      const source = headers.get('x-cos-copy-source');
+      const ifMatch = headers.get('x-cos-copy-source-if-match');
+      if (!source || !ifMatch || headers.get('x-cos-forbid-overwrite') !== 'true')
+        throw new Error('COS_FIXTURE_EXPECTED_CONDITIONAL_COPY');
+      const copied = await copyObject(Key, source, ifMatch);
+      return { statusCode: copied.statusCode, CopyObjectResult: { ETag: copied.ETag } };
+    }
+    const deleted = await deleteObject(Key);
+    if (!deleted.ok) {
+      throw Object.assign(new Error(`COS_DELETE_${deleted.status}`), {
+        statusCode: deleted.status,
+      });
+    }
+    return { statusCode: deleted.status, headers: {} };
+  };
+
+  type RequestCallback = (error: COS.CosError, result: COS.RequestResult) => void;
+
+  function request(params: COS.RequestParams, callback: RequestCallback): void;
+  function request(params: COS.RequestParams): Promise<COS.RequestResult>;
+  function request(params: COS.RequestParams, callback?: RequestCallback) {
+    const pending = requestObject(params);
+    if (!callback) return pending;
+    void pending.then(
+      (result) => callback(null, result),
+      (error: unknown) => Reflect.apply(callback, undefined, [error]),
+    );
+  }
 
   ctx.effect(() => {
     globalThis.fetch = interceptedFetch;
@@ -53,6 +125,7 @@ export function apply(ctx: Context) {
         `${cosOrigin}/object/${encodeURIComponent(params.Key)}`,
         {
           method: 'HEAD',
+          redirect: 'error',
         },
       );
       if (response.status === 404) {
@@ -74,37 +147,19 @@ export function apply(ctx: Context) {
       };
     } as unknown as typeof COS.prototype.headObject;
 
-    COS.prototype.putObjectCopy = async function (params: {
+    COS.prototype.putObjectCopy = function (params: {
       Key: string;
       CopySource: string;
       CopySourceIfMatch?: string;
     }) {
-      const slashIndex = params.CopySource.indexOf('/');
-      const source =
-        slashIndex >= 0 ? decodeURIComponent(params.CopySource.slice(slashIndex + 1)) : '';
-      const response = await originalFetch(`${cosOrigin}/copy`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          source,
-          target: params.Key,
-          ifMatch: params.CopySourceIfMatch ?? null,
-        }),
-      });
-      if (!response.ok) {
-        throw Object.assign(new Error(`COS_COPY_${response.status}`), {
-          statusCode: response.status,
-        });
-      }
-      return { statusCode: 200, ETag: response.headers.get('etag') ?? '"copied"' };
+      return copyObject(params.Key, params.CopySource, params.CopySourceIfMatch);
     } as unknown as typeof COS.prototype.putObjectCopy;
 
     COS.prototype.deleteObject = async function (params: { Key: string }) {
-      await originalFetch(`${cosOrigin}/object/${encodeURIComponent(params.Key)}`, {
-        method: 'DELETE',
-      });
+      await deleteObject(params.Key);
       return { statusCode: 204, headers: {} };
     } as unknown as typeof COS.prototype.deleteObject;
+    COS.prototype.request = request;
 
     return () => {
       if (globalThis.fetch === interceptedFetch) globalThis.fetch = originalFetch;
@@ -112,6 +167,7 @@ export function apply(ctx: Context) {
       COS.prototype.headObject = originalHeadObject;
       COS.prototype.putObjectCopy = originalPutObjectCopy;
       COS.prototype.deleteObject = originalDeleteObject;
+      COS.prototype.request = originalRequest;
     };
   });
 

@@ -380,6 +380,8 @@
 
 成功：200 返回最新优先的执行、协议、资源、归属、任务/attempt/inspection 身份与已知占槽时间。
 
+独立视频探测使用 `protocol="video.probe.v1"`，包含视频生成任务 `jobId` 及探测 `attemptId`，`inspectionId` 为 null。资源为 `probe`，占用一个槽。时间线提供实际下载、探测与收尾阶段。
+
 错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
 
 副作用：只读查询，无副作用。

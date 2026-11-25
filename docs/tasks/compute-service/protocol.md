@@ -63,6 +63,8 @@ B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/�
 
 成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份；`media` 只包含 ffprobe 得出的 `container`/`videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。尺寸使用已采用的 display rotation 规则，返回 1–65536 的安全整数；时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
 
+普通与启用观测的 B 从同一视频命令队列严格解析探测和转码，再按消息类型分发。探测与独立音频检测和通用媒体探测共用 `total`/`probe` 准入与相应 HOLD，转码使用 `total`/`encode`。同一 Worker 上在途的相同探测命令只操作一份本地临时文件，各投递在同一结果获确认后 ACK。相同 `messageId` 携带不同内容时按冲突拒收。
+
 ### `video.probe` 路由的同步要求
 
 保持 `version: 1`，无需换新 exchange 或 queue，但分别要在 `mio.compute.commands.v1` 交换机绑定 `video.probe.v1` 到现有 `mio.compute.commands.v1` 持久队列，以及将 `video.probe.result.v1` 绑定至现有 `mio.compute.results.v1` 队列。这是加性的 v1 topology 绑定；这些 bindings 与 A 端命令发布/结果消费适配未同步部署前，不能发送 probe。使用 `mandatory` 发布时新 routing key 没有 binding 必须被退回并保留上游重试现场，不能回退使用 `transcode.v1` 假装为转码。
@@ -99,6 +101,8 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 `media.encode`、`media.probe`、`media.control` 绑定既有命令交换机，`media.result` 绑定既有结果交换机，目标队列分别为 `mio.compute.media.encode`、`mio.compute.media.probe`、`mio.compute.media.control`、`mio.compute.media.results`。每条队列有专属 `.dlq`，死信沿既有方向的 DLX 可靠转发。`media.probe`、`scenes.detect` 和 `audio.waveform` 使用 probe 槽，其余使用 encode 槽。B 的单路转码和音频检测从同一进程内的 `total`、`encode`、`probe` 计数准入，占用保持至收尾，默认与最低部署硬上限为 `2/1/1`。各分类与总上限分别约束。
 
 Worker 控制使用 `worker.limits.command.<instanceId>` 绑定到对应实例的独立命令队列。`worker.telemetry` 结果路由同时承载 `worker.telemetry` 和 `worker.limits.result` 两种消息。两类回报均有 `instanceId`、`bootId`、`bootSequence`、`sequence` 和采样时间；遥测可携带实际执行身份、类别、占槽、待槽、HOLD 和事件。调限命令包含正整数 `revision`、操作者、请求时间和三维上限，回报绑定 `commandId` 及所处理的 `revision`。`applied` 的 `reason` 为 null，`rejected` 的 `reason` 使用枚举。Worker 协议消息以原始 UTF-8 字节计最多 64 KiB。发布与接收仍需 AMQP 身份校验，实例归属由实际接收方与部署身份核对。详见 [RabbitMQ 契约](../../integrations/rabbitmq.md#拓扑与权限)。
+
+独立视频探测的遥测执行身份使用 `protocol: "video.probe.v1"`、命令的 `jobId` 和 `attemptId`、`inspectionId: null`、`resource: "probe"` 与 `slots: 1`。进入待槽、取得和释放来自实际准入，阶段记录下载、探测和收尾。
 
 [通用媒体 HTTP](../../apis/compute.md#通用媒体处理)使用单独的媒体结果消费者，按发布顺序处理进度与终态。B 的媒体 encode、probe 和 control 各有自己的预取为一的通道。连接中断撤回该轮尚未占槽的等待并保留原任务身份，重新投递可继续原 attempt。待对账的早期副作用由同一 journal 接管。恢复已有输出占用同类容量，无需启动 FFmpeg。运行时遥测采集与持久调限的实现见相应开发单元。
 

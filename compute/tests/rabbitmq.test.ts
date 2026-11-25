@@ -518,6 +518,7 @@ it('keeps subscription paused across blocked admission and resumes after a later
     admissionReady: () => ready,
     needsMaintenance: () => !ready,
     reconcileOne: vi.fn(async () => {}),
+    handleVideoProbe: vi.fn(async () => {}),
     handle: vi.fn(async (_command: ComputeCommandV1, ack: () => void) => {
       ack();
     }),
@@ -691,6 +692,7 @@ it('does not resume a stopped maintenance window after its in-flight recovery re
   const worker = {
     admissionReady: () => true,
     needsMaintenance: () => true,
+    handleVideoProbe: vi.fn(async () => {}),
     reconcileOne: vi.fn(async () => {
       await pending;
     }),

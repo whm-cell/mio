@@ -77,6 +77,8 @@ interface CommandProtocol<T> {
   parse(value: unknown): T;
 }
 
+type VideoCommand = ComputeCommandV1 | VideoProbeCommandV1;
+
 async function closeConnection(
   connection: ChannelModel,
   closedConnections: WeakSet<ChannelModel>,
@@ -350,32 +352,28 @@ export class Broker {
   consume(
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
-    canAdmit: () => boolean,
+    canAdmit: ((command: VideoCommand) => boolean) | undefined,
     handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
   ): Promise<void> {
-    return this.consumeCommands(
-      {
-        queue: COMMAND_QUEUE,
-        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-        parse(value): ComputeCommandV1 | VideoProbeCommandV1 {
-          return value &&
-            typeof value === 'object' &&
-            !Array.isArray(value) &&
-            (value as Record<string, unknown>).type === 'video.probe'
-            ? parseVideoProbeCommandV1(value)
-            : parseComputeCommandV1(value);
-        },
+    const protocol: CommandProtocol<VideoCommand> = {
+      queue: COMMAND_QUEUE,
+      maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+      parse(value) {
+        return (value as { type?: unknown } | null)?.type === 'video.probe'
+          ? parseVideoProbeCommandV1(value)
+          : parseComputeCommandV1(value);
       },
-      async (command, ack) => {
-        if (command.type === 'video.probe') {
-          if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
-          return handleVideoProbe(command, ack);
-        }
-        return handle(command, ack);
-      },
-      failed,
-      canAdmit,
-    );
+    };
+    const dispatch = async (command: VideoCommand, ack: () => void) => {
+      if (command.type === 'video.probe') {
+        if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+        return handleVideoProbe(command, ack);
+      }
+      return handle(command, ack);
+    };
+    return canAdmit
+      ? this.consumeCommands(protocol, dispatch, failed, canAdmit)
+      : this.#consumeConcurrentChannel(protocol, dispatch, failed, 32);
   }
 
   consumeAudio(
@@ -392,22 +390,6 @@ export class Broker {
       handle,
       failed,
       canAdmit,
-    );
-  }
-
-  consumeTranscodes(
-    handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
-    failed: (error: unknown) => void,
-  ): Promise<void> {
-    return this.#consumeConcurrentChannel(
-      {
-        queue: COMMAND_QUEUE,
-        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-        parse: parseComputeCommandV1,
-      },
-      handle,
-      failed,
-      32,
     );
   }
 
@@ -546,7 +528,7 @@ export class Broker {
     protocol: CommandProtocol<T>,
     handle: (command: T, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
-    canAdmit: () => boolean,
+    canAdmit: (command: T) => boolean,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -575,13 +557,8 @@ export class Broker {
           report(new Error('CONSUMER_CANCELLED'));
           return;
         }
-        try {
-          if (this.#handling || !canAdmit()) {
-            void this.pause().catch(report);
-            return;
-          }
-        } catch (error) {
-          report(error);
+        if (this.#handling) {
+          void this.pause().catch(report);
           return;
         }
         let command: T;
@@ -593,6 +570,15 @@ export class Broker {
           } catch (error) {
             report(error);
           }
+          return;
+        }
+        try {
+          if (!canAdmit(command)) {
+            void this.pause().catch(report);
+            return;
+          }
+        } catch (error) {
+          report(error);
           return;
         }
         const tracked = Promise.resolve()
@@ -666,7 +652,7 @@ export class Broker {
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
     this.#concurrentClosing = true;
-    // Preserve journal ownership until admitted transcodes finish.
+    // Preserve journal and scratch ownership until admitted work finishes.
     if (this.#handling) await this.#handling;
     await Promise.allSettled(this.#concurrentHandling);
     this.#state.markClosed();

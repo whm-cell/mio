@@ -13,9 +13,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { parseVideoProbeCommandV1, parseVideoProbeResultV1 } from '@mio/compute-contracts';
-import type { VideoProbeCommandV1, VideoProbeResultV1 } from '@mio/compute-contracts';
+import type {
+  VideoProbeCommandV1,
+  VideoProbeResultV1,
+  WorkerTelemetryEvent,
+} from '@mio/compute-contracts';
 import { Journal } from '../src/adapters/journal.ts';
 import { probePath } from '../src/adapters/media.ts';
+import { ResourceSlots } from '../src/resource-slots.ts';
 import { Worker } from '../src/worker.ts';
 
 const directories: string[] = [];
@@ -104,6 +109,18 @@ it('probes the streamed local file and returns source identity and media metadat
   const input = command(file);
   const journal = new Journal(root, 'probe-test', true);
   const event: VideoProbeResultV1[] = [];
+  const { promise: confirmed, resolve: confirm } = Promise.withResolvers<void>();
+  const slots = new ResourceSlots();
+  slots.setLimits({ total: 1, encode: 0, probe: 1 });
+  slots.setHold('encode', 'encode-recovery', true);
+  slots.setHold('probe', 'media-attempt', true);
+  const events: WorkerTelemetryEvent[] = [];
+  const unsubscribe = slots.subscribe((message) => events.push(message));
+  const downloadVideoProbe = vi.fn(async (command: VideoProbeCommandV1, directory: string) => {
+    const destination = probePath(directory, command.messageId);
+    copyFileSync(file, destination);
+    return destination;
+  });
   const worker = new Worker(
     journal,
     {
@@ -115,24 +132,62 @@ it('probes the streamed local file and returns source identity and media metadat
         return false;
       },
       async upload() {},
-      async downloadVideoProbe(command, directory) {
-        const destination = probePath(directory, command.messageId);
-        copyFileSync(file, destination);
-        return destination;
-      },
+      downloadVideoProbe,
     },
     {
       async publish() {},
       async publishVideoProbe(message) {
         event.push(parseVideoProbeResultV1(message));
+        await confirmed;
       },
     },
     root,
+    slots,
   );
   const ack = vi.fn();
+  const duplicateAck = vi.fn();
+  const handling = worker.handleVideoProbe(input, ack);
+  const duplicate = worker.handleVideoProbe(structuredClone(input), duplicateAck);
   try {
-    await worker.handleVideoProbe(input, ack);
+    expect(slots.snapshot().waiting).toEqual({ total: 1, encode: 0, probe: 1 });
+    expect(downloadVideoProbe).not.toHaveBeenCalled();
+    await expect(
+      worker.handleVideoProbe({ ...input, source: { ...input.source, etag: '"other"' } }, vi.fn()),
+    ).rejects.toThrow('ATTEMPT_CONFLICT');
+    slots.setHold('probe', 'media-attempt', false);
+    await vi.waitFor(() => expect(event).toHaveLength(1));
+    expect(downloadVideoProbe).toHaveBeenCalledOnce();
+    expect(ack).not.toHaveBeenCalled();
+    expect(duplicateAck).not.toHaveBeenCalled();
+    const identity = {
+      protocol: 'video.probe.v1',
+      jobId: input.jobId,
+      attemptId: input.attemptId,
+      inspectionId: null,
+      resource: 'probe',
+      slots: 1,
+    };
+    expect(slots.snapshot()).toMatchObject({
+      usage: { total: 1, encode: 0, probe: 1 },
+      active: [identity],
+      holds: { encode: ['encode-recovery'], probe: [] },
+    });
+    confirm();
+    await Promise.all([handling, duplicate]);
     expect(ack).toHaveBeenCalledOnce();
+    expect(duplicateAck).toHaveBeenCalledOnce();
+    expect(slots.snapshot()).toMatchObject({
+      usage: { total: 0, encode: 0, probe: 0 },
+      active: [],
+    });
+    const executionEvents = events.filter((event) => 'execution' in event);
+    expect(executionEvents.map((event) => event.execution)).toEqual(
+      Array(6).fill(expect.objectContaining(identity)),
+    );
+    expect(new Set(executionEvents.map((event) => event.execution.executionId)).size).toBe(1);
+    expect(
+      executionEvents.map((event) => (event.kind === 'phase' ? event.phase : event.state)),
+    ).toEqual(['queued', 'acquired', 'downloading', 'processing', 'finalizing', 'released']);
     expect(event).toHaveLength(1);
     expect(event[0]).toMatchObject({
       version: 1,
@@ -158,15 +213,25 @@ it('probes the streamed local file and returns source identity and media metadat
     expect(existsSync(probePath(root, input.messageId))).toBe(false);
     expect(journal.get(input.attemptId)).toBeNull();
   } finally {
+    confirm();
+    worker.stop();
+    await Promise.allSettled([handling, duplicate]);
+    unsubscribe();
     journal.close();
   }
 });
 
-it('publishes a bounded failure result and removes the temporary file on invalid media', async () => {
+it('cleans up on an unconfirmed result, accepts redelivery, and cancels a waiting probe on stop', async () => {
   const root = directory();
   const input = command(fixture(root));
   const journal = new Journal(root, 'probe-test', true);
   const event: VideoProbeResultV1[] = [];
+  const publishVideoProbe = vi
+    .fn(async (message: VideoProbeResultV1) => {
+      event.push(message);
+    })
+    .mockRejectedValueOnce(new Error('CONFIRM_TIMEOUT'));
+  const slots = new ResourceSlots();
   const worker = new Worker(
     journal,
     {
@@ -186,18 +251,30 @@ it('publishes a bounded failure result and removes the temporary file on invalid
     },
     {
       async publish() {},
-      async publishVideoProbe(message) {
-        event.push(message);
-      },
+      publishVideoProbe,
     },
     root,
+    slots,
   );
   const ack = vi.fn();
   try {
+    await expect(worker.handleVideoProbe(input, ack)).rejects.toThrow('CONFIRM_TIMEOUT');
+    expect(ack).not.toHaveBeenCalled();
+    expect(existsSync(probePath(root, input.messageId))).toBe(false);
+    expect(slots.snapshot().usage.total).toBe(0);
+
     await worker.handleVideoProbe(input, ack);
     expect(ack).toHaveBeenCalledOnce();
     expect(event[0]).toMatchObject({ state: 'failed', errorCode: 'SOURCE_INVALID' });
     expect(existsSync(probePath(root, input.messageId))).toBe(false);
+    slots.setLimits({ total: 0, encode: 0, probe: 0 });
+    const pending = worker.handleVideoProbe(input, ack);
+    expect(slots.snapshot().waiting.probe).toBe(1);
+    worker.stop();
+    await expect(pending).rejects.toHaveProperty('name', 'AbortError');
+    expect(ack).toHaveBeenCalledOnce();
+    expect(slots.snapshot().waiting.probe).toBe(0);
+    await worker.waitIdle();
   } finally {
     journal.close();
   }

@@ -12,6 +12,11 @@
       "path": "docs/tasks/compute-service/changes/image-upload-verification/change.md"
     },
     {
+      "identity": "docs/tasks/compute-service/changes/video-probe-worker/change.md",
+      "kind": "change",
+      "path": "docs/tasks/compute-service/changes/video-probe-worker/change.md"
+    },
+    {
       "identity": "docs/tasks/compute-service/changes/worker-observability/change.md",
       "kind": "change",
       "path": "docs/tasks/compute-service/changes/worker-observability/change.md"

@@ -1,6 +1,7 @@
 import { epochMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
+import { isDeepStrictEqual } from 'node:util';
 import type {
   ComputeCommandV1,
   ComputeFailureCodeV1,
@@ -12,6 +13,7 @@ import type {
   VideoProbeResultV1,
   WorkerExecutionIdentity,
   WorkerExecutionPhase,
+  WorkerResourceClass,
 } from '@mio/compute-contracts';
 import { isJournalFailure } from './adapters/journal.ts';
 import type { Journal } from './adapters/journal.ts';
@@ -110,13 +112,17 @@ export class Worker {
   readonly #directory: string;
   readonly #slots: ResourceSlots;
   readonly #deliveries = new Map<string, Promise<void>>();
+  readonly #probeDeliveries = new Map<
+    string,
+    { command: VideoProbeCommandV1; task: Promise<void> }
+  >();
   readonly #executionIds = new Map<string, string>();
   readonly #ownedProcesses = new Set<string>();
   #maintenance: Promise<void> | undefined;
   #maintenanceAttempt: string | undefined;
   #cursor = '';
   #stopped = false;
-  #busy = false;
+  #probeDownloadBytes = 0;
   readonly #stopController = new AbortController();
 
   constructor(
@@ -141,7 +147,8 @@ export class Worker {
   }
 
   async waitIdle(): Promise<void> {
-    while (this.#deliveries.size || this.#maintenance || this.#busy) await sleep(50);
+    while (this.#deliveries.size || this.#probeDeliveries.size || this.#maintenance)
+      await sleep(50);
   }
 
   #syncProcessHold(): void {
@@ -152,10 +159,11 @@ export class Worker {
     );
   }
 
-  admissionReady(): boolean {
-    if (this.#stopped || this.#busy || this.#deliveries.size || this.#maintenance) return false;
-    this.#syncProcessHold();
-    if (!this.#slots.available('encode')) return false;
+  admissionReady(resource: WorkerResourceClass = 'encode'): boolean {
+    if (this.#stopped || this.#probeDeliveries.size || this.#deliveries.size || this.#maintenance)
+      return false;
+    if (resource === 'encode') this.#syncProcessHold();
+    if (!this.#slots.available(resource)) return false;
     try {
       requireSpace(this.#directory);
       return true;
@@ -167,7 +175,13 @@ export class Worker {
 
   needsMaintenance(): boolean {
     if (this.#stopped) return false;
-    if (!this.#busy && !this.#deliveries.size && !this.admissionReady()) return true;
+    if (
+      !this.#probeDeliveries.size &&
+      !this.#deliveries.size &&
+      !this.admissionReady() &&
+      !this.admissionReady('probe')
+    )
+      return true;
     return this.#nextIdleAttempt('') !== null;
   }
 
@@ -473,17 +487,43 @@ export class Worker {
   }
 
   async handleVideoProbe(command: VideoProbeCommandV1, ack: () => void): Promise<void> {
-    if (!this.admissionReady()) throw new Error('WORKER_NOT_READY');
+    const previous = this.#probeDeliveries.get(command.messageId);
+    if (previous) {
+      if (!isDeepStrictEqual(previous.command, command)) throw new Error('ATTEMPT_CONFLICT');
+      await previous.task;
+      ack();
+      return;
+    }
+    if (this.#stopped) throw new Error('WORKER_NOT_READY');
+    const task = this.#executeVideoProbe(command, ack);
+    this.#probeDeliveries.set(command.messageId, { command, task });
+    try {
+      await task;
+    } finally {
+      this.#probeDeliveries.delete(command.messageId);
+    }
+  }
+
+  async #executeVideoProbe(command: VideoProbeCommandV1, ack: () => void): Promise<void> {
+    const download = this.#store.downloadVideoProbe;
+    const publish = this.#broker.publishVideoProbe;
+    if (!download || !publish) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+    const execution: WorkerExecutionIdentity = {
+      executionId: createId(),
+      protocol: 'video.probe.v1',
+      jobId: command.jobId,
+      attemptId: command.attemptId,
+      inspectionId: null,
+      resource: 'probe',
+      slots: 1,
+    };
+    const release = await this.#slots.wait('probe', this.#stopController.signal, execution);
     const attemptLog = log.child({
       jobId: command.jobId,
       attemptId: command.attemptId,
       messageId: command.messageId,
     });
     attemptLog.info('VIDEO_PROBE_RECEIVED');
-    const download = this.#store.downloadVideoProbe;
-    const publish = this.#broker.publishVideoProbe;
-    if (!download || !publish) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
-    this.#busy = true;
     const diskController = new AbortController();
     const diskTimer = setInterval(() => {
       try {
@@ -499,11 +539,21 @@ export class Worker {
       diskController.signal,
     ]);
     try {
+      this.#stopController.signal.throwIfAborted();
       let result: VideoProbeResultV1;
       try {
         removeProbeFile(this.#directory, command.messageId);
-        requireProbeSpace(this.#directory, command.source.sizeBytes);
-        const path = await download.call(this.#store, command, this.#directory, signal);
+        const bytes = command.source.sizeBytes;
+        requireProbeSpace(this.#directory, bytes, this.#probeDownloadBytes);
+        this.#probeDownloadBytes += bytes;
+        this.#slots.phase(execution.executionId, 'downloading');
+        let path: string;
+        try {
+          path = await download.call(this.#store, command, this.#directory, signal);
+        } finally {
+          this.#probeDownloadBytes -= bytes;
+        }
+        this.#slots.phase(execution.executionId, 'processing');
         const media = await probeVideoFile(path, signal);
         result = videoProbeEvent(command, { state: 'succeeded', media });
       } catch (error) {
@@ -517,6 +567,7 @@ export class Worker {
           ),
         });
       }
+      this.#slots.phase(execution.executionId, 'finalizing');
       await publish.call(this.#broker, result);
       ack();
       attemptLog.info('VIDEO_PROBE_ACK_DISPATCHED');
@@ -527,7 +578,7 @@ export class Worker {
       } catch {
         attemptLog.error('VIDEO_PROBE_FILE_CLEANUP_FAILED');
       }
-      this.#busy = false;
+      release();
     }
   }
 

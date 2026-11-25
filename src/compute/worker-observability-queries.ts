@@ -1,5 +1,6 @@
 import { epochMs } from '@mio/foundation/time';
 import type {
+  WorkerExecutionIdentity,
   WorkerLimits,
   WorkerResourceClass,
   WorkerTelemetryEvent,
@@ -30,7 +31,7 @@ type ExecutionRow = {
   execution_id: string;
   instance_id: string;
   boot_id: string;
-  protocol: string;
+  protocol: WorkerExecutionIdentity['protocol'];
   job_id: string;
   attempt_id: string | null;
   inspection_id: string | null;

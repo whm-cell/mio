@@ -198,6 +198,68 @@ it('returns fresh bounded histories, separates stale/offline, and aggregates onl
   });
 });
 
+it('exposes a standalone video probe by job and attempt with its real slot timeline', async () => {
+  const now = Date.now();
+  const message = worker();
+  const probe: WorkerExecutionIdentity = {
+    ...execution(),
+    protocol: 'video.probe.v1',
+    resource: 'probe',
+  };
+  const acquired = message(1, now - 20, {
+    kind: 'execution',
+    state: 'acquired',
+    at: now - 20,
+    execution: probe,
+  });
+  acquired.usage = { total: 1, encode: 0, probe: 1 };
+  acquired.active = [{ ...probe, acquiredAt: now - 20 }];
+  await record(now - 20, parseWorkerTelemetry(acquired));
+  expect(await queries.worker('worker-a', now)).toMatchObject({
+    snapshot: { usage: acquired.usage, active: acquired.active },
+  });
+  await record(
+    now - 10,
+    parseWorkerTelemetry({
+      ...message(2, now - 10, {
+        kind: 'phase',
+        phase: 'processing',
+        at: now - 10,
+        execution: probe,
+      }),
+      active: acquired.active,
+      usage: acquired.usage,
+    }),
+  );
+  await record(
+    now,
+    parseWorkerTelemetry(
+      message(3, now, {
+        kind: 'execution',
+        state: 'released',
+        at: now,
+        execution: probe,
+      }),
+    ),
+  );
+  expect((await queries.executions({ jobId: probe.jobId, limit: 1 })).executions).toMatchObject([
+    { ...probe, state: 'released', acquiredAt: new Date(now - 20), endedAt: new Date(now) },
+  ]);
+  expect(await queries.execution(probe.executionId)).toMatchObject({
+    ...probe,
+    businessState: null,
+    businessStage: null,
+    timeline: [
+      { detail: { kind: 'execution', state: 'acquired' } },
+      { detail: { kind: 'phase', phase: 'processing' } },
+      { detail: { kind: 'execution', state: 'released' } },
+    ],
+  });
+  expect(await queries.worker('worker-a', now)).toMatchObject({
+    snapshot: { usage: zero, active: [] },
+  });
+});
+
 it('serializes conflicting edits, correlates applied receipts, and keeps control claims independent per instance', async () => {
   const now = Date.now();
   const a = worker();

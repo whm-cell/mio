@@ -16,6 +16,8 @@
 
 A 仅写命令交换机 `mio.compute.commands.v1`，读取视频结果、音频结果 stream、媒体结果及 Worker 遥测队列。B 仅写结果交换机 `mio.compute.results.v1`，读取视频、音频、媒体命令与所属实例控制队列。两者独立密码、无管理标签、无 configure 权限；管理密码只用于部署入口，不传给 A/B。[管理后台 RabbitMQ 只读监控](../../src/integrations/rabbitmq-monitor.ts)可选通过 `MIO_ADMIN_RABBITMQ_MONITOR_URL` 使用独立 `mio-<env>-monitor` 账号（`tags="monitoring"`，对 `mio-<env>` 的 `configure/write/read` 均为 `^$`，无权收发消息或修改拓扑）只读采集 Management HTTP 概览、节点告警与队列/死信积压指标。Worker 启动只接收 B 的 MQ 和本环境 COS 配置，不能继承 A 的数据库、认证秘密或管理配置。
 
+独立视频探测的 `video.probe.v1` 与 `video.probe.result.v1` 分别绑定到现有视频命令和结果队列。普通与启用观测的 B 均按严格消息类型分发，非法消息进入相应死信队列。B 在探测结果获发布确认后 ACK 原命令。见[计算协议](../tasks/compute-service/protocol.md)。
+
 通用媒体的 encode、probe、control 待发命令分别认领并保留各自退避。收到某一路由的确定 publisher NACK 或 mandatory return 时释放当前租约，在该路由按原消息 ID 重投，其他路由继续排空。确认结果不明或连接关闭时重建连接。每轮每路最多认领 10 条，确认和释放必须匹配当前租约。详见[通用媒体协议](../tasks/compute-service/protocol.md#通用媒体处理与-worker-观测协议)。
 
 音频检测使用独立的 `mio.compute.audio.commands.v1` quorum 队列（`audio.inspect.v1` 路由），沿用命令交换机及 1 GiB 容量策略。无效命令经 `audio.inspect.dead.v1` 进入专用 `mio.compute.audio.commands.dlq.v1`。B 在结果获发布确认后 ACK 原命令。读对象期间中断或结果确认失败会留下原命令供重投。
@@ -70,4 +72,4 @@ node --input-type=module -e 'import { computePermissions } from "./scripts/servi
 
 A 只消费已配置的实例及已验证的 AMQP `userId`。设置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 预置每实例的 `mio.compute.worker.control.<instanceId>` 及相应 DLQ。单实例沿用 `MIO_COMPUTE_EXPECTED_RESULT_USER`，多实例在 A 传入 `MIO_COMPUTE_WORKER_RESULT_USERS` 的 JSON 实例到 B 用户一对一映射。每个 B 用户仅获得自己的控制队列读权限及原计算队列，使用同一个已授权的 A 命令用户。新建拓扑脚本为多实例写出分别的 B 私有环境文件。已有部署先增量预置各角色和队列，再更新 A 映射，避免复用其他 B 的账户。
 
-`worker.telemetry` 与 `worker.limits.result` 都发到独立遥测队列，A 控制按实例路由并持久化去重。消息同时校验 `userId`、messageId、大小和严格协议。先升级 A 再启用新版 B 的阶段和明确 gap 字段。无 gap、无新阶段的旧 Worker 消息仍具相同形状。遥测、按实例控制、既有单路/音频/媒体消费分别管理连接与确认。
+`worker.telemetry` 与 `worker.limits.result` 都发到独立遥测队列，A 控制按实例路由并持久化去重。消息同时校验 `userId`、messageId、大小和严格协议。先升级 A 再启用新版 B 的阶段、明确 gap 字段及 `video.probe.v1` 执行身份。无 gap、无新阶段的旧 Worker 消息仍具相同形状。遥测、按实例控制、视频/音频/媒体消费分别管理连接与确认。

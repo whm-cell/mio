@@ -140,7 +140,11 @@ export function requireSpace(directory: string, incomingBytes = 0): void {
 }
 
 /** Reserve both the worker-directory budget and filesystem safety margin before a probe download. */
-export function requireProbeSpace(directory: string, expectedBytes: number): void {
+export function requireProbeSpace(
+  directory: string,
+  expectedBytes: number,
+  pendingBytes: number,
+): void {
   if (
     !Number.isSafeInteger(expectedBytes) ||
     expectedBytes < 1 ||
@@ -150,9 +154,10 @@ export function requireProbeSpace(directory: string, expectedBytes: number): voi
       expectedBytes > COMPUTE_MAX_MEDIA_BYTES ? 'SOURCE_TOO_LARGE' : 'SOURCE_INVALID',
     );
   const fs = statfsSync(directory);
+  const incomingBytes = pendingBytes + expectedBytes;
   if (
-    directoryBytes(directory) + expectedBytes > MAX_DIRECTORY_BYTES ||
-    fs.bavail * fs.bsize < MIN_FREE_BYTES + expectedBytes
+    directoryBytes(directory) + incomingBytes > MAX_DIRECTORY_BYTES ||
+    fs.bavail * fs.bsize < MIN_FREE_BYTES + incomingBytes
   )
     throw new MediaError('DISK_FULL');
 }

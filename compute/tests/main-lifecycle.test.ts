@@ -5,6 +5,7 @@ import type { ResourceSlots } from '../src/resource-slots.ts';
 
 const fixture = vi.hoisted(() => ({
   connect: vi.fn(),
+  consumeVideoProbes: vi.fn(async () => {}),
   closeJournal: vi.fn(),
   slots: vi.fn(),
   backoffListeners: [] as number[],
@@ -87,13 +88,18 @@ it('unsubscribes each reconnect lifetime before backoff and still stops the acti
   const originalArgv = process.argv;
   process.argv = [originalArgv[0]!, 'worker', 'start'];
   stubWorkerEnvironment();
+  fixture.consumeVideoProbes.mockClear();
   const rounds: ReturnType<typeof Promise.withResolvers<void>>[] = [];
   let stopping: AbortSignal | undefined;
   fixture.connect.mockImplementation(async (_url, _username, _expected, signal: AbortSignal) => {
     stopping = signal;
     const round = Promise.withResolvers<void>();
     rounds.push(round);
-    return { closed: () => round.promise, close: async () => {} };
+    return {
+      closed: () => round.promise,
+      close: async () => {},
+      consumeVideoProbes: fixture.consumeVideoProbes,
+    };
   });
   fixture.backoffListeners.length = 0;
   fixture.closeJournal.mockClear();
@@ -111,6 +117,12 @@ it('unsubscribes each reconnect lifetime before backoff and still stops the acti
       await vi.waitFor(() => expect(rounds).toHaveLength(index + 2));
     }
     expect(fixture.backoffListeners).toHaveLength(24);
+    expect(fixture.consumeVideoProbes).toHaveBeenCalledTimes(25);
+    expect(fixture.consumeVideoProbes).lastCalledWith(
+      expect.any(Function),
+      expect.any(Function),
+      false,
+    );
     expect(fixture.backoffListeners.every((count) => count === 0)).toBe(true);
     stop!();
     await vi.waitFor(() => expect(fixture.closeJournal).toHaveBeenCalledOnce());

@@ -42,7 +42,7 @@
 
 ## Worker 观测与调限
 
-视频命令通道同时消费转码与独立 `video.probe.v1` 命令。转码用 encode 槽，探测用 probe 槽。开启观测的实例在编码限为 0 时仍可用空闲的总槽和探测槽。探测在本地有界下载并执行 ffprobe，下载前把并发探测中待下载的字节计入预留。B 在结果获发布确认后 ACK 并收尾释放占槽。
+转码和独立 `video.probe.v1` 分别有自己的命令消费通道，使用 encode 与 probe 槽。编码暂停或占满原通道的预取时，探测仍可用空闲的总槽和探测槽。探测在本地有界下载并执行 ffprobe，下载前把并发探测中待下载的字节计入预留。B 在结果获发布确认后 ACK 并收尾释放占槽。已有部署按[绑定迁移](../docs/integrations/rabbitmq.md#独立视频探测队列迁移)切换，旧视频队列继续排空原先接收的探测。
 
 部署先在 A 侧迁移 PostgreSQL 并预置实例队列。B 的 `MIO_COMPUTE_INSTANCE_ID` 需在部署允许清单 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 内才接入观测与动态控制。沿用旧 SQLite 就地升级，复用稳定卷和实例身份。B 的 `MIO_COMPUTE_HARD_MAX_TOTAL`、`MIO_COMPUTE_HARD_MAX_ENCODE`、`MIO_COMPUTE_HARD_MAX_PROBE` 默认为 2/1/1，也是最低部署值。已有保存配置在重启时夹到当前硬限，revision 保留；默认运行限额从 2/1/1 起始。各计算通道使用有限的本地待槽，HOLD 优先于调高，降限不终止运行任务。
 

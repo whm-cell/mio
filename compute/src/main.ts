@@ -167,15 +167,22 @@ async function start(): Promise<void> {
         });
         void failed.catch(() => {});
         const closed = broker.closed();
-        maintenance = new Maintenance(broker, current, fail, monitored);
+        const cycle = new Maintenance(broker, current, fail, monitored);
+        maintenance = cycle;
         const initialized = await Promise.race([
-          maintenance.tick().then(() => true),
+          broker
+            .consumeVideoProbes(
+              (command, ack) => current.handleVideoProbe(command, ack),
+              fail,
+              monitored,
+            )
+            .then(() => cycle.tick())
+            .then(() => true),
           closed.then(() => false),
           stopped.then(() => false),
           failed,
         ]);
         if (!initialized) throw new Error('BROKER_CLOSED');
-        const cycle = maintenance;
         interval = setInterval(() => {
           void cycle.tick().catch(fail);
         }, 30_000);

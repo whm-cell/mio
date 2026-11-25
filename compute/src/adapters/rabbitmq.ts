@@ -24,6 +24,7 @@ import {
   RESULT_ROUTING_KEY,
   WORKER_TELEMETRY_ROUTING_KEY,
   WORKER_MAX_MESSAGE_BYTES,
+  VIDEO_PROBE_COMMAND_QUEUE,
   VIDEO_PROBE_RESULT_ROUTING_KEY,
   parseWorkerLimitsCommand,
   workerControlQueue,
@@ -390,6 +391,23 @@ export class Broker {
       handle,
       failed,
       canAdmit,
+    );
+  }
+
+  consumeVideoProbes(
+    handle: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    buffered: boolean,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: VIDEO_PROBE_COMMAND_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse: parseVideoProbeCommandV1,
+      },
+      handle,
+      failed,
+      buffered ? 32 : 1,
     );
   }
 

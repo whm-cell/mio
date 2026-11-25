@@ -49,6 +49,8 @@ pnpm start:test
 
 `broker:init:dev/test` 核对所选 vhost、A/B 用户、权限与容量策略，补齐前置已满足的重媒体拓扑。`LOCAL_BROKER_PREPROVISION_REQUIRED` 列出部署者应补的资源，预置完按原命令重跑。已有配置冲突报 `LOCAL_BROKER_CONFLICT` 并保留现场和已有消息。旧图片队列和权限按下面的切换步骤单独对账及退役。仅启用图片生成时可跳过 Broker 初始化和 B。
 
+启动新版 B 前先预置独立视频探测命令队列及 B 的精确读权限。已有共用绑定的环境按[独立视频探测队列迁移](integrations/rabbitmq.md#独立视频探测队列迁移)暂停发布、核对并切换，确认消费通道就绪后恢复 A。
+
 主服务 A 与 Worker B 是两个进程，`start:dev/test` 只启动 A。构建完成后，首次使用 `pnpm compute:init:dev` / `pnpm compute:init:test` 创建独占 journal；已有目录不能重新初始化。之后在两个终端分别用 `pnpm compute:start:dev` / `pnpm compute:start:test` 启动 B。入口注入本环境的 B 身份、稳定实例 ID 和持久目录，缺 COS 配置时明确失败；不会借用历史计算环境的凭据。B 生命周期和恢复见 [Worker 说明](../compute/README.md)。
 
 W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体数据库、COS、`compute` 迁移、`MIO_COMPUTE_ENABLED=true` 和 B/MQ；图片使用同一资产域数据库、COS、`generations` 迁移、`MIO_GENERATIONS_ENABLED=true` 和 A 专属持久目录，允许完全不配置 B/MQ。两者都先迁移 assets，初始化不会新建业务媒体数据库或 COS 桶。

@@ -16,7 +16,7 @@
 
 A 仅写命令交换机 `mio.compute.commands.v1`，读取视频结果、音频结果 stream、媒体结果及 Worker 遥测队列。B 仅写结果交换机 `mio.compute.results.v1`，读取视频、音频、媒体命令与所属实例控制队列。两者独立密码、无管理标签、无 configure 权限；管理密码只用于部署入口，不传给 A/B。[管理后台 RabbitMQ 只读监控](../../src/integrations/rabbitmq-monitor.ts)可选通过 `MIO_ADMIN_RABBITMQ_MONITOR_URL` 使用独立 `mio-<env>-monitor` 账号（`tags="monitoring"`，对 `mio-<env>` 的 `configure/write/read` 均为 `^$`，无权收发消息或修改拓扑）只读采集 Management HTTP 概览、节点告警与队列/死信积压指标。Worker 启动只接收 B 的 MQ 和本环境 COS 配置，不能继承 A 的数据库、认证秘密或管理配置。
 
-独立视频探测的 `video.probe.v1` 与 `video.probe.result.v1` 分别绑定到现有视频命令和结果队列。普通与启用观测的 B 均按严格消息类型分发，非法消息进入相应死信队列。B 在探测结果获发布确认后 ACK 原命令。见[计算协议](../tasks/compute-service/protocol.md)。
+独立视频探测命令 `video.probe.v1` 绑定专用 quorum 队列 `mio.compute.video.probe.commands.v1`，拒收经 `video.probe.dead.v1` 路由到 `mio.compute.video.probe.commands.dlq.v1`。探测结果 `video.probe.result.v1` 仍绑定 `mio.compute.results.v1`。B 在探测结果获发布确认后 ACK 原命令。见[计算协议](../tasks/compute-service/protocol.md)。
 
 通用媒体的 encode、probe、control 待发命令分别认领并保留各自退避。收到某一路由的确定 publisher NACK 或 mandatory return 时释放当前租约，在该路由按原消息 ID 重投，其他路由继续排空。确认结果不明或连接关闭时重建连接。每轮每路最多认领 10 条，确认和释放必须匹配当前租约。详见[通用媒体协议](../tasks/compute-service/protocol.md#通用媒体处理与-worker-观测协议)。
 
@@ -40,15 +40,15 @@ A 仅写命令交换机 `mio.compute.commands.v1`，读取视频结果、音频�
 
 若由另一位管理员恢复 vhost，在该 vhost 的权限页为运行初始化的 `mio-<env>-admin` 恢复 Compose 默认权限，Configure、Write 和 Read 均填 `.*`。RabbitMQ 会给创建者授予权限，初始化仍使用选定文件里的项目管理员。A/B 按下表单独授予受限权限。
 
-| 项目                     | 预置值                                                                                                                                                                                                                                         |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| vhost                    | `mio-<env>`                                                                                                                                                                                                                                    |
-| operator policy          | vhost 内命名 `mio-capacity`，Pattern `.*`，Priority `0`，Apply to `queues`（Queues）。Definition 为 `{"max-length-bytes":1073741824,"overflow":"reject-publish"}`。                                                                            |
-| 音频结果 operator policy | 命名 `mio-audio-result-retention`，Pattern `^mio\.compute\.audio\.results\.v1$`，Priority `1`，Apply to `streams`。Definition 为 `{"max-length-bytes":67108864}`。                                                                             |
-| A 用户                   | `mio-<env>-a`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_A_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                                                                                                     |
-| B 用户                   | `mio-<env>-b`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_B_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                                                                                                     |
-| A 权限                   | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.commands\.v1$`，Read 精确匹配 `mio.compute.results.v1`、`mio.compute.audio.results.v1`、`mio.compute.media.results`、`mio.compute.worker.telemetry`。                                    |
-| B 权限                   | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.results\.v1$`，Read 精确匹配 `mio.compute.commands.v1`、`mio.compute.audio.commands.v1`、`mio.compute.media.{encode,probe,control}` 及本实例 `mio.compute.worker.control.<instanceId>`。 |
+| 项目                     | 预置值                                                                                                                                                                                                                                                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| vhost                    | `mio-<env>`                                                                                                                                                                                                                                                                           |
+| operator policy          | vhost 内命名 `mio-capacity`，Pattern `.*`，Priority `0`，Apply to `queues`（Queues）。Definition 为 `{"max-length-bytes":1073741824,"overflow":"reject-publish"}`。                                                                                                                   |
+| 音频结果 operator policy | 命名 `mio-audio-result-retention`，Pattern `^mio\.compute\.audio\.results\.v1$`，Priority `1`，Apply to `streams`。Definition 为 `{"max-length-bytes":67108864}`。                                                                                                                    |
+| A 用户                   | `mio-<env>-a`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_A_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                                                                                                                                            |
+| B 用户                   | `mio-<env>-b`，无 tags，使用所选文件的 `MIO_LOCAL_RABBITMQ_B_PASSWORD` 和 RabbitMQ 默认 SHA-256 密码哈希。                                                                                                                                                                            |
+| A 权限                   | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.commands\.v1$`，Read 精确匹配 `mio.compute.results.v1`、`mio.compute.audio.results.v1`、`mio.compute.media.results`、`mio.compute.worker.telemetry`。                                                                           |
+| B 权限                   | 对 `mio-<env>`，Configure `^$`，Write `^mio\.compute\.results\.v1$`，Read 精确匹配 `mio.compute.commands.v1`、`mio.compute.video.probe.commands.v1`、`mio.compute.audio.commands.v1`、`mio.compute.media.{encode,probe,control}` 及本实例 `mio.compute.worker.control.<instanceId>`。 |
 
 升级已有拓扑时，部署者保留原 vhost、用户、密码、标签、音频 stream 和保留策略，只在原角色上预置表中新增的精确 Read 范围，再重跑 `pnpm broker:init:dev` 或 `pnpm broker:init:test`。实例 ID 默认取本环境原有 `MIO_LOCAL_COMPUTE_INSTANCE_ID`；显式 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 为至多 64 个唯一 ID 的逗号列表，须包含该 ID。每个 ID 最多 96 个 ASCII 字符，以字母或数字开头，后续允许字母、数字、点、下划线和连字符。每个 B 账号只获得自身实例控制队列的读取权限。用当前共享拓扑生成准确的 Read 正则（`id` 传入已有实例 ID），避免通配符或未转义的点：
 
@@ -67,6 +67,17 @@ node --input-type=module -e 'import { computePermissions } from "./scripts/servi
 [常规协议回归](../../tests/integrations/rabbitmq-protocol.test.ts)真实验证 A 发布重媒体命令、B 收取并 ACK、B 发布关联结果、A 收取并 ACK、关闭各自消费通道后原消息不重投，以及反向读取返回 AMQP `403 ACCESS_REFUSED`。成功与故意失败的用例都检查临时 vhost 和 A/B 用户是否删除。运行条件见[测试导航](../engineering/testing.md#按变更定位测试)。
 
 [音频隔离回归](../../tests/audio/media-rabbitmq.test.ts)使用同一隔离设施，验证两个 A 实例收到反序发布的各自结果、错误关联无法结算、未 ACK 命令重投，以及 stream 的生效保留策略。
+
+### 独立视频探测队列迁移
+
+新 vhost 使用当前拓扑初始化。已有 vhost 先核对 `mio.compute.commands.v1` 交换机下 `video.probe.v1` 的目标，再按下列顺序切换。
+
+1. 暂停所有可能发布探测的 A，等待在途发布确认结束。保留旧命令队列、结果队列、死信和 Worker 持久目录。若旧 B 停机时仍有未 ACK 的命令，连接关闭后由 broker 重投。
+2. 为所有 B 增补专属探测队列的精确 Read 权限。在所选本地环境执行 `pnpm broker:init:dev --migrate-video-probe`，test 环境使用 `broker:init:test`。普通初始化读到旧 binding 时以 `LOCAL_BROKER_VIDEO_PROBE_MIGRATION_REQUIRED` 停止写入。显式命令先声明新队列与死信、确认运行身份可登录并读回新绑定，再删除旧队列的 `video.probe.v1` 绑定并核对其消失。转码绑定及旧队列内 ready、unacked 和历史死信均保留。
+3. 独立部署的管理员使用[共享拓扑定义](../../scripts/service/compute-broker-topology.ts)预置同样的队列、死信、策略和 B 权限。暂停 A 期间先读回新的探测命令绑定和结果绑定，再按原交换机、旧命令队列及旧探测 binding 的 `properties_key` 删除这一条旧绑定。以管理端核对 `video.probe.v1` 最终只指向专属队列。
+4. 在暂停窗口升级 A 的遥测接收方，启动新 B，核对独立探测消费通道已登记。新 B 继续识别旧视频命令队列中已路由的合法探测。排空该队列时让转码正常取得槽位，保留既有 HOLD 和故障恢复处理。核对新路由、无待对账的重复发布及结果通道后再恢复 A 提交。
+
+绑定请求结果未知时保持 A 暂停，以管理端实际状态为依据重跑同一次迁移。回退时先保持 A 暂停，由新版 B 排空专属队列的 ready 和 unacked，核对后恢复旧绑定，再移除新队列的探测绑定；保留两个队列和死信。只有确认旧版 B 能处理原队列中的探测才恢复探测生产。
 
 ### Worker 遥测与控制
 

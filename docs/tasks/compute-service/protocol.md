@@ -63,26 +63,27 @@ B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/�
 
 成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份；`media` 只包含 ffprobe 得出的 `container`/`videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。尺寸使用已采用的 display rotation 规则，返回 1–65536 的安全整数；时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
 
-普通与启用观测的 B 从同一视频命令队列严格解析探测和转码，再按消息类型分发。探测与独立音频检测和通用媒体探测共用 `total`/`probe` 准入与相应 HOLD，转码使用 `total`/`encode`。同一 Worker 上在途的相同探测命令只操作一份本地临时文件，各投递在同一结果获确认后 ACK。相同 `messageId` 携带不同内容时按冲突拒收。
+普通与启用观测的 B 都有独立探测命令消费通道。探测与独立音频检测和通用媒体探测共用 `total`/`probe` 准入与相应 HOLD，转码使用 `total`/`encode`。原视频命令通道保留对已路由探测的严格解析和分发，以便迁移后排空。一个 Worker 上在途的相同探测命令只操作一份本地临时文件，各投递在同一结果获确认后 ACK。相同 `messageId` 携带不同内容时按冲突拒收。
 
 ### `video.probe` 路由的同步要求
 
-保持 `version: 1`，无需换新 exchange 或 queue，但分别要在 `mio.compute.commands.v1` 交换机绑定 `video.probe.v1` 到现有 `mio.compute.commands.v1` 持久队列，以及将 `video.probe.result.v1` 绑定至现有 `mio.compute.results.v1` 队列。这是加性的 v1 topology 绑定；这些 bindings 与 A 端命令发布/结果消费适配未同步部署前，不能发送 probe。使用 `mandatory` 发布时新 routing key 没有 binding 必须被退回并保留上游重试现场，不能回退使用 `transcode.v1` 假装为转码。
+继续使用 `version: 1`。部署者将 `mio.compute.commands.v1` 交换机的 `video.probe.v1` 路由切换到专属持久队列。A 在同一结果队列收到 `video.probe.result.v1`。部署按顺序暂停生产者、确认新绑定、解绑历史路由、启用 B 的专属消费后恢复 A。发布使用 `mandatory`，缺少有效绑定时返回上游错误并保留重试现场。见[独立视频探测队列迁移](../../integrations/rabbitmq.md#独立视频探测队列迁移)。
 
 ## 路由、回执与状态
 
-以下单路转码路由在隔离 vhost 内使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
+视频转码和独立探测使用持久 direct exchange 和 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
 
-| 路由         | 交换机                        | Routing key                | 队列                          |
-| ------------ | ----------------------------- | -------------------------- | ----------------------------- |
-| A 发转码命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`     |
-| A 发探测命令 | `mio.compute.commands.v1`     | `video.probe.v1`           | `mio.compute.commands.v1`     |
-| 命令死信     | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1` |
-| B 发转码结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`      |
-| B 发探测结果 | `mio.compute.results.v1`      | `video.probe.result.v1`    | `mio.compute.results.v1`      |
-| 结果死信     | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`  |
+| 路由         | 交换机                        | Routing key                | 队列                                      |
+| ------------ | ----------------------------- | -------------------------- | ----------------------------------------- |
+| A 发转码命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`                 |
+| A 发探测命令 | `mio.compute.commands.v1`     | `video.probe.v1`           | `mio.compute.video.probe.commands.v1`     |
+| 命令死信     | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1`             |
+| 探测命令死信 | `mio.compute.commands.dlx.v1` | `video.probe.dead.v1`      | `mio.compute.video.probe.commands.dlq.v1` |
+| B 发转码结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`                  |
+| B 发探测结果 | `mio.compute.results.v1`      | `video.probe.result.v1`    | `mio.compute.results.v1`                  |
+| 结果死信     | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`              |
 
-两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。未配置 Worker 观测的 B 保留单路转码命令消费 `prefetch=1`。已配置的实例有界接收 `prefetch=32`，并经[独立 Worker 共享槽](../../../compute/README.md#worker-观测与调限)限制实际准入。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
+两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。B 的转码和独立探测分别使用各自消费通道，未配置 Worker 观测时各自 `prefetch=1`，配置后各自 `prefetch=32`，并经[独立 Worker 共享槽](../../../compute/README.md#worker-观测与调限)限制实际准入。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
 
 A 在一个 PostgreSQL 事务写入视频 job 与 outbox，落库后触发 `wakePoll()`，合并并发唤醒，每轮认领并发布最多 10 条命令。Broker 故障后的重试从 1 秒起指数退避，最多 30 秒。结果消费者成功注册且同一 Broker 完成当轮 outbox 检查和发布后恢复初始退避。相同 owner/requestId 和输入返回原 job，输入冲突返回 409。收到发布确认且消息未退回时才将 outbox 标为已送达。B 在 journal 中持久化结果事件后发布，并在完成对应结果的确认后 ACK 命令。A 验证结果并提交 inbox 去重、资产及状态后 ACK 结果。连接中断后按稳定 messageId 幂等重投。
 

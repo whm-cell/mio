@@ -67,9 +67,12 @@ async function main(name: 'dev' | 'test') {
     await prepareLocalRegression(name, values);
     return;
   }
-  if (action === 'broker-init' && args.length === 0) {
+  if (
+    action === 'broker-init' &&
+    (args.length === 0 || (args.length === 1 && args[0] === '--migrate-video-probe'))
+  ) {
     const { prepareLocalBroker } = await import('./local-broker.ts');
-    await prepareLocalBroker(name, values);
+    await prepareLocalBroker(name, values, args.length === 1);
     return;
   }
   if (action === 'monitor-init' && args.length === 0) {

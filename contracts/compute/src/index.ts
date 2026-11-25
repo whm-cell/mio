@@ -9,6 +9,7 @@ export const COMMAND_ROUTING_KEY = 'transcode.v1';
 export const RESULT_EXCHANGE = 'mio.compute.results.v1';
 export const RESULT_QUEUE = 'mio.compute.results.v1';
 export const RESULT_ROUTING_KEY = 'transcode.result.v1';
+export const VIDEO_PROBE_COMMAND_QUEUE = 'mio.compute.video.probe.commands.v1';
 export const VIDEO_PROBE_COMMAND_ROUTING_KEY = 'video.probe.v1';
 export const VIDEO_PROBE_RESULT_ROUTING_KEY = 'video.probe.result.v1';
 

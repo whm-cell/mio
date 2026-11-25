@@ -1,5 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
-import { AUDIO_RESULT_QUEUE, parseWorkerInstanceIds } from '@mio/compute-contracts';
+import {
+  AUDIO_RESULT_QUEUE,
+  COMMAND_EXCHANGE,
+  COMMAND_QUEUE,
+  VIDEO_PROBE_COMMAND_QUEUE,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
+  parseWorkerInstanceIds,
+} from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import {
   audioResultPolicy,
@@ -11,7 +18,11 @@ import {
 type Json = Record<string, unknown>;
 
 /** Verify operator-provisioned resources and declare only the matching media topology. */
-export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.ProcessEnv) {
+export async function prepareLocalBroker(
+  name: 'dev' | 'test',
+  values: NodeJS.ProcessEnv,
+  migrateVideoProbe = false,
+) {
   const workerInstanceId = values.MIO_LOCAL_COMPUTE_INSTANCE_ID;
   const workerInstanceIds = parseWorkerInstanceIds(
     values.MIO_COMPUTE_WORKER_INSTANCE_IDS ?? workerInstanceId,
@@ -71,6 +82,27 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     throw new Error('LOCAL_BROKER_STREAM_FEATURE_REQUIRED');
   const vhost = `mio-${name}`;
   const vhostPath = `vhosts/${vhost}`;
+  const oldProbePath = `bindings/${vhost}/e/${COMMAND_EXCHANGE}/q/${COMMAND_QUEUE}`;
+  const newProbePath = `bindings/${vhost}/e/${COMMAND_EXCHANGE}/q/${VIDEO_PROBE_COMMAND_QUEUE}`;
+  const probeBinding = { routing_key: VIDEO_PROBE_COMMAND_ROUTING_KEY, arguments: {} };
+  async function legacyProbeBindingKey(): Promise<string | null> {
+    const bindings = await api('GET', oldProbePath);
+    if (bindings === null) return null;
+    if (!Array.isArray(bindings)) throw new Error(`LOCAL_BROKER_CONFLICT: ${oldProbePath}`);
+    const probes = bindings.filter(
+      (binding: Json | null) => binding?.routing_key === VIDEO_PROBE_COMMAND_ROUTING_KEY,
+    );
+    if (!probes.length) return null;
+    const [probe] = probes;
+    if (
+      probes.length !== 1 ||
+      !isDeepStrictEqual(probe.arguments, probeBinding.arguments) ||
+      typeof probe.properties_key !== 'string' ||
+      !probe.properties_key
+    )
+      throw new Error(`LOCAL_BROKER_CONFLICT: ${oldProbePath}`);
+    return probe.properties_key;
+  }
   const capacityPath = `operator-policies/${vhost}/mio-capacity`;
   const audioPolicyPath = `operator-policies/${vhost}/${audioResultPolicy.name}`;
   const roles = ['a', 'b'] as const;
@@ -112,6 +144,12 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     return missing;
   }
   const missingPrerequisites = await readPrerequisiteGaps();
+  const legacyProbe = !missingPrerequisites.has(vhostPath) && (await legacyProbeBindingKey());
+  const migrationRequired = () =>
+    new Error(
+      'LOCAL_BROKER_VIDEO_PROBE_MIGRATION_REQUIRED: pause A publishers and follow docs/integrations/rabbitmq.md#独立视频探测队列迁移',
+    );
+  if (legacyProbe && !migrateVideoProbe) throw migrationRequired();
   const topology = computeTopology(vhost, workerInstanceIds);
   const missingTopology: typeof topology = [];
   // Preflight everything before the first write. A failed/unknown write leaves resources for rerun.
@@ -129,13 +167,18 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
       (!path.endsWith('/' + AUDIO_RESULT_QUEUE) || !missingPrerequisites.has(audioPolicyPath))
     );
   });
-  for (const resource of declarations) await api(resource.method, resource.path, resource.body);
+  let appliedDeclarations = 0;
   function requireProvisioned(missing: Set<string>) {
     if (missing.size)
       throw new Error(
         `LOCAL_BROKER_PREPROVISION_REQUIRED: ${[...missing].join(', ')}\n` +
-          `Safe topology declarations completed: ${declarations.length}. Check current resources before provisioning. See docs/integrations/rabbitmq.md#预置本地-broker and rerun pnpm broker:init:${name}.`,
+          `Safe topology declarations completed: ${appliedDeclarations}. Check current resources before provisioning. See docs/integrations/rabbitmq.md#预置本地-broker and rerun pnpm broker:init:${name}.`,
       );
+  }
+  if (legacyProbe) requireProvisioned(missingPrerequisites);
+  for (const resource of declarations) {
+    await api(resource.method, resource.path, resource.body);
+    appliedDeclarations++;
   }
   requireProvisioned(missingPrerequisites);
 
@@ -163,7 +206,13 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     throw new Error(
       `LOCAL_BROKER_LOGIN_FAILED: ${failedLogin}; restore the original credentials, do not reset users`,
     );
+  if (legacyProbe) {
+    if (await absent(newProbePath, probeBinding, true))
+      throw new Error(`LOCAL_BROKER_VIDEO_PROBE_BINDING_UNVERIFIED: ${newProbePath}`);
+    await api('DELETE', `${oldProbePath}/${encodeURIComponent(legacyProbe)}`);
+  }
+  if (await legacyProbeBindingKey()) throw migrationRequired();
   console.log(
-    `${name}: RabbitMQ topology and A/B permissions ready (${declarations.length} declarations applied)`,
+    `${name}: RabbitMQ topology and A/B permissions ready (${appliedDeclarations} declarations applied)`,
   );
 }

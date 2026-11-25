@@ -160,7 +160,7 @@ export class Worker {
   }
 
   admissionReady(resource: WorkerResourceClass = 'encode'): boolean {
-    if (this.#stopped || this.#probeDeliveries.size || this.#deliveries.size || this.#maintenance)
+    if (this.#stopped || (resource === 'encode' && (this.#deliveries.size || this.#maintenance)))
       return false;
     if (resource === 'encode') this.#syncProcessHold();
     if (!this.#slots.available(resource)) return false;
@@ -175,12 +175,7 @@ export class Worker {
 
   needsMaintenance(): boolean {
     if (this.#stopped) return false;
-    if (
-      !this.#probeDeliveries.size &&
-      !this.#deliveries.size &&
-      !this.admissionReady() &&
-      !this.admissionReady('probe')
-    )
+    if (!this.#deliveries.size && !this.admissionReady() && !this.admissionReady('probe'))
       return true;
     return this.#nextIdleAttempt('') !== null;
   }

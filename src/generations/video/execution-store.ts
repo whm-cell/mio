@@ -17,6 +17,7 @@ import {
   VIDEO_EXECUTOR_MAX_AGE_SECONDS,
   VIDEO_EXECUTOR_MAX_QUERIES,
   VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VIDEO_INVALID_OUTPUT_ERRORS,
   VIDEO_MATERIALIZATION_MAX_ATTEMPTS,
   VIDEO_QUERY_RETRY_CODES,
   VIDEO_QUOTA_LOCK,
@@ -24,11 +25,15 @@ import {
 
 const EXECUTOR_LOCK = 672049927;
 const RELEASE_TIMEOUT_MS = 2000;
+const CLEANUP_RETRY_INTERVAL_MS = 30_000;
 const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
-const selection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
+const executionSelection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
   e.phase,e.claim_id,e.snapshot,e.upstream_task_id,e.query_attempt,e.async_max_queries,
-  e.async_deadline,e.checkpoint FROM mio_video_jobs j
-  JOIN mio_video_executions e ON e.job_id=j.id`;
+  e.async_deadline,e.checkpoint FROM mio_video_jobs j`;
+const runnable = `e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
+  AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp()
+    OR (e.phase='waiting' AND (e.async_deadline<=statement_timestamp()
+      OR e.query_attempt>=e.async_max_queries)))`;
 
 export type VideoClaim = Pick<VideoExecution, 'id' | 'claim_id'>;
 
@@ -111,33 +116,37 @@ export class VideoExecutionStore {
   }
 
   async claim(signal?: AbortSignal): Promise<VideoExecution | undefined> {
+    signal?.throwIfAborted();
+    const peek = await this.pool.query<{ due: boolean }>(
+      `SELECT EXISTS (SELECT FROM mio_video_executions e WHERE ${runnable}) AS due`,
+    );
+    if (!peek.rows[0]?.due) return;
+    signal?.throwIfAborted();
     let claim: VideoClaim | undefined;
     const claimId = createId();
     try {
       return await transaction(
         this.pool,
         async (client) => {
-          const result = await client.query<{ job_id: string }>(
-            `UPDATE mio_video_executions SET claim_id=$1,updated_at=now()
-         WHERE job_id=(SELECT e.job_id FROM mio_video_executions e
-           JOIN mio_video_jobs j ON j.id=e.job_id
-           WHERE e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
-           AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp()
-             OR (e.phase='waiting' AND (e.async_deadline<=statement_timestamp()
-               OR e.query_attempt>=e.async_max_queries)))
-           ORDER BY j.created_at LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
-         RETURNING job_id`,
+          const result = await client.query<VideoExecution>(
+            `WITH claimed AS (
+             UPDATE mio_video_executions SET claim_id=$1,updated_at=now()
+             WHERE job_id=(SELECT e.job_id FROM mio_video_executions e
+               JOIN mio_video_jobs j ON j.id=e.job_id
+               WHERE ${runnable}
+               ORDER BY j.created_at LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
+             RETURNING *
+           ) ${executionSelection} JOIN claimed e ON e.job_id=j.id`,
             [claimId],
           );
-          const id = result.rows[0]?.job_id;
-          if (!id) return;
-          claim = { id, claim_id: claimId };
-          return (await client.query<VideoExecution>(selection + ' WHERE j.id=$1', [id])).rows[0];
+          const row = result.rows[0];
+          if (row) claim = { id: row.id, claim_id: claimId };
+          return row;
         },
         signal,
       );
     } catch (error) {
-      // The commit may have succeeded even though the caller did not receive the row.
+      // PostgreSQL may have committed before the caller lost its COMMIT reply.
       if (claim) throw new VideoClaimUnsettled(claim, error);
       throw error;
     }
@@ -146,10 +155,10 @@ export class VideoExecutionStore {
   async completedCleanup(): Promise<VideoExecution[]> {
     return (
       await this.pool.query<VideoExecution>(
-        selection +
-          `
+        `${executionSelection} JOIN mio_video_executions e ON e.job_id=j.id
       WHERE j.state='completed' AND e.phase='done' AND e.checkpoint IS NOT NULL
         AND e.checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb
+        AND COALESCE((e.checkpoint->>'cleanupRetryAt')::timestamptz,'-infinity')<=statement_timestamp()
       ORDER BY e.updated_at LIMIT 10`,
       )
     ).rows;
@@ -157,9 +166,11 @@ export class VideoExecutionStore {
   async cleanupResult(id: string, cleaned: boolean): Promise<void> {
     await this.pool.query(
       `UPDATE mio_video_executions SET
-      checkpoint=CASE WHEN $2 THEN checkpoint||'{"cleaned":true}'::jsonb ELSE checkpoint END,
-      updated_at=now() WHERE job_id=$1 AND phase='done'`,
-      [id, cleaned],
+      checkpoint=CASE WHEN $2 THEN (checkpoint-'cleanupRetryAt')||'{"cleaned":true}'::jsonb
+        ELSE checkpoint||jsonb_build_object('cleanupRetryAt',clock_timestamp()+$3*interval '1 millisecond') END,
+      updated_at=now() WHERE job_id=$1 AND phase='done' AND checkpoint IS NOT NULL
+        AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb`,
+      [id, cleaned, CLEANUP_RETRY_INTERVAL_MS],
     );
   }
 
@@ -443,6 +454,13 @@ export class VideoExecutionStore {
     const output = typeof result === 'string' ? null : result;
     if (output && output.index !== index) throw new Error('VIDEO_RESULT_INVALID');
     const phase = output ? 'registered' : 'failed';
+    const errorCode = typeof result === 'string' ? result : null;
+    const skipped =
+      errorCode === 'VIDEO_RESULT_URL_EXPIRED'
+        ? 'expired'
+        : errorCode !== null && VIDEO_INVALID_OUTPUT_ERRORS.has(errorCode)
+          ? 'invalidOutputs'
+          : undefined;
     return transaction(
       this.pool,
       async (client) => {
@@ -488,7 +506,7 @@ export class VideoExecutionStore {
             index,
             output?.assetId ?? null,
             phase,
-            typeof result === 'string' ? result : null,
+            errorCode,
             output?.contentType ?? null,
             output?.sizeBytes ?? null,
             output?.sha256 ?? null,
@@ -505,12 +523,12 @@ export class VideoExecutionStore {
           WHERE job_id=$1`,
             [row.id, index],
           );
-        else if (result === 'VIDEO_RESULT_URL_EXPIRED')
+        else if (skipped)
           await client.query(
-            `UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,'{expired}',
-            COALESCE(checkpoint->'expired','{}'::jsonb)||jsonb_build_object($2::text,true)),updated_at=now()
+            `UPDATE mio_video_executions SET checkpoint=jsonb_set(checkpoint,ARRAY[$3::text],
+            COALESCE(checkpoint->$3::text,'{}'::jsonb)||jsonb_build_object($2::text,true)),updated_at=now()
           WHERE job_id=$1`,
-            [row.id, index],
+            [row.id, index, skipped],
           );
         return phase;
       },

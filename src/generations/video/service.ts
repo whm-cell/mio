@@ -9,7 +9,7 @@ import { videoRequestHash } from './contracts.ts';
 import { defaultVideoGenerateAudio } from './driver-capabilities.ts';
 import { validateVideoParameters } from '../../providers/onelink/video-route.ts';
 import type { createVideoInputResolver } from './inputs.ts';
-import type { VideoCreateRequest, VideoCapabilitiesView } from './contracts.ts';
+import type { VideoCreateRequest, VideoCapabilitiesView, VideoMode } from './contracts.ts';
 import type { VideoJobCommand } from './store.ts';
 import type { VideoJobCursor } from './store.ts';
 
@@ -93,6 +93,15 @@ function videoUnavailable(): GenerationError {
   return new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
 }
 
+function requireVideoMode(
+  admission: Awaited<ReturnType<ProviderService['videoAdmission']>>,
+  mode: VideoMode,
+): void {
+  if (!admission.available) throw videoUnavailable();
+  if (!admission.supportedModes.includes(mode))
+    throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_MODE_UNSUPPORTED');
+}
+
 /** Exposes video capability, durable job reads, and admission through the wired executor. */
 export function createVideoGenerationService(
   store: VideoGenerationStore,
@@ -124,6 +133,12 @@ export function createVideoGenerationService(
     return action;
   };
 
+  const currentProvider = () => {
+    const current = provider();
+    if (!current) throw videoUnavailable();
+    return current;
+  };
+
   const capabilities = (
     actor: Pick<ProviderPrincipal, 'userId'>,
     modelRef: string,
@@ -131,10 +146,141 @@ export function createVideoGenerationService(
     admit(async () => {
       if (!/^onelink:model:[a-z0-9-]{1,256}$/.test(modelRef))
         throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
-      const current = provider();
-      if (!current) throw videoUnavailable();
-      return current.videoCapabilities(actor, modelRef);
+      return currentProvider().videoCapabilities(actor, modelRef);
     });
+
+  const create = async (
+    actor: Pick<ProviderPrincipal, 'userId'>,
+    request: VideoCreateRequest,
+    turnSignal?: AbortSignal,
+    toolSnapshot?: () => VideoAdmissionSnapshot,
+  ) => {
+    const readSignal = turnSignal ? AbortSignal.any([turnSignal, stop.signal]) : stop.signal;
+    readSignal.throwIfAborted();
+    const hash = videoRequestHash(request);
+    const replay = async () => {
+      const previous = await store.byRequest(actor.userId, request.requestId);
+      readSignal.throwIfAborted();
+      if (!previous) return;
+      if (previous.inputHash !== hash)
+        throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
+      const job = await store.get(actor.userId, previous.jobId);
+      readSignal.throwIfAborted();
+      return { created: false, job };
+    };
+    const previous = await replay();
+    if (previous) return previous;
+
+    const signal = turnSignal ? AbortSignal.any([turnSignal, writable]) : writable;
+    signal.throwIfAborted();
+    let snapshot: VideoAdmissionSnapshot;
+    try {
+      if (toolSnapshot) snapshot = toolSnapshot();
+      else {
+        const admission = await currentProvider().videoAdmission(actor, request.modelRef);
+        signal.throwIfAborted();
+        if (admission.capabilitiesVersion !== request.expectedCapabilitiesVersion)
+          throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
+        requireVideoMode(admission, request.parameters.mode);
+        snapshot = admission.snapshot();
+      }
+    } catch (error) {
+      readSignal.throwIfAborted();
+      // A concurrent admission may commit before the fresh provider preflight fails.
+      if (error instanceof ProviderError || error instanceof GenerationError) {
+        const concurrent = await replay();
+        if (concurrent) return concurrent;
+      }
+      signal.throwIfAborted();
+      throw error;
+    }
+    if (!validateVideoParameters(request.parameters, snapshot.route))
+      throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
+    const effective = { ...request.parameters };
+    if (effective.watermark === undefined && snapshot.route.paramSpec.parameters?.watermark)
+      effective.watermark = snapshot.defaultVideoWatermark;
+    const audioDefault = defaultVideoGenerateAudio(snapshot.route.driver, snapshot.modelId);
+    if (effective.generateAudio === undefined && audioDefault !== undefined)
+      effective.generateAudio = audioDefault;
+    const snapshotRecord = snapshot as unknown as Record<string, unknown>;
+    const route = snapshotRecord.route;
+    const credential = snapshotRecord.credential;
+    if (
+      !route ||
+      typeof route !== 'object' ||
+      Array.isArray(route) ||
+      !credential ||
+      typeof credential !== 'object' ||
+      Array.isArray(credential)
+    )
+      throw videoUnavailable();
+    const command: VideoJobCommand = {
+      request: { ...request, parameters: effective },
+      inputSnapshot: inputSnapshot(request),
+    };
+    const admitted = Object.fromEntries(
+      [
+        'providerConfigId',
+        'providerRevision',
+        'credentialVersion',
+        'catalogVersion',
+        'adaptationVersion',
+        'modelRef',
+        'modelId',
+        'modelKey',
+        'profile',
+        'capabilitiesVersion',
+        'defaultVideoWatermark',
+      ]
+        .filter((key) => snapshotRecord[key] !== undefined)
+        .map((key) => [key, snapshotRecord[key]]),
+    );
+    admitted.driver = admitted.profile;
+    delete admitted.profile;
+    const executionSnapshot = {
+      providerConfigId: snapshotRecord.providerConfigId,
+      credentialVersion: snapshotRecord.credentialVersion,
+      credential,
+    };
+    let stored;
+    try {
+      if (command.inputSnapshot.length) {
+        if (!inspectInputs) throw videoUnavailable();
+        try {
+          command.inputObjects = await inspectInputs(
+            actor.userId,
+            command.inputSnapshot,
+            AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+          );
+        } catch (error) {
+          readSignal.throwIfAborted();
+          if (error instanceof GenerationError && (!signal.aborted || error === signal.reason))
+            throw error;
+          throw videoUnavailable();
+        }
+      }
+      signal.throwIfAborted();
+      stored = await store.create(
+        actor.userId,
+        request,
+        hash,
+        command,
+        admitted,
+        executionSnapshot,
+        routeSnapshot(snapshotRecord),
+        signal,
+      );
+    } catch (error) {
+      // The losing write was stopped, but another admission may have committed its request.
+      if (!executorStop.signal.aborted || error !== executorStop.signal.reason) throw error;
+      readSignal.throwIfAborted();
+      const concurrent = await replay();
+      if (!concurrent) throw error;
+      return concurrent;
+    }
+    if (stored.created && !writable.aborted) executor?.wake();
+    return { created: stored.created, job: await store.get(actor.userId, stored.jobId) };
+  };
 
   return {
     capabilities,
@@ -143,140 +289,27 @@ export function createVideoGenerationService(
       request: VideoCreateRequest,
       turnSignal?: AbortSignal,
     ) {
+      return admit(() => create(actor, request, turnSignal));
+    },
+    createFromTool(
+      actor: Pick<ProviderPrincipal, 'userId'>,
+      intent: Omit<VideoCreateRequest, 'expectedCapabilitiesVersion'>,
+      turnSignal?: AbortSignal,
+    ) {
       return admit(async () => {
-        const readSignal = turnSignal ? AbortSignal.any([turnSignal, stop.signal]) : stop.signal;
-        readSignal.throwIfAborted();
-        const hash = videoRequestHash(request);
-        const replay = async () => {
-          const previous = await store.byRequest(actor.userId, request.requestId);
-          readSignal.throwIfAborted();
-          if (!previous) return;
-          if (previous.inputHash !== hash)
-            throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
-          const job = await store.get(actor.userId, previous.jobId);
-          readSignal.throwIfAborted();
-          return { created: false, job };
+        turnSignal?.throwIfAborted();
+        const admission = await currentProvider().videoAdmission(actor, intent.modelRef);
+        turnSignal?.throwIfAborted();
+        // The tool checks availability and mode before looking up its durable request.
+        requireVideoMode(admission, intent.parameters.mode);
+        // Property order is part of the stored video request hash.
+        const request: VideoCreateRequest = {
+          requestId: intent.requestId,
+          modelRef: intent.modelRef,
+          expectedCapabilitiesVersion: admission.capabilitiesVersion,
+          parameters: intent.parameters,
         };
-        const previous = await replay();
-        if (previous) return previous;
-
-        const signal = turnSignal ? AbortSignal.any([turnSignal, writable]) : writable;
-        signal.throwIfAborted();
-        let snapshot: VideoAdmissionSnapshot;
-        try {
-          const current = provider();
-          if (!current) throw videoUnavailable();
-          const capability = await current.videoCapabilities(actor, request.modelRef);
-          signal.throwIfAborted();
-          if (capability.capabilitiesVersion !== request.expectedCapabilitiesVersion)
-            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
-          if (!capability.available) throw videoUnavailable();
-          if (
-            !capability.modes.some(
-              (mode) => mode.mode === request.parameters.mode && mode.supported,
-            )
-          )
-            throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_MODE_UNSUPPORTED');
-          snapshot = await current.snapshotVideo(actor, request.modelRef);
-          signal.throwIfAborted();
-          if (snapshot.capabilitiesVersion !== request.expectedCapabilitiesVersion)
-            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
-        } catch (error) {
-          readSignal.throwIfAborted();
-          // A concurrent admission may commit before the fresh provider preflight fails.
-          if (error instanceof ProviderError || error instanceof GenerationError) {
-            const concurrent = await replay();
-            if (concurrent) return concurrent;
-          }
-          signal.throwIfAborted();
-          throw error;
-        }
-        if (!validateVideoParameters(request.parameters, snapshot.route))
-          throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
-        const effective = { ...request.parameters };
-        if (effective.watermark === undefined && snapshot.route.paramSpec.parameters?.watermark)
-          effective.watermark = snapshot.defaultVideoWatermark;
-        const audioDefault = defaultVideoGenerateAudio(snapshot.route.driver, snapshot.modelId);
-        if (effective.generateAudio === undefined && audioDefault !== undefined)
-          effective.generateAudio = audioDefault;
-        const snapshotRecord = snapshot as unknown as Record<string, unknown>;
-        const route = snapshotRecord.route;
-        const credential = snapshotRecord.credential;
-        if (
-          !route ||
-          typeof route !== 'object' ||
-          Array.isArray(route) ||
-          !credential ||
-          typeof credential !== 'object' ||
-          Array.isArray(credential)
-        )
-          throw videoUnavailable();
-        const command: VideoJobCommand = {
-          request: { ...request, parameters: effective },
-          inputSnapshot: inputSnapshot(request),
-        };
-        const admitted = Object.fromEntries(
-          [
-            'providerConfigId',
-            'providerRevision',
-            'credentialVersion',
-            'catalogVersion',
-            'adaptationVersion',
-            'modelRef',
-            'modelId',
-            'modelKey',
-            'profile',
-            'capabilitiesVersion',
-            'defaultVideoWatermark',
-          ]
-            .filter((key) => snapshotRecord[key] !== undefined)
-            .map((key) => [key, snapshotRecord[key]]),
-        );
-        admitted.driver = admitted.profile;
-        delete admitted.profile;
-        const executionSnapshot = {
-          providerConfigId: snapshotRecord.providerConfigId,
-          credentialVersion: snapshotRecord.credentialVersion,
-          credential,
-        };
-        let stored;
-        try {
-          if (command.inputSnapshot.length) {
-            if (!inspectInputs) throw videoUnavailable();
-            try {
-              command.inputObjects = await inspectInputs(
-                actor.userId,
-                command.inputSnapshot,
-                AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
-              );
-            } catch (error) {
-              readSignal.throwIfAborted();
-              if (error instanceof GenerationError && (!signal.aborted || error === signal.reason))
-                throw error;
-              throw videoUnavailable();
-            }
-          }
-          signal.throwIfAborted();
-          stored = await store.create(
-            actor.userId,
-            request,
-            hash,
-            command,
-            admitted,
-            executionSnapshot,
-            routeSnapshot(snapshotRecord),
-            signal,
-          );
-        } catch (error) {
-          // The losing write was stopped, but another admission may have committed its request.
-          if (!executorStop.signal.aborted || error !== executorStop.signal.reason) throw error;
-          readSignal.throwIfAborted();
-          const concurrent = await replay();
-          if (!concurrent) throw error;
-          return concurrent;
-        }
-        if (stored.created && !writable.aborted) executor?.wake();
-        return { created: stored.created, job: await store.get(actor.userId, stored.jobId) };
+        return create(actor, request, turnSignal, admission.snapshot);
       });
     },
     get(actor: Pick<ProviderPrincipal, 'userId'>, jobId: string) {

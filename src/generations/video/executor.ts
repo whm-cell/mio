@@ -49,7 +49,12 @@ async function cleanCompleted(
   try {
     await cleanup(row, AbortSignal.any([stop, AbortSignal.timeout(60_000)]));
     cleaned = true;
-  } catch {
+  } catch (error) {
+    if (
+      stop.aborted &&
+      (error === stop.reason || (error instanceof Error && error.cause === stop.reason))
+    )
+      return;
     log.error('VIDEO_CLEANUP_PENDING');
   }
   await execution.cleanupResult(row.id, cleaned);

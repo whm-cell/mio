@@ -185,9 +185,8 @@ async function writeDownloadedVideo(
     const declared = response.headers.get('content-length');
     if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_VIDEO_BYTES))
       throw new Error('VIDEO_TOO_LARGE');
-    for await (const part of response.body) {
+    for await (const bytes of response.body) {
       signal.throwIfAborted();
-      const bytes = Buffer.from(part);
       sizeBytes += bytes.length;
       if (sizeBytes > MAX_VIDEO_BYTES) throw new Error('VIDEO_TOO_LARGE');
       hash.update(bytes);
@@ -336,7 +335,7 @@ export function createVideoMaterializer(
     if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
     return copied.etag;
   };
-  return async (row, video, index, stop) => {
+  return async (row, video, index, stop, freshResult?: boolean) => {
     const stagingSignal = AbortSignal.any([stop, AbortSignal.timeout(VIDEO_IO_TIMEOUT_MS)]);
     stagingSignal.throwIfAborted();
     const videoDirectory = join(dataDirectory, 'video');
@@ -348,13 +347,16 @@ export function createVideoMaterializer(
     const receipt = join(directory, `${index}.json`);
     let saved = await readReceipt(receipt, row.id, index, stagingSignal);
     let contentMd5: string | undefined;
+    let publishedMedia = false;
     if (!saved) {
       // Persist new directory entries before storing output identity or bytes in them.
       await syncDirectory(dataDirectory);
       await syncDirectory(videoDirectory);
-      let actual =
-        (await digestFile(file, stagingSignal)) ??
-        (await downloadVideo(video.url, file, stagingSignal, download));
+      let actual = await digestFile(file, stagingSignal);
+      if (!actual) {
+        actual = await downloadVideo(video.url, file, stagingSignal, download);
+        publishedMedia = actual !== undefined;
+      }
       if (!actual) {
         // Another claim published the bytes. Prefer its receipt when it is already visible.
         saved = await readReceipt(receipt, row.id, index, stagingSignal);
@@ -379,6 +381,15 @@ export function createVideoMaterializer(
     }
     if (!saved) throw new Error('VIDEO_CHECKPOINT_INVALID');
     const createdReceipt = contentMd5 !== undefined;
+    let skipPrewriteHead = freshResult === true && publishedMedia && createdReceipt;
+    const reconcileTargetCollision = (error: unknown) => {
+      const failure = error as { statusCode?: number; code?: string } | null;
+      if (!skipPrewriteHead || failure?.statusCode !== 409 || failure.code !== 'FileAlreadyExists')
+        throw error;
+      // Verify the competing object with HEAD and check any later target before writing.
+      skipPrewriteHead = false;
+      return undefined;
+    };
     // The name may be visible before its publisher finishes syncing the directory.
     if (!createdReceipt) await syncDirectory(directory);
     const key = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
@@ -386,7 +397,10 @@ export function createVideoMaterializer(
     let rawObject = createdReceipt ? undefined : await existingRaw(rawKey, saved, stagingSignal);
     let finalizingSignal = stagingSignal;
     const needsProbe = saved.media?.container !== 'mp4';
-    let object = needsProbe || !rawObject ? await existingObject(key, stagingSignal) : undefined;
+    let object =
+      !skipPrewriteHead && (needsProbe || !rawObject)
+        ? await existingObject(key, stagingSignal)
+        : undefined;
     if (object) verifyVideoObject(object, saved, saved.etag);
     const rebuildStage = !!saved.media && !rawObject && !object;
     let media: VideoProbeMetadataV1;
@@ -408,12 +422,19 @@ export function createVideoMaterializer(
           delete saved.etag;
           await save(receipt, saved, stagingSignal);
         }
-        let stagedEtag: string;
+        let stagedEtag: string | undefined;
         if (rawObject && saved.rawEtag) {
           stagedEtag = await copyVideo(rawKey, key, saved.rawEtag, saved.sha256, stagingSignal);
         } else {
           if (contentMd5 === undefined) throw new Error('VIDEO_CHECKPOINT_INVALID');
-          stagedEtag = await putStagingVideo(objects, key, file, saved, contentMd5, stagingSignal);
+          stagedEtag = await putStagingVideo(
+            objects,
+            key,
+            file,
+            saved,
+            contentMd5,
+            stagingSignal,
+          ).catch(reconcileTargetCollision);
         }
         object = await readHead(key, stagingSignal);
         verifyVideoObject(object, saved, stagedEtag);
@@ -446,12 +467,21 @@ export function createVideoMaterializer(
     } else {
       media = requireVerifiedMp4(saved.media);
     }
-    if (createdReceipt || rebuildStage)
+    if (!skipPrewriteHead && (createdReceipt || rebuildStage))
       rawObject = await existingRaw(rawKey, saved, finalizingSignal);
     if (!rawObject) {
       if (!saved.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
-      saved.rawEtag = await copyVideo(key, rawKey, saved.etag, saved.sha256, finalizingSignal);
-      await save(receipt, saved, finalizingSignal);
+      const copiedEtag = await copyVideo(
+        key,
+        rawKey,
+        saved.etag,
+        saved.sha256,
+        finalizingSignal,
+      ).catch(reconcileTargetCollision);
+      if (copiedEtag !== undefined) {
+        saved.rawEtag = copiedEtag;
+        await save(receipt, saved, finalizingSignal);
+      }
       rawObject = await readHead(rawKey, finalizingSignal);
       verifyVideoObject(rawObject, saved, saved.rawEtag);
     }

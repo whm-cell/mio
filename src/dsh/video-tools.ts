@@ -1,4 +1,3 @@
-import { ApplicationError } from '@mio/foundation/errors';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
@@ -382,17 +381,9 @@ export function registerConversationVideoTools(
             );
           exec.signal.throwIfAborted();
           try {
-            const capabilities = await bridge.capabilities(actor, args.modelRef);
-            exec.signal.throwIfAborted();
-            if (!capabilities.available) throw new ApplicationError('VIDEO_UNAVAILABLE');
-            if (
-              !capabilities.modes.some((entry) => entry.mode === 'text_to_video' && entry.supported)
-            )
-              throw new ApplicationError('VIDEO_MODE_UNSUPPORTED');
             const request = {
               requestId: deriveMediaToolRequestId('video', run, exec.callId),
               modelRef: args.modelRef,
-              expectedCapabilitiesVersion: capabilities.capabilitiesVersion,
               parameters: {
                 mode: 'text_to_video' as const,
                 prompt: args.prompt,

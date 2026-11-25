@@ -770,10 +770,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                         supportedModes: item.video.modes,
                       }));
                     },
-                    capabilities: (actor, modelRef) =>
-                      videoGenerations.capabilities(actor, modelRef),
                     createVideo: (actor, request, signal) =>
-                      videoGenerations.create(actor, request, signal).then((result) => result.job),
+                      videoGenerations
+                        .createFromTool(actor, request, signal)
+                        .then((result) => result.job),
                     getVideo: (actor, jobId) => videoGenerations.get(actor, jobId),
                     recoverVideo: (actor, jobId) => videoGenerations.recover(actor, jobId),
                   }

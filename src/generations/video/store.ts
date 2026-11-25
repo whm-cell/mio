@@ -147,7 +147,7 @@ export class VideoGenerationStore {
         // followed the automatic reply, so it is a conservative anchor for the first refresh.
         await client.query(
           `UPDATE mio_video_executions SET phase='materializing',claim_id=NULL,
-          next_query_at=NULL,checkpoint=(checkpoint-'expired')||jsonb_build_object(
+          next_query_at=NULL,checkpoint=(checkpoint-ARRAY['expired','invalidOutputs'])||jsonb_build_object(
             'materializationAttempts',0,'recoveryQuery','{"state":"available"}'::jsonb,
             'refreshAt',COALESCE(checkpoint->'refreshAt',to_jsonb(updated_at+$2*interval '1 millisecond'))
           ),updated_at=now()

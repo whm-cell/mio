@@ -194,49 +194,76 @@ async function observeDirectorySync(directory: string, beforeSync: () => Promise
 }
 
 describe('durable video materialization', () => {
-  it('uses one MD5-checked staging PUT and one copy bound to the probed source', async () => {
-    const f = await fixture();
-    try {
-      const output = await f.run(f.row, video, 0, AbortSignal.timeout(5000));
-      expect(output).toMatchObject({
-        width: 640,
-        height: 360,
-        durationMs: 4000,
-        contentType: 'video/mp4',
-      });
-      expect(output.key).toMatch(new RegExp('^mio/raw/' + output.assetId + '/'));
-      const command = f.probe.mock.calls[0]![0];
-      expect(command.source.stagingKey).toContain('mio/staging/video/' + f.row.id + '/0/');
-      expect(f.objects.copy).toHaveBeenCalledWith(
-        command.source.stagingKey,
-        output.key,
-        command.source.etag,
-        'private',
-        { contentType: 'video/mp4', sha256: output.sha256, signal: expect.any(AbortSignal) },
-      );
-      expect(await f.start()(f.row, video, 0, AbortSignal.timeout(5000))).toEqual(output);
-      expect(f.download).toHaveBeenCalledTimes(1);
-      expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
-      expect(f.objects.copy).toHaveBeenCalledTimes(1);
-      expect(f.probe).toHaveBeenCalledTimes(1);
-    } finally {
-      await f.close();
-    }
-  });
+  it.each([undefined, true])(
+    'uses one MD5-checked staging PUT and one copy bound to the probed source (fresh result %s)',
+    async (freshResult) => {
+      const f = await fixture();
+      try {
+        const output = await f.run(f.row, video, 0, AbortSignal.timeout(5000), freshResult);
+        expect(output).toMatchObject({
+          width: 640,
+          height: 360,
+          durationMs: 4000,
+          contentType: 'video/mp4',
+        });
+        expect(output.key).toMatch(new RegExp('^mio/raw/' + output.assetId + '/'));
+        const command = f.probe.mock.calls[0]![0];
+        const { stagingKey, etag } = command.source;
+        expect(stagingKey).toContain('mio/staging/video/' + f.row.id + '/0/');
+        expect(f.objects.copy).toHaveBeenCalledWith(stagingKey, output.key, etag, 'private', {
+          contentType: 'video/mp4',
+          sha256: output.sha256,
+          signal: expect.any(AbortSignal),
+        });
+        const head = vi.mocked(f.objects.head);
+        expect(head.mock.calls.map(([key]) => key)).toEqual(
+          freshResult ? [stagingKey, output.key] : [stagingKey, stagingKey, output.key, output.key],
+        );
+        const headCalls = head.mock.invocationCallOrder;
+        const [putCall] = vi.mocked(f.objects.putVideo!).mock.invocationCallOrder;
+        const [copyCall] = vi.mocked(f.objects.copy).mock.invocationCallOrder;
+        const stageVerification = headCalls[freshResult ? 0 : 1]!;
+        expect(putCall).toBeLessThan(stageVerification);
+        expect(stageVerification).toBeLessThan(f.probe.mock.invocationCallOrder[0]!);
+        expect(copyCall).toBeLessThan(headCalls[freshResult ? 1 : 3]!);
+        if (!freshResult) {
+          expect(headCalls[0]).toBeLessThan(putCall!);
+          expect(headCalls[2]).toBeLessThan(copyCall!);
+        }
+        head.mockClear();
+        expect(await f.start()(f.row, video, 0, AbortSignal.timeout(5000))).toEqual(output);
+        expect(head.mock.calls.map(([key]) => key)).toEqual([output.key]);
+        expect(f.download).toHaveBeenCalledTimes(1);
+        expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+        expect(f.objects.copy).toHaveBeenCalledTimes(1);
+        expect(f.probe).toHaveBeenCalledTimes(1);
+      } finally {
+        await f.close();
+      }
+    },
+  );
   it('reconciles staging before reading stale local bytes after a lost upload acknowledgement', async () => {
     const f = await fixture();
     try {
-      const put = f.objects.putVideo!;
-      const upload = vi.mocked(put).getMockImplementation()!;
-      vi.mocked(put).mockImplementationOnce(async (...args) => {
+      const put = vi.mocked(f.objects.putVideo!);
+      const upload = put.getMockImplementation()!;
+      put.mockImplementationOnce(async (...args) => {
         await upload(...args);
         throw new Error('lost acknowledgement');
       });
-      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toThrow(
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000), true)).rejects.toThrow(
         'lost acknowledgement',
       );
+      expect(f.objects.head).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8')).etag).toBeUndefined();
       await writeFile(f.checkpoint('0.media'), 'stale bytes');
-      expect(await f.run(f.row, video, 0, AbortSignal.timeout(5000))).toMatchObject({ index: 0 });
+      const output = await f.start()(f.row, video, 0, AbortSignal.timeout(5000));
+      expect(output).toMatchObject({ index: 0 });
+      expect(vi.mocked(f.objects.head).mock.calls.map(([key]) => key)).toEqual([
+        output.key,
+        put.mock.calls[0]![0],
+        output.key,
+      ]);
       expect(f.download).toHaveBeenCalledTimes(1);
       expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
       expect(f.objects.copy).toHaveBeenCalledTimes(1);
@@ -244,6 +271,100 @@ describe('durable video materialization', () => {
       await f.close();
     }
   });
+
+  describe.each(['staging', 'raw'])(
+    '%s target collision during fresh materialization',
+    (target) => {
+      it.each(['matching', 'different digest', 'unrelated 409'])(
+        'reconciles %s using the SDK error code and target identity',
+        async (outcome) => {
+          const f = await fixture();
+          const storage = cosFixture();
+          const failure = {
+            statusCode: 409,
+            code: outcome === 'unrelated 409' ? 'BucketAlreadyExists' : 'FileAlreadyExists',
+          };
+          const competing = {
+            bytes: f.bytes,
+            sha256:
+              outcome === 'different digest'
+                ? 'f'.repeat(64)
+                : createHash('sha256').update(f.bytes).digest('hex'),
+            etag: 'competing-object-etag',
+            contentType: 'video/mp4',
+          };
+          const putRequest = vi.spyOn(COS.prototype, 'putObject').mockRejectedValue(failure);
+          const copyRequest = vi.spyOn(COS.prototype, 'request').mockRejectedValue(failure);
+          const put = vi.mocked(f.objects.putVideo!);
+          const copy = vi.mocked(f.objects.copy);
+          try {
+            if (target === 'staging') {
+              put.mockImplementationOnce((...args) => {
+                f.saved.set(args[0], competing);
+                return storage.putVideo!(...args);
+              });
+            } else {
+              copy.mockImplementationOnce((...args) => {
+                f.saved.set(args[1], competing);
+                return storage.copy(...args);
+              });
+            }
+            const index = 3;
+            const materialized = f.run(f.row, video, index, AbortSignal.timeout(5000), true);
+            if (outcome === 'different digest')
+              await expect(materialized).rejects.toThrow('VIDEO_OBJECT_MISMATCH');
+            else if (outcome === 'unrelated 409') await expect(materialized).rejects.toBe(failure);
+            else await expect(materialized).resolves.toMatchObject({ index });
+            const { assetId, attemptId, etag, rawEtag } = JSON.parse(
+              await readFile(f.checkpoint(`${index}.json`), 'utf8'),
+            );
+            const stageKey = `mio/staging/video/${f.row.id}/${index}/${attemptId}.media`;
+            const rawKey = `mio/raw/${assetId}/${attemptId}`;
+            const collisionKey = target === 'staging' ? stageKey : rawKey;
+            const requests = target === 'staging' ? putRequest : copyRequest;
+            expect(requests).toHaveBeenCalledTimes(1);
+            expect(requests.mock.calls[0]![0]).toMatchObject({
+              Key: collisionKey,
+              Headers: { 'x-cos-forbid-overwrite': 'true' },
+            });
+            expect(f.saved.get(collisionKey)).toBe(competing);
+            const heads = vi.mocked(f.objects.head).mock.calls.map(([key]) => key);
+            if (outcome === 'matching') {
+              const output = await materialized;
+              expect(output).toMatchObject({ key: rawKey, etag: rawEtag });
+              if (target === 'staging') {
+                expect(etag).toBe(competing.etag);
+                expect(copy.mock.calls[0]!.slice(0, 3)).toEqual([stageKey, rawKey, competing.etag]);
+                expect(heads).toEqual([stageKey, rawKey, rawKey]);
+              } else {
+                expect(rawEtag).toBe(competing.etag);
+                expect(heads).toEqual([stageKey, rawKey]);
+              }
+              expect(f.probe).toHaveBeenCalledTimes(1);
+              expect(copy).toHaveBeenCalledTimes(1);
+            } else {
+              expect(rawEtag).toBeUndefined();
+              if (target === 'staging') {
+                expect(heads).toEqual(outcome === 'different digest' ? [stageKey] : []);
+                expect(f.probe).not.toHaveBeenCalled();
+                expect(copy).not.toHaveBeenCalled();
+              } else {
+                expect(heads).toEqual(
+                  outcome === 'different digest' ? [stageKey, rawKey] : [stageKey],
+                );
+                expect(copy).toHaveBeenCalledTimes(1);
+              }
+            }
+            expect(put).toHaveBeenCalledTimes(1);
+          } finally {
+            putRequest.mockRestore();
+            copyRequest.mockRestore();
+            await f.close();
+          }
+        },
+      );
+    },
+  );
 
   it.each(['media', 'json'])(
     'keeps the first %s publication during overlapping claims',
@@ -274,7 +395,7 @@ describe('durable video materialization', () => {
       }
 
       const signal = AbortSignal.timeout(5000);
-      const older = f.run({ ...f.row, claim_id: randomUUID() }, video, index, signal);
+      const older = f.run({ ...f.row, claim_id: randomUUID() }, video, index, signal, true);
       try {
         await Promise.race([
           entered.promise,
@@ -282,7 +403,21 @@ describe('durable video materialization', () => {
             throw new Error('older claim finished before the overlap');
           }),
         ]);
-        const newer = await f.start()({ ...f.row, claim_id: randomUUID() }, video, index, signal);
+        const newer = await f.start()(
+          { ...f.row, claim_id: randomUUID() },
+          video,
+          index,
+          signal,
+          true,
+        );
+        const { stagingKey } = f.probe.mock.calls[0]![0].source;
+        const head = vi.mocked(f.objects.head);
+        expect(head.mock.calls.map(([key]) => key)).toEqual(
+          boundary === 'media'
+            ? [stagingKey, newer.key]
+            : [stagingKey, stagingKey, newer.key, newer.key],
+        );
+        head.mockClear();
         const winner = await readFile(receipt, 'utf8');
         expect(JSON.parse(winner)).toMatchObject({
           jobId: f.row.id,
@@ -293,6 +428,7 @@ describe('durable video materialization', () => {
         resume.resolve();
 
         await expect(older).resolves.toEqual(newer);
+        expect(head.mock.calls.map(([key]) => key)).toEqual([newer.key]);
         expect(await readFile(receipt, 'utf8')).toBe(winner);
         expect(await readFile(file)).toEqual(f.bytes);
         expect((await readdir(f.checkpoint(''))).sort()).toEqual([
@@ -336,7 +472,7 @@ describe('durable video materialization', () => {
       });
       try {
         const signal = AbortSignal.timeout(5000);
-        await expect(f.run(f.row, video, index, signal)).rejects.toBe(error);
+        await expect(f.run(f.row, video, index, signal, true)).rejects.toBe(error);
         expect(await readFile(f.checkpoint(`${index}.media`))).toEqual(f.bytes);
         expect((await readdir(directory)).sort()).toEqual(
           extension === 'media' ? [`${index}.media`] : [`${index}.json`, `${index}.media`],
@@ -353,7 +489,7 @@ describe('durable video materialization', () => {
         vi.mocked(f.download).mockImplementationOnce(async (_url, _signal, consume) =>
           consume(new Response(null, { status: 403 })),
         );
-        const output = await f.start()(f.row, video, index, signal);
+        const output = await f.start()(f.row, video, index, signal, true);
         expect(output).toMatchObject({
           index,
           sha256: createHash('sha256').update(f.bytes).digest('hex'),
@@ -362,7 +498,14 @@ describe('durable video materialization', () => {
         if (extension === 'json')
           expect(receipt.assetId).toBe(JSON.parse(await firstReceipt).assetId);
         expect(synced.some((names) => names.includes(`${index}.json`))).toBe(true);
-        expect(f.probe.mock.calls[0]![0].outputIndex).toBe(index);
+        const command = f.probe.mock.calls[0]![0];
+        expect(command.outputIndex).toBe(index);
+        const { stagingKey } = command.source;
+        expect(vi.mocked(f.objects.head).mock.calls.map(([key]) => key)).toEqual(
+          extension === 'media'
+            ? [stagingKey, stagingKey, output.key, output.key]
+            : [output.key, stagingKey, stagingKey, output.key],
+        );
         expect(f.download).toHaveBeenCalledTimes(1);
         expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
         expect(await readFile(fragment, 'utf8')).toBe('unrelated temporary bytes');
@@ -478,6 +621,85 @@ describe('durable video materialization', () => {
       } finally {
         opened.mockReset();
         linked.mockReset();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['complete', 'length mismatch', 'shutdown'])(
+    'writes the original sliced stream chunk across a short write (%s)',
+    async (outcome) => {
+      const f = await fixture();
+      const bytes = new Uint8Array(f.bytes.length + 6).fill(0xff);
+      bytes.set(f.bytes, 3);
+      const chunk = bytes.subarray(3, bytes.length - 3);
+      const shortLength = 7;
+      const stop = new AbortController();
+      const reason = new Error('shutdown after short write');
+      const writes = vi.fn<(bytes: Uint8Array, offset: number, length: number) => void>();
+      const fs = await vi.importActual<typeof AsyncFileSystem>('node:fs/promises');
+      const opened = vi.mocked(open);
+      try {
+        opened.mockImplementation(async (path, ...options) => {
+          const handle = await fs.open(path, ...options);
+          if (String(path).startsWith(f.checkpoint('0.media.'))) {
+            const writable: {
+              write(
+                bytes: Uint8Array,
+                offset: number,
+                length: number,
+              ): Promise<{
+                bytesWritten: number;
+              }>;
+            } = handle;
+            const write = writable.write.bind(handle);
+            vi.spyOn(writable, 'write').mockImplementation(async (bytes, offset, length) => {
+              writes(bytes, offset, length);
+              const result = await write(bytes, offset, offset === 0 ? shortLength : length);
+              if (outcome === 'shutdown') stop.abort(reason);
+              return result;
+            });
+          }
+          return handle;
+        });
+        const declaredLength = chunk.length + (outcome === 'length mismatch' ? 1 : 0);
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(chunk);
+            controller.close();
+          },
+        });
+        vi.mocked(f.download).mockImplementationOnce((_url, _signal, consume) =>
+          consume(new Response(body, { headers: { 'content-length': String(declaredLength) } })),
+        );
+        const output = f.run(f.row, video, 0, stop.signal, true);
+        if (outcome === 'shutdown') await expect(output).rejects.toBe(reason);
+        else if (outcome === 'length mismatch')
+          await expect(output).rejects.toThrow('VIDEO_DOWNLOAD_INCOMPLETE');
+        else {
+          await expect(output).resolves.toMatchObject({
+            sizeBytes: chunk.length,
+            sha256: createHash('sha256').update(f.bytes).digest('hex'),
+          });
+          expect(await readFile(f.checkpoint('0.media'))).toEqual(f.bytes);
+        }
+        expect(writes.mock.calls.map(([, offset, length]) => [offset, length])).toEqual(
+          outcome === 'shutdown'
+            ? [[0, chunk.length]]
+            : [
+                [0, chunk.length],
+                [shortLength, chunk.length - shortLength],
+              ],
+        );
+        for (const [written] of writes.mock.calls) expect(written).toBe(chunk);
+        if (outcome !== 'complete') {
+          expect(await readdir(f.checkpoint(''))).toEqual([]);
+          expect(f.objects.putVideo).not.toHaveBeenCalled();
+          expect(f.objects.head).not.toHaveBeenCalled();
+          expect(f.probe).not.toHaveBeenCalled();
+        }
+      } finally {
+        opened.mockReset();
         await f.close();
       }
     },
@@ -1113,7 +1335,7 @@ describe('durable video materialization', () => {
     try {
       vi.mocked(f.objects.copy).mockImplementationOnce(cosFixture().copy);
       const finished = vi.fn();
-      const pending = f.run(f.row, video, 0, stop.signal).then(finished, finished);
+      const pending = f.run(f.row, video, 0, stop.signal, true).then(finished, finished);
       await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1));
       stop.abort(reason);
       await vi.waitFor(() => expect(finished).toHaveBeenCalledExactlyOnceWith(reason));
@@ -1122,7 +1344,9 @@ describe('durable video materialization', () => {
       const original = vi.mocked(f.objects.copy).mock.calls[0]!;
       expect(f.saved.get(original[1])?.etag).toBe('copied-before-shutdown');
       expect(JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8')).rawEtag).toBeUndefined();
-      const head = vi.mocked(f.objects.head).mockClear();
+      const head = vi.mocked(f.objects.head);
+      expect(head.mock.calls.map(([key]) => key)).toEqual([original[0]]);
+      head.mockClear();
       const restored = await f.start()(f.row, video, 0, AbortSignal.timeout(5000));
       expect(restored).toMatchObject({ key: original[1], etag: 'copied-before-shutdown' });
       expect(head.mock.calls.map(([key]) => key)).toEqual([original[1]]);
@@ -1148,7 +1372,7 @@ describe('durable video materialization', () => {
         f.saved.set(command.source.stagingKey, { ...source, etag: 'replacement' });
         return metadata;
       });
-      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toMatchObject({
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000), true)).rejects.toMatchObject({
         statusCode: 412,
       });
       const receipt = JSON.parse(
@@ -1157,6 +1381,9 @@ describe('durable video materialization', () => {
       const command = f.probe.mock.calls[0]![0];
       expect(receipt.etag).toBe(command.source.etag);
       expect(receipt.rawEtag).toBeUndefined();
+      expect(vi.mocked(f.objects.head).mock.calls.map(([key]) => key)).toEqual([
+        command.source.stagingKey,
+      ]);
       await expect(f.start()(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toThrow(
         'VIDEO_OBJECT_MISMATCH',
       );
@@ -1173,6 +1400,29 @@ describe('durable video materialization', () => {
     }
   });
 
+  it('requires staging HEAD to match the fresh PUT acknowledgement before probing', async () => {
+    const f = await fixture();
+    try {
+      const put = vi.mocked(f.objects.putVideo!);
+      const upload = put.getMockImplementation()!;
+      put.mockImplementationOnce(async (...args) => ({
+        ...(await upload(...args)),
+        etag: 'acknowledged-staging-etag',
+      }));
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000), true)).rejects.toThrow(
+        'VIDEO_OBJECT_MISMATCH',
+      );
+      expect(vi.mocked(f.objects.head).mock.calls.map(([key]) => key)).toEqual([
+        put.mock.calls[0]![0],
+      ]);
+      expect(f.probe).not.toHaveBeenCalled();
+      expect(f.objects.copy).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8')).etag).toBeUndefined();
+    } finally {
+      await f.close();
+    }
+  });
+
   it('retains a known copy receipt across restarts when raw HEAD reports a different ETag', async () => {
     const f = await fixture();
     try {
@@ -1181,12 +1431,19 @@ describe('durable video materialization', () => {
         await copy(...args);
         return { etag: 'copy-acknowledged-etag' };
       });
-      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toThrow(
+      await expect(f.run(f.row, video, 0, AbortSignal.timeout(5000), true)).rejects.toThrow(
         'VIDEO_OBJECT_MISMATCH',
       );
+      const receipt = JSON.parse(await readFile(f.checkpoint('0.json'), 'utf8'));
+      expect(receipt.rawEtag).toBe('copy-acknowledged-etag');
+      const [stage, raw] = vi.mocked(f.objects.copy).mock.calls[0]!;
+      const head = vi.mocked(f.objects.head);
+      expect(head.mock.calls.map(([key]) => key)).toEqual([stage, raw]);
+      head.mockClear();
       await expect(f.start()(f.row, video, 0, AbortSignal.timeout(5000))).rejects.toThrow(
         'VIDEO_OBJECT_MISMATCH',
       );
+      expect(head.mock.calls.map(([key]) => key)).toEqual([raw]);
       expect(f.objects.copy).toHaveBeenCalledTimes(1);
       expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
     } finally {

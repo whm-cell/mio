@@ -1,4 +1,4 @@
-import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
@@ -28,6 +28,7 @@ import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import { VideoSubmissionReceipts } from '../../src/generations/video/submission-receipts.ts';
 import type {
   VideoAssetReference,
+  VideoCapabilitiesView,
   VideoCreateRequest,
   VideoJobView,
 } from '../../src/generations/video/contracts.ts';
@@ -37,7 +38,10 @@ import type { withPublicHttps } from '../../src/integrations/onelink/public-http
 import { ProviderError } from '../../src/providers/contracts.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
 import { validateVideoRouteConfig } from '../../src/providers/onelink/video-route.ts';
+import { providerSchemaSQL } from '../../src/providers/schema.ts';
+import { createProviderService } from '../../src/providers/service.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
+import { createProviderStore } from '../../src/providers/store.ts';
 import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
@@ -172,6 +176,7 @@ type VideoHttpDatabase = Awaited<ReturnType<typeof authDatabase>>;
 
 interface AssetHttpFixtureOptions {
   withExecutor?: boolean;
+  withProviderStore?: boolean;
   realOutput?: Buffer<ArrayBuffer>;
   alternate?: { route: VideoRouteConfig; modelId: string };
   migrateGenerations?: (pool: Pool, database: VideoHttpDatabase) => Promise<unknown>;
@@ -211,6 +216,7 @@ async function assetHttpFixture(options: AssetHttpFixtureOptions = {}) {
 async function startAssetHttpFixture(
   {
     withExecutor = false,
+    withProviderStore = false,
     realOutput,
     alternate,
     migrateGenerations = (pool) => pool.query(generationSchemaSQL),
@@ -331,20 +337,51 @@ async function startAssetHttpFixture(
     available: true,
     modes: route.paramSpec.supportedModes.map((mode) => ({ mode, supported: true })),
   }));
-  const snapshotVideo = vi.fn(async () => ({
+  const makeSnapshot = () => ({
     capabilitiesVersion,
     route,
     modelId: alternate?.modelId ?? 'doubao-seedance-2-0-fast',
     providerConfigId: randomUUID(),
     credentialVersion: 1,
     credential: {},
+  });
+  const admissionSnapshot = vi.fn(makeSnapshot);
+  const videoAdmission = vi.fn(async () => ({
+    capabilitiesVersion,
+    available: true,
+    supportedModes: route.paramSpec.supportedModes,
+    snapshot: admissionSnapshot,
   }));
-  const provider = {
+  const snapshotVideo = vi.fn(async () => makeSnapshot());
+  let provider = {
     videoCapabilities,
+    videoAdmission,
     snapshotVideo,
     openImageSnapshot: vi.fn(() => 'fixture-key'),
     resolveImageTaskCredential: vi.fn(async () => 'fixture-key'),
   } as unknown as ProviderService;
+  let modelRef = 'onelink:model:' + randomUUID();
+  if (withProviderStore) {
+    const modelId = 'vega-1.5-pro';
+    const config = {
+      databaseURL: database.url,
+      masterKey: randomBytes(32),
+      masterKeyId: 'video-http-fixture',
+    };
+    await pool.query(providerSchemaSQL);
+    const providerStore = await createProviderStore(config);
+    provider = createProviderService(
+      providerStore,
+      config,
+      async () => Response.json({ data: [{ id: modelId }] }),
+      true,
+    );
+    cleanups.push(provider.close);
+    await provider.save(actor, 0, 'synthetic-video-http-key');
+    await provider.discover(actor);
+    await providerStore.importRoutes(legacyVideoRouteEntries([modelId]));
+    modelRef = (await provider.catalog(actor, 'video')).items[0]!.modelRef;
+  }
   const upstream = vi.fn<typeof fetch>(async (_url, options) => {
     if (options?.method === 'POST') {
       if (route.driver === 'kling-videos')
@@ -448,7 +485,6 @@ async function startAssetHttpFixture(
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('video test server address missing');
   const endpoint = `http://127.0.0.1:${address.port}/api/v1/compute/videos`;
-  const modelRef = 'onelink:model:' + randomUUID();
   const request = (
     references: VideoAssetReference[],
     id: string = randomUUID(),
@@ -469,13 +505,16 @@ async function startAssetHttpFixture(
     pool,
     store,
     service,
+    provider,
+    modelRef,
     execution,
     server,
     directory,
     applicationName: database.applicationName,
     request,
     postRequest,
-    videoCapabilities,
+    videoAdmission,
+    admissionSnapshot,
     snapshotVideo,
     heads,
     inputBytes,
@@ -534,6 +573,13 @@ async function startAssetHttpFixture(
     post(references: VideoAssetReference[], id?: string, signal?: AbortSignal) {
       return postRequest(request(references, id), 'fixture', signal);
     },
+    capabilities() {
+      const url = new URL(
+        `/api/v1/compute/video-capabilities/${encodeURIComponent(modelRef)}`,
+        endpoint,
+      );
+      return fetch(url, { headers: { cookie: 'session=fixture' } });
+    },
     get(id: string) {
       return fetch(`${endpoint}/${id}`, { headers: { cookie: 'session=fixture' } });
     },
@@ -568,16 +614,13 @@ it.each(['mp4', 'attached-cover', 'truncated-mp4', 'corrupt-mp4', 'mov', '3gp'] 
       const { id } = await accepted.json();
       await f.runNext();
 
-      const passes = kind === 'mp4' ? 1 : 3;
-      for (let attempt = 0; attempt < passes; attempt++) {
-        await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
-          id,
-        ]);
-        await f.runNext();
-      }
+      await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
+        id,
+      ]);
+      await f.runNext();
       expect(f.downloadCount()).toBe(1);
       expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
-      expect(f.probe).toHaveBeenCalledTimes(passes);
+      expect(f.probe).toHaveBeenCalledOnce();
       expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
 
       const response = await f.get(id);
@@ -639,6 +682,10 @@ it.each(['mp4', 'attached-cover', 'truncated-mp4', 'corrupt-mp4', 'mov', '3gp'] 
         expect(rows).toEqual([]);
         expect(raw).toEqual([]);
         expect(f.objects.copy).not.toHaveBeenCalled();
+        await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
+          id,
+        ]);
+        expect(await f.execution.claim()).toBeUndefined();
       }
     } finally {
       await f.close();
@@ -702,7 +749,7 @@ describe('video admission cancellation', () => {
     expect(f.upstream).not.toHaveBeenCalled();
   };
 
-  it.each(['provider capabilities', 'provider snapshot', 'material inspection'] as const)(
+  it.each(['provider state', 'material inspection'] as const)(
     'stops admission when a tool turn is cancelled during %s',
     async (stage) => {
       const f = await assetHttpFixture();
@@ -715,15 +762,9 @@ describe('video admission cancellation', () => {
       const controller = new AbortController();
       try {
         const asset = await f.addAsset();
-        if (stage === 'provider capabilities') {
-          const query = f.videoCapabilities.getMockImplementation()!;
-          f.videoCapabilities.mockImplementationOnce(async () => {
-            await pause();
-            return query();
-          });
-        } else if (stage === 'provider snapshot') {
-          const query = f.snapshotVideo.getMockImplementation()!;
-          f.snapshotVideo.mockImplementationOnce(async () => {
+        if (stage === 'provider state') {
+          const query = f.videoAdmission.getMockImplementation()!;
+          f.videoAdmission.mockImplementationOnce(async () => {
             await pause();
             return query();
           });
@@ -750,7 +791,8 @@ describe('video admission cancellation', () => {
         else resume.resolve();
         await expect(pending).rejects.toBe(controller.signal.reason);
         await expectUnadmitted(f);
-        if (stage === 'provider capabilities') expect(f.snapshotVideo).not.toHaveBeenCalled();
+        if (stage === 'provider state') expect(f.admissionSnapshot).not.toHaveBeenCalled();
+        expect(f.snapshotVideo).not.toHaveBeenCalled();
         if (stage !== 'material inspection') expect(f.objects.head).not.toHaveBeenCalled();
         if (stage === 'material inspection') expect(f.objects.materialUrl).not.toHaveBeenCalled();
       } finally {
@@ -894,11 +936,11 @@ describe('video admission cancellation', () => {
       f.server.prependOnceListener('request', (_request, response) => {
         response.once('close', () => disconnected.resolve());
       });
-      const snapshot = f.snapshotVideo.getMockImplementation()!;
-      f.snapshotVideo.mockImplementationOnce(async () => {
+      const readAdmission = f.videoAdmission.getMockImplementation()!;
+      f.videoAdmission.mockImplementationOnce(async () => {
         entered.resolve();
         await resume.promise;
-        return snapshot();
+        return readAdmission();
       });
       const asset = await f.addAsset();
       const id = randomUUID();
@@ -928,13 +970,142 @@ describe('video admission cancellation', () => {
 });
 
 describe('video admission replay', () => {
+  it('reads current owner state once at HTTP admission and refreshes it after dispatch reference checks', async () => {
+    const f = await assetHttpFixture({ withProviderStore: true });
+    const queries = vi.spyOn(Pool.prototype, 'query');
+    const expectStateReads = (count: number) => {
+      const reads = queries.mock.calls.filter(
+        ([sql]) =>
+          typeof sql === 'string' &&
+          sql.includes('FROM mio_provider_configs c WHERE c.owner_id=$1'),
+      );
+      expect(reads).toHaveLength(count);
+      for (const [sql, parameters] of reads) {
+        expect(parameters).toEqual([actor.userId]);
+        expect(sql).not.toContain('mio_provider_model_verifications');
+      }
+      queries.mockClear();
+    };
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let dispatch: ReturnType<typeof f.runNext> | undefined;
+    try {
+      const capabilityResponse = await f.capabilities();
+      expect(capabilityResponse.status).toBe(200);
+      const current: VideoCapabilitiesView = await capabilityResponse.json();
+      expect(current).toMatchObject({ modelRef: f.modelRef, available: true });
+      expectStateReads(1);
+
+      const asset = await f.addAsset();
+      const unsupported: VideoCreateRequest = {
+        requestId: randomUUID(),
+        modelRef: f.modelRef,
+        expectedCapabilitiesVersion: current.capabilitiesVersion,
+        parameters: {
+          mode: 'full',
+          prompt: 'A lake at dawn',
+          references: [{ assetId: asset.assetId }],
+        },
+      };
+      const modeRejected = await f.postRequest(unsupported);
+      expect(modeRejected.status).toBe(400);
+      expect(await modeRejected.json()).toMatchObject({
+        error: { code: 'VIDEO_MODE_UNSUPPORTED' },
+      });
+      expectStateReads(1);
+
+      const request: VideoCreateRequest = {
+        ...unsupported,
+        requestId: randomUUID(),
+        parameters: {
+          mode: 'first_frame',
+          prompt: 'A lake at dawn',
+          resolution: '480p',
+          durationSeconds: 4,
+          firstFrame: { assetId: asset.assetId },
+        },
+      };
+      const accepted = await f.postRequest(request);
+      expect(accepted.status).toBe(202);
+      const { id } = await accepted.json();
+      expectStateReads(1);
+      expect(
+        (
+          await f.pool.query(
+            `SELECT j.route_snapshot, e.snapshot FROM mio_video_jobs j
+         JOIN mio_video_executions e ON e.job_id = j.id WHERE j.id=$1`,
+            [id],
+          )
+        ).rows,
+      ).toMatchObject([
+        {
+          route_snapshot: {
+            capabilitiesVersion: current.capabilitiesVersion,
+            modelId: 'vega-1.5-pro',
+          },
+          snapshot: { credentialVersion: 1, credential: { ciphertext: expect.any(String) } },
+        },
+      ]);
+
+      f.objects.head.mockImplementationOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return asset.head;
+      });
+      dispatch = f.runNext();
+      await Promise.race([
+        entered.promise,
+        dispatch.then(() => {
+          throw new Error('dispatch settled before reference inspection');
+        }),
+      ]);
+      expectStateReads(0);
+      await f.provider.settings(actor, (await f.provider.get(actor))!.revision, { enabled: false });
+      resume.resolve();
+      await dispatch;
+      expect(f.objects.materialUrl).toHaveBeenCalledExactlyOnceWith(asset.key);
+      expectStateReads(1);
+      expect(f.upstream).not.toHaveBeenCalled();
+      expect(await f.store.get(actor.userId, id)).toMatchObject({
+        state: 'rejected',
+        error: { code: 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE' },
+      });
+
+      const replay = await f.postRequest(request);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ id, state: 'rejected' });
+      expectStateReads(0);
+      const stale = await f.postRequest(unsupported);
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toMatchObject({ error: { code: 'VIDEO_CAPABILITIES_STALE' } });
+      expectStateReads(1);
+
+      const disabled: VideoCapabilitiesView = await (await f.capabilities()).json();
+      expect(disabled).toMatchObject({ available: false, unavailableReason: 'PROVIDER_DISABLED' });
+      expectStateReads(1);
+      const matching = await f.postRequest({
+        ...unsupported,
+        expectedCapabilitiesVersion: disabled.capabilitiesVersion,
+      });
+      expect(matching.status).toBe(503);
+      expect(await matching.json()).toMatchObject({ error: { code: 'VIDEO_UNAVAILABLE' } });
+      expectStateReads(1);
+      expect(f.wake).toHaveBeenCalledOnce();
+    } finally {
+      queries.mockRestore();
+      resume.resolve();
+      await Promise.allSettled([dispatch]);
+      await f.close();
+    }
+  });
+
   it.each([
-    ['changed capabilities lookup', 'VIDEO_CAPABILITIES_STALE'],
-    ['changed submission snapshot', 'VIDEO_CAPABILITIES_STALE'],
-    ['disabled submission route', 'MODEL_ROUTE_DISABLED'],
+    ['changed capabilities version', 409, 'VIDEO_CAPABILITIES_STALE'],
+    ['unavailable matching version', 503, 'VIDEO_UNAVAILABLE'],
+    ['provider read error', 503, 'PROVIDER_UNAVAILABLE'],
   ] as const)(
     'compares concurrent submissions to the committed winner after a %s',
-    async (stage, code) => {
+    async (stage, status, code) => {
       const f = await assetHttpFixture();
       const entered = Promise.withResolvers<void>();
       const resume = Promise.withResolvers<void>();
@@ -944,21 +1115,15 @@ describe('video admission replay', () => {
         if (++waiting === 3) entered.resolve();
         await resume.promise;
       };
-      const capabilities = f.videoCapabilities.getMockImplementation()!;
-      const snapshot = f.snapshotVideo.getMockImplementation()!;
+      const readAdmission = f.videoAdmission.getMockImplementation()!;
       try {
-        if (stage === 'changed capabilities lookup') {
-          f.videoCapabilities.mockImplementation(async () => {
-            await pause();
-            return { ...(await capabilities()), capabilitiesVersion: 'changed-capabilities' };
-          });
-        } else {
-          f.snapshotVideo.mockImplementation(async () => {
-            await pause();
-            if (stage === 'disabled submission route') throw new ProviderError(409, code);
-            return { ...(await snapshot()), capabilitiesVersion: 'changed-capabilities' };
-          });
-        }
+        f.videoAdmission.mockImplementation(async () => {
+          await pause();
+          if (stage === 'provider read error') throw new ProviderError(status, code);
+          const admission = await readAdmission();
+          if (stage === 'unavailable matching version') return { ...admission, available: false };
+          return { ...admission, capabilitiesVersion: 'changed-capabilities' };
+        });
         const asset = await f.addAsset();
         const request = f.request([{ assetId: asset.assetId }]);
         const changed = {
@@ -977,17 +1142,12 @@ describe('video admission replay', () => {
             }),
           ),
         ]);
-        if (stage === 'changed capabilities lookup')
-          f.videoCapabilities.mockImplementationOnce(capabilities);
-        else f.snapshotVideo.mockImplementationOnce(snapshot);
+        f.videoAdmission.mockImplementationOnce(readAdmission);
 
         const accepted = await f.postRequest(request);
         expect(accepted.status).toBe(202);
         const job = await accepted.json();
         expect(f.upstream).not.toHaveBeenCalled();
-        // The worker sees the original route before the pending preflights observe the change.
-        if (stage !== 'changed capabilities lookup')
-          f.snapshotVideo.mockImplementationOnce(snapshot);
         await f.runNext();
         resume.resolve();
         const repeated = await replay;
@@ -999,7 +1159,7 @@ describe('video admission replay', () => {
         const fresh = f.postRequest({ ...request, requestId: randomUUID() });
         pending.push(fresh);
         for (const response of await Promise.all([otherOwner, fresh])) {
-          expect(response.status).toBe(409);
+          expect(response.status).toBe(status);
           expect(await response.json()).toMatchObject({ error: { code } });
         }
         const hash = createHash('sha256').update(JSON.stringify(request), 'utf8').digest('hex');
@@ -1012,6 +1172,9 @@ describe('video admission replay', () => {
           { job_id: job.id },
         ]);
         expect(f.wake).toHaveBeenCalledTimes(1);
+        expect(f.videoAdmission).toHaveBeenCalledTimes(5);
+        expect(f.admissionSnapshot).toHaveBeenCalledOnce();
+        expect(f.snapshotVideo).toHaveBeenCalledOnce();
         expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST']);
         expect(await (await f.get(job.id)).json()).toMatchObject({ state: 'submitted' });
       } finally {
@@ -1031,11 +1194,11 @@ describe('video admission replay', () => {
       const controller = new AbortController();
       let pending: ReturnType<typeof f.service.create> | undefined;
       try {
-        f.snapshotVideo.mockImplementationOnce(async () => {
+        f.videoAdmission.mockImplementationOnce(async () => {
           entered.resolve();
           await resume.promise;
           if (failure === 'PostgreSQL failure') await f.pool.query('SELECT 1 / 0');
-          throw new ProviderError(409, 'MODEL_ROUTE_DISABLED');
+          throw new ProviderError(503, 'PROVIDER_UNAVAILABLE');
         });
         const asset = await f.addAsset();
         const request = f.request([{ assetId: asset.assetId }]);
@@ -1070,10 +1233,10 @@ describe('video admission replay', () => {
     const controller = new AbortController();
     let pending: ReturnType<typeof f.service.create> | undefined;
     try {
-      f.snapshotVideo.mockImplementationOnce(async () => {
+      f.videoAdmission.mockImplementationOnce(async () => {
         entered.resolve();
         await resume.promise;
-        throw new ProviderError(409, 'MODEL_ROUTE_DISABLED');
+        throw new ProviderError(503, 'PROVIDER_UNAVAILABLE');
       });
       const asset = await f.addAsset();
       const request = f.request([{ assetId: asset.assetId }]);
@@ -1229,8 +1392,9 @@ describe('video admission after executor lease loss', () => {
           expect(await rejected.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
           expect(lookup).toHaveBeenCalledTimes(5);
         }
-        expect(f.videoCapabilities).toHaveBeenCalledTimes(3);
-        expect(f.snapshotVideo).toHaveBeenCalledTimes(3);
+        expect(f.videoAdmission).toHaveBeenCalledTimes(3);
+        expect(f.admissionSnapshot).toHaveBeenCalledTimes(3);
+        expect(f.snapshotVideo).not.toHaveBeenCalled();
         expect((await f.pool.query('SELECT id,state FROM mio_video_jobs')).rows).toEqual([
           { id: job.id, state: 'accepted' },
         ]);
@@ -1306,7 +1470,7 @@ describe('video admission after executor lease loss', () => {
           stage === 'quota lock' ? 2 : 1,
         );
         await f.loseExecutorLease();
-        f.videoCapabilities.mockClear();
+        f.videoAdmission.mockClear();
         f.snapshotVideo.mockClear();
         f.objects.head.mockClear();
 
@@ -1332,7 +1496,7 @@ describe('video admission after executor lease loss', () => {
         expect(list.status).toBe(200);
         expect(await list.json()).toMatchObject({ items: [{ id }] });
         expect(await (await f.list('other')).json()).toMatchObject({ items: [] });
-        expect(f.videoCapabilities).not.toHaveBeenCalled();
+        expect(f.videoAdmission).not.toHaveBeenCalled();
         expect(f.snapshotVideo).not.toHaveBeenCalled();
         expect(f.objects.head).not.toHaveBeenCalled();
 

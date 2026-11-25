@@ -463,6 +463,123 @@ describe('durable video execution', () => {
     expect(f.materialize.mock.calls.map(([, , index]) => index)).toEqual([0, 2, 3, 2, 2, 2]);
   });
 
+  it('skips each proven invalid output across restart while other indices keep their retry budget', async () => {
+    const f = await fixture();
+    const videos = ['corrupt', 'storage-error', 'valid', 'wrong-format', 'missing-staging'].map(
+      (name) => ({ url: `https://media.fixture/${name}.mp4` }),
+    );
+    const outputs = videos.map((_, index) => ({
+      ...f.output,
+      index,
+      assetId: randomUUID(),
+      key: 'mio/raw/' + randomUUID(),
+    }));
+    const failures = new Map([
+      [0, 'VIDEO_SOURCE_INVALID'],
+      [1, 'VIDEO_STORAGE_FAILURE'],
+      [3, 'VIDEO_MEDIA_INVALID'],
+      [4, 'VIDEO_SOURCE_CHANGED'],
+    ]);
+    f.materialize.mockImplementation(async (_row, video, index) => {
+      expect(video).toEqual(videos[index]);
+      const code = failures.get(index);
+      if (code) throw new Error(code);
+      return outputs[index]!;
+    });
+    vi.mocked(f.protocol.query).mockResolvedValue({ state: 'returned', videos });
+    await f.run(await f.next());
+    await f.run(await f.next());
+    const view = () => f.store.get(f.actor.userId, f.job.jobId);
+    const firstPass = (await view()).outputs;
+    expect(firstPass).toMatchObject(
+      outputs.map(({ index, assetId }) =>
+        index === 2
+          ? { index, status: 'registered', assetId }
+          : { index, status: 'failed', assetId: null, errorCode: failures.get(index) },
+      ),
+    );
+    expect(await f.durableState()).toMatchObject({
+      phase: 'materializing',
+      checkpoint: { materializationAttempts: 1, invalidOutputs: { 0: true, 3: true } },
+    });
+
+    await f.execution.close();
+    const restarted = new VideoGenerationStore(f.pool).executorStore();
+    cleanups.push(() => restarted.close());
+    await restarted.startExecutor(() => {});
+    const resume = f.runner({}, restarted);
+    for (let pass = 0; pass < 2; pass++) await resume(await f.next(restarted));
+    const attempts = () => f.materialize.mock.calls.map(([, , index, , fresh]) => [index, fresh]);
+    expect(attempts()).toEqual([
+      [0, true],
+      [1, true],
+      [2, true],
+      [3, true],
+      [4, true],
+      [1, false],
+      [4, false],
+      [1, false],
+      [4, false],
+    ]);
+    expect(await view()).toMatchObject({
+      state: 'partial',
+      recovery: { available: true },
+      outputs: firstPass,
+    });
+    expect(await restarted.claim()).toBeUndefined();
+    expect(await f.durableState()).toMatchObject({
+      phase: 'done',
+      checkpoint: { materializationAttempts: 3, invalidOutputs: { 0: true, 3: true } },
+    });
+
+    await f.store.recover(f.actor.userId, f.job.jobId);
+    expect((await view()).outputs).toEqual(firstPass);
+    expect((await f.durableState()).checkpoint.invalidOutputs).toBeUndefined();
+    failures.clear();
+    await resume(await f.next(restarted));
+    expect(attempts().slice(9)).toEqual([
+      [0, false],
+      [1, false],
+      [3, false],
+      [4, false],
+    ]);
+    expect(await view()).toMatchObject({
+      state: 'completed',
+      outputs: outputs.map(({ index, assetId }) => ({ index, status: 'registered', assetId })),
+    });
+    expect(f.protocol.submit).toHaveBeenCalledOnce();
+    expect(f.protocol.query).toHaveBeenCalledOnce();
+  });
+
+  it('resumes a legacy failed output without assuming that its ambiguous invalid code is permanent', async () => {
+    const f = await fixture();
+    await f.run(await f.next());
+    const row = await f.next();
+    expect(await f.execution.returned(row, [{ url: 'https://media.fixture/video.mp4' }])).toBe(
+      true,
+    );
+    await f.pool.query(
+      `INSERT INTO mio_video_outputs(job_id,output_index,phase,error_code)
+       VALUES ($1,0,'failed','VIDEO_SOURCE_INVALID')`,
+      [row.id],
+    );
+    await f.execution.release(row);
+    await f.run(await f.next());
+    expect(f.materialize).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: row.id, phase: 'materializing' }),
+      { url: 'https://media.fixture/video.mp4' },
+      0,
+      expect.any(AbortSignal),
+      false,
+    );
+    expect(await f.store.get(f.actor.userId, row.id)).toMatchObject({
+      state: 'completed',
+      outputs: [{ index: 0, status: 'registered', assetId: f.output.assetId }],
+    });
+    expect(f.protocol.submit).toHaveBeenCalledOnce();
+    expect(f.protocol.query).not.toHaveBeenCalled();
+  });
+
   it('preserves a replacement from the last pass across restart without materializing on a stale claim', async () => {
     const f = await fixture(undefined, 'kling');
     const videos = [
@@ -2185,8 +2302,7 @@ describe('video executor ownership and capacity', () => {
       ...args: unknown[]
     ) {
       const sql = args[0];
-      if (typeof sql === 'string' && sql.startsWith('UPDATE mio_video_executions SET claim_id=$1'))
-        claimants.add(this);
+      if (typeof sql === 'string' && sql.startsWith('WITH claimed AS (')) claimants.add(this);
       const result = Reflect.apply(original, this, args);
       if (sql === 'COMMIT' && claimants.has(this) && !discarded) {
         discarded = true;
@@ -2265,11 +2381,7 @@ describe('video executor ownership and capacity', () => {
       const sql = args[0];
       if (sql === 'ROLLBACK' && doomed.has(this)) rollback();
       const result = Reflect.apply(original, this, args);
-      if (
-        !interrupted &&
-        typeof sql === 'string' &&
-        sql.startsWith('UPDATE mio_video_executions SET claim_id=$1')
-      ) {
+      if (!interrupted && typeof sql === 'string' && sql.startsWith('WITH claimed AS (')) {
         interrupted = true;
         doomed.add(this);
         return Promise.resolve(result).then(async (written) => {
@@ -2393,6 +2505,142 @@ describe('video executor ownership and capacity', () => {
     expect(await f.durableState()).toEqual(current);
     expect(f.protocol.submit).not.toHaveBeenCalled();
     expect(f.protocol.query).not.toHaveBeenCalled();
+  });
+
+  it('defers only the failed completed cleanup and keeps its retry time across restart', async () => {
+    const f = await fixture();
+    const healthy = await f.create({
+      request: { ...f.request, requestId: randomUUID() },
+      inputSnapshot: [],
+    });
+    const ids = [f.job.jobId, healthy.jobId];
+    await f.pool.query("UPDATE mio_video_jobs SET state='completed' WHERE id=ANY($1)", [ids]);
+    await f.pool.query(
+      `UPDATE mio_video_executions SET phase='done',checkpoint=$2,
+       updated_at=CASE WHEN job_id=$3 THEN '2000-01-01' ELSE now() END WHERE job_id=ANY($1)`,
+      [
+        ids,
+        JSON.stringify({
+          videos: [{ url: 'https://media.fixture/video.mp4' }],
+          materializationAttempts: 1,
+        }),
+        f.job.jobId,
+      ],
+    );
+    await f.execution.close();
+
+    const cleanup = vi
+      .fn<NonNullable<VideoTransports['cleanup']>>()
+      .mockResolvedValue(undefined)
+      .mockImplementationOnce(async () => {
+        throw new Error('fixture storage unavailable');
+      });
+    const start = (store: VideoGenerationStore) =>
+      createVideoExecutor(
+        store,
+        () => f.provider,
+        f.materialize,
+        { protocol: () => f.protocol, cleanup },
+        f.directory,
+      );
+    const startedAt = await f.databaseNow();
+    const first = await start(f.store);
+    cleanups.push(() => first.close());
+    const attempts = () => cleanup.mock.calls.map(([row]) => row.id);
+    await vi.waitFor(
+      async () => {
+        const { rows } = await f.pool.query(
+          `SELECT checkpoint->>'cleaned' AS cleaned FROM mio_video_executions WHERE job_id=$1`,
+          [healthy.jobId],
+        );
+        expect(rows).toEqual([{ cleaned: 'true' }]);
+      },
+      { timeout: 5000 },
+    );
+    expect(attempts()).toEqual(ids);
+    const failed = await f.durableState();
+    const retryAt = Date.parse(failed.checkpoint.cleanupRetryAt);
+    expect(retryAt).toBeGreaterThanOrEqual(startedAt + 30_000);
+    expect(retryAt).toBeLessThanOrEqual((await f.databaseNow()) + 30_000);
+    expect(await f.execution.completedCleanup()).toEqual([]);
+    await first.close();
+
+    const restartedStore = new VideoGenerationStore(f.pool);
+    const restarted = await start(restartedStore);
+    cleanups.push(() => restarted.close());
+    expect(await restartedStore.executorStore().completedCleanup()).toEqual([]);
+    expect((await f.durableState()).checkpoint).toEqual(failed.checkpoint);
+    expect(attempts()).toEqual(ids);
+    // Advance only this fixture after proving the stored future cutoff survives a restart.
+    await f.pool.query(
+      `UPDATE mio_video_executions SET checkpoint=checkpoint||
+        jsonb_build_object('cleanupRetryAt',clock_timestamp()-interval '1 millisecond')
+       WHERE job_id=$1`,
+      [f.job.jobId],
+    );
+    await vi.waitFor(
+      async () =>
+        expect(await f.durableState()).toMatchObject({
+          phase: 'done',
+          checkpoint: { cleaned: true },
+        }),
+      { timeout: 5000 },
+    );
+    expect(attempts()).toEqual([...ids, f.job.jobId]);
+    expect((await f.durableState()).checkpoint.cleanupRetryAt).toBeUndefined();
+    expect(f.protocol.submit).not.toHaveBeenCalled();
+    expect(f.protocol.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { outcome: 'a storage failure', storageFailed: true },
+    { outcome: 'a cancelled receipt read', storageFailed: false },
+  ])('settles $outcome during cleanup and shutdown', async ({ storageFailed }) => {
+    const f = await fixture();
+    await f.run(await f.next());
+    await f.run(await f.next());
+    expect(await f.durableState()).toMatchObject({ phase: 'done', state: 'completed' });
+    await f.execution.close();
+
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      {
+        protocol: () => f.protocol,
+        cleanup: async (_row, signal) => {
+          entered.resolve();
+          await finish.promise;
+          await readFile(f.receiptPath, { signal });
+        },
+      },
+      f.directory,
+    );
+    try {
+      await entered.promise;
+      const failedAt = await f.databaseNow();
+      if (storageFailed) finish.reject(new Error('fixture storage unavailable'));
+      const closing = executor.close();
+      expect(executor.signal.aborted).toBe(true);
+      finish.resolve();
+      await closing;
+      const failed = await f.durableState();
+      expect(failed.checkpoint.cleaned).toBeUndefined();
+      if (storageFailed) {
+        expect(Date.parse(failed.checkpoint.cleanupRetryAt)).toBeGreaterThanOrEqual(
+          failedAt + 30_000,
+        );
+        expect(await f.execution.completedCleanup()).toEqual([]);
+      } else {
+        expect(failed.checkpoint.cleanupRetryAt).toBeUndefined();
+        expect(await f.execution.completedCleanup()).toMatchObject([{ id: f.job.jobId }]);
+      }
+    } finally {
+      finish.resolve();
+      await executor.close();
+    }
   });
 
   it('shares four slots between execution, cleanup and receipt reconciliation through pressure and shutdown', async () => {

@@ -131,6 +131,39 @@ export function createProviderService(
     ]);
     return { row, model, route, preference, reason, capabilitiesVersion: version };
   };
+  const videoSnapshot = ({
+    row,
+    model,
+    route,
+    reason,
+    capabilitiesVersion,
+  }: Awaited<ReturnType<typeof videoState>>): VideoAdmissionSnapshot => {
+    if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
+    if (!row || !model || !route || !videoRuntime || !videoRouteRuntimeAvailable(route.route))
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
+    const frozenRoute = Object.freeze({
+      ...route.route,
+      paramSpec: Object.freeze(structuredClone(route.route.paramSpec)),
+      requestDefaults: Object.freeze({}),
+      outputSpec: Object.freeze({}),
+    });
+    const credentialSnapshot = serializeCredentialSnapshot(row);
+    return Object.freeze({
+      ...credentialSnapshot,
+      credential: Object.freeze({ ...credentialSnapshot.credential }),
+      modelRef: modelReference(model.model_key),
+      modelId: model.raw_model_id!,
+      modelKey: model.model_key,
+      vendor: route.vendor,
+      profile: route.profile,
+      route: frozenRoute,
+      defaultVideoWatermark: row.default_video_watermark,
+      providerRevision: row.revision,
+      catalogVersion: row.catalog_version!,
+      adaptationVersion: route.declarationVersion,
+      capabilitiesVersion,
+    });
+  };
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
     const row = await store.state(actor.userId, false);
@@ -318,36 +351,20 @@ export function createProviderService(
         cancellation: { supported: false },
       };
     },
+    async videoAdmission(actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) {
+      const state = await videoState(actor, modelRef);
+      return {
+        capabilitiesVersion: state.capabilitiesVersion,
+        available: state.reason === null,
+        supportedModes: state.route?.route.paramSpec.supportedModes ?? [],
+        snapshot: () => videoSnapshot(state),
+      };
+    },
     async snapshotVideo(
       actor: Pick<ProviderPrincipal, 'userId'>,
       modelRef: string,
     ): Promise<VideoAdmissionSnapshot> {
-      const { row, model, route, reason, capabilitiesVersion } = await videoState(actor, modelRef);
-      if (reason) throw new ProviderError(HTTP_STATUS.CONFLICT, reason);
-      if (!row || !model || !route || !videoRuntime || !videoRouteRuntimeAvailable(route.route))
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'ADAPTER_PENDING');
-      const frozenRoute = Object.freeze({
-        ...route.route,
-        paramSpec: Object.freeze(structuredClone(route.route.paramSpec)),
-        requestDefaults: Object.freeze({}),
-        outputSpec: Object.freeze({}),
-      });
-      const credentialSnapshot = serializeCredentialSnapshot(row);
-      return Object.freeze({
-        ...credentialSnapshot,
-        credential: Object.freeze({ ...credentialSnapshot.credential }),
-        modelRef: modelReference(model.model_key),
-        modelId: model.raw_model_id!,
-        modelKey: model.model_key,
-        vendor: route.vendor,
-        profile: route.profile,
-        route: frozenRoute,
-        defaultVideoWatermark: row.default_video_watermark,
-        providerRevision: row.revision,
-        catalogVersion: row.catalog_version!,
-        adaptationVersion: route.declarationVersion,
-        capabilitiesVersion,
-      });
+      return videoSnapshot(await videoState(actor, modelRef));
     },
     /** Resolve only the current owner's credential for an already admitted task. */
     async resolveImageTaskCredential(ownerId: string) {

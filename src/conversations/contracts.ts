@@ -1,6 +1,5 @@
 import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
 import type {
-  VideoCapabilitiesView,
   VideoCapabilityMode,
   VideoCreateRequest,
   VideoJobView,
@@ -273,10 +272,9 @@ export interface ConversationVideoJobView {
 }
 export interface ConversationVideoTools {
   listModels(actor: { userId: string }): Promise<ConversationVideoModelSummary[]>;
-  capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
   createVideo(
     actor: { userId: string },
-    request: VideoCreateRequest,
+    request: Omit<VideoCreateRequest, 'expectedCapabilitiesVersion'>,
     signal?: AbortSignal,
   ): Promise<VideoJobView>;
   getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;

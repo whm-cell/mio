@@ -40,6 +40,7 @@ const MIN_FREE_BYTES = 2 * 1024 ** 3;
 const VIDEO_PROBE_PREFIX = '.video-probe-';
 const VIDEO_PROBE_SUFFIX = '.media';
 const PROCESS_STDOUT_LIMIT = 64 * 1024;
+const PROCESS_STDERR_LIMIT = 256 * 1024;
 const MP4_PROBE_INPUT = [
   '-protocol_whitelist',
   'file',
@@ -397,7 +398,7 @@ async function runProcess(
   });
   child.stderr.on('data', (data: Buffer) => {
     stderrBytes += data.length;
-    if (stderrBytes > 256 * 1024) child.kill('SIGKILL');
+    if (stderrBytes > PROCESS_STDERR_LIMIT) child.kill('SIGKILL');
   });
   let aborted = false;
   const abort = () => {
@@ -686,12 +687,11 @@ async function readFragmentSampleCounts(
 
 function requireCleanProbe(result: ProcessResult): void {
   if (result.aborted) throw new MediaError('EXECUTION_TIMEOUT');
-  if (
-    result.exitCode !== 0 ||
-    result.stderrBytes !== 0 ||
-    result.stdout.length > PROCESS_STDOUT_LIMIT
-  )
+  if (result.stderrBytes > PROCESS_STDERR_LIMIT || result.stdout.length > PROCESS_STDOUT_LIMIT)
     throw new MediaError('SOURCE_INVALID');
+  // A process killed outside the local time and output limits did not finish validating the source.
+  if (result.exitCode === null) throw new MediaError('PROBE_FAILED');
+  if (result.exitCode !== 0 || result.stderrBytes !== 0) throw new MediaError('SOURCE_INVALID');
 }
 
 interface VideoPacketTime {

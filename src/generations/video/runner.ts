@@ -17,6 +17,7 @@ import {
   hasVideoQueryBudget,
   hasVideoResultUrl,
   isVideoUpstreamTaskId,
+  VIDEO_INVALID_OUTPUT_ERRORS,
   VIDEO_MATERIALIZATION_MAX_ATTEMPTS,
   VideoResultUrlExpired,
 } from './execution.ts';
@@ -24,6 +25,7 @@ import type { VideoSubmissionReceipts } from './submission-receipts.ts';
 
 const log = createLogger('app', 'video-runner');
 const MATERIALIZATION_ERRORS = new Set([
+  ...VIDEO_INVALID_OUTPUT_ERRORS,
   'VIDEO_CHECKPOINT_INVALID',
   'VIDEO_DIRECTORY_INVALID',
   'VIDEO_DISK_FULL',
@@ -31,7 +33,6 @@ const MATERIALIZATION_ERRORS = new Set([
   'VIDEO_DOWNLOAD_INCOMPLETE',
   'VIDEO_EXECUTION_TIMEOUT',
   'VIDEO_FILE_INVALID',
-  'VIDEO_MEDIA_INVALID',
   'VIDEO_OBJECT_MISMATCH',
   'VIDEO_PROBE_BUSY',
   'VIDEO_PROBE_FAILED',
@@ -40,7 +41,6 @@ const MATERIALIZATION_ERRORS = new Set([
   'VIDEO_PROBE_TIMEOUT',
   'VIDEO_RESULT_INVALID',
   'VIDEO_SOURCE_CHANGED',
-  'VIDEO_SOURCE_INVALID',
   'VIDEO_SOURCE_TOO_LARGE',
   'VIDEO_STORAGE_FAILED',
   'VIDEO_STORAGE_FAILURE',
@@ -101,22 +101,25 @@ export function createVideoRunner(
       .catch(() => log.error('VIDEO_VERIFICATION_UNAVAILABLE'));
   };
 
-  const materializeOutput = async (row: VideoExecution, video: { url: string }, index: number) => {
-    let expired = false;
-    let code = 'VIDEO_MATERIALIZATION_FAILED';
+  const materializeOutput = async (
+    row: VideoExecution,
+    video: { url: string },
+    index: number,
+    freshResult: boolean,
+  ) => {
+    let errorCode = 'VIDEO_MATERIALIZATION_FAILED';
     try {
-      const output = await materialize(row, video, index, stop);
+      const output = await materialize(row, video, index, stop, freshResult);
       const phase = await store.writeOutput(row, index, output, stop);
-      return { phase, expired };
+      return { phase, errorCode: null };
     } catch (error) {
       stop.throwIfAborted();
-      expired = error instanceof VideoResultUrlExpired;
-      if (expired) code = 'VIDEO_RESULT_URL_EXPIRED';
+      if (error instanceof VideoResultUrlExpired) errorCode = 'VIDEO_RESULT_URL_EXPIRED';
       else if (error instanceof Error && MATERIALIZATION_ERRORS.has(error.message))
-        code = error.message;
+        errorCode = error.message;
     }
-    const phase = await store.writeOutput(row, index, code, stop);
-    return { phase, expired: phase === 'failed' && expired };
+    const phase = await store.writeOutput(row, index, errorCode, stop);
+    return { phase, errorCode };
   };
 
   const recoveryQuery = async (
@@ -200,17 +203,24 @@ export function createVideoRunner(
     return saved && recovery.refreshed !== undefined;
   };
 
-  const materializePass = async (row: VideoExecution, videos: VideoResultSource[]) => {
+  const materializePass = async (
+    row: VideoExecution,
+    videos: VideoResultSource[],
+    freshResult: boolean,
+  ) => {
     const progress = await store.outputProgress(row.id);
     const refreshed = row.checkpoint?.recoveryQuery?.refreshed;
     const expired = new Set(Object.keys(row.checkpoint?.expired ?? {}).map(Number));
+    const invalid = { ...row.checkpoint?.invalidOutputs };
     const needsPass = (video: VideoResultSource, index: number) =>
       hasVideoResultUrl(video) &&
       progress.get(index) !== 'registered' &&
       !refreshed?.[index] &&
-      !expired.has(index);
+      !expired.has(index) &&
+      !invalid[index];
     const attempt = await store.beginMaterialization(row, videos.some(needsPass));
     if (!attempt) return;
+    const freshPass = freshResult && attempt.reserved && attempt.attempts === 1;
     for (const [index, video] of videos.entries()) {
       stop.throwIfAborted();
       if (progress.get(index) === 'registered' || refreshed?.[index] === 'finished') continue;
@@ -219,10 +229,13 @@ export function createVideoRunner(
         hasUrl &&
         (refreshed?.[index] === 'pending' || (attempt.reserved && needsPass(video, index)))
       ) {
-        const output = await materializeOutput(row, video, index);
+        const output = await materializeOutput(row, video, index, freshPass);
         if (!output.phase) return;
         progress.set(index, output.phase);
-        if (output.expired) expired.add(index);
+        if (output.phase === 'failed' && output.errorCode !== null) {
+          if (output.errorCode === 'VIDEO_RESULT_URL_EXPIRED') expired.add(index);
+          else if (VIDEO_INVALID_OUTPUT_ERRORS.has(output.errorCode)) invalid[index] = true;
+        }
       } else if (!progress.has(index)) {
         const code = hasUrl ? 'VIDEO_MATERIALIZATION_LIMIT' : 'VIDEO_RESULT_INVALID';
         const phase = await store.writeOutput(row, index, code, stop);
@@ -246,12 +259,12 @@ export function createVideoRunner(
     else await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED', stop);
   };
 
-  const materializeResult = async (row: VideoExecution) => {
+  const materializeResult = async (row: VideoExecution, freshResult = false) => {
     try {
       stop.throwIfAborted();
       const videos = row.checkpoint?.videos;
       if (Array.isArray(videos) && videos.length > 0 && videos.length <= 16)
-        await materializePass(row, videos);
+        await materializePass(row, videos, freshResult);
       else
         await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED', stop);
     } catch {
@@ -267,11 +280,14 @@ export function createVideoRunner(
       return;
     }
     if (!(await store.returned(row, videos))) return;
-    await materializeResult({
-      ...row,
-      phase: 'materializing',
-      checkpoint: { videos, materializationAttempts: 0 },
-    });
+    await materializeResult(
+      {
+        ...row,
+        phase: 'materializing',
+        checkpoint: { videos, materializationAttempts: 0 },
+      },
+      true,
+    );
   };
 
   const submit = async (row: VideoExecution) => {

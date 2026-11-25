@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { afterEach, expect, it, vi } from 'vitest';
 import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
@@ -58,7 +58,7 @@ async function fixture() {
     url.searchParams.set('application_name', name);
     const target = new Pool({ connectionString: url.toString(), max: 1 });
     cleanups.push(() => target.end());
-    return { name, store: new VideoGenerationStore(target) };
+    return { name, store: new VideoGenerationStore(target), pool: target };
   };
   const writer = connection('writer');
   const recovery = connection('recovery');
@@ -229,6 +229,100 @@ async function raceRecovery(f: Fixture, trigger: string, write: () => Promise<un
   }
   return { firstWait, outcomes };
 }
+
+it('checks an idle queue with one read and discovers later work without waiting on other rows', async () => {
+  const f = await fixture();
+  const { jobId: newer } = await f.admit(f.ownerId);
+  await f.pool.query("UPDATE mio_video_jobs SET created_at='2000-01-01' WHERE id=$1", [f.jobId]);
+  await f.pool.query("UPDATE mio_video_executions SET next_query_at=now()+interval '1 hour'");
+  const query = vi.spyOn(Client.prototype, 'query');
+  try {
+    await expect(f.execution.claim()).resolves.toBeUndefined();
+    expect(query).toHaveBeenCalledOnce();
+    expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT EXISTS \(/);
+    await f.pool.query('UPDATE mio_video_executions SET next_query_at=now()');
+
+    const locked = await f.pool.connect();
+    let claimed: Awaited<ReturnType<typeof f.execution.claim>>;
+    try {
+      await locked.query('BEGIN');
+      await locked.query('SELECT job_id FROM mio_video_executions WHERE job_id=$1 FOR UPDATE', [
+        f.jobId,
+      ]);
+      await locked.query('SELECT id FROM mio_video_jobs WHERE id=$1 FOR UPDATE', [newer]);
+      query.mockClear();
+      claimed = await f.execution.claim();
+      expect(claimed).toMatchObject({
+        id: newer,
+        claim_id: expect.any(String),
+        phase: 'ready',
+      });
+      expect(query.mock.calls.map(([sql]) => sql)).toEqual([
+        expect.stringMatching(/^SELECT EXISTS \(/),
+        'BEGIN',
+        expect.stringMatching(/^WITH claimed AS \([\s\S]+RETURNING[\s\S]+JOIN claimed/),
+        'COMMIT',
+      ]);
+    } finally {
+      await locked.query('ROLLBACK').finally(() => locked.release());
+    }
+    await f.execution.release(claimed!);
+    await f.pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
+      newer,
+    ]);
+    await expect(f.execution.claim()).resolves.toMatchObject({ id: f.jobId, phase: 'ready' });
+  } finally {
+    query.mockRestore();
+  }
+});
+
+it('makes no claim after a stop during the peek or before the claim COMMIT', async () => {
+  const f = await fixture();
+  const stop = new AbortController();
+  const stopped = new Error('fixture stopped');
+  const original = Client.prototype.query;
+  const query = vi.spyOn(Client.prototype, 'query');
+  try {
+    const checkout = await f.writer.pool.connect();
+    const waiting = f.execution.claim(stop.signal);
+    try {
+      expect(f.writer.pool.waitingCount).toBe(1);
+      stop.abort(stopped);
+    } finally {
+      checkout.release();
+    }
+    await expect(waiting).rejects.toBe(stopped);
+    expect(query).toHaveBeenCalledOnce();
+    expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT EXISTS \(/);
+    query.mockClear();
+    await expect(f.execution.claim(stop.signal)).rejects.toBe(stopped);
+    expect(query).not.toHaveBeenCalled();
+
+    const duringClaim = new AbortController();
+    query.mockImplementation(function (this: Client, ...args: unknown[]) {
+      const result = Reflect.apply(original, this, args);
+      const sql = args[0];
+      if (typeof sql !== 'string' || !sql.startsWith('WITH claimed AS (')) return result;
+      return Promise.resolve(result).then((claimed) => {
+        duringClaim.abort(stopped);
+        return claimed;
+      });
+    });
+    await expect(f.execution.claim(duringClaim.signal)).rejects.toMatchObject({
+      cause: stopped,
+      claim: { id: f.jobId, claim_id: expect.any(String) },
+    });
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual([
+      expect.stringMatching(/^SELECT EXISTS \(/),
+      'BEGIN',
+      expect.stringMatching(/^WITH claimed AS \(/),
+      'ROLLBACK',
+    ]);
+  } finally {
+    query.mockRestore();
+  }
+  await expect(f.execution.claim()).resolves.toMatchObject({ id: f.jobId, phase: 'ready' });
+});
 
 it('completes a video through its output foreign key while competing recoveries wait', async () => {
   const f = await fixture();

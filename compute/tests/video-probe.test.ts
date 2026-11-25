@@ -730,6 +730,24 @@ it('kills a running late-decode subprocess and releases its Worker slot and file
   }
 });
 
+it('reports a retryable failure when the probe process for a valid video is killed externally', async () => {
+  const root = directory();
+  const file = fixture(root);
+  const original = await vi.importActual<typeof ChildProcess>('node:child_process');
+  let exited: Promise<unknown[]> | undefined;
+  vi.mocked(spawn).mockImplementation((binary, args, options) => {
+    const child = original.spawn(binary, args, options);
+    if (binary === 'ffprobe' && !exited) {
+      exited = once(child, 'exit');
+      child.once('spawn', () => child.kill('SIGKILL'));
+    }
+    return child;
+  });
+  const result = await inspectFixture(root, file);
+  expect(await exited).toEqual([null, 'SIGKILL']);
+  expect(result).toMatchObject({ state: 'failed', errorCode: 'PROBE_FAILED' });
+});
+
 it('gives a probe admitted near the queue deadline its full execution budget', async () => {
   const root = directory();
   const file = fixture(root);

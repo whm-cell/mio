@@ -17,6 +17,7 @@ export const VIDEO_EXECUTOR_MAX_QUERIES = 360;
 export const VIDEO_EXECUTOR_MAX_AGE_SECONDS = 1800;
 export const VIDEO_EXECUTOR_QUERY_INTERVAL_MS = 5000;
 export const VIDEO_MATERIALIZATION_MAX_ATTEMPTS = 3;
+export const VIDEO_INVALID_OUTPUT_ERRORS = new Set(['VIDEO_SOURCE_INVALID', 'VIDEO_MEDIA_INVALID']);
 export const VIDEO_QUOTA_LOCK = 672049926;
 
 export interface VideoSubmissionReceipt {
@@ -59,7 +60,9 @@ export interface VideoCheckpoint {
   videos: VideoResultSource[];
   materializationAttempts: number;
   cleaned?: boolean;
+  cleanupRetryAt?: string;
   expired?: Record<number, true>;
+  invalidOutputs?: Record<number, true>;
   refreshAt?: string;
   recoveryQuery?: VideoRecoveryQuery;
 }
@@ -108,6 +111,7 @@ export type VideoMaterializer = (
   video: { url: string },
   index: number,
   signal: AbortSignal,
+  freshResult?: boolean,
 ) => Promise<VideoMaterializedOutput>;
 
 export type VideoSubmitResult =

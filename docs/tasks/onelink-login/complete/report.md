@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/integrations/onelink/sso.ts](../../../../src/integrations/onelink/sso.ts) · [src/admin/service.ts](../../../../src/admin/service.ts) · [src/admin/http.ts](../../../../src/admin/http.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/apis/admin.md](../../../apis/admin.md) · [docs/integrations/onelink-sso.md](../../../integrations/onelink-sso.md)
 
+## onelink-auth-callback
+
+**万联 OneLink 授权发起、AES-256-GCM 跳转、回调解析与待处理候选存储**
+
+[src/integrations/onelink/sso.ts](../../../../src/integrations/onelink/sso.ts) · [src/auth/onelink-store.ts](../../../../src/auth/onelink-store.ts) · [src/auth/onelink.ts](../../../../src/auth/onelink.ts) · [src/auth/http.ts](../../../../src/auth/http.ts) · [docs/auth.md](../../../auth.md) · [docs/apis/auth.md](../../../apis/auth.md)
+
 ```mio-prd-results
 {
   "version": 5,

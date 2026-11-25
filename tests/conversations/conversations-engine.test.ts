@@ -13,7 +13,7 @@ import {
 } from '../../src/conversations/prompt.ts';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
 import { parseImageJobPresentationMeta } from '../../src/dsh/image-tools.ts';
-import { authorizeConversationTools } from '../../src/dsh/policy.ts';
+import { authorizeConversationImageTools } from '../../src/dsh/policy.ts';
 import { createConversationVision } from '../../src/dsh/vision.ts';
 import { protocolResponse } from '../onelink/fixture.ts';
 import { kernelRuntime, ScriptedModel, textResponse } from '../support/kernel-runtime.ts';
@@ -129,9 +129,9 @@ it('keeps budget denials monotonic across repeated guard checks, honors aborted 
   const { ctx } = await setup([]);
   let revoke: (() => void) | undefined;
   const handle = await ctx.mioKernel.create('guard-monotonic', {}, (agentCtx, agent) => {
-    revoke = authorizeConversationTools(agentCtx, agent, {
-      imageGeneration: true,
-      imageInspection: false,
+    revoke = authorizeConversationImageTools(agentCtx, agent, {
+      generation: true,
+      inspection: false,
       videoGeneration: true,
     });
   });

@@ -7,7 +7,7 @@ import { Pool } from 'pg';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { readAdminConfig } from '../../src/admin/config.ts';
 import type { AdminPrincipal, AdminStoredAuthSettings } from '../../src/admin/contracts.ts';
-import { createAdminHandler } from '../../src/admin/http.ts';
+import { createAdminHandler, readAdminSessionCookie } from '../../src/admin/http.ts';
 import { adminSchemaSQL, checkAdminSchema } from '../../src/admin/schema.ts';
 import { createAdminService } from '../../src/admin/service.ts';
 import { AdminStore, createAdminStore } from '../../src/admin/store.ts';
@@ -16,6 +16,7 @@ import { AUTH_BASE_PATH, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
+import { createComputeOpsHandler } from '../../src/compute/ops-http.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
@@ -35,6 +36,7 @@ import {
   makeChatRouteFixture,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { makeAudioRouteFixture } from '../providers/fixtures/onelink-audio-route.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -1552,5 +1554,283 @@ it('keeps the newest committed auth policy when PATCH responses complete out of 
   } finally {
     first.resolve(raceEnabledSettings);
     await service.close();
+  }
+});
+
+it('manages voice operation templates and route revisions through the admin endpoints', async () => {
+  const modelId = `speech-admin-${randomUUID()}`;
+  const tts = makeAudioRouteFixture(modelId);
+  const routes = [
+    tts,
+    makeAudioRouteFixture(modelId, 'audio.voices.list'),
+    makeAudioRouteFixture(modelId, 'audio.clone'),
+  ];
+  const requestRoute = (body: unknown) =>
+    requestApi('/api/v1/admin/routes', 'POST', body, adminCookie);
+  const published = await requestRoute({ routes });
+  expect(published.status).toBe(200);
+  const { revisions } = (await published.json()) as {
+    revisions: { id: string; operation: string }[];
+  };
+  expect(revisions.map((revision) => revision.operation)).toEqual(
+    routes.map((route) => route.operation),
+  );
+  const info = () =>
+    requestApi(`/api/v1/admin/models?category=voice&q=${modelId}`, 'GET', undefined, adminCookie);
+  const rows = ((await (await info()).json()) as { items: { audioRoutes: unknown[] }[] }).items;
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.audioRoutes).toEqual(
+    expect.arrayContaining(
+      routes.map((route) =>
+        expect.objectContaining({
+          operation: route.operation,
+          enabled: true,
+          declarationVersion: 1,
+          verifiedUserCount: 0,
+        }),
+      ),
+    ),
+  );
+  const disabled = await requestRoute({ route: { ...tts, enabled: false } });
+  expect(await disabled.json()).toMatchObject({
+    revisions: [{ action: 'disable', declarationVersion: 2 }],
+  });
+  const rollback = await requestApi(
+    '/api/v1/admin/routes/rollback',
+    'POST',
+    { revisionId: revisions[0]!.id },
+    adminCookie,
+  );
+  expect(rollback.status).toBe(200);
+  expect(await rollback.json()).toMatchObject({ operation: 'audio.tts', declarationVersion: 3 });
+  const deleted = await requestApi(
+    '/api/v1/admin/routes',
+    'DELETE',
+    { rawModelId: modelId, operation: 'audio.clone' },
+    adminCookie,
+  );
+  expect(deleted.status).toBe(200);
+  const routeHistory = await requestApi(
+    `/api/v1/admin/revisions?rawModelId=${modelId}`,
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(await routeHistory.json()).toMatchObject({
+    routeRevisions: expect.arrayContaining([
+      expect.objectContaining({ operation: 'audio.tts', action: 'rollback' }),
+      expect.objectContaining({ operation: 'audio.clone', action: 'delete' }),
+    ]),
+  });
+  const routeTemplate: Record<string, unknown> = { ...tts };
+  delete routeTemplate.rawModelId;
+  const template = await requestApi(
+    '/api/v1/admin/templates',
+    'POST',
+    {
+      templateKey: 'voice-tts-fixture',
+      label: 'Speech fixture',
+      routeTemplate,
+    },
+    adminCookie,
+  );
+  expect(template.status).toBe(201);
+  expect(await template.json()).toMatchObject({
+    template: { operation: 'audio.tts', driver: 'minimax-tts' },
+  });
+});
+
+it('delegates /api/v1/admin/compute/* through createAdminHandler with and without compute handler', async () => {
+  // 1. Default admin server (no computeHandler configured): 401 before 503, OPTIONS allowed
+  const unconfiguredPreflight = await requestApi('/api/v1/admin/compute/summary', 'OPTIONS');
+  expect(unconfiguredPreflight.status).toBe(204);
+  expect(unconfiguredPreflight.headers.get('access-control-allow-origin')).toBe(origin);
+
+  for (const probePath of [
+    '/api/v1/admin/compute',
+    '/api/v1/admin/compute/unknown',
+    '/api/v1/admin/compute/summary',
+  ]) {
+    const unconfiguredAnon = await requestApi(probePath, 'GET');
+    expect(unconfiguredAnon.status).toBe(401);
+    expect(await unconfiguredAnon.json()).toMatchObject({ error: { code: 'ADMIN_UNAUTHORIZED' } });
+
+    const unconfiguredUser = await requestApi(probePath, 'GET', undefined, userCookie);
+    expect(unconfiguredUser.status).toBe(401);
+    expect(await unconfiguredUser.json()).toMatchObject({ error: { code: 'ADMIN_UNAUTHORIZED' } });
+  }
+
+  const unconfiguredAdmin = await requestApi(
+    '/api/v1/admin/compute/summary',
+    'GET',
+    undefined,
+    adminCookie,
+  );
+  expect(unconfiguredAdmin.status).toBe(503);
+  expect(await unconfiguredAdmin.json()).toMatchObject({
+    error: { code: 'COMPUTE_OPS_UNAVAILABLE' },
+  });
+
+  // Unauthenticated PUT without Origin -> 401; authenticated PUT without Origin -> 403
+  const unconfiguredAnonPut = await fetch(
+    `${origin}/api/v1/admin/compute/workers/worker-a/limits`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: 0, total: 2, encode: 1, probe: 1 }),
+    },
+  );
+  expect(unconfiguredAnonPut.status).toBe(401);
+  expect(await unconfiguredAnonPut.json()).toMatchObject({ error: { code: 'ADMIN_UNAUTHORIZED' } });
+
+  const unconfiguredAuthedPutNoOrigin = await fetch(
+    `${origin}/api/v1/admin/compute/workers/worker-a/limits`,
+    {
+      method: 'PUT',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: 0, total: 2, encode: 1, probe: 1 }),
+    },
+  );
+  expect(unconfiguredAuthedPutNoOrigin.status).toBe(403);
+  expect(await unconfiguredAuthedPutNoOrigin.json()).toMatchObject({
+    error: { code: 'ORIGIN_REQUIRED' },
+  });
+
+  // Legacy routes are completely absent
+  expect((await requestApi('/ops/compute/', 'GET', undefined, adminCookie)).status).toBe(404);
+  expect(
+    (await requestApi('/api/v1/ops/compute/summary', 'GET', undefined, adminCookie)).status,
+  ).toBe(404);
+
+  // 2. Delegated admin server with computeHandler wired like src/plugin.ts
+  const crossPortOrigin = 'http://localhost:4330';
+  const summaryPayload = {
+    now: new Date('2026-11-25T00:00:00.000Z'),
+    instances: { online: 1, stale: 0, offline: 0, unseen: 0 },
+    aggregate: {
+      usage: { total: 1, encode: 1, probe: 0 },
+      applied: { total: 2, encode: 1, probe: 1 },
+      hard: { total: 2, encode: 1, probe: 1 },
+      waiting: { total: 0, encode: 0, probe: 0 },
+      heldResources: 0,
+    },
+    outbox: { transcode: 0, media: 0, total: 0 },
+    broker: { ready: null, unacknowledged: null },
+    peaks: [],
+  };
+  const requestLimits = vi.fn(
+    async (
+      _target: string,
+      _actor: string,
+      revision: number,
+      limits: { total: number; encode: number; probe: number },
+    ) => ({
+      commandId: 'delegated-command',
+      revision: revision + 1,
+      limits,
+      requestedAt: new Date(),
+      status: 'pending',
+    }),
+  );
+  const wake = vi.fn();
+  const unusedRead = async (): Promise<never> => {
+    throw new Error('Unexpected read');
+  };
+  const allowedOrigins = [origin, crossPortOrigin];
+  const computeHandler = createComputeOpsHandler(
+    {
+      summary: async () => summaryPayload,
+      workers: unusedRead,
+      worker: unusedRead,
+      executions: unusedRead,
+      execution: unusedRead,
+      history: unusedRead,
+      limits: unusedRead,
+    },
+    { request: requestLimits },
+    async (headers) => {
+      const principal = await adminService.authenticate(
+        readAdminSessionCookie(headers.get('cookie')),
+      );
+      return principal
+        ? {
+            id: principal.admin.id,
+            username: principal.admin.username,
+            sessionId: principal.sessionId,
+          }
+        : null;
+    },
+    allowedOrigins,
+    wake,
+  );
+  const delegatedHandler = createAdminHandler(adminService, allowedOrigins, computeHandler);
+  const delegatedServer = createServer((req, res) => {
+    void delegatedHandler(req, res);
+  });
+  delegatedServer.listen(0, '127.0.0.1');
+  await once(delegatedServer, 'listening');
+  try {
+    const address = delegatedServer.address();
+    if (!address || typeof address === 'string') throw new Error('Missing port');
+    const base = `http://127.0.0.1:${address.port}`;
+
+    for (const probePath of [
+      '/api/v1/admin/compute',
+      '/api/v1/admin/compute/unknown',
+      '/api/v1/admin/compute/summary',
+    ]) {
+      const anonProbe = await fetch(`${base}${probePath}`, {
+        headers: { origin: crossPortOrigin },
+      });
+      expect(anonProbe.status).toBe(401);
+      expect(await anonProbe.json()).toMatchObject({ error: { code: 'ADMIN_UNAUTHORIZED' } });
+
+      const userProbe = await fetch(`${base}${probePath}`, {
+        headers: { origin: crossPortOrigin, cookie: userCookie },
+      });
+      expect(userProbe.status).toBe(401);
+      expect(await userProbe.json()).toMatchObject({ error: { code: 'ADMIN_UNAUTHORIZED' } });
+    }
+
+    const authedUnknown = await fetch(`${base}/api/v1/admin/compute/unknown`, {
+      headers: { origin: crossPortOrigin, cookie: adminCookie },
+    });
+    expect(authedUnknown.status).toBe(404);
+    expect(await authedUnknown.json()).toMatchObject({ error: { code: 'NOT_FOUND' } });
+
+    const okSummary = await fetch(`${base}/api/v1/admin/compute/summary`, {
+      headers: { origin: crossPortOrigin, cookie: adminCookie },
+    });
+    expect(okSummary.status).toBe(200);
+    expect(okSummary.headers.get('access-control-allow-origin')).toBe(crossPortOrigin);
+    expect(await okSummary.json()).toEqual({
+      ...summaryPayload,
+      now: summaryPayload.now.toISOString(),
+    });
+
+    const putRes = await fetch(`${base}/api/v1/admin/compute/workers/worker-a/limits`, {
+      method: 'PUT',
+      headers: {
+        origin: crossPortOrigin,
+        cookie: adminCookie,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ expectedRevision: 0, total: 2, encode: 1, probe: 1 }),
+    });
+    expect(putRes.status).toBe(202);
+    expect(requestLimits).toHaveBeenCalledWith('worker-a', 'miioo_admin', 0, {
+      total: 2,
+      encode: 1,
+      probe: 1,
+    });
+    expect(wake).toHaveBeenCalledOnce();
+
+    const meRes = await fetch(`${base}/api/v1/admin/auth/me`, {
+      headers: { origin: crossPortOrigin, cookie: adminCookie },
+    });
+    expect(meRes.status).toBe(200);
+    expect(await meRes.json()).toMatchObject({ admin: { username: 'miioo_admin' } });
+  } finally {
+    delegatedServer.close();
   }
 });

@@ -19,6 +19,8 @@ export function registerVisionTool(
 ): void {
   const tool = defineTool({
     name: 'inspect_image_asset',
+    // Bound the whole inspection, including waiting for the image-preparation gate.
+    timeoutMs: 60_000,
     description: 'Inspect a ready image asset owned by the current user.',
     parameters: {
       assetId: { type: 'string', required: true, description: 'Mio image asset UUID v4.' },

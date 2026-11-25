@@ -200,9 +200,13 @@ export function parseVideoJobPresentationMeta(
       (output.errorCode !== null &&
         (typeof output.errorCode !== 'string' || !ERROR_CODE_PATTERN.test(output.errorCode))) ||
       (output.width !== null &&
-        (typeof output.width !== 'number' || !Number.isSafeInteger(output.width) || output.width < 1)) ||
+        (typeof output.width !== 'number' ||
+          !Number.isSafeInteger(output.width) ||
+          output.width < 1)) ||
       (output.height !== null &&
-        (typeof output.height !== 'number' || !Number.isSafeInteger(output.height) || output.height < 1)) ||
+        (typeof output.height !== 'number' ||
+          !Number.isSafeInteger(output.height) ||
+          output.height < 1)) ||
       !isNullableNumber(output.durationSeconds) ||
       (output.hasAudio !== null && typeof output.hasAudio !== 'boolean')
     )
@@ -252,9 +256,13 @@ export function registerConversationVideoTools(
         isConcurrencySafe: (args) =>
           isPlainJsonRecord(args) && Object.keys(args).every((key) => LIST_KEYS.has(key)),
         output: {
-          schema: { type: 'object', additionalProperties: false, properties: {
-            models: { type: 'array', items: modelSchema, required: true },
-          } },
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              models: { type: 'array', items: modelSchema, required: true },
+            },
+          },
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
         },
         execute: async (args, exec) => {
@@ -262,12 +270,17 @@ export function registerConversationVideoTools(
           exec.signal.throwIfAborted();
           try {
             const models = await bridge.listModels(actor);
-            return { models: models.map((model: ConversationVideoModelSummary) => ({
-              ...model,
-              supportedModes: model.supportedModes.filter(
-                (entry) => typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
-              ).map(({ mode, supported }) => ({ mode, supported })),
-            })) };
+            return {
+              models: models.map((model: ConversationVideoModelSummary) => ({
+                ...model,
+                supportedModes: model.supportedModes
+                  .filter(
+                    (entry) =>
+                      typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
+                  )
+                  .map(({ mode, supported }) => ({ mode, supported })),
+              })),
+            };
           } catch (error) {
             return sanitizedError(error);
           }
@@ -283,8 +296,16 @@ export function registerConversationVideoTools(
         description:
           'Submit one text-to-video job for the current user. Check list_video_models first and use only an available model. After the job handle is returned, report its ID and state and finish this turn; never poll it in the same turn.',
         parameters: {
-          modelRef: { type: 'string', required: true, description: 'Exact modelRef from list_video_models.' },
-          prompt: { type: 'string', required: true, description: 'Final video prompt, at most 5000 Unicode code points.' },
+          modelRef: {
+            type: 'string',
+            required: true,
+            description: 'Exact modelRef from list_video_models.',
+          },
+          prompt: {
+            type: 'string',
+            required: true,
+            description: 'Final video prompt, at most 5000 Unicode code points.',
+          },
           ratio: { type: 'string' },
           resolution: { type: 'string' },
           durationSeconds: { type: 'number' },
@@ -294,7 +315,11 @@ export function registerConversationVideoTools(
         output: {
           schema: videoJobSchema,
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-          presentationMeta: (_args, value) => ({ kind: 'mio.video-job', tool: 'submit_video_job', job: value }),
+          presentationMeta: (_args, value) => ({
+            kind: 'mio.video-job',
+            tool: 'submit_video_job',
+            job: value,
+          }),
         },
         execute: async (args, exec) => {
           assertAllowedArguments(args, SUBMIT_KEYS);
@@ -308,17 +333,23 @@ export function registerConversationVideoTools(
             (args.ratio !== undefined && typeof args.ratio !== 'string') ||
             (args.resolution !== undefined && typeof args.resolution !== 'string') ||
             (args.durationSeconds !== undefined &&
-              (typeof args.durationSeconds !== 'number' || !Number.isFinite(args.durationSeconds) || args.durationSeconds <= 0)) ||
+              (typeof args.durationSeconds !== 'number' ||
+                !Number.isFinite(args.durationSeconds) ||
+                args.durationSeconds <= 0)) ||
             (args.generateAudio !== undefined && typeof args.generateAudio !== 'boolean') ||
             (args.watermark !== undefined && typeof args.watermark !== 'boolean')
           )
-            throw new HarnessError('MIO_VIDEO_TOOL_ERROR: VIDEO_INPUT_INVALID', 'VIDEO_INPUT_INVALID');
+            throw new HarnessError(
+              'MIO_VIDEO_TOOL_ERROR: VIDEO_INPUT_INVALID',
+              'VIDEO_INPUT_INVALID',
+            );
           exec.signal.throwIfAborted();
           try {
             const capabilities = await bridge.capabilities(actor, args.modelRef);
-            if (!capabilities.available)
-              throw new ApplicationError('VIDEO_UNAVAILABLE');
-            if (!capabilities.modes.some((entry) => entry.mode === 'text_to_video' && entry.supported))
+            if (!capabilities.available) throw new ApplicationError('VIDEO_UNAVAILABLE');
+            if (
+              !capabilities.modes.some((entry) => entry.mode === 'text_to_video' && entry.supported)
+            )
               throw new ApplicationError('VIDEO_MODE_UNSUPPORTED');
             const request = {
               requestId: deriveConversationVideoRequestId(
@@ -334,7 +365,9 @@ export function registerConversationVideoTools(
                 prompt: args.prompt,
                 ...(args.ratio !== undefined ? { ratio: args.ratio } : {}),
                 ...(args.resolution !== undefined ? { resolution: args.resolution } : {}),
-                ...(args.durationSeconds !== undefined ? { durationSeconds: args.durationSeconds } : {}),
+                ...(args.durationSeconds !== undefined
+                  ? { durationSeconds: args.durationSeconds }
+                  : {}),
                 ...(args.generateAudio !== undefined ? { generateAudio: args.generateAudio } : {}),
                 ...(args.watermark !== undefined ? { watermark: args.watermark } : {}),
               },
@@ -354,15 +387,24 @@ export function registerConversationVideoTools(
     closedParametersTool(
       defineTool({
         name: 'recover_video_job',
-        description: 'When the user requests recovery, resume saving a previous owner-scoped video job from its existing result. Never resubmits generation. Report the returned state and finish this turn.',
+        description:
+          'When the user requests recovery, resume saving a previous owner-scoped video job from its existing result. Never resubmits generation. Report the returned state and finish this turn.',
         parameters: {
-          jobId: { type: 'string', required: true, description: 'The previous Mio video job UUID.' },
+          jobId: {
+            type: 'string',
+            required: true,
+            description: 'The previous Mio video job UUID.',
+          },
         },
         isConcurrencySafe: () => false,
         output: {
           schema: videoJobSchema,
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-          presentationMeta: (_args, value) => ({ kind: 'mio.video-job', tool: 'get_video_job', job: value }),
+          presentationMeta: (_args, value) => ({
+            kind: 'mio.video-job',
+            tool: 'get_video_job',
+            job: value,
+          }),
         },
         execute: async (args, exec) => {
           assertAllowedArguments(args, GET_KEYS);
@@ -388,14 +430,22 @@ export function registerConversationVideoTools(
         description:
           'Query a previous owner-scoped Mio video job by jobId. If non-terminal, report its current state and finish this turn; never busy-poll.',
         parameters: {
-          jobId: { type: 'string', required: true, description: 'Mio video job UUID returned by submit_video_job.' },
+          jobId: {
+            type: 'string',
+            required: true,
+            description: 'Mio video job UUID returned by submit_video_job.',
+          },
         },
         isConcurrencySafe: (args) =>
           isPlainJsonRecord(args) && Object.keys(args).every((key) => GET_KEYS.has(key)),
         output: {
           schema: videoJobSchema,
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-          presentationMeta: (_args, value) => ({ kind: 'mio.video-job', tool: 'get_video_job', job: value }),
+          presentationMeta: (_args, value) => ({
+            kind: 'mio.video-job',
+            tool: 'get_video_job',
+            job: value,
+          }),
         },
         execute: async (args, exec) => {
           assertAllowedArguments(args, GET_KEYS);
@@ -407,9 +457,14 @@ export function registerConversationVideoTools(
             exec.signal.throwIfAborted();
           }
           if (submittedPendingJobs.has(args.jobId) || polledPendingJobs.has(args.jobId))
-            throw new HarnessError('MIO_VIDEO_TOOL_ERROR: VIDEO_JOB_POLL_DEFERRED', 'VIDEO_JOB_POLL_DEFERRED');
+            throw new HarnessError(
+              'MIO_VIDEO_TOOL_ERROR: VIDEO_JOB_POLL_DEFERRED',
+              'VIDEO_JOB_POLL_DEFERRED',
+            );
           let release!: () => void;
-          const inFlight = new Promise<void>((resolve) => { release = resolve; });
+          const inFlight = new Promise<void>((resolve) => {
+            release = resolve;
+          });
           inFlightPollByJobId.set(args.jobId, inFlight);
           try {
             const job = sanitizeVideoJob(await bridge.getVideo(actor, args.jobId));

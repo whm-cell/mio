@@ -1,7 +1,11 @@
+import { parseWorkerInstanceIds } from '@mio/compute-contracts';
+
 export interface ComputeConfig {
   brokerURL: string;
   brokerUser: string;
   expectedResultUser: string;
+  workerUsers?: ReadonlyMap<string, string>;
+  workerInstances?: readonly string[];
 }
 
 /** Opt in explicitly so an unrelated RabbitMQ setting cannot enable the service. */
@@ -31,8 +35,57 @@ export function readComputeConfig(env: NodeJS.ProcessEnv = process.env): Compute
       )
     )
       throw new Error();
-    return { brokerURL, brokerUser, expectedResultUser };
+    const workerInstances = parseWorkerInstanceIds(env.MIO_COMPUTE_WORKER_INSTANCE_IDS);
+    const settings: ComputeConfig = { brokerURL, brokerUser, expectedResultUser };
+    if (workerInstances.length) {
+      settings.workerInstances = workerInstances;
+      settings.workerUsers = workerUserMapping(
+        env.MIO_COMPUTE_WORKER_RESULT_USERS,
+        workerInstances,
+        brokerUser,
+        expectedResultUser,
+      );
+    } else if (env.MIO_COMPUTE_WORKER_RESULT_USERS !== undefined) throw new Error();
+    return settings;
   } catch {
-    throw new Error('COMPUTE_CONFIG: explicit separate broker identities required');
+    throw new Error(
+      'COMPUTE_CONFIG: explicit broker identities and valid Worker settings required',
+    );
   }
+}
+
+function workerUserMapping(
+  input: string | undefined,
+  instances: readonly string[],
+  app: string,
+  legacy: string,
+) {
+  if (input === undefined && instances.length === 1) return new Map([[instances[0]!, legacy]]);
+  if (input === undefined || input.length > 20_000) throw new Error();
+  const value: unknown = JSON.parse(input);
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== instances.length
+  )
+    throw new Error();
+  const record = value as Record<string, unknown>;
+  const used = new Set<string>();
+  return new Map(
+    instances.map((id) => {
+      const peer = Object.hasOwn(record, id) ? record[id] : undefined;
+      if (
+        typeof peer !== 'string' ||
+        !peer ||
+        peer.length > 128 ||
+        peer === app ||
+        used.has(peer) ||
+        /[\x00-\x20\x7f]/.test(peer)
+      )
+        throw new Error();
+      used.add(peer);
+      return [id, peer] as const;
+    }),
+  );
 }

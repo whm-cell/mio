@@ -17,6 +17,7 @@ import {
   ONELINK_FIXTURE_ROUTES,
   findFixtureRoute,
   importRoutesViaCli,
+  makeChatRouteFixture,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { unpackPluginPackage } from '../support/auth-runtime.ts';
@@ -32,6 +33,7 @@ interface RecordedChatRequest {
   authorization: string | null;
   tools: { type?: string; function?: { name?: string; parameters?: Record<string, unknown> } }[];
   messages: Record<string, unknown>[];
+  reasoningEffort: unknown;
 }
 
 interface RecordedImageUpstream {
@@ -52,6 +54,10 @@ interface SseFrame {
   event: string;
   data: Record<string, unknown>;
 }
+
+const reasoningModelId = 'mio-m5-reasoning-fixture';
+const reasoningText = 'M5 fixture reasoning. ';
+const missingToolJobId = '235b78c8-0731-4584-a314-398d4812f587';
 
 async function generateValidImage(format: 'png' | 'jpeg', color: string): Promise<Buffer> {
   const codec = format === 'png' ? 'png' : 'mjpeg';
@@ -122,16 +128,22 @@ function extractMessageText(content: unknown): string {
   return JSON.stringify(content ?? '');
 }
 
+function userPromptIndex(messages: Record<string, unknown>[]): number {
+  return messages.findLastIndex((message) => {
+    if (message.role !== 'user') return false;
+    // The OpenAI wire format represents DSH's internal repeat notices as user content.
+    const text = extractMessageText(message.content);
+    return (
+      !text.startsWith('You are repeating the exact same tool call with identical arguments.') &&
+      !text.startsWith('Repeated tool call detected:')
+    );
+  });
+}
+
 function currentTurnToolOutputs(
   messages: Record<string, unknown>[],
 ): { toolCallId: string; text: string }[] {
-  let lastUserIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === 'user') {
-      lastUserIndex = index;
-      break;
-    }
-  }
+  const lastUserIndex = userPromptIndex(messages);
   const slice = lastUserIndex >= 0 ? messages.slice(lastUserIndex + 1) : messages;
   return slice
     .filter((msg) => msg.role === 'tool')
@@ -170,6 +182,7 @@ function streamOpenAiToolCalls(
   res: ServerResponse,
   calls: { id: string; name: string; args: Record<string, unknown> }[],
   requestId: string,
+  reasoning?: { text: string; tokens: number },
 ): void {
   res.writeHead(200, {
     'content-type': 'text/event-stream',
@@ -185,6 +198,7 @@ function streamOpenAiToolCalls(
         index: 0,
         delta: {
           role: 'assistant',
+          ...(reasoning ? { reasoning_content: reasoning.text } : {}),
           tool_calls: calls.map((call, index) => ({
             index,
             id: call.id,
@@ -201,7 +215,12 @@ function streamOpenAiToolCalls(
     object: 'chat.completion.chunk',
     model: 'deepseek-v4.1-flash',
     choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-    usage: { prompt_tokens: 18, completion_tokens: 9, total_tokens: 27 },
+    usage: {
+      prompt_tokens: 18,
+      completion_tokens: 9,
+      total_tokens: 27,
+      ...(reasoning ? { completion_tokens_details: { reasoning_tokens: reasoning.tokens } } : {}),
+    },
   };
   res.write(`data: ${JSON.stringify(chunk1)}\n\n`);
   res.write(`data: ${JSON.stringify(chunk2)}\n\n`);
@@ -493,6 +512,7 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
       if (parsed.pathname === '/v1/models' && req.method === 'GET') {
         const baseCatalog = [
           'deepseek-v4.1-flash',
+          reasoningModelId,
           'doubao-seedream-4.0',
           'doubao-seedream-4.5',
           'image-vidu-q2',
@@ -511,17 +531,41 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
         const body = JSON.parse((await readBodyBuffer(req)).toString('utf8')) as {
           messages?: Record<string, unknown>[];
           tools?: RecordedChatRequest['tools'];
+          reasoning_effort?: unknown;
         };
         const messages = body.messages ?? [];
         chatRequests.push({
           authorization,
           tools: body.tools ?? [],
           messages,
+          reasoningEffort: body.reasoning_effort,
         });
         const reqSeq = `obs-${chatRequests.length}`;
-        const lastUser = messages.filter((m) => m.role === 'user').at(-1);
+        const lastUser = messages[userPromptIndex(messages)];
         const prompt = extractMessageText(lastUser?.content);
         const toolOutputs = currentTurnToolOutputs(messages);
+
+        if (prompt === 'M5_PROGRESS_TURN' && toolOutputs.length === 0) {
+          streamOpenAiToolCalls(
+            res,
+            [
+              { id: 'm5_list', name: 'list_image_models', args: {} },
+              {
+                id: 'm5_submit',
+                name: 'submit_image_job',
+                args: {
+                  modelRef: 'onelink:image:doubao-seedream-4.0',
+                  prompt: 'fixture private image arguments',
+                  clientOperationKey: 'm5-progress',
+                },
+              },
+              { id: 'm5_missing', name: 'get_image_job', args: { jobId: missingToolJobId } },
+            ],
+            reqSeq,
+            { text: reasoningText, tokens: 7 },
+          );
+          return;
+        }
 
         if (prompt === 'WORKFLOW_TURN_1') {
           if (toolOutputs.length === 0) {
@@ -1252,7 +1296,11 @@ describe('conversation controlled intent-level image tools end-to-end', () => {
           }
         : route,
     );
-    await importRoutesViaCli(migrateEnv, [...imageRoutes, disabledRoute]);
+    const reasoningRoute = {
+      ...makeChatRouteFixture(reasoningModelId, 'openai'),
+      capabilityMetadata: { reasoning: { supported: true, efforts: ['low', 'high'] } } as const,
+    };
+    await importRoutesViaCli(migrateEnv, [...imageRoutes, disabledRoute, reasoningRoute]);
 
     // Build and pack official Profile with temporary child-Profile overlay
     const profileDir = await mkdtemp(join(tmpdir(), 'mio-conv-img-profile-'));
@@ -2160,7 +2208,7 @@ export function apply(ctx: Context) {
     ).toBe(202);
     const stepReceipt = await waitReceiptStatus(budgetConv, 'step-budget', 0);
     expect(stepReceipt.status).toBe('failed');
-    expect(stepReceipt.error).toBe('MODEL_FAILED');
+    expect(stepReceipt.error).toBe('TURN_STEP_BUDGET_EXCEEDED');
     expect(chatRequests.length - chatBeforeStepBudget).toBe(8);
 
     // 5. Mid-turn cancel revokes active grant cleanly and allows subsequent turns
@@ -2368,5 +2416,124 @@ export function apply(ctx: Context) {
       heldKlingWaiters.shift()?.();
     }
     await waitImageJobCompleted(pendingJobId, 0);
+  }, 45_000);
+
+  it('checks declared turn efforts, projects bounded progress, and preserves durable replay', async () => {
+    const base = '/api/v1/conversations';
+    const startPosts = chatRequests.length;
+    const modelRef = `onelink:chat:${reasoningModelId}`;
+    const unsupportedCreate = await call(base, 'POST', {
+      modelRef: chatModelRef,
+      reasoningEffort: 'low',
+    });
+    expect(unsupportedCreate.status).toBe(409);
+    expect(await unsupportedCreate.json()).toMatchObject({
+      error: { code: 'MODEL_REASONING_UNSUPPORTED' },
+    });
+    const invalidCreate = await call(base, 'POST', { modelRef, reasoningEffort: null });
+    expect(invalidCreate.status).toBe(400);
+    expect(await invalidCreate.json()).toMatchObject({ error: { code: 'BODY_INVALID' } });
+    const created = await call(base, 'POST', { modelRef, reasoningEffort: 'low' });
+    expect(created.status).toBe(201);
+    const conversation = (await created.json()) as { id: string; reasoningEffort: string };
+    expect(conversation.reasoningEffort).toBe('low');
+    const path = `${base}/${conversation.id}`;
+    const message = { requestId: 'm5-progress', text: 'M5_PROGRESS_TURN', reasoningEffort: 'high' };
+    const send = (body: unknown) => call(`${path}/messages`, 'POST', body);
+    const disallowed = await send({ ...message, reasoningEffort: 'medium' });
+    expect(disallowed.status).toBe(409);
+    expect(await disallowed.json()).toMatchObject({
+      error: { code: 'MODEL_REASONING_UNSUPPORTED' },
+    });
+    const invalidSend = await send({ ...message, reasoningEffort: 'auto' });
+    expect(invalidSend.status).toBe(400);
+    expect(await invalidSend.json()).toMatchObject({ error: { code: 'BODY_INVALID' } });
+    expect((await call(`${path}/requests/${message.requestId}`)).status).toBe(404);
+    expect(chatRequests).toHaveLength(startPosts);
+
+    const profiles = collectSseFrames(await call(`${path}/events`), message.requestId);
+    expect((await send(message)).status).toBe(202);
+    const frames = await profiles;
+    expect(frames.at(-1)).toMatchObject({
+      event: 'state',
+      data: { receipt: { requestId: message.requestId, status: 'completed' } },
+    });
+    expect(chatRequests.slice(startPosts).map(({ reasoningEffort }) => reasoningEffort)).toEqual([
+      'high',
+      'high',
+    ]);
+    const reasoningFrames = frames.filter(({ event }) => event === 'reasoning');
+    expect(reasoningFrames.map(({ data }) => data.text).join('')).toBe(reasoningText);
+    const statusFrames = frames.filter(({ event }) => event === 'tool-status');
+    expect(statusFrames).toHaveLength(6);
+    for (const [tool, end] of [
+      ['list_image_models', 'completed'],
+      ['submit_image_job', 'completed'],
+      ['get_image_job', 'failed'],
+    ]) {
+      expect(statusFrames.filter(({ data }) => data.tool === tool).map(({ data }) => data)).toEqual(
+        ['running', end].map((status) => ({
+          type: 'tool-status',
+          requestId: message.requestId,
+          tool,
+          status,
+        })),
+      );
+    }
+    expect(frames.indexOf(reasoningFrames.at(-1)!)).toBeLessThan(frames.indexOf(statusFrames[0]!));
+    expect(frames.indexOf(statusFrames.at(-1)!)).toBeLessThan(
+      frames.findIndex(({ event }) => event === 'text'),
+    );
+    expect(frames.filter(({ event }) => event === 'tool')).toMatchObject([
+      { data: { tool: 'submit_image_job' } },
+    ]);
+
+    const persisted = (
+      await observer.query(
+        `SELECT model_binding,model_observations FROM mio_conversation_requests
+         WHERE conversation_id=$1 AND request_id=$2`,
+        [conversation.id, message.requestId],
+      )
+    ).rows[0];
+    expect(persisted.model_binding).toMatchObject({ reasoningEffort: 'high' });
+    expect(persisted.model_binding).not.toHaveProperty('apiKey');
+    expect(persisted.model_observations[0].usage.reasoningTokens).toBe(7);
+    expect(persisted.model_observations[1].usage).not.toHaveProperty('reasoningTokens');
+
+    const history = await (await call(`${path}/history`)).text();
+    expect(history).toContain('plain conversation reply');
+    expect(history).toContain('"tool":"submit_image_job"');
+    expect(history).not.toContain(reasoningText);
+    expect(history).not.toContain(missingToolJobId);
+    expect(history).not.toContain('list_image_models');
+
+    await profileControl.stop();
+    await profileControl.start('database');
+    expect(await (await call(`${path}/history`)).text()).toBe(history);
+    const inherited = { requestId: 'm5-inherited', text: 'inherit the configured default' };
+    expect((await send(inherited)).status).toBe(202);
+    expect((await waitReceiptStatus(conversation.id, inherited.requestId)).status).toBe(
+      'completed',
+    );
+    expect(chatRequests.at(-1)?.reasoningEffort).toBe('low');
+    const recentPosts = chatRequests.length;
+    await observer.query(
+      `UPDATE mio_provider_model_routes SET capability_metadata=capability_metadata - 'reasoning',
+         declaration_version=declaration_version+1 WHERE raw_model_id=$1 AND operation='chat'`,
+      [reasoningModelId],
+    );
+    const replay = await send(message);
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({
+      requestId: message.requestId,
+      status: 'completed',
+    });
+    const conflict = await send({ ...message, reasoningEffort: 'low' });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: { code: 'REQUEST_ID_CONFLICT' } });
+    const fresh = await send({ ...inherited, requestId: 'm5-revoked' });
+    expect(fresh.status).toBe(409);
+    expect(await fresh.json()).toMatchObject({ error: { code: 'MODEL_REASONING_UNSUPPORTED' } });
+    expect(chatRequests).toHaveLength(recentPosts);
   }, 45_000);
 });

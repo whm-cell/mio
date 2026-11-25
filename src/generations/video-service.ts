@@ -226,7 +226,8 @@ export function createVideoGenerationService(
     recover(actor: Pick<ProviderPrincipal, 'userId'>, jobId: string) {
       return admit(async () => {
         if (!isUuidV4(jobId)) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
-        if (!executor) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+        if (!executor)
+          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
         await store.recover(actor.userId, jobId);
         executor.wake();
         return store.get(actor.userId, jobId);

@@ -1,11 +1,23 @@
 import { isDeepStrictEqual } from 'node:util';
+import { AUDIO_RESULT_QUEUE, parseWorkerInstanceIds } from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
-import { computeCapacity, computePermissions, computeTopology } from './compute-broker-topology.ts';
+import {
+  audioResultPolicy,
+  computeCapacity,
+  computePermissions,
+  computeTopology,
+} from './compute-broker-topology.ts';
 
 type Json = Record<string, unknown>;
 
 /** Verify operator-provisioned resources and declare only the matching media topology. */
 export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.ProcessEnv) {
+  const workerInstanceId = values.MIO_LOCAL_COMPUTE_INSTANCE_ID;
+  const workerInstanceIds = parseWorkerInstanceIds(
+    values.MIO_COMPUTE_WORKER_INSTANCE_IDS ?? workerInstanceId,
+  );
+  if (workerInstanceId && !workerInstanceIds.includes(workerInstanceId))
+    throw new Error('LOCAL_BROKER_WORKER_INSTANCE_NOT_PROVISIONED');
   const base = `http://127.0.0.1:${values.MIO_LOCAL_RABBITMQ_MANAGEMENT_PORT}/api/`;
   const auth = Buffer.from(`mio-${name}-admin:${values.MIO_LOCAL_RABBITMQ_PASSWORD}`).toString(
     'base64',
@@ -60,6 +72,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
   const vhost = `mio-${name}`;
   const vhostPath = `vhosts/${vhost}`;
   const capacityPath = `operator-policies/${vhost}/mio-capacity`;
+  const audioPolicyPath = `operator-policies/${vhost}/${audioResultPolicy.name}`;
   const roles = ['a', 'b'] as const;
   // These management endpoints can replace existing metadata. Compose provisions the root vhost.
   const prerequisites: { path: string; expected: Json }[] = [
@@ -73,6 +86,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
         'apply-to': 'queues',
       },
     },
+    { path: audioPolicyPath, expected: audioResultPolicy.definition },
   ];
   for (const role of roles) {
     const user = `mio-${name}-${role}`;
@@ -87,7 +101,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     });
     prerequisites.push({
       path: `permissions/${vhost}/${user}`,
-      expected: computePermissions(role),
+      expected: computePermissions(role, workerInstanceId),
     });
   }
   async function readPrerequisiteGaps() {
@@ -98,7 +112,7 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     return missing;
   }
   const missingPrerequisites = await readPrerequisiteGaps();
-  const topology = computeTopology(vhost);
+  const topology = computeTopology(vhost, workerInstanceIds);
   const missingTopology: typeof topology = [];
   // Preflight everything before the first write. A failed/unknown write leaves resources for rerun.
   if (!missingPrerequisites.has(vhostPath)) {
@@ -107,10 +121,14 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
         missingTopology.push(resource);
     }
   }
-  // Exchanges are safe without the capacity policy. Queues and bindings wait for it.
-  const declarations = missingPrerequisites.has(capacityPath)
-    ? missingTopology.filter(({ path }) => path.startsWith('exchanges/'))
-    : missingTopology;
+  // Each queue and binding waits for its own policy.
+  const declarations = missingTopology.filter(({ path }) => {
+    if (path.startsWith('exchanges/')) return true;
+    return (
+      !missingPrerequisites.has(capacityPath) &&
+      (!path.endsWith('/' + AUDIO_RESULT_QUEUE) || !missingPrerequisites.has(audioPolicyPath))
+    );
+  });
   for (const resource of declarations) await api(resource.method, resource.path, resource.body);
   function requireProvisioned(missing: Set<string>) {
     if (missing.size)

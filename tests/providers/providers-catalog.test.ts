@@ -116,6 +116,12 @@ it('limits route imports to sourced, implemented vendor drivers and rejects endp
     submitPath: '/v1/chat/completions',
   });
   expect(validateRouteImportPayload({ routes: [entry] })).toHaveLength(1);
+  for (const cacheRetention of ['none', 'short', 'long'])
+    expect(
+      validateModelRouteEntry({ ...entry, capabilityMetadata: { cacheRetention } }),
+    ).toMatchObject({
+      capabilityMetadata: { cacheRetention },
+    });
   for (const patch of [
     { driver: 'unknown' },
     { driver: 'gpt-images-v1' },
@@ -131,9 +137,50 @@ it('limits route imports to sourced, implemented vendor drivers and rejects endp
     { endpoint: 'https://other.test' },
     { capabilityMetadata: { price: 0 } },
     { capabilityMetadata: { contextWindow: 0 } },
+    { capabilityMetadata: { cacheRetention: '24h' } },
+    { capabilityMetadata: { cacheRetention: null } },
+    { capabilityMetadata: { cacheRetention: 60 } },
     { classification: 'unknown' },
   ])
     expect(() => validateModelRouteEntry({ ...entry, ...patch })).toThrow('ROUTE_INVALID');
+});
+
+it('accepts only explicit bounded reasoning capability on chat declarations', () => {
+  const route = findFixtureRoute('deepseek-v4.1-flash', 'chat');
+  for (const metadata of [
+    { reasoning: { supported: false } },
+    { reasoning: { supported: true } },
+    { reasoning: { supported: true }, streamIdleTimeoutMs: 120_000 },
+    { reasoning: { supported: true, efforts: ['low', 'high'] }, streamIdleTimeoutMs: 31_000 },
+  ])
+    expect(
+      validateModelRouteEntry({ ...route, capabilityMetadata: metadata }).capabilityMetadata,
+    ).toEqual(metadata);
+  for (const metadata of [
+    { reasoning: null },
+    { reasoning: {} },
+    { reasoning: { supported: 'true' } },
+    { reasoning: { supported: true, defaultEffort: 'low' } },
+    { reasoning: { supported: false, efforts: ['low'] } },
+    { reasoning: { supported: true, efforts: [] } },
+    { reasoning: { supported: true, efforts: ['max'] } },
+    { reasoning: { supported: true, efforts: ['high', 'high'] } },
+    { streamIdleTimeoutMs: 31_000 },
+    { reasoning: { supported: false }, streamIdleTimeoutMs: 31_000 },
+    ...[0, 120_001, '90_000', 12.5].map((streamIdleTimeoutMs) => ({
+      reasoning: { supported: true },
+      streamIdleTimeoutMs,
+    })),
+  ])
+    expect(() => validateModelRouteEntry({ ...route, capabilityMetadata: metadata })).toThrow(
+      'ROUTE_INVALID',
+    );
+  expect(() =>
+    validateModelRouteEntry({
+      ...findFixtureRoute('doubao-seedream-4.5', 'image.generate'),
+      capabilityMetadata: { reasoning: { supported: true } },
+    }),
+  ).toThrow('ROUTE_INVALID');
 });
 
 it('requires an explicit visual chat route for bounded image budgets', () => {
@@ -284,6 +331,7 @@ it('validates explicit image route paramSpec, edit/mask/outpaint gates, and deri
   });
 
   for (const bad of [
+    { ...gptFixture, capabilityMetadata: { cacheRetention: 'long' } },
     // edit without editPath
     { ...gptFixture, editPath: null },
     // edit with 0 maxReferenceImages
@@ -611,6 +659,8 @@ it('validates schema tables, image drivers, and keeps incomplete async routes AD
   });
   const restrictedItem = restrictedView.items.find((i) => i.modelId === 'doubao-seedream-4.5');
   const chatOnlyItem = restrictedView.items.find((i) => i.modelId === 'deepseek-v4.1-flash');
+  expect(restrictedItem).not.toHaveProperty('reasoning');
+  expect(chatOnlyItem?.reasoning).toEqual({ supported: false });
   expect(restrictedItem?.image.parameters).toEqual({
     supportedOperations: ['generate'],
     requiresAsync: false,

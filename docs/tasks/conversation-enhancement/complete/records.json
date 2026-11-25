@@ -1,0 +1,219 @@
+{
+  "version": 5,
+  "prd": "docs/tasks/conversation-enhancement/prd.md",
+  "results": [
+    {
+      "key": "conversation-context-compaction",
+      "title": "长对话上下文计量、工具裁剪与漫剧摘要压缩",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "手动压缩的 HTTP 受理、权限、回执和 SSE 上下文水位"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "复用归属、活动占用与请求幂等的手动压缩入口"
+        },
+        {
+          "path": "src/dsh/conversation-compaction.ts",
+          "purpose": "原生计量、裁剪及同路由有界摘要与检查点"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "同一次模型尝试的正文发布与超窗恢复控制"
+        },
+        {
+          "path": "src/dsh/mixed-session-persistence.ts",
+          "purpose": "旧日志原格式续写与新校验和 zstd 格式"
+        },
+        {
+          "path": "tests/conversations/m3-profile.test.ts",
+          "purpose": "正式打包对话入口、持久观测、历史与重启回归"
+        }
+      ],
+      "outcomes": "SSE 初始和可估算的终态公开脱敏 Token 水位，窗口无依据时返回 null。工具输出先按确定性规则裁剪，原始历史、正式消息和资产 UUID 保持可读。空闲会话的 owner 可按 requestId 手动压缩并查询原回执。自动恢复使用同会话的冻结 BYOK 路由。明确超窗且本次尝试未公开非空正文时，最多一次摘要及一次正文重发，三次实际出站分开记录。本次尝试已公开正文时保留已推送片段，以 MODEL_CONTEXT_OVERFLOW 结算。旧无压缩日志留在原目录续写，新会话使用带校验和的 zstd。",
+      "verification": "候选 50cae853466ff6ffd3734be06c367406fac87689，契约修订 6，11 项证据通过。完整静态及生产构建、43 文件 371 项正式隔离定向、打包烟测和独立审查通过。同候选较早的 30 文件 269 项是补测，直接父项的原件独立保留。pnpm check 覆盖采用主分支成功的全量 CI 基线、合流和当前实际增量。相同五轮历史经 Qwen-Long 实际生成完整摘要并持久化检查点，冷启动后另一次真实正文准确答出仅首轮出现的角色饰物、位置和完整资产 UUID，公开历史压缩及重启前后相同，两次出站分别留回执。先前四次真实截断和一次较短样本的摘要成功保留为各自的原始观察。",
+      "limitations": "摘要硬输出预算取路由输出上限、1024、声明窗口八分之一下取整中的最小值，最低 1 token。普通路由未声明输出上限时使用默认 1024。短摘要长度是软目标，输出截断只保留原历史和既有观察。估算有误差，无法容纳的非替换输入或历史前缀可能无法压缩。真实正向验收覆盖进程内声明 W8192/O1024 的 Qwen-Long 路由。产品超窗、未知、取消及损坏边界由协议替身和隔离数据验证。当前候选远端全量、生产性能及其它供应商容量仍待各自验证。",
+      "acceptance": {
+        "candidate": {
+          "commit": "50cae853466ff6ffd3734be06c367406fac87689",
+          "contractRevision": 6
+        },
+        "statement": "接受并登记 M3",
+        "reference": "当前 Codex 多轮对话进阶会话中，用户在得知 50cae853466ff6ffd3734be06c367406fac87689（契约修订 6）、草稿 6ada6ead-be97-4524-84ec-9f48de5e5093、11 项验收及 Qwen-Long 冷启动真实续聊的验收结果后，明确回复「接受并登记 M3」。"
+      }
+    },
+    {
+      "key": "conversation-lifecycle-and-titles",
+      "title": "会话标题、活跃分页、软归档及 256 KiB 消息",
+      "locations": [
+        {
+          "path": "src/conversations/http.ts",
+          "purpose": "改名、归档与消息长度控制的公开入口"
+        },
+        {
+          "path": "src/conversations/store.ts",
+          "purpose": "所有权、事务、精度分页、归档和活动投影"
+        },
+        {
+          "path": "src/conversations/schema.ts",
+          "purpose": "活动时间、标题和归档字段的兼容增量迁移"
+        },
+        {
+          "path": "src/dsh/conversations.ts",
+          "purpose": "官方标题、持久人类事件和原生会话生命周期"
+        },
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "当前 HTTP、游标和持久边界合同"
+        },
+        {
+          "path": "tests/conversations/conversation-lifecycle.test.ts",
+          "purpose": "打包 Profile 基于真实 PG 和 JSONL 的生命周期、长消息与投影故障验证"
+        }
+      ],
+      "outcomes": "首条真实人类输入落盘后生成确定性标题。手工标题固定，活跃度只由真实人类输入推进。默认活跃倒序保留 PG 微秒游标并接受现有 UUID 页游标。空闲归档幂等，保留历史、旧回执与资产引用，已归档的新写入受阻。消息正文与文本容纳到 256 KiB，控制入口保留 16 KiB。活动投影初次失败时只用同一已持久事件补写一次，模型终态按实际执行结算。",
+      "verification": "当前干净候选静态检查、AST 与构建通过。正式打包 Profile 装载、认证、关闭与端口释放通过。完整对话 21 文件 159 项及跨域 64 文件 697 项通过，含 180 KiB 完整冷读、256 KiB 与 +1 边界、原始控制能力、旧数据迁移、真实 PG 一次/两次投影故障和 BYOK 单次调度。覆盖 pnpm check 的结论来自父提交 4feeb45 的完整 GitHub Actions run 45128875498 和当前候选增量。独立代码、质量与规范审阅均通过。",
+      "limitations": "本机隔离 PostgreSQL 和原生日志为实测环境，模型、OneLink 与 COS 使用替身。当前 SHA 的远端门禁、真实供应商长文本容量和生产迁移及部署未验证。M1 与 M2 保留独立候选，文本合流预演发现四处源码冲突，等待单独集成验证。",
+      "acceptance": {
+        "candidate": {
+          "commit": "07fa5ec93de0e43e37c26bf036e771bd403a6b2e",
+          "contractRevision": 4
+        },
+        "statement": "接受 M2 候选",
+        "reference": "2026-11-23 当前对话已交回 M2 本地候选 07fa5ec93de0e43e37c26bf036e771bd403a6b2e（契约修订 4、5 项证据和草稿 cb969e40-99b6-4f5e-b622-88956212cd00）。用户在该候选的确认题答复「接受 M2 候选」。"
+      }
+    },
+    {
+      "key": "conversation-purpose-and-context-injection",
+      "title": "会话用途模板与受控项目上下文注入",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "创建用途、正常消息入口与公开响应"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "迁移、服务端项目来源、归属及源码部署契约"
+        },
+        {
+          "path": "docs/integrations/dsh.md",
+          "purpose": "固定提示前缀、原生项目上下文、计量与公开投影"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "会话创建与可信 fresh 消息接收"
+        },
+        {
+          "path": "src/conversations/project-context.ts",
+          "purpose": "拥有者和会话两重身份、结构与 UTF-8 字节限制"
+        },
+        {
+          "path": "src/dsh/conversation-context.ts",
+          "purpose": "固定 DSH 会话中的当轮内部项目上下文"
+        },
+        {
+          "path": "tests/conversations/m4-profile.test.ts",
+          "purpose": "打包 Profile 标准消息和冷启动、分页及用量验收"
+        }
+      ],
+      "outcomes": "创建时支持受控 general 和 drama-script，既有通用会话形状与提示词兼容。通过标准消息 HTTP 用拥有者及会话标识在新受理轮次读取最新可选项目数据，校验完整且有界的 JSON，支持未关联及失败后同 ID 重试。模型接收当轮项目数据，同时保持固定提示前缀和 M3 水位计算。公开历史、实时事件、标题和 PG 元数据保持既有投影。已由独立合流带入真实 M3 成果。",
+      "verification": "本地候选 117651aa6a10ea6d3591d0957ebb3029176e1c62，契约修订 3，6 项必需证据通过。全仓 check:static、构建、独立 Profile 烟测和 46 文件 387 项受影响用例通过。标准打包 HTTP、双真实 codec 的协议替身、原始 SIGKILL 中断和冷启动复验均通过。完整 pnpm check 依据公共全量共同基线、M1-M3 和当前代码/成果差异及定向原件人工覆盖。",
+      "limitations": "当前以固定 DSH、隔离 PostgreSQL 和受控协议替身验证。外部业务域 D2 项目源接入、实际供应商生成质量/缓存命中及生产表现有各自验收。原生内部日志适用私有日志访问规则。",
+      "acceptance": {
+        "candidate": {
+          "commit": "117651aa6a10ea6d3591d0957ebb3029176e1c62",
+          "contractRevision": 3
+        },
+        "statement": "接受并登记 M4",
+        "reference": "2026-11-23 当前 Codex 对话中，用户针对本地 M4 候选 117651aa6a10ea6d3591d0957ebb3029176e1c62、契约修订 3 和草稿 b8e9790b-30a1-4192-916f-6ddb7ce165f8 明确答复「接受并登记 M4」。"
+      }
+    },
+    {
+      "key": "conversation-reasoning-and-progress-events",
+      "title": "可控深度思考与实时执行进度",
+      "locations": [
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "会话默认与单轮覆盖、公开 SSE 及回执契约"
+        },
+        {
+          "path": "docs/apis/providers.md",
+          "purpose": "聊天模型目录的推理能力与档位"
+        },
+        {
+          "path": "docs/integrations/onelink.md",
+          "purpose": "两协议的档位映射、空闲期限与用量口径"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "请求归属、幂等、当前快照和冻结档位"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "请求级绑定、受控协议选项和可用推理计数"
+        },
+        {
+          "path": "tests/conversations/conversation-image-tools.test.ts",
+          "purpose": "正式 Profile 的实时进度、图片任务卡片、回执与冷读回归"
+        },
+        {
+          "path": "tests/onelink/m5-runtime.test.ts",
+          "purpose": "固定协议、工具守卫和断流用量回归"
+        }
+      ],
+      "outcomes": "平台聊天路由明确声明推理支持、允许档位和可选延长的连接期限，用户目录公开能力。创建时可确定会话默认，单轮覆盖只作用本轮。未声明档位在接收前明确拒绝，已受理回执按原输入优先重放。正式 SSE 显示上游真实思考增量和授权工具的脱敏执行状态，公开历史继续提供正文、有效图片任务卡片与原有状态。PG 保留上游实际报告的推理计数，包括显式零和提前断流时已取得的项目。",
+      "verification": "候选 ef3b0c73130e4169184bd39b771bd7b92ac3e911，契约修订 3，8 项证据通过。全仓静态与生产构建、48 文件 407 项受影响隔离回归和正式打包 smoke 通过。pnpm check 的覆盖由共同全量 CI 4feeb452、M1 至 M4 增量及本候选实际差分核对得到。真实单轮在同代码修订 2 通过官方打包 Profile 和隔离 mio_dev 实际发出一次 DeepSeek V4.1 Flash high 请求，1024 token 上限，SSE 59 个 reasoning 帧和 6 个正文帧，终态 completed，供应商自报与 PG 均为 155 个 reasoning tokens。修订 3 仅记录旧 Anthropic 取舍，真实原件保持原身份并按同输入人工复核。",
+      "limitations": "旧 Anthropic 预算型路由延续普通聊天。精确档位适用于已验证能在原输出上限正确编码档位的路由。SSE 沿原 64 KiB 单帧、快照队列与待写限制，超限关闭订阅。真实模型仅观察所列 DeepSeek 单轮，其他协议用确定性替身。候选远端全量、生产验证和接续单元各自保留。",
+      "acceptance": {
+        "candidate": {
+          "commit": "ef3b0c73130e4169184bd39b771bd7b92ac3e911",
+          "contractRevision": 3
+        },
+        "statement": "接受并登记 M5",
+        "reference": "2026-11-23 当前 Codex 对话中，交回 M5 本地候选 ef3b0c73130e4169184bd39b771bd7b92ac3e911、契约修订 3 与草稿 55ee7b53-b8d7-4403-ad23-95a1d4112742 后，用户明确回复「接受并登记 M5」。"
+      }
+    },
+    {
+      "key": "conversation-step-reliability-and-cache",
+      "title": "对话步级检查点、前缀缓存与脱敏错误回执",
+      "locations": [
+        {
+          "path": "src/dsh/conversation-checkpoints.ts",
+          "purpose": "正式 DSH 检查点、重复提醒、协作超时和持久工具卡片"
+        },
+        {
+          "path": "src/providers/onelink/router.ts",
+          "purpose": "平台聊天路由缓存元数据校验"
+        },
+        {
+          "path": "src/dsh/onelink.ts",
+          "purpose": "固定协议的请求快照、受控缓存与安全模型观察"
+        },
+        {
+          "path": "src/conversations/service.ts",
+          "purpose": "归属请求的公开结算与实时状态"
+        },
+        {
+          "path": "docs/conversations.md",
+          "purpose": "持久化、恢复、工具和缓存运行边界"
+        },
+        {
+          "path": "docs/apis/conversations.md",
+          "purpose": "对外回执与 SSE 已采用契约"
+        }
+      ],
+      "outcomes": "实现 M1 助手模型出站、顶层工具执行与步间的原生日志检查点，以及持久后发布的图像任务卡片。提供连续同参提醒、图片查看协作期限和路由受控的前缀缓存。GET 回执与 SSE 共用细分脱敏失败码，沿用历史 MODEL_FAILED 和当前用户请求身份。",
+      "verification": "候选 978d72073e63272fea07b7b1b8c5fa462385b49a 的八项必需证据通过。全量静态和构建、隔离定向回归 76 文件 855 测试、独立打包 Profile 烟测成功。完整检查覆盖来自主分支 4feeb452 的全量 CI 基线和当前增量。独立真实验证使用本人开发账号当前 minimax-m3 和进程私有 Anthropic 快照发送一次短缓存标记，HTTP 200、max-tokens，适配观察报告 183 cache-read tokens。",
+      "limitations": "图像任务受理与对话日志落盘分属持久层，互有中断窗口。真实验证使用临时进程内路由，确认一次真实网关兼容，对应 32 token 截断且无文本增量。供应商报告的缓存读数不证明标记因果或跨轮缓存效果。正式 HTTP/SSE 由隔离打包 Profile 验证。受验提交和草稿仅在本地，当前候选没有远端 CI 或发布。",
+      "acceptance": {
+        "candidate": {
+          "commit": "978d72073e63272fea07b7b1b8c5fa462385b49a",
+          "contractRevision": 3
+        },
+        "statement": "接受 M1 候选",
+        "reference": "Codex 多轮对话进阶 PRD 实施会话中，用户对 M1 978d72073e63272fea07b7b1b8c5fa462385b49a 草稿的明确回复。"
+      }
+    }
+  ]
+}

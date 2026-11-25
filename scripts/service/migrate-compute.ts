@@ -13,7 +13,7 @@ try {
     try {
       await client.query('BEGIN');
       await client.query(computeSchemaSQL);
-      await checkComputeSchema(client);
+      await checkComputeSchema(client, true);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');

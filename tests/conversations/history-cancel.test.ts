@@ -45,6 +45,7 @@ it('cancels only the disconnected history HTTP request and drains it before clos
   const engine: ConversationEngine = {
     available: true,
     create: async () => {},
+    rename: async (_id, title) => title,
     run: async () => 'completed',
     cancel: vi.fn(async () => {}),
     close: vi.fn(async () => {}),

@@ -1,3 +1,5 @@
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -8,12 +10,20 @@ import { Pool } from 'pg';
 import sharp from 'sharp';
 import { imageOutputKey } from '../../src/generations/contracts.ts';
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import type { Conversation, HistoryPage } from '../../src/conversations/contracts.ts';
 import {
   makeChatRouteFixture,
   importRoutesViaCli,
 } from '../providers/fixtures/onelink-routes-fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { packedAuthRuntime } from '../support/auth-runtime.ts';
+import {
+  kernelRuntime,
+  modelOptions,
+  ScriptedModel,
+  textResponse,
+} from '../support/kernel-runtime.ts';
+import { readSessionArtifact } from '../support/session-artifact.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let runtime: Awaited<ReturnType<typeof packedAuthRuntime>>;
@@ -93,14 +103,17 @@ beforeAll(async () => {
     expect(result.status, result.stdout + result.stderr).toBe(0);
   }
   const route = makeChatRouteFixture('deepseek-v4.1-flash', 'deepseek');
-  await importRoutesViaCli(env, {
-    ...route,
-    capabilityMetadata: {
-      ...route.capabilityMetadata,
-      inputModalities: ['text', 'image'],
-      maxRequestImages: 1,
+  await importRoutesViaCli(env, [
+    {
+      ...route,
+      capabilityMetadata: {
+        ...route.capabilityMetadata,
+        inputModalities: ['text', 'image'],
+        maxRequestImages: 1,
+      },
     },
-  });
+    makeChatRouteFixture('deepseek-v4-flash', 'deepseek'),
+  ]);
   runtime = await packedAuthRuntime(database.url, '', 'unused', {
     conversations: true,
     visionCosOrigin: `http://127.0.0.1:${address.port}`,
@@ -266,6 +279,55 @@ it('accepts owned original and derived sources and rejects unauthorized, unready
   expect((await runtime.onelinkRequests()).length).toBe(baseline);
 }, 30000);
 
+it('rejects text-only switching on retained images and allows it on a pre-image fork', async () => {
+  const source = await call('/api/v1/conversations', 'POST', {});
+  expect(source.status, await source.clone().text()).toBe(201);
+  const { id: sourceId, modelRef } = (await source.json()) as Conversation;
+  const sourcePath = `/api/v1/conversations/${sourceId}`;
+  const assetId = [...objects.keys()][0]!.split('/')[2]!;
+  const requestsBefore = (await runtime.onelinkRequests()).length;
+  const send = async (path: string, requestId: string, text: string, imageAssetIds?: string[]) => {
+    const accepted = await call(`${path}/messages`, 'POST', { requestId, text, imageAssetIds });
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    await expect
+      .poll(async () => {
+        const receipt = await call(`${path}/requests/${requestId}`);
+        return ((await receipt.json()) as { status: string }).status;
+      })
+      .toBe('completed');
+  };
+  await send(sourcePath, 'text', 'text before image');
+  const history = await call(`${sourcePath}/history`);
+  expect(history.status).toBe(200);
+  const cutoff = ((await history.json()) as HistoryPage).items.find(
+    ({ role }) => role === 'status',
+  )!.seq;
+  await send(sourcePath, 'image', 'image after cutoff', [assetId]);
+  const textModel = { modelRef: 'onelink:chat:deepseek-v4-flash' };
+  const rejected = await call(`${sourcePath}/model`, 'PUT', textModel);
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toMatchObject({ error: { code: 'MODEL_MODALITY_UNSUPPORTED' } });
+  const sourceSelection = await call(`${sourcePath}/model`, 'PUT', { modelRef });
+  expect(await sourceSelection.json()).toMatchObject({ modelRef });
+
+  const branched = await call(`${sourcePath}/forks`, 'POST', {
+    requestId: 'before-image',
+    turnEndSeq: cutoff,
+  });
+  expect(branched.status, await branched.clone().text()).toBe(201);
+  const { id: childId } = (await branched.json()) as Conversation;
+  const childPath = `/api/v1/conversations/${childId}`;
+  const selected = await call(`${childPath}/model`, 'PUT', textModel);
+  expect(selected.status, await selected.clone().text()).toBe(200);
+  expect(await runtime.onelinkRequests()).toHaveLength(requestsBefore + 2);
+  await send(childPath, 'text-only', 'branch without the later image');
+  const wires = await runtime.onelinkRequests();
+  expect(wires).toHaveLength(requestsBefore + 3);
+  expect(wires.at(-1)?.body.model).toBe('deepseek-v4-flash');
+  expect(JSON.stringify(wires.at(-1)?.body.messages)).toContain('text before image');
+  expect(JSON.stringify(wires.at(-1)?.body.messages)).not.toContain('image after cutoff');
+});
+
 it('drains an offloaded turn, cancels blocked cold history on shutdown and reads it after restart', async () => {
   const ids = [...objects.keys()].map((key) => key.split('/')[2]!);
   const baseline = (await runtime.onelinkRequests()).length;
@@ -300,12 +362,13 @@ it('drains an offloaded turn, cancels blocked cold history on shutdown and reads
     status: string;
   };
   const debugHistory = await (await call(`/api/v1/conversations/${id}/history?limit=100`)).json();
-  const files = await readdir(runtime.nativeLogRoot, { recursive: true, withFileTypes: true });
+  const files = await readdir(runtime.nativeLogRoots[1], { recursive: true, withFileTypes: true });
   const logs = await Promise.all(
     files
-      .filter((entry) => entry.isFile())
-      .map((entry) => readFile(join(entry.parentPath, entry.name), 'utf8')),
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl.zstd'))
+      .map((entry) => readSessionArtifact(join(entry.parentPath, entry.name))),
   );
+  expect(logs.length).toBeGreaterThan(0);
   const persisted = logs.join('\n');
   expect(persisted).toContain('"type":"image/offload"');
   expect(persisted).not.toContain('synthetic-profile-key');
@@ -351,3 +414,74 @@ it('drains an offloaded turn, cancels blocked cold history on shutdown and reads
   expect(replayed).toContain(ids[0]);
   expect(replayed).toContain(ids[1]);
 }, 30000);
+
+it('restarts the packed Profile, reads a pre-existing legacy session, and appends to its raw log', async () => {
+  const created = await call('/api/v1/conversations', 'POST', {});
+  expect(created.status, await created.clone().text()).toBe(201);
+  const { id } = (await created.json()) as { id: string };
+  const legacyId = SessionId(randomUUID());
+
+  // Seed a real pre-upgrade artifact through the old SDK composition, using
+  // only this regression Profile's home and database fixture.
+  await runtime.stop();
+  const old = await kernelRuntime(
+    runtime.nativeLogRoots[0],
+    new ScriptedModel([textResponse('legacy-profile-response')]),
+  );
+  let legacyPath: string;
+  try {
+    const handle = await old.mioKernel.create(legacyId, modelOptions);
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'legacy-profile-input' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    await old.mioKernel.flush(handle.agent.session);
+    const artifact = (await old.sessionPersistence.stat(legacyId))?.location;
+    if (artifact?.kind !== 'jsonl') throw new Error('Missing legacy fixture artifact');
+    legacyPath = artifact.path;
+    await old.mioKernel.close();
+  } finally {
+    await old.fiber.dispose();
+  }
+  const original = await readFile(legacyPath);
+  const stored = await observer.query(
+    'UPDATE mio_conversations SET dsh_session_id=$1 WHERE id=$2 AND owner_id=$3',
+    [legacyId, id, ownerId],
+  );
+  expect(stored.rowCount).toBe(1);
+  await runtime.start('database');
+
+  const initialCalls = (await runtime.onelinkRequests()).length;
+  const before = await call(`/api/v1/conversations/${id}/history?limit=100`);
+  expect(before.status).toBe(200);
+  expect(await before.text()).toContain('legacy-profile-response');
+  expect((await readFile(legacyPath)).equals(original)).toBe(true);
+  expect((await runtime.onelinkRequests()).length).toBe(initialCalls);
+
+  const next = await call(`/api/v1/conversations/${id}/messages`, 'POST', {
+    requestId: 'legacy-continuation',
+    text: 'Continue the previous legacy conversation',
+  });
+  expect(next.status, await next.clone().text()).toBe(202);
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (
+            await call(`/api/v1/conversations/${id}/requests/legacy-continuation`)
+          ).json()) as { status: string }
+        ).status,
+    )
+    .toBe('completed');
+  const calls = await runtime.onelinkRequests();
+  expect(calls).toHaveLength(initialCalls + 1);
+  expect(JSON.stringify(calls.at(-1)?.body)).toContain('legacy-profile-response');
+  const continued = await readFile(legacyPath);
+  expect(continued.subarray(0, original.length).equals(original)).toBe(true);
+  expect(continued.subarray(original.length).toString('utf8')).toContain(
+    'previous legacy conversation',
+  );
+});

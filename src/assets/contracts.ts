@@ -11,11 +11,14 @@ export interface AssetPrincipal {
 }
 
 export interface AssetObjectStore {
-  uploadUrl(key: string, size: number): string;
+  uploadUrl(key: string, size: number, acl?: 'private'): string;
   downloadUrl(key: string): string;
+  audioPlaybackUrl?(key: string, contentType: string): string;
+  hlsSegmentUrl?(key: string, expiresIn: number): string;
   materialUrl?(key: string): string;
   head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  readMedia?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   putImage?(
     key: string,
     bytes: Uint8Array,
@@ -30,7 +33,20 @@ export interface AssetObjectStore {
     sha256: string,
     signal: AbortSignal,
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
-  copy(source: string, target: string, etag: string): Promise<void>;
+  readAudio?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  putAudio?(
+    key: string,
+    bytes: Uint8Array,
+    format: string,
+    sha256: string,
+    signal: AbortSignal,
+  ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
+  ensureAudioPrivate?(
+    key: string,
+    expected: { sizeBytes: number; etag: string; sha256?: string },
+    signal: AbortSignal,
+  ): Promise<void>;
+  copy(source: string, target: string, etag: string, acl?: 'private'): Promise<void>;
   delete(key: string): Promise<void>;
 }
 

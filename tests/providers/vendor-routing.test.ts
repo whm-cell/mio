@@ -19,6 +19,7 @@ import type { GenerationObjects } from '../../src/generations/execution.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { createConversationService } from '../../src/conversations/service.ts';
 import { createConversationStore } from '../../src/conversations/store.ts';
+import { installConversationTitles } from '../../src/dsh/conversation-titles.ts';
 import { createDshConversationEngine } from '../../src/dsh/conversations.ts';
 import type { ProviderConfig } from '../../src/providers/config.ts';
 import type { ModelRouteInput, ProviderPrincipal } from '../../src/providers/contracts.ts';
@@ -386,7 +387,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
             driver: 'openai-chat',
             classification: 'chat',
             submitPath: '/v1/chat/completions',
-            capabilityMetadata: { maxOutputTokens: 2048 },
+            capabilityMetadata: { maxOutputTokens: 2048, cacheRetention: 'long' },
             sourceKind: 'protocol-reference',
             source: 'unit1-acceptance-scenario-4',
             sourceVersion: 'v1',
@@ -497,6 +498,9 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         });
 
         try {
+          await ctx.inject(['sessions', 'sessionProjections', 'agents'], async (titleCtx) => {
+            await installConversationTitles(titleCtx);
+          });
           await providerService.save(actor, 0, 'sk-zero-ts-key-12345');
           const afterSave = (await providerService.get(actor))!;
           await providerService.settings(actor, afterSave.revision, {
@@ -506,6 +510,10 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
           const catalog = await providerService.catalog(actor);
           const chatModel = catalog.items.find((i) => i.modelId === 's-chat-custom-2048')!;
           const imageModel = catalog.items.find((i) => i.modelId === 'WL-Next-Seedream-X')!;
+          const selection = await providerService.selectChat(actor, chatModel.modelRef);
+          const snapshot = await providerService.resolveChat(actor, selection);
+          expect(snapshot.cacheRetention).toBe('long');
+          expect(Object.isFrozen(snapshot)).toBe(true);
 
           const created = await convService.create(actor, chatModel.modelRef);
           const chatReqId = randomUUID();
@@ -515,10 +523,18 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
               'completed',
             );
           });
+          const conversations = await convService.list(actor, undefined, 20);
+          expect(conversations.items).toContainEqual(
+            expect.objectContaining({ id: created.id, title: 'ping' }),
+          );
+          expect(chatOutbound).toHaveLength(1);
           expect(chatOutbound[0]).toMatchObject({
             model: 's-chat-custom-2048',
             max_tokens: 2048,
           });
+          expect(JSON.stringify(chatOutbound[0])).not.toMatch(
+            /"(?:prompt_cache_(?:key|retention)|cache_control)":/,
+          );
 
           const postRes = await realFetch(`${httpOrigin}/api/v1/compute/images`, {
             method: 'POST',

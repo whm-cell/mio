@@ -32,6 +32,9 @@ vi.mock('../../src/integrations/cos.ts', () => ({
     async putImage() {
       throw new Error('unexpected generation');
     },
+    async readMedia() {
+      throw new Error('unexpected manifest while the broker is offline');
+    },
     async copy(source: string, target: string, etag: string) {
       const bytes = cloud.bytes.get(source);
       if (!bytes || `staging-${createHash('sha256').update(bytes).digest('hex')}` !== etag)
@@ -239,4 +242,28 @@ it('accepts authenticated jobs and keeps the outbox while the broker is offline'
   ).rows[0]!;
   expect(persisted.input_etag).toBe(`raw-${createHash('sha256').update(bytes).digest('hex')}`);
   expect(persisted.sent_at).toBeNull();
+
+  const mediaRequest = {
+    requestId: randomUUID(),
+    operation: 'media.probe',
+    inputs: [{ assetId: upload.assetId }],
+    parameters: {},
+  };
+  expect((await call('/api/v1/compute/media', mediaRequest, '')).status).toBe(401);
+  const mediaResponse = await call('/api/v1/compute/media', mediaRequest);
+  expect(mediaResponse.status, await mediaResponse.clone().text()).toBe(202);
+  const media = (await mediaResponse.json()) as { jobId: string; status: string };
+  expect(media).toMatchObject({ status: 'accepted', profile: 'standard-media', outputs: [] });
+  expect((await call(`/api/v1/compute/media/${media.jobId}`, undefined, otherCookie)).status).toBe(
+    404,
+  );
+  expect(
+    (
+      await observer.query<{ etag: string; sent_at: Date | null }>(
+        `SELECT j.inputs->0->>'etag' AS etag,o.sent_at
+       FROM mio_media_jobs j JOIN mio_media_outbox o ON o.job_id=j.id WHERE j.id=$1`,
+        [media.jobId],
+      )
+    ).rows[0],
+  ).toEqual({ etag: persisted.input_etag, sent_at: null });
 });

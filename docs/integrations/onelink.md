@@ -2,7 +2,9 @@
 
 ## 适用范围与接入事实
 
-实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)、[供应商原厂逻辑路由模块](../../src/providers/onelink/router.ts)、[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)以及 A [原厂图片驱动目录](../../src/integrations/onelink/router.ts)。OpenAI Images（`openai-images`）、Volcengine Ark（`volcengine-ark-images`）、Vidu（`vidu-images`）与 Kling（`kling-images`）图片能力均复用同一用户的 OneLink 凭据，首次提交持久冻结已加密凭据快照及版本，实际调用才解密；异步查询使用原任务用户的当前 Key。图片生成与恢复由 A 的 PG 执行记录和专属持久目录承接，不经过 RabbitMQ 或 B；B 不持有 OneLink Key 或图片 RSA 私钥。由单轨数据库路由表 `mio_provider_model_routes` 将用户当前动态目录中已发现的精确 `raw_model_id` 映射到纯原厂协议驱动；W1/W2 文本仍独立于图片和 COS 现场条件。OneLink 文档示例中的 `viduq2`、`kling-v3` 仅作协议参考，不据此生成或改写目录成员；已实证的模型观察见[图片能力成果](../tasks/onelink-image-generation/complete/report.md)，路由架构与待实测模型边界见[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，未执行真实闭环的型号保持 `unverified`，不能外推已验证结论。视频、语音、音乐及向量执行器仍未装配。范围见[万联 PRD](../tasks/onelink-integration/prd.md)、[万联图片 PRD](../tasks/onelink-image-generation/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)。公开[模型目录文档](https://docs.onelinkai.cloud/8882392m0)、[Seedream 接入说明](https://docs.onelinkai.cloud/8655248m0)、[Vidu 系列接入说明](https://docs.onelinkai.cloud/8653257m0)、[Kling 系列接入说明](https://docs.onelinkai.cloud/8653497m0)与[文本接入说明](https://docs.onelinkai.cloud/8882610m0)只作协议、字段和映射参考，不建立成员清单；成员与数量仍只取当前用户 Key 成功 GET `/v1/models`。旧源码身份仅在[测试参考](../../tests/providers/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
+实际消费者为[用户万联配置](../providers.md)、[目录客户端](../../src/integrations/onelink/models.ts)、[供应商原厂逻辑路由模块](../../src/providers/onelink/router.ts)、[文本传输](../../src/integrations/onelink/chat.ts)/[DSH 适配](../../src/dsh/onelink.ts)以及 A [原厂图片驱动目录](../../src/integrations/onelink/router.ts)。OpenAI Images（`openai-images`）、Volcengine Ark（`volcengine-ark-images`）、Vidu（`vidu-images`）与 Kling（`kling-images`）图片能力均复用同一用户的 OneLink 凭据，首次提交持久冻结已加密凭据快照及版本，实际调用才解密；异步查询使用原任务用户的当前 Key。图片生成与恢复由 A 的 PG 执行记录和专属持久目录承接，不经过 RabbitMQ 或 B；B 不持有 OneLink Key 或图片 RSA 私钥。由单轨数据库路由表 `mio_provider_model_routes` 将用户当前动态目录中已发现的精确 `raw_model_id` 映射到纯原厂协议驱动；W1/W2 文本仍独立于图片和 COS 现场条件。OneLink 文档示例中的 `viduq2`、`kling-v3` 仅作协议参考，不据此生成或改写目录成员；已实证的模型观察见[图片能力成果](../tasks/onelink-image-generation/complete/report.md)，路由架构与待实测模型边界见[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，未执行真实闭环的型号保持 `unverified`，不能外推已验证结论。视频、音乐及向量执行器仍未装配。范围见[万联 PRD](../tasks/onelink-integration/prd.md)、[万联图片 PRD](../tasks/onelink-image-generation/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)。公开[模型目录文档](https://docs.onelinkai.cloud/8882392m0)、[Seedream 接入说明](https://docs.onelinkai.cloud/8655248m0)、[Vidu 系列接入说明](https://docs.onelinkai.cloud/8653257m0)、[Kling 系列接入说明](https://docs.onelinkai.cloud/8653497m0)与[文本接入说明](https://docs.onelinkai.cloud/8882610m0)只作协议、字段和映射参考，不建立成员清单；成员与数量仍只取当前用户 Key 成功 GET `/v1/models`。旧源码身份仅在[测试参考](../../tests/providers/fixtures/onelink-legacy-snapshot.ts)保存，不参与生产或构建。
+
+音频域已装配 MiniMax 标准配音驱动 `minimax-tts` 与授权样本复刻驱动 `minimax-clone`。真实 OneLink 网关可用性按账号、精确模型和操作核验。[音频 API](../apis/audio.md)
 
 ## 必须遵守的约束
 
@@ -20,11 +22,23 @@
 
 ## 使用经验与适用条件
 
-聊天只允许固定 origin 下经路由校验的相对提交路径：`openai-chat` 要求以 `/v1/` 开头且以 `/chat/completions` 结尾（默认 `/v1/chat/completions`），`anthropic-messages` 固定为 `/v1/messages`（兼容固定 Anthropic SDK 精确的 `?beta=true` 查询），不放行 `..`、`//` 或其他路径/查询。两协议统一 Bearer，SDK x-api-key 被移除，无 ambient/native credential 回退。重定向为 error；SDK及Mio自动 retry 均为0，Anthropic strict-tool 自动降级重发也关闭。鉴权、端点、并发快照不通过共享环境变量切换。正常响应保留公开 PiAi 编码语义；非2xx错误体在进入SDK前替换为固定诊断，观察只取白名单status/requestId/usage/finish/failureCode，不透传原响应/异常。已知HTTP 401/403、408/504、429分别映射鉴权、超时、限流，其他失败不猜测额度或可用性。取消/超时和观察持久化失败分别记录实际状态。
+聊天只允许固定 origin 下经路由校验的相对提交路径：`openai-chat` 要求以 `/v1/` 开头且以 `/chat/completions` 结尾（默认 `/v1/chat/completions`），`anthropic-messages` 固定为 `/v1/messages`（兼容固定 Anthropic SDK 精确的 `?beta=true` 查询），不放行 `..`、`//` 或其他路径/查询。两协议统一 Bearer，SDK x-api-key 被移除，无 ambient/native credential 回退。重定向为 error。SDK 通用重试和 Anthropic strict-tool 自动降级重发均关闭。鉴权、端点、并发快照不通过共享环境变量切换。正常响应保留公开 PiAi 编码语义。
+
+固定 `@earendil-works/pi-ai@1.5.0` 按冻结的聊天路由发送缓存策略。`anthropic-messages` 默认用 `short` 在公开 SDK 允许的断点发 `cache_control: {type:'ephemeral'}`，`long` 额外请求 `ttl:'1h'`，`none` 不发送缓存标记。`openai-chat` 依赖上游自动前缀缓存，省略 `prompt_cache_key`、`prompt_cache_retention` 与 SDK 会话关联头。实际缓存可用性和读写量由供应商响应确认。
+
+选中已声明的推理档位时，`openai-chat` 编码 `reasoning_effort`。声明 `vendor: 'deepseek'` 的该协议路由使用固定 SDK 的 DeepSeek 兼容项，额外编码 `thinking.type: 'enabled'` 并保留工具衔接所需的 `reasoning_content`。`anthropic-messages` 当前的可选档位对应支持自适应推理的模型，编码 `thinking.type: 'adaptive'` 和 `output_config.effort`，输出上限沿原路由；仅支持旧版预算的模型可声明推理支持并省略可选档位。未选档的普通请求和辅助摘要都沿原协议参数与上游默认。本地目录和 SDK 协议编码结果不能代替端点的实际档位证据。
+
+固定 SDK 的公开响应观察钩子读取上游明确报告的 `completion_tokens_details.reasoning_tokens`（Chat Completions）或 `output_tokens_details.thinking_tokens`（Messages）。合法值按原计数进入 `model_observations.usage.reasoningTokens`，显式零也保留。字段缺失时省略，输出用量沿 SDK 原值，已经包含的思考 token 不另行累加。提前结束流时，已报告的推理用量可作为 `partial` 观察独立保存。
+
+HTTP 401/403、402、408/504、429 分别分类为鉴权、额度、超时、限流，其他 5xx 是上游失败。400/413/422 响应仅在 1 秒内取得不超过 8 KiB 的完整错误体时识别白名单上下文超限诊断。成功 HTTP 响应里的已知流终止诊断也可识别上下文超限。其他拒绝保持一般失败。非 2xx 响应进入 SDK 前替换为固定诊断，观察只保存白名单 HTTP 状态、供应商请求 ID、用量、终止原因和失败分类。原响应和异常详情不会透传。取消、超时和观察持久化失败分别按实际状态记录。[公开回执错误码](../apis/conversations.md#get-apiv1conversationsidrequestsrequestid)
+
+M3 在声明了上下文窗口的路由上使用同一请求冻结的账号、模型、路径、凭据和取消信号调用漫剧摘要。摘要请求只携带文本。模型返回的正式摘要写入会话日志，隐藏思考和未完成摘要丢弃。检查点同时保留成功图片工具调用中已验证的参考图、蒙版、任务或检查对象 UUID。每轮最多发一次摘要调用。适配器明确归类为 `CONTEXT_OVERFLOW` 时，该次尝试尚未发布非空正文且有用摘要已持久化，才可重发一次当前正文步骤。若该次尝试已发布正文，保留已发流式片段并以 `MODEL_CONTEXT_OVERFLOW` 结算。原始会话日志保留失败尝试，公开历史按既有消息规则投影。此前步骤的正文、该次尝试的隐藏思考和空文本增量不影响恢复。普通限流、上游故障、超时和 SDK 根据体积推测的超窗均无计费重发。单条新消息的估算已达到窗口容量时，仍由供应商判定正常正文请求结果，该轮无摘要调用或自动重发。手动压缩使用本次授权会话的冻结路由和凭据。实际发出的调用按顺序追加到同一请求的 `model_observations`，摘要带 `purpose: compaction`。省略用量时按实际标记未知，记录不携带摘要提示词或上游错误原文。
 
 明确声明视觉输入的 chat 路由沿相同固定端点与认证，通过公开 PiAi 编码向 OpenAI 或 Anthropic 协议发送有界图片预览。预算预检和旧图卸载发生在供应商 transport 启动之前；本地失败或卸载重试不登记虚假的上游调用观察。测试替身的线级成功不等于真实视觉模型已验证，现有 chat verified 也不区分文字与图片。
 
-Mio 文本输出上限按路由/适配 `maxOutputTokens`（合法范围 `1..65536`，未配置时默认 `1024`）及 30 秒 HTTP/idle 本地政策执行，未知 supplier context/最大输出不从 SDK 默认大容量推导。普通 check 使用协议替身；独立 conversations-live 经正式用户入口执行真实文本，失败记录实际白名单观察。各协议保留确定性回归，真实验证目标与开发安排沿[万联 PRD](../tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，实际接受范围与限制见对应成果入口。一个目标通过不证明其他目标，未发现或无对应成功观察的目标仍未验证。
+Mio 文本输出上限按路由/适配 `maxOutputTokens`（合法范围 `1..65536`，未配置时默认 `1024`）执行，未知 supplier context/最大输出不从 SDK 默认大容量推导。普通路由的 HTTP 请求期限和 SDK 流式空闲期限均为 30 秒。明确支持推理的路由可声明最长 120 秒的 `streamIdleTimeoutMs`，并同时用于 HTTP 请求期限和流式空闲期限。普通 check 使用协议替身；独立 conversations-live 经正式用户入口执行真实文本，失败记录实际白名单观察。各协议保留确定性回归，真实验证目标与开发安排沿[万联 PRD](../tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，实际接受范围与限制见对应成果入口。一个目标通过不证明其他目标，未发现或无对应成功观察的目标仍未验证。
+
+已实现的 MiniMax 配音与复刻沿[语音路由声明](../providers.md#音频操作和音色登记)固定相对路径。接收任务时冻结精确模型、参数、音色及加密凭据并持久化提交意图。配音发送 JSON，复刻发送 multipart，复刻样本须有当次授权和本人资产校验。HTTP 成功仍需解析业务状态和输出；只有确认的供应商结果才写实测验证。提交结果未知时保留原任务；已收到的输出沿本地检查点继续发布。音色浏览与刷新查询本人本地库。[音频 API](../apis/audio.md)
 
 旧地址归一化允许其他 host 原样通过，不能作为允许列表复用；旧 TLS 补链、回退和重试没有作为当前必需能力搬入。旧预设及其冲突仅是迁移参考。其余非文本协议路径、错误和生成重试在后续真实消费者出现时另行采纳，不从目录成功推导 Messages、图片、MiniMax 或素材线路可用。
 

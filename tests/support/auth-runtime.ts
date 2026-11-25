@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
+import type { ConversationProjectContextResolver } from '../../src/conversations/project-context.ts';
 
 function runCheckedCommand(bin: string, args: string[]): void {
   const result = spawnSync(bin, args, { encoding: 'utf8', timeout: 60000 });
@@ -140,7 +141,7 @@ export async function packedAuthRuntime(
   };
   return {
     origin,
-    nativeLogRoot: join(home, 'sessions'),
+    nativeLogRoots: [join(home, 'sessions'), join(home, 'sessions-zstd')] as const,
     async blockVisionHistory() {
       await writeFile(join(directory, 'model-fixture/block-history'), 'block');
     },
@@ -177,6 +178,14 @@ export async function packedAuthRuntime(
     },
     async setOnelinkCatalog(ids: string[]) {
       await writeFile(join(directory, 'model-fixture/catalog.json'), JSON.stringify(ids));
+    },
+    async setConversationProjectContext(
+      association: Awaited<ReturnType<ConversationProjectContextResolver>>,
+    ) {
+      await writeFile(
+        join(directory, 'model-fixture/project-context.json'),
+        JSON.stringify(association),
+      );
     },
     async onelinkRequests(): Promise<
       { authorization: string | null; path: string; body: Record<string, unknown> }[]

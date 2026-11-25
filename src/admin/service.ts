@@ -13,18 +13,26 @@ import { probeRedisMetrics } from '../integrations/redis.ts';
 import { hashAdminPassword, verifyAdminPassword } from '../auth/admin-password.ts';
 import type { AuthRuntimePolicy } from '../auth/config.ts';
 import type { ProviderConfig } from '../providers/config.ts';
-import { CHAT_PROFILES, ProviderError, categories } from '../providers/contracts.ts';
+import {
+  CHAT_PROFILES,
+  ProviderError,
+  categories,
+  isProviderOperation,
+} from '../providers/contracts.ts';
 import type { Category, PlatformRouteRecord } from '../providers/contracts.ts';
 import {
   serializeRouteInputSnapshot,
   validateModelRouteEntry,
 } from '../providers/onelink/router.ts';
+import { AUDIO_ROUTES } from '../providers/onelink/audio.ts';
+import { VOICE_DRIVER } from '../providers/onelink/voices.ts';
 import type { ProviderService } from '../providers/service.ts';
 import { AdminError, SMS_BYPASS_CODE_PATTERN, isAuthSmsMode } from './contracts.ts';
 import type {
   AdminAccountView,
   AdminAuthRuntimeDefaults,
   AdminCatalogSummary,
+  AdminAudioRouteView,
   AdminDiscoveryCandidateItem,
   AdminGlobalSettingsView,
   AdminModelCatalogItem,
@@ -824,10 +832,29 @@ export function createAdminService(
       const chatRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       const imageRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       const videoRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
+      const audioRoutes = new Map<string, AdminAudioRouteView[]>();
       for (const route of raw.routeRows) {
         if (route.operation === 'chat') chatRoutes.set(route.raw_model_id, route);
         else if (route.operation === 'image.generate') imageRoutes.set(route.raw_model_id, route);
         else if (route.operation === 'video.generate') videoRoutes.set(route.raw_model_id, route);
+        else {
+          const stats = statsMap.get(route.raw_model_id);
+          const verifiedUserCount = {
+            'audio.voices.list': stats?.verified_voice_users ?? 0,
+            'audio.tts': stats?.verified_tts_users ?? 0,
+            'audio.clone': stats?.verified_clone_users ?? 0,
+          }[route.operation];
+          const entries = audioRoutes.get(route.raw_model_id) ?? [];
+          entries.push({
+            operation: route.operation,
+            route: serializeRouteInputSnapshot(route),
+            enabled: route.enabled,
+            declarationVersion: route.declaration_version,
+            verifiedUserCount,
+            updatedAt: route.updated_at.toISOString(),
+          });
+          audioRoutes.set(route.raw_model_id, entries);
+        }
       }
 
       const allItems: AdminModelCatalogItem[] = [...raw.catalogRows]
@@ -841,12 +868,13 @@ export function createAdminService(
           const chat = chatRoutes.get(rawModelId);
           const image = imageRoutes.get(rawModelId);
           const video = videoRoutes.get(rawModelId);
+          const voice = audioRoutes.get(rawModelId) ?? [];
           const category: Category | null =
             cat.category ??
             video?.classification ??
             image?.classification ??
             chat?.classification ??
-            null;
+            (voice.length ? 'voice' : null);
           const supplierMeta =
             Object.keys(cat.supplier_metadata ?? {}).length > 0
               ? cat.supplier_metadata
@@ -866,6 +894,7 @@ export function createAdminService(
             userVerifiedChatCount: stats?.verified_chat_users ?? 0,
             userVerifiedImageCount: stats?.verified_image_users ?? 0,
             userVerifiedVideoCount: stats?.verified_video_users ?? 0,
+            audioRoutes: voice.sort((a, b) => a.operation.localeCompare(b.operation)),
             policy: {
               userVisible: cat.user_visible,
               allowUndiscovered: cat.allow_undiscovered,
@@ -909,32 +938,35 @@ export function createAdminService(
           };
         });
 
+      const routes = (item: AdminModelCatalogItem) =>
+        [...item.audioRoutes, item.chatRouteMeta, item.imageRouteMeta, item.videoRouteMeta].filter(
+          (route) => route !== null,
+        );
+      const routeStates = new Map(
+        allItems.map((item) => {
+          const configured = routes(item);
+          return [
+            item.rawModelId,
+            configured.length === 0
+              ? 'pending'
+              : configured.some((route) => route.enabled)
+                ? 'enabled'
+                : 'disabled',
+          ];
+        }),
+      );
       const summary: AdminCatalogSummary = {
         totalModels: allItems.length,
         benchmarkModels: allItems.filter(
           (item) => item.inLatestProbe || item.userDiscoveredCount > 0,
         ).length,
-        configuredEnabled: allItems.filter(
-          (item) =>
-            Boolean(item.chatRouteMeta?.enabled) ||
-            Boolean(item.imageRouteMeta?.enabled) ||
-            Boolean(item.videoRouteMeta?.enabled),
-        ).length,
+        configuredEnabled: allItems.filter((item) => routeStates.get(item.rawModelId) === 'enabled')
+          .length,
         configuredDisabled: allItems.filter(
-          (item) =>
-            !item.chatRouteMeta?.enabled &&
-            !item.imageRouteMeta?.enabled &&
-            !item.videoRouteMeta?.enabled &&
-            (item.chatRouteMeta !== null ||
-              item.imageRouteMeta !== null ||
-              item.videoRouteMeta !== null),
+          (item) => routeStates.get(item.rawModelId) === 'disabled',
         ).length,
-        pendingRoutes: allItems.filter(
-          (item) =>
-            item.chatRouteMeta === null &&
-            item.imageRouteMeta === null &&
-            item.videoRouteMeta === null,
-        ).length,
+        pendingRoutes: allItems.filter((item) => routeStates.get(item.rawModelId) === 'pending')
+          .length,
         hiddenFromUsers: allItems.filter((item) => !item.policy.userVisible).length,
         curatedUndiscovered: allItems.filter((item) => item.policy.allowUndiscovered).length,
       };
@@ -942,19 +974,7 @@ export function createAdminService(
       const keyword = filters.q?.trim().toLowerCase() ?? '';
       const filtered = allItems.filter((item) => {
         if (filters.category && item.category !== filters.category) return false;
-        if (filters.status) {
-          const hasEnabled =
-            Boolean(item.chatRouteMeta?.enabled) ||
-            Boolean(item.imageRouteMeta?.enabled) ||
-            Boolean(item.videoRouteMeta?.enabled);
-          const hasAny =
-            item.chatRouteMeta !== null ||
-            item.imageRouteMeta !== null ||
-            item.videoRouteMeta !== null;
-          if (filters.status === 'enabled' && !hasEnabled) return false;
-          if (filters.status === 'disabled' && (!hasAny || hasEnabled)) return false;
-          if (filters.status === 'pending' && hasAny) return false;
-        }
+        if (filters.status && routeStates.get(item.rawModelId) !== filters.status) return false;
         if (filters.visibility === 'visible' && !item.policy.userVisible) return false;
         if (filters.visibility === 'hidden' && item.policy.userVisible) return false;
         if (filters.visibility === 'curated' && !item.policy.allowUndiscovered) return false;
@@ -1019,12 +1039,7 @@ export function createAdminService(
       input: { rawModelId?: unknown; operation?: unknown; summary?: unknown },
     ) {
       assertOpen();
-      if (
-        !isValidRawModelId(input.rawModelId) ||
-        (input.operation !== 'chat' &&
-          input.operation !== 'image.generate' &&
-          input.operation !== 'video.generate')
-      ) {
+      if (!isValidRawModelId(input.rawModelId) || !isProviderOperation(input.operation)) {
         throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
       }
       const summary = parseOptionalBoundedString(input.summary, 500) ?? null;
@@ -1092,6 +1107,7 @@ export function createAdminService(
           chat: [...CHAT_PROFILES],
           image: [...IMAGE_DRIVERS],
           video: [...VIDEO_DRIVERS],
+          audio: [VOICE_DRIVER, AUDIO_ROUTES.tts.driver, AUDIO_ROUTES.clone.driver],
         },
         categories: [...categories],
         items,

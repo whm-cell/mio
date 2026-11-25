@@ -1,12 +1,15 @@
+import { createProviderAudioService } from './audio.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { utcISOString } from '@mio/foundation/time';
 import { createHash } from 'node:crypto';
 import type { VideoCapabilitiesView } from '../generations/video-contracts.ts';
-import { ProviderError, categories } from './contracts.ts';
+import { ProviderError, categories, supportsChatReasoning } from './contracts.ts';
 import type {
   Category,
   Discovery,
   ProviderPrincipal,
+  ProviderOperation,
+  ChatReasoningEffort,
   ChatSelection,
   ChatRuntimeSnapshot,
   ImageAdmissionSnapshot,
@@ -161,6 +164,30 @@ export function createProviderService(
     });
     return { row, selection, adaptation };
   };
+  const boundChatState = async (actor: ProviderPrincipal, selected: ChatSelection) => {
+    const state = await chatState(actor, selected.modelRef);
+    const { selection } = state;
+    if (
+      selection.providerConfigId !== selected.providerConfigId ||
+      selection.modelId !== selected.modelId ||
+      (selected.modelKey !== undefined && selected.modelKey !== selection.modelKey)
+    )
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
+    return state;
+  };
+  const selectChatRoute = async (
+    actor: ProviderPrincipal,
+    modelRef?: string,
+    reasoningEffort?: ChatReasoningEffort,
+  ) => {
+    const { selection, adaptation } = await chatState(actor, modelRef);
+    if (
+      reasoningEffort !== undefined &&
+      !supportsChatReasoning(adaptation.capabilityMetadata.reasoning, reasoningEffort)
+    )
+      throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_REASONING_UNSUPPORTED');
+    return { selection, inputModalities: adaptation.inputModalities };
+  };
   const discover = async (actor: ProviderPrincipal): Promise<Discovery> => {
     const row = await store.beginRefresh(actor.userId);
     const result: Discovery = {
@@ -214,7 +241,9 @@ export function createProviderService(
       throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_DISABLED');
     return { row, model: model!, adaptation };
   };
+  const audio = createProviderAudioService(store, config, assertOpen);
   return {
+    ...audio,
     sealMaterialAuth(
       ownerId: string,
       sessionId: string,
@@ -350,7 +379,7 @@ export function createProviderService(
       const models = [];
       for (const model of row.models) {
         if (
-          membershipError(row, model, whitelist, catalogByRawId) !== null ||
+          membershipError(row, model, whitelist, true, catalogByRawId) !== null ||
           disabledKeys.has(model.model_key)
         )
           continue;
@@ -384,25 +413,36 @@ export function createProviderService(
       }
       return models;
     },
-    async selectChat(actor: ProviderPrincipal, modelRef?: string): Promise<ChatSelection> {
-      return (await chatState(actor, modelRef)).selection;
+    async selectChat(
+      actor: ProviderPrincipal,
+      modelRef?: string,
+      reasoningEffort?: ChatReasoningEffort,
+    ): Promise<ChatSelection> {
+      return (await selectChatRoute(actor, modelRef, reasoningEffort)).selection;
+    },
+    selectChatRoute,
+    async chatContextWindow(
+      actor: ProviderPrincipal,
+      selected: ChatSelection,
+    ): Promise<number | null> {
+      const { adaptation } = await boundChatState(actor, selected);
+      return adaptation.contextWindow ?? null;
     },
     async resolveChat(
       actor: ProviderPrincipal,
       selected: ChatSelection,
     ): Promise<ChatRuntimeSnapshot> {
-      const { row, selection, adaptation } = await chatState(actor, selected.modelRef);
-      if (
-        selection.providerConfigId !== selected.providerConfigId ||
-        selection.modelId !== selected.modelId ||
-        (selected.modelKey !== undefined && selected.modelKey !== selection.modelKey)
-      )
-        throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
+      const { row, selection, adaptation } = await boundChatState(actor, selected);
       const apiKey = decryptCredential(
         row,
         { ownerId: actor.userId, providerId: row.id, credentialVersion: row.credential_version },
         config,
       );
+      const { cacheRetention, reasoning, streamIdleTimeoutMs } = adaptation.capabilityMetadata;
+      const frozenReasoning =
+        reasoning?.supported && reasoning.efforts
+          ? Object.freeze({ ...reasoning, efforts: Object.freeze([...reasoning.efforts]) })
+          : reasoning && Object.freeze({ ...reasoning });
       return Object.freeze({
         ...selection,
         modelKey: selection.modelKey!,
@@ -419,6 +459,9 @@ export function createProviderService(
         inputModalities: Object.freeze([...adaptation.inputModalities]),
         imageBudget: Object.freeze({ ...adaptation.imageBudget }),
         ...(adaptation.contextWindow ? { contextWindow: adaptation.contextWindow } : {}),
+        ...(cacheRetention !== undefined ? { cacheRetention } : {}),
+        ...(frozenReasoning !== undefined ? { reasoning: frozenReasoning } : {}),
+        ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
         apiKey,
       });
     },
@@ -434,11 +477,7 @@ export function createProviderService(
       assertOpen();
       return store.importRoutes(input, actor);
     },
-    deleteRoutes(
-      rawModelId: string,
-      actor: RouteRevisionActor,
-      operation?: 'chat' | 'image.generate' | 'video.generate',
-    ) {
+    deleteRoutes(rawModelId: string, actor: RouteRevisionActor, operation?: ProviderOperation) {
       assertOpen();
       return store.deleteRoutes(rawModelId, actor, operation);
     },
@@ -493,7 +532,7 @@ export function createProviderService(
       if (!closing) {
         cancellation.abort();
         closing = (async () => {
-          await Promise.allSettled([...active]);
+          await Promise.allSettled([...active, audio.voices.close()]);
           await store.close();
         })();
       }

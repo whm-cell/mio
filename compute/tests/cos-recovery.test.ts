@@ -205,3 +205,94 @@ it('rejects an ETag or streamed digest mismatch before returning a probe file', 
   );
   expect(() => readFileSync(probePath(root, messageId))).toThrow();
 });
+
+it('sets private ACL and immutable checksums on both media outputs and the manifest PUT', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mio-media-put-'));
+  directories.push(root);
+  const attemptId = randomUUID();
+  const { MediaFiles } = await import('../src/adapters/media-files.ts');
+  const files = new MediaFiles(root, attemptId);
+  const putObject = vi.fn(async (options: Record<string, unknown>) => {
+    let length = 0;
+    for await (const chunk of options.Body as Readable) length += (chunk as Buffer).length;
+    expect(length).toBe(options.ContentLength);
+    return {};
+  });
+  const store = await createObjectStore(
+    putObject,
+    async () => ({}),
+    () => Readable.from([]),
+  );
+  const signal = AbortSignal.timeout(5000);
+  for (const [name, mime] of [
+    ['audio.wav', 'audio/wav'],
+    ['manifest.json', 'application/json'],
+  ]) {
+    const body = Buffer.from(name!);
+    await files.write(name!, body);
+    const hash = createHash('sha256').update(body).digest('hex');
+    const key = `mio/media/${randomUUID()}/${attemptId}/${name}`;
+    await store.uploadMedia(key, files, name!, { size: body.length, sha256: hash }, mime!, signal);
+    expect(putObject).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        Key: key,
+        ACL: 'private',
+        ContentLength: body.length,
+        ContentType: mime,
+        'x-cos-meta-sha256': hash,
+        Headers: {
+          'x-cos-forbid-overwrite': 'true',
+          'Content-MD5': createHash('md5').update(body).digest('base64'),
+        },
+      }),
+    );
+  }
+  expect(putObject).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  [412, undefined, 'INPUT_CHANGED'],
+  [408, undefined, 'STORAGE_FAILURE'],
+  [429, undefined, 'STORAGE_FAILURE'],
+  [503, undefined, 'STORAGE_FAILURE'],
+  [undefined, 'ECONNRESET', 'STORAGE_FAILURE'],
+  [403, undefined, 'MEDIA_OBJECT_RESPONSE'],
+  [404, undefined, 'MEDIA_OBJECT_RESPONSE'],
+] as const)(
+  'classifies a conditional media GET failure %s / %s as %s',
+  async (statusCode, code, expected) => {
+    const getObject = vi.fn((_options: unknown, callback: (error: object) => void) =>
+      setImmediate(() => callback({ statusCode, code })),
+    );
+    vi.doMock('cos-nodejs-sdk-v5', () => ({
+      default: class {
+        getObject = getObject;
+      },
+    }));
+    const { ObjectStore } = await import('../src/adapters/cos.ts');
+    const { MediaFiles } = await import('../src/adapters/media-files.ts');
+    const root = mkdtempSync(join(tmpdir(), 'mio-media-get-'));
+    directories.push(root);
+    const store = new ObjectStore({
+      bucket: 'test',
+      region: 'test',
+      secretId: 'id',
+      secretKey: 'key',
+    });
+    const assetId = randomUUID(),
+      key = `mio/raw/${assetId}/${randomUUID()}`;
+    await expect(
+      store.downloadMedia(
+        { assetId, key, sizeBytes: 1, etag: '"frozen"' },
+        new MediaFiles(root, randomUUID()),
+        'input-0',
+        AbortSignal.timeout(5000),
+      ),
+    ).rejects.toThrow(expected);
+    expect(getObject).toHaveBeenCalledOnce();
+    expect(getObject).toHaveBeenCalledWith(
+      expect.objectContaining({ Key: key, IfMatch: '"frozen"' }),
+      expect.any(Function),
+    );
+  },
+);

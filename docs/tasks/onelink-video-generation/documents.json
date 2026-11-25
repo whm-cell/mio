@@ -2,14 +2,19 @@
   "version": 1,
   "documents": [
     {
-      "identity": "docs/tasks/onelink-video-generation/prd.md",
-      "kind": "prd",
-      "path": "docs/tasks/onelink-video-generation/prd.md"
-    },
-    {
       "identity": "docs/tasks/onelink-video-generation/design.md",
       "kind": "design",
       "path": "docs/tasks/onelink-video-generation/design.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-video-generation/design-v1-implementation.md",
+      "kind": "design",
+      "path": "docs/tasks/onelink-video-generation/design-v1-implementation.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-video-generation/prd.md",
+      "kind": "prd",
+      "path": "docs/tasks/onelink-video-generation/prd.md"
     }
   ]
 }

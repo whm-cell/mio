@@ -1,6 +1,6 @@
 # 计算服务 RabbitMQ 部署
 
-当前 RabbitMQ 拓扑服务 A 与 B 之间的视频转码。A 接受视频任务并发出命令，B 执行转码并发送结果。
+RabbitMQ 连接 A 和 B 的视频转码、独立音频检测、通用媒体处理及 Worker 控制协议。
 
 开发和人工测试的常驻实例使用[环境入口](../../docs/local-environments.md)统一管理，公共权限和持久化边界见 [RabbitMQ 契约](../../docs/integrations/rabbitmq.md)。下列独立 Compose 和一次性 bootstrap 仍用于独占部署及隔离探针，不替代开发/测试环境，也不自动接管其数据。
 
@@ -33,14 +33,14 @@ node scripts/service/prepare-compute-broker.ts "$RABBITMQ_ENV_FILE" .runtime/com
 
 输出目录必须是 `.runtime` 下尚不存在的目录。准备和观测脚本按 Node dotenv 规则读取同一份环境文件。默认从 `RABBITMQ_MANAGEMENT_PORT` 推导 `http://127.0.0.1:<port>`，也兼容显式 `RABBITMQ_MANAGEMENT_URL`。管理地址须使用 HTTP 和 `127.0.0.1`，省略用户信息、路径、查询和片段。
 
-准备脚本先验证 `stream_queue` feature flag 和原 vhost 中能匹配 quorum 队列的 1 GiB operator policy，发现同名当前拓扑资源时停止。脚本记录计划，将随机 A/B 凭据写入 0600 文件，再在业务 vhost 和两个独立测试 vhost 中各建立四条持久 quorum 队列。
+准备脚本先验证 `stream_queue` feature flag 和原 vhost 中能匹配 quorum 队列的 1 GiB operator policy，发现同名当前拓扑资源时停止。脚本记录计划，将随机 A/B 凭据写入 0600 文件，再在业务 vhost 和两个独立测试 vhost 中建立共享拓扑，包括以下既有视频队列及音频、媒体和 Worker 队列。
 
 - 视频命令队列 `mio.compute.commands.v1` 与对应死信队列 `mio.compute.commands.dlq.v1`
 - 视频结果队列 `mio.compute.results.v1` 与对应死信队列 `mio.compute.results.dlq.v1`
 
-交换机和 routing key 见[计算协议](../../docs/tasks/compute-service/protocol.md#路由回执与状态)。源队列配置 `dead-letter-strategy=at-least-once`，四条队列均设置 `overflow=reject-publish` 和 `delivery-limit=-1`。初始化完成前逐队列核对实际匹配的 `mio-capacity` 及合并生效的 1 GiB 消息体上限和 `reject-publish`。出现策略冲突或网络请求结果未知时，查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源后再决定如何恢复。重试须保留已有业务队列和消息。
+交换机和 routing key 见[计算协议](../../docs/tasks/compute-service/protocol.md#路由回执与状态)。源队列配置 `dead-letter-strategy=at-least-once`，quorum 队列设置 `overflow=reject-publish` 和 `delivery-limit=-1`。初始化前可通过 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 指定实例控制队列；指定多个 ID 时同时用 `MIO_COMPUTE_INSTANCE_ID` 选定本次生成 B 凭据对应的实例。部署者为其他实例单独发放各自精确 ACL。初始化完成前逐 quorum 队列核对 `mio-capacity` 及生效的 1 GiB 上限和 `reject-publish`，另核对音频结果 stream 的独立保留策略。出现策略冲突或网络请求结果未知时，查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源后再决定如何恢复。重试须保留已有业务队列和消息。
 
-`runtime-a.env` 和 `runtime-b.env` 提供业务 vhost 的不同账户配置。`worker-test-a.env` 与 `worker-test-b.env` 指向 Worker 测试 vhost，`probe-a.env` 与 `probe-b.env` 指向环境探针 vhost。各文件提供 `RABBITMQ_URL`、`MIO_COMPUTE_BROKER_USER` 和对应的 `MIO_COMPUTE_EXPECTED_RESULT_USER` 或 `MIO_COMPUTE_EXPECTED_COMMAND_USER`。A 启用转码时还需设置 `MIO_COMPUTE_ENABLED=true`。A 仅写命令交换机、读结果队列，B 仅写结果交换机、读视频命令队列。两者均无管理或 impersonator 标签，也没有 configure 权限。运行时不声明拓扑。消息发布方设置自身 `userId`，消费者核对预期身份。
+`runtime-a.env` 和 `runtime-b.env` 提供业务 vhost 的不同账户配置。`worker-test-a.env` 与 `worker-test-b.env` 指向 Worker 测试 vhost，`probe-a.env` 与 `probe-b.env` 指向环境探针 vhost。各文件提供 `RABBITMQ_URL`、`MIO_COMPUTE_BROKER_USER` 和对应的 `MIO_COMPUTE_EXPECTED_RESULT_USER` 或 `MIO_COMPUTE_EXPECTED_COMMAND_USER`。A 启用转码时还需设置 `MIO_COMPUTE_ENABLED=true`。A 仅写命令交换机、读指定结果队列；B 仅写结果交换机，读取共享命令队列和自身实例的控制队列。两者均无管理或 impersonator 标签，也没有 configure 权限。运行时不声明拓扑。消息发布方设置自身 `userId`，消费者核对预期身份。
 
 云端图片生成及恢复在 A 执行。若旧部署仍有 `mio.compute.image.commands.v1`、图片 DLX/DLQ 或 B 的旧图片权限，依[图片生成切换步骤](../../docs/local-environments.md#图片生成迁移与切换)核对旧 PG/outbox、消息、消费者、B journal 与未确认上传，确认排空后显式退役图片资源并收缩权限。初始化不会自动退役旧拓扑，历史任务和恢复原件须保留。
 

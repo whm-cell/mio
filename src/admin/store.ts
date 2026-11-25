@@ -11,6 +11,7 @@ import type {
   PlatformCatalogModelRecord,
   PlatformModelOriginSource,
   PlatformRouteRecord,
+  ProviderOperation,
   PlatformRouteRevisionRecord,
 } from '../providers/contracts.ts';
 import { checkProviderSchema } from '../providers/schema.ts';
@@ -64,7 +65,7 @@ interface RouteTemplateRow {
   template_key: string;
   label: string;
   description: string;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   vendor: string;
   driver: string;
   route_template: Record<string, unknown>;
@@ -685,6 +686,9 @@ export class AdminStore {
         verified_chat_users: number;
         verified_image_users: number;
         verified_video_users: number;
+        verified_voice_users: number;
+        verified_tts_users: number;
+        verified_clone_users: number;
         sample_metadata: Record<string, unknown> | null;
       }>(
         `SELECT
@@ -714,6 +718,9 @@ export class AdminStore {
               AND r_video.declaration_version = v.declaration_version
               AND c.catalog_credential_version = c.credential_version
              THEN c.id END)::int AS verified_video_users,
+           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.voices.list')::int AS verified_voice_users,
+           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.tts')::int AS verified_tts_users,
+           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.clone')::int AS verified_clone_users,
            (ARRAY_AGG(m.supplier_metadata ORDER BY m.last_seen_at DESC NULLS LAST)
              FILTER (WHERE m.metadata_source = 'onelink-v1-models'))[1] AS sample_metadata
          FROM mio_provider_models m
@@ -735,6 +742,21 @@ export class AdminStore {
           AND r_video.raw_model_id = m.raw_model_id COLLATE "C"
           AND r_video.operation = 'video.generate'
           AND r_video.enabled = true
+         LEFT JOIN mio_provider_model_routes r_audio
+           ON r_audio.provider_type = c.provider_type
+          AND r_audio.raw_model_id = m.raw_model_id COLLATE "C"
+          AND r_audio.operation = v.operation
+          AND r_audio.operation IN ('audio.voices.list','audio.tts','audio.clone')
+          AND r_audio.enabled = true
+         CROSS JOIN LATERAL (SELECT
+           v.verification_status='verified' AND r_audio.declaration_version=v.declaration_version
+           AND r_audio.driver=v.driver AND c.catalog_credential_version=c.credential_version
+           AND v.tested_tuple->>'credentialVersion'=c.credential_version::text
+           AND v.tested_tuple->>'catalogVersion'=c.catalog_version::text
+           AND v.tested_tuple->>'adaptationVersion'=r_audio.declaration_version::text
+           AND v.tested_tuple->>'operation'=v.operation
+           AND v.tested_tuple->>'profile'=v.driver AS valid
+         ) current_audio
          WHERE m.raw_model_id IS NOT NULL
          GROUP BY m.raw_model_id`,
       ),
@@ -1085,7 +1107,7 @@ export class AdminStore {
       templateKey: string;
       label: string;
       description: string;
-      operation: 'chat' | 'image.generate' | 'video.generate';
+      operation: ProviderOperation;
       vendor: string;
       driver: string;
       routeTemplate: Record<string, unknown>;
@@ -1142,7 +1164,7 @@ export class AdminStore {
       templateKey: string;
       label: string;
       description: string;
-      operation: 'chat' | 'image.generate' | 'video.generate';
+      operation: ProviderOperation;
       vendor: string;
       driver: string;
       routeTemplate: Record<string, unknown>;

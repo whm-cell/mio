@@ -1,4 +1,11 @@
 import type { Pool } from 'pg';
+import { audioSchemaSQL, checkAudioSchema } from '../audio/jobs/schema.ts';
+import { voiceSchemaSQL, checkVoiceSchema } from '../audio/voices/schema.ts';
+import {
+  checkProviderOperations,
+  providerOperationCheck,
+  upgradeProviderOperationSQL,
+} from './operation-schema.ts';
 import { legacyProviderUpgradeSQL } from './schema-migration.ts';
 export { providerReferencesSQL } from './schema-migration.ts';
 
@@ -68,7 +75,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_routes (
   raw_model_id text COLLATE "C" NOT NULL
     CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   vendor text NOT NULL
     CHECK (char_length(vendor) BETWEEN 1 AND 64 AND vendor ~ '^[a-z0-9-]+$'),
   driver text NOT NULL
@@ -138,13 +145,6 @@ BEGIN
       EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', target_table, rec.conname);
     END LOOP;
   END LOOP;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_routes'::regclass
-      AND conname='mio_provider_model_routes_operation_v1_check'
-  ) THEN
-    ALTER TABLE mio_provider_model_routes ADD CONSTRAINT mio_provider_model_routes_operation_v1_check
-      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
-  END IF;
   FOR rec IN
     SELECT conname FROM pg_constraint
     WHERE conrelid='mio_provider_model_routes'::regclass AND contype='c'
@@ -230,7 +230,6 @@ BEGIN
     SELECT conname FROM pg_constraint
     WHERE conrelid='mio_provider_model_routes'::regclass AND contype='c'
       AND NOT convalidated AND conname IN (
-        'mio_provider_model_routes_operation_v1_check',
         'mio_provider_model_routes_submit_path_safe_check',
         'mio_provider_model_routes_video_route_check'
       )
@@ -242,7 +241,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
   provider_id uuid NOT NULL,
   model_key uuid NOT NULL,
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   declaration_version integer NOT NULL
     CHECK (declaration_version > 0),
   driver text NOT NULL
@@ -255,6 +254,8 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
   PRIMARY KEY (provider_id, model_key, operation),
   FOREIGN KEY (provider_id, model_key) REFERENCES mio_provider_models(provider_id, model_key)
 );
+${upgradeProviderOperationSQL('mio_provider_model_routes')}
+${upgradeProviderOperationSQL('mio_provider_model_verifications')}
 ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin;
 DO $$ BEGIN
   IF NOT EXISTS (
@@ -340,7 +341,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
   raw_model_id text COLLATE "C" NOT NULL
     CHECK (octet_length(raw_model_id) BETWEEN 1 AND 256 AND raw_model_id !~ '[[:cntrl:]]'),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   declaration_version integer NOT NULL
     CHECK (declaration_version >= 1),
   action text NOT NULL
@@ -361,6 +362,7 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
     OR (action <> 'delete' AND after_route IS NOT NULL AND jsonb_typeof(after_route) = 'object')
   )
 );
+${upgradeProviderOperationSQL('mio_provider_model_route_revisions')}
 ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
 DO $$
 DECLARE
@@ -381,32 +383,20 @@ BEGIN
       EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', target_table, rec.conname);
     END LOOP;
   END LOOP;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_verifications'::regclass
-      AND conname='mio_provider_model_verifications_operation_v1_check'
-  ) THEN
-    ALTER TABLE mio_provider_model_verifications ADD CONSTRAINT mio_provider_model_verifications_operation_v1_check
-      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_model_route_revisions'::regclass
-      AND conname='mio_provider_model_route_revisions_operation_v1_check'
-  ) THEN
-    ALTER TABLE mio_provider_model_route_revisions ADD CONSTRAINT mio_provider_model_route_revisions_operation_v1_check
-      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
-  END IF;
   FOR rec IN
-    SELECT conrelid::regclass AS table_name, conname FROM pg_constraint
+    SELECT conname FROM pg_constraint
     WHERE conrelid IN (
+      'mio_provider_model_routes'::regclass,
       'mio_provider_model_verifications'::regclass,
       'mio_provider_model_route_revisions'::regclass
-    ) AND contype='c' AND NOT convalidated
+    ) AND contype='c'
       AND conname IN (
+        'mio_provider_model_routes_operation_v1_check',
         'mio_provider_model_verifications_operation_v1_check',
         'mio_provider_model_route_revisions_operation_v1_check'
       )
   LOOP
-    EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', rec.table_name, rec.conname);
+    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', rec.conrelid::regclass, rec.conname);
   END LOOP;
   FOR rec IN
     SELECT conname FROM pg_constraint
@@ -448,6 +438,8 @@ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_lookup
   ON mio_provider_model_route_revisions (provider_type, raw_model_id, operation, created_at DESC);
+${voiceSchemaSQL}
+${audioSchemaSQL}
 `;
 
 export async function checkProviderSchema(
@@ -455,6 +447,13 @@ export async function checkProviderSchema(
   _images = false,
 ): Promise<void> {
   void _images;
+  await checkProviderOperations(pool, [
+    'mio_provider_model_routes',
+    'mio_provider_model_verifications',
+    'mio_provider_model_route_revisions',
+  ]);
+  await checkVoiceSchema(pool);
+  await checkAudioSchema(pool);
   for (const [sql, types] of [
     [
       'SELECT id,credential_version,catalog_version,catalog_credential_version,catalog_succeeded_at,latest_refresh_seq,last_attempt_seq,last_attempt_credential_version,last_attempt_started_at,last_attempt_finished_at,last_attempt_status,last_attempt_error_code,credential_auth_state FROM mio_provider_configs LIMIT 0',
@@ -515,30 +514,16 @@ export async function checkProviderSchema(
     FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid
     WHERE con.conrelid IN ('mio_provider_model_routes'::regclass, 'mio_provider_model_verifications'::regclass, 'mio_provider_model_route_revisions'::regclass)
     AND con.conname IN (
-      'mio_provider_model_routes_operation_v1_check',
       'mio_provider_model_routes_submit_path_safe_check',
-      'mio_provider_model_routes_video_route_check',
-      'mio_provider_model_verifications_operation_v1_check',
-      'mio_provider_model_route_revisions_operation_v1_check'
+      'mio_provider_model_routes_video_route_check'
     )`);
   for (const [table, name, marker] of [
-    ['mio_provider_model_routes', 'mio_provider_model_routes_operation_v1_check', 'video.generate'],
     [
       'mio_provider_model_routes',
       'mio_provider_model_routes_submit_path_safe_check',
       'predictLongRunning',
     ],
     ['mio_provider_model_routes', 'mio_provider_model_routes_video_route_check', 'kling-videos'],
-    [
-      'mio_provider_model_verifications',
-      'mio_provider_model_verifications_operation_v1_check',
-      'video.generate',
-    ],
-    [
-      'mio_provider_model_route_revisions',
-      'mio_provider_model_route_revisions_operation_v1_check',
-      'video.generate',
-    ],
   ] as const) {
     const constraint = routeConstraints.rows.find((item) => item.name === name);
     if (
@@ -553,6 +538,10 @@ export async function checkProviderSchema(
     ['mio_provider_model_verifications', ['provider_id', 'model_key', 'operation']],
     ['mio_provider_catalog_models', ['provider_type', 'raw_model_id']],
     ['mio_provider_model_route_revisions', ['id']],
+    ['mio_provider_voice_catalogs', ['provider_id']],
+    ['mio_provider_voices', ['id']],
+    ['mio_audio_jobs', ['id']],
+    ['mio_audio_records', ['id']],
   ] as const) {
     const pk = await pool.query<{
       unique: boolean;

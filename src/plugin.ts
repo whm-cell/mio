@@ -28,10 +28,15 @@ import { createConversationStore } from './conversations/store.ts';
 import { createConversationService } from './conversations/service.ts';
 import type { ConversationService } from './conversations/service.ts';
 import type { ConversationImageTools, ConversationVideoTools } from './conversations/contracts.ts';
+import type { ConversationProjectContextResolver } from './conversations/project-context.ts';
 import { createConversationHandler } from './conversations/http.ts';
 import { createDshConversationEngine } from './dsh/conversations.ts';
+import { applyConversationPolicies } from './dsh/conversation-checkpoints.ts';
+import { installConversationTitles } from './dsh/conversation-titles.ts';
 import { createConversationVision } from './dsh/vision.ts';
 import * as imageOffload from '@deepseek-ai/dsh-compaction-image-offload';
+import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner';
+import TokenMeter from '@deepseek-ai/dsh-token-meter';
 import { readProviderConfig } from './providers/config.ts';
 import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
@@ -40,13 +45,34 @@ import { createProviderHandler } from './providers/http.ts';
 import { AssetError } from './assets/contracts.ts';
 import { readAssetConfig } from './assets/config.ts';
 import { createAssetStore } from './assets/store.ts';
+import type { AssetStore } from './assets/store.ts';
+import type { AssetObjectStore } from './assets/contracts.ts';
+import { createAudioHandler } from './audio/http.ts';
+import { createAudioJobService } from './audio/jobs/service.ts';
+import type { AudioJobService } from './audio/jobs/service.ts';
+import { createAudioMediaClient } from './audio/media.ts';
 import { createAssetService } from './assets/service.ts';
+import { startAssetDerivatives } from './assets/derivatives.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
 import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
+import { createMediaHandler } from './compute/media-http.ts';
+import { createMediaService } from './compute/media-service.ts';
+import { createMediaStore } from './compute/media-store.ts';
+import { createComputeOpsHandler } from './compute/ops-http.ts';
+import {
+  openWorkerObservabilityPool,
+  WorkerObservabilityStore,
+} from './compute/worker-observability-store.ts';
+import { WorkerObservabilityQueries } from './compute/worker-observability-queries.ts';
+import {
+  startWorkerObservability,
+  WorkerControlStore,
+} from './compute/worker-observability-control.ts';
+import { ComputeBroker } from './integrations/rabbitmq.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
 import { createMaterialStore } from './materials/store.ts';
@@ -72,10 +98,21 @@ import { readAdminConfig } from './admin/config.ts';
 import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
 import type { AdminService } from './admin/service.ts';
-import { createAdminHandler } from './admin/http.ts';
+import { createAdminHandler, readAdminSessionCookie } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    mioConversationProjectContext: ConversationProjectContextResolver;
+  }
+}
+
+class ConversationTokenMeter extends TokenMeter {
+  // The parent retains sessionProjections until its conversation work drains.
+  static override inject = [];
+}
 
 const AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
@@ -184,6 +221,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
+    let audio: AudioJobService | undefined;
+    let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
     const verifyAvatarAsset = async (
       identity: { userId: string; sessionId: string },
@@ -203,9 +243,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     };
     const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
     if (assetConfig) {
-      const store = await createAssetStore(assetConfig.databaseURL);
+      const store = await createAssetStore(assetConfig.databaseURL, Boolean(computeConfig));
       try {
-        const acquired = (assets = createAssetService(store, createCosStorage(assetConfig)));
+        const objects = createCosStorage(assetConfig);
+        assetResources = { store, objects };
+        const acquired = (assets = createAssetService(store, objects));
         vision = createConversationVision((owner, id, expected, signal) =>
           acquired.readVisionSource(owner, id, expected, signal),
         );
@@ -214,6 +256,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             closeMioResources(
               () => conversations?.close(),
               () => materials?.close(),
+              () => audio?.close(),
+              () => derivatives?.close(),
               () => acquired.close(),
             ),
         );
@@ -260,6 +304,83 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
+    if (computeConfig && assetConfig && assetResources) {
+      const store = await createMediaStore(assetConfig.databaseURL);
+      let media: ReturnType<typeof createMediaService> | undefined;
+      try {
+        const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
+        derivatives = startAssetDerivatives(assetResources.store, acquired);
+        ctx.effect(() => () => {
+          const scheduler = derivatives?.close();
+          return closeMioResources(
+            () => acquired.close(),
+            () => scheduler,
+          );
+        });
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/media',
+            handler: createMediaHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        const scheduler = derivatives?.close();
+        await closeMioResources(
+          () => (media ? media.close() : store.close()),
+          () => scheduler,
+        );
+        throw error;
+      }
+    }
+    let computeOps:
+      | {
+          view: WorkerObservabilityQueries;
+          control: WorkerControlStore;
+          wake: () => void;
+        }
+      | undefined;
+    if (computeConfig?.workerInstances?.length && assetConfig) {
+      const pool = await openWorkerObservabilityPool(assetConfig.databaseURL);
+      let telemetry: ReturnType<typeof startWorkerObservability> | undefined;
+      try {
+        const instances = computeConfig.workerInstances;
+        const observations = new WorkerObservabilityStore(pool, instances);
+        const control = adminConfig ? new WorkerControlStore(pool, instances) : undefined;
+        const ownedTelemetry = (telemetry = startWorkerObservability(
+          (stop) =>
+            ComputeBroker.connect(
+              computeConfig.brokerURL,
+              computeConfig.brokerUser,
+              computeConfig.expectedResultUser,
+              stop,
+              computeConfig.workerUsers,
+            ),
+          observations,
+          control,
+        ));
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => ownedTelemetry.close(),
+              () => pool.end(),
+            ),
+        );
+        if (adminConfig && control) {
+          computeOps = {
+            view: new WorkerObservabilityQueries(pool, instances),
+            control,
+            wake: ownedTelemetry.wake,
+          };
+        }
+      } catch (error) {
+        await closeMioResources(
+          () => telemetry?.close(),
+          () => pool.end(),
+        );
+        throw error;
+      }
+    }
     if (providerConfig) {
       const store = await createProviderStore(providerConfig, imageEnabled);
       providers = createProviderService(
@@ -270,6 +391,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       );
       const ownedProviders = providers;
       try {
+        if (computeConfig && assetResources) {
+          audio = createAudioJobService(
+            ownedProviders.audioStore,
+            ownedProviders,
+            assetResources.objects,
+            createAudioMediaClient(computeConfig),
+            assetResources.store,
+          );
+        }
+        const ownedAudio = audio;
         // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
         ctx.effect(
           () => () =>
@@ -279,6 +410,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => videoGenerations?.close(),
               () => generations?.close(),
               () => materials?.close(),
+              () => ownedAudio?.close(),
               () => ownedProviders.close(),
             ),
         );
@@ -289,8 +421,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             handler: createProviderHandler(ownedProviders, auth.identity, authConfig.origins),
           }),
         );
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/audio',
+            handler: createAudioHandler(
+              ownedProviders,
+              auth.identity,
+              authConfig.origins,
+              ownedAudio,
+            ),
+          }),
+        );
       } catch (error) {
-        await ownedProviders.close();
+        await closeMioResources(
+          () => audio?.close(),
+          () => ownedProviders.close(),
+        );
         throw error;
       }
     }
@@ -316,11 +463,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               },
             ));
         ctx.effect(() => () => acquired.close());
+        const computeHandler = computeOps
+          ? createComputeOpsHandler(
+              computeOps.view,
+              computeOps.control,
+              async (headers) => {
+                const principal = await acquired.authenticate(
+                  readAdminSessionCookie(headers.get('cookie')),
+                );
+                return principal
+                  ? {
+                      id: principal.admin.id,
+                      username: principal.admin.username,
+                      sessionId: principal.sessionId,
+                    }
+                  : null;
+              },
+              adminConfig.allowedOrigins,
+              computeOps.wake,
+            )
+          : undefined;
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/admin',
-            handler: createAdminHandler(acquired, adminConfig.allowedOrigins),
+            handler: createAdminHandler(acquired, adminConfig.allowedOrigins, computeHandler),
           }),
         );
       } catch (error) {
@@ -481,21 +648,39 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (!ctx.get('mioKernel')) throw new Error('CONVERSATION_CONFIG: DSH kernel required');
       await ctx.plugin({
         name: 'mio-conversations',
-        inject: ['mioKernel', 'llm', 'webServer', 'agents', 'sessions', 'systemPrompt'],
+        inject: [
+          'mioKernel',
+          'llm',
+          'webServer',
+          'agents',
+          'sessions',
+          'sessionProjections',
+          'systemPrompt',
+        ],
         async apply(conversationCtx: Context) {
+          const audioTools = conversationConfig.byok ? audio : undefined;
           let acquired: ConversationService | undefined;
           let http: ReturnType<typeof createConversationHandler> | undefined;
           // Keep the plugin on the parent's retained service scope. A child with its
           // own required injections may otherwise unload when those services begin
           // shutting down, before the parent has drained history and active turns.
-          const offload = conversationCtx.plugin({
-            name: imageOffload.name,
-            apply: imageOffload.apply,
+          const policies = conversationCtx.plugin({
+            name: 'mio-conversation-policies',
+            async apply(policyCtx: Context) {
+              applyConversationPolicies(policyCtx);
+              imageOffload.apply(policyCtx);
+              await Promise.all([
+                policyCtx.plugin(ConversationTokenMeter),
+                policyCtx.plugin(ToolResultPruner),
+              ]);
+            },
           });
-          // Cordis unloads sibling effects concurrently. Collect the plugin disposer and
-          // conversation drain in one effect so the projection outlives every agent.
+          const titles = installConversationTitles(conversationCtx);
+          // Cordis unloads sibling effects concurrently. Adopt both disposers so
+          // the policies and title service outlive every conversation agent.
           conversationCtx.effect(function* () {
-            yield offload.dispose;
+            yield titles.dispose;
+            yield policies.dispose;
             yield async () => {
               const failures: unknown[] = [];
               try {
@@ -509,16 +694,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 failures.push(error);
               }
               if (failures.length) {
-                try {
-                  await offload.dispose();
-                } catch (error) {
-                  failures.push(error);
-                }
+                const retired = await Promise.allSettled([policies.dispose(), titles.dispose()]);
+                for (const result of retired)
+                  if (result.status === 'rejected') failures.push(result.reason);
                 throw new AggregateError(failures, 'Conversation cleanup failed');
               }
             };
           });
-          await offload;
+          await Promise.all([policies, titles]);
           const store = await createConversationStore(conversationConfig.databaseURL);
           try {
             const imageTools: ConversationImageTools | undefined =
@@ -563,10 +746,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     conversationConfig,
                     imageTools,
                     vision,
+                    audioTools,
                     conversationVideoTools,
                   ),
                   providers,
                   vision,
+                  async (lookup) => {
+                    const resolve = conversationCtx.get('mioConversationProjectContext');
+                    return resolve ? resolve(lookup) : null;
+                  },
+                  audioTools,
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,

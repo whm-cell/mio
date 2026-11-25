@@ -10,6 +10,8 @@ import type {
   VideoProbeCommandV1,
   VideoProbeFailureCodeV1,
   VideoProbeResultV1,
+  WorkerExecutionIdentity,
+  WorkerExecutionPhase,
 } from '@mio/compute-contracts';
 import { isJournalFailure } from './adapters/journal.ts';
 import type { Journal } from './adapters/journal.ts';
@@ -28,12 +30,25 @@ import {
 } from './adapters/media.ts';
 import type { ObjectStore } from './adapters/cos.ts';
 import type { Broker } from './adapters/rabbitmq.ts';
+import { ResourceSlots } from './resource-slots.ts';
 import type { Attempt, Phase } from './types.ts';
 
 const ATTEMPT_MS = 60 * 60 * 1000;
 const VIDEO_PROBE_TIMEOUT_MS = 5 * 60 * 1000;
 const log = createLogger('worker', 'worker');
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function identity(command: ComputeCommandV1): WorkerExecutionIdentity {
+  return {
+    executionId: createId(),
+    protocol: 'transcode.v1',
+    jobId: command.jobId,
+    attemptId: command.attemptId,
+    inspectionId: null,
+    resource: 'encode',
+    slots: 1,
+  };
+}
 
 type ResultState =
   | { state: 'running' }
@@ -93,10 +108,15 @@ export class Worker {
     Partial<Pick<ObjectStore, 'downloadVideoProbe'>>;
   readonly #broker: Pick<Broker, 'publish'> & Partial<Pick<Broker, 'publishVideoProbe'>>;
   readonly #directory: string;
-  #busy = false;
-  #activeAttemptId: string | null = null;
+  readonly #slots: ResourceSlots;
+  readonly #deliveries = new Map<string, Promise<void>>();
+  readonly #executionIds = new Map<string, string>();
+  readonly #ownedProcesses = new Set<string>();
+  #maintenance: Promise<void> | undefined;
+  #maintenanceAttempt: string | undefined;
   #cursor = '';
   #stopped = false;
+  #busy = false;
   readonly #stopController = new AbortController();
 
   constructor(
@@ -105,11 +125,14 @@ export class Worker {
       Partial<Pick<ObjectStore, 'downloadVideoProbe'>>,
     broker: Pick<Broker, 'publish'> & Partial<Pick<Broker, 'publishVideoProbe'>>,
     directory: string,
+    slots = new ResourceSlots(),
   ) {
     this.#journal = journal;
     this.#store = store;
     this.#broker = broker;
     this.#directory = directory;
+    this.#slots = slots;
+    this.#syncProcessHold();
   }
 
   stop(): void {
@@ -118,11 +141,21 @@ export class Worker {
   }
 
   async waitIdle(): Promise<void> {
-    while (this.#busy) await sleep(50);
+    while (this.#deliveries.size || this.#maintenance || this.#busy) await sleep(50);
+  }
+
+  #syncProcessHold(): void {
+    this.#slots.setHold(
+      'encode',
+      'transcode',
+      this.#journal.hasUnknownProcess(this.#ownedProcesses),
+    );
   }
 
   admissionReady(): boolean {
-    if (this.#stopped || this.#busy || this.#journal.hasUnknownProcess()) return false;
+    if (this.#stopped || this.#busy || this.#deliveries.size || this.#maintenance) return false;
+    this.#syncProcessHold();
+    if (!this.#slots.available('encode')) return false;
     try {
       requireSpace(this.#directory);
       return true;
@@ -134,11 +167,24 @@ export class Worker {
 
   needsMaintenance(): boolean {
     if (this.#stopped) return false;
-    if (!this.#busy && !this.admissionReady()) return true;
-    const first = this.#journal.recoverableAfter('');
-    if (!first) return false;
-    if (first.command.attemptId !== this.#activeAttemptId) return true;
-    return this.#journal.recoverableAfter(first.command.attemptId) !== null;
+    if (!this.#busy && !this.#deliveries.size && !this.admissionReady()) return true;
+    return this.#nextIdleAttempt('') !== null;
+  }
+
+  #nextIdleAttempt(cursor: string): Attempt | null {
+    for (
+      let attempt = this.#journal.recoverableAfter(cursor);
+      attempt;
+      attempt = this.#journal.recoverableAfter(attempt.command.attemptId)
+    ) {
+      if (!this.#deliveries.has(attempt.command.attemptId)) return attempt;
+    }
+    return null;
+  }
+
+  #phase(attemptId: string, phase: WorkerExecutionPhase): void {
+    const id = this.#executionIds.get(attemptId);
+    if (id) this.#slots.phase(id, phase);
   }
 
   #event(command: ComputeCommandV1, state: ResultState): ComputeResultV1 {
@@ -208,6 +254,7 @@ export class Worker {
   }
 
   async #finishUpload(attempt: Attempt, signal: AbortSignal): Promise<void> {
+    this.#phase(attempt.command.attemptId, 'uploading');
     const { command, outputSize: size, outputSha256: sha256 } = attempt;
     if (!size || !sha256) {
       await this.#emit(attempt, 'unknown_mismatch', {
@@ -280,26 +327,47 @@ export class Worker {
     );
   }
 
-  async reconcileOne(): Promise<void> {
-    if (this.#busy || this.#stopped) return;
-    this.#busy = true;
-    try {
-      await this.#reconcileNext();
-    } finally {
-      this.#busy = false;
-    }
+  reconcileOne(): Promise<void> {
+    if (this.#maintenance) return this.#maintenance;
+    if (this.#stopped) return Promise.resolve();
+    const flight = this.#reconcileNext().finally(() => {
+      this.#maintenance = undefined;
+      this.#maintenanceAttempt = undefined;
+    });
+    this.#maintenance = flight;
+    return flight;
   }
 
   async #reconcileNext(): Promise<void> {
-    let attempt = this.#journal.recoverableAfter(this.#cursor);
-    if (!attempt) {
-      this.#cursor = '';
-      attempt = this.#journal.recoverableAfter('');
-    }
+    const attempt = this.#nextIdleAttempt(this.#cursor) ?? this.#nextIdleAttempt('');
     if (!attempt) return;
-    this.#cursor = attempt.command.attemptId;
-    await this.#recover(attempt);
-    const current = this.#journal.get(attempt.command.attemptId);
+    const id = attempt.command.attemptId;
+    this.#cursor = id;
+    const recoveringOutput = [
+      'output_ready',
+      'uploading',
+      'unknown_upload',
+      'unknown_mismatch',
+    ].includes(attempt.phase);
+    // Known output recovery may proceed under an uncertain process HOLD without starting FFmpeg.
+    const execution = identity(attempt.command);
+    const release = recoveringOutput
+      ? this.#slots.acquireOutputRecovery('encode', execution)
+      : null;
+    if (recoveringOutput && !release) return;
+    this.#maintenanceAttempt = id;
+    if (release) this.#executionIds.set(id, execution.executionId);
+    try {
+      await this.#recover(attempt);
+      this.#cleanup(id);
+    } finally {
+      this.#executionIds.delete(id);
+      this.#releaseSlot(release);
+    }
+  }
+
+  #cleanup(attemptId: string): void {
+    const current = this.#journal.get(attemptId);
     if (current && !current.cleaned && ['succeeded', 'failed'].includes(current.phase)) {
       this.#requireConfirmedOutcome(current.command.attemptId);
       removeFiles(this.#directory, current.command.attemptId);
@@ -307,17 +375,74 @@ export class Worker {
     }
   }
 
-  async handle(command: ComputeCommandV1, ack: () => void): Promise<void> {
-    if (!this.admissionReady()) throw new Error('WORKER_NOT_READY');
+  #releaseSlot(release: (() => void) | null): void {
+    try {
+      this.#syncProcessHold();
+    } catch (error) {
+      this.#slots.setHold('encode', 'transcode', true);
+      throw error;
+    } finally {
+      release?.();
+    }
+  }
+
+  async handle(command: ComputeCommandV1, ack: () => void, buffered = false): Promise<void> {
+    const id = command.attemptId;
+    const previous = this.#deliveries.get(id);
+    if (previous && buffered) {
+      await previous;
+      this.#journal.accept(command);
+      ack();
+      return;
+    }
+    if (this.#stopped || (!buffered && !this.admissionReady())) throw new Error('WORKER_NOT_READY');
+    const task = this.#executeDelivery(command, ack, buffered);
+    this.#deliveries.set(id, task);
+    try {
+      await task;
+    } finally {
+      this.#deliveries.delete(id);
+    }
+  }
+
+  async #executeDelivery(
+    command: ComputeCommandV1,
+    ack: () => void,
+    buffered: boolean,
+  ): Promise<void> {
+    const id = command.attemptId;
+    if (this.#maintenanceAttempt === id) await this.#maintenance;
+    this.#syncProcessHold();
+    const execution = identity(command);
+    const previous = buffered ? this.#journal.get(id) : null;
+    const recoverOutput =
+      previous &&
+      ['output_ready', 'uploading', 'unknown_upload', 'unknown_mismatch'].includes(previous.phase);
+    const statusOnly =
+      previous && ['launching', 'running', 'unknown_process'].includes(previous.phase);
+    // Querying an earlier process requires no capacity and cannot wait on its own HOLD.
+    const release = statusOnly
+      ? null
+      : buffered
+        ? recoverOutput
+          ? await this.#slots.waitForOutputRecovery(
+              'encode',
+              this.#stopController.signal,
+              execution,
+            )
+          : await this.#slots.wait('encode', this.#stopController.signal, execution)
+        : this.#slots.acquire('encode', execution);
+    if (!release && !statusOnly) throw new Error('WORKER_NOT_READY');
+    if (release) this.#executionIds.set(id, execution.executionId);
     const attemptLog = log.child({
       jobId: command.jobId,
       attemptId: command.attemptId,
       messageId: command.messageId,
     });
     attemptLog.info('COMMAND_RECEIVED');
-    this.#busy = true;
-    this.#activeAttemptId = command.attemptId;
     try {
+      this.#stopController.signal.throwIfAborted();
+      if (!statusOnly) requireSpace(this.#directory);
       const attempt = this.#journal.accept(command);
       if (
         [
@@ -336,17 +461,14 @@ export class Worker {
       }
       await this.#flush(command.attemptId);
       this.#requireConfirmedOutcome(command.attemptId);
-      const final = this.#journal.get(command.attemptId);
-      if (final && !final.cleaned && ['succeeded', 'failed'].includes(final.phase)) {
-        removeFiles(this.#directory, command.attemptId);
-        this.#journal.markCleaned(command.attemptId);
-      }
+      this.#phase(command.attemptId, 'finalizing');
+      this.#cleanup(command.attemptId);
       ack();
       this.#journal.markAckDispatched(command.attemptId);
       attemptLog.info('COMMAND_ACK_DISPATCHED');
     } finally {
-      this.#activeAttemptId = null;
-      this.#busy = false;
+      this.#executionIds.delete(id);
+      this.#releaseSlot(release);
     }
   }
 
@@ -436,10 +558,13 @@ export class Worker {
     let spawned = false;
     try {
       removeFiles(this.#directory, command.attemptId);
+      this.#phase(command.attemptId, 'downloading');
       await this.#store.download(command, this.#directory, signal);
       const identity = processIdentity();
       if (!identity) throw new Error('PROCESS_IDENTITY_UNAVAILABLE');
       this.#journal.transition(command.attemptId, 'launching');
+      this.#ownedProcesses.add(command.attemptId);
+      this.#phase(command.attemptId, 'processing');
       const output = await transcode(this.#directory, command.attemptId, signal, (pid) => {
         spawned = true;
         this.#journal.recordPid(command.attemptId, pid, identity);
@@ -491,6 +616,7 @@ export class Worker {
       else if ((error as Error).message === 'INPUT_TOO_LARGE') code = 'INPUT_TOO_LARGE';
       await this.#emit(current, 'failed', { state: 'failed', errorCode: code });
     } finally {
+      this.#ownedProcesses.delete(command.attemptId);
       clearInterval(diskTimer);
     }
   }

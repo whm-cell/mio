@@ -3,6 +3,8 @@ import { Pool } from 'pg';
 import { spawnSync } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
+import { makeAudioRouteFixture } from './fixtures/onelink-audio-route.ts';
+import { makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
 import { legacyProviderSchemaSQL } from './fixtures/provider-legacy-schema.ts';
 import { providerSchemaSQL, checkProviderSchema } from '../../src/providers/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
@@ -26,6 +28,71 @@ async function seed(pool: Pool, discovery: unknown, credential = 1) {
   );
   return id;
 }
+it('upgrades all three installed operation constraints atomically without losing existing revisions', async () =>
+  databaseTest(async (pool) => {
+    await pool.query(providerSchemaSQL);
+    const tables = [
+      'mio_provider_model_routes',
+      'mio_provider_model_verifications',
+      'mio_provider_model_route_revisions',
+    ];
+    for (const table of tables)
+      await pool.query(`ALTER TABLE ${table} DROP CONSTRAINT ${table}_operation_check,
+        ADD CONSTRAINT ${table}_operation_check CHECK (operation IN ('chat', 'image.generate'))`);
+    await expect(checkProviderSchema(pool)).rejects.toThrow('operation constraints');
+    const route = makeAudioRouteFixture('exact-tts-fixture');
+    const environment = {
+      PATH: process.env.PATH,
+      MIO_PROVIDERS_DATABASE_URL: (pool.options as { connectionString: string }).connectionString,
+      MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+      MIO_PROVIDERS_MASTER_KEY_ID: 'migration-fixture',
+    };
+    const cli = (name: string, argument: string, input?: string) =>
+      spawnSync(process.execPath, [`scripts/service/${name}.ts`, argument], {
+        env: environment,
+        input,
+        encoding: 'utf8',
+      });
+    const oldRoute = makeChatRouteFixture('existing-chat-fixture', 'openai');
+    const existing = await pool.query(
+      `INSERT INTO mio_provider_model_route_revisions (
+        id,raw_model_id,operation,declaration_version,action,actor_type,actor_name,after_route
+      ) VALUES($1,'existing-chat-fixture','chat',1,'cli-import','cli','fixture',$2::jsonb) RETURNING id`,
+      [randomUUID(), JSON.stringify(oldRoute)],
+    );
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(providerSchemaSQL);
+      await checkProviderSchema(client);
+      await expect(
+        client.query("UPDATE mio_provider_model_route_revisions SET operation='invalid-operation'"),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
+    await expect(checkProviderSchema(pool)).rejects.toThrow('operation constraints');
+    for (let run = 0; run < 2; run++) {
+      const migration = cli('migrate-providers', '--apply');
+      expect(migration.status, migration.stderr).toBe(0);
+    }
+    const imported = cli('import-provider-route', '--stdin', JSON.stringify(route));
+    expect(imported.status, imported.stderr).toBe(0);
+    expect(JSON.parse(imported.stdout)).toMatchObject({
+      inserted: 1,
+      verification: 'unverified',
+      revisions: [{ rawModelId: route.rawModelId, operation: 'audio.tts', action: 'cli-import' }],
+    });
+    expect(
+      (
+        await pool.query('SELECT operation FROM mio_provider_model_route_revisions WHERE id=$1', [
+          existing.rows[0].id,
+        ])
+      ).rows,
+    ).toEqual([{ operation: 'chat' }]);
+  }));
+
 const success = (ids: string[], credentialVersion = 1) => ({
   ids,
   credentialVersion,

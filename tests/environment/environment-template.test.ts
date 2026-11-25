@@ -2,6 +2,7 @@ import { lstat, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
+import { WORKER_DEFAULT_LIMITS } from '@mio/compute-contracts';
 import { expect, it, onTestFinished } from 'vitest';
 import {
   createLocalEnvironment,
@@ -62,6 +63,13 @@ const adminSettings = {
   MIO_ADMIN_RABBITMQ_MONITOR_URL: 'http://mio-dev-monitor:fixture-monitor@127.0.0.1:15680/mio-dev',
   MIO_ADMIN_REDIS_MONITOR_URL: 'redis://mio_monitor:fixture-monitor@127.0.0.1:56379',
 };
+const workerOpsSettings = {
+  MIO_COMPUTE_WORKER_INSTANCE_IDS: 'worker-a,worker-b',
+  MIO_COMPUTE_WORKER_RESULT_USERS: '{"worker-a":"peer-a","worker-b":"peer-b"}',
+  MIO_COMPUTE_HARD_MAX_TOTAL: '3',
+  MIO_COMPUTE_HARD_MAX_ENCODE: '2',
+  MIO_COMPUTE_HARD_MAX_PROBE: '1',
+};
 const enableSwitches = {
   MIO_ADMIN_ENABLED: 'true',
   MIO_AUTH_SMS_ENABLED: 'true',
@@ -70,6 +78,7 @@ const enableSwitches = {
   MIO_GENERATIONS_ENABLED: 'true',
   MIO_MATERIALS_ENABLED: 'true',
   MIO_PROVIDERS_CATALOG_WHITELIST: 'true',
+  MIO_VIDEO_GENERATIONS_ENABLED: 'true',
 };
 
 async function temporaryDirectory() {
@@ -126,6 +135,7 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
     ...officialKey,
     ...assetSettings,
     ...adminSettings,
+    ...workerOpsSettings,
     ...enableSwitches,
     MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
     MIO_MATERIALS_PUBLIC_BASE_URL: 'https://materials.example.com',
@@ -135,6 +145,15 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(optional).toEqual(Object.keys(optIns).sort());
   const examples = parseEnv(template.replace(assignmentPrefix, '$2='));
   expect(examples.MIO_AUTH_EMAIL_PASSWORD_ENABLED).toBe('false');
+  expect([
+    examples.MIO_COMPUTE_HARD_MAX_TOTAL,
+    examples.MIO_COMPUTE_HARD_MAX_ENCODE,
+    examples.MIO_COMPUTE_HARD_MAX_PROBE,
+  ]).toEqual([
+    String(WORKER_DEFAULT_LIMITS.total),
+    String(WORKER_DEFAULT_LIMITS.encode),
+    String(WORKER_DEFAULT_LIMITS.probe),
+  ]);
   const invalidSwitches = Object.entries(enableSwitches)
     .filter(([key, value]) => examples[key] !== value)
     .map(([key]) => key);
@@ -156,7 +175,27 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(readAssetConfig(configured)?.sessionToken !== undefined, 'MIO_COS_SESSION_TOKEN').toBe(
     true,
   );
-  expect(readComputeConfig(configured) !== undefined, 'MIO_COMPUTE_ENABLED').toBe(true);
+  expect(readComputeConfig(configured), 'MIO_COMPUTE_ENABLED').toMatchObject({
+    workerInstances: ['worker-a', 'worker-b'],
+    workerUsers: new Map([
+      ['worker-a', 'peer-a'],
+      ['worker-b', 'peer-b'],
+    ]),
+  });
+  const exampleCompute = readComputeConfig({
+    ...configured,
+    MIO_COMPUTE_WORKER_INSTANCE_IDS: examples.MIO_COMPUTE_WORKER_INSTANCE_IDS,
+    MIO_COMPUTE_WORKER_RESULT_USERS: examples.MIO_COMPUTE_WORKER_RESULT_USERS,
+  });
+  expect(exampleCompute).toMatchObject({
+    workerInstances: ['worker-local'],
+    workerUsers: new Map([['worker-local', examples.MIO_COMPUTE_EXPECTED_RESULT_USER]]),
+  });
+  for (const [key, value] of [
+    ['MIO_COMPUTE_WORKER_INSTANCE_IDS', 'worker a'],
+    ['MIO_COMPUTE_WORKER_RESULT_USERS', '{"worker-a":"same","worker-b":"same"}'],
+  ] as const)
+    expect(() => readComputeConfig({ ...configured, [key]: value }), key).toThrow('COMPUTE_CONFIG');
   expect(readGenerationConfig(configured) !== undefined, 'MIO_GENERATIONS_ENABLED').toBe(true);
   expect(readMaterialConfig(configured) !== undefined, 'MIO_MATERIALS_ENABLED').toBe(true);
   expect(readMaterialAuthConfig(configured)).toEqual({

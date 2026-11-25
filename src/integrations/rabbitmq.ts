@@ -8,20 +8,48 @@ import type {
   SocketOptions,
 } from 'amqplib';
 import {
+  AUDIO_COMMAND_ROUTING_KEY,
+  AUDIO_MAX_MESSAGE_BYTES,
+  AUDIO_RESULT_QUEUE,
   COMMAND_EXCHANGE,
   COMMAND_ROUTING_KEY,
   COMPUTE_MAX_MESSAGE_BYTES,
+  MEDIA_CONTROL_ROUTING_KEY,
+  MEDIA_ENCODE_ROUTING_KEY,
+  MEDIA_MAX_MESSAGE_BYTES,
+  MEDIA_PROBE_ROUTING_KEY,
+  MEDIA_RESULT_QUEUE,
   RESULT_QUEUE,
+  WORKER_TELEMETRY_QUEUE,
+  WORKER_MAX_MESSAGE_BYTES,
+  parseWorkerTelemetry,
+  parseWorkerLimitsResult,
+  workerControlRoutingKey,
+  mediaResourceClass,
+  parseAudioInspectResultV1,
   parseComputeResultV1,
+  parseMediaResult,
   parseVideoProbeResultV1,
   VIDEO_PROBE_COMMAND_ROUTING_KEY,
 } from '@mio/compute-contracts';
 import type {
+  AudioInspectCommandV1,
+  AudioInspectResultV1,
   ComputeCommandV1,
   ComputeResultV1,
+  MediaCommand,
+  MediaControl,
+  MediaResult,
   VideoProbeCommandV1,
   VideoProbeResultV1,
+  WorkerTelemetry,
+  WorkerLimitsResult,
+  WorkerLimitsCommand,
 } from '@mio/compute-contracts';
+
+/** The broker resolved this individual command as rejected. Connection state is independent. */
+export class MediaPublishRejected extends Error {}
+export class WorkerControlPublishRejected extends Error {}
 
 async function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
@@ -78,6 +106,8 @@ export class ComputeBroker {
   private readonly publisher: ConfirmChannel;
   private readonly userId: string;
   private readonly expectedUserId: string;
+  private readonly workerUsers: ReadonlyMap<string, string>;
+  private readonly trustedWorkerUsers: ReadonlySet<string>;
   private readonly lifecycle: { closed: boolean; callback: (() => void) | undefined };
   private readonly closedConnections: WeakSet<ChannelModel>;
   private readonly transport: AbortController;
@@ -94,6 +124,7 @@ export class ComputeBroker {
     lifecycle: { closed: boolean; callback: (() => void) | undefined },
     closedConnections: WeakSet<ChannelModel>,
     transport: AbortController,
+    workerUsers: ReadonlyMap<string, string>,
   ) {
     this.consumerConnection = consumerConnection;
     this.publisherConnection = publisherConnection;
@@ -101,6 +132,8 @@ export class ComputeBroker {
     this.publisher = publisher;
     this.userId = userId;
     this.expectedUserId = expectedUserId;
+    this.workerUsers = workerUsers;
+    this.trustedWorkerUsers = new Set(workerUsers.values());
     this.lifecycle = lifecycle;
     this.closedConnections = closedConnections;
     this.transport = transport;
@@ -111,6 +144,7 @@ export class ComputeBroker {
     userId: string,
     expectedUserId: string,
     stop?: AbortSignal,
+    workerUsers: ReadonlyMap<string, string> = new Map(),
   ): Promise<ComputeBroker> {
     const parsed = new URL(url);
     if (
@@ -182,6 +216,7 @@ export class ComputeBroker {
         lifecycle,
         closedConnections,
         transport,
+        workerUsers,
       );
     };
     const onStop = () => transport.abort(stop?.reason);
@@ -203,7 +238,55 @@ export class ComputeBroker {
     }
   }
 
-  async publish(message: ComputeCommandV1 | VideoProbeCommandV1): Promise<void> {
+  publish(message: ComputeCommandV1 | VideoProbeCommandV1): Promise<void> {
+    return this.publishCommand(
+      message.type === 'video.probe' ? VIDEO_PROBE_COMMAND_ROUTING_KEY : COMMAND_ROUTING_KEY,
+      message,
+    );
+  }
+
+  publishAudio(message: AudioInspectCommandV1): Promise<void> {
+    return this.publishCommand(AUDIO_COMMAND_ROUTING_KEY, message);
+  }
+
+  publishMedia(message: MediaCommand | MediaControl): Promise<void> {
+    const routingKey =
+      message.type === 'media.control'
+        ? MEDIA_CONTROL_ROUTING_KEY
+        : mediaResourceClass(message.operation) === 'encode'
+          ? MEDIA_ENCODE_ROUTING_KEY
+          : MEDIA_PROBE_ROUTING_KEY;
+    return this.publishCommand(routingKey, message).catch((error: unknown) => {
+      // amqplib 2.2.1 uses "message nacked" for the confirm callback on Basic.Nack.
+      if (error instanceof Error && ['message nacked', 'MESSAGE_RETURNED'].includes(error.message))
+        throw new MediaPublishRejected(error.message, { cause: error });
+      throw error;
+    });
+  }
+
+  publishWorkerControl(command: WorkerLimitsCommand): Promise<void> {
+    return this.publishCommand(workerControlRoutingKey(command.instanceId), command).catch(
+      (error: unknown) => {
+        if (
+          error instanceof Error &&
+          ['message nacked', 'MESSAGE_RETURNED'].includes(error.message)
+        )
+          throw new WorkerControlPublishRejected(error.message, { cause: error });
+        throw error;
+      },
+    );
+  }
+
+  private async publishCommand(
+    routingKey: string,
+    message:
+      | ComputeCommandV1
+      | VideoProbeCommandV1
+      | AudioInspectCommandV1
+      | MediaCommand
+      | MediaControl
+      | WorkerLimitsCommand,
+  ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
       if (value.properties.messageId === message.messageId) returned = true;
@@ -213,8 +296,6 @@ export class ComputeBroker {
     let onDrain: (() => void) | undefined;
     try {
       let drain: Promise<void> = Promise.resolve();
-      const routingKey =
-        message.type === 'video.probe' ? VIDEO_PROBE_COMMAND_ROUTING_KEY : COMMAND_ROUTING_KEY;
       const confirmation = new Promise<void>((resolve, reject) => {
         const writable = this.publisher.publish(
           COMMAND_EXCHANGE,
@@ -250,40 +331,134 @@ export class ComputeBroker {
     }
   }
 
-  async consume(
+  consume(
     handle: (result: ComputeResultV1) => Promise<void>,
     failed: () => void,
     handleProbe?: (result: VideoProbeResultV1) => Promise<void>,
   ): Promise<void> {
+    return this.consumeResults(
+      {
+        queue: RESULT_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse(value) {
+          return (value as { type?: unknown } | null)?.type === 'video.probe.result'
+            ? parseVideoProbeResultV1(value)
+            : parseComputeResultV1(value);
+        },
+      },
+      async (result) => {
+        if (result.type === 'video.probe.result') {
+          if (!handleProbe)
+            throw Object.assign(new Error('VIDEO_PROBE_UNAVAILABLE'), { permanent: true });
+          await handleProbe(result);
+        } else await handle(result);
+      },
+      failed,
+      this.transport.signal,
+    );
+  }
+
+  consumeAudio(
+    handle: (result: AudioInspectResultV1) => Promise<void>,
+    failed: () => void,
+    stop: AbortSignal,
+  ): Promise<void> {
+    return this.consumeResults(
+      {
+        queue: AUDIO_RESULT_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectResultV1,
+      },
+      handle,
+      failed,
+      AbortSignal.any([stop, this.transport.signal]),
+    );
+  }
+
+  async consumeMedia(handle: (result: MediaResult) => Promise<void>, failed: () => void) {
+    // Media progress has no wire sequence field. Keep dispatch order through
+    // the inbox of this dedicated media result consumer.
+    await untilAborted(this.consumer.prefetch(1), this.transport.signal);
+    return this.consumeResults(
+      { queue: MEDIA_RESULT_QUEUE, maxBytes: MEDIA_MAX_MESSAGE_BYTES, parse: parseMediaResult },
+      handle,
+      failed,
+      this.transport.signal,
+    );
+  }
+
+  consumeWorker(
+    handle: (message: WorkerTelemetry | WorkerLimitsResult) => Promise<void>,
+    failed: () => void,
+  ): Promise<void> {
+    return this.consumeResults(
+      {
+        queue: WORKER_TELEMETRY_QUEUE,
+        maxBytes: WORKER_MAX_MESSAGE_BYTES,
+        parse(value) {
+          return (value as { type?: string } | null)?.type === 'worker.limits.result'
+            ? parseWorkerLimitsResult(value)
+            : parseWorkerTelemetry(value);
+        },
+        authenticated: (value, peer) =>
+          this.workerUsers.size === 0
+            ? peer === this.expectedUserId
+            : this.workerUsers.get(value.instanceId) === peer,
+      },
+      handle,
+      failed,
+      this.transport.signal,
+    );
+  }
+
+  private async consumeResults<T extends { messageId: string }>(
+    protocol: {
+      queue: string;
+      maxBytes: number;
+      parse: (value: unknown) => T;
+      authenticated?: (result: T, peer: string) => boolean;
+    },
+    handle: (result: T) => Promise<void>,
+    failed: () => void,
+    stop: AbortSignal,
+  ): Promise<void> {
+    stop.throwIfAborted();
+    const stream = protocol.queue === AUDIO_RESULT_QUEUE;
     await untilAborted(
       this.consumer.consume(
-        RESULT_QUEUE,
+        protocol.queue,
         (message: ConsumeMessage | null) => {
           if (!this.accepting || this.lifecycle.closed) return;
           if (!message) {
             failed();
             return;
           }
-          let result: ComputeResultV1 | VideoProbeResultV1;
+          let result: T;
           try {
             if (
-              message.properties.userId !== this.expectedUserId ||
+              !message.properties.userId ||
+              (message.properties.userId !== this.expectedUserId &&
+                !this.trustedWorkerUsers.has(message.properties.userId)) ||
               message.properties.contentType !== 'application/json' ||
-              message.content.length > COMPUTE_MAX_MESSAGE_BYTES
+              message.content.length > protocol.maxBytes
             )
               throw new Error('RESULT_INVALID');
             const value: unknown = JSON.parse(
               new TextDecoder('utf-8', { fatal: true }).decode(message.content),
             );
-            result =
-              (value as { type?: unknown })?.type === 'video.probe.result'
-                ? parseVideoProbeResultV1(value)
-                : parseComputeResultV1(value);
+            result = protocol.parse(value);
+            if (
+              protocol.authenticated &&
+              !protocol.authenticated(result, message.properties.userId)
+            )
+              throw new Error('RESULT_USER_MISMATCH');
             if (message.properties.messageId !== result.messageId)
               throw new Error('RESULT_ID_MISMATCH');
           } catch {
             try {
-              this.consumer.reject(message, false);
+              // A stream retains entries after ACK. Advance this consumer past invalid entries.
+              if (stream) this.consumer.ack(message);
+              else this.consumer.reject(message, false);
             } catch {
               if (this.accepting) failed();
             }
@@ -292,16 +467,13 @@ export class ComputeBroker {
           let shouldFail = false;
           const task = (async () => {
             try {
-              if (result.type === 'video.probe.result') {
-                if (!handleProbe)
-                  throw Object.assign(new Error('VIDEO_PROBE_UNAVAILABLE'), { permanent: true });
-                await handleProbe(result);
-              } else await handle(result);
+              await handle(result);
             } catch (error) {
               if (!this.lifecycle.closed) {
                 if ((error as { permanent?: boolean })?.permanent) {
                   try {
-                    this.consumer.reject(message, false);
+                    if (stream) this.consumer.ack(message);
+                    else this.consumer.reject(message, false);
                   } catch {
                     shouldFail = true;
                   }
@@ -325,9 +497,9 @@ export class ComputeBroker {
           });
           this.inFlight.add(tracked);
         },
-        { noAck: false },
+        { noAck: false, ...(stream ? { arguments: { 'x-stream-offset': 'next' } } : {}) },
       ),
-      this.transport.signal,
+      stop,
     );
   }
   onClose(callback: () => void): void {

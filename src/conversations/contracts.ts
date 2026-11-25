@@ -1,3 +1,11 @@
+import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
+import type {
+  VideoCapabilitiesView,
+  VideoCreateRequest,
+  VideoJobView,
+  VideoMode,
+} from '../generations/video-contracts.ts';
+import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HttpError } from '@mio/foundation/errors';
 import type {
   ImageDriver,
@@ -5,12 +13,10 @@ import type {
   ImageRequestParameters,
 } from '../generations/contracts.ts';
 import type {
-  VideoCapabilitiesView,
-  VideoCreateRequest,
-  VideoJobView,
-  VideoMode,
-} from '../generations/video-contracts.ts';
-import type { ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
+  ChatReasoningEffort,
+  ChatRuntimeSnapshot,
+  ChatSelection,
+} from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
   userId: string;
@@ -19,21 +25,80 @@ export interface Principal {
 export type RequestStatus =
   'accepted' | 'input-persisted' | 'completed' | 'cancelled' | 'failed' | 'unknown';
 export type TerminalRequestStatus = Exclude<RequestStatus, 'accepted' | 'input-persisted'>;
+export type ModelFailure =
+  | 'MODEL_AUTH_FAILED'
+  | 'MODEL_QUOTA_EXCEEDED'
+  | 'MODEL_RATE_LIMITED'
+  | 'MODEL_TIMEOUT'
+  | 'MODEL_CONTEXT_OVERFLOW'
+  | 'MODEL_UPSTREAM_ERROR'
+  | 'TURN_STEP_BUDGET_EXCEEDED';
+export type ConversationRunResult =
+  | TerminalRequestStatus
+  | typeof outputTruncation.reason
+  | { status: 'failed'; error: ModelFailure };
 export const isInFlightRequest = (status: RequestStatus) =>
   status === 'accepted' || status === 'input-persisted';
 export const outputTruncation = { reason: 'max-tokens', message: '已达输出上限' } as const;
+export const MAX_CONVERSATION_TITLE_BYTES = 120;
+
+export type ConversationPurpose = 'general' | 'drama-script' | 'audio';
+export interface AudioSelection {
+  voiceRef: string | null;
+  name: string | null;
+  revision: number;
+}
+export const emptyAudioSelection: AudioSelection = Object.freeze({
+  voiceRef: null,
+  name: null,
+  revision: 0,
+});
+
+export interface ConversationAudioTurn {
+  readonly userId: string;
+  readonly conversationId: string;
+  readonly requestId: string;
+  readonly audioContext: FrozenAudioContext;
+  readonly audioSelection: AudioSelection;
+  selectAudioVoice(voiceRef: string): Promise<AudioSelection>;
+}
+
+export interface ConversationTurnContext {
+  readonly purpose: ConversationPurpose;
+  /** Validated UTF-8 JSON from the trusted project resolver for this turn. */
+  readonly projectContext?: string;
+  readonly audio?: ConversationAudioTurn;
+}
+
 export interface Conversation {
   id: string;
   createdAt: string;
+  updatedAt: string;
+  title: string | null;
   state: 'creating' | 'ready' | 'unknown';
   modelRef?: string | null;
+  purpose?: 'drama-script' | 'audio';
+  audioSelection?: AudioSelection;
+  reasoningEffort?: ChatReasoningEffort;
+  forkedFromConversationId?: string;
+  forkedUntilSeq?: number;
 }
+export interface ConversationArchive {
+  id: string;
+  archivedAt: string;
+}
+export interface ContextUsage {
+  estimatedTokens: number;
+  contextWindow: number | null;
+  compacted: boolean;
+}
+export type CaptureContextUsage = (read: () => ContextUsage) => void;
 export interface ModelObservation {
   readonly status?: number;
   readonly providerRequestId?: string;
   readonly usage?: {
-    inputTokens: number;
-    outputTokens: number;
+    inputTokens?: number;
+    outputTokens?: number;
     totalTokens?: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
@@ -42,6 +107,7 @@ export interface ModelObservation {
   readonly usageStatus?: 'reported' | 'partial' | 'unknown';
   readonly finish: string;
   readonly failureCode?: string;
+  readonly purpose?: 'compaction';
 }
 export interface ConversationRun {
   readonly userId: string;
@@ -49,6 +115,7 @@ export interface ConversationRun {
   readonly dshSessionId: string;
   readonly requestId: string;
   readonly snapshot: ChatRuntimeSnapshot;
+  readonly reasoningEffort?: ChatReasoningEffort;
   offloadableImages?(): number;
   observe(observation: ModelObservation): Promise<void>;
 }
@@ -62,7 +129,9 @@ export interface Receipt {
 export interface ConversationSnapshot {
   conversationId: string;
   activeRequestId: string | null;
+  audioSelection?: AudioSelection;
   receipt: Receipt | null;
+  contextUsage?: ContextUsage;
 }
 /** Serializable image identity; binary content and private object keys stay outside history. */
 export interface ConversationImageReference {
@@ -116,6 +185,18 @@ export interface ConversationVision {
   acquireRequest(signal: AbortSignal): Promise<() => void>;
 }
 export type ConversationImageToolName = 'submit_image_job' | 'get_image_job';
+export type ConversationAudioToolName = 'submit_audio_job' | 'get_audio_job' | 'clone_audio_voice';
+export type ConversationToolName =
+  | ConversationImageToolName
+  | 'list_image_models'
+  | 'inspect_image_asset'
+  | ConversationVideoToolName
+  | 'list_video_models'
+  | 'recover_video_job'
+  | ConversationAudioToolName
+  | 'list_audio_models'
+  | 'list_audio_voices'
+  | 'select_audio_voice';
 export interface ConversationImageJobOutput {
   readonly index: number;
   readonly assetId: string;
@@ -196,6 +277,26 @@ export interface ConversationVideoTools {
   getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
   recoverVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
 }
+export interface ConversationAudioTools {
+  listModels(actor: { userId: string }, operation: AudioOperation): Promise<unknown[]>;
+  listVoices(actor: { userId: string }, query: URLSearchParams): Promise<unknown>;
+  create(
+    actor: { userId: string },
+    body: Record<string, unknown>,
+  ): Promise<{ created: boolean; job: AudioJobView }>;
+  clone(
+    actor: { userId: string },
+    body: Record<string, unknown>,
+    fingerprint?: string,
+  ): Promise<{ created: boolean; job: AudioJobView }>;
+  get(actor: { userId: string }, id: string): Promise<AudioJobView>;
+  freezeContext(actor: { userId: string }, value: unknown): Promise<FrozenAudioContext>;
+  resolveVoice(
+    actor: { userId: string },
+    voiceRef: string,
+  ): Promise<{ voiceRef: string; name: string }>;
+}
+
 export type HistoryItem =
   | {
       seq: number;
@@ -206,6 +307,7 @@ export type HistoryItem =
     }
   | { seq: number; role: 'tool'; tool: ConversationImageToolName; job: ConversationImageJobView }
   | { seq: number; role: 'tool'; tool: ConversationVideoToolName; job: ConversationVideoJobView }
+  | { seq: number; role: 'tool'; tool: ConversationAudioToolName; job: AudioJobView }
   | {
       seq: number;
       role: 'status';
@@ -219,6 +321,13 @@ export interface HistoryPage {
 }
 export type ConversationEvent =
   | { type: 'text'; requestId: string; text: string }
+  | { type: 'reasoning'; requestId: string; text: string }
+  | {
+      type: 'tool-status';
+      requestId: string;
+      tool: ConversationToolName;
+      status: 'running' | 'completed' | 'failed';
+    }
   | {
       type: 'tool';
       requestId: string;
@@ -231,12 +340,30 @@ export type ConversationEvent =
       tool: ConversationVideoToolName;
       job: ConversationVideoJobView;
     }
-  | { type: 'state'; receipt: Receipt }
+  | { type: 'tool'; requestId: string; tool: ConversationAudioToolName; job: AudioJobView }
+  | { type: 'audio-selection'; conversationId: string; selection: AudioSelection }
+  | { type: 'state'; receipt: Receipt; contextUsage?: ContextUsage }
   | { type: 'error'; code: string };
 export interface ConversationEngine {
   readonly available: boolean;
   create(id: string, selection?: ChatSelection): Promise<void>;
+  resolveForkBoundary?(sourceId: string, upToSeq?: number): Promise<number>;
+  fork?(
+    sourceId: string,
+    targetId: string,
+    upToSeq: number,
+    selection?: ChatSelection,
+  ): Promise<void>;
+  hasRetainedImages?(id: string): Promise<boolean>;
+  rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
+  contextUsage?(id: string, signal?: AbortSignal): Promise<ContextUsage>;
+  compact?(
+    id: string,
+    binding: ConversationRun,
+    signal: AbortSignal,
+    captureContextUsage?: CaptureContextUsage,
+  ): Promise<ConversationRunResult>;
   run(
     id: string,
     requestId: string,
@@ -245,7 +372,10 @@ export interface ConversationEngine {
     emit: (event: ConversationEvent) => void,
     binding?: ConversationRun,
     images?: readonly ConversationImageReference[],
-  ): Promise<TerminalRequestStatus | typeof outputTruncation.reason>;
+    admitted?: (eventTimeMs: number, autoTitle?: string) => Promise<void>,
+    captureContextUsage?: CaptureContextUsage,
+    turnContext?: ConversationTurnContext,
+  ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
   close(): Promise<void>;
 }

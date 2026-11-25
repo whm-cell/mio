@@ -14,6 +14,37 @@ export interface ProviderPrincipal {
 }
 export const categories = ['chat', 'image', 'video', 'voice', 'music'] as const;
 export type Category = (typeof categories)[number];
+export const providerOperations = [
+  'chat',
+  'image.generate',
+  'video.generate',
+  'audio.voices.list',
+  'audio.tts',
+  'audio.clone',
+] as const;
+export type ProviderOperation = (typeof providerOperations)[number];
+export type AudioDriver = 'minimax-voices' | 'minimax-tts' | 'minimax-clone';
+export type ChatCacheRetention = 'none' | 'short' | 'long';
+export type ChatReasoningEffort = 'low' | 'medium' | 'high';
+export type ChatReasoningCapability =
+  | { readonly supported: false }
+  | { readonly supported: true; readonly efforts?: readonly ChatReasoningEffort[] };
+export const DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS = 30_000;
+
+export function isChatReasoningEffort(value: unknown): value is ChatReasoningEffort {
+  return value === 'low' || value === 'medium' || value === 'high';
+}
+
+export function supportsChatReasoning(
+  capability: ChatReasoningCapability | undefined,
+  effort: ChatReasoningEffort,
+): boolean {
+  return capability?.supported === true && capability.efforts?.includes(effort) === true;
+}
+
+export function isProviderOperation(value: unknown): value is ProviderOperation {
+  return providerOperations.some((operation) => operation === value);
+}
 export class ProviderError extends HttpError {}
 export interface Discovery {
   credentialVersion: number;
@@ -61,7 +92,7 @@ export interface ModelPreference {
 
 export const CHAT_PROFILES = ['openai-chat', 'anthropic-messages'] as const;
 export type ChatProfile = (typeof CHAT_PROFILES)[number];
-/** Declared route evidence is separate from catalog membership and runtime implementation. */
+/** Evidence for an implemented protocol route; catalog membership is deliberately absent. */
 export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
 export interface ImageCapabilityMetadata {
   modes: ImageOperation[];
@@ -103,6 +134,9 @@ export interface ImageParameterView {
 export interface AdaptationCapabilityMetadata {
   contextWindow?: number;
   maxOutputTokens?: number;
+  cacheRetention?: ChatCacheRetention;
+  reasoning?: ChatReasoningCapability;
+  streamIdleTimeoutMs?: number;
   inputModalities?: ('text' | 'image')[];
   maxRequestImages?: number;
   maxRequestImageBytes?: number;
@@ -143,7 +177,7 @@ export interface ModelRecord {
 export interface PlatformRouteRecord {
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   vendor: string;
   driver: string;
   classification: Category;
@@ -163,7 +197,7 @@ export interface PlatformRouteRecord {
 export interface VerificationRecord {
   provider_id: string;
   model_key: string;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   declaration_version: number;
   driver: string;
   verification_status: 'unverified' | 'verified';
@@ -206,7 +240,7 @@ export interface PlatformRouteRevisionRecord {
   id: string;
   provider_type: 'onelink';
   raw_model_id: string;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   declaration_version: number;
   action: RouteRevisionAction;
   actor_type: 'admin' | 'cli';
@@ -221,9 +255,9 @@ export interface PlatformRouteRevisionRecord {
 export interface ModelRouteInput {
   providerType?: 'onelink';
   rawModelId: string;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   vendor: string;
-  driver: ChatProfile | ImageDriver | VideoDriver;
+  driver: ChatProfile | ImageDriver | VideoDriver | AudioDriver;
   classification: Category;
   submitPath: string;
   editPath?: string | null;
@@ -244,7 +278,7 @@ export interface VerificationSnapshot {
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
   readonly modelKey: string;
-  readonly operation: 'chat' | 'image.generate' | 'video.generate';
+  readonly operation: ProviderOperation;
   readonly profile: string;
 }
 
@@ -270,6 +304,9 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly submitPath?: string;
   readonly maxOutputTokens?: number;
   readonly contextWindow?: number;
+  readonly cacheRetention?: ChatCacheRetention;
+  readonly reasoning?: ChatReasoningCapability;
+  readonly streamIdleTimeoutMs?: number;
   readonly inputModalities?: readonly ('text' | 'image')[];
   readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;

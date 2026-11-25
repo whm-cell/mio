@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import type { ComputeResultV1 } from '@mio/compute-contracts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
-import { computeSchemaSQL } from '../../src/compute/schema.ts';
+import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
 import { ComputeStore } from '../../src/compute/store.ts';
+import { checkComputeCapacity, lockComputeCapacity } from '../../src/compute/capacity.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
@@ -29,7 +30,7 @@ afterAll(async () => {
 }, 30000);
 beforeEach(async () => {
   await pool.query(
-    'TRUNCATE mio_compute_inbox,mio_compute_outbox,mio_compute_jobs,mio_assets CASCADE',
+    'TRUNCATE mio_compute_inbox,mio_compute_outbox,mio_compute_jobs,mio_media_jobs,mio_assets CASCADE',
   );
   assetId = randomUUID();
   key = `mio/raw/${assetId}/${randomUUID()}`;
@@ -67,7 +68,7 @@ function event(
   if (state === 'unknown') return { ...base, state, errorCode: 'UPLOAD_UNKNOWN' };
   return { ...base, state: 'running' };
 }
-const create = (requestId = randomUUID(), who = owner) =>
+const create = (requestId: string = randomUUID(), who = owner) =>
   store.create(who, requestId, assetId, key, 3, 'raw-actual-etag');
 
 it('serializes duplicate requests and atomically records one outbox command', async () => {
@@ -215,4 +216,111 @@ it('commits a derived asset and terminal state in the same transaction without s
     "SELECT count(*) FROM mio_assets WHERE asset_kind='derived'",
   );
   expect(Number(rows.rows[0]!.count)).toBe(1);
+});
+
+async function seedMediaJobs(count: number, ownerId: string, state: string) {
+  await pool.query(
+    `INSERT INTO mio_media_jobs
+       (id,owner_id,request_id,request_hash,operation,parameters,inputs,profile,state,attempt,attempt_id,command_id)
+     SELECT gen_random_uuid(),$1,gen_random_uuid(),'fixture','media.probe','{}','[]','standard-media',$2,1,gen_random_uuid(),gen_random_uuid()
+     FROM generate_series(1,$3::integer)`,
+    [ownerId, state, count],
+  );
+}
+
+it('keeps prior job and outbox on an additive migration and opens the floor idempotently', async () => {
+  const existing = await create();
+  const original = await pool.query('SELECT command FROM mio_compute_outbox WHERE job_id=$1', [
+    existing.job.id,
+  ]);
+  // This per-test PostgreSQL schema models the tables an existing revision would have installed.
+  await pool.query(
+    'DROP TABLE mio_media_controls,mio_media_retries,mio_media_files,mio_media_inbox,mio_media_outbox,mio_media_jobs',
+  );
+  await expect(checkComputeSchema(pool)).rejects.toMatchObject({ code: '42P01' });
+  await pool.query(computeSchemaSQL);
+  await pool.query(computeSchemaSQL);
+  await expect(checkComputeSchema(pool)).resolves.toBeUndefined();
+  expect(await store.owned(existing.job.id, owner)).toEqual(existing.job);
+  expect(
+    (await pool.query('SELECT command FROM mio_compute_outbox WHERE job_id=$1', [existing.job.id]))
+      .rows,
+  ).toEqual(original.rows);
+});
+
+it('counts media reconciliation and cancellation with legacy video and retains idempotency at capacity', async () => {
+  await seedMediaJobs(7, owner, 'accepted');
+  await seedMediaJobs(1, owner, 'reconciling');
+  await seedMediaJobs(1, owner, 'cancel_requested');
+  await seedMediaJobs(20, owner, 'succeeded');
+  await seedMediaJobs(20, owner, 'cancelled');
+  const last = await create();
+  await expect(create()).rejects.toMatchObject({ status: 429, code: 'COMPUTE_QUOTA_EXCEEDED' });
+  await expect(create(last.job.request_id)).resolves.toEqual({ job: last.job, created: false });
+  await expect(
+    store.create(owner, last.job.request_id, randomUUID(), key, 3, 'etag'),
+  ).rejects.toMatchObject({ status: 409, code: 'REQUEST_CONFLICT' });
+  await store.accept(event(last.job, 'failed'));
+  expect((await store.owned(last.job.id, owner))?.attempt).toBe(2);
+  await expect(create()).rejects.toMatchObject({ status: 429, code: 'COMPUTE_QUOTA_EXCEEDED' });
+});
+
+it('serializes mixed admissions for the last global place and releases it after rollback', async () => {
+  await seedMediaJobs(499, 'other-owners', 'queued');
+  const admitted = Promise.withResolvers<void>();
+  const finishMedia = Promise.withResolvers<void>();
+  const media = (async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lockComputeCapacity(client);
+      await checkComputeCapacity(client, 'other-requester');
+      await client.query(
+        `INSERT INTO mio_media_jobs
+           (id,owner_id,request_id,request_hash,operation,parameters,inputs,profile,state,attempt,attempt_id,command_id)
+         VALUES(gen_random_uuid(),'other-requester',gen_random_uuid(),'fixture','media.probe','{}','[]','standard-media','accepted',1,gen_random_uuid(),gen_random_uuid())`,
+      );
+      admitted.resolve();
+      await finishMedia.promise;
+      await client.query('COMMIT');
+    } catch (error) {
+      admitted.reject(error);
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  })();
+  void media.catch(() => {});
+  await admitted.promise;
+  let videoCompleted = false;
+  const competing = create().finally(() => {
+    videoCompleted = true;
+  });
+  void competing.catch(() => {});
+  try {
+    await vi.waitFor(
+      async () => {
+        expect(videoCompleted).toBe(false);
+        const lock = await pool.query(
+          `SELECT 1 FROM pg_locks JOIN pg_stat_activity USING(pid)
+         WHERE locktype='advisory' AND NOT granted AND classid=0 AND objid=672049923
+           AND application_name=$1`,
+          [database.applicationName],
+        );
+        expect(lock.rowCount).toBe(1);
+      },
+      { timeout: 4000 },
+    );
+  } finally {
+    finishMedia.resolve();
+    await media;
+  }
+  await expect(competing).rejects.toMatchObject({ status: 429, code: 'COMPUTE_QUOTA_EXCEEDED' });
+  await pool.query("UPDATE mio_media_jobs SET state='failed' WHERE owner_id='other-requester'");
+  const invalidAsset = randomUUID();
+  await expect(
+    store.create(owner, randomUUID(), invalidAsset, key, 3, 'etag'),
+  ).rejects.toMatchObject({ status: 404, code: 'ASSET_NOT_FOUND' });
+  await expect(create()).resolves.toMatchObject({ created: true });
 });

@@ -61,18 +61,33 @@ export function membershipError(
   },
   model?: ModelRecord,
   whitelist = false,
+  allowUndiscovered = true,
   catalogByRawId?: ReadonlyMap<string, PlatformCatalogModelRecord>,
+): string | null {
+  return catalogMembershipError(
+    row,
+    model,
+    model?.raw_model_id
+      ? (catalogByRawId?.get(model.raw_model_id) ??
+          findCatalogModel(row.catalog_models, model.raw_model_id))
+      : undefined,
+    whitelist,
+    allowUndiscovered,
+  );
+}
+
+export function catalogMembershipError(
+  row: ProviderRow,
+  model: ModelRecord | undefined,
+  catalogModel: PlatformCatalogModelRecord | undefined,
+  whitelist: boolean,
+  allowUndiscovered: boolean,
 ): string | null {
   if (!row.enabled) return 'PROVIDER_DISABLED';
   if (row.credential_auth_state === 'rejected') return 'PROVIDER_AUTH_REJECTED';
   if (row.catalog_version === null || row.catalog_credential_version !== row.credential_version)
     return 'MODEL_CATALOG_NOT_DISCOVERED';
   if (!model) return 'MODEL_NOT_FOUND';
-  const catalogModel = model.raw_model_id
-    ? catalogByRawId
-      ? catalogByRawId.get(model.raw_model_id)
-      : findCatalogModel(row.catalog_models, model.raw_model_id)
-    : undefined;
   if (whitelist) {
     if (!catalogModel || !catalogModel.user_visible) return 'MODEL_HIDDEN';
   } else if (catalogModel && !catalogModel.user_visible) {
@@ -84,6 +99,7 @@ export function membershipError(
     model.credential_version === row.credential_version &&
     model.catalog_version === row.catalog_version;
   const curatedAllowed =
+    allowUndiscovered &&
     model.metadata_source === 'admin-curated-hidden' &&
     Boolean(catalogModel?.allow_undiscovered) &&
     Boolean(catalogModel?.user_visible);
@@ -283,14 +299,14 @@ export function catalogView(
           effectiveDefault:
             pref.is_default &&
             pref.enabled &&
-            !membershipError(state!, model, whitelist, catalogByRawId) &&
+            !membershipError(state!, model, whitelist, true, catalogByRawId) &&
             pref.usage === 'chat' &&
             !!chatRoute,
         }));
         const chat = preferences.find((pref) => pref.usage === 'chat');
         const image = preferences.find((pref) => pref.usage === 'image');
         const imageReason =
-          membershipError(state!, model, whitelist, catalogByRawId) ??
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!imageRoute || !imageRoute.asyncReady
             ? 'ADAPTER_PENDING'
             : image?.enabled === false
@@ -298,7 +314,7 @@ export function catalogView(
               : null);
         const videoPreference = preferences.find((pref) => pref.usage === 'video');
         const videoReason =
-          membershipError(state!, model, whitelist, catalogByRawId) ??
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!videoRoute
             ? 'ADAPTER_PENDING'
             : !videoRoute.enabled
@@ -309,7 +325,7 @@ export function catalogView(
                   ? 'ADAPTER_PENDING'
                   : null);
         const reason =
-          membershipError(state!, model, whitelist, catalogByRawId) ??
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!chatRoute ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);
         const discovered =
           model.membership_state === 'current' &&
@@ -378,6 +394,11 @@ export function catalogView(
           enabled: chat?.enabled ?? true,
           isDefault: chat?.isDefault ?? false,
           protocol: chatRoute?.profile ?? null,
+          ...(effectiveCategory === 'chat'
+            ? {
+                reasoning: chatRoute?.capabilityMetadata.reasoning ?? { supported: false as const },
+              }
+            : {}),
           runnable: reason === null,
           unavailableReason: reason,
         };
@@ -392,7 +413,7 @@ export function catalogView(
         preference && state?.models.find((item) => item.model_key === preference.model_key);
       const reason = !preference
         ? 'MODEL_DEFAULT_NOT_SET'
-        : (membershipError(state!, model, whitelist, catalogByRawId) ??
+        : (membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!preference.enabled
             ? 'MODEL_DISABLED'
             : usage !== 'chat'

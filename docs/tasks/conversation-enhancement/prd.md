@@ -23,7 +23,7 @@ Mio 当前已具备用户归属、BYOK 动态准入、PostgreSQL 元数据与 DS
 
 以下四项核心边界由项目负责人于 2026-11-23 明确确认，作为本 PRD 全部开发单元的共同约束：
 
-1. **失败重试与 BYOK 计费红线**：普通上游瞬时失败（`429`、`5xx`、网络或流式超时）**默认不自动重发计费模型请求**（不挂载无感自动重试），改为由 M1 将细分脱敏错误码明确返回前端，由用户按需触发重试或经 M6 重新生成；**唯一受控例外**为启用 M3 自动压缩的会话在收到明确 `CONTEXT_OVERFLOW` 时，允许在同一受理轮次内执行一次受控摘要压缩并重发一次正文请求，两次模型调用的用量与状态均须如实追加至同一请求的 `model_observations`。
+1. **失败重试与 BYOK 计费红线**：普通上游瞬时失败（`429`、`5xx`、网络或流式超时）默认不自动重发计费模型请求，M1 向前端返回细分脱敏错误码，由用户按需重试或经 M6 重新生成。M3 的受控例外限于上游明确返回 `CONTEXT_OVERFLOW`、且出错的这次正文尝试尚未通过 SSE 发布非空正文的情况，同一受理轮次可执行一次摘要及一次正文重发。首次正文失败、摘要、正文重发各自按实际出站向同一请求的 `model_observations` 追加观察，恢复路径合计最多三次出站。若这次尝试已发布非空正文，保留流上已推送的片段并直接以 `MODEL_CONTEXT_OVERFLOW` 结算，不追加摘要或重发。整轮自动摘要最多一次，未知结果保留原回执。
 2. **单轮消息请求体积上限**：仅将 `POST /api/v1/conversations/:id/messages` 的 JSON 请求体上限从现行 `16 KiB` 放宽至 **`256 KiB`**（覆盖旧库单集剧本最大约 170 KB 的粘贴与润色场景）；其余对话创建、绑定、重命名、取消、分叉与压缩等控制接口继续保持 `16 KiB` 上限与 10 秒读取期限。
 3. **对话删除语义**：统一采用**软归档**（`DELETE /api/v1/conversations/:id` 幂等写入 `archived_at`），归档后退出常规会话列表并拒绝新消息发送、模型切换与手动压缩，但完整保留底层 DSH JSONL 日志、请求回执审计及已生成的私有图片资产引用；物理清除与数据保留周期另立全局治理规范。
 4. **深度思考（Reasoning）公开投影边界**：思考过程增量与状态**仅通过实时 SSE 事件流推送**供前端展示实时推理进度，不混入 `GET /api/v1/conversations/:id/history` 的正式助手消息正文；DSH 原生会话日志照常保留完整思考块，不破坏底层回放与未来按需扩展。
@@ -117,21 +117,22 @@ Mio 当前已具备用户归属、BYOK 动态准入、PostgreSQL 元数据与 DS
   - 挂载确定性 Token 计量服务，向客户端公开当前会话估算的上下文占用与路由窗口容量；
   - 挂载无模型工具输出裁剪器，在压力升高时优先裁减历史大体积工具文本（如历史 `list_image_models` 返回列表），保留头尾与完整原始日志；
   - 打通 `OneLinkAdapter` 受控 `purpose: 'compaction'` 绑定，实现面向 AI 漫剧创作的自动上下文摘要压缩、收到 `CONTEXT_OVERFLOW` 时的单次自动压缩重发，以及空闲会话显式手动压缩接口 `POST /api/v1/conversations/:id/compact`；
-  - 支持将新建/新写入 JSONL 会话日志切换为带校验和的 `zstd` 帧压缩，同时无损兼容既有未压缩历史日志读取。
+  - 新会话使用带校验和的 `zstd` 帧压缩，既有未压缩会话保留原目录、日志及续写格式。
   - **明确非目标**：不删除或篡改原始 JSONL 历史事件；不对未声明 `contextWindow` 的路由猜测窗口大小触发自动摘要；压缩绝不跨会话或借用全局 Key。
 - **C0 就绪条件与解决动作**：
-  - **依赖**：M1 已完成（`CONTEXT_OVERFLOW` 识别与步级检查点就绪）。
-  - **C0 核对项**：定稿纯业务模块中的**漫剧会话压缩提示词**（要求结构化保留：核心世界观与时代设定、已登场角色/场景/道具档案、分集剧情推进状态、已引用的用户或生成资产 UUID `assetId`/`jobId`、画风与镜头语言约束、当前待办创作意图）；确定触发阈值与保留比例（如输入压力达 `min(W * 0.8, W - maxOutputTokens - headroom)` 时触发，保留最近约 20% 表面节点且遵守 `toolPairingBalanced` 工具配对边界）；核对 `dsh-session-persistence-jsonl` 在同一 `sessions` 根目录下混合读取历史 `compression: 'none'` 与新 `compression: 'zstd'` 日志的实测兼容性。
+  - **依赖**：M1 的 `CONTEXT_OVERFLOW` 识别与步级检查点已经人工接受，候选为 `978d72073e63272fea07b7b1b8c5fa462385b49a`。[M1 成果](complete/report.md#conversation-step-reliability-and-cache)
+  - **C0 核对项**：漫剧摘要结构化保留核心世界观与时代设定、已登场角色/场景/道具档案、分集剧情推进状态、已引用的用户或生成资产 UUID `assetId`/`jobId`、画风与镜头语言约束、当前待办创作意图。取 `headroom = min(1024, floor(W * 0.1))`，输入压力达到 `max(1, min(floor(W * 0.8), W - maxOutputTokens - headroom))` 时尝试压缩，保留最近约 20% 表面节点并遵守 `toolPairingBalanced` 工具配对边界。固定版本的官方日志服务在同一根目录切换格式时拒绝打开旧日志和创建新日志。双目录的隔离验证通过并已获人工接受，原 `sessions` 负责旧会话冷读和续写，新 `sessions-zstd` 负责新会话。
 - **C1 实施要点与依赖顺序**：
-  1. 在根 `package.json` 显式声明 `0.2.2-rc.1` 的 `@deepseek-ai/dsh-token-meter`、`@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-compaction-tool-result-pruner`；装配挂载计量与裁剪服务，并在验证兼容后将 [cordis.patch.yml](../../../cordis.patch.yml) 的 `sessions` 切换为 `compression: zstd`。
+  1. 在根 `package.json` 显式声明 `0.2.2-rc.1` 的 `@deepseek-ai/dsh-token-meter`、`@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-compaction-tool-result-pruner`。装配挂载计量、裁剪服务及两套官方日志后端，并按同一会话 ID 路由，重复 ID、损坏或读取故障拒绝继续。
   2. 改造 [src/dsh/onelink.ts](../../../src/dsh/onelink.ts)：允许已绑定 `ConversationRun` 的活动轮次（或显式手动压缩请求）通过 `prepareCall` / `stream` 执行 `purpose === 'compaction'` 的同模型调用，强制复用同一 `userId`、冻结路由与 `apiKey`，拒绝携带外部工具调用，并将压缩步骤的观测追加进 `model_observations`（标记辅助用途以便区分正文步骤）。
-  3. 在 `src/conversations/` 与 `src/dsh/` 实现基于 `CompactionEngine` 的漫剧压缩策略及 `POST /api/v1/conversations/:id/compact`（传入幂等 `requestId`，忙时返回 `409 CONVERSATION_BUSY`，无 `contextWindow` 路由返回明确不可压缩错误码）；在 SSE `snapshot`/`state` 或会话详情附带脱敏 `contextUsage: { estimatedTokens, contextWindow, compacted }`；确保 `history()` 继续只投影真实用户与助手消息，把内部 `compact-checkpoint` 摘要块隔离在模型可见表面之内、公开历史之外（或仅输出轻量已压缩状态提示）。
+  3. 在 `src/conversations/` 与 `src/dsh/` 实现基于 `CompactionEngine` 的漫剧压缩策略及 `POST /api/v1/conversations/:id/compact`。客户端传入幂等 `requestId`，成功受理后沿现有 202、GET 回执与 SSE 结算。忙时返回 `409 CONVERSATION_BUSY`，无可用 BYOK 窗口时返回 `409 CONVERSATION_COMPACTION_UNSUPPORTED`。在 SSE `snapshot` 和可取得估算的终态 `state` 附带脱敏 `contextUsage: { estimatedTokens, contextWindow, compacted }`，窗口无依据时为 `null`。保留 `history()` 的用户、助手及已有公开工具和状态投影，内部摘要只进入模型可见上下文。
   4. 进入 `verify` 前同步 [docs/conversations.md](../../conversations.md)、[docs/apis/conversations.md](../../apis/conversations.md)、[docs/integrations/dsh.md](../../integrations/dsh.md) 与 [docs/integrations/onelink.md](../../integrations/onelink.md)。
 - **验收与接受条件**：
   - 隔离小窗口路由（如 `contextWindow = 8192`）连续多轮输入长剧本设定与工具调用：验证先触发零模型调用的工具结果裁剪，继续增长后触发漫剧摘要压缩，后续轮次模型入参包含压缩摘要与近期消息且仍能准确回答第 1 轮的角色设定与图片 `assetId`；
-  - 模拟上游首次返回 `CONTEXT_OVERFLOW`，验证同轮自动完成一次压缩并重发成功，`model_observations` 准确记录失败、压缩与重发三次受控记录，若重发仍超限则立即以 `MODEL_CONTEXT_OVERFLOW` 终止（绝不二次循环重发）；
+  - 模拟同一次模型尝试在发布非空正文前收到上游明确 `CONTEXT_OVERFLOW`，验证同轮一次摘要压缩和一次重发，`model_observations` 分别记录失败、摘要与重发。重发仍超限时立即以 `MODEL_CONTEXT_OVERFLOW` 终止。
+  - 模拟该次尝试发布非空正文后才收到明确超限，验证 SSE 保留已推送片段、GET 和 SSE 返回 `MODEL_CONTEXT_OVERFLOW`，该次失败后没有摘要或重发。原生失败尝试留在日志中，公开历史沿正式消息投影。前序步骤已发布的正文及本次隐藏推理不改变该判定。
   - 验证 `GET /api/v1/conversations/:id/history` 翻页仍完整返回压缩前的全部原始用户/助手消息，不泄露内部压缩提示词；
-  - 验证旧 `compression: 'none'` 会话文件在升级 `zstd` 后重启冷读与续聊 100% 正常；在常驻 `mio_dev` 用有界最小窗口配置完成一次真实模型压缩闭环观察。
+  - 用正式双目录装配验证旧 `compression: 'none'` 会话重启冷读与原格式续写、新校验和 `zstd` 会话冷读续写和 ID 冲突拒绝。验证手动压缩的权限、去重、取消与无可压缩前缀的零次出站。在常驻 `mio_dev` 用有界最小窗口配置完成一次真实模型压缩闭环观察。
 
 ### 5.4 单元 M4：会话用途模板与受控项目上下文注入（对接漫剧 D2）
 

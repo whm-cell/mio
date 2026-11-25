@@ -14,22 +14,28 @@ import type {
   ImageRouteParamSpec,
 } from '../../generations/contracts.ts';
 import type { VideoDriver, VideoMode } from '../../generations/video-contracts.ts';
+import { AUDIO_ROUTES, audioCapabilities, validAudioRoute } from './audio.ts';
+import { VOICE_DRIVER, VOICE_OPERATION, VOICE_PATH, validVoiceRoute } from './voices.ts';
 import { validateVideoRouteConfig } from './video-route.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,
   ProviderError,
   categories,
+  isChatReasoningEffort,
 } from '../contracts.ts';
 import type {
   AdaptationCapabilityMetadata,
   AdaptationSourceKind,
+  AudioDriver,
   Category,
   ChatProfile,
+  ChatReasoningCapability,
   ImageCapabilityMetadata,
   ImageParameterView,
   ChatImageBudget,
   PlatformRouteRecord,
+  ProviderOperation,
   VerificationRecord,
   VideoCapabilityMetadata,
   VideoRouteConfig,
@@ -106,9 +112,9 @@ export function deriveImageParameterView(route: ImageRouteConfig): ImageParamete
 export interface ValidatedModelRoute {
   readonly providerType: 'onelink';
   readonly rawModelId: string;
-  readonly operation: 'chat' | 'image.generate' | 'video.generate';
+  readonly operation: ProviderOperation;
   readonly vendor: string;
-  readonly driver: ChatProfile | ImageDriver | VideoDriver;
+  readonly driver: ChatProfile | ImageDriver | VideoDriver | AudioDriver;
   readonly classification: Category;
   readonly submitPath: string;
   readonly editPath: string | null;
@@ -172,6 +178,28 @@ function invalidRoute(): never {
   throw new ProviderError(HTTP_STATUS.BAD_REQUEST, 'ROUTE_INVALID');
 }
 
+function validateChatReasoning(value: unknown): ChatReasoningCapability | undefined {
+  if (value === undefined) return;
+  if (
+    !isPlainObject(value) ||
+    Object.keys(value).some((key) => key !== 'supported' && key !== 'efforts')
+  )
+    invalidRoute();
+  const { supported, efforts } = value;
+  if (supported === false && efforts === undefined) return { supported: false };
+  if (supported !== true) invalidRoute();
+  if (efforts === undefined) return { supported };
+  if (
+    !Array.isArray(efforts) ||
+    efforts.length === 0 ||
+    efforts.length > 3 ||
+    !efforts.every(isChatReasoningEffort) ||
+    new Set(efforts).size !== efforts.length
+  )
+    invalidRoute();
+  return { supported, efforts: [...efforts] };
+}
+
 function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
   if (value === undefined) return {};
   if (!isPlainObject(value)) invalidRoute();
@@ -180,6 +208,9 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
       ![
         'contextWindow',
         'maxOutputTokens',
+        'cacheRetention',
+        'reasoning',
+        'streamIdleTimeoutMs',
         'inputModalities',
         'maxRequestImages',
         'maxRequestImageBytes',
@@ -199,6 +230,25 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
     (!Number.isSafeInteger(value.maxOutputTokens) ||
       Number(value.maxOutputTokens) < 1 ||
       Number(value.maxOutputTokens) > 65_536)
+  )
+    invalidRoute();
+  const { cacheRetention } = value;
+  if (
+    cacheRetention !== undefined &&
+    cacheRetention !== 'none' &&
+    cacheRetention !== 'short' &&
+    cacheRetention !== 'long'
+  )
+    invalidRoute();
+  const reasoning = validateChatReasoning(value.reasoning);
+  const { streamIdleTimeoutMs } = value;
+  if (
+    streamIdleTimeoutMs !== undefined &&
+    (reasoning?.supported !== true ||
+      typeof streamIdleTimeoutMs !== 'number' ||
+      !Number.isSafeInteger(streamIdleTimeoutMs) ||
+      streamIdleTimeoutMs < 1 ||
+      streamIdleTimeoutMs > 120_000)
   )
     invalidRoute();
   if (
@@ -230,6 +280,9 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
     ...(typeof value.maxOutputTokens === 'number'
       ? { maxOutputTokens: value.maxOutputTokens }
       : {}),
+    ...(cacheRetention !== undefined ? { cacheRetention } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
     ...(Array.isArray(value.inputModalities)
       ? { inputModalities: value.inputModalities.includes('image') ? ['text', 'image'] : ['text'] }
       : {}),
@@ -354,6 +407,37 @@ export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
           cancellation: { supported: false },
         },
       },
+      sourceKind: value.sourceKind as AdaptationSourceKind,
+      source,
+      sourceVersion,
+      enabled,
+    };
+  }
+
+  if (
+    value.operation === 'audio.tts' ||
+    value.operation === 'audio.clone' ||
+    value.operation === VOICE_OPERATION
+  ) {
+    const listing = value.operation === VOICE_OPERATION;
+    if (listing ? !validVoiceRoute(value) : !validAudioRoute(value)) invalidRoute();
+    const route = listing
+      ? { driver: VOICE_DRIVER, path: VOICE_PATH }
+      : AUDIO_ROUTES[value.operation === 'audio.tts' ? 'tts' : 'clone'];
+    return {
+      providerType,
+      rawModelId,
+      operation: value.operation,
+      vendor: 'minimax',
+      driver: route.driver,
+      classification: 'voice',
+      submitPath: route.path,
+      editPath: null,
+      queryPathTemplate: null,
+      paramSpec: listing ? {} : { ...audioCapabilities(value.paramSpec)! },
+      requestDefaults: {},
+      outputSpec: {},
+      capabilityMetadata: {},
       sourceKind: value.sourceKind as AdaptationSourceKind,
       source,
       sourceVersion,
@@ -713,7 +797,7 @@ export function resolveVideoRoute(row: PlatformRouteRecord): ResolvedVideoRoute 
 
 export function resolveVerificationView(options: {
   verification: VerificationRecord | undefined;
-  operation: 'chat' | 'image.generate' | 'video.generate';
+  operation: ProviderOperation;
   declarationVersion: number;
   profile: string;
   credentialVersion: number;

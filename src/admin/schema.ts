@@ -1,4 +1,9 @@
 import type { Pool } from 'pg';
+import {
+  checkProviderOperations,
+  providerOperationCheck,
+  upgradeProviderOperationSQL,
+} from '../providers/operation-schema.ts';
 
 const initialRouteTemplatesSeedJson = JSON.stringify([
   {
@@ -446,7 +451,7 @@ CREATE TABLE IF NOT EXISTS mio_admin_route_templates (
   description text NOT NULL DEFAULT ''
     CHECK (char_length(description) <= 500),
   operation text NOT NULL
-    CHECK (operation IN ('chat', 'image.generate')),
+    CHECK (${providerOperationCheck}),
   vendor text NOT NULL
     CHECK (char_length(vendor) BETWEEN 1 AND 64 AND vendor ~ '^[a-z0-9-]+$'),
   driver text NOT NULL
@@ -460,34 +465,9 @@ CREATE TABLE IF NOT EXISTS mio_admin_route_templates (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
-DO $$
-DECLARE
-  rec record;
-BEGIN
-  FOR rec IN
-    SELECT conname FROM pg_constraint
-    WHERE conrelid='mio_admin_route_templates'::regclass AND contype='c'
-      AND position('operation' in pg_get_constraintdef(oid)) > 0
-      AND position('image.generate' in pg_get_constraintdef(oid)) > 0
-      AND position('video.generate' in pg_get_constraintdef(oid)) = 0
-  LOOP
-    EXECUTE format('ALTER TABLE mio_admin_route_templates DROP CONSTRAINT %I', rec.conname);
-  END LOOP;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='mio_admin_route_templates'::regclass
-      AND conname='mio_admin_route_templates_operation_v1_check'
-  ) THEN
-    ALTER TABLE mio_admin_route_templates ADD CONSTRAINT mio_admin_route_templates_operation_v1_check
-      CHECK (operation IN ('chat', 'image.generate', 'video.generate')) NOT VALID;
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='mio_admin_route_templates'::regclass
-      AND conname='mio_admin_route_templates_operation_v1_check' AND NOT convalidated
-  ) THEN
-    ALTER TABLE mio_admin_route_templates
-      VALIDATE CONSTRAINT mio_admin_route_templates_operation_v1_check;
-  END IF;
-END $$;
+ALTER TABLE mio_admin_route_templates
+  DROP CONSTRAINT IF EXISTS mio_admin_route_templates_operation_v1_check;
+${upgradeProviderOperationSQL('mio_admin_route_templates')}
 CREATE TABLE IF NOT EXISTS mio_admin_audit_logs (
   id uuid PRIMARY KEY,
   actor_id text,
@@ -563,6 +543,7 @@ END $$;
 `;
 
 export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void> {
+  await checkProviderOperations(pool, ['mio_admin_route_templates']);
   for (const [sql, types] of [
     [
       'SELECT id,username,password_hash,is_super_admin,created_at,updated_at FROM mio_admin_accounts LIMIT 0',
@@ -602,13 +583,4 @@ export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void>
     if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
       throw new Error('ADMIN_SCHEMA: incompatible columns');
   }
-  const routeOperation = await pool.query<{ definition: string; valid: boolean }>(`
-    SELECT pg_get_constraintdef(oid) AS definition,convalidated AS valid
-    FROM pg_constraint WHERE conrelid='mio_admin_route_templates'::regclass
-      AND conname='mio_admin_route_templates_operation_v1_check'`);
-  if (
-    !routeOperation.rows[0]?.valid ||
-    !routeOperation.rows[0].definition.includes('video.generate')
-  )
-    throw new Error('ADMIN_SCHEMA: video route template operation constraint required');
 }

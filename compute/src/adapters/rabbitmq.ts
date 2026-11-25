@@ -10,20 +10,47 @@ import type {
   SocketOptions,
 } from 'amqplib';
 import {
+  AUDIO_COMMAND_QUEUE,
+  AUDIO_MAX_MESSAGE_BYTES,
+  AUDIO_RESULT_ROUTING_KEY,
   COMMAND_QUEUE,
   COMPUTE_MAX_MESSAGE_BYTES,
+  MEDIA_CONTROL_QUEUE,
+  MEDIA_ENCODE_QUEUE,
+  MEDIA_MAX_MESSAGE_BYTES,
+  MEDIA_PROBE_QUEUE,
+  MEDIA_RESULT_ROUTING_KEY,
   RESULT_EXCHANGE,
   RESULT_ROUTING_KEY,
+  WORKER_TELEMETRY_ROUTING_KEY,
+  WORKER_MAX_MESSAGE_BYTES,
   VIDEO_PROBE_RESULT_ROUTING_KEY,
+  parseWorkerLimitsCommand,
+  workerControlQueue,
+  mediaResourceClass,
+  parseAudioInspectCommandV1,
   parseComputeCommandV1,
+  parseMediaCommand,
+  parseMediaControl,
   parseVideoProbeCommandV1,
 } from '@mio/compute-contracts';
 import type {
+  AudioInspectCommandV1,
+  AudioInspectResultV1,
   ComputeCommandV1,
   ComputeResultV1,
+  MediaCommand,
+  MediaControl,
+  MediaResult,
   VideoProbeCommandV1,
   VideoProbeResultV1,
+  WorkerResourceClass,
+  WorkerTelemetry,
+  WorkerLimitsResult,
+  WorkerLimitsCommand,
 } from '@mio/compute-contracts';
+
+export class WorkerTelemetryPublishRejected extends Error {}
 
 const BROKER_STARTUP_TIMEOUT_MS = 5000;
 const BROKER_CLOSE_TIMEOUT_MS = 5000;
@@ -42,6 +69,12 @@ interface ConsumerSlot {
 interface ConsumerGate {
   open: boolean;
   slot: ConsumerSlot;
+}
+
+interface CommandProtocol<T> {
+  queue: string;
+  maxBytes: number;
+  parse(value: unknown): T;
 }
 
 async function closeConnection(
@@ -107,6 +140,8 @@ export class Broker {
   #handling: Promise<void> | null = null;
   #pause: Promise<void> | null = null;
   #handlerFailure: unknown = null;
+  readonly #concurrentHandling = new Set<Promise<void>>();
+  #concurrentClosing = false;
 
   private constructor(
     consumerConnection: ChannelModel,
@@ -236,8 +271,31 @@ export class Broker {
   publishVideoProbe(message: VideoProbeResultV1): Promise<void> {
     return this.publishMessage(message, VIDEO_PROBE_RESULT_ROUTING_KEY);
   }
+
+  publishAudio(message: AudioInspectResultV1): Promise<void> {
+    return this.publishMessage(message, AUDIO_RESULT_ROUTING_KEY);
+  }
+
+  publishMedia(message: MediaResult): Promise<void> {
+    return this.publishMessage(message, MEDIA_RESULT_ROUTING_KEY);
+  }
+
+  publishWorker(message: WorkerTelemetry | WorkerLimitsResult): Promise<void> {
+    return this.publishMessage(message, WORKER_TELEMETRY_ROUTING_KEY).catch((error: unknown) => {
+      if (error instanceof Error && ['message nacked', 'MESSAGE_RETURNED'].includes(error.message))
+        throw new WorkerTelemetryPublishRejected(error.message, { cause: error });
+      throw error;
+    });
+  }
+
   private async publishMessage(
-    message: ComputeResultV1 | VideoProbeResultV1,
+    message:
+      | ComputeResultV1
+      | VideoProbeResultV1
+      | AudioInspectResultV1
+      | MediaResult
+      | WorkerTelemetry
+      | WorkerLimitsResult,
     routingKey: string,
   ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
@@ -289,11 +347,206 @@ export class Broker {
     }
   }
 
-  async consume(
+  consume(
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
     handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
+  ): Promise<void> {
+    return this.consumeCommands(
+      {
+        queue: COMMAND_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse(value): ComputeCommandV1 | VideoProbeCommandV1 {
+          return value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            (value as Record<string, unknown>).type === 'video.probe'
+            ? parseVideoProbeCommandV1(value)
+            : parseComputeCommandV1(value);
+        },
+      },
+      async (command, ack) => {
+        if (command.type === 'video.probe') {
+          if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+          return handleVideoProbe(command, ack);
+        }
+        return handle(command, ack);
+      },
+      failed,
+      canAdmit,
+    );
+  }
+
+  consumeAudio(
+    handle: (command: AudioInspectCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    canAdmit: () => boolean,
+  ): Promise<void> {
+    return this.consumeCommands(
+      {
+        queue: AUDIO_COMMAND_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectCommandV1,
+      },
+      handle,
+      failed,
+      canAdmit,
+    );
+  }
+
+  consumeTranscodes(
+    handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: COMMAND_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse: parseComputeCommandV1,
+      },
+      handle,
+      failed,
+      32,
+    );
+  }
+
+  consumeAudioInspections(
+    handle: (command: AudioInspectCommandV1, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: AUDIO_COMMAND_QUEUE,
+        maxBytes: AUDIO_MAX_MESSAGE_BYTES,
+        parse: parseAudioInspectCommandV1,
+      },
+      handle,
+      failed,
+      32,
+    );
+  }
+
+  consumeWorkerControl(
+    instanceId: string,
+    handle: (command: WorkerLimitsCommand, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: workerControlQueue(instanceId),
+        maxBytes: WORKER_MAX_MESSAGE_BYTES,
+        parse: parseWorkerLimitsCommand,
+      },
+      handle,
+      failed,
+    );
+  }
+
+  consumeMedia(
+    resource: WorkerResourceClass,
+    handle: (command: MediaCommand, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      {
+        queue: resource === 'encode' ? MEDIA_ENCODE_QUEUE : MEDIA_PROBE_QUEUE,
+        maxBytes: MEDIA_MAX_MESSAGE_BYTES,
+        parse(value) {
+          const command = parseMediaCommand(value);
+          if (mediaResourceClass(command.operation) !== resource)
+            throw new Error('COMMAND_RESOURCE_MISMATCH');
+          return command;
+        },
+      },
+      handle,
+      failed,
+      32,
+    );
+  }
+
+  consumeMediaControl(
+    handle: (command: MediaControl, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+  ): Promise<void> {
+    return this.#consumeConcurrentChannel(
+      { queue: MEDIA_CONTROL_QUEUE, maxBytes: MEDIA_MAX_MESSAGE_BYTES, parse: parseMediaControl },
+      handle,
+      failed,
+    );
+  }
+
+  async #consumeConcurrentChannel<T extends { messageId: string }>(
+    protocol: CommandProtocol<T>,
+    handle: (command: T, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    prefetch = 1,
+  ): Promise<void> {
+    if (this.#state.closed || this.#concurrentClosing) throw new Error('BROKER_CLOSED');
+    const channel = await this.#consumerConnection.createChannel();
+    watchConsumer(channel, this.#state);
+    await channel.prefetch(prefetch);
+    await channel.consume(
+      protocol.queue,
+      (message) => {
+        if (this.#state.closed || this.#concurrentClosing) return;
+        if (!message) {
+          failed(new Error('CONSUMER_CANCELLED'));
+          return;
+        }
+        let command: T;
+        try {
+          command = this.#decodeCommand(protocol, message);
+        } catch {
+          try {
+            channel.reject(message, false);
+          } catch (error) {
+            failed(error);
+          }
+          return;
+        }
+        const tracked = handle(command, () => channel.ack(message))
+          .catch((error: unknown) => {
+            if (error instanceof Error && error.message === 'ATTEMPT_CONFLICT') {
+              try {
+                channel.reject(message, false);
+              } catch (rejectError) {
+                failed(rejectError);
+              }
+            } else failed(error);
+          })
+          .finally(() => {
+            this.#concurrentHandling.delete(tracked);
+          });
+        this.#concurrentHandling.add(tracked);
+      },
+      { noAck: false, consumerTag: `mio-${createId()}` },
+    );
+  }
+
+  #decodeCommand<T extends { messageId: string }>(
+    protocol: CommandProtocol<T>,
+    message: ConsumeMessage,
+  ): T {
+    if (
+      message.properties.userId !== this.#expectedUserId ||
+      message.properties.contentType !== 'application/json' ||
+      message.content.length > protocol.maxBytes
+    )
+      throw new Error('COMMAND_INVALID');
+    const value: unknown = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(message.content),
+    );
+    const command = protocol.parse(value);
+    if (message.properties.messageId !== command.messageId) throw new Error('COMMAND_ID_MISMATCH');
+    return command;
+  }
+
+  private async consumeCommands<T extends { messageId: string }>(
+    protocol: CommandProtocol<T>,
+    handle: (command: T, ack: () => void) => Promise<void>,
+    failed: (error: unknown) => void,
+    canAdmit: () => boolean,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -313,7 +566,7 @@ export class Broker {
       failed(error);
     };
     await slot.channel.consume(
-      COMMAND_QUEUE,
+      protocol.queue,
       (message: ConsumeMessage | null) => {
         // A closed gate leaves late deliveries unacked; closing this exact channel requeues them.
         // Late cancellation notifications from that channel also belong to the old consumer.
@@ -331,25 +584,9 @@ export class Broker {
           report(error);
           return;
         }
-        let command: ComputeCommandV1 | VideoProbeCommandV1;
+        let command: T;
         try {
-          if (
-            message.properties.userId !== this.#expectedUserId ||
-            message.properties.contentType !== 'application/json' ||
-            message.content.length > COMPUTE_MAX_MESSAGE_BYTES
-          )
-            throw new Error('COMMAND_INVALID');
-          const body = new TextDecoder('utf-8', { fatal: true }).decode(message.content);
-          const value: unknown = JSON.parse(body);
-          command =
-            value &&
-            typeof value === 'object' &&
-            !Array.isArray(value) &&
-            (value as Record<string, unknown>).type === 'video.probe'
-              ? parseVideoProbeCommandV1(value)
-              : parseComputeCommandV1(value);
-          if (message.properties.messageId !== command.messageId)
-            throw new Error('COMMAND_ID_MISMATCH');
+          command = this.#decodeCommand(protocol, message);
         } catch {
           try {
             slot.channel.reject(message, false);
@@ -360,12 +597,7 @@ export class Broker {
         }
         const tracked = Promise.resolve()
           .then(() => {
-            const ack = () => slot.channel.ack(message);
-            if (command.type === 'video.probe') {
-              if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
-              return handleVideoProbe(command, ack);
-            }
-            return handle(command, ack);
+            return handle(command, () => slot.channel.ack(message));
           })
           .catch((error: unknown) => {
             const code = error instanceof Error ? error.message : '';
@@ -433,8 +665,10 @@ export class Broker {
 
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
+    this.#concurrentClosing = true;
     // Preserve journal ownership until admitted transcodes finish.
     if (this.#handling) await this.#handling;
+    await Promise.allSettled(this.#concurrentHandling);
     this.#state.markClosed();
     const deadline = setTimeout(() => this.#transport.abort(), BROKER_CLOSE_TIMEOUT_MS);
     try {

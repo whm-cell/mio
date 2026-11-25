@@ -1,9 +1,11 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { Context } from '@deepseek-ai/cordis';
 import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
   IMAGE_OFFLOAD_REQUIRED_CODE,
   LlmAdapter,
   LlmError,
+  ReasoningEffortId,
   resolveRetryPolicy,
 } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
@@ -19,11 +21,21 @@ import type {
   ModelObservation,
 } from '../conversations/contracts.ts';
 import type { ChatProfile, ChatSelection, ChatRuntimeSnapshot } from '../providers/contracts.ts';
-import { DEFAULT_CHAT_IMAGE_BUDGET } from '../providers/contracts.ts';
+import {
+  DEFAULT_CHAT_IMAGE_BUDGET,
+  DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS,
+  supportsChatReasoning,
+} from '../providers/contracts.ts';
 import { ONELINK_ORIGIN } from '../integrations/onelink/models.ts';
-import { chatTransport } from '../integrations/onelink/chat.ts';
+import { chatTransport, isChatContextOverflow } from '../integrations/onelink/chat.ts';
 import type { ChatResponseFacts } from '../integrations/onelink/chat.ts';
 import { prepareVisionRequest, visionAttachmentStore } from './vision-request.ts';
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface LlmRequestPurposeMap {
+    compaction: true;
+  }
+}
 
 const retryPolicy = resolveRetryPolicy({ mode: 'normal', maxRetries: 0 }, 'Mio OneLink');
 const noCredentials: CredentialStore = {
@@ -43,13 +55,21 @@ const chatProfiles = {
     api: openAICompletionsApi,
     apiId: 'openai-completions',
     path: '/v1/chat/completions',
-    compat: { maxTokensField: 'max_tokens', supportsStore: false },
+    defaultCacheRetention: 'none',
+    // OneLink's Chat Completions endpoint manages prefix caching on the server.
+    compat: {
+      maxTokensField: 'max_tokens',
+      supportsStore: false,
+      supportsLongCacheRetention: false,
+      sendSessionAffinityHeaders: false,
+    },
   },
   'anthropic-messages': {
     provider: 'onelink-anthropic',
     api: anthropicMessagesApi,
     apiId: 'anthropic-messages',
     path: '/v1/messages',
+    defaultCacheRetention: 'short',
     // Disable SDK strict-tool downgrade/repost; Mio owns every visible attempt.
     compat: { supportsStrictTools: false },
   },
@@ -63,7 +83,7 @@ function protocolProfile(profile: ChatProfile) {
 export const onelinkRoute = (selection: ChatSelection) =>
   protocolProfile(selection.protocol).provider;
 
-function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
+export function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
   const maxTokens = snapshot.maxOutputTokens ?? 1024;
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 65536)
     throw new LlmError('OneLink maxOutputTokens is invalid', 'BINDING_REQUIRED');
@@ -92,8 +112,13 @@ function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
   return { protocol, submitPath, baseUrl: ONELINK_ORIGIN };
 }
 
-function chatFailureCode(aborted: boolean, status: number | undefined, fallback: string): string {
+function chatFailureCode(
+  aborted: boolean,
+  facts: ChatResponseFacts,
+  failure: { code: string; message?: string },
+): string {
   if (aborted) return 'ABORTED';
+  const { status, contextOverflow } = facts;
   switch (status) {
     case HTTP_STATUS.UNAUTHORIZED:
     case HTTP_STATUS.FORBIDDEN:
@@ -107,8 +132,14 @@ function chatFailureCode(aborted: boolean, status: number | undefined, fallback:
       return 'TIMEOUT';
   }
   if (status !== undefined && status >= 500) return 'SERVER';
-  if (status !== undefined && status >= HTTP_STATUS.BAD_REQUEST) return 'INVALID_REQUEST';
-  return fallback;
+  if (status !== undefined && status >= HTTP_STATUS.BAD_REQUEST)
+    return contextOverflow ? 'CONTEXT_OVERFLOW' : 'INVALID_REQUEST';
+  if (status === HTTP_STATUS.OK && failure.message && isChatContextOverflow(failure.message))
+    return 'CONTEXT_OVERFLOW';
+  // The SDK also infers overflow from payload size and usage heuristics.
+  if (failure.code === CONTEXT_WINDOW_EXCEEDED_CODE) return 'PI_AI_ERROR';
+  if (failure.code === 'STREAM_CLOSED') return 'TRANSPORT';
+  return failure.code;
 }
 
 function metadata(
@@ -116,6 +147,7 @@ function metadata(
   model: string,
   snapshot: ChatRuntimeSnapshot,
 ): LlmResolvedModelInfo {
+  const efforts = snapshot.reasoning?.supported ? snapshot.reasoning.efforts : undefined;
   return {
     provider,
     id: model,
@@ -123,13 +155,66 @@ function metadata(
     inputModalities: [...(snapshot.inputModalities ?? ['text'])],
     defaultMaxTokens: snapshotMaxTokens(snapshot),
     ...(snapshot.contextWindow ? { context: { contextWindow: snapshot.contextWindow } } : {}),
+    ...(efforts?.length
+      ? { reasoning: { efforts: efforts.map((id) => ({ id: ReasoningEffortId(id), name: id })) } }
+      : {}),
   };
+}
+
+type OneLinkResponseFacts = ChatResponseFacts & { reasoningTokens?: number };
+
+/** Both fixed codecs expose the parsed event before usage normalization erases field presence. */
+function providerReasoningTokens(profile: ChatProfile, event: unknown): number | undefined {
+  type Usage = {
+    completion_tokens_details?: { reasoning_tokens?: unknown };
+    output_tokens_details?: { thinking_tokens?: unknown };
+  };
+  const data = event as {
+    type?: string;
+    usage?: Usage;
+    message?: { usage?: Usage };
+    choices?: { usage?: Usage }[];
+  } | null;
+  const tokens =
+    profile === 'openai-chat'
+      ? (data?.usage ?? data?.choices?.[0]?.usage)?.completion_tokens_details?.reasoning_tokens
+      : (data?.type === 'message_delta'
+          ? data.usage
+          : data?.type === 'message_start'
+            ? data.message?.usage
+            : undefined
+        )?.output_tokens_details?.thinking_tokens;
+  return typeof tokens === 'number' && Number.isSafeInteger(tokens) && tokens >= 0
+    ? tokens
+    : undefined;
+}
+
+function wireModel(
+  model: Model<Api>,
+  effort: SimpleStreamOptions['reasoning'],
+  vendor: ChatRuntimeSnapshot['vendor'],
+): Model<Api> {
+  if (!model.reasoning) return model;
+  // Preserve the old wire defaults for turns without a selection and for summaries.
+  if (effort === undefined) return { ...model, reasoning: false };
+  if (model.api === 'anthropic-messages')
+    return { ...model, compat: { ...model.compat, forceAdaptiveThinking: true } };
+  if (vendor === 'deepseek')
+    return {
+      ...model,
+      compat: {
+        ...model.compat,
+        thinkingFormat: 'deepseek',
+        requiresReasoningContentOnAssistantMessages: true,
+      },
+    };
+  return model;
 }
 
 /** One immutable request's SDK provider; only the public protocol factories perform encoding. */
 function requestAdapter(
   run: ConversationRun,
-  facts: ChatResponseFacts,
+  facts: OneLinkResponseFacts,
   vision: ConversationVision | undefined,
   expected: Parameters<typeof visionAttachmentStore>[2],
   execution: { started: boolean },
@@ -149,6 +234,10 @@ function requestAdapter(
       ...rest,
       fetch: transport,
       maxRetries: 0,
+      onProviderStreamEvent(event) {
+        const count = providerReasoningTokens(run.snapshot.protocol, event);
+        if (count !== undefined) facts.reasoningTokens = count;
+      },
       headers: {
         ...rest.headers,
         authorization: `Bearer ${run.snapshot.apiKey}`,
@@ -163,7 +252,7 @@ function requestAdapter(
     api: protocol.apiId,
     baseUrl,
     input: [...(run.snapshot.inputModalities ?? ['text'])],
-    reasoning: false,
+    reasoning: run.snapshot.reasoning?.supported === true,
     // SDK 1.5.0 treats zero as unknown. Never expose this as supplier metadata.
     contextWindow: run.snapshot.contextWindow ?? 0,
     maxTokens,
@@ -186,10 +275,17 @@ function requestAdapter(
       stream: (selected, context, options) =>
         api.stream(selected, context, requestOptions(options)),
       streamSimple: (selected, context, options) =>
-        api.streamSimple(selected, context, requestOptions(options)),
+        api.streamSimple(
+          wireModel(selected, options?.reasoning, run.snapshot.vendor),
+          context,
+          requestOptions(options),
+        ),
     },
   });
   const budget = run.snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET;
+  const streamIdleTimeoutMs =
+    (run.snapshot.reasoning?.supported ? run.snapshot.streamIdleTimeoutMs : undefined) ??
+    DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS;
   const profile: ResolvedPiAiProviderProfile = {
     provider,
     displayName: 'OneLinkAI',
@@ -197,10 +293,10 @@ function requestAdapter(
     modelErrors: new Map(),
     configuredMaxTokens: new Map([[run.snapshot.modelId, maxTokens]]),
     retryPolicy,
-    streamIdleTimeoutMs: 30_000,
-    timeoutMs: 30_000,
+    streamIdleTimeoutMs,
+    timeoutMs: streamIdleTimeoutMs,
     transport: 'sse',
-    cacheRetention: 'none',
+    cacheRetention: run.snapshot.cacheRetention ?? protocol.defaultCacheRetention,
     maxRequestImageBytes: budget.maxRequestImageBytes,
     maxRequestImages: budget.maxRequestImages,
     imageOffloadCountQuantum: 1,
@@ -221,6 +317,8 @@ function requestAdapter(
   });
 }
 
+export const OBSERVATION_UNAVAILABLE = 'OBSERVATION_UNAVAILABLE';
+
 /** Stable registration, request-owned snapshots. A Session id by itself grants no billing authority. */
 export class OneLinkAdapter extends LlmAdapter {
   private readonly vision: ConversationVision | undefined;
@@ -229,6 +327,31 @@ export class OneLinkAdapter extends LlmAdapter {
     this.vision = vision;
   }
   private readonly bindings = new WeakMap<AbortSignal, ConversationRun>();
+  private readonly compactionGrants = new WeakMap<
+    AbortSignal,
+    { run: ConversationRun; used: boolean }
+  >();
+
+  async withCompaction<T>(
+    signal: AbortSignal,
+    run: ConversationRun,
+    dispatch: () => Promise<T>,
+  ): Promise<T> {
+    signal.throwIfAborted();
+    if (
+      this.bindings.get(signal) !== run ||
+      run.snapshot.contextWindow === undefined ||
+      this.compactionGrants.has(signal)
+    )
+      throw new LlmError('OneLink summary has no trusted binding', 'BINDING_REQUIRED');
+    this.compactionGrants.set(signal, { run, used: false });
+    try {
+      return await dispatch();
+    } finally {
+      this.compactionGrants.delete(signal);
+    }
+  }
+
   bind(signal: AbortSignal, run: ConversationRun): () => void {
     const old = this.bindings.get(signal);
     if (old && old !== run) throw new LlmError('OneLink binding conflict', 'BINDING_CONFLICT');
@@ -259,7 +382,7 @@ export class OneLinkAdapter extends LlmAdapter {
   }
   override async prepareCall(provider: string, model: string, signal?: AbortSignal) {
     const run = this.bound(provider, model, signal);
-    const facts: ChatResponseFacts = {};
+    const facts: OneLinkResponseFacts = {};
     const expected = new Map();
     const execution = { started: false };
     const inner = await requestAdapter(run, facts, this.vision, expected, execution).prepareCall(
@@ -280,7 +403,7 @@ export class OneLinkAdapter extends LlmAdapter {
     options: GenerateOptions,
     signal: AbortSignal,
     run: ConversationRun,
-    facts: ChatResponseFacts,
+    facts: OneLinkResponseFacts,
     stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>,
     expected: Parameters<typeof visionAttachmentStore>[2] extends ReadonlyMap<infer K, infer V>
       ? Map<K, V>
@@ -288,12 +411,26 @@ export class OneLinkAdapter extends LlmAdapter {
     execution: { started: boolean },
   ): AsyncIterable<StreamChunk> {
     const maxTokens = snapshotMaxTokens(run.snapshot);
+    const grant = options.purpose === 'compaction' ? this.compactionGrants.get(signal) : undefined;
+    const effort = grant ? undefined : run.reasoningEffort;
     if (
       this.bindings.get(signal) !== run ||
       options.signal !== signal ||
       signal.aborted ||
       options.sessionId !== run.dshSessionId ||
-      options.purpose !== undefined ||
+      options.reasoningEffort !== effort ||
+      (effort !== undefined && !supportsChatReasoning(run.snapshot.reasoning, effort)) ||
+      (options.purpose !== undefined &&
+        (!grant ||
+          grant.run !== run ||
+          grant.used ||
+          options.toolHistory !== undefined ||
+          Boolean(options.tools?.length) ||
+          options.messages.some(
+            (message) =>
+              (message.role !== 'system' && message.role !== 'user') ||
+              message.content.some((block) => block.type !== 'text'),
+          ))) ||
       options.provider !== onelinkRoute(run.snapshot) ||
       options.model !== run.snapshot.modelId ||
       !options.maxTokens ||
@@ -306,30 +443,43 @@ export class OneLinkAdapter extends LlmAdapter {
         (!run.snapshot.inputModalities?.includes('image') || !this.vision))
     )
       throw new LlmError('OneLink request does not match its binding', 'BINDING_REQUIRED');
+    if (grant) grant.used = true;
     let usage: ModelObservation['usage'];
     let failureCode: string | undefined;
     let observed = false;
     let release: (() => void) | undefined;
     execution.started = false;
     const observation = (finish: string): ModelObservation => {
-      // DSH can report cached input with both uncached input and output at zero.
-      if (!usage || !Object.values(usage).some((count) => count > 0))
-        return {
-          ...facts,
-          finish,
-          usageStatus: 'unknown',
-          ...(failureCode ? { failureCode } : {}),
-        };
-      return {
-        ...facts,
-        usage,
+      const { status, providerRequestId, reasoningTokens } = facts;
+      const base = {
+        ...(status !== undefined ? { status } : {}),
+        ...(providerRequestId !== undefined ? { providerRequestId } : {}),
         finish,
+        ...(grant ? { purpose: 'compaction' as const } : {}),
         ...(failureCode ? { failureCode } : {}),
+      };
+      // DSH can report cached input with both uncached input and output at zero.
+      const observedUsage = reasoningTokens === undefined ? usage : { ...usage, reasoningTokens };
+      if (
+        !observedUsage ||
+        (reasoningTokens === undefined && !Object.values(observedUsage).some((count) => count > 0))
+      )
+        return { ...base, usageStatus: 'unknown' };
+      return {
+        ...base,
+        usage: observedUsage,
         usageStatus:
-          finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls'
+          usage && (finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls')
             ? 'reported'
             : 'partial',
       };
+    };
+    const persistObservation = async (finish: string) => {
+      try {
+        await run.observe(observation(finish));
+      } catch {
+        throw new LlmError('OneLink observation unavailable', OBSERVATION_UNAVAILABLE);
+      }
     };
     try {
       const containsImages = options.messages.some((message) =>
@@ -350,7 +500,7 @@ export class OneLinkAdapter extends LlmAdapter {
         if (chunk.type === 'finish') {
           let safe = chunk;
           if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-            failureCode = chatFailureCode(signal.aborted, facts.status, chunk.reason.failure.code);
+            failureCode = chatFailureCode(signal.aborted, facts, chunk.reason.failure);
             safe = {
               type: 'finish',
               reason: {
@@ -368,32 +518,29 @@ export class OneLinkAdapter extends LlmAdapter {
           }
           if (execution.started) {
             observed = true;
-            await run.observe(observation(safe.reason.kind));
+            await persistObservation(safe.reason.kind);
           }
           yield safe;
         } else yield chunk;
       }
     } catch (error) {
+      if (error instanceof LlmError && error.code === OBSERVATION_UNAVAILABLE) throw error;
       if (error instanceof LlmError && error.code === IMAGE_OFFLOAD_REQUIRED_CODE) {
         failureCode = IMAGE_OFFLOAD_REQUIRED_CODE;
         throw error;
       }
-      failureCode = signal.aborted
-        ? 'ABORTED'
-        : error instanceof LlmError && error.code === 'TIMEOUT'
-          ? 'TIMEOUT'
-          : 'ONELINK_FAILED';
+      failureCode = chatFailureCode(
+        signal.aborted,
+        facts,
+        error instanceof LlmError ? error : { code: 'ONELINK_FAILED' },
+      );
       throw new LlmError('OneLink model request failed', failureCode);
     } finally {
       release?.();
       // The loop may stop consuming immediately after abort; it need not request a terminal chunk.
       if (!observed && execution.started) {
         failureCode ??= signal.aborted ? 'ABORTED' : 'ONELINK_UNKNOWN';
-        try {
-          await run.observe(observation(signal.aborted ? 'aborted' : 'unknown'));
-        } catch {
-          throw new LlmError('OneLink observation unavailable', 'OBSERVATION_UNAVAILABLE');
-        }
+        await persistObservation(signal.aborted ? 'aborted' : 'unknown');
       }
     }
   }

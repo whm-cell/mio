@@ -384,7 +384,7 @@ BEGIN
     END LOOP;
   END LOOP;
   FOR rec IN
-    SELECT conname FROM pg_constraint
+    SELECT conrelid, conname FROM pg_constraint
     WHERE conrelid IN (
       'mio_provider_model_routes'::regclass,
       'mio_provider_model_verifications'::regclass,

@@ -458,8 +458,8 @@ describe('video asset admission over HTTP', () => {
     }
   });
 
-  it.each(['admission', 'submission'] as const)(
-    'halts a hung SDK HEAD during video %s without signing or submitting',
+  it.each(['admission', 'submission', 'legacy-admission'] as const)(
+    'halts a hung HEAD during video %s without signing or submitting',
     async (stage) => {
       const f = await assetHttpFixture();
       const reply = Promise.withResolvers<COS.HeadObjectResult>();
@@ -478,8 +478,16 @@ describe('video asset admission over HTTP', () => {
       try {
         const asset = await f.addAsset();
         const references = [{ assetId: asset.assetId }];
-        if (stage === 'admission') {
-          f.objects.head.mockImplementationOnce(storage.head);
+        const legacyHead = async (key: string) => {
+          expect(key).toBe(asset.key);
+          started.resolve();
+          const actual = await reply.promise;
+          return { size: Number(actual.headers?.['content-length']), etag: actual.ETag };
+        };
+        if (stage !== 'submission') {
+          f.objects.head.mockImplementationOnce(
+            stage === 'legacy-admission' ? legacyHead : storage.head,
+          );
           const pending = f.post(references);
           await started.promise;
           await f.closeAdmissions();

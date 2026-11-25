@@ -613,7 +613,7 @@ it('routes transcode commands and preserves bounded result prefetch', async () =
   await broker.close();
 });
 
-it.each(['drain', 'abort'] as const)('settles transcode HEADs on %s', async (shutdown) => {
+it.each(['drain', 'abort', 'legacy'] as const)('HEAD shutdown %s', async (shutdown) => {
   const pair = connections();
   const events: string[] = [];
   let releaseHeads: () => void = () => {};
@@ -630,22 +630,33 @@ it.each(['drain', 'abort'] as const)('settles transcode HEADs on %s', async (shu
       events.push('store.close');
     }),
   } as unknown as ComputeStore;
-  const objects = createCosStorage({
+  const storage = createCosStorage({
     databaseURL: 'postgresql://example.invalid/media',
     bucket: 'mio-test-1234567890',
     region: 'ap-shanghai',
     secretId: 'fixture',
     secretKey: 'fixture',
   });
-  const head = vi.spyOn(COS.prototype, 'headObject').mockImplementation(async () => {
+  async function finishHead() {
     events.push('head.start');
     await headGate;
     events.push('head.end');
+  }
+  const sdkHead = vi.spyOn(COS.prototype, 'headObject').mockImplementation(async () => {
+    await finishHead();
     return {
       ETag: 'etag',
       headers: { 'content-length': '3', 'x-cos-meta-sha256': 'a'.repeat(64) },
     };
   });
+  const legacyHead = vi.fn(async (key: string) => {
+    expect(key).toMatch(/^mio\/derived\//);
+    await finishHead();
+    return { size: 3, etag: 'etag', sha256: 'a'.repeat(64) };
+  });
+  const objects: AssetObjectStore =
+    shutdown === 'legacy' ? { ...storage, head: legacyHead } : storage;
+  const head = shutdown === 'legacy' ? legacyHead : sdkHead;
   const timeout = vi.spyOn(AbortSignal, 'timeout');
   pair.consumer.close.mockImplementation(async () => {
     events.push('consumer.close');
@@ -692,14 +703,15 @@ it.each(['drain', 'abort'] as const)('settles transcode HEADs on %s', async (shu
   try {
     await vi.waitFor(() => expect(head).toHaveBeenCalledTimes(2));
     expect(timeout).toHaveBeenCalledWith(180_000);
-    if (shutdown === 'abort') vi.useFakeTimers();
+    if (shutdown !== 'drain') vi.useFakeTimers();
     const closing = service.close();
     pair.consumer.channel.delivery!(late);
     expect(head).toHaveBeenCalledTimes(2);
     expect(pair.consumer.close).not.toHaveBeenCalled();
     expect(store.close).not.toHaveBeenCalled();
-    if (shutdown === 'abort') {
+    if (shutdown !== 'drain') {
       await vi.advanceTimersByTimeAsync(5000);
+      expect(store.close).toHaveBeenCalledOnce();
       await closing;
       expect(events).not.toContain('head.end');
       releaseHeads();
@@ -720,7 +732,62 @@ it.each(['drain', 'abort'] as const)('settles transcode HEADs on %s', async (shu
     releaseHeads();
     await service.close();
     timeout.mockRestore();
-    head.mockRestore();
+    sdkHead.mockRestore();
+  }
+});
+
+it('returns compute storage unavailable when a legacy HEAD misses the deadline', async () => {
+  connections();
+  const assetId = randomUUID();
+  const key = `mio/raw/${assetId}/${randomUUID()}`;
+  const store = {
+    request: vi.fn().mockResolvedValue(undefined),
+    input: vi.fn().mockResolvedValue({ raw_key: key, size_bytes: '3' }),
+    create: vi.fn(),
+    claim: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn(),
+  } as unknown as ComputeStore;
+  const started = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<{ size: number; etag: string }>();
+  const objects: AssetObjectStore = {
+    head: async (objectKey: string) => {
+      expect(objectKey).toBe(key);
+      started.resolve();
+      return reply.promise;
+    },
+    uploadUrl: vi.fn(),
+    downloadUrl: vi.fn(),
+    copy: vi.fn(),
+    delete: vi.fn(),
+  };
+  const deadline = new AbortController();
+  const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal);
+  const service = createComputeService(store, objects, {
+    brokerURL: 'amqp://a:secret@127.0.0.1/test',
+    brokerUser: 'a',
+    expectedResultUser: 'b',
+  });
+  try {
+    const result = vi.fn();
+    const pending = service
+      .create({ userId: 'owner', sessionId: 'session' }, randomUUID(), assetId)
+      .then(result, result);
+    await started.promise;
+    expect(timeout).toHaveBeenCalledWith(180_000);
+    deadline.abort(new DOMException('fixture deadline', 'TimeoutError'));
+    await vi.waitFor(() =>
+      expect(result).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 503, code: 'COMPUTE_STORAGE_UNAVAILABLE' }),
+      ),
+    );
+    await pending;
+    reply.resolve({ size: 3, etag: 'etag' });
+    await reply.promise;
+    expect(store.create).not.toHaveBeenCalled();
+  } finally {
+    reply.resolve({ size: 3, etag: 'etag' });
+    await service.close();
+    timeout.mockRestore();
   }
 });
 

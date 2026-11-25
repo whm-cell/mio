@@ -5,6 +5,7 @@ import { mkdir, open, readFile, rename, statfs, lstat, unlink } from 'node:fs/pr
 import { dirname, join } from 'node:path';
 import type { VideoProbeCommandV1, VideoProbeMetadataV1 } from '@mio/compute-contracts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
+import { waitForObjectHead } from '../assets/contracts.ts';
 import { withPublicHttps } from '../integrations/onelink/public-https.ts';
 import type {
   VideoExecution,
@@ -158,8 +159,10 @@ export function createVideoMaterializer(
   probe: VideoProbe,
   download: typeof withPublicHttps = withPublicHttps,
 ): VideoMaterializer {
+  const readHead = (key: string, signal: AbortSignal) =>
+    waitForObjectHead(() => objects.head(key, signal), signal);
   const existingObject = (key: string, signal: AbortSignal) =>
-    objects.head(key, signal).catch((error: unknown) => {
+    readHead(key, signal).catch((error: unknown) => {
       signal.throwIfAborted();
       if ((error as { statusCode?: number } | null)?.statusCode === 404) return;
       throw error;
@@ -220,7 +223,7 @@ export function createVideoMaterializer(
             stream.destroy();
             await handle.close();
           }
-          object = await objects.head(key, signal);
+          object = await readHead(key, signal);
         }
         verifyVideoObject(object, saved, uploadedEtag);
         signal.throwIfAborted();
@@ -266,7 +269,7 @@ export function createVideoMaterializer(
         if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
         saved.rawEtag = copied.etag;
         await save(receipt, saved);
-        rawObject = await objects.head(rawKey, signal);
+        rawObject = await readHead(rawKey, signal);
       }
       verifyVideoObject(rawObject, saved, saved.rawEtag);
       signal.throwIfAborted();
@@ -302,12 +305,13 @@ export function createVideoCleanup(objects: AssetObjectStore, dataDirectory: str
       const receipt = join(directory, String(index) + '.json');
       const saved = await readReceipt(receipt, row.id, index);
       if (!saved) continue;
-      const raw = await objects.head(`mio/raw/${saved.assetId}/${saved.attemptId}`, signal);
+      const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
+      const raw = await waitForObjectHead(() => objects.head(rawKey, signal), signal);
       signal.throwIfAborted();
       verifyVideoObject(raw, saved, saved.rawEtag);
       const staging = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
       try {
-        const value = await objects.head(staging, signal);
+        const value = await waitForObjectHead(() => objects.head(staging, signal), signal);
         verifyVideoObject(value, saved, saved.etag);
         signal.throwIfAborted();
         await objects.delete(staging);

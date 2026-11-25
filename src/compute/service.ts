@@ -4,6 +4,7 @@ import { epochMs } from '@mio/foundation/time';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { COMPUTE_MAX_MEDIA_BYTES } from '@mio/compute-contracts';
 import type { ComputeResultV1, VideoProbeCommandV1 } from '@mio/compute-contracts';
+import { waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeBroker } from '../integrations/rabbitmq.ts';
 import type { ComputeConfig } from './config.ts';
@@ -68,7 +69,10 @@ export function createComputeService(
       });
       if (result.state === 'succeeded' && (await store.current(result))) {
         const signal = objectReadSignal();
-        const object = await objects.head(result.output.key, signal);
+        const object = await waitForObjectHead(
+          () => objects.head(result.output.key, signal),
+          signal,
+        );
         signal.throwIfAborted();
         if (
           object.size !== result.output.sizeBytes ||
@@ -220,7 +224,7 @@ export function createComputeService(
         let object: Awaited<ReturnType<AssetObjectStore['head']>>;
         try {
           const signal = objectReadSignal();
-          object = await objects.head(input.raw_key, signal);
+          object = await waitForObjectHead(() => objects.head(input.raw_key, signal), signal);
           signal.throwIfAborted();
         } catch {
           throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');

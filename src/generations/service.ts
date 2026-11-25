@@ -4,6 +4,7 @@ import { epochMs } from '@mio/foundation/time';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { ImageRequestParameters } from './contracts.ts';
 import type { ProviderService } from '../providers/service.ts';
+import { waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetPrincipal } from '../assets/contracts.ts';
 import type { GenerationObjects } from './execution.ts';
 import type { GenerationConfig } from './config.ts';
@@ -37,11 +38,14 @@ export async function createGenerationService(
   const active = new Set<Promise<void>>();
   const admissions = new Set<Promise<unknown>>();
   const run = createGenerationRunner(store, files, objects, provider, stop.signal, transports);
-  const head: GenerationObjects['head'] = (key, signal) =>
-    objects.head(
-      key,
-      AbortSignal.any([stop.signal, AbortSignal.timeout(180_000), ...(signal ? [signal] : [])]),
-    );
+  const head: GenerationObjects['head'] = (key, signal) => {
+    const bounded = AbortSignal.any([
+      stop.signal,
+      AbortSignal.timeout(180_000),
+      ...(signal ? [signal] : []),
+    ]);
+    return waitForObjectHead(() => objects.head(key, bounded), bounded);
+  };
   const create = createGenerationAdmission(store, files, head, provider);
   let cleanup: Promise<void> | undefined;
   let cleanupCursor: string | undefined;

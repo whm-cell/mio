@@ -1,6 +1,6 @@
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { MAX_ASSET_BYTES } from '../assets/contracts.ts';
+import { MAX_ASSET_BYTES, waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetObjectStore, AssetPrincipal } from '../assets/contracts.ts';
 import {
   MEDIA_AVAILABLE_OPERATIONS,
@@ -119,7 +119,10 @@ export function createMediaService(
         for (const id of ids) {
           const asset = byId.get(id)!;
           const size = Number(asset.size_bytes);
-          const head = await objects.head(asset.raw_key, signal).catch(() => {
+          const head = await waitForObjectHead(
+            () => objects.head(asset.raw_key, signal),
+            signal,
+          ).catch(() => {
             signal.throwIfAborted();
             throw new MediaError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
           });

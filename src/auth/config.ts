@@ -21,6 +21,40 @@ export interface AuthRuntimePolicy extends PhoneSmsPolicy {
 
 export type AuthPolicyReader = () => AuthRuntimePolicy;
 
+export interface OneLinkSsoRuntimePolicy {
+  readonly enabled: boolean;
+  readonly clientName: string;
+  readonly allowedClientIds: readonly string[];
+}
+
+export type OneLinkSsoPolicyReader = () => OneLinkSsoRuntimePolicy;
+
+const ONELINK_ROUTER_CLIENT_ID = 'routerClientId';
+
+export function resolveAllowedOneLinkClientIds(
+  clientName: string,
+  clientId: string | null,
+  expectedClientId: string | null,
+): readonly string[] {
+  if (expectedClientId !== null) {
+    const trimmed = expectedClientId.trim();
+    return trimmed && trimmed !== ONELINK_ROUTER_CLIENT_ID ? [trimmed] : [];
+  }
+  const normalizedClientName = clientName.trim();
+  const candidates = [
+    clientId?.trim() ?? '',
+    normalizedClientName,
+    normalizedClientName ? `${normalizedClientName}ClientId` : '',
+  ];
+  const allowed: string[] = [];
+  for (const candidate of candidates) {
+    if (candidate && candidate !== ONELINK_ROUTER_CLIENT_ID && !allowed.includes(candidate)) {
+      allowed.push(candidate);
+    }
+  }
+  return allowed;
+}
+
 export interface AuthConfig {
   baseURL: string;
   secret: string;

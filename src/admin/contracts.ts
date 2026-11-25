@@ -237,3 +237,46 @@ export interface AdminGlobalSettingsView {
     readonly smsProviderConfigured: boolean;
   };
 }
+
+export type OneLinkSsoRegistrationStatus = 'unregistered' | 'registered' | 'trusted_existing';
+export type OneLinkSsoRegistrationSource = 'register_200' | 'register_362_trusted';
+export type OneLinkSsoRegisterOutcome =
+  'registered' | 'already_exists_trusted' | 'rejected' | 'failed';
+
+export interface AdminOneLinkSsoConfigView {
+  readonly environment: string;
+  readonly enabled: boolean;
+  readonly clientName: string;
+  readonly clientId: string | null;
+  readonly expectedClientId: string | null;
+  readonly registrationStatus: OneLinkSsoRegistrationStatus;
+  readonly registrationSource: OneLinkSsoRegistrationSource | null;
+  readonly lastRegisterCode: number | null;
+  readonly lastRegisterTraceId: string | null;
+  readonly lastRegisterMessage: string | null;
+  readonly lastRegisteredAt: string | null;
+  readonly revision: number;
+  readonly updatedBy: string | null;
+  readonly updatedAt: string | null;
+}
+
+export interface AdminOneLinkSsoRuntimeView {
+  readonly configured: boolean;
+  readonly hasEncryptionKey: boolean;
+  readonly authorizeOrigin: string | null;
+  readonly registerOrigin: string | null;
+  readonly callbackUrl: string | null;
+  readonly tokenVerificationMode: 'payload_sub_unverified';
+}
+
+export interface AdminOneLinkSsoView {
+  readonly config: AdminOneLinkSsoConfigView;
+  readonly runtime: AdminOneLinkSsoRuntimeView;
+}
+
+export interface AdminOneLinkSsoRegisterView extends AdminOneLinkSsoView {
+  readonly outcome: OneLinkSsoRegisterOutcome;
+  readonly upstreamCode: number | null;
+  readonly errorCode: string | null;
+  readonly traceId: string | null;
+}

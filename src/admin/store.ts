@@ -6,6 +6,7 @@ import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import type { AuthRuntimePolicy, AuthSmsMode } from '../auth/config.ts';
 import type { DiscoveredModel } from '../integrations/onelink/models.ts';
+import type { OneLinkSsoRegisterResult } from '../integrations/onelink/sso.ts';
 import type {
   Category,
   PlatformCatalogModelRecord,
@@ -21,12 +22,15 @@ import type {
   AdminAccountView,
   AdminAuditLogRecord,
   AdminComputeMonitoringSummary,
+  AdminOneLinkSsoConfigView,
   AdminPrincipal,
   AdminRevisionsView,
   AdminRouteTemplateUiHints,
   AdminRouteTemplateView,
   AdminStoredAuthSettings,
   MonitoringWindow,
+  OneLinkSsoRegistrationSource,
+  OneLinkSsoRegistrationStatus,
   ProbeConfigView,
   UnifiedModelRawSources,
 } from './contracts.ts';
@@ -88,6 +92,59 @@ interface GlobalSettingsRow {
   updated_by: string | null;
   created_at: Date;
   updated_at: Date;
+}
+
+interface OneLinkSsoConfigRow {
+  environment: string;
+  enabled: boolean;
+  client_name: string;
+  client_id: string | null;
+  expected_client_id: string | null;
+  registration_status: OneLinkSsoRegistrationStatus;
+  registration_source: OneLinkSsoRegistrationSource | null;
+  last_register_code: number | null;
+  last_register_trace_id: string | null;
+  last_register_message: string | null;
+  last_registered_at: Date | null;
+  revision: number;
+  updated_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+const ONELINK_SSO_COLUMNS =
+  'environment, enabled, client_name, client_id, expected_client_id, registration_status, registration_source, last_register_code, last_register_trace_id, last_register_message, last_registered_at, revision, updated_by, created_at, updated_at';
+
+function toOneLinkSsoConfigView(row: OneLinkSsoConfigRow): AdminOneLinkSsoConfigView {
+  return {
+    environment: row.environment,
+    enabled: row.enabled,
+    clientName: row.client_name,
+    clientId: row.client_id,
+    expectedClientId: row.expected_client_id,
+    registrationStatus: row.registration_status,
+    registrationSource: row.registration_source,
+    lastRegisterCode: row.last_register_code,
+    lastRegisterTraceId: row.last_register_trace_id,
+    lastRegisterMessage: row.last_register_message,
+    lastRegisteredAt: row.last_registered_at?.toISOString() ?? null,
+    revision: row.revision,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function toAuditOneLinkSsoState(view: AdminOneLinkSsoConfigView): Record<string, unknown> {
+  return {
+    environment: view.environment,
+    enabled: view.enabled,
+    clientName: view.clientName,
+    clientId: view.clientId,
+    expectedClientId: view.expectedClientId,
+    registrationStatus: view.registrationStatus,
+    registrationSource: view.registrationSource,
+    revision: view.revision,
+  };
 }
 
 function parseStoredAuthPolicy(value: Record<string, unknown>): AuthRuntimePolicy {
@@ -214,6 +271,8 @@ async function materializeCuratedModelForActiveProviders(
 
 export class AdminStore {
   readonly initialAuthSettings: AdminStoredAuthSettings | null;
+  readonly initialOneLinkSsoConfig: AdminOneLinkSsoConfigView | null;
+  readonly oneLinkSsoEnv: string;
   private readonly pool: Pool;
   private readonly conversationsPool: Pool | null;
   private readonly ownsConversationsPool: boolean;
@@ -226,12 +285,16 @@ export class AdminStore {
     ownsConversationsPool: boolean,
     mediaPool: Pool | null,
     initialAuthSettings: AdminStoredAuthSettings | null = null,
+    initialOneLinkSsoConfig: AdminOneLinkSsoConfigView | null = null,
+    oneLinkSsoEnv = 'dev',
   ) {
     this.pool = pool;
     this.conversationsPool = conversationsPool;
     this.ownsConversationsPool = ownsConversationsPool;
     this.mediaPool = mediaPool;
     this.initialAuthSettings = initialAuthSettings;
+    this.initialOneLinkSsoConfig = initialOneLinkSsoConfig;
+    this.oneLinkSsoEnv = oneLinkSsoEnv;
   }
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -1791,6 +1854,255 @@ export class AdminStore {
     });
   }
 
+  async readOneLinkSsoConfig(environment: string): Promise<AdminOneLinkSsoConfigView | null> {
+    const row = (
+      await this.pool.query<OneLinkSsoConfigRow>(
+        `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1`,
+        [environment],
+      )
+    ).rows[0];
+    return row ? toOneLinkSsoConfigView(row) : null;
+  }
+
+  async updateOneLinkSsoConfig(
+    actor: AdminAccountView,
+    environment: string,
+    input: {
+      expectedRevision: number;
+      enabled: boolean;
+      expectedClientId?: string | null;
+      clientName: string;
+    },
+  ): Promise<AdminOneLinkSsoConfigView> {
+    return this.transaction(async (client) => {
+      let beforeState: Record<string, unknown> | null = null;
+      let updatedRow: OneLinkSsoConfigRow | undefined;
+
+      if (input.expectedRevision === 0) {
+        const expectedClientId = input.expectedClientId ?? null;
+        updatedRow = (
+          await client.query<OneLinkSsoConfigRow>(
+            `INSERT INTO mio_admin_onelink_sso_config (
+               environment, enabled, client_name, expected_client_id, revision, updated_by
+             ) VALUES ($1, $2, $3, $4, 1, $5)
+             ON CONFLICT (environment) DO NOTHING
+             RETURNING ${ONELINK_SSO_COLUMNS}`,
+            [environment, input.enabled, input.clientName, expectedClientId, actor.username],
+          )
+        ).rows[0];
+        if (!updatedRow) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+      } else {
+        const existing = (
+          await client.query<OneLinkSsoConfigRow>(
+            `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1 FOR UPDATE`,
+            [environment],
+          )
+        ).rows[0];
+        if (!existing || existing.revision !== input.expectedRevision) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+        beforeState = toAuditOneLinkSsoState(toOneLinkSsoConfigView(existing));
+        const nextExpectedClientId =
+          input.expectedClientId === undefined
+            ? existing.expected_client_id
+            : input.expectedClientId;
+        updatedRow = (
+          await client.query<OneLinkSsoConfigRow>(
+            `UPDATE mio_admin_onelink_sso_config
+             SET enabled = $2, client_name = $3, expected_client_id = $4,
+                 revision = revision + 1, updated_by = $5, updated_at = now()
+             WHERE environment = $1 AND revision = $6
+             RETURNING ${ONELINK_SSO_COLUMNS}`,
+            [
+              environment,
+              input.enabled,
+              input.clientName,
+              nextExpectedClientId,
+              actor.username,
+              input.expectedRevision,
+            ],
+          )
+        ).rows[0];
+        if (!updatedRow) {
+          throw new AdminError(HTTP_STATUS.CONFLICT, 'SETTINGS_CONFLICT');
+        }
+      }
+
+      const saved = toOneLinkSsoConfigView(updatedRow);
+      await client.query(
+        `INSERT INTO mio_admin_audit_logs (
+           id, actor_id, actor_name, action, target_id, summary, before_state, after_state
+         ) VALUES ($1, $2, $3, 'onelink.sso.update', $4, $5, $6::jsonb, $7::jsonb)`,
+        [
+          createId(),
+          actor.id,
+          actor.username,
+          environment,
+          `Updated OneLink SSO config (env=${environment}, enabled=${saved.enabled}, rev=${saved.revision})`,
+          beforeState ? JSON.stringify(beforeState) : null,
+          JSON.stringify(toAuditOneLinkSsoState(saved)),
+        ],
+      );
+      return saved;
+    });
+  }
+
+  async recordOneLinkSsoRegistration(
+    actor: AdminAccountView,
+    environment: string,
+    clientName: string,
+    result: OneLinkSsoRegisterResult,
+  ): Promise<AdminOneLinkSsoConfigView | null> {
+    return this.transaction(async (client) => {
+      const existing = (
+        await client.query<OneLinkSsoConfigRow>(
+          `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1 FOR UPDATE`,
+          [environment],
+        )
+      ).rows[0];
+
+      if (result.kind === 'registered') {
+        const beforeState = existing
+          ? toAuditOneLinkSsoState(toOneLinkSsoConfigView(existing))
+          : null;
+        const row = (
+          await client.query<OneLinkSsoConfigRow>(
+            `INSERT INTO mio_admin_onelink_sso_config (
+               environment, enabled, client_name, client_id, expected_client_id,
+               registration_status, registration_source,
+               last_register_code, last_register_trace_id, last_register_message,
+               last_registered_at, revision, updated_by
+             ) VALUES (
+               $1, false, $2, $3, NULL,
+               'registered', 'register_200',
+               200, $4, 'registered',
+               now(), 1, $5
+             )
+             ON CONFLICT (environment) DO UPDATE SET
+               client_name = EXCLUDED.client_name,
+               client_id = EXCLUDED.client_id,
+               registration_status = 'registered',
+               registration_source = 'register_200',
+               last_register_code = 200,
+               last_register_trace_id = EXCLUDED.last_register_trace_id,
+               last_register_message = EXCLUDED.last_register_message,
+               last_registered_at = now(),
+               revision = mio_admin_onelink_sso_config.revision + 1,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()
+             RETURNING ${ONELINK_SSO_COLUMNS}`,
+            [environment, result.clientName, result.clientId, result.traceId, actor.username],
+          )
+        ).rows[0]!;
+        const saved = toOneLinkSsoConfigView(row);
+        await client.query(
+          `INSERT INTO mio_admin_audit_logs (
+             id, actor_id, actor_name, action, target_id, summary, before_state, after_state
+           ) VALUES ($1, $2, $3, 'onelink.sso.register', $4, $5, $6::jsonb, $7::jsonb)`,
+          [
+            createId(),
+            actor.id,
+            actor.username,
+            environment,
+            `Registered OneLink SSO client (env=${environment}, code=200, rev=${saved.revision})`,
+            beforeState ? JSON.stringify(beforeState) : null,
+            JSON.stringify({
+              ...toAuditOneLinkSsoState(saved),
+              code: 200,
+              traceId: result.traceId,
+            }),
+          ],
+        );
+        return saved;
+      }
+
+      if (result.kind === 'already_exists') {
+        const beforeState = existing
+          ? toAuditOneLinkSsoState(toOneLinkSsoConfigView(existing))
+          : null;
+        const row = (
+          await client.query<OneLinkSsoConfigRow>(
+            `INSERT INTO mio_admin_onelink_sso_config (
+               environment, enabled, client_name, client_id, expected_client_id,
+               registration_status, registration_source,
+               last_register_code, last_register_trace_id, last_register_message,
+               last_registered_at, revision, updated_by
+             ) VALUES (
+               $1, false, $2, $2, NULL,
+               'trusted_existing', 'register_362_trusted',
+               362, $3, 'already_exists_trusted',
+               now(), 1, $4
+             )
+             ON CONFLICT (environment) DO UPDATE SET
+               client_name = EXCLUDED.client_name,
+               client_id = COALESCE(
+                 mio_admin_onelink_sso_config.client_id,
+                 mio_admin_onelink_sso_config.expected_client_id,
+                 EXCLUDED.client_name
+               ),
+               registration_status = CASE
+                 WHEN mio_admin_onelink_sso_config.registration_status = 'registered' THEN 'registered'
+                 ELSE 'trusted_existing'
+               END,
+               registration_source = COALESCE(
+                 mio_admin_onelink_sso_config.registration_source,
+                 'register_362_trusted'
+               ),
+               last_register_code = 362,
+               last_register_trace_id = EXCLUDED.last_register_trace_id,
+               last_register_message = EXCLUDED.last_register_message,
+               last_registered_at = now(),
+               revision = mio_admin_onelink_sso_config.revision + 1,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()
+             RETURNING ${ONELINK_SSO_COLUMNS}`,
+            [environment, clientName, result.traceId, actor.username],
+          )
+        ).rows[0]!;
+        const saved = toOneLinkSsoConfigView(row);
+        await client.query(
+          `INSERT INTO mio_admin_audit_logs (
+             id, actor_id, actor_name, action, target_id, summary, before_state, after_state
+           ) VALUES ($1, $2, $3, 'onelink.sso.register', $4, $5, $6::jsonb, $7::jsonb)`,
+          [
+            createId(),
+            actor.id,
+            actor.username,
+            environment,
+            `Trusted existing OneLink SSO client (env=${environment}, code=362, rev=${saved.revision})`,
+            beforeState ? JSON.stringify(beforeState) : null,
+            JSON.stringify({
+              ...toAuditOneLinkSsoState(saved),
+              code: 362,
+              traceId: result.traceId,
+            }),
+          ],
+        );
+        return saved;
+      }
+
+      await client.query(
+        `INSERT INTO mio_admin_audit_logs (
+           id, actor_id, actor_name, action, target_id, summary, after_state
+         ) VALUES ($1, $2, $3, 'onelink.sso.register_failed', $4, $5, $6::jsonb)`,
+        [
+          createId(),
+          actor.id,
+          actor.username,
+          environment,
+          `OneLink SSO client registration failed (env=${environment}, code=${result.code ?? 'null'})`,
+          JSON.stringify({
+            code: result.code,
+            traceId: result.traceId,
+          }),
+        ],
+      );
+      return existing ? toOneLinkSsoConfigView(existing) : null;
+    });
+  }
+
   close(): Promise<void> {
     if (!this.closing) {
       this.closing = (async () => {
@@ -1808,20 +2120,33 @@ export class AdminStore {
   }
 }
 
-export async function createAdminStore(config: AdminConfig): Promise<AdminStore> {
+export async function createAdminStore(
+  config: AdminConfig,
+  oneLinkSsoEnvOverride?: string,
+): Promise<AdminStore> {
   const pool = createManagedPool(config.databaseURL, 'mio-admin', 4);
+  const oneLinkSsoEnv = oneLinkSsoEnvOverride ?? config.oneLinkSsoEnv ?? 'dev';
   let conversationsPool: Pool | null = null;
   let ownsConversationsPool = false;
   let mediaPool: Pool | null = null;
   try {
     await checkProviderSchema(pool);
     await checkAdminSchema(pool);
-    const initialAuthRow = (
-      await pool.query<GlobalSettingsRow>(
+    const [initialAuthRes, initialOneLinkRes] = await Promise.all([
+      pool.query<GlobalSettingsRow>(
         "SELECT setting_key, value, revision, updated_by, created_at, updated_at FROM mio_admin_global_settings WHERE setting_key = 'auth'",
-      )
-    ).rows[0];
+      ),
+      pool.query<OneLinkSsoConfigRow>(
+        `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1`,
+        [oneLinkSsoEnv],
+      ),
+    ]);
+    const initialAuthRow = initialAuthRes.rows[0];
     const initialAuthSettings = initialAuthRow ? toStoredAuthSettings(initialAuthRow) : null;
+    const initialOneLinkRow = initialOneLinkRes.rows[0];
+    const initialOneLinkSsoConfig = initialOneLinkRow
+      ? toOneLinkSsoConfigView(initialOneLinkRow)
+      : null;
     if (config.conversationsDatabaseURL) {
       if (config.conversationsDatabaseURL === config.databaseURL) {
         conversationsPool = pool;
@@ -1839,6 +2164,8 @@ export async function createAdminStore(config: AdminConfig): Promise<AdminStore>
       ownsConversationsPool,
       mediaPool,
       initialAuthSettings,
+      initialOneLinkSsoConfig,
+      oneLinkSsoEnv,
     );
   } catch (error) {
     await Promise.allSettled([

@@ -1,6 +1,6 @@
 # 管理后台 HTTP 契约
 
-[API 导航](index.md)；模型路由与平台目录白名单存储见[用户万联配置](../providers.md)，中间件只读监控约束见[Redis 契约](../integrations/redis.md)与[RabbitMQ 契约](../integrations/rabbitmq.md)，需求与架构背景见[Web 管理后台 PRD](../tasks/web-admin-console/prd.md)。仅在完整配置认证、供应商域并显式设置 `MIO_ADMIN_ENABLED=true` 后注册。
+[API 导航](index.md)；模型路由与平台目录白名单存储见[用户万联配置](../providers.md)，万联 SSO 配置与注册约束见[万联 OneLink SSO 契约](../integrations/onelink-sso.md)，中间件只读监控约束见[Redis 契约](../integrations/redis.md)与[RabbitMQ 契约](../integrations/rabbitmq.md)，需求与架构背景见[Web 管理后台 PRD](../tasks/web-admin-console/prd.md)与[万联第三方登录 PRD](../tasks/onelink-login/prd.md)。仅在完整配置认证、供应商域并显式设置 `MIO_ADMIN_ENABLED=true` 后注册。
 
 ## 本域共同约定
 
@@ -8,7 +8,7 @@
 
 所有写入请求（`POST`、`PUT`、`PATCH`、`DELETE`）必须携带允许列表内的精确 `Origin`（合并 `MIO_AUTH_ALLOWED_ORIGINS`、`MIO_AUTH_BASE_URL` 与可选 `MIO_ADMIN_ALLOWED_ORIGINS`）；携带正文的写入接口要求 `application/json`，常规接口上限 16384 字节，路由与模板写入上限 65536 字节，批量模型导入上限 262144 字节，读取期限均为 10 秒。`GET` 提供 `Origin` 时也须匹配。`OPTIONS` 预检无需登录但须匹配允许的 `Origin`。修改类入口在读取完请求体后重新核验管理员会话仍然有效。
 
-所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`。
+所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、OneLink SSO 加密密钥、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`/`ONELINK_SSO_NOT_CONFIGURED`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`/`ONELINK_REGISTER_IN_PROGRESS`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`/`ONELINK_SSO_UNAVAILABLE`。
 
 ## POST /api/v1/admin/auth/login
 
@@ -105,6 +105,42 @@
 错误：见共同约定。
 
 副作用：只读查询，不联网。
+
+## GET /api/v1/admin/onelink/sso
+
+身份：当前登录管理员。
+
+输入：无查询参数。
+
+成功：200 `{config:{environment,enabled,clientName,clientId,expectedClientId,registrationStatus,registrationSource,lastRegisterCode,lastRegisterTraceId,lastRegisterMessage,lastRegisteredAt,revision,updatedBy,updatedAt},runtime:{configured,hasEncryptionKey,authorizeOrigin,registerOrigin,callbackUrl,tokenVerificationMode}}`。当 `mio_admin_onelink_sso_config` 尚无当前环境记录时，默认返回 `enabled:false`、`registrationStatus:'unregistered'`、`revision:0` 与空注册元数据；`runtime.tokenVerificationMode` 固定返回 `'payload_sub_unverified'`，`runtime` 仅报告配置就绪度与脱敏后的 origin/回调地址，绝不返回 `MIO_ONELINK_SSO_ENC_KEY`。
+
+错误：见共同约定。
+
+副作用：读取当前环境的万联 SSO 配置并同步刷新内存策略快照，不修改数据库且不联网。
+
+## PATCH /api/v1/admin/onelink/sso
+
+身份：当前登录管理员；读取请求体后重新核验管理员会话仍然有效。
+
+输入：`{expectedRevision,enabled,expectedClientId?}`，严格拒绝额外字段。`expectedRevision` 为非负整数；`enabled` 为布尔值；`expectedClientId` 可省略、为 `null` 或 `1..128` 字符且不含空白/控制字符且不为 `routerClientId` 的字符串。
+
+成功：200，返回结构与 `GET /api/v1/admin/onelink/sso` 相同；首次写入后 `revision` 为 `1`，后续每次更新递增 `1`。
+
+错误：服务端未配齐 OneLink SSO 环境变量却尝试设置 `enabled:true` 返回 400 `ONELINK_SSO_NOT_CONFIGURED`，字段非法或传入 `routerClientId` 返回 400 `ADMIN_INPUT_INVALID`，`expectedRevision` 冲突返回 409 `SETTINGS_CONFLICT`；其余见共同约定。
+
+副作用：在单事务内按乐观锁写入 `mio_admin_onelink_sso_config` 并记录 `action='onelink.sso.update'`、`target_id=<environment>` 的脱敏审计日志；事务提交后立即刷新内存只读策略快照，无需重启服务。
+
+## POST /api/v1/admin/onelink/sso/register
+
+身份：当前登录管理员；读取请求体后重新核验管理员会话仍然有效。
+
+输入：`{}`，严格拒绝额外字段。
+
+成功：200 `{outcome,upstreamCode,errorCode,traceId,config,runtime}`，其中 `outcome` 为 `'registered' | 'already_exists_trusted' | 'rejected' | 'failed'`。`200` 校验合法 `clientId` 后持久化为 `registrationStatus='registered'` 并保留既有 `enabled` 与 `expectedClientId`；`362` 不阻塞，保留既有配置与已有 `clientId`（无 `clientId` 时按 `expectedClientId ?? clientName` 标记为 `trusted_existing`）；`363`、`364` 及上游故障返回脱敏 `errorCode`（`ONELINK_CLIENT_NAME_INVALID`/`ONELINK_CLIENT_TEMPLATE_MISSING`/`ONELINK_REGISTER_UPSTREAM_FAILED`）与 `traceId`，不覆盖既有配置或登记状态。
+
+错误：服务端未配置 OneLink SSO 返回 503 `ONELINK_SSO_UNAVAILABLE`，已有同进程注册请求在途返回 409 `ONELINK_REGISTER_IN_PROGRESS`；其余见共同约定。
+
+副作用：单次受控向配置的万联注册地址发送 `POST {"clientName":"<clientName>"}`（10 秒超时、32 KiB 响应上限、拒绝重定向、零重试），按结果更新配置表、刷新内存策略快照并写入 `onelink.sso.register` 或脱敏的 `onelink.sso.register_failed`（仅含 `code` 与 `traceId`）审计日志。
 
 ## POST /api/v1/admin/models/import
 

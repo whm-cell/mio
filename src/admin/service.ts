@@ -5,12 +5,15 @@ import { randomBytes } from 'node:crypto';
 import { IMAGE_DRIVERS } from '../generations/contracts.ts';
 import { DiscoveryError, discoverModels } from '../integrations/onelink/models.ts';
 import type { DiscoveredModel, ModelTransport } from '../integrations/onelink/models.ts';
+import { registerOneLinkSsoClient } from '../integrations/onelink/sso.ts';
+import type { OneLinkSsoConfig, OneLinkSsoRegisterTransport } from '../integrations/onelink/sso.ts';
 import type { RabbitmqMonitorSnapshot } from '../integrations/rabbitmq-monitor.ts';
 import { probeRabbitmqMetrics } from '../integrations/rabbitmq-monitor.ts';
 import type { RedisMonitorSnapshot } from '../integrations/redis.ts';
 import { probeRedisMetrics } from '../integrations/redis.ts';
 import { hashAdminPassword, verifyAdminPassword } from '../auth/admin-password.ts';
-import type { AuthRuntimePolicy } from '../auth/config.ts';
+import { resolveAllowedOneLinkClientIds } from '../auth/config.ts';
+import type { AuthRuntimePolicy, OneLinkSsoRuntimePolicy } from '../auth/config.ts';
 import type { ProviderConfig } from '../providers/config.ts';
 import {
   CHAT_PROFILES,
@@ -35,6 +38,10 @@ import type {
   AdminDiscoveryCandidateItem,
   AdminGlobalSettingsView,
   AdminModelCatalogItem,
+  AdminOneLinkSsoConfigView,
+  AdminOneLinkSsoRegisterView,
+  AdminOneLinkSsoRuntimeView,
+  AdminOneLinkSsoView,
   AdminPrincipal,
   AdminProbeDiscoveryResult,
   AdminRouteTemplateUiHints,
@@ -99,6 +106,58 @@ function validateGlobalSettingsUpdate(input: { expectedRevision?: unknown; auth?
 export interface AdminMonitorProbes {
   readonly probeRabbitmq?: () => Promise<RabbitmqMonitorSnapshot>;
   readonly probeRedis?: () => Promise<RedisMonitorSnapshot>;
+}
+
+export interface AdminOneLinkSsoRuntimeOptions {
+  readonly config?: OneLinkSsoConfig;
+  readonly authBaseURL?: string;
+  readonly registerTransport?: OneLinkSsoRegisterTransport;
+}
+
+const ONELINK_CLIENT_ID_FORBIDDEN_CHARS = /[\s\u0000-\u001f\u007f]/;
+const ONELINK_ROUTER_CLIENT_ID = 'routerClientId';
+
+function validateOneLinkSsoUpdate(input: {
+  expectedRevision?: unknown;
+  enabled?: unknown;
+  expectedClientId?: unknown;
+}): {
+  expectedRevision: number;
+  enabled: boolean;
+  expectedClientId?: string | null;
+} {
+  if (
+    typeof input.expectedRevision !== 'number' ||
+    !Number.isSafeInteger(input.expectedRevision) ||
+    input.expectedRevision < 0 ||
+    input.expectedRevision > MAX_PG_INT32
+  ) {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  if (typeof input.enabled !== 'boolean') {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  let expectedClientId: string | null | undefined;
+  if (input.expectedClientId === undefined) {
+    expectedClientId = undefined;
+  } else if (input.expectedClientId === null) {
+    expectedClientId = null;
+  } else if (
+    typeof input.expectedClientId === 'string' &&
+    input.expectedClientId.length >= 1 &&
+    input.expectedClientId.length <= 128 &&
+    !ONELINK_CLIENT_ID_FORBIDDEN_CHARS.test(input.expectedClientId) &&
+    input.expectedClientId !== ONELINK_ROUTER_CLIENT_ID
+  ) {
+    expectedClientId = input.expectedClientId;
+  } else {
+    throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
+  }
+  return {
+    expectedRevision: input.expectedRevision,
+    enabled: input.enabled,
+    ...(expectedClientId !== undefined ? { expectedClientId } : {}),
+  };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -357,9 +416,11 @@ export function createAdminService(
   transport?: ModelTransport,
   monitors?: AdminMonitorProbes,
   authRuntimeDefaults?: AdminAuthRuntimeDefaults,
+  oneLinkSso?: AdminOneLinkSsoRuntimeOptions,
 ) {
   const cancellation = new AbortController();
   const activeProbes = new Set<Promise<AdminProbeDiscoveryResult>>();
+  let activeOneLinkRegister: Promise<AdminOneLinkSsoRegisterView> | null = null;
   let dummyHashPromise: Promise<string> | undefined;
   let closing: Promise<void> | undefined;
 
@@ -376,6 +437,69 @@ export function createAdminService(
     ? { ...store.initialAuthSettings.auth }
     : defaultAuthPolicy();
   let currentAuthRevision = store.initialAuthSettings?.revision ?? 0;
+
+  const oneLinkSsoEnv = oneLinkSso?.config?.environment ?? store.oneLinkSsoEnv;
+  const oneLinkSsoClientName = oneLinkSso?.config?.clientName ?? 'miioo';
+  const normalizedAuthBaseURL = oneLinkSso?.authBaseURL?.replace(/\/+$/, '') ?? null;
+  const oneLinkSsoRuntime: AdminOneLinkSsoRuntimeView = {
+    configured: Boolean(oneLinkSso?.config),
+    hasEncryptionKey: Boolean(oneLinkSso?.config?.encryptionKey),
+    authorizeOrigin: oneLinkSso?.config ? new URL(oneLinkSso.config.authorizeUrl).origin : null,
+    registerOrigin: oneLinkSso?.config ? new URL(oneLinkSso.config.registerUrl).origin : null,
+    callbackUrl: normalizedAuthBaseURL
+      ? `${normalizedAuthBaseURL}/api/auth/callback/onelink`
+      : null,
+    tokenVerificationMode: 'payload_sub_unverified',
+  };
+  const defaultOneLinkSsoConfig = (): AdminOneLinkSsoConfigView => ({
+    environment: oneLinkSsoEnv,
+    enabled: false,
+    clientName: oneLinkSsoClientName,
+    clientId: null,
+    expectedClientId: null,
+    registrationStatus: 'unregistered',
+    registrationSource: null,
+    lastRegisterCode: null,
+    lastRegisterTraceId: null,
+    lastRegisterMessage: null,
+    lastRegisteredAt: null,
+    revision: 0,
+    updatedBy: null,
+    updatedAt: null,
+  });
+  const toOneLinkSsoRuntimePolicy = (
+    stored: AdminOneLinkSsoConfigView | null,
+  ): OneLinkSsoRuntimePolicy => {
+    const clientName = stored?.clientName ?? oneLinkSsoClientName;
+    return {
+      enabled: Boolean(oneLinkSso?.config) && (stored?.enabled ?? false),
+      clientName,
+      allowedClientIds: resolveAllowedOneLinkClientIds(
+        clientName,
+        stored?.clientId ?? null,
+        stored?.expectedClientId ?? null,
+      ),
+    };
+  };
+  const initialOneLinkSso =
+    store.initialOneLinkSsoConfig?.environment === oneLinkSsoEnv
+      ? store.initialOneLinkSsoConfig
+      : null;
+  let currentOneLinkSsoPolicy: OneLinkSsoRuntimePolicy =
+    toOneLinkSsoRuntimePolicy(initialOneLinkSso);
+  let currentOneLinkSsoRevision = initialOneLinkSso?.revision ?? 0;
+
+  const syncOneLinkSsoSnapshot = (stored: AdminOneLinkSsoConfigView | null) => {
+    const revision = stored?.revision ?? 0;
+    if (revision >= currentOneLinkSsoRevision) {
+      currentOneLinkSsoPolicy = toOneLinkSsoRuntimePolicy(stored);
+      currentOneLinkSsoRevision = revision;
+    }
+  };
+  const formatOneLinkSsoView = (stored: AdminOneLinkSsoConfigView | null): AdminOneLinkSsoView => ({
+    config: stored ?? defaultOneLinkSsoConfig(),
+    runtime: oneLinkSsoRuntime,
+  });
 
   const formatGlobalSettingsView = (
     stored: AdminStoredAuthSettings | null,
@@ -1213,11 +1337,103 @@ export function createAdminService(
       return formatGlobalSettingsView(saved);
     },
 
+    getOneLinkSsoPolicy(): OneLinkSsoRuntimePolicy {
+      return currentOneLinkSsoPolicy;
+    },
+
+    async getOneLinkSso(): Promise<AdminOneLinkSsoView> {
+      assertOpen();
+      const stored = await store.readOneLinkSsoConfig(oneLinkSsoEnv);
+      syncOneLinkSsoSnapshot(stored);
+      return formatOneLinkSsoView(stored);
+    },
+
+    async updateOneLinkSso(
+      principal: AdminPrincipal,
+      input: { expectedRevision?: unknown; enabled?: unknown; expectedClientId?: unknown },
+    ): Promise<AdminOneLinkSsoView> {
+      assertOpen();
+      const validated = validateOneLinkSsoUpdate(input);
+      if (validated.enabled && !oneLinkSsoRuntime.configured) {
+        throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ONELINK_SSO_NOT_CONFIGURED');
+      }
+      const saved = await store.updateOneLinkSsoConfig(principal.admin, oneLinkSsoEnv, {
+        expectedRevision: validated.expectedRevision,
+        enabled: validated.enabled,
+        clientName: oneLinkSsoClientName,
+        ...(validated.expectedClientId !== undefined
+          ? { expectedClientId: validated.expectedClientId }
+          : {}),
+      });
+      syncOneLinkSsoSnapshot(saved);
+      return formatOneLinkSsoView(saved);
+    },
+
+    async registerOneLinkSso(principal: AdminPrincipal): Promise<AdminOneLinkSsoRegisterView> {
+      assertOpen();
+      const cfg = oneLinkSso?.config;
+      if (!cfg) {
+        throw new AdminError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ONELINK_SSO_UNAVAILABLE');
+      }
+      if (activeOneLinkRegister) {
+        throw new AdminError(HTTP_STATUS.CONFLICT, 'ONELINK_REGISTER_IN_PROGRESS');
+      }
+      const task = (async (): Promise<AdminOneLinkSsoRegisterView> => {
+        const result = await registerOneLinkSsoClient(cfg, {
+          signal: cancellation.signal,
+          ...(oneLinkSso?.registerTransport ? { transport: oneLinkSso.registerTransport } : {}),
+        });
+        assertOpen();
+        const saved = await store.recordOneLinkSsoRegistration(
+          principal.admin,
+          oneLinkSsoEnv,
+          cfg.clientName,
+          result,
+        );
+        syncOneLinkSsoSnapshot(saved);
+        const view = formatOneLinkSsoView(saved);
+        if (result.kind === 'registered') {
+          return {
+            outcome: 'registered',
+            upstreamCode: result.code,
+            errorCode: null,
+            traceId: result.traceId,
+            ...view,
+          };
+        }
+        if (result.kind === 'already_exists') {
+          return {
+            outcome: 'already_exists_trusted',
+            upstreamCode: result.code,
+            errorCode: null,
+            traceId: result.traceId,
+            ...view,
+          };
+        }
+        return {
+          outcome: result.kind,
+          upstreamCode: result.code,
+          errorCode: result.errorCode,
+          traceId: result.traceId,
+          ...view,
+        };
+      })();
+      activeOneLinkRegister = task;
+      try {
+        return await task;
+      } finally {
+        if (activeOneLinkRegister === task) activeOneLinkRegister = null;
+      }
+    },
+
     close() {
       if (!closing) {
         cancellation.abort();
         closing = (async () => {
-          await Promise.allSettled([...activeProbes]);
+          await Promise.allSettled([
+            ...activeProbes,
+            ...(activeOneLinkRegister ? [activeOneLinkRegister] : []),
+          ]);
           await store.close();
         })();
       }

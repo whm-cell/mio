@@ -24,6 +24,7 @@
 | `MIO_TENCENT_SMS_SECRET_ID`、`MIO_TENCENT_SMS_SECRET_KEY`、`MIO_TENCENT_SMS_APP_ID`、`MIO_TENCENT_SMS_SIGN_NAME`、`MIO_TENCENT_SMS_TEMPLATE_ID`、`MIO_TENCENT_SMS_REGION` | 启用短信时全部必填；模板须接受验证码和有效分钟数两个参数                                                                                                                              |
 | `MIO_AUTH_SMS_PHONE_HOUR_LIMIT`、`MIO_AUTH_SMS_PHONE_DAY_LIMIT`、`MIO_AUTH_SMS_IP_HOUR_LIMIT`、`MIO_AUTH_SMS_IP_DAY_LIMIT`、`MIO_AUTH_SMS_GLOBAL_DAY_LIMIT`               | 可选正整数，只允许收紧默认额度，依次最多 5、10、20、100、1000                                                                                                                         |
 | `MIO_AUTH_WECHAT_ENABLED`、`MIO_AUTH_WECHAT_APP_ID`、`MIO_AUTH_WECHAT_APP_SECRET`                                                                                         | 默认关闭；启用时须完整配置网站应用凭据与实际回调域，见[微信契约](integrations/wechat.md)                                                                                              |
+| `MIO_ONELINK_SSO_ENC_KEY`、`MIO_ONELINK_SSO_AUTHORIZE_URL`、`MIO_ONELINK_SSO_REGISTER_URL`（及可选 `CLIENT_NAME` / `APP_NAME` / `ENV`）                                   | 可选服务端凭据组，默认未配置；须同时经管理端开启运行期热开关后对外开放，见[万联 OneLink SSO 契约](integrations/onelink-sso.md)                                                        |
 
 三个必要配置均未提供时保持原无 DB 的 foundation Profile；提供任一却不完整会拒绝装载，不能静默降级。此兼容边界用于既有基础插件和开发环境；启用认证须配置完整并先迁移。
 
@@ -47,6 +48,8 @@ pnpm start:dev
 用户资料通过 `GET /api/v1/me/profile` 与 `PATCH /api/v1/me/profile` 读写，仅允许修改昵称（`name`）与头像资产（`avatarAssetId`）；非空 `avatarAssetId` 须经装配注入的资产核验回调确认属于本人、状态 `ready` 且 MIME 为 `image/jpeg`、`image/png` 或 `image/webp`，不在认证表持久化签名 URL。`src/auth` 不直接导入 `src/assets`。
 
 微信 QR polling 使用同一认证库中的 `mioWechatQR` 模型，包含不透明 ID、唯一且可空的 OAuth state 摘要、QR Cookie 摘要、带索引的状态与过期时间，以及可空的确认用户、确认时间和失败原因码。模型通过 `authOptions` 的插件 schema 进入现有显式迁移与启动检查；即使微信关闭，升级后也须先显式迁移 QR 结构才能启用认证。QR 表不保存 state、Cookie、Session secret 或供应商 token 明文；Better Auth 自身的数据库 OAuth state 仍沿用原策略，不受这条 QR 表存储规则替代。
+
+万联 OneLink 授权流程使用同一认证库中的 `mioOneLinkPending` 模型，记录唯一 `tokenDigest`（待处理 Cookie 的 SHA-256 摘要）、用途 `intent`（`login` / `bind`）、带索引的 `status`（`started` / `candidate_ready` / `completed` / `rejected` / `cancelled`）与 `expiresAt`、可选发起身份（`initiatorUserId` / `initiatorSessionId`）、暂存候选信息（`candidateSub` / `candidateClientId` / `candidateToken`）、受限回跳路径 `returnPath` 以及 `createdAt` / `updatedAt`。`oneLinkPlugin` 无条件注册在 `authOptions().plugins` 中，因此无论是否配置 `MIO_ONELINK_SSO_*` 环境变量，`auth:migrate` 与启动 `getMigrations` 均始终检查并保持 `mioOneLinkPending` 结构同步。该表绝不保存待处理 Cookie 原文、上游 `access_token`、`refresh_token` 或 AES 密钥。
 
 认证与 `MIO_API_TOKEN` 分离，后者仍只保护 foundation 能力查询，不能作为 userId。认证启用失败时插件不注册 readyz 或业务路由；成功后 readyz 只表明本次装载就绪，不持续查询数据库健康。
 
@@ -105,9 +108,15 @@ pnpm auth:migrate --rollback-sms-budget --apply
 
 针对跨站 `WxLogin` iframe 回调省略 `SameSite=Lax` state Cookie 的场景，认证 HTTP 适配器在 `/api/auth/callback/wechat` 提供单跳同源 HTML 桥接（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'` CSP、`Referrer-Policy: no-referrer`、`Cache-Control: no-store` 与 `mio_bridge` 防循环），使第二跳同源携带 state Cookie 进入认证库；QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
 
+### 万联 OneLink 登录与回调
+
+万联 OneLink 第三方登录默认关闭，受服务端 `.env` 配置就绪度与管理端按环境运行期热开关双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink` 与 `/api/auth/onelink/pending` 均返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。发起授权时创建 10 分钟有效的 `mioOneLinkPending` 记录（创建时最多清理 100 条已过期至少 10 分钟的旧记录），并下发 `Path=/api/auth`、15 分钟 `Max-Age` 的 HttpOnly/SameSite=Lax 待处理 Cookie（HTTPS 名称 `__Secure-mio.onelink_pending` 且带 `Secure`，回环 HTTP 名称 `mio.onelink_pending`）；`intent="bind"` 额外要求当前持有创建时间不足 10 分钟、未撤销且未禁用的会话且尚未绑定万联账号。
+
+回调 `GET /api/auth/callback/onelink` 统一附带 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`，按[万联 OneLink SSO 契约](integrations/onelink-sso.md)构造的 6 字段加密跳转返回后处理 `unauthorized=true` 或解析 `access_token`。**v1 安全边界声明（`payload_sub_unverified`）**：当前版本仅对 JWT payload 执行严格 Base64URL 解码与 `sub`/`exp`/`client_id`（显式拒绝 `routerClientId`）校验，不执行 JWT 密码学验签，也不向万联发起在线令牌自省，无法防御不可信公网直接伪造三段式 JWT 访问回调接口；因此仅适用于默认关闭热开关控制下的受控开发、测试与管理端验证沙箱，公网生产放量前须补充正式验签或自省能力。已绑定活跃用户的登录回调原子完成待处理记录后签发 Mio 会话并 `303` 跳转至干净结果地址；已禁用账号拒绝签发；未绑定登录与已登录绑定回调**绝不在 GET 中写入新的永久 `user` 或 `account` 记录**，而是原子暂存为 `candidate_ready` 并保留待处理 Cookie，通过 `GET /api/auth/onelink/pending` 只读返回候选元信息（`bind` 复核原近期会话）；迟到或并发回调不能覆盖已进入 `candidate_ready` 的候选记录，也不清除其待处理 Cookie。建人、已有账号短信绑定与 `bind_current` 永久写入以及 `/api/v1/me/profile` 的 `onelinkBound` 字段由后续单元交付。
+
 ## 职责与限制
 
-- [认证配置](../src/auth/config.ts)的 `readAuthConfig` 与 `authOptions` 由装配、运行时和显式迁移按职责复用；`AUTH_BASE_PATH` 是库选项、插件前缀注册和认证 HTTP 路径截取的同一权威值。`authOptions` 始终挂载邮箱/密码路由并接受只读 `AuthPolicyReader` 回调，由 `src/plugin.ts` 在完成管理域数据库水合后注入内存策略快照并注册 `/api/auth` 路由，`src/auth` 不直接导入 `src/admin`。`service.ts` 持有认证库与 DB 池，`http.ts` 负责白名单、来源、动态邮箱/密码策略门控和响应适配，并使用 A 内共同有界读取取得原始正文；`plugin.ts` 仅装配与释放。响应头、包装错误与读取入口见 [API 领域导航](apis/index.md#运行时公共能力)，库原始响应仍由认证适配器转发。
+- [认证配置](../src/auth/config.ts)的 `readAuthConfig` 与 `authOptions` 由装配、运行时和显式迁移按职责复用；`AUTH_BASE_PATH` 是库选项、插件前缀注册和认证 HTTP 路径截取的同一权威值。`authOptions` 始终挂载邮箱/密码路由及 `oneLinkPlugin`，并分别接受只读 `AuthPolicyReader` 与 `OneLinkSsoPolicyReader` 回调，由 `src/plugin.ts` 在完成管理域数据库水合后注入内存策略快照并注册 `/api/auth` 路由，`src/auth` 不直接导入 `src/admin`。`service.ts` 持有认证库与 DB 池，`http.ts` 负责白名单、来源、动态邮箱/密码策略门控、万联回调无来源引用头与响应适配，并使用 A 内共同有界读取取得原始正文；`plugin.ts` 仅装配与释放。响应头、包装错误与读取入口见 [API 领域导航](apis/index.md#运行时公共能力)，库原始响应仍由认证适配器转发。
 - [认证服务](../src/auth/service.ts)的 `Authentication.identity(headers)` 返回经数据库验证且未禁用账号的 `{userId,sessionId}` 或 `null`；`/api/v1/me`、`/api/v1/me/profile` 和[对话 HTTP](../src/conversations/http.ts)等业务适配器是实际消费者，调用时禁止刷新会话。`Authentication.profile`、`updateProfile` 与 `setUserDisabled` 分别承载当前用户资料读写及事务性账号禁启用与会话撤销。装配入口注入身份解析能力及窄头像资产核验回调，再把可信主体传给[对话应用服务](../src/conversations/service.ts)等业务服务检查资源归属；应用服务不依赖 Node HTTP、DSH 或认证驱动，也不信任请求体 userId 或服务 token。长流失效与已受理轮次的关系按[对话规范](conversations.md)执行。项目 CRUD 尚未实现。
 - 首期邮箱未验证，不能凭同邮箱自动合并第三方账号，也不能用于团队邀请信任或邮件找回；微信显式绑定依靠当前会话与微信授权。邮箱验证、邮件找回、MFA、团队与生成分别按后续契约接入；未开放的入口返回 404。
 - 数据库凭据与错误脱敏按 [PostgreSQL 使用契约](integrations/postgres.md#必须遵守的约束)执行；密码、cookie、会话 token 和部署秘密不写入公共日志或报告。

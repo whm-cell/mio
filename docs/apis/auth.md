@@ -8,7 +8,7 @@
 
 OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH 与预检才返回 403。
 
-邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
+邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink` 与 `/api/auth/onelink/pending` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
@@ -28,6 +28,10 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | `/wechat/qr-session`                                                                                           | 60 秒 / 20 次        |
 | `/wechat/qr-session/{qrcode_id}/poll`                                                                          | 各 ID 60 秒 / 300 次 |
 | `/callback/wechat`                                                                                             | 60 秒 / 100 次       |
+| `/onelink/start`                                                                                               | 60 秒 / 20 次        |
+| `/onelink/pending`                                                                                             | 60 秒 / 60 次        |
+| `/onelink/cancel`                                                                                              | 60 秒 / 30 次        |
+| `/callback/onelink`                                                                                            | 60 秒 / 100 次       |
 | `/change-password`                                                                                             | 10 秒 / 3 次         |
 | `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次  |
 
@@ -110,6 +114,54 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 副作用：第一跳 iframe 桥接不调用认证库，不消费 `/callback/wechat` 限流额度，也不触碰数据库或微信接口。进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
 
 当 state 对应 QR 会话时，在原签名 Cookie 和单次保留检查后关联 QR；过期 QR 在供应商兑换前以 400 拒绝。只有本次 callback 的新 Session 用户能将 pending QR 标记为 confirmed，已有登录 Cookie 不会让失败回调变成成功；其余已进入的失败回调把对应 pending QR 标记为 failed。重复／并发 callback 不替换已经确认或消费的结果。QR 用户拒绝参数脱敏为 `WECHAT_AUTH_FAILED` 后回到批准的完成路径，普通 OAuth 重定向行为保持原契约。缺失或错误发起 Cookie 的请求在关联 QR 前拒绝，不将该 QR 标记失败。
+
+## POST /api/auth/onelink/start
+
+身份：`intent="login"` 允许匿名发起；`intent="bind"` 要求当前浏览器持有创建时间不足 10 分钟、未撤销且未禁用的 C 端会话，且该用户尚未绑定万联账号。
+
+输入：JSON 对象，必填 `intent`（仅 `"login"` 或 `"bind"`），可选 `returnPath`（省略时默认 `"/"`；须为 `1..256` 字符、以单个 `/` 开头、不含 `//`、`\` 或控制字符且解析后 origin 与 `MIO_AUTH_BASE_URL` 严格一致的本站相对路径，允许附带查询串如 `"/?nav=onelink-sandbox"`；显式 `null` 或未知字段拒绝）。Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定。
+
+成功：200 与 `{url}`，其中 `url` 为经服务端 `.env` 32 字节密钥 AES-256-GCM 加密 6 字段明文（`clientType="web"`、`clientName`、`name`、`url`、`callback`、`timestamp`）构造的万联授权地址；同时下发待处理 Cookie（HTTPS 名称 `__Secure-mio.onelink_pending` 且带 `Secure`，回环 HTTP 名称 `mio.onelink_pending`；属性为 `HttpOnly`、`SameSite=Lax`、`Path=/api/auth`、`Max-Age=900`）。响应保持 `Cache-Control: no-store`。
+
+错误：输入或 `returnPath` 非法返回 400 `INVALID_INPUT`；`intent="bind"` 缺失/过期/失效/禁用会话返回 401 `SESSION_REQUIRED`；当前用户已绑定万联账号返回 409 `ONELINK_ALREADY_BOUND`；未配置服务端 `.env` 或运行期热开关关闭返回 503 `ONELINK_UNAVAILABLE`；数据库或加密构造失败返回脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文与 429 沿共同约定。
+
+副作用：清理最多 100 条已过期至少 10 分钟的 `mioOneLinkPending` 记录后，插入 10 分钟有效的 `status="started"` 待处理记录（仅保存 Cookie 的 SHA-256 摘要，不存原文，绑定用途另记录发起 `userId` 与 `sessionId`）；禁用用户会话被一并撤销并清 Cookie。本入口不创建或修改永久 `user`/`account` 记录。
+
+## GET /api/auth/callback/onelink
+
+身份：发起浏览器的待处理 Cookie（`mio.onelink_pending` / `__Secure-mio.onelink_pending`）以及万联回调查询参数（`unauthorized=true` 或 `access_token`）；当待处理记录为 `intent="bind"` 时，还要求当前浏览器仍持有与发起时一致的 `userId`、`sessionId` 且创建时间不足 10 分钟、未撤销、未禁用的 C 端会话。
+
+输入：只开放 GET，不要求普通 POST 的 `Origin`（如提供 `Origin` 仍须在允许列表内）。读取查询参数 `unauthorized` 与 `access_token`（忽略且绝不持久保存 `refresh_token`）；v1 阶段按 `payload_sub_unverified` 规则对 `access_token` 执行 3 段 Base64URL JWT 结构检查、payload UTF-8 JSON 解码及 `sub`、`exp`、`client_id`（显式拒绝 `routerClientId` 并校验命中当前环境 `allowedClientIds`）语义校验，**不执行密码学验签或万联在线自省**，公网生产放量前须补充正式验签/自省或严格受控热开关评估。
+
+成功：统一返回 `303 See Other` 并附带 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`，`Location` 固定为干净的本站相对路径 `${returnPath}` 并设置唯一结果参数 `onelink_result`（绝不携带 `access_token`、`refresh_token`、`sub` 或 `candidateToken`）：已绑定活跃用户登录签发 Mio 会话 Cookie、清除待处理 Cookie 并跳转 `onelink_result=logged_in`；未绑定登录暂存待绑候选、保留待处理 Cookie 并跳转 `onelink_result=choose_account`；已登录绑定暂存待绑候选、保留待处理 Cookie 并跳转 `onelink_result=confirm_bind`；用户拒绝、无效/过期/错配令牌、禁用账号、缺失/失效待处理状态或失效绑定会话分别以 `303` 收敛至 `unauthorized`、`invalid_token`、`account_disabled`、`invalid_state` 或 `session_required`。
+
+错误：未配置服务端 `.env` 或运行期热开关关闭返回 503 `ONELINK_UNAVAILABLE`（同样携带 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`）；数据库或会话基础设施异常返回脱敏 503 `AUTH_UNAVAILABLE`；非法 `Origin`、非 GET 方法与限流沿共同约定（响应仍保持 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`）。
+
+副作用：本 GET 回调**绝不写入新的永久 `user` 或 `account` 记录**。已绑定活跃用户登录在条件更新 `status="started" -> "completed"` 成功后签发会话并清除待处理 Cookie；其余失败分支按条件更新 `started -> rejected` 并清除待处理 Cookie。未绑定登录与绑定路径原子更新 `started -> candidate_ready` 并写入 `candidateSub`、`candidateClientId`、`candidateToken`；若待处理记录已处于未过期的 `candidate_ready`，迟到或并发回调绝不覆盖既有候选记录且不清除待处理 Cookie，直接 `303` 跳转 `onelink_result=invalid_state`。上游令牌与 AES 密钥绝不落库或写入日志。
+
+## GET /api/auth/onelink/pending
+
+身份：持有有效 `candidate_ready` 状态对应待处理 Cookie 的当前浏览器；当 `intent="bind"` 时，还要求当前浏览器持有与发起时一致且创建时间不足 10 分钟、未撤销、未禁用的 C 端会话。
+
+输入：无正文；`Origin` 可省略，提供时须在允许列表内。
+
+成功：200 与 `{status:"candidate_ready",intent,candidateToken,onelinkSub,onelinkSubMasked,clientId,expiresAt}`（`clientId` 可为 `null`，`expiresAt` 为 ISO 8601 时间戳），不返回上游 `access_token`、`refresh_token`、Cookie 原文、内部 `tokenDigest` 或 AES 密钥。
+
+错误：缺失 Cookie、待处理记录不存在/已过期/非 `candidate_ready` 返回 404 `ONELINK_PENDING_NOT_FOUND`；`intent="bind"` 下缺失、过期、切换或已禁用会话返回 401 `SESSION_REQUIRED`；未配置服务端 `.env` 或运行期热开关关闭返回 503 `ONELINK_UNAVAILABLE`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`；来源、方法与 429 沿共同约定。
+
+副作用：只读查询 `mioOneLinkPending`（并在 `intent="bind"` 发现已禁用账号遗留会话时撤销该会话并清会话 Cookie）；不写入永久用户或账号记录，不修改待处理状态。
+
+## POST /api/auth/onelink/cancel
+
+身份：允许匿名或已登录浏览器调用，按可选待处理 Cookie 定位当前待处理记录。
+
+输入：严格空 JSON 对象 `{}`，拒绝任何额外字段；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定。
+
+成功：200 与 `{ok:true}`，并始终下发 `Max-Age=0`、`Path=/api/auth` 的空值待处理 Cookie 清除浏览器端状态。
+
+错误：非空对象或非法 JSON 返回 400 `INVALID_INPUT`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文与 429 沿共同约定。本入口不受万联运行期热开关关闭阻断，确保随时可清理遗留待处理状态。
+
+副作用：若携带有效待处理 Cookie，则将对应处于 `started` 或 `candidate_ready` 状态的 `mioOneLinkPending` 记录原子更新为 `cancelled`，随后清除待处理 Cookie；不影响当前 C 端登录会话或既有永久绑定。
 
 ## POST /api/auth/phone-number/send-otp
 

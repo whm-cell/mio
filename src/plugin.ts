@@ -194,8 +194,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         clientName: defaultOneLinkClientName,
         allowedClientIds: resolveAllowedOneLinkClientIds(defaultOneLinkClientName, null, null),
       };
-    // Wired into auth handlers in Unit 2 (onelink-auth-callback).
-    void getOneLinkSsoPolicy;
     const redisConfig = backend === 'redis' ? readRedisConfig() : undefined;
     const deadline = monotonicMs() + 5000;
     const redis = redisConfig ? await createRedisResource(redisConfig, deadline) : undefined;
@@ -203,7 +201,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     try {
       const rateLimit =
         redis && (await createRedisRateLimit(redis, redisConfig!.namespace, deadline));
-      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy);
+      auth = await createAuthentication(authConfig, rateLimit, undefined, getAuthPolicy, {
+        ...(oneLinkSsoConfig ? { config: oneLinkSsoConfig } : {}),
+        getPolicy: getOneLinkSsoPolicy,
+      });
       const acquired = auth;
       ctx.effect(() => async () => {
         await Promise.all([acquired.close(), redis?.close()]);

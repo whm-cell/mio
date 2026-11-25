@@ -1,13 +1,23 @@
+import { epochMs } from '@mio/foundation/time';
+import { createCipheriv, randomBytes } from 'node:crypto';
+
 const ENV_PATTERN = /^[A-Za-z0-9_.-]{1,32}$/;
 const ENC_KEY_PATTERN = /^[\x21-\x7e]{32}$/;
 const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]+$/;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 const ROUTER_CLIENT_ID = 'routerClientId';
 const DEFAULT_REGISTER_TIMEOUT_MS = 10_000;
 const MAX_REGISTER_RESPONSE_BYTES = 32 * 1024;
+const MAX_JWT_LENGTH = 16 * 1024;
+const MAX_JWT_SUB_LENGTH = 256;
+const AES_GCM_IV_BYTES = 12;
+const AES_GCM_AUTH_TAG_BYTES = 16;
+const AES_256_KEY_BYTES = 32;
 const MIN_PG_INT32 = -2_147_483_648;
 const MAX_PG_INT32 = 2_147_483_647;
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export interface OneLinkSsoConfig {
   readonly environment: string;
@@ -295,4 +305,152 @@ export async function registerOneLinkSsoClient(
     };
   }
   return failed(code, traceId);
+}
+
+export interface OneLinkAuthorizeUrlOptions {
+  readonly baseURL: string;
+  readonly timestamp?: number;
+  readonly iv?: Buffer;
+}
+
+export type OneLinkAccessTokenParseFailureReason =
+  | 'malformed_jwt'
+  | 'invalid_payload'
+  | 'invalid_sub'
+  | 'expired'
+  | 'router_client_rejected'
+  | 'client_id_mismatch';
+
+export type OneLinkAccessTokenParseResult =
+  | { readonly ok: true; readonly sub: string; readonly clientId: string | null }
+  | { readonly ok: false; readonly reason: OneLinkAccessTokenParseFailureReason };
+
+/** Encrypt the exact 6-field Wanlian web authorize payload with AES-256-GCM. */
+export function buildOneLinkAuthorizeUrl(
+  config: OneLinkSsoConfig,
+  options: OneLinkAuthorizeUrlOptions,
+): string {
+  let base: URL;
+  try {
+    base = new URL(options.baseURL);
+  } catch {
+    throw new Error('ONELINK_SSO_CRYPTO: invalid baseURL');
+  }
+  if (base.origin !== options.baseURL || !['https:', 'http:'].includes(base.protocol)) {
+    throw new Error('ONELINK_SSO_CRYPTO: invalid baseURL');
+  }
+  const key = Buffer.from(config.encryptionKey, 'utf8');
+  if (key.length !== AES_256_KEY_BYTES) {
+    throw new Error('ONELINK_SSO_CRYPTO: encryption key must be 32 bytes');
+  }
+  const iv = options.iv ?? randomBytes(AES_GCM_IV_BYTES);
+  if (iv.length !== AES_GCM_IV_BYTES) {
+    throw new Error('ONELINK_SSO_CRYPTO: IV must be 12 bytes');
+  }
+  const timestamp = options.timestamp ?? epochMs();
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+    throw new Error('ONELINK_SSO_CRYPTO: invalid timestamp');
+  }
+  if (
+    !config.clientName ||
+    config.clientName.length > 50 ||
+    WHITESPACE_OR_CONTROL.test(config.clientName) ||
+    config.clientName === ROUTER_CLIENT_ID
+  ) {
+    throw new Error('ONELINK_SSO_CRYPTO: invalid clientName');
+  }
+  const plaintext = JSON.stringify({
+    clientType: 'web',
+    clientName: config.clientName,
+    name: config.appName,
+    url: base.origin,
+    callback: `${base.origin}/api/auth/callback/onelink`,
+    timestamp,
+  });
+  const cipher = createCipheriv('aes-256-gcm', key, iv, {
+    authTagLength: AES_GCM_AUTH_TAG_BYTES,
+  });
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  const encrypted = `${iv.toString('base64')}:${authTag.toString('base64')}:${ciphertext.toString('base64')}`;
+  const target = new URL(config.authorizeUrl);
+  target.searchParams.set('enc', encrypted);
+  return target.toString();
+}
+
+/**
+ * v1 payload_sub_unverified parser: strictly validates JWT structure, Base64URL payload,
+ * sub, optional numeric exp and optional client_id (always rejecting routerClientId).
+ * Does NOT perform cryptographic signature verification or upstream token introspection.
+ */
+export function parseOneLinkAccessToken(
+  token: unknown,
+  allowedClientIds: readonly string[],
+  nowMs?: number,
+): OneLinkAccessTokenParseResult {
+  if (typeof token !== 'string' || token.length < 1 || token.length > MAX_JWT_LENGTH) {
+    return { ok: false, reason: 'malformed_jwt' };
+  }
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts.some((part) => !BASE64URL_SEGMENT.test(part))) {
+    return { ok: false, reason: 'malformed_jwt' };
+  }
+  const payloadSegment = parts[1]!;
+  if (payloadSegment.length % 4 === 1) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+  let parsed: unknown;
+  try {
+    const decoded = UTF8_DECODER.decode(Buffer.from(payloadSegment, 'base64url'));
+    parsed = JSON.parse(decoded);
+  } catch {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+  const payload = parsed as Record<string, unknown>;
+  const sub = payload.sub;
+  if (
+    typeof sub !== 'string' ||
+    sub.length < 1 ||
+    sub.length > MAX_JWT_SUB_LENGTH ||
+    CONTROL_CHARS.test(sub) ||
+    sub.trim() !== sub
+  ) {
+    return { ok: false, reason: 'invalid_sub' };
+  }
+  if ('exp' in payload && payload.exp !== undefined) {
+    if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) {
+      return { ok: false, reason: 'invalid_payload' };
+    }
+    if (payload.exp * 1000 <= (nowMs ?? epochMs())) {
+      return { ok: false, reason: 'expired' };
+    }
+  }
+  let clientId: string | null = null;
+  if ('client_id' in payload && payload.client_id !== undefined && payload.client_id !== null) {
+    if (typeof payload.client_id !== 'string' || payload.client_id.length === 0) {
+      return { ok: false, reason: 'invalid_payload' };
+    }
+    if (payload.client_id === ROUTER_CLIENT_ID) {
+      return { ok: false, reason: 'router_client_rejected' };
+    }
+    if (!allowedClientIds.includes(payload.client_id)) {
+      return { ok: false, reason: 'client_id_mismatch' };
+    }
+    clientId = payload.client_id;
+  }
+  return { ok: true, sub, clientId };
+}
+
+export function maskOneLinkSub(sub: string): string {
+  const chars = [...sub];
+  if (chars.length >= 8) {
+    return `${chars.slice(0, 3).join('')}***${chars.slice(-3).join('')}`;
+  }
+  if (chars.length <= 2) {
+    return '***';
+  }
+  return `***${chars.slice(-2).join('')}`;
 }

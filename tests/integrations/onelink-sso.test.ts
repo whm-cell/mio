@@ -1,9 +1,13 @@
+import { createDecipheriv } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolveAllowedOneLinkClientIds } from '../../src/auth/config.ts';
 import {
+  buildOneLinkAuthorizeUrl,
+  maskOneLinkSub,
+  parseOneLinkAccessToken,
   readOneLinkSsoConfig,
   registerOneLinkSsoClient,
 } from '../../src/integrations/onelink/sso.ts';
@@ -459,5 +463,296 @@ describe('registerOneLinkSsoClient', () => {
       traceId: null,
     });
     expect(requestCount).toBe(1);
+  });
+});
+
+function decryptEncParam(enc: string, key: string): Record<string, unknown> {
+  const parts = enc.split(':');
+  expect(parts).toHaveLength(3);
+  const [ivB64, authTagB64, cipherB64] = parts;
+  const iv = Buffer.from(ivB64!, 'base64');
+  const authTag = Buffer.from(authTagB64!, 'base64');
+  const ciphertext = Buffer.from(cipherB64!, 'base64');
+  expect(iv).toHaveLength(12);
+  expect(authTag).toHaveLength(16);
+  const decipher = createDecipheriv('aes-256-gcm', Buffer.from(key, 'utf8'), iv);
+  decipher.setAuthTag(authTag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+  return JSON.parse(plaintext) as Record<string, unknown>;
+}
+
+function makeJwt(payload: unknown, header: Record<string, unknown> = { alg: 'RS256', typ: 'JWT' }) {
+  const encodedHeader = Buffer.from(JSON.stringify(header), 'utf8').toString('base64url');
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  return `${encodedHeader}.${encodedPayload}.synthetic-sig`;
+}
+
+describe('buildOneLinkAuthorizeUrl', () => {
+  it('encrypts the exact 6-field Wanlian payload in iv:authTag:ciphertext AES-256-GCM format', () => {
+    const config = makeConfig('https://api-test.wanlian.cloud/sso/client/register');
+    const fixedIv = Buffer.from('0102030405060708090a0b0c', 'hex');
+    const fixedTimestamp = 1_764_000_000_123;
+    const baseURL = 'https://mio-tunnel.example.test';
+
+    const url = buildOneLinkAuthorizeUrl(config, {
+      baseURL,
+      timestamp: fixedTimestamp,
+      iv: fixedIv,
+    });
+    expect(url).not.toContain(SYNTHETIC_ENC_KEY);
+
+    const parsed = new URL(url);
+    expect(parsed.origin).toBe('https://scenic.wanlian.cloud');
+    expect(parsed.pathname).toBe('/authorize');
+    expect([...parsed.searchParams.keys()]).toEqual(['enc']);
+
+    const rawEnc = parsed.searchParams.get('enc')!;
+    expect(url).toContain(`enc=${encodeURIComponent(rawEnc)}`);
+    const [ivB64] = rawEnc.split(':');
+    expect(ivB64).toBe(fixedIv.toString('base64'));
+
+    const decrypted = decryptEncParam(rawEnc, SYNTHETIC_ENC_KEY);
+    expect(Object.keys(decrypted).sort()).toEqual([
+      'callback',
+      'clientName',
+      'clientType',
+      'name',
+      'timestamp',
+      'url',
+    ]);
+    expect(decrypted).toEqual({
+      clientType: 'web',
+      clientName: 'miioo',
+      name: 'Miioo',
+      url: baseURL,
+      callback: `${baseURL}/api/auth/callback/onelink`,
+      timestamp: fixedTimestamp,
+    });
+
+    // Default random IV produces distinct enc strings on consecutive calls.
+    const first = buildOneLinkAuthorizeUrl(config, { baseURL, timestamp: fixedTimestamp });
+    const second = buildOneLinkAuthorizeUrl(config, { baseURL, timestamp: fixedTimestamp });
+    expect(first).not.toBe(second);
+  });
+
+  it('rejects invalid IV, key length, clientName, baseURL or timestamp without leaking the encryption key', () => {
+    const config = makeConfig('https://api-test.wanlian.cloud/sso/client/register');
+    const invalidCalls = [
+      () =>
+        buildOneLinkAuthorizeUrl(config, {
+          baseURL: 'https://mio.example.test',
+          iv: Buffer.alloc(16),
+        }),
+      () =>
+        buildOneLinkAuthorizeUrl(
+          { ...config, encryptionKey: 'short-key' },
+          { baseURL: 'https://mio.example.test' },
+        ),
+      () =>
+        buildOneLinkAuthorizeUrl(
+          { ...config, clientName: '' },
+          { baseURL: 'https://mio.example.test' },
+        ),
+      () =>
+        buildOneLinkAuthorizeUrl(
+          { ...config, clientName: 'miioo app' },
+          { baseURL: 'https://mio.example.test' },
+        ),
+      () =>
+        buildOneLinkAuthorizeUrl(
+          { ...config, clientName: 'routerClientId' },
+          { baseURL: 'https://mio.example.test' },
+        ),
+      () =>
+        buildOneLinkAuthorizeUrl(
+          { ...config, clientName: 'x'.repeat(51) },
+          { baseURL: 'https://mio.example.test' },
+        ),
+      () => buildOneLinkAuthorizeUrl(config, { baseURL: 'https://mio.example.test/with-path' }),
+      () => buildOneLinkAuthorizeUrl(config, { baseURL: 'ftp://mio.example.test' }),
+      () =>
+        buildOneLinkAuthorizeUrl(config, {
+          baseURL: 'https://mio.example.test',
+          timestamp: -1,
+        }),
+    ];
+    for (const invoke of invalidCalls) {
+      let caught: unknown;
+      try {
+        invoke();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/^ONELINK_SSO_CRYPTO:/);
+      expect((caught as Error).message).not.toContain(SYNTHETIC_ENC_KEY);
+      expect((caught as Error).message).not.toContain('short-key');
+    }
+  });
+});
+
+describe('parseOneLinkAccessToken', () => {
+  const allowed = ['miioo', 'miiooClientId'] as const;
+  const nowMs = 1_764_000_000_000;
+  const futureExp = Math.floor(nowMs / 1000) + 3600;
+
+  it('accepts valid JWT payloads for miioo, miiooClientId and omitted/null client_id', () => {
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user-001', client_id: 'miioo', exp: futureExp }),
+        allowed,
+        nowMs,
+      ),
+    ).toEqual({ ok: true, sub: 'ol-user-001', clientId: 'miioo' });
+
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user-002', client_id: 'miiooClientId', exp: futureExp }),
+        allowed,
+        nowMs,
+      ),
+    ).toEqual({ ok: true, sub: 'ol-user-002', clientId: 'miiooClientId' });
+
+    expect(parseOneLinkAccessToken(makeJwt({ sub: 'ol-user-003' }), allowed, nowMs)).toEqual({
+      ok: true,
+      sub: 'ol-user-003',
+      clientId: null,
+    });
+
+    expect(
+      parseOneLinkAccessToken(makeJwt({ sub: 'ol-user-004', client_id: null }), allowed, nowMs),
+    ).toEqual({ ok: true, sub: 'ol-user-004', clientId: null });
+  });
+
+  it('rejects malformed JWT syntax, invalid Base64URL and non-object JSON payloads', () => {
+    const header = Buffer.from('{"alg":"RS256"}').toString('base64url');
+    const malformedCases: unknown[] = [
+      undefined,
+      null,
+      123,
+      '',
+      'a.b',
+      'a.b.c.d',
+      'a..c',
+      `${header}.invalid+base64.sig`,
+      `${header}.invalid/base64.sig`,
+      `${header}.eyJzdWIiOiJ4In0=.sig`,
+      `${header}.${'a'.repeat(16 * 1024)}.sig`,
+    ];
+    for (const token of malformedCases) {
+      expect(parseOneLinkAccessToken(token, allowed, nowMs)).toEqual({
+        ok: false,
+        reason: 'malformed_jwt',
+      });
+    }
+
+    const nonJsonPayload = Buffer.from('not-json', 'utf8').toString('base64url');
+    const invalidUtf8Payload = Buffer.from([0xff, 0xfe, 0xfd]).toString('base64url');
+    const truncatedBase64Url = `${Buffer.from('{"sub":"xy"}', 'utf8').toString('base64url')}A`;
+    for (const token of [
+      `${header}.${nonJsonPayload}.sig`,
+      `${header}.${invalidUtf8Payload}.sig`,
+      `${header}.${truncatedBase64Url}.sig`,
+      makeJwt(null),
+      makeJwt(['sub']),
+      makeJwt('plain-string'),
+      makeJwt(42),
+    ]) {
+      expect(parseOneLinkAccessToken(token, allowed, nowMs)).toEqual({
+        ok: false,
+        reason: 'invalid_payload',
+      });
+    }
+  });
+
+  it('rejects missing, empty, untrimmed, overlong or control-character sub claims', () => {
+    const invalidSubPayloads = [
+      {},
+      { sub: '' },
+      { sub: '   ' },
+      { sub: ' user-1' },
+      { sub: 'user-1 ' },
+      { sub: 'user\n1' },
+      { sub: 'user\u00001' },
+      { sub: 'user\u007f1' },
+      { sub: 'x'.repeat(257) },
+      { sub: 12345 },
+      { sub: null },
+    ];
+    for (const payload of invalidSubPayloads) {
+      expect(parseOneLinkAccessToken(makeJwt(payload), allowed, nowMs)).toEqual({
+        ok: false,
+        reason: 'invalid_sub',
+      });
+    }
+  });
+
+  it('rejects expired and non-numeric exp claims', () => {
+    expect(parseOneLinkAccessToken(makeJwt({ sub: 'ol-user', exp: 0 }), allowed, nowMs)).toEqual({
+      ok: false,
+      reason: 'expired',
+    });
+
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user', exp: Math.floor(nowMs / 1000) - 1 }),
+        allowed,
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: 'expired' });
+
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user', exp: Math.floor(nowMs / 1000) }),
+        allowed,
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: 'expired' });
+
+    for (const exp of ['1999999999', null, true, {}]) {
+      expect(parseOneLinkAccessToken(makeJwt({ sub: 'ol-user', exp }), allowed, nowMs)).toEqual({
+        ok: false,
+        reason: 'invalid_payload',
+      });
+    }
+  });
+
+  it('always rejects routerClientId and mismatched or invalid client_id claims', () => {
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user', client_id: 'routerClientId', exp: futureExp }),
+        ['routerClientId', ...allowed],
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: 'router_client_rejected' });
+
+    expect(
+      parseOneLinkAccessToken(
+        makeJwt({ sub: 'ol-user', client_id: 'otherClientId', exp: futureExp }),
+        allowed,
+        nowMs,
+      ),
+    ).toEqual({ ok: false, reason: 'client_id_mismatch' });
+
+    for (const clientId of ['', 123, {}]) {
+      expect(
+        parseOneLinkAccessToken(
+          makeJwt({ sub: 'ol-user', client_id: clientId, exp: futureExp }),
+          allowed,
+          nowMs,
+        ),
+      ).toEqual({ ok: false, reason: 'invalid_payload' });
+    }
+  });
+});
+
+describe('maskOneLinkSub', () => {
+  it('masks long and short subjects without exposing the full value', () => {
+    expect(maskOneLinkSub('onelink-user-987654')).toBe('one***654');
+    expect(maskOneLinkSub('12345678')).toBe('123***678');
+    expect(maskOneLinkSub('1234567')).toBe('***67');
+    expect(maskOneLinkSub('abc')).toBe('***bc');
+    expect(maskOneLinkSub('ab')).toBe('***');
+    expect(maskOneLinkSub('x')).toBe('***');
   });
 });

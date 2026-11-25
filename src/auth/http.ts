@@ -42,6 +42,10 @@ const routes = new Map([
   ['/link-social', 'POST'],
   ['/callback/wechat', 'GET'],
   ['/wechat/qr-session', 'POST'],
+  ['/onelink/start', 'POST'],
+  ['/callback/onelink', 'GET'],
+  ['/onelink/pending', 'GET'],
+  ['/onelink/cancel', 'POST'],
   ['/sign-out', 'POST'],
   ['/get-session', 'GET'],
   ['/change-password', 'POST'],
@@ -151,8 +155,11 @@ export function createAuthHandler(
     }));
   const stateCookieName = config.baseURL.startsWith('https:') ? '__Secure-mio.state' : 'mio.state';
   const wechatCallbackPath = `${AUTH_BASE_PATH}/callback/wechat`;
+  const oneLinkCallbackPath = `${AUTH_BASE_PATH}/callback/onelink`;
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const requestId = startHttpResponse(response);
+    const pathname = (request.url ?? '').split('?')[0]!;
+    if (pathname === oneLinkCallbackPath) response.setHeader('referrer-policy', 'no-referrer');
     const fail = (status: number, code: string) => {
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     };
@@ -164,7 +171,6 @@ export function createAuthHandler(
       response.setHeader('access-control-allow-credentials', 'true');
       response.setHeader('vary', 'Origin');
     }
-    const pathname = (request.url ?? '').split('?')[0]!;
     const qrCreate = pathname === `${AUTH_BASE_PATH}/wechat/qr-session`;
     const qrPoll =
       pathname.startsWith(`${AUTH_BASE_PATH}/`) &&

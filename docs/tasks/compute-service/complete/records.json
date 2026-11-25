@@ -366,12 +366,12 @@
           "purpose": "A 侧历史存储、控制分发与默认关闭的操作员路由装配"
         },
         {
-          "path": "src/compute/ops-web/index.html",
-          "purpose": "实际占用、历史、调限与审计的同源控制台"
+          "path": "src/compute/ops-http.ts",
+          "purpose": "已收敛为超级管理员鉴权的纯 JSON 计算运维接口（前端控制台迁至独立工程 mio-admin-web）"
         },
         {
-          "path": "docs/apis/compute-ops.md",
-          "purpose": "可试验的登录、权限、查询与调限 HTTP 契约"
+          "path": "docs/apis/admin.md",
+          "purpose": "已合并收口的管理员计算 Worker 观测与动态调限 HTTP 契约"
         }
       ],
       "outcomes": "单路视频、独立音频检测和通用媒体共用真实总槽、编码槽、探针槽。A 保留每实例实际并发、任务占槽历史、缺口与 HOLD，运维控制台支持有权限的持久调限、排空、零上限暂停、离线待生效和可追溯审计。",

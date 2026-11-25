@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
 import {
-  copyFile,
   link,
   mkdir,
   mkdtemp,
@@ -73,11 +72,6 @@ async function fixture(ids: string[] = []) {
   for (const [path, text] of Object.entries(files)) {
     await mkdir(dirname(join(root, path)), { recursive: true });
     await writeFile(join(root, path), text);
-  }
-  for (const path of config.sourceAssets ?? []) {
-    const target = join(root, path);
-    await mkdir(dirname(target), { recursive: true });
-    await copyFile(join(project, path), target);
   }
   expect(spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root }).status).toBe(0);
   return { root, config, documents };

@@ -66,8 +66,6 @@ const adminSettings = {
 const workerOpsSettings = {
   MIO_COMPUTE_WORKER_INSTANCE_IDS: 'worker-a,worker-b',
   MIO_COMPUTE_WORKER_RESULT_USERS: '{"worker-a":"peer-a","worker-b":"peer-b"}',
-  MIO_COMPUTE_OPS_ENABLED: 'true',
-  MIO_COMPUTE_OPS_USER_IDS: 'OpaqueOperatorFixture',
   MIO_COMPUTE_HARD_MAX_TOTAL: '3',
   MIO_COMPUTE_HARD_MAX_ENCODE: '2',
   MIO_COMPUTE_HARD_MAX_PROBE: '1',
@@ -146,7 +144,6 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
   expect(optional).toEqual(Object.keys(optIns).sort());
   const examples = parseEnv(template.replace(assignmentPrefix, '$2='));
   expect(examples.MIO_AUTH_EMAIL_PASSWORD_ENABLED).toBe('false');
-  expect(examples.MIO_COMPUTE_OPS_ENABLED).toBe('false');
   expect([
     examples.MIO_COMPUTE_HARD_MAX_TOTAL,
     examples.MIO_COMPUTE_HARD_MAX_ENCODE,
@@ -183,24 +180,19 @@ it('lists exactly the documented opt-ins and accepts their complete configuratio
       ['worker-a', 'peer-a'],
       ['worker-b', 'peer-b'],
     ]),
-    opsUserIds: ['OpaqueOperatorFixture'],
   });
   const exampleCompute = readComputeConfig({
     ...configured,
     MIO_COMPUTE_WORKER_INSTANCE_IDS: examples.MIO_COMPUTE_WORKER_INSTANCE_IDS,
     MIO_COMPUTE_WORKER_RESULT_USERS: examples.MIO_COMPUTE_WORKER_RESULT_USERS,
-    MIO_COMPUTE_OPS_ENABLED: examples.MIO_COMPUTE_OPS_ENABLED,
   });
   expect(exampleCompute).toMatchObject({
     workerInstances: ['worker-local'],
     workerUsers: new Map([['worker-local', examples.MIO_COMPUTE_EXPECTED_RESULT_USER]]),
   });
-  expect(exampleCompute).not.toHaveProperty('opsUserIds');
   for (const [key, value] of [
     ['MIO_COMPUTE_WORKER_INSTANCE_IDS', 'worker a'],
     ['MIO_COMPUTE_WORKER_RESULT_USERS', '{"worker-a":"same","worker-b":"same"}'],
-    ['MIO_COMPUTE_OPS_ENABLED', 'yes'],
-    ['MIO_COMPUTE_OPS_USER_IDS', 'operator,operator'],
   ] as const)
     expect(() => readComputeConfig({ ...configured, [key]: value }), key).toThrow('COMPUTE_CONFIG');
   expect(readGenerationConfig(configured) !== undefined, 'MIO_GENERATIONS_ENABLED').toBe(true);

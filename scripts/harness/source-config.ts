@@ -22,7 +22,6 @@ export interface HarnessConfig {
   privateRoots: string[];
   generatedRoots: string[];
   configurationFiles: string[];
-  sourceAssets?: string[];
   projects?: Record<string, SourceProject>;
 }
 
@@ -243,7 +242,6 @@ export function parseHarnessConfig(text: string): HarnessConfig {
         'privateRoots',
         'generatedRoots',
         'configurationFiles',
-        'sourceAssets',
         'projects',
       ].includes(key)
     )
@@ -272,19 +270,6 @@ export function parseHarnessConfig(text: string): HarnessConfig {
   const privateRoots = paths(data.privateRoots, 'privateRoots', errors);
   const generated = paths(data.generatedRoots, 'generatedRoots', errors);
   const configuration = paths(data.configurationFiles, 'configurationFiles', errors);
-  if (data.sourceAssets !== undefined) {
-    for (const path of paths(data.sourceAssets, 'sourceAssets', errors)) {
-      if (
-        !names.some((root) => roots[root] === 'production' && beneath(path, root)) ||
-        !/\.(?:html|css|js)$/.test(path) ||
-        configuration.includes(path) ||
-        documents.some((root) => beneath(path, root))
-      )
-        errors.push(
-          `SOURCE_ASSET_INVALID ${path}: use an explicit production HTML, CSS or browser JS file`,
-        );
-    }
-  }
   const excluded = [...privateRoots, ...generated];
   for (let i = 0; i < excluded.length; i++)
     for (const other of excluded.slice(i + 1))

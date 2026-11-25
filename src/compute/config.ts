@@ -6,7 +6,6 @@ export interface ComputeConfig {
   expectedResultUser: string;
   workerUsers?: ReadonlyMap<string, string>;
   workerInstances?: readonly string[];
-  opsUserIds?: readonly string[];
 }
 
 /** Opt in explicitly so an unrelated RabbitMQ setting cannot enable the service. */
@@ -47,24 +46,10 @@ export function readComputeConfig(env: NodeJS.ProcessEnv = process.env): Compute
         expectedResultUser,
       );
     } else if (env.MIO_COMPUTE_WORKER_RESULT_USERS !== undefined) throw new Error();
-    const enabled = env.MIO_COMPUTE_OPS_ENABLED;
-    if (enabled !== undefined && enabled !== 'true' && enabled !== 'false') throw new Error();
-    if (enabled === 'true') {
-      const users = env.MIO_COMPUTE_OPS_USER_IDS?.split(',').map((id) => id.trim()) ?? [];
-      if (
-        !workerInstances.length ||
-        !users.length ||
-        users.length > 64 ||
-        users.some((id) => !id || id.length > 128 || /[\x00-\x20\x7f]/.test(id)) ||
-        new Set(users).size !== users.length
-      )
-        throw new Error();
-      settings.opsUserIds = users;
-    }
     return settings;
   } catch {
     throw new Error(
-      'COMPUTE_CONFIG: explicit broker identities and valid Worker/ops settings required',
+      'COMPUTE_CONFIG: explicit broker identities and valid Worker settings required',
     );
   }
 }

@@ -66,7 +66,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **Worker 并发观测、占槽历史与每实例动态调限**
 
-[contracts/compute/src/worker-observability.ts](../../../../contracts/compute/src/worker-observability.ts) · [compute/src/main.ts](../../../../compute/src/main.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/compute/ops-web/index.html](../../../../src/compute/ops-web/index.html) · [docs/apis/compute-ops.md](../../../apis/compute-ops.md)
+[contracts/compute/src/worker-observability.ts](../../../../contracts/compute/src/worker-observability.ts) · [compute/src/main.ts](../../../../compute/src/main.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/compute/ops-http.ts](../../../../src/compute/ops-http.ts) · [docs/apis/admin.md](../../../apis/admin.md)
 
 ```mio-prd-results
 {

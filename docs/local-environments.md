@@ -183,4 +183,4 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 
 ### Worker 观测与调限
 
-启用前先执行计算增量迁移，再用部署拓扑入口预置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 中的准确实例。A 即使不挂运维路由也保存这些实例的遥测。需要控制台时，A 另设 `MIO_COMPUTE_OPS_ENABLED=true` 与操作员 Mio 用户 ID 清单 `MIO_COMPUTE_OPS_USER_IDS`。Ops 使用正常 Cookie 和精确 Origin。PG 保留样本 7 天、执行或事件 30 天、调限审计 90 天。仍待投递的控制及必要审计保留到可安全清理。隔离回归使用本机专属 PG schema 和 RabbitMQ 临时 vhost。更多见[计算运维](apis/compute-ops.md)。
+启用前先执行计算增量迁移，再用部署拓扑入口预置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 中的准确实例。只要配置了该实例清单，A 即使未启用管理后台也会持续消费并保存这些实例的遥测以防队列积压。需要查询与在线动态调限时，A 启用管理后台 `MIO_ADMIN_ENABLED=true`（并按需配置 `MIO_ADMIN_ALLOWED_ORIGINS`），开放 `/api/v1/admin/compute/*` 纯 JSON 接口，统一复用超级管理员会话 Cookie（`mio.admin_session`）与精确 `Origin`，由独立同级前端工程 `mio-admin-web`（「计算 Worker」菜单）访问。PG 保留样本 7 天、执行或事件 30 天、调限审计 90 天。仍待投递的控制及必要审计保留到可安全清理。隔离回归使用本机专属 PG schema 和 RabbitMQ 临时 vhost。更多见[管理后台 HTTP](apis/admin.md)。

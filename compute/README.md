@@ -44,4 +44,4 @@
 
 部署先在 A 侧迁移 PostgreSQL 并预置实例队列。B 的 `MIO_COMPUTE_INSTANCE_ID` 需在部署允许清单 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 内才接入观测与动态控制。沿用旧 SQLite 就地升级，复用稳定卷和实例身份。B 的 `MIO_COMPUTE_HARD_MAX_TOTAL`、`MIO_COMPUTE_HARD_MAX_ENCODE`、`MIO_COMPUTE_HARD_MAX_PROBE` 默认为 2/1/1，也是最低部署值。已有保存配置在重启时夹到当前硬限，revision 保留；默认运行限额从 2/1/1 起始。各计算通道使用有限的本地待槽，HOLD 优先于调高，降限不终止运行任务。
 
-B 的遥测每 5 秒采样，真实阶段与占槽变化另记，未确认出箱最多 100000 条且正文合计不超过 256 MiB。触及容量时仅淘汰未确认遥测并上报缺口，保留控制结果和在途发布。Broker 确认后立即回收正文页，只保留消息身份与确认时间 24 小时。丢失和写入故障可见，脱离业务恢复与 FFmpeg 重投。参考[运维 API](../docs/apis/compute-ops.md)和[RabbitMQ 契约](../docs/integrations/rabbitmq.md)。
+B 的遥测每 5 秒采样，真实阶段与占槽变化另记，未确认出箱最多 100000 条且正文合计不超过 256 MiB。触及容量时仅淘汰未确认遥测并上报缺口，保留控制结果和在途发布。Broker 确认后立即回收正文页，只保留消息身份与确认时间 24 小时。丢失和写入故障可见，脱离业务恢复与 FFmpeg 重投。参考[管理后台 HTTP](../docs/apis/admin.md)和[RabbitMQ 契约](../docs/integrations/rabbitmq.md)。

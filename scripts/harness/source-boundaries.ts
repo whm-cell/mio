@@ -40,7 +40,7 @@ export function allowsCapability(
 ): boolean {
   if (
     name === 'fs' &&
-    ['src/generations/files.ts', 'src/compute/ops-web.ts'].includes(file) &&
+    file === 'src/generations/files.ts' &&
     (!project || project.declaration.packageRoot === '.')
   )
     return true;

@@ -3,7 +3,6 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AssetPrincipal } from '../assets/contracts.ts';
 import { readJsonBody, RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { WorkerOpsError } from './worker-observability-control.ts';
@@ -14,11 +13,17 @@ import type {
   WorkerObservabilityQueries,
 } from './worker-observability-queries.ts';
 
-const prefix = '/api/v1/ops/compute/';
+const base = '/api/v1/admin/compute';
+const prefix = `${base}/`;
 const maxHistoryMs = 7 * 24 * 60 * 60_000;
 const hourMs = 60 * 60_000;
 const routes = new Set(['summary', 'workers', 'executions', 'history', 'limits']);
-type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;
+interface ComputeAdminActor {
+  readonly id: string;
+  readonly username: string;
+  readonly sessionId: string;
+}
+type AdminIdentity = (headers: Headers) => Promise<ComputeAdminActor | null>;
 type Readings = Pick<
   WorkerObservabilityQueries,
   'summary' | 'workers' | 'worker' | 'executions' | 'execution' | 'history' | 'limits'
@@ -144,13 +149,11 @@ function limitBody(value: Record<string, unknown>) {
 export function createComputeOpsHandler(
   service: Readings,
   control: Pick<WorkerControlStore, 'request'>,
-  identity: Identity,
+  identity: AdminIdentity,
   origins: readonly string[],
-  userIds: readonly string[],
   wake: () => void,
 ) {
   const allowed = new Set(origins);
-  const operators = new Set(userIds);
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const requestId = startHttpResponse(response);
     const fail = (status: number, code: string) =>
@@ -165,6 +168,23 @@ export function createComputeOpsHandler(
         response.setHeader('vary', 'Origin');
       }
       const url = new URL(request.url ?? '', 'http://mio.invalid');
+      if (url.pathname !== base && !url.pathname.startsWith(prefix))
+        return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      if (request.method === 'OPTIONS') {
+        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+        response
+          .writeHead(HTTP_STATUS.NO_CONTENT, {
+            'access-control-allow-methods': 'GET, PUT, OPTIONS',
+            'access-control-allow-headers': 'Content-Type',
+          })
+          .end();
+        return;
+      }
+      const headers = new Headers();
+      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
+      const actor = await identity(headers);
+      if (!actor?.sessionId) return fail(HTTP_STATUS.UNAUTHORIZED, 'ADMIN_UNAUTHORIZED');
+
       if (!url.pathname.startsWith(prefix)) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const parts = url.pathname.slice(prefix.length).split('/');
       const [section, id, action] = parts;
@@ -181,21 +201,6 @@ export function createComputeOpsHandler(
       )
         return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const method = write ? 'PUT' : 'GET';
-      if (request.method === 'OPTIONS') {
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        response
-          .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': method + ', OPTIONS',
-            'access-control-allow-headers': 'Content-Type',
-          })
-          .end();
-        return;
-      }
-      const headers = new Headers();
-      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
-      const actor = await identity(headers);
-      if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
-      if (!operators.has(actor.userId)) return fail(HTTP_STATUS.FORBIDDEN, 'OPS_FORBIDDEN');
 
       if (request.method !== method) {
         response.setHeader('allow', method + ', OPTIONS');
@@ -204,16 +209,21 @@ export function createComputeOpsHandler(
       if (write) {
         checkQuery(url.searchParams, []);
         if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        if (request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
+        if (
+          request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !==
+          'application/json'
+        )
           return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
         const body = await readJsonBody(request, 4096, true);
         const confirmed = await identity(headers);
-        if (!confirmed || confirmed.sessionId !== actor.sessionId)
-          return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
-        if (confirmed.userId !== actor.userId || !operators.has(confirmed.userId))
-          return fail(HTTP_STATUS.FORBIDDEN, 'OPS_FORBIDDEN');
+        if (
+          !confirmed?.sessionId ||
+          confirmed.id !== actor.id ||
+          confirmed.sessionId !== actor.sessionId
+        )
+          return fail(HTTP_STATUS.UNAUTHORIZED, 'ADMIN_UNAUTHORIZED');
         const { expectedRevision, limits } = limitBody(body);
-        const pending = await control.request(id, confirmed.userId, expectedRevision, limits);
+        const pending = await control.request(id, confirmed.username, expectedRevision, limits);
         wake();
         response
           .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })

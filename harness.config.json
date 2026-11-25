@@ -46,11 +46,6 @@
       "src/integrations/rabbitmq-monitor.ts"
     ]
   },
-  "sourceAssets": [
-    "src/compute/ops-web/index.html",
-    "src/compute/ops-web/styles.css",
-    "src/compute/ops-web/app.js"
-  ],
   "documentRoots": [
     "README.md",
     "AGENTS.md",

@@ -63,7 +63,6 @@ import { createMediaHandler } from './compute/media-http.ts';
 import { createMediaService } from './compute/media-service.ts';
 import { createMediaStore } from './compute/media-store.ts';
 import { createComputeOpsHandler } from './compute/ops-http.ts';
-import { createComputeOpsWebHandler } from './compute/ops-web.ts';
 import {
   openWorkerObservabilityPool,
   WorkerObservabilityStore,
@@ -93,7 +92,7 @@ import { readAdminConfig } from './admin/config.ts';
 import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
 import type { AdminService } from './admin/service.ts';
-import { createAdminHandler } from './admin/http.ts';
+import { createAdminHandler, readAdminSessionCookie } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
@@ -326,54 +325,52 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
+    let computeOps:
+      | {
+          view: WorkerObservabilityQueries;
+          control: WorkerControlStore;
+          wake: () => void;
+        }
+      | undefined;
     if (computeConfig?.workerInstances?.length && assetConfig) {
       const pool = await openWorkerObservabilityPool(assetConfig.databaseURL);
-      const instances = computeConfig.workerInstances;
-      const operators = computeConfig.opsUserIds;
-      const observations = new WorkerObservabilityStore(pool, instances);
-      const control = operators ? new WorkerControlStore(pool, instances) : undefined;
-      const telemetry = startWorkerObservability(
-        (stop) =>
-          ComputeBroker.connect(
-            computeConfig.brokerURL,
-            computeConfig.brokerUser,
-            computeConfig.expectedResultUser,
-            stop,
-            computeConfig.workerUsers,
-          ),
-        observations,
-        control,
-      );
-      ctx.effect(
-        () => () =>
-          closeMioResources(
-            () => telemetry.close(),
-            () => pool.end(),
-          ),
-      );
-      if (operators && control) {
-        const view = new WorkerObservabilityQueries(pool, instances);
-        ctx.effect(() =>
-          ctx.webServer.register({
-            kind: 'prefix',
-            path: '/api/v1/ops/compute',
-            handler: createComputeOpsHandler(
-              view,
-              control,
-              auth.identity,
-              authConfig.origins,
-              operators,
-              telemetry.wake,
+      let telemetry: ReturnType<typeof startWorkerObservability> | undefined;
+      try {
+        const instances = computeConfig.workerInstances;
+        const observations = new WorkerObservabilityStore(pool, instances);
+        const control = adminConfig ? new WorkerControlStore(pool, instances) : undefined;
+        const ownedTelemetry = (telemetry = startWorkerObservability(
+          (stop) =>
+            ComputeBroker.connect(
+              computeConfig.brokerURL,
+              computeConfig.brokerUser,
+              computeConfig.expectedResultUser,
+              stop,
+              computeConfig.workerUsers,
             ),
-          }),
+          observations,
+          control,
+        ));
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => ownedTelemetry.close(),
+              () => pool.end(),
+            ),
         );
-        ctx.effect(() =>
-          ctx.webServer.register({
-            kind: 'prefix',
-            path: '/ops/compute',
-            handler: createComputeOpsWebHandler(auth.identity, operators),
-          }),
+        if (adminConfig && control) {
+          computeOps = {
+            view: new WorkerObservabilityQueries(pool, instances),
+            control,
+            wake: ownedTelemetry.wake,
+          };
+        }
+      } catch (error) {
+        await closeMioResources(
+          () => telemetry?.close(),
+          () => pool.end(),
         );
+        throw error;
       }
     }
     if (providerConfig) {
@@ -452,11 +449,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               },
             ));
         ctx.effect(() => () => acquired.close());
+        const computeHandler = computeOps
+          ? createComputeOpsHandler(
+              computeOps.view,
+              computeOps.control,
+              async (headers) => {
+                const principal = await acquired.authenticate(
+                  readAdminSessionCookie(headers.get('cookie')),
+                );
+                return principal
+                  ? {
+                      id: principal.admin.id,
+                      username: principal.admin.username,
+                      sessionId: principal.sessionId,
+                    }
+                  : null;
+              },
+              adminConfig.allowedOrigins,
+              computeOps.wake,
+            )
+          : undefined;
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/admin',
-            handler: createAdminHandler(acquired, adminConfig.allowedOrigins),
+            handler: createAdminHandler(acquired, adminConfig.allowedOrigins, computeHandler),
           }),
         );
       } catch (error) {

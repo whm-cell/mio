@@ -64,5 +64,3 @@ DSH 边界同时核对导入名称、解析器的 `packageId` 和解析目标真
 最小维护验证：使用已有 guardrail fixtures 验证合法同模块新文件、类型导入越过框架边界、运行时依赖脚本、循环、新增根目录漏编译，以及长而低分支函数仅报告。改变 AST 支持或边界判定时再补对应样例，不以文档包含“AST”或规则 ID 代替行为验证。语言、代码形态与职责由各自适合的检查负责，不把分支数当作算法优劣。
 
 工具链采用 TS 编译器解析源码、ESLint 和 Prettier，以及 Vitest 执行行为测试。文档用 CommonMark 解析器核对本地链接；不复制个人 Python 模板，从而保持项目开发检查只需 Node 工具链。DSH CLI 的传递依赖较多，安装依赖不意味着 Profile 已装载这些能力。锁定 `@opentelemetry/api` 为 `1.9.0` 以匹配本次 DSH 所带 OTel SDK 的 peer 范围；升级时复核该 override。
-
-浏览器 HTML、CSS 和原生 JS 可用 `sourceAssets` 在生产源根下逐文件声明，并由 A 构建复制。清单仅允许这三种后缀，缺失或未声明文件会失败。此类资源经格式、JS lint、打包与浏览器验证，Node 生产源码继续按 TypeScript AST 和实际编译范围检查。

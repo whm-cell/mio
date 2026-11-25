@@ -4,7 +4,7 @@
 {"version":1,"type":"feature","section":"目标与边界"}
 ```
 
-本 PRD 回应 2026-11-20 提出的需求：查看 Worker 并发个数和上限、每个任务占用的 Worker 数目，通过小型 Web 页面保留并查询历史，并在线调整并发上限。本文基于 `origin/A@7002715` 原型方案在主干确立产品要求、架构口径与 **O0–O5 本期开发单元规划**（对应[父 PRD](../../prd.md#通用媒体处理与资产自动派生)中的 M5 单元），**当前主干尚未合入对应源码**；所有新增协议、表结构、管理 API 与 Web 页面均为待实施候选，须在后续按 O0–O5 合入主干并完成隔离回归、浏览器视觉验证与人类接受后正式收口，本 PRD 登记不代表开发就绪或能力已接受。
+本 PRD 回应 2026-11-20 提出的需求：查看 Worker 并发个数和上限、每个任务占用的 Worker 数目，通过 Web 管理后台保留并查询历史，并在线调整并发上限。本轮架构纠偏明确**废除**此前方案中的“A 后端托管同源静态页 `/ops/compute/`（原生 HTML/JS/CSS）”、“普通用户 Cookie + `MIO_COMPUTE_OPS_USER_IDS` 白名单”、“`MIO_COMPUTE_OPS_ENABLED` 开关”与“`/api/v1/ops/compute/*` 前缀”，统一收口为：**`mio` 后端仅提供纯 JSON 管理接口 `/api/v1/admin/compute/*`**，复用超级管理员会话 Cookie（`mio.admin_session`，`Path=/api/v1/admin`）与 `MIO_ADMIN_ALLOWED_ORIGINS`，受 `MIO_ADMIN_ENABLED=true` 门控；**前端控制台归属独立同级工程 `mio-admin-web`（「计算 Worker」一级菜单，见[Web 管理后台 PRD](../../../web-admin-console/prd.md) Unit 3 `admin-compute-workers`）**。对应[父 PRD](../../prd.md#通用媒体处理与资产自动派生)中的 M5 单元；本轮架构纠偏候选尚待重新验证与人类重新接受，旧公共成果记录在重新接受前仍仅代表上一次已接受候选。
 
 ## 主干基线与候选代码落点
 
@@ -42,7 +42,7 @@
 
 ```mermaid
 flowchart LR
-  Web[轻量 Web 控制台] --> A[A 鉴权与观测 API]
+  Web["mio-admin-web 计算 Worker 控制台"] --> A["A 超管鉴权与纯 JSON 观测 API"]
   A --> PG[(现有 PostgreSQL)]
   B[B 统一资源槽与任务埋点] --> MQ[现有 RabbitMQ]
   MQ --> A
@@ -52,9 +52,9 @@ flowchart LR
 ```
 
 - B 负责实际占槽、释放、等待、心跳和应用配置。业务槽计数来自真实 acquire/release；观测链路故障不重跑 FFmpeg，也不改变业务结果确认顺序。
-- A 负责登录与操作员授权、历史落库、聚合查询和配置审计。B 不获得 A 的数据库、登录秘密或 MQ 管理凭据。
-- 页面由 A 提供同源静态资源及 API，使用原生 JavaScript、CSS 和 SVG 图表，不另起数据库或指标平台；静态资源进入 A 构建产物。
-- 管理接口从现有 Cookie 身份解析后核对 `MIO_COMPUTE_OPS_USER_IDS` 操作员 allowlist。A 始终消费并保存 Worker 遥测；未设置 `MIO_COMPUTE_OPS_ENABLED=true` 时不发布调限，也不注册管理入口。普通用户接口仍按 owner 隔离。
+- A 负责超级管理员鉴权、历史落库、聚合查询、纯 JSON 管理接口和配置审计。B 不获得 A 的数据库、登录秘密或 MQ 管理凭据。
+- A 仅提供纯 JSON 管理接口 `/api/v1/admin/compute/*`，不再托管 `/ops/compute/` 静态页或内嵌浏览器静态资源；前端控制台归属独立同级工程 `mio-admin-web`（「计算 Worker」一级菜单），不另起数据库或指标平台。
+- 管理接口统一复用超级管理员会话 Cookie（`mio.admin_session`，`Path=/api/v1/admin`）与 `MIO_ADMIN_ALLOWED_ORIGINS`，废除普通用户 Cookie + `MIO_COMPUTE_OPS_USER_IDS` 白名单与 `MIO_COMPUTE_OPS_ENABLED` 开关。只要配置 `MIO_COMPUTE_WORKER_INSTANCE_IDS`，A 即持续消费并保存 Worker 遥测以防队列积压；启用 `MIO_ADMIN_ENABLED=true` 时开放 `/api/v1/admin/compute/*` 管理查询与动态调限（启用管理后台但未配置 Worker 实例时，鉴权后返回 `503 COMPUTE_OPS_UNAVAILABLE`，未登录统一返回 `401 ADMIN_UNAUTHORIZED`）。普通用户接口仍按 owner 隔离。
 - RabbitMQ 新增遥测路由与按 instanceId 精确寻址的配置控制队列，由已有拓扑部署入口增量预建，授予精确权限；B 运行时不声明拓扑。不能把目标实例配置放进多 B 竞争消费的共享任务队列。
 
 ## 动态上限的实际行为
@@ -95,66 +95,66 @@ flowchart LR
 
 ## 页面与 API
 
-候选页面入口为 `/ops/compute/`，候选服务端管理 API 前缀为 `/api/v1/ops/compute`（对应现行契约 `docs/apis/compute-ops.md` 将随 M5/O2–O4 实现切片在 verify 前创建并登记，不在 P0 提前创建）；不修改现有本人任务 API。
+前端控制台归属独立同级工程 `mio-admin-web` 的「计算 Worker」一级菜单（并在「运行与中间件监控」提供快捷入口跳转，详见[Web 管理后台 PRD](../../../web-admin-console/prd.md) Unit 3 `admin-compute-workers`）；`mio` 后端仅提供纯 JSON 管理 API，前缀统一为 `/api/v1/admin/compute`（现行契约统一收口至[管理后台 HTTP 契约](../../../../apis/admin.md)），不托管 `/ops/compute/` 静态页，不修改现有本人任务 API。
 
 | 页面区域          | 内容                                                                                               |
 | ----------------- | -------------------------------------------------------------------------------------------------- |
 | 总览              | 在线/过期/离线实例、实际并发/已生效上限、分类占用、HOLD、队列积压与最近峰值                        |
 | Worker 列表与详情 | 每实例 total/encode/probe、等待任务、当前任务、心跳时间、配置 desired/applied 和调限表单           |
 | 任务列表与详情    | API 可按协议外的实例、任务和状态过滤；页面展示最近执行、attempt/inspection、占用 Worker 与占槽区间 |
-| 历史与变更        | 最近一小时并发曲线叠加当时上限，独立页面展示调限审计                                               |
+| 历史与变更        | 最近一小时并发曲线叠加当时上限，独立视图展示调限审计                                               |
 
-| 候选 API                                      | 用途                                          |
-| --------------------------------------------- | --------------------------------------------- |
-| `GET /api/v1/ops/compute/summary`             | 当前聚合状态及数据新鲜度                      |
-| `GET /api/v1/ops/compute/workers`             | 实例分页及当前容量                            |
-| `GET /api/v1/ops/compute/workers/{id}`        | 实例任务、HOLD 和配置状态                     |
-| `GET /api/v1/ops/compute/executions`          | 有界执行历史过滤                              |
-| `GET /api/v1/ops/compute/executions/{id}`     | 单次执行占槽与阶段时间线                      |
-| `GET /api/v1/ops/compute/history`             | 有界时间范围与点数的并发/上限曲线             |
-| `GET /api/v1/ops/compute/limits`              | 调限审计查询                                  |
-| `PUT /api/v1/ops/compute/workers/{id}/limits` | 提交 `expectedRevision`、total、encode、probe |
+| 管理 API                                        | 用途                                          |
+| ----------------------------------------------- | --------------------------------------------- |
+| `GET /api/v1/admin/compute/summary`             | 当前聚合状态及数据新鲜度                      |
+| `GET /api/v1/admin/compute/workers`             | 实例分页及当前容量                            |
+| `GET /api/v1/admin/compute/workers/{id}`        | 实例任务、HOLD 和配置状态                     |
+| `GET /api/v1/admin/compute/executions`          | 有界执行历史过滤                              |
+| `GET /api/v1/admin/compute/executions/{id}`     | 单次执行占槽与阶段时间线                      |
+| `GET /api/v1/admin/compute/history`             | 有界时间范围与点数的并发/上限曲线             |
+| `GET /api/v1/admin/compute/limits`              | 调限审计查询                                  |
+| `PUT /api/v1/admin/compute/workers/{id}/limits` | 提交 `expectedRevision`、total、encode、probe |
 
-写接口复用现有精确 Origin、JSON、读取时限、会话复核和 `no-store` 约束，增加操作员权限核对。表单同时显示当前实际占用、部署硬上限、提交值和生效反馈；保存后以 `applied` 回报更新，不能先乐观显示成功生效。页面正常、空态、离线、数据缺口、超上限排空和无权访问均纳入验收。
+所有接口复用超级管理员会话 Cookie（`mio.admin_session`，`Path=/api/v1/admin`）、`MIO_ADMIN_ALLOWED_ORIGINS`、`no-store` 及统一 JSON 错误体；未登录或携带普通用户 Cookie 统一返回 `401 ADMIN_UNAUTHORIZED`。写接口额外要求精确 `Origin`、`application/json`、4096 字节 / 10 秒读体限制与读体后复核管理员会话，`requestedBy` 记录当前管理员用户名 `admin.username`。表单同时显示当前实际占用、部署硬上限、提交值和生效反馈；保存后以 `applied` 回报更新，不能先乐观显示成功生效。页面正常、空态、离线、数据缺口、超上限排空、未配置实例（503）和无权访问均纳入验收。
 
 ## O0–O5 本期开发单元与 C0/C1 安排
 
-生命周期定义沿[协调协议](../../../../coordination.md#当前任务的生命周期)，规划交付遵循[规划交付要求](../../../../coordination.md#规划交付要求)。以下 O0–O5 单元归属于[父 PRD](../../prd.md#通用媒体处理与资产自动派生)的 **M5** 集成切片（其中 O0/O1 的计数槽接口在 M1 同步对齐，避免 M5 返工）；**规划交付不自动授予 O0–O5 代码实施或环境操作授权，开工前须在各单元 C0 确认对应实施授权**。当前主干均未启动或接受；O0–O4 为 M5 内部渐进切片，单切片测试通过不构成独立接受，统一随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果。
+生命周期定义沿[协调协议](../../../../coordination.md#当前任务的生命周期)，规划交付遵循[规划交付要求](../../../../coordination.md#规划交付要求)。以下 O0–O5 单元归属于[父 PRD](../../prd.md#通用媒体处理与资产自动派生)的 **M5** 集成切片（其中 O4 控制台前端随架构纠偏收敛至独立工程 `mio-admin-web` 的[Unit 3 `admin-compute-workers`](../../../web-admin-console/prd.md#33-unit-3admin-compute-workers计算-worker-并发观测占槽历史与在线动态调限)）；O0–O4 为 M5 内部渐进切片，单切片测试通过不构成独立接受，统一随 O5/M5 架构纠偏完整候选经独立审查与人类重新接受后更新 `worker-observability` 成果。
 
-| 单元                   | 结果与非目标                                                                                                                                                                                  | C0：决定、授权、依赖、缺口及解决动作                                                                                                                                                                                                                                                | C1：实施顺序、验收与接受条件                                                                                                                                                                                                                                                                                                                                |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| O0 口径和协议冻结      | 冻结 `worker.telemetry`、`worker.limits.command/result` 严格消息协议、稳定 `instanceId`/`bootId`/`sequence`/`executionId` 身份与按实例控制队列拓扑；不含业务实现                              | 依赖 M1 共享协议与计数槽定义稳定；开工前须确认 O0 协议与拓扑变更实施授权，确认 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 与精确 MQ 权限边界，共享协议与拓扑由集成负责人唯一写入；缺口为既有 `broker:init` 增量升级对按实例控制队列的冲突检测，解决动作为 C0 核对拓扑幂等升级                | 先在 `contracts/compute/` 实现严格 parser 与大小校验，再补 `scripts/service/compute-broker-topology.ts` 与权限单测；验收覆盖非法消息、旧 revision、实例不匹配与精确 AMQP 权限边界；**接受条件**：作为 M5 内部切片不单独接受，随 O5/M5 完整候选经独立审查与人类明确接受后收口                                                                                |
-| O1 真实并发与占槽采集  | 在 M1 已引入的计数型 `ResourceSlots` 基础上，扩展按执行身份持槽、动态 `setLimits`、三类 Worker 并发准入与排空、占槽/等待/释放/HOLD 埋点及 SQLite telemetry outbox；不含 A 侧持久化或 Web 页面 | 依赖 O0 与 M1–M2 运行时接口；开工前须确认 O1 Worker 并发与 journal 改造实施授权；核对单路视频转码（`compute/src/worker.ts`）与独立音频检测（`compute/src/audio-worker.ts`）放开多并发时的临时目录与重投隔离；缺口为同 `inspectionId` 并发目录竞争，解决动作为 C0 冻结按尝试隔离路径 | 先改造计数槽与三类 Worker 并发准入（保留未知进程 HOLD 阻断与 100000 条遥测上限），再接 SQLite 增量迁移与 outbox；验收覆盖 `total`/`encode`/`probe` 组合、幂等释放、HOLD 不可绕过、并发后 ACK/清理顺序与音频重投不回退；**接受条件**：单切片测试通过不构成独立接受，随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果              |
-| O2 历史后端与只读 API  | 在 A 落地 5 张 PG `mio_compute_worker_*` 核心业务表（另含配套遥测 inbox 与 control outbox 表）、7/30/90 天分层清理及 `GET /api/v1/ops/compute/*` 只读查询接口；不含写调限与前端页面           | 依赖 O0–O1 遥测契约及现行认证/PG 规范；开工前须确认 O2 迁移与只读管理接口实施授权；确认 `MIO_COMPUTE_OPS_USER_IDS` allowlist 与未启用 `MIO_COMPUTE_OPS_ENABLED=true` 时不注册管理路由；缺口为 `docs/apis/compute-ops.md` 精确错误码与分页上限，解决动作为 C0 冻结 API 细节          | 先落 PG 显式增量迁移与幂等消费/聚合查询，再落分层清理与只读 HTTP 路由，并在 verify 前起草 `docs/apis/compute-ops.md`；验收覆盖乱序/旧 `bootId` 不覆盖新态、事件列映射、7/30/90 天顺序清理与非操作员拒绝；**接受条件**：单切片测试通过不构成独立接受，随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果                            |
-| O3 持久动态调限        | 交付 `PUT /api/v1/ops/compute/workers/{id}/limits`、A 侧 desired/审计/control outbox 与 B 侧 journal 持久 `revision`/硬上限校验/`applied`/`rejected` 回报                                     | 依赖 O0–O2；开工前须确认 O3 持久调限与控制通道实施授权；冻结 `expectedRevision` 409 冲突、0 暂停、下调平滑排空与离线待生效语义，以及按实例控制队列独立于满载计算通道；缺口为重启后旧 `revision` 与硬上限下调冲突裁决，解决动作为 C0 冻结重启夹紧规则                                | 先实现 A 侧事务 desired+审计+outbox 与路由，再实现 B 侧控制消费、硬上限校验与 journal 持久化；验收覆盖 0 暂停、降限排空、重启保留、超硬上限拒绝、并发编辑 409、错误实例拒绝及满载下控制通道不阻塞；**接受条件**：单切片测试通过不构成独立接受，随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果                                  |
-| O4 小型 Web 可观测界面 | 交付 `/ops/compute/` 同源原生 JS/CSS/SVG 页面（总览、Worker 详情、实际/生效/硬上限曲线、任务占槽、调限表单、审计），5 秒轮询，纳入 A 独立构建产物；不另起指标平台                             | 依赖 O2–O3 API 冻结；开工前须确认 O4 同源静态页面与构建集成实施授权；确认同源 Cookie 鉴权、精准 Origin 写校验、15s 缺测断线及超上限排空视觉标记；缺口为独立构建脚本静态资源复制与插件路由挂载顺序，解决动作为 C0 核对 `src/plugin.ts` 与 `scripts/service/build.ts`                 | 先实现同源静态页面与 SVG 曲线/表单交互，再接入构建复制与路由注册，同步更新 `docs/apis/compute-ops.md` 与 `docs/local-environments.md`；验收覆盖桌面/移动布局、空态、离线、曲线断点、长 `instanceId`、无权访问与刷新后历史/配置可查；**接受条件**：单切片测试通过不构成独立接受，随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果 |
-| O5 联合回归与交回      | 完成 O0–O4 全链路自动化回归、真实并发变更验证、浏览器视觉核验、`quality-review`/`norms-review` 与独立审查交回；不宣称目标服务器最大吞吐或生产容量                                             | 依赖 O0–O4 形成干净候选及隔离 PG/RabbitMQ/常驻 `mio_dev` 环境；开工前须确认 O5 联验、浏览器视觉验证与交付审查授权；确认独立审查者与覆盖 `pnpm check` 的有效来源；缺口为生产机器提高硬上限后的长稳容量证据，解决动作为继续如实保留为延期/pending，不以短测替代                       | 执行受影响单测/集成回归、双产物构建、浏览器端到端实证与三方对账；**接受条件**：所有必需证据绑定同一干净候选、实际证明“改上限真改变并发”且不破坏既有单路转码/音频/通用媒体处理，经人类明确接受后登记 `worker-observability` 成果                                                                                                                             |
+| 单元                     | 结果与非目标                                                                                                                                                                                     | C0：决定、授权、依赖、缺口及解决动作                                                                                                                                                                                                                                                | C1：实施顺序、验收与接受条件                                                                                                                                                                                                                                                                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| O0 口径和协议冻结        | 冻结 `worker.telemetry`、`worker.limits.command/result` 严格消息协议、稳定 `instanceId`/`bootId`/`sequence`/`executionId` 身份与按实例控制队列拓扑；不含业务实现                                 | 依赖 M1 共享协议与计数槽定义稳定；开工前须确认 O0 协议与拓扑变更实施授权，确认 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 与精确 MQ 权限边界，共享协议与拓扑由集成负责人唯一写入；缺口为既有 `broker:init` 增量升级对按实例控制队列的冲突检测，解决动作为 C0 核对拓扑幂等升级                | 先在 `contracts/compute/` 实现严格 parser 与大小校验，再补 `scripts/service/compute-broker-topology.ts` 与权限单测；验收覆盖非法消息、旧 revision、实例不匹配与精确 AMQP 权限边界；**接受条件**：作为 M5 内部切片不单独接受，随 O5/M5 完整候选经独立审查与人类明确接受后收口                                                                        |
+| O1 真实并发与占槽采集    | 在 M1 已引入的计数型 `ResourceSlots` 基础上，扩展按执行身份持槽、动态 `setLimits`、三类 Worker 并发准入与排空、占槽/等待/释放/HOLD 埋点及 SQLite telemetry outbox；不含 A 侧持久化或 Web 页面    | 依赖 O0 与 M1–M2 运行时接口；开工前须确认 O1 Worker 并发与 journal 改造实施授权；核对单路视频转码（`compute/src/worker.ts`）与独立音频检测（`compute/src/audio-worker.ts`）放开多并发时的临时目录与重投隔离；缺口为同 `inspectionId` 并发目录竞争，解决动作为 C0 冻结按尝试隔离路径 | 先改造计数槽与三类 Worker 并发准入（保留未知进程 HOLD 阻断与 100000 条遥测上限），再接 SQLite 增量迁移与 outbox；验收覆盖 `total`/`encode`/`probe` 组合、幂等释放、HOLD 不可绕过、并发后 ACK/清理顺序与音频重投不回退；**接受条件**：单切片测试通过不构成独立接受，随 O5/M5 完整候选经独立审查与人类明确接受后登记 `worker-observability` 成果      |
+| O2 历史后端与只读管理API | 在 A 落地 5 张 PG `mio_compute_worker_*` 核心业务表（另含配套遥测 inbox 与 control outbox 表）、7/30/90 天分层清理及 `GET /api/v1/admin/compute/*` 纯 JSON 只读管理接口；不含静态页托管          | 依赖 O0–O1 遥测契约及现行超管认证/PG 规范；确认统一复用 `mio.admin_session` 与 `MIO_ADMIN_ENABLED=true` 门控（只要配置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 即持续落盘遥测，未配置实例时鉴权后返回 `503 COMPUTE_OPS_UNAVAILABLE`）；将契约合入 `docs/apis/admin.md`                    | 保持 `src/admin/` 与 `src/compute/` 零互相导入，经 `createAdminHandler` 委托 `/api/v1/admin/compute/*`，同步更新 `docs/apis/admin.md`；验收覆盖乱序/旧 `bootId` 不覆盖新态、事件列映射、7/30/90 天顺序清理、匿名/普通用户 401 `ADMIN_UNAUTHORIZED` 及未配置实例 503；**接受条件**：随 O5/M5 完整候选经独立审查与人类接受收口                        |
+| O3 持久动态调限          | 交付 `PUT /api/v1/admin/compute/workers/{id}/limits`、A 侧 desired/审计（`requestedBy` 记 `admin.username`）/control outbox 与 B 侧 journal 持久 `revision`/硬上限校验/`applied`/`rejected` 回报 | 依赖 O0–O2；确认 `expectedRevision` 409 冲突、0 暂停、下调平滑排空与离线待生效语义、精确 `MIO_ADMIN_ALLOWED_ORIGINS` 与读体后会话复核，以及按实例控制队列独立于满载计算通道                                                                                                         | 复用超管会话与 Origin 校验写入事务 desired+审计+outbox 并唤醒控制派发，B 侧控制消费、硬上限校验与 journal 持久化保持不变；验收覆盖 0 暂停、降限排空、重启保留、超硬上限拒绝、并发编辑 409、会话撤销拦截及满载下控制通道不阻塞；**接受条件**：随 O5/M5 完整候选经独立审查与人类明确接受后收口                                                        |
+| O4 独立管理台 Web 界面   | 在独立同级前端工程 `mio-admin-web` 交付「计算 Worker」一级菜单及「运行与中间件监控」快捷入口，对接 `/api/v1/admin/compute/*`（总览、Worker 详情、并发历史 SVG 曲线、任务占槽、调限表单、审计）   | 依赖 O2–O3 纯 JSON 接口冻结与 `mio-admin-web` 现有鉴权和样式规范；彻底剥离 `mio` 后端旧 `/ops/compute/` 静态文件、构建复制与 `sourceAssets`/`ops-web` 护栏特例                                                                                                                      | 在 `mio-admin-web` 按模块化组件实现 5 秒轮询、15s 缺测断线、超上限排空标识、脏态防覆盖调限表单及 503/离线兜底，并同步更新 `docs/apis/admin.md`、`docs/local-environments.md` 与 `docs/engineering/source-guardrails.md`；验收覆盖桌面/移动布局、空态、离线、曲线断点、503 与无权拦截；**接受条件**：随 O5/M5 完整候选经独立审查与人类明确接受后收口 |
+| O5 联合回归与交回        | 完成 O0–O4 全链路自动化回归、真实并发变更验证、独立前端联调、`quality-review`/`norms-review` 与独立审查交回；不宣称目标服务器最大吞吐或生产容量                                                  | 依赖 O0–O4 形成干净候选及隔离 PG/RabbitMQ/常驻 `mio_dev` 环境；确认独立审查者与覆盖 `pnpm check` 的有效来源；生产机器提高硬上限后的长稳容量证据继续如实保留为延期/pending，不以短测替代                                                                                             | 执行受影响单测/集成回归、双产物构建、前后端联调实证与三方对账；**接受条件**：所有必需证据绑定同一干净候选、实际证明“改上限真改变并发”且不破坏既有单路转码/音频/通用媒体处理与管理后台，经人类明确接受后更新 `worker-observability` 成果                                                                                                             |
 
-主要候选修改入口为：B 侧 `compute/src/resource-slots.ts`（候选）、`compute/src/main.ts`、三类 worker/runtime、`compute/src/maintenance.ts`、`compute/src/adapters/rabbitmq.ts` 与 `compute/src/adapters/journal.ts`；共享协议 `contracts/compute/`；A 侧 `src/compute/schema.ts`、store/service、管理 API、同源静态资源与 `src/plugin.ts`；以及构建、拓扑、本地环境与隔离测试。
+主要实现入口为：B 侧 `compute/src/resource-slots.ts`、`compute/src/main.ts`、三类 worker/runtime、`compute/src/maintenance.ts`、`compute/src/adapters/rabbitmq.ts` 与 `compute/src/adapters/journal.ts`；共享协议 `contracts/compute/`；A 侧 `src/compute/schema.ts`、`src/compute/worker-observability-{schema,store,queries,control}.ts`、`src/compute/ops-http.ts`、`src/admin/http.ts` 与 `src/plugin.ts`；前端控制台位于独立同级仓库 `mio-admin-web`；以及构建、拓扑、本地环境与隔离测试。
 
 ## 已确认实施决定
 
-| 决定        | 当前值与行为                                                                                                                                      |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 调限边界    | 每个 Worker 实例独立 revision 和控制队列；不提供集群原子总上限                                                                                    |
-| 操作员      | 显式 `MIO_COMPUTE_OPS_USER_IDS` allowlist；未启用 Ops 时不注册页面和管理 API                                                                      |
-| Worker 实例 | `MIO_COMPUTE_WORKER_INSTANCE_IDS` 同时用于拓扑、B 控制队列权限和 A 遥测 allowlist                                                                 |
-| 部署硬上限  | 默认和最低 2/1/1；通过 `MIO_COMPUTE_HARD_MAX_TOTAL`、`MIO_COMPUTE_HARD_MAX_ENCODE`、`MIO_COMPUTE_HARD_MAX_PROBE` 提高后重启 B，网页不能越过硬上限 |
-| 降低与暂停  | 降低上限不取消已运行任务，显示排空；0/0/0 可暂停所有新执行，分类 0 可暂停对应资源类                                                               |
-| 保留期      | 采样 7 天、执行事件和摘要 30 天、调限审计 90 天                                                                                                   |
-| 遥测故障    | B 最多保留 100000 条未确认 Worker 消息；记录失败只写错误日志，不回滚或重跑业务；已确认消息超过 24 小时后清理                                      |
-| 不在本期    | 全局集群令牌、自动扩缩容、任意多槽权重、FFmpeg 线程在线调参、RabbitMQ management 指标                                                             |
+| 决定           | 当前值与行为                                                                                                                                                                                                                                                                      |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 调限边界       | 每个 Worker 实例独立 revision 和控制队列；不提供集群原子总上限                                                                                                                                                                                                                    |
+| 管理鉴权与门控 | 统一复用超级管理员会话 `mio.admin_session`（`Path=/api/v1/admin`）与 `MIO_ADMIN_ALLOWED_ORIGINS`，受 `MIO_ADMIN_ENABLED=true` 门控；废除 `MIO_COMPUTE_OPS_ENABLED`、`MIO_COMPUTE_OPS_USER_IDS` 与后端 `/ops/compute/` 静态页；前端归属独立工程 `mio-admin-web`「计算 Worker」菜单 |
+| Worker 实例    | `MIO_COMPUTE_WORKER_INSTANCE_IDS` 同时用于拓扑、B 控制队列权限和 A 遥测 allowlist；配置后 A 持续保存遥测，启用管理后台后开放 `/api/v1/admin/compute/*`，未配置实例时鉴权后返回 `503 COMPUTE_OPS_UNAVAILABLE`                                                                      |
+| 部署硬上限     | 默认和最低 2/1/1；通过 `MIO_COMPUTE_HARD_MAX_TOTAL`、`MIO_COMPUTE_HARD_MAX_ENCODE`、`MIO_COMPUTE_HARD_MAX_PROBE` 提高后重启 B，网页不能越过硬上限                                                                                                                                 |
+| 降低与暂停     | 降低上限不取消已运行任务，显示排空；0/0/0 可暂停所有新执行，分类 0 可暂停对应资源类                                                                                                                                                                                               |
+| 保留期         | 采样 7 天、执行事件和摘要 30 天、调限审计 90 天                                                                                                                                                                                                                                   |
+| 遥测故障       | B 最多保留 100000 条未确认 Worker 消息；记录失败只写错误日志，不回滚或重跑业务；已确认消息超过 24 小时后清理                                                                                                                                                                      |
+| 不在本期       | 全局集群令牌、自动扩缩容、任意多槽权重、FFmpeg 线程在线调参、后端托管静态控制台、RabbitMQ management 指标（计算 Worker 遥测侧不注入 MQ 管理凭据）                                                                                                                                 |
 
 ## 验收重点与工作量
 
 必须用实际执行证明“改上限真的改变并发”，并覆盖 `encode`/`probe`/`total` 组合、不同实例隔离、单任务归属、短任务峰值、同执行身份去重、控制通道不被满载阻塞、取消/异常/重启后不漏占或双释放、未知进程不冒充空闲、离线待生效和历史断档。
 
-历史重启后可查询，配置 `revision` 与操作者可追溯；非操作员不得读取跨用户任务或修改上限。PG 迁移、保留清理和观测异常不影响业务任务/资产恢复。自动回归复用仓库隔离通道，真实业务和容量观察按实际授权单独取得，短测不代替父 PRD 中延期的正式容量窗口。
+历史重启后可查询，配置 `revision` 与操作管理员用户名（`admin.username`）可追溯；未登录与普通 C 端用户不得读取跨用户任务或修改上限，统一返回 `401 ADMIN_UNAUTHORIZED`。PG 迁移、保留清理和观测异常不影响业务任务/资产恢复。自动回归复用仓库隔离通道，真实业务和容量观察按实际授权单独取得，短测不代替父 PRD 中延期的正式容量窗口。
 
 目标部署若提高 `2/1/1` 硬上限，必须另做 CPU、内存、磁盘和代表性媒体容量观察。短时单机测试只证明调限和准入行为，不证明长期吞吐或生产容量。
 
 ## 规范与成果关系
 
-实施阶段须沿用并在 verify 前同步更新[计算 HTTP 契约](../../../../apis/compute.md)、[RabbitMQ 契约](../../../../integrations/rabbitmq.md)、[现有运行说明](../../../../../compute/README.md)、[常驻环境](../../../../local-environments.md)及新增 `docs/apis/compute-ops.md`（不在 P0 提前创建或修改现行规范）。已有 `compute-jobs`、`compute-worker`、`compute-local-artifacts` 等接受事实只代表各自候选；本能力须在后续实施与验证后由 `worker-observability` 成果独立验证和接受。
+实施阶段须沿用并在 verify 前同步更新[管理后台 HTTP 契约](../../../../apis/admin.md)、[计算 HTTP 契约](../../../../apis/compute.md)、[API 导航](../../../../apis/index.md)、[RabbitMQ 契约](../../../../integrations/rabbitmq.md)、[现有运行说明](../../../../../compute/README.md)、[常驻环境](../../../../local-environments.md)及[源码护栏](../../../../engineering/source-guardrails.md)（废除旧 `docs/apis/compute-ops.md`），并与[Web 管理后台 PRD](../../../web-admin-console/prd.md) Unit 3 `admin-compute-workers` 保持一致。已有 `compute-jobs`、`compute-worker`、`compute-local-artifacts` 及上一轮 `worker-observability` 接受事实只代表各自旧候选；本轮架构纠偏候选须在重新验证并获人类明确接受后更新 `worker-observability` 成果。
 
-本文件记录当前产品要求、规划边界与 O0–O5 开发单元安排。主干尚未合入对应实现；后续静态检查、隔离回归、浏览器视觉验证、目标服务器容量与人类接受均须分别取证，未执行项如实保持 pending。
+本文件记录当前产品要求、架构纠偏口径与 O0–O5 开发单元安排。本轮架构纠偏静态检查、隔离回归、独立前端联调、目标服务器容量与人类重新接受均须分别取证，未执行项如实保持 pending。

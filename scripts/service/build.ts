@@ -1,4 +1,4 @@
-import { copyFile, mkdir, rm } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -21,9 +21,4 @@ if (result.status === 0) {
     { stdio: 'inherit' },
   );
   process.exitCode = migrations.status ?? 1;
-  if (migrations.status === 0) {
-    await mkdir('dist/compute/ops-web', { recursive: true });
-    for (const file of ['index.html', 'app.js', 'styles.css'])
-      await copyFile(`src/compute/ops-web/${file}`, `dist/compute/ops-web/${file}`);
-  }
 }

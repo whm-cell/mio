@@ -8,27 +8,26 @@ const base = {
   MIO_COMPUTE_EXPECTED_RESULT_USER: 'worker-default',
 };
 
-it('keeps existing single B behavior and registers Ops only on explicit enablement with operators', () => {
+it('keeps existing single B behavior and reads workerInstances/workerUsers without legacy ops switches', () => {
   expect(readComputeConfig(base)).toEqual({
     brokerURL: base.RABBITMQ_URL,
     brokerUser: 'app',
     expectedResultUser: 'worker-default',
   });
-  const observed = { ...base, MIO_COMPUTE_WORKER_INSTANCE_IDS: 'worker-a' };
-  expect(readComputeConfig({ ...observed, MIO_COMPUTE_OPS_ENABLED: 'false' })).not.toHaveProperty(
-    'opsUserIds',
-  );
-  const id = 'OpaqueMioUser01bLkw4z0963qD';
-  expect(
+  const observed = readComputeConfig({ ...base, MIO_COMPUTE_WORKER_INSTANCE_IDS: 'worker-a' });
+  expect(observed).toEqual({
+    brokerURL: base.RABBITMQ_URL,
+    brokerUser: 'app',
+    expectedResultUser: 'worker-default',
+    workerInstances: ['worker-a'],
+    workerUsers: new Map([['worker-a', 'worker-default']]),
+  });
+  expect(() =>
     readComputeConfig({
-      ...observed,
-      MIO_COMPUTE_OPS_ENABLED: 'true',
-      MIO_COMPUTE_OPS_USER_IDS: id,
+      ...base,
+      MIO_COMPUTE_WORKER_RESULT_USERS: '{"worker-a":"worker-default"}',
     }),
-  ).toMatchObject({ workerUsers: new Map([['worker-a', 'worker-default']]), opsUserIds: [id] });
-  expect(() => readComputeConfig({ ...observed, MIO_COMPUTE_OPS_ENABLED: 'true' })).toThrow(
-    'COMPUTE_CONFIG',
-  );
+  ).toThrow('COMPUTE_CONFIG');
 });
 
 it('requires a complete one-to-one Worker user mapping when multiple control queues are deployed', () => {

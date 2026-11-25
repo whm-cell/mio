@@ -27,18 +27,9 @@ export function videoDisplayGeometry(stream: VideoDisplayStream) {
   const sin = Math.abs(Math.sin(radians));
   const sar = probeRatio(aspect, ':');
   const pixelWidth = sar ?? 1;
-  const displayWidth = Math.round(cos * width * pixelWidth + sin * height);
-  const displayHeight = Math.round(sin * width * pixelWidth + cos * height);
-  if (
-    !Number.isSafeInteger(displayWidth) ||
-    !Number.isSafeInteger(displayHeight) ||
-    displayWidth < 1 ||
-    displayHeight < 1
-  )
-    return null;
   return {
-    width: displayWidth,
-    height: displayHeight,
+    width: Math.round(cos * width * pixelWidth + sin * height),
+    height: Math.round(sin * width * pixelWidth + cos * height),
     rotation,
     sampleAspectRatio: sar === null ? '1:1' : aspect,
   };

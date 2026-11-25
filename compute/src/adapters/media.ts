@@ -464,6 +464,10 @@ export async function probeVideoFile(
       video.codec_name.length > 128 ||
       !/^[A-Za-z0-9_,.+-]+$/.test(video.codec_name) ||
       !size ||
+      !Number.isSafeInteger(size.width) ||
+      !Number.isSafeInteger(size.height) ||
+      size.width < 1 ||
+      size.height < 1 ||
       size.width > 65536 ||
       size.height > 65536
     )

@@ -44,6 +44,51 @@
       }
     },
     {
+      "key": "onelink-account-binding",
+      "title": "万联 OneLink 账号创建、已有手机号绑定、当前会话绑定与全站短信 bypass 策略对齐",
+      "locations": [
+        {
+          "path": "src/auth/onelink.ts",
+          "purpose": "POST /api/auth/onelink/existing/send-otp 与 POST /api/auth/onelink/complete（create/link_existing/bind_current，支持 live/bypass/disabled 短信模式）"
+        },
+        {
+          "path": "src/auth/onelink-store.ts",
+          "purpose": "事务性建人/绑号、全局行锁序防死锁与锁后过期校验"
+        },
+        {
+          "path": "src/auth/phone.ts",
+          "purpose": "/api/auth/phone-number/* 与 /api/auth/phone-binding/* 统一遵循全局 smsMode（live/bypass/disabled）"
+        },
+        {
+          "path": "src/auth/phone-store.ts",
+          "purpose": "onelink_existing 专用短信挑战及 bypass 模式原子手机绑定事务 bindPhoneWithoutChallenge"
+        },
+        {
+          "path": "src/auth/account.ts",
+          "purpose": "GET/PATCH /api/v1/me/profile 只读 onelinkBound 字段"
+        },
+        {
+          "path": "docs/auth.md",
+          "purpose": "认证底座短信模式策略、万联账号归属事务与全局锁序规范"
+        },
+        {
+          "path": "docs/apis/auth.md",
+          "purpose": "万联绑定、手机补绑与用户资料 HTTP 契约"
+        }
+      ],
+      "outcomes": "交付 action=create（事务原子建人写关联、冲突零孤儿）、action=link_existing（专用 onelink_existing 短信挑战与全站 smsMode live/bypass/disabled 支持、无注册枚举、零自动建号）、action=bind_current（10 分钟近期会话复核、锁定展示候选与同用户幂等）、/api/auth/phone-binding/* 同步支持全局 bypass 模式以及 GET/PATCH /api/v1/me/profile 只读 onelinkBound 字段。",
+      "verification": "候选 cc39762306a4b672ac791412ed6f975b16194468（基于集成提交 2fb2f14 仅增量记录 Unit 1–2 公开接受结果）真实执行 pnpm check:static、pnpm work documents、9 套件认证/管理/插件全量回归、pnpm test:smoke 及质量/三方规范复核均通过；并在本地 mio_dev 与 mio-admin-web 经 Cloudflare Quick Tunnel HTTPS 对接真实万联测试环境及真实/固定码短信完成实测通过。",
+      "limitations": "smsMode='bypass' 为高风险开发/测试能力，覆盖登录与全部手机号绑定入口，严禁在公开生产环境长期开启；v1 仍保持 payload_sub_unverified 安全边界，公网生产开放前须另行完成验真/自省与老用户迁移映射评审；远端 GitHub Actions 全量 CI 待 PR 推送后核验。",
+      "acceptance": {
+        "candidate": {
+          "commit": "cc39762306a4b672ac791412ed6f975b16194468",
+          "contractRevision": 3
+        },
+        "statement": "接受万联 OneLink 账号创建、已有手机号绑定、当前会话绑定与方案 A 全站短信 bypass 对齐交付及已披露的安全边界与限制，完成本地公共成果发布。",
+        "reference": "2026-11-25 对话 2336144c-85b3-4d33-b6de-8c72b1560798 中用户先确认方案 A，随后在 Cloudflare Quick Tunnel + 万联测试环境实测通过后明确回复：“功能已经完成，看还有是否还未complete的关键护栏内容，继续完成……完成后，准备将代码合并至远端的main，包括（mio和mio-admin-web）”。原集成受验代码候选 2fb2f146345b102e623e952ba9f3c2cd254b2ac0 至当前候选 cc39762306a4b672ac791412ed6f975b16194468 仅新增同批 Unit 1–2 接受记录，并已完成重新执行与复核。"
+      }
+    },
+    {
       "key": "onelink-auth-callback",
       "title": "万联 OneLink 授权发起、AES-256-GCM 跳转、回调解析与待处理候选存储",
       "locations": [

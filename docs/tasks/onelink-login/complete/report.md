@@ -8,6 +8,12 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 [src/integrations/onelink/sso.ts](../../../../src/integrations/onelink/sso.ts) · [src/admin/service.ts](../../../../src/admin/service.ts) · [src/admin/http.ts](../../../../src/admin/http.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/apis/admin.md](../../../apis/admin.md) · [docs/integrations/onelink-sso.md](../../../integrations/onelink-sso.md)
 
+## onelink-account-binding
+
+**万联 OneLink 账号创建、已有手机号绑定、当前会话绑定与全站短信 bypass 策略对齐**
+
+[src/auth/onelink.ts](../../../../src/auth/onelink.ts) · [src/auth/onelink-store.ts](../../../../src/auth/onelink-store.ts) · [src/auth/phone.ts](../../../../src/auth/phone.ts) · [src/auth/phone-store.ts](../../../../src/auth/phone-store.ts) · [src/auth/account.ts](../../../../src/auth/account.ts) · [docs/auth.md](../../../auth.md) · [docs/apis/auth.md](../../../apis/auth.md)
+
 ## onelink-auth-callback
 
 **万联 OneLink 授权发起、AES-256-GCM 跳转、回调解析与待处理候选存储**

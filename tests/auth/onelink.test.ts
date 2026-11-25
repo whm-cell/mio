@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
@@ -9,7 +10,7 @@ import {
   readAuthConfig,
   resolveAllowedOneLinkClientIds,
 } from '../../src/auth/config.ts';
-import type { OneLinkSsoRuntimePolicy } from '../../src/auth/config.ts';
+import type { AuthRuntimePolicy, OneLinkSsoRuntimePolicy } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import type { Authentication } from '../../src/auth/service.ts';
@@ -18,6 +19,7 @@ import { authDatabase } from '../support/auth-database.ts';
 
 const SYNTHETIC_ENC_KEY = 'synthetic-test-only-enc-key-32ch';
 const PASSWORD = 'correct-horse-onelink-test-42';
+const AUTH_SECRET = randomBytes(40).toString('hex');
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
@@ -25,6 +27,16 @@ let origin: string;
 let server: ReturnType<typeof createServer>;
 let auth: Authentication;
 let policy: OneLinkSsoRuntimePolicy;
+let authPolicy: AuthRuntimePolicy;
+let delivered = new Map<string, string>();
+let smsSendCount = 0;
+let failSmsSend = false;
+
+const smsSender = async (phone: string, code: string) => {
+  smsSendCount += 1;
+  delivered.set(phone, code);
+  if (failSmsSend) throw new Error('synthetic sms provider outage');
+};
 
 const oneLinkConfig: OneLinkSsoConfig = {
   environment: 'test',
@@ -123,6 +135,80 @@ async function countUsersAndAccounts() {
   };
 }
 
+async function createPhoneUser(phoneNumber: string) {
+  const sendRes = await call('/api/auth/phone-number/send-otp', { body: { phoneNumber } });
+  expect(sendRes.status, await sendRes.clone().text()).toBe(200);
+  const normalized = phoneNumber.startsWith('+86') ? phoneNumber : `+86${phoneNumber}`;
+  const code = delivered.get(normalized)!;
+  const verifyRes = await call('/api/auth/phone-number/verify', {
+    body: { phoneNumber, code },
+  });
+  expect(verifyRes.status, await verifyRes.clone().text()).toBe(200);
+  const sessionCookie = cookieHeader(verifyRes);
+  const me = (await (await call('/api/v1/me', { cookie: sessionCookie })).json()) as {
+    userId: string;
+    sessionId: string;
+  };
+  return { ...me, phone: normalized, cookie: sessionCookie };
+}
+
+async function stageLoginCandidate(sub: string, returnPath = '/?nav=onelink-sandbox') {
+  const startRes = await call('/api/auth/onelink/start', {
+    body: { intent: 'login', returnPath },
+  });
+  expect(startRes.status).toBe(200);
+  const pendingCookie = cookieHeader(startRes);
+  const cbRes = await call(
+    `/api/auth/callback/onelink?access_token=${encodeURIComponent(
+      makeJwt({ sub, client_id: 'miiooClientId', exp: futureExp() }),
+    )}`,
+    { cookie: pendingCookie, origin: false },
+  );
+  expect(cbRes.status).toBe(303);
+  expect(cbRes.headers.get('location')).toBe(`${returnPath}&onelink_result=choose_account`);
+  const pendingRes = await call('/api/auth/onelink/pending', {
+    cookie: pendingCookie,
+    origin: false,
+  });
+  expect(pendingRes.status).toBe(200);
+  const candidate = (await pendingRes.json()) as {
+    candidateToken: string;
+    onelinkSub: string;
+  };
+  return { pendingCookie, candidateToken: candidate.candidateToken, sub };
+}
+
+async function stageBindCandidate(
+  sessionCookie: string,
+  sub: string,
+  returnPath = '/?nav=onelink-sandbox',
+) {
+  const startRes = await call('/api/auth/onelink/start', {
+    body: { intent: 'bind', returnPath },
+    cookie: sessionCookie,
+  });
+  expect(startRes.status, await startRes.clone().text()).toBe(200);
+  const pendingCookie = cookieHeader(startRes);
+  const cbRes = await call(
+    `/api/auth/callback/onelink?access_token=${encodeURIComponent(
+      makeJwt({ sub, client_id: 'miioo', exp: futureExp() }),
+    )}`,
+    { cookie: joinCookies(pendingCookie, sessionCookie), origin: false },
+  );
+  expect(cbRes.status).toBe(303);
+  expect(cbRes.headers.get('location')).toBe(`${returnPath}&onelink_result=confirm_bind`);
+  const pendingRes = await call('/api/auth/onelink/pending', {
+    cookie: joinCookies(pendingCookie, sessionCookie),
+    origin: false,
+  });
+  expect(pendingRes.status).toBe(200);
+  const candidate = (await pendingRes.json()) as {
+    candidateToken: string;
+    onelinkSub: string;
+  };
+  return { pendingCookie, candidateToken: candidate.candidateToken, sub };
+}
+
 beforeAll(async () => {
   database = await authDatabase();
   pool = new Pool({ connectionString: database.url });
@@ -138,19 +224,36 @@ beforeAll(async () => {
     clientName: 'miioo',
     allowedClientIds: resolveAllowedOneLinkClientIds('miioo', 'miiooClientId', null),
   };
+  authPolicy = {
+    emailPasswordEnabled: true,
+    smsMode: 'live',
+    smsBypassCode: null,
+  };
 
   const config = readAuthConfig({
     MIO_AUTH_BASE_URL: origin,
-    MIO_AUTH_SECRET: randomBytes(40).toString('hex'),
+    MIO_AUTH_SECRET: AUTH_SECRET,
     MIO_AUTH_DATABASE_URL: database.url,
   })!;
-  await (await getMigrations(authOptions(config, pool))).runMigrations();
-  auth = await createAuthentication(config, undefined, undefined, undefined, {
+  const migrated = spawnSync(process.execPath, ['scripts/service/migrate-auth.ts', '--apply'], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: {
+      MIO_AUTH_BASE_URL: origin,
+      MIO_AUTH_SECRET: AUTH_SECRET,
+      MIO_AUTH_DATABASE_URL: database.url,
+    },
+  });
+  expect(migrated.status, migrated.stderr).toBe(0);
+  auth = await createAuthentication(config, undefined, smsSender, () => authPolicy, {
     config: oneLinkConfig,
     getPolicy: () => policy,
   });
-  server.on('request', createAuthHandler(config, auth));
-}, 30_000);
+  server.on(
+    'request',
+    createAuthHandler(config, auth, undefined, () => authPolicy),
+  );
+}, 45_000);
 
 beforeEach(async () => {
   policy = {
@@ -158,8 +261,18 @@ beforeEach(async () => {
     clientName: 'miioo',
     allowedClientIds: resolveAllowedOneLinkClientIds('miioo', 'miiooClientId', null),
   };
+  authPolicy = {
+    emailPasswordEnabled: true,
+    smsMode: 'live',
+    smsBypassCode: null,
+  };
+  delivered = new Map();
+  smsSendCount = 0;
+  failSmsSend = false;
   await pool.query('DELETE FROM "rateLimit"');
   await pool.query('DELETE FROM "mioOneLinkPending"');
+  await pool.query('DELETE FROM "mioPhoneChallenge"');
+  await pool.query('DELETE FROM "mioSmsBudget"');
 });
 
 afterAll(async () => {
@@ -228,6 +341,22 @@ describe('OneLink schema migration & unconfigured/disabled gating', () => {
         const pendingRes = await fetch(`${base}/api/auth/onelink/pending`);
         expect(pendingRes.status).toBe(503);
         expect(await pendingRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
+
+        const sendOtpRes = await fetch(`${base}/api/auth/onelink/existing/send-otp`, {
+          method: 'POST',
+          headers: { origin, 'content-type': 'application/json' },
+          body: JSON.stringify({ phoneNumber: '13800138000' }),
+        });
+        expect(sendOtpRes.status).toBe(503);
+        expect(await sendOtpRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
+
+        const completeRes = await fetch(`${base}/api/auth/onelink/complete`, {
+          method: 'POST',
+          headers: { origin, 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'create', candidateToken: 'tok' }),
+        });
+        expect(completeRes.status).toBe(503);
+        expect(await completeRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
       } finally {
         unconfiguredServer.closeAllConnections();
         await new Promise<void>((resolve) => unconfiguredServer.close(() => resolve()));
@@ -267,6 +396,18 @@ describe('OneLink schema migration & unconfigured/disabled gating', () => {
     const pendingRes = await call('/api/auth/onelink/pending', { origin: false });
     expect(pendingRes.status).toBe(503);
     expect(await pendingRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
+
+    const sendOtpRes = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: '13800138000' },
+    });
+    expect(sendOtpRes.status).toBe(503);
+    expect(await sendOtpRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
+
+    const completeRes = await call('/api/auth/onelink/complete', {
+      body: { action: 'create', candidateToken: 'tok' },
+    });
+    expect(completeRes.status).toBe(503);
+    expect(await completeRes.json()).toMatchObject({ code: 'ONELINK_UNAVAILABLE' });
 
     // Cancel remains available to clear stale cookies even when switch is toggled off.
     const cancelRes = await call('/api/auth/onelink/cancel', { body: {} });
@@ -658,6 +799,16 @@ describe('GET /api/auth/callback/onelink, GET /api/auth/onelink/pending and POST
     });
     expect(meRes.status).toBe(200);
     expect(await meRes.json()).toMatchObject({ userId: activeUser.userId });
+
+    const profileRes = await call('/api/v1/me/profile', {
+      cookie: sessionSetCookie!.split(';')[0]!,
+      origin: false,
+    });
+    expect(profileRes.status).toBe(200);
+    expect(await profileRes.json()).toMatchObject({
+      userId: activeUser.userId,
+      onelinkBound: true,
+    });
 
     // Replaying callback with completed pending cookie fails without issuing another session.
     const replayRes = await call(
@@ -1187,6 +1338,1203 @@ describe('GET /api/auth/callback/onelink, GET /api/auth/onelink/pending and POST
         onelinkSub: winningSub,
         candidateToken: winningToken,
       });
+    }
+  });
+});
+
+describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onelink/complete', () => {
+  it('Path 2 (action=create): creates user+account atomically, supports optional phone-binding and blocks replay', async () => {
+    const occupiedOwner = await createPhoneUser('13800138101');
+    const sub = `ol-path2-${randomUUID()}`;
+    const staged = await stageLoginCandidate(sub);
+
+    const createRes = await call('/api/auth/onelink/complete', {
+      body: { action: 'create', candidateToken: staged.candidateToken },
+      cookie: staged.pendingCookie,
+    });
+    expect(createRes.status, await createRes.clone().text()).toBe(200);
+    const created = (await createRes.json()) as {
+      status: boolean;
+      action: string;
+      userId: string;
+    };
+    expect(created.status).toBe(true);
+    expect(created.action).toBe('create');
+    expect(created.userId).toBeTruthy();
+
+    const sessionCookie = findSetCookie(createRes, 'mio.session_token');
+    expect(sessionCookie).toBeDefined();
+    expect(findSetCookie(createRes, 'mio.onelink_pending')).toMatch(/Max-Age=0/i);
+    const userCookie = sessionCookie!.split(';')[0]!;
+
+    const me = (await (await call('/api/v1/me', { cookie: userCookie })).json()) as {
+      userId: string;
+      sessionId: string;
+    };
+    expect(me.userId).toBe(created.userId);
+
+    const profileRes = await call('/api/v1/me/profile', { cookie: userCookie });
+    expect(profileRes.status).toBe(200);
+    const profile = (await profileRes.json()) as {
+      userId: string;
+      displayId: string;
+      name: string;
+      avatarAssetId: string | null;
+      phoneNumber: string | null;
+      phoneNumberVerified: boolean;
+      wechatBound: boolean;
+      onelinkBound: boolean;
+    };
+    expect(profile).toMatchObject({
+      userId: created.userId,
+      name: '万联用户',
+      avatarAssetId: null,
+      phoneNumber: null,
+      phoneNumberVerified: false,
+      wechatBound: false,
+      onelinkBound: true,
+    });
+    expect(profile.displayId).toMatch(/^miioo_\d{6}$/);
+
+    // Verify placeholder email and no persisted upstream tokens in DB.
+    const dbUser = (
+      await pool.query<{ email: string; emailVerified: boolean }>(
+        'SELECT email, "emailVerified" FROM "user" WHERE id = $1',
+        [created.userId],
+      )
+    ).rows[0]!;
+    expect(dbUser.email).toMatch(/^onelink-.+@auth\.mio\.invalid$/);
+    expect(dbUser.emailVerified).toBe(false);
+    const dbAccount = (
+      await pool.query<{ accessToken: string | null; refreshToken: string | null }>(
+        `SELECT "accessToken", "refreshToken" FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+        [created.userId],
+      )
+    ).rows[0]!;
+    expect(dbAccount).toEqual({ accessToken: null, refreshToken: null });
+
+    // PATCH /api/v1/me/profile returns onelinkBound: true.
+    const patched = await call('/api/v1/me/profile', {
+      method: 'PATCH',
+      body: { name: '万联新用户' },
+      cookie: userCookie,
+    });
+    expect(patched.status).toBe(200);
+    expect(await patched.json()).toMatchObject({
+      userId: created.userId,
+      name: '万联新用户',
+      onelinkBound: true,
+    });
+
+    // Optional phone binding: occupied phone returns 409 PHONE_CONFLICT and preserves original owner.
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const occupiedSend = await call('/api/auth/phone-binding/send-otp', {
+      body: { phoneNumber: '13800138101' },
+      cookie: userCookie,
+    });
+    expect(occupiedSend.status).toBe(200);
+    const occupiedConfirm = await call('/api/auth/phone-binding/confirm', {
+      body: { phoneNumber: '13800138101', code: delivered.get('+8613800138101')! },
+      cookie: userCookie,
+    });
+    expect(occupiedConfirm.status).toBe(409);
+    expect(await occupiedConfirm.json()).toMatchObject({ code: 'PHONE_CONFLICT' });
+    const ownerPhoneRow = (
+      await pool.query<{ id: string }>('SELECT id FROM "user" WHERE "phoneNumber" = $1', [
+        '+8613800138101',
+      ])
+    ).rows[0]!;
+    expect(ownerPhoneRow.id).toBe(occupiedOwner.userId);
+
+    // Optional phone binding: idle phone succeeds -> both phone login and OneLink login return identical userId.
+    const idleSend = await call('/api/auth/phone-binding/send-otp', {
+      body: { phoneNumber: '13800138102' },
+      cookie: userCookie,
+    });
+    expect(idleSend.status).toBe(200);
+    const idleConfirm = await call('/api/auth/phone-binding/confirm', {
+      body: { phoneNumber: '13800138102', code: delivered.get('+8613800138102')! },
+      cookie: userCookie,
+    });
+    expect(idleConfirm.status).toBe(200);
+
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const phoneSend = await call('/api/auth/phone-number/send-otp', {
+      body: { phoneNumber: '13800138102' },
+    });
+    expect(phoneSend.status).toBe(200);
+    const phoneLogin = await call('/api/auth/phone-number/verify', {
+      body: { phoneNumber: '13800138102', code: delivered.get('+8613800138102')! },
+    });
+    expect(phoneLogin.status).toBe(200);
+    const phoneMe = (await (
+      await call('/api/v1/me', { cookie: cookieHeader(phoneLogin) })
+    ).json()) as { userId: string };
+    expect(phoneMe.userId).toBe(created.userId);
+
+    // Subsequent OneLink login directly lands on the exact same userId (Path 1).
+    const startAgain = await call('/api/auth/onelink/start', { body: { intent: 'login' } });
+    const cbAgain = await call(
+      `/api/auth/callback/onelink?access_token=${encodeURIComponent(
+        makeJwt({ sub, client_id: 'miiooClientId', exp: futureExp() }),
+      )}`,
+      { cookie: cookieHeader(startAgain), origin: false },
+    );
+    expect(cbAgain.status).toBe(303);
+    expect(cbAgain.headers.get('location')).toBe('/?onelink_result=logged_in');
+    const olMe = (await (
+      await call('/api/v1/me', {
+        cookie: findSetCookie(cbAgain, 'mio.session_token')!.split(';')[0]!,
+      })
+    ).json()) as { userId: string };
+    expect(olMe.userId).toBe(created.userId);
+
+    // Replay of completed create using the preserved old pending cookie -> 409 with zero new rows or sessions.
+    const countsBeforeReplay = await countUsersAndAccounts();
+    const sessionsBeforeReplay = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM "session"'))
+        .rows[0]!.count,
+    );
+    const replayRes = await call('/api/auth/onelink/complete', {
+      body: { action: 'create', candidateToken: staged.candidateToken },
+      cookie: staged.pendingCookie,
+    });
+    expect(replayRes.status).toBe(409);
+    expect(await replayRes.json()).toMatchObject({ code: 'ONELINK_PENDING_ALREADY_COMPLETED' });
+    expect(findSetCookie(replayRes, 'mio.session_token')).toBeUndefined();
+    expect(await countUsersAndAccounts()).toEqual(countsBeforeReplay);
+    const sessionsAfterReplay = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM "session"'))
+        .rows[0]!.count,
+    );
+    expect(sessionsAfterReplay).toBe(sessionsBeforeReplay);
+  });
+
+  it('Path 3 (link_existing): forbids smsMode=bypass, prevents enumeration/auto-create, verifies real OTP and links existing phone user', async () => {
+    const existingPhone = '13800138201';
+    const unregisteredPhone = '13800138202';
+    const existingUser = await createPhoneUser(existingPhone);
+    const preProfile = (await (
+      await call('/api/v1/me/profile', { cookie: existingUser.cookie })
+    ).json()) as { onelinkBound: boolean };
+    expect(preProfile.onelinkBound).toBe(false);
+
+    // 1. Without real SMS configured, even smsMode='bypass' MUST return 503 SMS_UNAVAILABLE on both endpoints.
+    const noSmsConfig = readAuthConfig({
+      MIO_AUTH_BASE_URL: origin,
+      MIO_AUTH_SECRET: AUTH_SECRET,
+      MIO_AUTH_DATABASE_URL: database.url,
+    })!;
+    const bypassPolicy: AuthRuntimePolicy = {
+      emailPasswordEnabled: true,
+      smsMode: 'bypass',
+      smsBypassCode: '654321',
+    };
+    const noSmsAuth = await createAuthentication(
+      noSmsConfig,
+      undefined,
+      undefined,
+      () => bypassPolicy,
+      { config: oneLinkConfig, getPolicy: () => policy },
+    );
+    const noSmsServer = createServer(
+      createAuthHandler(noSmsConfig, noSmsAuth, undefined, () => bypassPolicy),
+    );
+    noSmsServer.listen(0, '127.0.0.1');
+    await once(noSmsServer, 'listening');
+    const noSmsAddr = noSmsServer.address();
+    if (!noSmsAddr || typeof noSmsAddr === 'string') throw new Error('missing addr');
+    const noSmsBase = `http://127.0.0.1:${noSmsAddr.port}`;
+    try {
+      const stagedForNoSms = await stageLoginCandidate(`ol-nosms-${randomUUID()}`);
+      const noSmsSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({ phoneNumber: existingPhone }),
+      });
+      expect(noSmsSend.status).toBe(503);
+      expect(await noSmsSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+
+      const noSmsComplete = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({
+          action: 'link_existing',
+          candidateToken: stagedForNoSms.candidateToken,
+          phoneNumber: existingPhone,
+          code: '654321',
+        }),
+      });
+      expect(noSmsComplete.status).toBe(503);
+      expect(await noSmsComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+    } finally {
+      noSmsServer.closeAllConnections();
+      await new Promise<void>((resolve) => noSmsServer.close(() => resolve()));
+      await noSmsAuth.close();
+    }
+
+    // 2. With real SMS configured + smsMode='disabled': returns 503 SMS_UNAVAILABLE and never invokes sender.
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    smsSendCount = 0;
+    const sub = `ol-path3-${randomUUID()}`;
+    const staged = await stageLoginCandidate(sub);
+
+    authPolicy = { emailPasswordEnabled: true, smsMode: 'disabled', smsBypassCode: '654321' };
+    const disabledSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: existingPhone },
+      cookie: staged.pendingCookie,
+    });
+    expect(disabledSend.status).toBe(503);
+    expect(await disabledSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+    const disabledComplete = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: existingPhone,
+        code: '654321',
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(disabledComplete.status).toBe(503);
+    expect(await disabledComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+    expect(smsSendCount).toBe(0);
+
+    // 3. With real SMS configured + smsMode='bypass': STILL sends real SMS, debits persistent budget and rejects bypass code!
+    authPolicy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '654321' };
+    const unregSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: unregisteredPhone },
+      cookie: staged.pendingCookie,
+    });
+    expect(unregSend.status).toBe(200);
+    expect(await unregSend.json()).toEqual({ status: true });
+    expect(smsSendCount).toBe(1);
+    const budgetCount = Number(
+      (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM "mioSmsBudget"'))
+        .rows[0]!.count,
+    );
+    expect(budgetCount).toBeGreaterThan(0);
+
+    // Unregistered phone returns 404 EXISTING_PHONE_NOT_FOUND with ZERO users/accounts created and pending stays reusable!
+    const beforeUnreg = await countUsersAndAccounts();
+    const unregCode = delivered.get(`+86${unregisteredPhone}`)!;
+    const unregComplete = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: unregisteredPhone,
+        code: unregCode,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(unregComplete.status).toBe(404);
+    expect(await unregComplete.json()).toMatchObject({ code: 'EXISTING_PHONE_NOT_FOUND' });
+    expect(findSetCookie(unregComplete, 'mio.onelink_pending')).toBeUndefined();
+    expect(await countUsersAndAccounts()).toEqual(beforeUnreg);
+
+    // Unverified phone user in DB is also rejected as 404 EXISTING_PHONE_NOT_FOUND with zero writes.
+    const unverifiedPhone = '13800138203';
+    await pool.query(
+      `INSERT INTO "user" (id, name, email, "emailVerified", "phoneNumber", "phoneNumberVerified", "createdAt", "updatedAt")
+       VALUES ($1, 'Unverified', $2, false, $3, false, now(), now())`,
+      [randomUUID(), `unverified-${randomUUID()}@example.test`, `+86${unverifiedPhone}`],
+    );
+    const unverifiedSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: unverifiedPhone },
+      cookie: staged.pendingCookie,
+    });
+    expect(unverifiedSend.status).toBe(200);
+    const beforeUnverified = await countUsersAndAccounts();
+    const unverifiedComplete = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: unverifiedPhone,
+        code: delivered.get(`+86${unverifiedPhone}`)!,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(unverifiedComplete.status).toBe(404);
+    expect(await unverifiedComplete.json()).toMatchObject({ code: 'EXISTING_PHONE_NOT_FOUND' });
+    expect(findSetCookie(unverifiedComplete, 'mio.onelink_pending')).toBeUndefined();
+    expect(await countUsersAndAccounts()).toEqual(beforeUnverified);
+
+    // Now reuse the SAME pending row for the verified existing phone while smsMode='bypass' is still active!
+    const realSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: existingPhone },
+      cookie: staged.pendingCookie,
+    });
+    expect(realSend.status).toBe(200);
+    const realCode = delivered.get(`+86${existingPhone}`)!;
+    const bypassProbeCode = realCode === '654321' ? '000000' : '654321';
+
+    // Fixed bypass code is rejected and preserves pending cookie for retry!
+    const bypassAttempt = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: existingPhone,
+        code: bypassProbeCode,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(bypassAttempt.status).toBe(400);
+    expect(await bypassAttempt.json()).toMatchObject({ code: 'INVALID_OTP' });
+    expect(findSetCookie(bypassAttempt, 'mio.onelink_pending')).toBeUndefined();
+
+    // Pre-check candidateToken BEFORE consuming OTP: wrong candidateToken returns 400 ONELINK_PENDING_INVALID without consuming the OTP!
+    const badTokenAttempt = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: 'wrong-candidate-token',
+        phoneNumber: existingPhone,
+        code: realCode,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(badTokenAttempt.status).toBe(400);
+    expect(await badTokenAttempt.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    // Right candidateToken + realCode succeeds and logs into exact existingUser.userId!
+    const usersBeforeLink = (await countUsersAndAccounts()).users;
+    const okLink = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: existingPhone,
+        code: realCode,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(okLink.status, await okLink.clone().text()).toBe(200);
+    expect(await okLink.json()).toEqual({
+      status: true,
+      action: 'link_existing',
+      userId: existingUser.userId,
+    });
+    expect(findSetCookie(okLink, 'mio.onelink_pending')).toMatch(/Max-Age=0/i);
+    const linkedSessionCookie = findSetCookie(okLink, 'mio.session_token')!.split(';')[0]!;
+    expect((await countUsersAndAccounts()).users).toBe(usersBeforeLink);
+
+    const linkedProfile = (await (
+      await call('/api/v1/me/profile', { cookie: linkedSessionCookie })
+    ).json()) as { userId: string; phoneNumber: string; onelinkBound: boolean };
+    expect(linkedProfile).toMatchObject({
+      userId: existingUser.userId,
+      phoneNumber: `+86${existingPhone}`,
+      onelinkBound: true,
+    });
+
+    // Replay of completed link_existing returns 409 ONELINK_PENDING_ALREADY_COMPLETED.
+    const replayLink = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: staged.candidateToken,
+        phoneNumber: existingPhone,
+        code: realCode,
+      },
+      cookie: staged.pendingCookie,
+    });
+    expect(replayLink.status).toBe(409);
+    expect(await replayLink.json()).toMatchObject({ code: 'ONELINK_PENDING_ALREADY_COMPLETED' });
+    expect(findSetCookie(replayLink, 'mio.session_token')).toBeUndefined();
+
+    // 4. Disabled existing phone user -> 403 ACCOUNT_DISABLED with zero account row written.
+    authPolicy = { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: null };
+    const disabledPhone = '13800138204';
+    const disabledUser = await createPhoneUser(disabledPhone);
+    await auth.setUserDisabled(disabledUser.userId, true);
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const disabledStaged = await stageLoginCandidate(`ol-disabled-link-${randomUUID()}`);
+    expect(
+      (
+        await call('/api/auth/onelink/existing/send-otp', {
+          body: { phoneNumber: disabledPhone },
+          cookie: disabledStaged.pendingCookie,
+        })
+      ).status,
+    ).toBe(200);
+    const disabledLinkRes = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: disabledStaged.candidateToken,
+        phoneNumber: disabledPhone,
+        code: delivered.get(`+86${disabledPhone}`)!,
+      },
+      cookie: disabledStaged.pendingCookie,
+    });
+    expect(disabledLinkRes.status).toBe(403);
+    expect(await disabledLinkRes.json()).toMatchObject({ code: 'ACCOUNT_DISABLED' });
+    expect(findSetCookie(disabledLinkRes, 'mio.session_token')).toBeUndefined();
+    const disabledAccounts = await pool.query(
+      `SELECT id FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+      [disabledUser.userId],
+    );
+    expect(disabledAccounts.rowCount).toBe(0);
+
+    // 5. Conflict when target phone user ALREADY has another OneLink sub -> 409 ONELINK_ALREADY_BOUND preserving original sub.
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const secondSubStaged = await stageLoginCandidate(`ol-second-sub-${randomUUID()}`);
+    expect(
+      (
+        await call('/api/auth/onelink/existing/send-otp', {
+          body: { phoneNumber: existingPhone },
+          cookie: secondSubStaged.pendingCookie,
+        })
+      ).status,
+    ).toBe(200);
+    const alreadyBoundUserRes = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: secondSubStaged.candidateToken,
+        phoneNumber: existingPhone,
+        code: delivered.get(`+86${existingPhone}`)!,
+      },
+      cookie: secondSubStaged.pendingCookie,
+    });
+    expect(alreadyBoundUserRes.status).toBe(409);
+    expect(await alreadyBoundUserRes.json()).toMatchObject({ code: 'ONELINK_ALREADY_BOUND' });
+    const preservedSub = (
+      await pool.query<{ accountId: string }>(
+        `SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+        [existingUser.userId],
+      )
+    ).rows[0]!;
+    expect(preservedSub.accountId).toBe(sub);
+
+    // 6. Conflict when candidate sub ALREADY belongs to another user -> 409 ONELINK_ALREADY_BOUND preserving original owner.
+    await pool.query('DELETE FROM "rateLimit"');
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const unboundTargetPhone = '13800138205';
+    const unboundTarget = await createPhoneUser(unboundTargetPhone);
+    const claimedSub = `ol-claimed-by-other-${randomUUID()}`;
+    const stagedBeforeClaim = await stageLoginCandidate(claimedSub);
+    const originalOwner = await createEmailUser();
+    await pool.query(
+      `INSERT INTO "account" (id, "accountId", "providerId", "userId", "createdAt", "updatedAt")
+       VALUES ($1, $2, 'onelink', $3, now(), now())`,
+      [randomUUID(), claimedSub, originalOwner.userId],
+    );
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    expect(
+      (
+        await call('/api/auth/onelink/existing/send-otp', {
+          body: { phoneNumber: unboundTargetPhone },
+          cookie: stagedBeforeClaim.pendingCookie,
+        })
+      ).status,
+    ).toBe(200);
+    const subClaimConflictRes = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: stagedBeforeClaim.candidateToken,
+        phoneNumber: unboundTargetPhone,
+        code: delivered.get(`+86${unboundTargetPhone}`)!,
+      },
+      cookie: stagedBeforeClaim.pendingCookie,
+    });
+    expect(subClaimConflictRes.status).toBe(409);
+    expect(await subClaimConflictRes.json()).toMatchObject({ code: 'ONELINK_ALREADY_BOUND' });
+    const preservedOwnerRow = (
+      await pool.query<{ userId: string }>(
+        `SELECT "userId" FROM "account" WHERE "providerId" = 'onelink' AND "accountId" = $1`,
+        [claimedSub],
+      )
+    ).rows[0]!;
+    expect(preservedOwnerRow.userId).toBe(originalOwner.userId);
+    const unboundTargetProfile = (await (
+      await call('/api/v1/me/profile', { cookie: unboundTarget.cookie })
+    ).json()) as { onelinkBound: boolean };
+    expect(unboundTargetProfile.onelinkBound).toBe(false);
+  });
+
+  it('enforces onelink_existing OTP 3-attempt lock, cross-purpose/cross-pending isolation, rate limits and send validation', async () => {
+    const phone = '13800138301';
+    const existing = await createPhoneUser(phone);
+    await pool.query('DELETE FROM "mioSmsBudget"');
+
+    const pendingA = await stageLoginCandidate(`ol-iso-a-${randomUUID()}`);
+    const pendingB = await stageLoginCandidate(`ol-iso-b-${randomUUID()}`);
+
+    // Validation on existing/send-otp: extra keys, missing cookie, bind pending.
+    const extraKeyRes = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: phone, userId: existing.userId },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(extraKeyRes.status).toBe(400);
+    expect(await extraKeyRes.json()).toMatchObject({ code: 'INVALID_INPUT' });
+
+    const missingCookieSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: phone },
+    });
+    expect(missingCookieSend.status).toBe(404);
+    expect(await missingCookieSend.json()).toMatchObject({ code: 'ONELINK_PENDING_NOT_FOUND' });
+
+    const bindOwner = await createEmailUser();
+    const bindPending = await stageBindCandidate(bindOwner.cookie, `ol-bind-send-${randomUUID()}`);
+    const bindSendAttempt = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: phone },
+      cookie: bindPending.pendingCookie,
+    });
+    expect(bindSendAttempt.status).toBe(400);
+    expect(await bindSendAttempt.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    // Cross-purpose: login OTP cannot be used for link_existing.
+    expect(
+      (await call('/api/auth/phone-number/send-otp', { body: { phoneNumber: phone } })).status,
+    ).toBe(200);
+    const loginOtp = delivered.get(`+86${phone}`)!;
+    const loginReplay = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: pendingA.candidateToken,
+        phoneNumber: phone,
+        code: loginOtp,
+      },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(loginReplay.status).toBe(400);
+    expect(await loginReplay.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+    // Cross-purpose: bind OTP cannot be used for link_existing.
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    expect(
+      (
+        await call('/api/auth/phone-binding/send-otp', {
+          body: { phoneNumber: phone },
+          cookie: bindOwner.cookie,
+        })
+      ).status,
+    ).toBe(200);
+    const bindOtp = delivered.get(`+86${phone}`)!;
+    const bindReplay = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: pendingA.candidateToken,
+        phoneNumber: phone,
+        code: bindOtp,
+      },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(bindReplay.status).toBe(400);
+    expect(await bindReplay.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+    // Send onelink_existing OTP for Pending A -> immediate resend hits 429 SMS_RATE_LIMITED (60s cooldown).
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    expect(
+      (
+        await call('/api/auth/onelink/existing/send-otp', {
+          body: { phoneNumber: phone },
+          cookie: pendingA.pendingCookie,
+        })
+      ).status,
+    ).toBe(200);
+    const otpA = delivered.get(`+86${phone}`)!;
+
+    const cooldownRes = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: phone },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(cooldownRes.status).toBe(429);
+    expect(await cooldownRes.json()).toMatchObject({ code: 'SMS_RATE_LIMITED' });
+
+    // Cross-purpose reverse: onelink_existing OTP cannot be used on /phone-number/verify.
+    const reverseReplay = await call('/api/auth/phone-number/verify', {
+      body: { phoneNumber: phone, code: otpA },
+    });
+    expect(reverseReplay.status).toBe(400);
+    expect(await reverseReplay.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+    // Cross-pending isolation: Pending A's OTP rejected on Pending B, and Pending B's send does NOT overwrite Pending A's challenge!
+    const crossPendingReplay = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: pendingB.candidateToken,
+        phoneNumber: phone,
+        code: otpA,
+      },
+      cookie: pendingB.pendingCookie,
+    });
+    expect(crossPendingReplay.status).toBe(400);
+    expect(await crossPendingReplay.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    expect(
+      (
+        await call('/api/auth/onelink/existing/send-otp', {
+          body: { phoneNumber: phone },
+          cookie: pendingB.pendingCookie,
+        })
+      ).status,
+    ).toBe(200);
+    const otpB = delivered.get(`+86${phone}`)!;
+
+    // 3 wrong attempts on Pending B lock/delete ONLY Pending B's challenge; 4th try with right otpB fails.
+    const wrongCodeB = otpB === '999999' ? '888888' : '999999';
+    for (let i = 0; i < 3; i += 1) {
+      const badTry = await call('/api/auth/onelink/complete', {
+        body: {
+          action: 'link_existing',
+          candidateToken: pendingB.candidateToken,
+          phoneNumber: phone,
+          code: wrongCodeB,
+        },
+        cookie: pendingB.pendingCookie,
+      });
+      expect(badTry.status).toBe(400);
+      expect(await badTry.json()).toMatchObject({ code: 'INVALID_OTP' });
+    }
+    const lockedOutTry = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: pendingB.candidateToken,
+        phoneNumber: phone,
+        code: otpB,
+      },
+      cookie: pendingB.pendingCookie,
+    });
+    expect(lockedOutTry.status).toBe(400);
+    expect(await lockedOutTry.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+    // Pending A's challenge remained completely intact despite Pending B's send & 3-attempt deletion!
+    const okPendingA = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: pendingA.candidateToken,
+        phoneNumber: phone,
+        code: otpA,
+      },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(okPendingA.status, await okPendingA.clone().text()).toBe(200);
+    expect(await okPendingA.json()).toEqual({
+      status: true,
+      action: 'link_existing',
+      userId: existing.userId,
+    });
+
+    // Calling existing/send-otp on an already-completed pending returns 409 ONELINK_PENDING_ALREADY_COMPLETED.
+    const sendOnCompleted = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: phone },
+      cookie: pendingA.pendingCookie,
+    });
+    expect(sendOnCompleted.status).toBe(409);
+    expect(await sendOnCompleted.json()).toMatchObject({
+      code: 'ONELINK_PENDING_ALREADY_COMPLETED',
+    });
+
+    // Sender outage returns 503 SMS_UNAVAILABLE and leaves challenge unactivated (cannot be consumed).
+    await pool.query('DELETE FROM "mioSmsBudget"');
+    const outagePending = await stageLoginCandidate(`ol-outage-${randomUUID()}`);
+    failSmsSend = true;
+    const outageSend = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: '13800138309' },
+      cookie: outagePending.pendingCookie,
+    });
+    failSmsSend = false;
+    expect(outageSend.status).toBe(503);
+    expect(await outageSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+    const unactivatedCode = delivered.get('+8613800138309')!;
+    const unactivatedTry = await call('/api/auth/onelink/complete', {
+      body: {
+        action: 'link_existing',
+        candidateToken: outagePending.candidateToken,
+        phoneNumber: '13800138309',
+        code: unactivatedCode,
+      },
+      cookie: outagePending.pendingCookie,
+    });
+    expect(unactivatedTry.status).toBe(400);
+    expect(await unactivatedTry.json()).toMatchObject({ code: 'INVALID_OTP' });
+  });
+
+  it('Path 4 (bind_current): preserves sessionId, supports same-user idempotency and enforces strict session/input/token checks', async () => {
+    const owner = await createEmailUser();
+    const otherUser = await createEmailUser();
+    const sub = `ol-path4-${randomUUID()}`;
+
+    const initialProfile = (await (
+      await call('/api/v1/me/profile', { cookie: owner.cookie })
+    ).json()) as { onelinkBound: boolean };
+    expect(initialProfile.onelinkBound).toBe(false);
+
+    // Stage TWO bind pendings for the same user + same sub, plus one for a different sub (to test conflict).
+    const staged1 = await stageBindCandidate(owner.cookie, sub);
+    const staged2 = await stageBindCandidate(owner.cookie, sub);
+    const stagedDifferentSub = await stageBindCandidate(
+      owner.cookie,
+      `ol-path4-diff-${randomUUID()}`,
+    );
+    const loginStaged = await stageLoginCandidate(`ol-path4-login-wrong-intent-${randomUUID()}`);
+    const before = await countUsersAndAccounts();
+
+    // Strict input rejection: client can NEVER supply userId, sub, or unexpected fields.
+    for (const badBody of [
+      {},
+      { action: 'bind_current' },
+      { action: 'bind_current', candidateToken: '' },
+      { action: 'bind_current', candidateToken: staged1.candidateToken, userId: owner.userId },
+      { action: 'bind_current', candidateToken: staged1.candidateToken, sub },
+      { action: 'create', candidateToken: staged1.candidateToken, sub },
+      {
+        action: 'link_existing',
+        candidateToken: staged1.candidateToken,
+        phoneNumber: '13800138000',
+        code: '123456',
+        userId: owner.userId,
+      },
+      { action: 'unknown', candidateToken: staged1.candidateToken },
+    ]) {
+      const res = await call('/api/auth/onelink/complete', {
+        body: badBody,
+        cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+      });
+      expect(res.status, JSON.stringify(badBody)).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'INVALID_INPUT' });
+    }
+
+    // Missing pending cookie -> 404 ONELINK_PENDING_NOT_FOUND.
+    const noPendingCookie = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: owner.cookie,
+    });
+    expect(noPendingCookie.status).toBe(404);
+    expect(await noPendingCookie.json()).toMatchObject({ code: 'ONELINK_PENDING_NOT_FOUND' });
+
+    // Wrong candidateToken -> 400 ONELINK_PENDING_INVALID (10th request in window).
+    const badToken = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: 'wrong-token' },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(badToken.status).toBe(400);
+    expect(await badToken.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    // 11th request in 60s window hits the configured /onelink/complete rate limit (max: 10).
+    const rateLimited = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: 'wrong-token' },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(rateLimited.status).toBe(429);
+    await pool.query('DELETE FROM "rateLimit"');
+
+    // Wrong action for intent='bind' -> 400 ONELINK_PENDING_INVALID, and login pending for bind_current -> 400 ONELINK_PENDING_INVALID.
+    const wrongAction = await call('/api/auth/onelink/complete', {
+      body: { action: 'create', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(wrongAction.status).toBe(400);
+    expect(await wrongAction.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    const loginToBindCurrent = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: loginStaged.candidateToken },
+      cookie: joinCookies(loginStaged.pendingCookie, owner.cookie),
+    });
+    expect(loginToBindCurrent.status).toBe(400);
+    expect(await loginToBindCurrent.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    // Cancelled pending -> 400 ONELINK_PENDING_INVALID.
+    expect(
+      (await call('/api/auth/onelink/cancel', { body: {}, cookie: loginStaged.pendingCookie }))
+        .status,
+    ).toBe(200);
+    const cancelledComplete = await call('/api/auth/onelink/complete', {
+      body: { action: 'create', candidateToken: loginStaged.candidateToken },
+      cookie: loginStaged.pendingCookie,
+    });
+    expect(cancelledComplete.status).toBe(400);
+    expect(await cancelledComplete.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+
+    // Session guards: anonymous, switched user, same-user different session, expired session (>10m, non-refreshing).
+    const anonBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: staged1.pendingCookie,
+    });
+    expect(anonBind.status).toBe(401);
+    expect(await anonBind.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+
+    const switchedBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, otherUser.cookie),
+    });
+    expect(switchedBind.status).toBe(401);
+    expect(await switchedBind.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+
+    const secondSessionRes = await call('/api/auth/sign-in/email', {
+      body: { email: owner.email, password: PASSWORD },
+    });
+    const secondSessionCookie = cookieHeader(secondSessionRes);
+    const diffSessionBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, secondSessionCookie),
+    });
+    expect(diffSessionBind.status).toBe(401);
+    expect(await diffSessionBind.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+
+    // Age session to 2 days old -> rejected with 401 SESSION_REQUIRED and expiresAt is NOT refreshed!
+    await pool.query(
+      `UPDATE "session" SET "createdAt" = now() - interval '2 days', "expiresAt" = now() + interval '5 days' WHERE id = $1`,
+      [owner.sessionId],
+    );
+    const beforeExp = (
+      await pool.query<{ expiresAt: Date }>('SELECT "expiresAt" FROM "session" WHERE id = $1', [
+        owner.sessionId,
+      ])
+    ).rows[0]!.expiresAt.getTime();
+    const expiredSessionBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(expiredSessionBind.status).toBe(401);
+    expect(await expiredSessionBind.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+    expect(findSetCookie(expiredSessionBind, 'mio.session_token')).toBeUndefined();
+    const afterExp = (
+      await pool.query<{ expiresAt: Date }>('SELECT "expiresAt" FROM "session" WHERE id = $1', [
+        owner.sessionId,
+      ])
+    ).rows[0]!.expiresAt.getTime();
+    expect(afterExp).toBe(beforeExp);
+    expect(await countUsersAndAccounts()).toEqual(before);
+
+    // Restore fresh session and execute bind_current -> 200, writes 1 account row, preserves original sessionId!
+    await pool.query('DELETE FROM "rateLimit"');
+    await pool.query('UPDATE "session" SET "createdAt" = now() WHERE id = $1', [owner.sessionId]);
+    const bindOk = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(bindOk.status, await bindOk.clone().text()).toBe(200);
+    expect(await bindOk.json()).toEqual({
+      status: true,
+      action: 'bind_current',
+      userId: owner.userId,
+    });
+    expect(findSetCookie(bindOk, 'mio.onelink_pending')).toMatch(/Max-Age=0/i);
+    expect(findSetCookie(bindOk, 'mio.session_token')).toBeUndefined();
+
+    const meAfterBind = (await (await call('/api/v1/me', { cookie: owner.cookie })).json()) as {
+      userId: string;
+      sessionId: string;
+    };
+    expect(meAfterBind).toEqual({ userId: owner.userId, sessionId: owner.sessionId });
+    const profileAfterBind = (await (
+      await call('/api/v1/me/profile', { cookie: owner.cookie })
+    ).json()) as { onelinkBound: boolean };
+    expect(profileAfterBind.onelinkBound).toBe(true);
+
+    // Replay of completed staged1 -> 409 ONELINK_PENDING_ALREADY_COMPLETED.
+    const replayBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged1.candidateToken },
+      cookie: joinCookies(staged1.pendingCookie, owner.cookie),
+    });
+    expect(replayBind.status).toBe(409);
+    expect(await replayBind.json()).toMatchObject({ code: 'ONELINK_PENDING_ALREADY_COMPLETED' });
+
+    // Same-user + same-sub idempotency on staged2 -> 200 with alreadyBound: true and still strictly 1 account row!
+    const idempotentBind = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: staged2.candidateToken },
+      cookie: joinCookies(staged2.pendingCookie, owner.cookie),
+    });
+    expect(idempotentBind.status, await idempotentBind.clone().text()).toBe(200);
+    expect(await idempotentBind.json()).toEqual({
+      status: true,
+      action: 'bind_current',
+      userId: owner.userId,
+      alreadyBound: true,
+    });
+    const accountRows = await pool.query(
+      `SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+      [owner.userId],
+    );
+    expect(accountRows.rowCount).toBe(1);
+    expect(accountRows.rows[0]!.accountId).toBe(sub);
+
+    // Same user trying to bind a DIFFERENT sub -> 409 ONELINK_ALREADY_BOUND preserving original sub.
+    const diffSubConflict = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: stagedDifferentSub.candidateToken },
+      cookie: joinCookies(stagedDifferentSub.pendingCookie, owner.cookie),
+    });
+    expect(diffSubConflict.status).toBe(409);
+    expect(await diffSubConflict.json()).toMatchObject({ code: 'ONELINK_ALREADY_BOUND' });
+    const afterDiffConflict = await pool.query<{ accountId: string }>(
+      `SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+      [owner.userId],
+    );
+    expect(afterDiffConflict.rowCount).toBe(1);
+    expect(afterDiffConflict.rows[0]!.accountId).toBe(sub);
+
+    // Disabled user with lingering session row -> 401 SESSION_REQUIRED, session deleted, zero writes.
+    const disableable = await createEmailUser();
+    const disableStaged = await stageBindCandidate(
+      disableable.cookie,
+      `ol-disabled-bind-${randomUUID()}`,
+    );
+    await pool.query('UPDATE "user" SET disabled = true, "disabledAt" = now() WHERE id = $1', [
+      disableable.userId,
+    ]);
+    const disabledBindRes = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: disableStaged.candidateToken },
+      cookie: joinCookies(disableStaged.pendingCookie, disableable.cookie),
+    });
+    expect(disabledBindRes.status).toBe(401);
+    expect(await disabledBindRes.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+    expect(
+      (await pool.query('SELECT id FROM "session" WHERE id = $1', [disableable.sessionId]))
+        .rowCount,
+    ).toBe(0);
+    expect(
+      (
+        await pool.query(
+          `SELECT id FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+          [disableable.userId],
+        )
+      ).rowCount,
+    ).toBe(0);
+
+    // Revoked session cannot complete a staged bind_current -> 401 SESSION_REQUIRED with zero writes.
+    const revokable = await createEmailUser();
+    const revStaged = await stageBindCandidate(revokable.cookie, `ol-revoked-${randomUUID()}`);
+    expect((await call('/api/auth/sign-out', { body: {}, cookie: revokable.cookie })).status).toBe(
+      200,
+    );
+    const revokedRes = await call('/api/auth/onelink/complete', {
+      body: { action: 'bind_current', candidateToken: revStaged.candidateToken },
+      cookie: joinCookies(revStaged.pendingCookie, revokable.cookie),
+    });
+    expect(revokedRes.status).toBe(401);
+    expect(await revokedRes.json()).toMatchObject({ code: 'SESSION_REQUIRED' });
+    const revAccounts = await pool.query(
+      `SELECT id FROM "account" WHERE "userId" = $1 AND "providerId" = 'onelink'`,
+      [revokable.userId],
+    );
+    expect(revAccounts.rowCount).toBe(0);
+  });
+
+  it('handles concurrent create and concurrent bind_current for the same sub with zero orphan users and preserved ownership', async () => {
+    // 1. Two concurrent action=create for the SAME sub from two independent pending logins.
+    const raceCreateSub = `ol-race-create-${randomUUID()}`;
+    const createA = await stageLoginCandidate(raceCreateSub);
+    const createB = await stageLoginCandidate(raceCreateSub);
+    const beforeCreate = await countUsersAndAccounts();
+
+    const [resA, resB] = await Promise.all([
+      call('/api/auth/onelink/complete', {
+        body: { action: 'create', candidateToken: createA.candidateToken },
+        cookie: createA.pendingCookie,
+      }),
+      call('/api/auth/onelink/complete', {
+        body: { action: 'create', candidateToken: createB.candidateToken },
+        cookie: createB.pendingCookie,
+      }),
+    ]);
+
+    const createStatuses = [resA.status, resB.status].sort((a, b) => a - b);
+    expect(createStatuses).toEqual([200, 409]);
+    const createLoser = resA.status === 409 ? resA : resB;
+    const createWinner = resA.status === 200 ? resA : resB;
+    expect(await createLoser.json()).toMatchObject({ code: 'ONELINK_ALREADY_BOUND' });
+    const winnerBody = (await createWinner.json()) as { userId: string };
+
+    // CRITICAL: strictly +1 user and +1 account (ZERO orphan user from rolled-back loser transaction!).
+    const afterCreate = await countUsersAndAccounts();
+    expect(afterCreate.users).toBe(beforeCreate.users + 1);
+    expect(afterCreate.accounts).toBe(beforeCreate.accounts + 1);
+    const createdAcc = await pool.query<{ userId: string }>(
+      `SELECT "userId" FROM "account" WHERE "providerId" = 'onelink' AND "accountId" = $1`,
+      [raceCreateSub],
+    );
+    expect(createdAcc.rowCount).toBe(1);
+    expect(createdAcc.rows[0]!.userId).toBe(winnerBody.userId);
+
+    // 2. Two users racing action=bind_current for the SAME sub.
+    const user1 = await createEmailUser();
+    const user2 = await createEmailUser();
+    const raceBindSub = `ol-race-bind-${randomUUID()}`;
+    const bind1 = await stageBindCandidate(user1.cookie, raceBindSub);
+    const bind2 = await stageBindCandidate(user2.cookie, raceBindSub);
+
+    const [bindRes1, bindRes2] = await Promise.all([
+      call('/api/auth/onelink/complete', {
+        body: { action: 'bind_current', candidateToken: bind1.candidateToken },
+        cookie: joinCookies(bind1.pendingCookie, user1.cookie),
+      }),
+      call('/api/auth/onelink/complete', {
+        body: { action: 'bind_current', candidateToken: bind2.candidateToken },
+        cookie: joinCookies(bind2.pendingCookie, user2.cookie),
+      }),
+    ]);
+
+    const bindStatuses = [bindRes1.status, bindRes2.status].sort((a, b) => a - b);
+    expect(bindStatuses).toEqual([200, 409]);
+    const bindWinnerUser = bindRes1.status === 200 ? user1 : user2;
+    const bindLoserUser = bindRes1.status === 200 ? user2 : user1;
+    const bindLoserRes = bindRes1.status === 409 ? bindRes1 : bindRes2;
+    expect(await bindLoserRes.json()).toMatchObject({ code: 'ONELINK_ALREADY_BOUND' });
+
+    const boundOwner = await pool.query<{ userId: string }>(
+      `SELECT "userId" FROM "account" WHERE "providerId" = 'onelink' AND "accountId" = $1`,
+      [raceBindSub],
+    );
+    expect(boundOwner.rowCount).toBe(1);
+    expect(boundOwner.rows[0]!.userId).toBe(bindWinnerUser.userId);
+
+    const winnerProfile = (await (
+      await call('/api/v1/me/profile', { cookie: bindWinnerUser.cookie })
+    ).json()) as { onelinkBound: boolean };
+    const loserProfile = (await (
+      await call('/api/v1/me/profile', { cookie: bindLoserUser.cookie })
+    ).json()) as { onelinkBound: boolean };
+    expect(winnerProfile.onelinkBound).toBe(true);
+    expect(loserProfile.onelinkBound).toBe(false);
+  });
+
+  it('enforces post-lock expiry, deadlock-free concurrent bind_current + phone-binding/confirm, and clears pending cookie on post-commit session error', async () => {
+    // 1. Post-lock expiry in lockOneLinkPendingByDigest: a waiting complete sees expiry AFTER acquiring FOR UPDATE.
+    const expStaged = await stageLoginCandidate(`ol-post-lock-exp-${randomUUID()}`);
+    const expRow = (
+      await pool.query<{ id: string }>(
+        `SELECT id FROM "mioOneLinkPending" ORDER BY "createdAt" DESC LIMIT 1`,
+      )
+    ).rows[0]!;
+    await pool.query(
+      `UPDATE "mioOneLinkPending" SET "expiresAt" = clock_timestamp() + interval '250 milliseconds' WHERE id = $1`,
+      [expRow.id],
+    );
+    const beforeExp = await countUsersAndAccounts();
+    const locker = await pool.connect();
+    let completeAfterLock: Promise<Response>;
+    try {
+      await locker.query('BEGIN');
+      await locker.query('SELECT id FROM "mioOneLinkPending" WHERE id = $1 FOR UPDATE', [
+        expRow.id,
+      ]);
+      const xid = (await locker.query<{ xid: string }>('SELECT pg_current_xact_id()::text AS xid'))
+        .rows[0]!.xid;
+
+      completeAfterLock = call('/api/auth/onelink/complete', {
+        body: { action: 'create', candidateToken: expStaged.candidateToken },
+        cookie: expStaged.pendingCookie,
+      });
+
+      await vi.waitFor(
+        async () => {
+          const waiting = await pool.query(
+            `SELECT 1 FROM pg_locks
+             WHERE locktype = 'transactionid' AND transactionid::text = $1 AND NOT granted`,
+            [xid],
+          );
+          expect(waiting.rowCount).toBeGreaterThanOrEqual(1);
+        },
+        { timeout: 5000, interval: 10 },
+      );
+
+      // Hold the lock until PostgreSQL's own clock_timestamp() passes expiresAt, then release with ROLLBACK.
+      await vi.waitFor(
+        async () => {
+          const check = (
+            await pool.query<{ expired: boolean }>(
+              `SELECT ("expiresAt" <= clock_timestamp()) AS expired FROM "mioOneLinkPending" WHERE id = $1`,
+              [expRow.id],
+            )
+          ).rows[0]!;
+          expect(check.expired).toBe(true);
+        },
+        { timeout: 5000, interval: 20 },
+      );
+      await locker.query('ROLLBACK');
+    } catch (error) {
+      await locker.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      locker.release();
+    }
+
+    const expRes = await completeAfterLock!;
+    expect(expRes.status).toBe(400);
+    expect(await expRes.json()).toMatchObject({ code: 'ONELINK_PENDING_INVALID' });
+    expect(findSetCookie(expRes, 'mio.session_token')).toBeUndefined();
+    expect(await countUsersAndAccounts()).toEqual(beforeExp);
+
+    // 2. Concurrent bind_current + phone-binding/confirm on the same user/session completes without 40P01 deadlock.
+    for (let idx = 0; idx < 3; idx += 1) {
+      await pool.query('DELETE FROM "rateLimit"');
+      await pool.query('DELETE FROM "mioSmsBudget"');
+      const user = await createEmailUser();
+      const phone = `1380013840${idx}`;
+      const sub = `ol-deadlock-free-${idx}-${randomUUID()}`;
+      const bindStaged = await stageBindCandidate(user.cookie, sub);
+      expect(
+        (
+          await call('/api/auth/phone-binding/send-otp', {
+            body: { phoneNumber: phone },
+            cookie: user.cookie,
+          })
+        ).status,
+      ).toBe(200);
+      const otp = delivered.get(`+86${phone}`)!;
+
+      const [oneLinkBindRes, phoneBindRes] = await Promise.all([
+        call('/api/auth/onelink/complete', {
+          body: { action: 'bind_current', candidateToken: bindStaged.candidateToken },
+          cookie: joinCookies(bindStaged.pendingCookie, user.cookie),
+        }),
+        call('/api/auth/phone-binding/confirm', {
+          body: { phoneNumber: phone, code: otp },
+          cookie: user.cookie,
+        }),
+      ]);
+      expect(oneLinkBindRes.status, await oneLinkBindRes.clone().text()).toBe(200);
+      expect(phoneBindRes.status, await phoneBindRes.clone().text()).toBe(200);
+      const profile = (await (
+        await call('/api/v1/me/profile', { cookie: user.cookie })
+      ).json()) as {
+        phoneNumber: string | null;
+        phoneNumberVerified: boolean;
+        onelinkBound: boolean;
+      };
+      expect(profile).toMatchObject({
+        phoneNumber: `+86${phone}`,
+        phoneNumberVerified: true,
+        onelinkBound: true,
+      });
+    }
+
+    // 3. Post-commit "session" insert failure returns sanitized 503 AUTH_UNAVAILABLE and clears onelink_pending cookie.
+    await pool.query('DELETE FROM "rateLimit"');
+    const failSessionStaged = await stageLoginCandidate(`ol-session-fail-${randomUUID()}`);
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION mio_test_reject_session_insert()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'private_session_trigger_failure_secret';
+      END;
+      $$;
+    `);
+    await pool.query(`
+      CREATE TRIGGER mio_test_reject_session_insert_trg
+      BEFORE INSERT ON "session"
+      FOR EACH ROW EXECUTE FUNCTION mio_test_reject_session_insert();
+    `);
+    try {
+      const failRes = await call('/api/auth/onelink/complete', {
+        body: { action: 'create', candidateToken: failSessionStaged.candidateToken },
+        cookie: failSessionStaged.pendingCookie,
+      });
+      expect(failRes.status).toBe(503);
+      const bodyText = await failRes.text();
+      expect(bodyText).toContain('AUTH_UNAVAILABLE');
+      expect(bodyText).not.toContain('private_session_trigger_failure_secret');
+      expect(findSetCookie(failRes, 'mio.onelink_pending')).toMatch(/Max-Age=0/i);
+      expect(findSetCookie(failRes, 'mio.session_token')).toBeUndefined();
+    } finally {
+      await pool.query('DROP TRIGGER IF EXISTS mio_test_reject_session_insert_trg ON "session"');
+      await pool.query('DROP FUNCTION IF EXISTS mio_test_reject_session_insert()');
     }
   });
 });

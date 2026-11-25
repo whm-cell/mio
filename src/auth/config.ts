@@ -219,10 +219,13 @@ export function authOptions(
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
       oneLinkPlugin(
-        config.baseURL,
+        config,
         pool,
         oneLink?.config,
         oneLink?.getPolicy ?? DISABLED_ONELINK_POLICY,
+        sms,
+        AUTH_PLACEHOLDER_EMAIL_DOMAIN,
+        getPolicy,
       ),
     ],
     user: {
@@ -285,6 +288,8 @@ export function authOptions(
         '/onelink/start': { window: 60, max: 20 },
         '/onelink/pending': { window: 60, max: 60 },
         '/onelink/cancel': { window: 60, max: 30 },
+        '/onelink/existing/send-otp': { window: 60, max: 100 },
+        '/onelink/complete': { window: 60, max: 10 },
       },
     },
     advanced: {

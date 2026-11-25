@@ -41,9 +41,9 @@ pnpm start:dev
 
 探测返回真实列顺序、类型、nullable、default、注释和序列归属，并保留内部迁移表选项、Better Auth 表／列差异、额外无默认必填列检查及启动／迁移的必需索引检查。运行时结构检查不代表持续索引巡检。配置显式保留 `transaction:true`；注册事务、认证池所有者及关闭责任不变，不自动修改目标结构。
 
-认证基础 schema 包括可空且唯一的手机号与 `displayId`、账号禁用列 `disabled`（默认 `false`）与 `disabledAt`、头像资产引用 `avatarAssetId`、验证码挑战、短信预算键表及账号复合唯一索引。运行与显式迁移都检查基础结构；短信事件表的迁移和启用条件见[发送预算切换与回退](#发送预算切换与回退)。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更；对已有用户表执行 `auth:migrate --apply` 时，`disabled` 按列默认值回填为 `false`，`displayId` 与 `avatarAssetId` 保持可空兼容。启用供应商但配置不全会拒绝装载；未启用或关闭配置开关时相应入口返回不可用，不影响其余已启用入口。
+认证基础 schema 包括可空且唯一的手机号与 `displayId`、账号禁用列 `disabled`（默认 `false`）与 `disabledAt`、头像资产引用 `avatarAssetId`、验证码挑战、短信预算键表及账号复合唯一索引。运行与显式迁移都检查基础结构；短信事件表的迁移和启用条件见[发送预算切换与回退](#发送预算切换与回退)。账号表的 `(providerId, accountId)` 唯一约束防止同一凭据跨用户归属，`(userId, providerId)` 唯一约束确保一个用户至多有一个微信身份或一个万联身份；后一约束也适用于当前的 `credential` 账号。若既有账号违反任一约束，迁移失败并保留冲突供人工处理，不能静默合并或删除。未来支持同一 provider 的多个账号前须重新评估该约束。旧用户及会话保留，启动不自动应用变更；对已有用户表执行 `auth:migrate --apply` 时，`disabled` 按列默认值回填为 `false`，`displayId` 与 `avatarAssetId` 保持可空兼容。启用供应商但配置不全会拒绝装载；未启用或关闭配置开关时相应入口返回不可用，不影响其余已启用入口。
 
-新注册用户（邮箱、手机或微信）在创建事务内自动分配唯一 `displayId`（`miioo_` 加 6 位数字）；客户端注册输入不可伪造 `displayId`、`avatarAssetId`、`disabled` 或 `disabledAt`。通过事务性服务方法 `Authentication.setUserDisabled(userId, disabled)` 禁用账号时，在同一 PostgreSQL 事务内写入禁用状态并删除该用户全部活动会话；禁用账号无法通过邮箱、短信验证码、微信 OAuth 或微信 QR 签发新会话，若存在并发或遗留会话行，`/api/v1/me`、`/api/v1/me/profile`、`Authentication.identity`、`/api/auth/get-session` 及受会话保护的认证入口均将其视为无效并清理会话。重新启用后恢复登录能力，不恢复已撤销会话。
+新注册用户（邮箱、手机、微信或万联）在创建事务内自动分配唯一 `displayId`（`miioo_` 加 6 位数字）；客户端注册输入不可伪造 `displayId`、`avatarAssetId`、`disabled` 或 `disabledAt`。通过事务性服务方法 `Authentication.setUserDisabled(userId, disabled)` 禁用账号时，在同一 PostgreSQL 事务内写入禁用状态并删除该用户全部活动会话；禁用账号无法通过邮箱、短信验证码、微信 OAuth、微信 QR 或万联 OneLink 签发新会话，若存在并发或遗留会话行，`/api/v1/me`、`/api/v1/me/profile`、`Authentication.identity`、`/api/auth/get-session` 及受会话保护的认证入口均将其视为无效并清理会话。重新启用后恢复登录能力，不恢复已撤销会话。
 
 用户资料通过 `GET /api/v1/me/profile` 与 `PATCH /api/v1/me/profile` 读写，仅允许修改昵称（`name`）与头像资产（`avatarAssetId`）；非空 `avatarAssetId` 须经装配注入的资产核验回调确认属于本人、状态 `ready` 且 MIME 为 `image/jpeg`、`image/png` 或 `image/webp`，不在认证表持久化签名 URL。`src/auth` 不直接导入 `src/assets`。
 
@@ -73,9 +73,9 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 
 ### 手机验证码与发送预算
 
-大陆手机号统一为 `+86` 和 11 位号码；随机六位验证码有效 5 分钟，最多错误 3 次。登录和绑定挑战按用途及号码区分，绑定还对应发起的 userId 和 sessionId，确认时重新核对不超过 10 分钟且未撤销的原会话。验证码仅保存带挑战和用途上下文的 HMAC，不保存明文；短期挑战与账号用户均由认证 PostgreSQL 管理。已登录用户只可首次绑定空闲号码，不能换绑、合并或转移。
+大陆手机号统一为 `+86` 和 11 位号码；随机六位验证码有效 5 分钟，最多错误 3 次。登录（`login`）、手机绑定（`bind`）与万联绑定已有手机号账号（`onelink_existing`）三类挑战严格按用途隔离：`bind` 另绑定发起的 `userId` 和 `sessionId`，确认时重新核对不超过 10 分钟且未撤销的原会话；`onelink_existing` 复用既有 `mioPhoneChallenge` 表（零结构迁移），挑战键与 HMAC 摘要绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，确保不同浏览器或待处理操作互不覆盖且不同用途验证码不可跨入口重放。验证码仅保存带挑战和用途上下文的 HMAC，不保存明文；短期挑战与账号用户均由认证 PostgreSQL 管理。已登录用户只可首次绑定空闲号码，不能换绑、合并或转移。
 
-短信验证运行时受管理后台「全局配置」`smsMode`（`live` / `bypass` / `disabled`，默认 `live`）热控制：`live` 走原有真实腾讯短信与持久预算流程；`disabled` 使全部 4 个手机入口（`/phone-number/*` 与 `/phone-binding/*`）直接返回 `503 SMS_UNAVAILABLE` 且不调用供应商；`bypass` 仅作用于登录入口（`/phone-number/send-otp` 校验输入、已配置合法 6 位固定测试码与直连 IP 后跳过短信供应商与预算直接返回 `{status:true}`，`/phone-number/verify` 无需前置 `send-otp` 或腾讯短信配置，以恒定时间 `timingSafeEqual` 比对管理员配置的 6 位固定测试码并执行相同的用户验证、禁用拦截、自动分配 `displayId` 与会话签发流程，且保留 Better Auth 路由限流）。手机绑定入口（`/phone-binding/send-otp` 与 `/phone-binding/confirm`）**不跟随** `bypass`，始终要求真实短信运行时。
+短信验证运行时受管理后台「全局配置」`smsMode`（`live` / `bypass` / `disabled`，默认 `live`）热控制：`live` 走原有真实腾讯短信与持久预算流程；`disabled` 使全部 4 个手机入口（`/phone-number/*` 与 `/phone-binding/*`）及万联已有账号短信入口（`/onelink/existing/send-otp` 与 `/onelink/complete` 的 `action="link_existing"`）直接返回 `503 SMS_UNAVAILABLE` 且不调用供应商；`bypass` 仅作用于登录入口（`/phone-number/send-otp` 校验输入、已配置合法 6 位固定测试码与直连 IP 后跳过短信供应商与预算直接返回 `{status:true}`，`/phone-number/verify` 无需前置 `send-otp` 或腾讯短信配置，以恒定时间 `timingSafeEqual` 比对管理员配置的 6 位固定测试码并执行相同的用户验证、禁用拦截、自动分配 `displayId` 与会话签发流程，且保留 Better Auth 路由限流）。手机绑定入口（`/phone-binding/send-otp`、`/phone-binding/confirm`）与万联已有账号绑定短信入口（`/onelink/existing/send-otp`、`POST /onelink/complete` 的 `action="link_existing"`）**均不跟随** `bypass`，始终强制要求真实短信运行时与持久短信预算。
 
 短信预算独立于挑战和现有请求限流：同一手机号 60 秒冷却、滚动 1 小时至多 5 次及 24 小时至多 10 次，IP 分别至多 20/100 次，整个应用 24 小时至多 1000 次；配置只能收紧。使用直接连接地址及与认证相同的 IP 规范化，代理后共享代理地址额度。预算保存在 PostgreSQL，号码和 IP 键采用稳定 SHA-256，仅为固定长度而非匿名化。正常重启、验证码消费、认证 secret 轮换及 Redis 的 65 秒恢复不会清除预算；数据库恢复到旧快照可能丢失近期预算，需按最长窗口排清后恢复发送。
 
@@ -108,11 +108,19 @@ pnpm auth:migrate --rollback-sms-budget --apply
 
 针对跨站 `WxLogin` iframe 回调省略 `SameSite=Lax` state Cookie 的场景，认证 HTTP 适配器在 `/api/auth/callback/wechat` 提供单跳同源 HTML 桥接（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'` CSP、`Referrer-Policy: no-referrer`、`Cache-Control: no-store` 与 `mio_bridge` 防循环），使第二跳同源携带 state Cookie 进入认证库；QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
 
-### 万联 OneLink 登录与回调
+### 万联 OneLink 登录、回调与账号归属
 
-万联 OneLink 第三方登录默认关闭，受服务端 `.env` 配置就绪度与管理端按环境运行期热开关双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink` 与 `/api/auth/onelink/pending` 均返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。发起授权时创建 10 分钟有效的 `mioOneLinkPending` 记录（创建时最多清理 100 条已过期至少 10 分钟的旧记录），并下发 `Path=/api/auth`、15 分钟 `Max-Age` 的 HttpOnly/SameSite=Lax 待处理 Cookie（HTTPS 名称 `__Secure-mio.onelink_pending` 且带 `Secure`，回环 HTTP 名称 `mio.onelink_pending`）；`intent="bind"` 额外要求当前持有创建时间不足 10 分钟、未撤销且未禁用的会话且尚未绑定万联账号。
+万联 OneLink 第三方登录默认关闭，受服务端 `.env` 配置就绪度与管理端按环境运行期热开关双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink`、`/api/auth/onelink/pending`、`/api/auth/onelink/existing/send-otp` 与 `/api/auth/onelink/complete` 均返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。发起授权时创建 10 分钟有效的 `mioOneLinkPending` 记录（创建时最多清理 100 条已过期至少 10 分钟的旧记录），并下发 `Path=/api/auth`、15 分钟 `Max-Age` 的 HttpOnly/SameSite=Lax 待处理 Cookie（HTTPS 名称 `__Secure-mio.onelink_pending` 且带 `Secure`，回环 HTTP 名称 `mio.onelink_pending`）；`intent="bind"` 额外要求当前持有创建时间不足 10 分钟、未撤销且未禁用的会话且尚未绑定万联账号。
 
-回调 `GET /api/auth/callback/onelink` 统一附带 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`，按[万联 OneLink SSO 契约](integrations/onelink-sso.md)构造的 6 字段加密跳转返回后处理 `unauthorized=true` 或解析 `access_token`。**v1 安全边界声明（`payload_sub_unverified`）**：当前版本仅对 JWT payload 执行严格 Base64URL 解码与 `sub`/`exp`/`client_id`（显式拒绝 `routerClientId`）校验，不执行 JWT 密码学验签，也不向万联发起在线令牌自省，无法防御不可信公网直接伪造三段式 JWT 访问回调接口；因此仅适用于默认关闭热开关控制下的受控开发、测试与管理端验证沙箱，公网生产放量前须补充正式验签或自省能力。已绑定活跃用户的登录回调原子完成待处理记录后签发 Mio 会话并 `303` 跳转至干净结果地址；已禁用账号拒绝签发；未绑定登录与已登录绑定回调**绝不在 GET 中写入新的永久 `user` 或 `account` 记录**，而是原子暂存为 `candidate_ready` 并保留待处理 Cookie，通过 `GET /api/auth/onelink/pending` 只读返回候选元信息（`bind` 复核原近期会话）；迟到或并发回调不能覆盖已进入 `candidate_ready` 的候选记录，也不清除其待处理 Cookie。建人、已有账号短信绑定与 `bind_current` 永久写入以及 `/api/v1/me/profile` 的 `onelinkBound` 字段由后续单元交付。
+回调 `GET /api/auth/callback/onelink` 统一附带 `Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`，按[万联 OneLink SSO 契约](integrations/onelink-sso.md)构造的 6 字段加密跳转返回后处理 `unauthorized=true` 或解析 `access_token`。**v1 安全边界声明（`payload_sub_unverified`）**：当前版本仅对 JWT payload 执行严格 Base64URL 解码与 `sub`/`exp`/`client_id`（显式拒绝 `routerClientId`）校验，不执行 JWT 密码学验签，也不向万联发起在线令牌自省，无法防御不可信公网直接伪造三段式 JWT 访问回调接口；因此仅适用于默认关闭热开关控制下的受控开发、测试与管理端验证沙箱，公网生产放量前须补充正式验签或自省能力。已绑定活跃用户的登录回调原子完成待处理记录后签发 Mio 会话并 `303` 跳转至干净结果地址；已禁用账号拒绝签发；未绑定登录与已登录绑定回调**绝不在 GET 中写入新的永久 `user` 或 `account` 记录**，而是原子暂存为 `candidate_ready` 并保留待处理 Cookie，通过 `GET /api/auth/onelink/pending` 只读返回候选元信息（`bind` 复核原近期会话）；迟到或并发回调不能覆盖已进入 `candidate_ready` 的候选记录，也不清除其待处理 Cookie。
+
+待绑候选通过 `POST /api/auth/onelink/complete` 完成显式账号归属（客户端绝不传入目标 `userId` 或万联 `sub`）；认证域跨表行锁统一遵守 `mioPhoneChallenge` → `user` → `session` → `mioOneLinkPending` → `account` 固定顺序，且待处理过期判断始终在取得 `FOR UPDATE` 行锁后重新取库时钟核验：
+
+- `action="create"`：在同一 PostgreSQL 事务内锁定待处理记录、分配唯一 `displayId` 并创建 `name="万联用户"`、占位邮箱 `onelink-…@auth.mio.invalid`（`emailVerified=false`）、空手机号的新用户、写入 `(providerId='onelink', accountId=sub)` 关联并标记待处理为 `completed`；若遭遇并发唯一约束冲突（`23505`），整个事务回滚不留孤儿用户并返回 `409 ONELINK_ALREADY_BOUND`。成功后签发 C 端会话 Cookie 并清理待处理 Cookie；新用户后续可经 `/api/auth/phone-binding/*` 补绑空闲手机号。
+- `action="link_existing"`：须先经 `POST /api/auth/onelink/existing/send-otp` 发送 `onelink_existing` 专用真实短信验证码（消耗持久短信预算、无手机号注册枚举、绝不跟随 `smsMode='bypass'`）。完成提交在消费单次验证码前先复核待处理状态与 `candidateToken`；验码通过后在同一事务内依序锁定目标手机号用户与待处理记录（先校验待处理状态再校验用户状态），绝不自动建号（未注册或未验证返回 `404 EXISTING_PHONE_NOT_FOUND` 且保留待处理状态，禁用账号返回 `403 ACCOUNT_DISABLED`，唯一约束冲突回滚并保留原归属返回 `409 ONELINK_ALREADY_BOUND`），绑定成功后标记 `completed`、签发原用户会话并清理待处理 Cookie。
+- `action="bind_current"`：在非续期核验 10 分钟内有效且未禁用的当前 C 端会话后，于同一事务内依序锁定用户、原近期会话与 `intent="bind"` 待处理记录并比对发起 `userId`/`sessionId` 与 `candidateToken`；若当前用户已绑定同一 `sub` 则幂等完成待处理并返回 `alreadyBound=true`，其余冲突回滚并保留原归属返回 `409 ONELINK_ALREADY_BOUND`。成功后仅清理待处理 Cookie，不改写或重建当前 C 端会话 Cookie。
+
+`GET /api/v1/me/profile` 与 `PATCH /api/v1/me/profile` 返回只读布尔字段 `onelinkBound`，实时反映当前用户在 `account` 表是否存在 `providerId='onelink'` 绑定记录。
 
 ## 职责与限制
 

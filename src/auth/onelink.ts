@@ -1,7 +1,7 @@
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { epochMs } from '@mio/foundation/time';
 import type { BetterAuthPlugin, GenericEndpointContext } from 'better-auth';
-import { APIError, createAuthEndpoint, getSession } from 'better-auth/api';
+import { APIError, createAuthEndpoint, getIP, getSession } from 'better-auth/api';
 import { deleteSessionCookie, setSessionCookie } from 'better-auth/cookies';
 import { randomBytes } from 'node:crypto';
 import type { Pool } from 'pg';
@@ -14,16 +14,32 @@ import type { OneLinkSsoConfig } from '../integrations/onelink/sso.ts';
 import { isUserDisabled } from './account.ts';
 import {
   cancelActiveOneLinkPending,
+  completeOneLinkBindCurrent,
+  completeOneLinkCreate,
+  completeOneLinkLinkExisting,
   completeStartedPendingLogin,
   createOneLinkPending,
   findBoundOneLinkUser,
+  oneLinkCandidateTokensMatch,
   oneLinkPendingSchema,
   readOneLinkPendingByDigest,
   rejectStartedPending,
   transitionStartedPendingToCandidate,
   userHasOneLinkAccount,
 } from './onelink-store.ts';
-import type { OneLinkPendingIntent, OneLinkPendingRecord } from './onelink-store.ts';
+import type {
+  BoundOneLinkUser,
+  OneLinkPendingIntent,
+  OneLinkPendingRecord,
+} from './onelink-store.ts';
+import { isSixDigitCode, normalizeMainlandPhone, parsePhoneInput } from './phone.ts';
+import type { PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
+import type { PhoneLimits } from './phone-budget.ts';
+import {
+  activatePhoneChallenge,
+  consumeOneLinkExistingPhoneChallenge,
+  reserveOneLinkExistingPhoneChallenge,
+} from './phone-store.ts';
 
 export interface OneLinkSsoRuntimePolicy {
   readonly enabled: boolean;
@@ -158,8 +174,189 @@ function authUnavailable(headers?: HeadersInit): never {
   );
 }
 
-function isClientApiError(error: unknown): error is APIError {
-  return error instanceof APIError && error.statusCode >= 400 && error.statusCode < 500;
+function smsUnavailable(): never {
+  throw new APIError('SERVICE_UNAVAILABLE', {
+    code: 'SMS_UNAVAILABLE',
+    message: 'SMS unavailable',
+  });
+}
+
+function requirePendingCookie(ctx: GenericEndpointContext): string {
+  const cookieValue = readPendingCookie(ctx);
+  if (!cookieValue) {
+    throw new APIError('NOT_FOUND', {
+      code: 'ONELINK_PENDING_NOT_FOUND',
+      message: 'OneLink pending session not found',
+    });
+  }
+  return cookieValue;
+}
+
+function isAccountDisabledError(error: unknown): boolean {
+  return (
+    error instanceof APIError &&
+    Boolean(error.body) &&
+    typeof error.body === 'object' &&
+    (error.body as { code?: unknown }).code === 'ACCOUNT_DISABLED'
+  );
+}
+
+function isExposedApiError(error: unknown): error is APIError {
+  if (!(error instanceof APIError)) return false;
+  if (error.statusCode >= 400 && error.statusCode < 500) return true;
+  const code =
+    error.body && typeof error.body === 'object'
+      ? (error.body as { code?: unknown }).code
+      : undefined;
+  return (
+    code === 'SMS_UNAVAILABLE' || code === 'ONELINK_UNAVAILABLE' || code === 'AUTH_UNAVAILABLE'
+  );
+}
+
+type OneLinkCompleteInput =
+  | { readonly action: 'create'; readonly candidateToken: string }
+  | {
+      readonly action: 'link_existing';
+      readonly candidateToken: string;
+      readonly phone: string;
+      readonly code: string;
+    }
+  | { readonly action: 'bind_current'; readonly candidateToken: string };
+
+function parseCompleteBody(body: unknown): OneLinkCompleteInput | null {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const input = body as Record<string, unknown>;
+  const action = input.action;
+  if (action !== 'create' && action !== 'link_existing' && action !== 'bind_current') return null;
+  const expectedKeys =
+    action === 'link_existing'
+      ? ['action', 'candidateToken', 'phoneNumber', 'code']
+      : ['action', 'candidateToken'];
+  const actualKeys = Object.keys(input);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key) => !expectedKeys.includes(key))
+  ) {
+    return null;
+  }
+  if (typeof input.candidateToken !== 'string' || input.candidateToken.length === 0) return null;
+  if (action === 'link_existing') {
+    const phone = normalizeMainlandPhone(input.phoneNumber);
+    if (!phone || !isSixDigitCode(input.code)) return null;
+    return { action, candidateToken: input.candidateToken, phone, code: input.code };
+  }
+  return { action, candidateToken: input.candidateToken };
+}
+
+function assertLoginCandidatePending(
+  row: OneLinkPendingRecord | null,
+  candidateToken?: string,
+): { readonly id: string; readonly candidateToken: string } {
+  if (!row) {
+    throw new APIError('NOT_FOUND', {
+      code: 'ONELINK_PENDING_NOT_FOUND',
+      message: 'OneLink pending session not found',
+    });
+  }
+  if (row.status === 'completed') {
+    throw new APIError('CONFLICT', {
+      code: 'ONELINK_PENDING_ALREADY_COMPLETED',
+      message: 'OneLink pending session is already completed',
+    });
+  }
+  if (
+    row.expired ||
+    row.status !== 'candidate_ready' ||
+    row.intent !== 'login' ||
+    !row.candidateSub ||
+    !row.candidateToken ||
+    (candidateToken !== undefined &&
+      !oneLinkCandidateTokensMatch(row.candidateToken, candidateToken))
+  ) {
+    throw new APIError('BAD_REQUEST', {
+      code: 'ONELINK_PENDING_INVALID',
+      message: 'OneLink pending session is invalid',
+    });
+  }
+  return { id: row.id, candidateToken: row.candidateToken };
+}
+
+type OneLinkCompleteFailureStatus =
+  | 'not_found'
+  | 'already_completed'
+  | 'invalid'
+  | 'already_bound'
+  | 'existing_not_found'
+  | 'account_disabled'
+  | 'session_required';
+
+function failCompleteStatus(status: OneLinkCompleteFailureStatus): never {
+  if (status === 'not_found') {
+    throw new APIError('NOT_FOUND', {
+      code: 'ONELINK_PENDING_NOT_FOUND',
+      message: 'OneLink pending session not found',
+    });
+  }
+  if (status === 'already_completed') {
+    throw new APIError('CONFLICT', {
+      code: 'ONELINK_PENDING_ALREADY_COMPLETED',
+      message: 'OneLink pending session is already completed',
+    });
+  }
+  if (status === 'already_bound') {
+    throw new APIError('CONFLICT', {
+      code: 'ONELINK_ALREADY_BOUND',
+      message: 'OneLink account is already bound',
+    });
+  }
+  if (status === 'existing_not_found') {
+    throw new APIError('NOT_FOUND', {
+      code: 'EXISTING_PHONE_NOT_FOUND',
+      message: 'Existing verified phone account not found',
+    });
+  }
+  if (status === 'account_disabled') {
+    throw new APIError('FORBIDDEN', {
+      code: 'ACCOUNT_DISABLED',
+      message: 'Account is disabled',
+    });
+  }
+  if (status === 'session_required') {
+    throw new APIError('UNAUTHORIZED', {
+      code: 'SESSION_REQUIRED',
+      message: 'Recent session required',
+    });
+  }
+  throw new APIError('BAD_REQUEST', {
+    code: 'ONELINK_PENDING_INVALID',
+    message: 'OneLink pending session is invalid',
+  });
+}
+
+async function issueOneLinkLoginSession(
+  ctx: GenericEndpointContext,
+  user: BoundOneLinkUser,
+): Promise<void> {
+  let session;
+  try {
+    session = await ctx.context.internalAdapter.createSession(user.id);
+  } catch (error) {
+    clearPendingCookie(ctx);
+    if (isAccountDisabledError(error)) {
+      throw new APIError(
+        'FORBIDDEN',
+        { code: 'ACCOUNT_DISABLED', message: 'Account is disabled' },
+        ctx.responseHeaders,
+      );
+    }
+    throw error;
+  }
+  if (!session) {
+    clearPendingCookie(ctx);
+    return authUnavailable(ctx.responseHeaders);
+  }
+  await setSessionCookie(ctx, { session, user });
+  clearPendingCookie(ctx);
 }
 
 async function readValidRecentSession(
@@ -251,12 +448,7 @@ async function finishLoginCallback(
     session = await ctx.context.internalAdapter.createSession(boundUser.id);
   } catch (error) {
     clearPendingCookie(ctx);
-    if (
-      error instanceof APIError &&
-      error.body &&
-      typeof error.body === 'object' &&
-      (error.body as { code?: unknown }).code === 'ACCOUNT_DISABLED'
-    ) {
+    if (isAccountDisabledError(error)) {
       return redirect303(
         ctx,
         buildCleanRedirectLocation(row.returnPath, baseURL, 'account_disabled'),
@@ -299,19 +491,25 @@ async function finishBindCallback(
   return redirect303(ctx, buildCleanRedirectLocation(row.returnPath, baseURL, 'confirm_bind'));
 }
 
-/** OneLink authorize start, callback parsing and pending candidate storage; never writes new permanent users/accounts on GET. */
+/** OneLink authorize start, callback parsing, pending storage, dedicated existing-phone OTP and atomic complete actions. */
 export function oneLinkPlugin(
-  baseURL: string,
+  config: { readonly baseURL: string; readonly secret: string; readonly smsLimits: PhoneLimits },
   pool: Pool,
   oneLinkConfig: OneLinkSsoConfig | undefined,
   getPolicy: OneLinkSsoPolicyReader,
+  sms: PhoneSmsRuntime | undefined,
+  placeholderDomain: string,
+  getAuthPolicy?: () => PhoneSmsPolicy,
 ): BetterAuthPlugin {
+  const { baseURL } = config;
+  const readAuthPolicy: () => PhoneSmsPolicy =
+    getAuthPolicy ?? (() => ({ smsMode: 'live', smsBypassCode: null }));
   return {
     id: 'mio-onelink',
     schema: oneLinkPendingSchema,
     endpoints: {
       startOneLink: createAuthEndpoint('/onelink/start', { method: 'POST' }, async (ctx) => {
-        const { config, policy } = requireOneLinkReady(oneLinkConfig, getPolicy);
+        const { config: ssoConfig, policy } = requireOneLinkReady(oneLinkConfig, getPolicy);
         const input = parseStartBody(ctx.body, baseURL);
         if (!input) {
           throw new APIError('BAD_REQUEST', { code: 'INVALID_INPUT', message: 'Invalid input' });
@@ -338,7 +536,7 @@ export function oneLinkPlugin(
             initiatorSessionId = session.sessionId;
           }
           const url = buildOneLinkAuthorizeUrl(
-            { ...config, clientName: policy.clientName },
+            { ...ssoConfig, clientName: policy.clientName },
             { baseURL },
           );
           const cookieValue = randomBytes(32).toString('hex');
@@ -352,7 +550,7 @@ export function oneLinkPlugin(
           setPendingCookie(ctx, cookieValue);
           return ctx.json({ url });
         } catch (error) {
-          if (isClientApiError(error)) throw error;
+          if (isExposedApiError(error)) throw error;
           return authUnavailable();
         }
       }),
@@ -396,20 +594,14 @@ export function oneLinkPlugin(
           }
           return await finishBindCallback(ctx, pool, baseURL, row, parsed);
         } catch (error) {
-          if (isClientApiError(error)) throw error;
+          if (isExposedApiError(error)) throw error;
           return authUnavailable(CALLBACK_HEADERS);
         }
       }),
       pendingOneLink: createAuthEndpoint('/onelink/pending', { method: 'GET' }, async (ctx) => {
         requireOneLinkReady(oneLinkConfig, getPolicy);
         try {
-          const cookieValue = readPendingCookie(ctx);
-          if (!cookieValue) {
-            throw new APIError('NOT_FOUND', {
-              code: 'ONELINK_PENDING_NOT_FOUND',
-              message: 'OneLink pending session not found',
-            });
-          }
+          const cookieValue = requirePendingCookie(ctx);
           const row = await readOneLinkPendingByDigest(pool, sha256Utf8(cookieValue));
           if (
             !row ||
@@ -446,8 +638,8 @@ export function oneLinkPlugin(
             expiresAt: row.expiresAt.toISOString(),
           });
         } catch (error) {
-          if (isClientApiError(error)) throw error;
-          return authUnavailable();
+          if (isExposedApiError(error)) throw error;
+          return authUnavailable(ctx.responseHeaders);
         }
       }),
       cancelOneLink: createAuthEndpoint('/onelink/cancel', { method: 'POST' }, async (ctx) => {
@@ -467,8 +659,122 @@ export function oneLinkPlugin(
           clearPendingCookie(ctx);
           return ctx.json({ ok: true });
         } catch (error) {
-          if (isClientApiError(error)) throw error;
-          return authUnavailable();
+          if (isExposedApiError(error)) throw error;
+          return authUnavailable(ctx.responseHeaders);
+        }
+      }),
+      sendOneLinkExistingOTP: createAuthEndpoint(
+        '/onelink/existing/send-otp',
+        { method: 'POST' },
+        async (ctx) => {
+          requireOneLinkReady(oneLinkConfig, getPolicy);
+          const { phone } = parsePhoneInput(ctx.body, false);
+          const cookieValue = requirePendingCookie(ctx);
+          let row: OneLinkPendingRecord | null;
+          try {
+            row = await readOneLinkPendingByDigest(pool, sha256Utf8(cookieValue));
+          } catch {
+            return authUnavailable(ctx.responseHeaders);
+          }
+          const pending = assertLoginCandidatePending(row);
+          if (readAuthPolicy().smsMode === 'disabled' || !sms) return smsUnavailable();
+          const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
+          if (!ip) return smsUnavailable();
+          try {
+            const challenge = await reserveOneLinkExistingPhoneChallenge(
+              pool,
+              sms.tables,
+              config.secret,
+              config.smsLimits,
+              phone,
+              ip,
+              { pendingId: pending.id, candidateToken: pending.candidateToken },
+            );
+            await sms.sender(phone, challenge.code);
+            if (!(await activatePhoneChallenge(pool, challenge.id))) {
+              throw new Error('SMS_UNAVAILABLE');
+            }
+          } catch (error) {
+            const code = error instanceof Error ? error.message : 'SMS_UNAVAILABLE';
+            if (code === 'SMS_RATE_LIMITED') {
+              throw new APIError('TOO_MANY_REQUESTS', {
+                code: 'SMS_RATE_LIMITED',
+                message: 'SMS rate limit reached',
+              });
+            }
+            return smsUnavailable();
+          }
+          return ctx.json({ status: true });
+        },
+      ),
+      completeOneLink: createAuthEndpoint('/onelink/complete', { method: 'POST' }, async (ctx) => {
+        requireOneLinkReady(oneLinkConfig, getPolicy);
+        const input = parseCompleteBody(ctx.body);
+        if (!input) {
+          throw new APIError('BAD_REQUEST', { code: 'INVALID_INPUT', message: 'Invalid input' });
+        }
+        const tokenDigest = sha256Utf8(requirePendingCookie(ctx));
+        try {
+          if (input.action === 'create') {
+            const result = await completeOneLinkCreate(pool, {
+              tokenDigest,
+              candidateToken: input.candidateToken,
+              placeholderDomain,
+            });
+            if (result.status !== 'ok') return failCompleteStatus(result.status);
+            await issueOneLinkLoginSession(ctx, result.user);
+            return ctx.json({ status: true, action: 'create', userId: result.user.id });
+          }
+          if (input.action === 'link_existing') {
+            if (readAuthPolicy().smsMode === 'disabled' || !sms) return smsUnavailable();
+            const row = await readOneLinkPendingByDigest(pool, tokenDigest);
+            const pending = assertLoginCandidatePending(row, input.candidateToken);
+            const consumed = await consumeOneLinkExistingPhoneChallenge(
+              pool,
+              config.secret,
+              input.phone,
+              input.code,
+              { pendingId: pending.id, candidateToken: pending.candidateToken },
+            );
+            if (consumed !== 'ok') {
+              throw new APIError('BAD_REQUEST', {
+                code: 'INVALID_OTP',
+                message: 'Invalid verification code',
+              });
+            }
+            const result = await completeOneLinkLinkExisting(pool, {
+              tokenDigest,
+              candidateToken: input.candidateToken,
+              phone: input.phone,
+            });
+            if (result.status !== 'ok') return failCompleteStatus(result.status);
+            await issueOneLinkLoginSession(ctx, result.user);
+            return ctx.json({ status: true, action: 'link_existing', userId: result.user.id });
+          }
+          const session = await readValidRecentSession(ctx);
+          if (!session) {
+            throw new APIError(
+              'UNAUTHORIZED',
+              { code: 'SESSION_REQUIRED', message: 'Recent session required' },
+              ctx.responseHeaders,
+            );
+          }
+          const result = await completeOneLinkBindCurrent(pool, {
+            tokenDigest,
+            candidateToken: input.candidateToken,
+            session,
+          });
+          if (result.status !== 'ok') return failCompleteStatus(result.status);
+          clearPendingCookie(ctx);
+          return ctx.json({
+            status: true,
+            action: 'bind_current',
+            userId: result.userId,
+            ...(result.alreadyBound ? { alreadyBound: true } : {}),
+          });
+        } catch (error) {
+          if (isExposedApiError(error)) throw error;
+          return authUnavailable(ctx.responseHeaders);
         }
       }),
     },

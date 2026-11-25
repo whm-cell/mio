@@ -278,12 +278,14 @@ it('assigns unique miioo_XXXXXX displayId across signup methods and rejects clie
         phoneNumber: string | null;
         phoneNumberVerified: boolean;
         wechatBound: boolean;
+        onelinkBound: boolean;
       };
     }),
   );
   const ids = profiles.map((p) => p.displayId);
   for (const displayId of ids) expect(displayId).toMatch(/^miioo_\d{6}$/);
   expect(new Set(ids).size).toBe(3);
+  for (const profile of profiles) expect(profile.onelinkBound).toBe(false);
   expect(profiles[1]!.phoneNumber).toBe('+8613800138002');
   expect(profiles[1]!.phoneNumberVerified).toBe(true);
   expect(profiles[1]!.wechatBound).toBe(false);

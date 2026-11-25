@@ -8,7 +8,7 @@
 
 OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH 与预检才返回 403。
 
-邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink` 与 `/api/auth/onelink/pending` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
+邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink`、`/api/auth/onelink/pending`、`/api/auth/onelink/existing/send-otp` 与 `/api/auth/onelink/complete` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
@@ -31,6 +31,8 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | `/onelink/start`                                                                                               | 60 秒 / 20 次        |
 | `/onelink/pending`                                                                                             | 60 秒 / 60 次        |
 | `/onelink/cancel`                                                                                              | 60 秒 / 30 次        |
+| `/onelink/existing/send-otp`                                                                                   | 60 秒 / 100 次       |
+| `/onelink/complete`                                                                                            | 60 秒 / 10 次        |
 | `/callback/onelink`                                                                                            | 60 秒 / 100 次       |
 | `/change-password`                                                                                             | 10 秒 / 3 次         |
 | `/sign-out`、`/get-session`、`/list-sessions`、`/revoke-session`、`/revoke-sessions`、`/revoke-other-sessions` | 各自 60 秒 / 100 次  |
@@ -162,6 +164,42 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 错误：非空对象或非法 JSON 返回 400 `INVALID_INPUT`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文与 429 沿共同约定。本入口不受万联运行期热开关关闭阻断，确保随时可清理遗留待处理状态。
 
 副作用：若携带有效待处理 Cookie，则将对应处于 `started` 或 `candidate_ready` 状态的 `mioOneLinkPending` 记录原子更新为 `cancelled`，随后清除待处理 Cookie；不影响当前 C 端登录会话或既有永久绑定。
+
+## POST /api/auth/onelink/existing/send-otp
+
+身份：持有有效、未过期且处于 `candidate_ready` 状态的 `intent="login"` 待处理 Cookie 的当前浏览器。
+
+输入：严格 JSON 对象 `{phoneNumber}`，接受 11 位大陆手机号或其 `+86` 格式，拒绝任何额外字段；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定。
+
+成功：200 与 `{status:true}`，表示真实短信供应商已受理（不证明送达），绝不暴露该手机号是否已在 Mio 注册。
+
+错误：输入无效返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、非 `candidate_ready` 或用途非 `login` 返回 400 `ONELINK_PENDING_INVALID`；短信预算耗尽返回 429 `SMS_RATE_LIMITED`；未配置服务端万联 `.env` 或万联热开关关闭返回 503 `ONELINK_UNAVAILABLE`；运行时策略 `smsMode='disabled'`、未启用真实短信供应商、缺失客户端 IP 或供应商拒绝／激活失败返回 503 `SMS_UNAVAILABLE`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`。本入口**严禁跟随** `smsMode='bypass'`。
+
+副作用：在单事务内扣减持久短信预算并写入 `purpose="onelink_existing"` 挑战（绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，不同浏览器与待处理操作互不覆盖，亦不与 `login`/`bind` 挑战互通），调用真实短信供应商成功后激活挑战；失败或未知不返预算、不自动重发，亦不清除待处理 Cookie。
+
+## POST /api/auth/onelink/complete
+
+身份：持有有效待处理 Cookie 的当前浏览器；`action="link_existing"` 另须持有当前待处理操作对应的单次 `onelink_existing` 真实短信验证码；`action="bind_current"` 另须持有与发起时一致且创建时间不足 10 分钟、未撤销、未禁用的 C 端会话。
+
+输入：严格 JSON 对象，按 `action` 仅允许精确字段集合，拒绝任何额外字段（包括客户端传入的目标 `userId` 或万联 `sub`）；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定：
+
+- `action="create"`：`{action:"create", candidateToken}`
+- `action="link_existing"`：`{action:"link_existing", candidateToken, phoneNumber, code}`（规范化大陆手机号与 6 位数字验证码）
+- `action="bind_current"`：`{action:"bind_current", candidateToken}`
+
+成功：按 `action` 返回 200 与 `{status:true, action, userId}`（`bind_current` 幂等命中时附带 `alreadyBound:true`），并始终清除待处理 Cookie：
+
+- `action="create"`：200 与 `{status:true, action:"create", userId}`，签发新用户 C 端会话 Cookie 并清除待处理 Cookie。
+- `action="link_existing"`：200 与 `{status:true, action:"link_existing", userId}`，签发已有手机号用户 C 端会话 Cookie 并清除待处理 Cookie。
+- `action="bind_current"`：200 与 `{status:true, action:"bind_current", userId}`（若当前用户已绑定同一万联 `sub`，额外返回 `alreadyBound:true`），仅清除待处理 Cookie，**不修改或重建现有 C 端会话 Cookie**。
+
+错误：输入非法或携带额外字段返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成（含重放已完成 Cookie）返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、状态非 `candidate_ready`、用途不匹配或 `candidateToken` 不匹配返回 400 `ONELINK_PENDING_INVALID`；`link_existing` 验证码错误、过期、跨用途／跨待处理重放或连续错 3 次锁定返回 400 `INVALID_OTP`；`link_existing` 手机号未注册或未验证返回 404 `EXISTING_PHONE_NOT_FOUND`（**绝不自动建号**且保留待处理状态）；`link_existing` 目标账号已禁用返回 403 `ACCOUNT_DISABLED`；`bind_current` 缺失、过期、切换或已禁用原近期会话返回 401 `SESSION_REQUIRED`；唯一约束冲突（该万联 `sub` 已归属他人，或目标用户已绑定另一万联身份）返回 409 `ONELINK_ALREADY_BOUND` 并保留原归属；未配置万联 `.env` 或热开关关闭返回 503 `ONELINK_UNAVAILABLE`；`link_existing` 在 `smsMode='disabled'` 或未配置真实短信供应商时返回 503 `SMS_UNAVAILABLE`（**严禁跟随** `smsMode='bypass'`）；数据库或会话基础设施异常返回脱敏 503 `AUTH_UNAVAILABLE`。
+
+副作用：所有写入均在单 PostgreSQL 事务内锁定 `mioOneLinkPending` 并执行原子提交，唯一约束冲突完整回滚且保留原归属：
+
+- `create`：在同一 PostgreSQL 事务内锁定待处理记录、分配唯一 `displayId` 并创建 `name="万联用户"`、保留域占位邮箱 `onelink-…@auth.mio.invalid`（`emailVerified=false`）、`phoneNumber=null` 的新用户、插入 `(providerId='onelink', accountId=sub)` 关联并更新待处理为 `completed`；若遭遇 `account` 唯一冲突则整个事务回滚（零孤儿用户）。成功后签发会话并清除待处理 Cookie；新用户后续可经 `/api/auth/phone-binding/*` 补绑空闲手机号。
+- `link_existing`：消费验证码前先核验待处理状态与 `candidateToken`；单次消费 `onelink_existing` 验证码（错误尝试在独立事务中递增并在第 3 次失败后删除）后，在单事务内依序锁定目标用户与待处理记录（先校验待处理状态再校验目标用户）并写入万联关联，不创建任何新用户；成功后标记 `completed`、签发原用户会话并清除待处理 Cookie。
+- `bind_current`：非续期校验近期会话后，在同一事务内依次锁定用户、原近期会话与 `intent="bind"` 待处理记录并复核发起身份与 `candidateToken`；若当前用户已绑定同一 `sub` 则幂等完成待处理，否则写入万联关联并标记 `completed`，成功后仅清除待处理 Cookie。
 
 ## POST /api/auth/phone-number/send-otp
 
@@ -337,19 +375,19 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：无正文。Origin 可省略，提供时必须在允许列表内。
 
-成功：200 和 `{userId,displayId,name,avatarAssetId,phoneNumber,phoneNumberVerified,wechatBound}`；`displayId`、`avatarAssetId` 与 `phoneNumber` 可为 `null`，不返回密码哈希、邮箱占位、供应商 token 或头像签名 URL。
+成功：200 和 `{userId,displayId,name,avatarAssetId,phoneNumber,phoneNumberVerified,wechatBound,onelinkBound}`；`displayId`、`avatarAssetId` 与 `phoneNumber` 可为 `null`，不返回密码哈希、邮箱占位、供应商 token 或头像签名 URL。
 
 错误：未登录、会话失效或账号已禁用返回 401 `UNAUTHORIZED`；来源或方法错误与数据库故障沿共同约定。
 
-副作用：只读取当前用户资料与微信绑定状态，不刷新会话或写入数据。
+副作用：只读取当前用户资料与微信、万联绑定状态，不刷新会话或写入数据。
 
 ## PATCH /api/v1/me/profile
 
 身份：Cookie 经数据库校验后的未禁用可信身份；读取正文后重新核对身份。
 
-输入：JSON 对象，至少包含 `name` 或 `avatarAssetId` 之一，拒绝任何其他字段（包括 `displayId`、`disabled`、`email`、`phoneNumber`）。`name` 为去首尾空白后 1–50 个 Unicode 字符且不含控制字符的字符串；`avatarAssetId` 为小写 UUID v4 或 `null`。来源、JSON、16 KiB 与 10 秒读取期限沿共同约定。
+输入：JSON 对象，至少包含 `name` 或 `avatarAssetId` 之一，拒绝任何其他字段（包括 `displayId`、`disabled`、`email`、`phoneNumber`、`onelinkBound`）。`name` 为去首尾空白后 1–50 个 Unicode 字符且不含控制字符的字符串；`avatarAssetId` 为小写 UUID v4 或 `null`。来源、JSON、16 KiB 与 10 秒读取期限沿共同约定。
 
-成功：200，返回更新后的完整用户资料对象（结构同 `GET /api/v1/me/profile`）。
+成功：200，返回更新后的完整用户资料对象（结构同 `GET /api/v1/me/profile`，含 `onelinkBound`）。
 
 错误：字段非法或头像资产非 `image/jpeg`、`image/png`、`image/webp` 返回 400 `INVALID_INPUT`；未登录或账号已禁用返回 401 `UNAUTHORIZED`；头像资产不存在或不属于当前用户返回 404 `ASSET_NOT_FOUND`；头像资产非 `ready` 返回 409 `ASSET_NOT_READY`；资产服务未装配或不可用时设置非空头像返回 503 `ASSET_UNAVAILABLE`；正文与来源错误沿共同约定。
 

@@ -46,6 +46,8 @@ const routes = new Map([
   ['/callback/onelink', 'GET'],
   ['/onelink/pending', 'GET'],
   ['/onelink/cancel', 'POST'],
+  ['/onelink/existing/send-otp', 'POST'],
+  ['/onelink/complete', 'POST'],
   ['/sign-out', 'POST'],
   ['/get-session', 'GET'],
   ['/change-password', 'POST'],

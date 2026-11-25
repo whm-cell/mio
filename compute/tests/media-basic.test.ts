@@ -9,6 +9,7 @@ import type { MediaCommand, MediaOperation, MediaParameters } from '@mio/compute
 import { MEDIA_PROFILE } from '@mio/compute-contracts';
 import type { MediaExecutionContext, MediaStep } from '../src/media-execution.ts';
 import { MediaFiles } from '../src/adapters/media-files.ts';
+import { probeVideoFile } from '../src/adapters/media.ts';
 import { Journal } from '../src/adapters/journal.ts';
 import { MediaProcessAdapter } from '../src/adapters/media-process.ts';
 import { waveform } from '../src/plans/audio.ts';
@@ -142,6 +143,11 @@ describe('real FFmpeg media plans through production process/file adapters', () 
       videoCodec: 'h264',
     });
     expect(result.data.probe!.durationSeconds).toBeCloseTo(2, 1);
+    expect(await probeVideoFile(video, AbortSignal.timeout(10_000))).toMatchObject({
+      width: 320,
+      height: 180,
+      hasAudio: true,
+    });
     expect(task.steps[0]).toMatchObject({ id: 'probe-input-0', capture: 'json', tool: 'ffprobe' });
     expect(task.steps[0]!.args.at(-1)).toBe('@file:input-0');
     await expect(probeInput(64, task.context)).rejects.toMatchObject({ code: 'INPUT_INVALID' });
@@ -158,6 +164,11 @@ describe('real FFmpeg media plans through production process/file adapters', () 
       rotation: 90,
       sampleAspectRatio: '2:1',
     });
+    expect(await probeVideoFile(rotated, AbortSignal.timeout(10_000))).toMatchObject({
+      width: 180,
+      height: 640,
+      hasAudio: false,
+    });
     const frameTask = setup('frames.extract', { mode: 'first_last', maxFrames: 1, width: 180 }, [
       rotated,
     ]);
@@ -165,6 +176,25 @@ describe('real FFmpeg media plans through production process/file adapters', () 
     expect(
       await probeFile(frames.files[0]!.name, 'check-display-frame', frameTask.context),
     ).toMatchObject({ width: 180, height: 640 });
+  });
+  it('preserves each probe operation’s duration boundary', async () => {
+    const source = join(root, 'long-video.mp4');
+    ffmpeg([
+      '-f',
+      'lavfi',
+      '-i',
+      'color=black:size=32x32:rate=1:duration=1801',
+      '-c:v',
+      'libx264',
+      '-threads',
+      '1',
+      source,
+    ]);
+    const task = setup('media.probe', {}, [source]);
+    expect((await executeBasic(task.command, task.context)).data.probe?.durationSeconds).toBe(1801);
+    await expect(probeVideoFile(source, AbortSignal.timeout(10_000))).rejects.toMatchObject({
+      code: 'SOURCE_INVALID',
+    });
   });
   it('rejects malformed media, actual overlong input and source windows beyond EOF', async () => {
     const bad = join(root, 'bad'),

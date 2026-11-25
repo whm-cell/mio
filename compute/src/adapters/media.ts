@@ -28,6 +28,8 @@ import {
   COMPUTE_MAX_MEDIA_BYTES,
 } from '@mio/compute-contracts';
 import type { AudioInspectCommandV1, AudioInspection } from '@mio/compute-contracts';
+import { videoDisplayGeometry } from '../video-display.ts';
+import type { VideoDisplayStream } from '../video-display.ts';
 
 const MAX_DIRECTORY_BYTES = 10 * 1024 ** 3;
 const MIN_FREE_BYTES = 2 * 1024 ** 3;
@@ -357,44 +359,17 @@ async function runProcess(
   }
 }
 
+interface ProbeStream extends VideoDisplayStream {
+  codec_type?: string;
+  codec_name?: string;
+  r_frame_rate?: string;
+  avg_frame_rate?: string;
+}
+
 interface Probe {
   duration: number;
   container: string;
-  streams: {
-    codec_type?: string;
-    codec_name?: string;
-    width?: number;
-    height?: number;
-    r_frame_rate?: string;
-    avg_frame_rate?: string;
-    side_data_list?: { rotation?: number }[];
-    tags?: { rotate?: string };
-  }[];
-}
-
-function displaySize(
-  stream: Probe['streams'][number] | undefined,
-): { width: number; height: number } | null {
-  if (
-    !stream?.width ||
-    !stream.height ||
-    !Number.isSafeInteger(stream.width) ||
-    !Number.isSafeInteger(stream.height) ||
-    stream.width < 1 ||
-    stream.height < 1
-  )
-    return null;
-  const rotation =
-    stream.side_data_list?.find((item) => item.rotation !== undefined)?.rotation ??
-    Number(stream.tags?.rotate ?? 0);
-  if (!Number.isFinite(rotation)) return null;
-  const angle = ((rotation % 360) * Math.PI) / 180;
-  const cosine = Math.abs(Math.cos(angle));
-  const sine = Math.abs(Math.sin(angle));
-  return {
-    width: Math.ceil(stream.width * cosine + stream.height * sine - 1e-8),
-    height: Math.ceil(stream.width * sine + stream.height * cosine - 1e-8),
-  };
+  streams: ProbeStream[];
 }
 
 async function probe(path: string, signal: AbortSignal): Promise<Probe> {
@@ -408,7 +383,7 @@ async function probe(path: string, signal: AbortSignal): Promise<Probe> {
       '-format_whitelist',
       'mov,matroska,webm,avi,mpegts',
       '-show_entries',
-      'format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate:stream_side_data=rotation:stream_tags=rotate',
+      'format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,sample_aspect_ratio:stream_side_data=rotation:stream_tags=rotate',
       '-of',
       'json',
       path,
@@ -454,7 +429,7 @@ export async function probeVideoFile(
   try {
     const media = await probe(path, signal);
     const video = media.streams.find((stream) => stream.codec_type === 'video');
-    const size = displaySize(video);
+    const size = video ? videoDisplayGeometry(video) : null;
     if (
       !video?.codec_name ||
       video.codec_name.length > 128 ||

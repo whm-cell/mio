@@ -171,11 +171,11 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：严格 JSON 对象 `{phoneNumber}`，接受 11 位大陆手机号或其 `+86` 格式，拒绝任何额外字段；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定。
 
-成功：200 与 `{status:true}`，表示真实短信供应商已受理（不证明送达），绝不暴露该手机号是否已在 Mio 注册。
+成功：200 与 `{status:true}`；`smsMode='live'` 下表示真实短信供应商已受理（不证明送达），`smsMode='bypass'` 下在校验待处理状态、已配置合法 6 位固定测试码与直连客户端 IP 后直接返回 `{status:true}`（不调用短信供应商、不占预算）；两种模式均绝不暴露该手机号是否已在 Mio 注册。
 
-错误：输入无效返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、非 `candidate_ready` 或用途非 `login` 返回 400 `ONELINK_PENDING_INVALID`；短信预算耗尽返回 429 `SMS_RATE_LIMITED`；未配置服务端万联 `.env` 或万联热开关关闭返回 503 `ONELINK_UNAVAILABLE`；运行时策略 `smsMode='disabled'`、未启用真实短信供应商、缺失客户端 IP 或供应商拒绝／激活失败返回 503 `SMS_UNAVAILABLE`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`。本入口**严禁跟随** `smsMode='bypass'`。
+错误：输入无效返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、非 `candidate_ready` 或用途非 `login` 返回 400 `ONELINK_PENDING_INVALID`；短信预算耗尽返回 429 `SMS_RATE_LIMITED`；未配置服务端万联 `.env` 或万联热开关关闭返回 503 `ONELINK_UNAVAILABLE`；运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用真实短信供应商、`smsMode='bypass'` 下未配置合法 6 位固定测试码、缺失客户端 IP 或供应商拒绝／激活失败返回 503 `SMS_UNAVAILABLE`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`。
 
-副作用：在单事务内扣减持久短信预算并写入 `purpose="onelink_existing"` 挑战（绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，不同浏览器与待处理操作互不覆盖，亦不与 `login`/`bind` 挑战互通），调用真实短信供应商成功后激活挑战；失败或未知不返预算、不自动重发，亦不清除待处理 Cookie。
+副作用：`smsMode='live'` 下在单事务内扣减持久短信预算并写入 `purpose="onelink_existing"` 挑战（绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，不同浏览器与待处理操作互不覆盖，亦不与 `login`/`bind` 挑战互通），调用真实短信供应商成功后激活挑战；失败或未知不返预算、不自动重发，亦不清除待处理 Cookie。`smsMode='bypass'` 下不调用短信供应商、不占用短信预算，但仍受认证路由限流与待处理状态校验约束。
 
 ## POST /api/auth/onelink/complete
 
@@ -193,12 +193,12 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 - `action="link_existing"`：200 与 `{status:true, action:"link_existing", userId}`，签发已有手机号用户 C 端会话 Cookie 并清除待处理 Cookie。
 - `action="bind_current"`：200 与 `{status:true, action:"bind_current", userId}`（若当前用户已绑定同一万联 `sub`，额外返回 `alreadyBound:true`），仅清除待处理 Cookie，**不修改或重建现有 C 端会话 Cookie**。
 
-错误：输入非法或携带额外字段返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成（含重放已完成 Cookie）返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、状态非 `candidate_ready`、用途不匹配或 `candidateToken` 不匹配返回 400 `ONELINK_PENDING_INVALID`；`link_existing` 验证码错误、过期、跨用途／跨待处理重放或连续错 3 次锁定返回 400 `INVALID_OTP`；`link_existing` 手机号未注册或未验证返回 404 `EXISTING_PHONE_NOT_FOUND`（**绝不自动建号**且保留待处理状态）；`link_existing` 目标账号已禁用返回 403 `ACCOUNT_DISABLED`；`bind_current` 缺失、过期、切换或已禁用原近期会话返回 401 `SESSION_REQUIRED`；唯一约束冲突（该万联 `sub` 已归属他人，或目标用户已绑定另一万联身份）返回 409 `ONELINK_ALREADY_BOUND` 并保留原归属；未配置万联 `.env` 或热开关关闭返回 503 `ONELINK_UNAVAILABLE`；`link_existing` 在 `smsMode='disabled'` 或未配置真实短信供应商时返回 503 `SMS_UNAVAILABLE`（**严禁跟随** `smsMode='bypass'`）；数据库或会话基础设施异常返回脱敏 503 `AUTH_UNAVAILABLE`。
+错误：输入非法或携带额外字段返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成（含重放已完成 Cookie）返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、状态非 `candidate_ready`、用途不匹配或 `candidateToken` 不匹配返回 400 `ONELINK_PENDING_INVALID`；`link_existing` 验证码错误（含 `bypass` 模式下固定码不匹配）、过期、跨用途／跨待处理重放或连续错 3 次锁定返回 400 `INVALID_OTP`；`link_existing` 手机号未注册或未验证返回 404 `EXISTING_PHONE_NOT_FOUND`（**绝不自动建号**且保留待处理状态）；`link_existing` 目标账号已禁用返回 403 `ACCOUNT_DISABLED`；`bind_current` 缺失、过期、切换或已禁用原近期会话返回 401 `SESSION_REQUIRED`；唯一约束冲突（该万联 `sub` 已归属他人，或目标用户已绑定另一万联身份）返回 409 `ONELINK_ALREADY_BOUND` 并保留原归属；未配置万联 `.env` 或热开关关闭返回 503 `ONELINK_UNAVAILABLE`；`link_existing` 在 `smsMode='disabled'`、`smsMode='live'` 下未配置真实短信供应商或 `smsMode='bypass'` 下未配置合法 6 位固定测试码时返回 503 `SMS_UNAVAILABLE`；数据库或会话基础设施异常返回脱敏 503 `AUTH_UNAVAILABLE`。
 
 副作用：所有写入均在单 PostgreSQL 事务内锁定 `mioOneLinkPending` 并执行原子提交，唯一约束冲突完整回滚且保留原归属：
 
 - `create`：在同一 PostgreSQL 事务内锁定待处理记录、分配唯一 `displayId` 并创建 `name="万联用户"`、保留域占位邮箱 `onelink-…@auth.mio.invalid`（`emailVerified=false`）、`phoneNumber=null` 的新用户、插入 `(providerId='onelink', accountId=sub)` 关联并更新待处理为 `completed`；若遭遇 `account` 唯一冲突则整个事务回滚（零孤儿用户）。成功后签发会话并清除待处理 Cookie；新用户后续可经 `/api/auth/phone-binding/*` 补绑空闲手机号。
-- `link_existing`：消费验证码前先核验待处理状态与 `candidateToken`；单次消费 `onelink_existing` 验证码（错误尝试在独立事务中递增并在第 3 次失败后删除）后，在单事务内依序锁定目标用户与待处理记录（先校验待处理状态再校验目标用户）并写入万联关联，不创建任何新用户；成功后标记 `completed`、签发原用户会话并清除待处理 Cookie。
+- `link_existing`：验码前先核验待处理状态与 `candidateToken`；`smsMode='live'` 下单次消费 `onelink_existing` 验证码（错误尝试在独立事务中递增并在第 3 次失败后删除），`smsMode='bypass'` 下无需前置 `send-otp` 或真实短信运行时，以恒定时间比对后台配置的 6 位固定测试码；随后在单事务内依序锁定目标用户与待处理记录（先校验待处理状态再校验目标用户）并写入万联关联，不创建任何新用户；成功后标记 `completed`、签发原用户会话并清除待处理 Cookie。
 - `bind_current`：非续期校验近期会话后，在同一事务内依次锁定用户、原近期会话与 `intent="bind"` 待处理记录并复核发起身份与 `candidateToken`；若当前用户已绑定同一 `sub` 则幂等完成待处理，否则写入万联关联并标记 `completed`，成功后仅清除待处理 Cookie。
 
 ## POST /api/auth/phone-number/send-otp
@@ -231,23 +231,23 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：`phoneNumber`；格式与登录发码相同。
 
-成功：200 和 `{status:true}` 表示供应商已受理，不证明送达。
+成功：200 和 `{status:true}`；`smsMode='live'` 下表示供应商已受理（不证明送达），`smsMode='bypass'` 下在校验近期会话、已配置合法 6 位固定测试码与直连客户端 IP 后直接返回 `{status:true}`（无需配置腾讯短信）。
 
-错误：输入无效为 400，无近期会话为 401，预算耗尽为 429，运行时策略 `smsMode='disabled'`、未启用真实短信供应商或供应商拒绝／结果未知为 503 `SMS_UNAVAILABLE`。本入口**不跟随** `smsMode='bypass'`。
+错误：输入无效为 400，无近期会话为 401，预算耗尽为 429，运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用真实短信供应商、`smsMode='bypass'` 下未配置合法 6 位固定测试码或供应商拒绝／结果未知为 503 `SMS_UNAVAILABLE`。
 
-副作用：占用短信预算并发送绑定用途验证码，绑定原用户、会话和号码；失败和未知不返预算、不自动重发。
+副作用：`smsMode='live'` 下占用短信预算并发送绑定用途验证码，绑定原用户、会话和号码；失败和未知不返预算、不自动重发。`smsMode='bypass'` 下不调用短信供应商、不占用短信预算，但仍受近期会话与认证路由限流约束。
 
 ## POST /api/auth/phone-binding/confirm
 
-身份：与发码相同且仍有效的近期会话，以及该号码的绑定用途验证码。
+身份：与发码相同且仍有效的近期会话，以及该号码的绑定用途验证码（`smsMode='bypass'` 下为后台配置的 6 位固定测试验证码）。
 
 输入：`phoneNumber,code`；格式与登录验证相同。
 
 成功：返回 `{status:true}`，在当前用户首次绑定空闲号码，userId 不变。
 
-错误：输入、验证码、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，运行时策略 `smsMode='disabled'` 或未启用真实短信供应商为 503 `SMS_UNAVAILABLE`。本入口**不跟随** `smsMode='bypass'`。
+错误：输入、验证码（含 `bypass` 模式下固定码不匹配）、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用真实短信供应商或 `smsMode='bypass'` 下未配置合法 6 位固定测试码为 503 `SMS_UNAVAILABLE`。
 
-副作用：消费验证码并在事务中检查原会话、更新当前用户；不转移或合并账号。持久预算及恢复边界见[认证底座](../auth.md#手机验证码与发送预算)。
+副作用：`smsMode='live'` 下消费验证码并在事务中检查原会话、更新当前用户；`smsMode='bypass'` 下无需前置 `send-otp` 或真实短信运行时，在校验近期会话并以恒定时间比对固定测试码后，以相同行锁顺序（`"user"` → `"session"`）在事务中复核原会话并写入空闲号码；不转移或合并账号。持久预算及恢复边界见[认证底座](../auth.md#手机验证码与发送预算)。
 
 ## POST /api/auth/sign-up/email
 

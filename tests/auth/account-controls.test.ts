@@ -916,30 +916,83 @@ it('enforces runtime smsMode bypass/disabled with a real SMS sender wired while 
     expect(unverifiedRes.status).toBe(400);
     expect(((await unverifiedRes.json()) as { code: string }).code).toBe('INVALID_OTP');
 
-    // Phone binding does NOT follow bypass: uses real sender and rejects fixed bypass code
+    // Phone binding ALSO follows bypass: requires recent session, skips real SMS sender & budget, and verifies fixed code.
+    const unauthBindSend = await req('/api/auth/phone-binding/send-otp', {
+      phoneNumber: '13800138086',
+    });
+    expect(unauthBindSend.status).toBe(401);
+    expect(((await unauthBindSend.json()) as { code: string }).code).toBe('SESSION_REQUIRED');
+
     const bindSend = await req(
       '/api/auth/phone-binding/send-otp',
       { phoneNumber: '13800138086' },
       binderCookie,
     );
     expect(bindSend.status).toBe(200);
-    expect(smsSendCalls).toBe(1);
-    const realBindCode = sentCodes.get('+8613800138086')!;
-    expect(realBindCode).toMatch(/^\d{6}$/);
+    expect(await bindSend.json()).toEqual({ status: true });
+    expect(smsSendCalls).toBe(0);
+    expect((await pool.query('SELECT count(*)::int AS c FROM "mioSmsBudget"')).rows[0].c).toBe(0);
 
+    const bindWithWrongCode = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138086', code: '000000' },
+      binderCookie,
+    );
+    expect(bindWithWrongCode.status).toBe(400);
+    expect(((await bindWithWrongCode.json()) as { code: string }).code).toBe('INVALID_OTP');
+
+    // Occupied phone still rejected with 409 PHONE_CONFLICT under bypass
+    const bindOccupied = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138084', code: '654321' },
+      binderCookie,
+    );
+    expect(bindOccupied.status).toBe(409);
+    expect(((await bindOccupied.json()) as { code: string }).code).toBe('PHONE_CONFLICT');
+
+    // Valid fixed bypass code binds free phone without calling real SMS sender
     const bindWithBypassCode = await req(
       '/api/auth/phone-binding/confirm',
-      { phoneNumber: '13800138086', code: realBindCode === '654321' ? '123456' : '654321' },
+      { phoneNumber: '13800138086', code: '654321' },
       binderCookie,
     );
-    expect(bindWithBypassCode.status).toBe(400);
+    expect(bindWithBypassCode.status).toBe(200);
+    expect(smsSendCalls).toBe(0);
+    expect(sentCodes.size).toBe(0);
 
-    const bindWithRealCode = await req(
-      '/api/auth/phone-binding/confirm',
-      { phoneNumber: '13800138086', code: realBindCode },
-      binderCookie,
+    // Switching back to live mode still uses real SMS sender and rejects fixed bypass code
+    policy = { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: '654321' };
+    const liveBinderRes = await req('/api/auth/sign-up/email', {
+      name: 'Live Binder',
+      email: `live-binder-${randomUUID()}@example.test`,
+      password,
+    });
+    expect(liveBinderRes.status).toBe(200);
+    const liveBinderCookie = cookies(liveBinderRes);
+
+    const liveBindSend = await req(
+      '/api/auth/phone-binding/send-otp',
+      { phoneNumber: '13800138087' },
+      liveBinderCookie,
     );
-    expect(bindWithRealCode.status).toBe(200);
+    expect(liveBindSend.status).toBe(200);
+    expect(smsSendCalls).toBe(1);
+    const realBindCode = sentCodes.get('+8613800138087')!;
+    expect(realBindCode).toMatch(/^\d{6}$/);
+
+    const liveBindWrongCode = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138087', code: realBindCode === '654321' ? '123456' : '654321' },
+      liveBinderCookie,
+    );
+    expect(liveBindWrongCode.status).toBe(400);
+
+    const liveBindWithRealCode = await req(
+      '/api/auth/phone-binding/confirm',
+      { phoneNumber: '13800138087', code: realBindCode },
+      liveBinderCookie,
+    );
+    expect(liveBindWithRealCode.status).toBe(200);
   } finally {
     srv.closeAllConnections();
     await new Promise<void>((resolve) => srv.close(() => resolve()));
@@ -1136,15 +1189,24 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
     expect(((await disabledBypass.json()) as { code: string }).code).toBe('ACCOUNT_DISABLED');
     expect(disabledBypass.headers.getSetCookie()).toEqual([]);
 
-    // Phone binding does NOT follow bypass -> 503 SMS_UNAVAILABLE without SMS provider
+    // Phone binding ALSO follows bypass even without real SMS provider configured
     const bindSend = await req(
       '/api/auth/phone-binding/send-otp',
       'POST',
       { phoneNumber: '13900139003' },
       emailUserCookie,
     );
-    expect(bindSend.status).toBe(503);
-    expect(((await bindSend.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+    expect(bindSend.status).toBe(200);
+    expect(await bindSend.json()).toEqual({ status: true });
+
+    const badBindConfirm = await req(
+      '/api/auth/phone-binding/confirm',
+      'POST',
+      { phoneNumber: '13900139003', code: '000000' },
+      emailUserCookie,
+    );
+    expect(badBindConfirm.status).toBe(400);
+    expect(((await badBindConfirm.json()) as { code: string }).code).toBe('INVALID_OTP');
 
     const bindConfirm = await req(
       '/api/auth/phone-binding/confirm',
@@ -1152,8 +1214,13 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
       { phoneNumber: '13900139003', code: '246810' },
       emailUserCookie,
     );
-    expect(bindConfirm.status).toBe(503);
-    expect(((await bindConfirm.json()) as { code: string }).code).toBe('SMS_UNAVAILABLE');
+    expect(bindConfirm.status).toBe(200);
+    expect(await bindConfirm.json()).toEqual({ status: true });
+    const boundEmailProfile = (await (
+      await req('/api/v1/me/profile', 'GET', undefined, emailUserCookie)
+    ).json()) as { phoneNumber: string; phoneNumberVerified: boolean };
+    expect(boundEmailProfile.phoneNumber).toBe('+8613900139003');
+    expect(boundEmailProfile.phoneNumberVerified).toBe(true);
 
     // Hot-toggle smsMode to 'disabled' (rev 2 -> 3) -> all 4 phone endpoints return 503
     const toggleDisabled = await req(

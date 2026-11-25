@@ -230,6 +230,40 @@ async function verifyChallengeRow(
   return row;
 }
 
+async function applyUserPhoneBind(
+  client: PoolClient,
+  userId: string,
+  phone: string,
+): Promise<'ok' | 'conflict'> {
+  await client.query('SAVEPOINT phone_bind');
+  try {
+    const updated = await client.query(
+      `UPDATE "user" SET "phoneNumber" = $2, "phoneNumberVerified" = true, "updatedAt" = now()
+       WHERE id = $1 AND "phoneNumber" IS NULL RETURNING id`,
+      [userId, phone],
+    );
+    if (!updated.rowCount) return 'conflict';
+  } catch (error) {
+    if ((error as { code?: string }).code !== '23505') throw error;
+    await client.query('ROLLBACK TO SAVEPOINT phone_bind');
+    return 'conflict';
+  }
+  return 'ok';
+}
+
+/** Bind a phone number under smsMode='bypass' with the same lock order and session recheck. */
+export async function bindPhoneWithoutChallenge(
+  pool: Pool,
+  phone: string,
+  binding: BindingIdentity,
+): Promise<'ok' | 'conflict' | 'session'> {
+  return withAuthTransaction(pool, async (client) => {
+    await client.query('SELECT id FROM "user" WHERE id = $1 FOR UPDATE', [binding.userId]);
+    if (!(await bindingSessionIsActive(client, binding))) return 'session';
+    return applyUserPhoneBind(client, binding.userId, phone);
+  });
+}
+
 /** A bind locks and rechecks the original session before changing its user. */
 export async function consumePhoneChallenge(
   pool: Pool,
@@ -258,20 +292,7 @@ export async function consumePhoneChallenge(
         [row.id],
       );
       if (!consumed.rowCount) return 'invalid';
-      await client.query('SAVEPOINT phone_bind');
-      try {
-        const updated = await client.query(
-          `UPDATE "user" SET "phoneNumber" = $2, "phoneNumberVerified" = true, "updatedAt" = now()
-           WHERE id = $1 AND "phoneNumber" IS NULL RETURNING id`,
-          [binding.userId, phone],
-        );
-        if (!updated.rowCount) return 'conflict';
-      } catch (error) {
-        if ((error as { code?: string }).code !== '23505') throw error;
-        await client.query('ROLLBACK TO SAVEPOINT phone_bind');
-        return 'conflict';
-      }
-      return 'ok';
+      return applyUserPhoneBind(client, binding.userId, phone);
     }
     const consumed = await client.query(
       'DELETE FROM "mioPhoneChallenge" WHERE id = $1 AND "expiresAt" > clock_timestamp() RETURNING id',

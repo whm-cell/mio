@@ -13,6 +13,7 @@ import type { Pool } from 'pg';
 import type { SmsSender } from '../integrations/tencent-sms.ts';
 import {
   activatePhoneChallenge,
+  bindPhoneWithoutChallenge,
   consumePhoneChallenge,
   reservePhoneChallenge,
 } from './phone-store.ts';
@@ -125,8 +126,13 @@ export function phonePlugin(
         const { phone } = parsePhoneInput(ctx.body, false);
         const policy = readPolicy();
         if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
-        if (purpose === 'login' && policy.smsMode === 'bypass') {
+        if (policy.smsMode === 'bypass') {
           if (!isSixDigitCode(policy.smsBypassCode)) return failure('SMS_UNAVAILABLE');
+          if (purpose === 'bind') {
+            const session = await getAuthoritativeSessionFromCtx(ctx);
+            if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
+              return failure('SESSION_REQUIRED');
+          }
           const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
           if (!ip) return failure('SMS_UNAVAILABLE');
           return ctx.json({ status: true });
@@ -169,9 +175,23 @@ export function phonePlugin(
         const { phone, code } = parsePhoneInput(ctx.body, true);
         const policy = readPolicy();
         if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
-        if (purpose === 'login' && policy.smsMode === 'bypass') {
+        if (policy.smsMode === 'bypass') {
           const expected = policy.smsBypassCode;
           if (!isSixDigitCode(expected)) return failure('SMS_UNAVAILABLE');
+          if (purpose === 'bind') {
+            const session = await getAuthoritativeSessionFromCtx(ctx);
+            if (!session || epochMs() - session.session.createdAt.getTime() >= 600_000)
+              return failure('SESSION_REQUIRED');
+            if (!timingSafeEqual(Buffer.from(code, 'utf8'), Buffer.from(expected, 'utf8')))
+              return failure('INVALID_OTP');
+            const bound = await bindPhoneWithoutChallenge(pool, phone, {
+              userId: session.user.id,
+              sessionId: session.session.id,
+            });
+            if (bound !== 'ok')
+              return failure(bound === 'conflict' ? 'PHONE_CONFLICT' : 'SESSION_REQUIRED');
+            return ctx.json({ status: true });
+          }
           if (!timingSafeEqual(Buffer.from(code, 'utf8'), Buffer.from(expected, 'utf8')))
             return failure('INVALID_OTP');
         } else {

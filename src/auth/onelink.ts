@@ -3,7 +3,7 @@ import { epochMs } from '@mio/foundation/time';
 import type { BetterAuthPlugin, GenericEndpointContext } from 'better-auth';
 import { APIError, createAuthEndpoint, getIP, getSession } from 'better-auth/api';
 import { deleteSessionCookie, setSessionCookie } from 'better-auth/cookies';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Pool } from 'pg';
 import {
   buildOneLinkAuthorizeUrl,
@@ -677,7 +677,15 @@ export function oneLinkPlugin(
             return authUnavailable(ctx.responseHeaders);
           }
           const pending = assertLoginCandidatePending(row);
-          if (readAuthPolicy().smsMode === 'disabled' || !sms) return smsUnavailable();
+          const authPolicy = readAuthPolicy();
+          if (authPolicy.smsMode === 'disabled') return smsUnavailable();
+          if (authPolicy.smsMode === 'bypass') {
+            if (!isSixDigitCode(authPolicy.smsBypassCode)) return smsUnavailable();
+            const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
+            if (!ip) return smsUnavailable();
+            return ctx.json({ status: true });
+          }
+          if (!sms) return smsUnavailable();
           const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
           if (!ip) return smsUnavailable();
           try {
@@ -726,21 +734,38 @@ export function oneLinkPlugin(
             return ctx.json({ status: true, action: 'create', userId: result.user.id });
           }
           if (input.action === 'link_existing') {
-            if (readAuthPolicy().smsMode === 'disabled' || !sms) return smsUnavailable();
-            const row = await readOneLinkPendingByDigest(pool, tokenDigest);
-            const pending = assertLoginCandidatePending(row, input.candidateToken);
-            const consumed = await consumeOneLinkExistingPhoneChallenge(
-              pool,
-              config.secret,
-              input.phone,
-              input.code,
-              { pendingId: pending.id, candidateToken: pending.candidateToken },
-            );
-            if (consumed !== 'ok') {
-              throw new APIError('BAD_REQUEST', {
-                code: 'INVALID_OTP',
-                message: 'Invalid verification code',
-              });
+            const authPolicy = readAuthPolicy();
+            if (authPolicy.smsMode === 'disabled') return smsUnavailable();
+            if (authPolicy.smsMode === 'bypass') {
+              const expected = authPolicy.smsBypassCode;
+              if (!isSixDigitCode(expected)) return smsUnavailable();
+              const row = await readOneLinkPendingByDigest(pool, tokenDigest);
+              assertLoginCandidatePending(row, input.candidateToken);
+              if (
+                !timingSafeEqual(Buffer.from(input.code, 'utf8'), Buffer.from(expected, 'utf8'))
+              ) {
+                throw new APIError('BAD_REQUEST', {
+                  code: 'INVALID_OTP',
+                  message: 'Invalid verification code',
+                });
+              }
+            } else {
+              if (!sms) return smsUnavailable();
+              const row = await readOneLinkPendingByDigest(pool, tokenDigest);
+              const pending = assertLoginCandidatePending(row, input.candidateToken);
+              const consumed = await consumeOneLinkExistingPhoneChallenge(
+                pool,
+                config.secret,
+                input.phone,
+                input.code,
+                { pendingId: pending.id, candidateToken: pending.candidateToken },
+              );
+              if (consumed !== 'ok') {
+                throw new APIError('BAD_REQUEST', {
+                  code: 'INVALID_OTP',
+                  message: 'Invalid verification code',
+                });
+              }
             }
             const result = await completeOneLinkLinkExisting(pool, {
               tokenDigest,

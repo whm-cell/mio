@@ -1510,35 +1510,38 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     expect(sessionsAfterReplay).toBe(sessionsBeforeReplay);
   });
 
-  it('Path 3 (link_existing): forbids smsMode=bypass, prevents enumeration/auto-create, verifies real OTP and links existing phone user', async () => {
+  it('Path 3 (link_existing): supports live/bypass/disabled smsMode, prevents enumeration/auto-create, and links existing phone user', async () => {
     const existingPhone = '13800138201';
     const unregisteredPhone = '13800138202';
+    const bypassOnlyPhone = '13800138209';
     const existingUser = await createPhoneUser(existingPhone);
+    const bypassExistingUser = await createPhoneUser(bypassOnlyPhone);
     const preProfile = (await (
       await call('/api/v1/me/profile', { cookie: existingUser.cookie })
     ).json()) as { onelinkBound: boolean };
     expect(preProfile.onelinkBound).toBe(false);
 
-    // 1. Without real SMS configured, even smsMode='bypass' MUST return 503 SMS_UNAVAILABLE on both endpoints.
+    // 1. Without real SMS configured: smsMode='live' returns 503, smsMode='bypass' with null code fails closed 503,
+    //    and smsMode='bypass' with valid 6-digit code skips real SMS, prevents auto-create, and links existing phone user.
     const noSmsConfig = readAuthConfig({
       MIO_AUTH_BASE_URL: origin,
       MIO_AUTH_SECRET: AUTH_SECRET,
       MIO_AUTH_DATABASE_URL: database.url,
     })!;
-    const bypassPolicy: AuthRuntimePolicy = {
+    let noSmsPolicy: AuthRuntimePolicy = {
       emailPasswordEnabled: true,
-      smsMode: 'bypass',
+      smsMode: 'live',
       smsBypassCode: '654321',
     };
     const noSmsAuth = await createAuthentication(
       noSmsConfig,
       undefined,
       undefined,
-      () => bypassPolicy,
+      () => noSmsPolicy,
       { config: oneLinkConfig, getPolicy: () => policy },
     );
     const noSmsServer = createServer(
-      createAuthHandler(noSmsConfig, noSmsAuth, undefined, () => bypassPolicy),
+      createAuthHandler(noSmsConfig, noSmsAuth, undefined, () => noSmsPolicy),
     );
     noSmsServer.listen(0, '127.0.0.1');
     await once(noSmsServer, 'listening');
@@ -1547,19 +1550,32 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     const noSmsBase = `http://127.0.0.1:${noSmsAddr.port}`;
     try {
       const stagedForNoSms = await stageLoginCandidate(`ol-nosms-${randomUUID()}`);
-      const noSmsSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
+      const noSmsLiveSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
         method: 'POST',
         headers: {
           origin,
           'content-type': 'application/json',
           cookie: stagedForNoSms.pendingCookie,
         },
-        body: JSON.stringify({ phoneNumber: existingPhone }),
+        body: JSON.stringify({ phoneNumber: bypassOnlyPhone }),
       });
-      expect(noSmsSend.status).toBe(503);
-      expect(await noSmsSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+      expect(noSmsLiveSend.status).toBe(503);
+      expect(await noSmsLiveSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
 
-      const noSmsComplete = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+      noSmsPolicy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: null };
+      const noSmsMalformedSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({ phoneNumber: bypassOnlyPhone }),
+      });
+      expect(noSmsMalformedSend.status).toBe(503);
+      expect(await noSmsMalformedSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+
+      const noSmsMalformedComplete = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
         method: 'POST',
         headers: {
           origin,
@@ -1569,12 +1585,83 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
         body: JSON.stringify({
           action: 'link_existing',
           candidateToken: stagedForNoSms.candidateToken,
-          phoneNumber: existingPhone,
+          phoneNumber: bypassOnlyPhone,
           code: '654321',
         }),
       });
-      expect(noSmsComplete.status).toBe(503);
-      expect(await noSmsComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+      expect(noSmsMalformedComplete.status).toBe(503);
+      expect(await noSmsMalformedComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
+
+      noSmsPolicy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '654321' };
+      const noSmsBypassSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({ phoneNumber: bypassOnlyPhone }),
+      });
+      expect(noSmsBypassSend.status).toBe(200);
+      expect(await noSmsBypassSend.json()).toEqual({ status: true });
+
+      const noSmsWrongCode = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({
+          action: 'link_existing',
+          candidateToken: stagedForNoSms.candidateToken,
+          phoneNumber: bypassOnlyPhone,
+          code: '000000',
+        }),
+      });
+      expect(noSmsWrongCode.status).toBe(400);
+      expect(await noSmsWrongCode.json()).toMatchObject({ code: 'INVALID_OTP' });
+
+      // Unregistered phone under bypass still returns 404 EXISTING_PHONE_NOT_FOUND with zero users created.
+      const beforeNoSmsUnreg = await countUsersAndAccounts();
+      const noSmsUnreg = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({
+          action: 'link_existing',
+          candidateToken: stagedForNoSms.candidateToken,
+          phoneNumber: unregisteredPhone,
+          code: '654321',
+        }),
+      });
+      expect(noSmsUnreg.status).toBe(404);
+      expect(await noSmsUnreg.json()).toMatchObject({ code: 'EXISTING_PHONE_NOT_FOUND' });
+      expect(await countUsersAndAccounts()).toEqual(beforeNoSmsUnreg);
+
+      const noSmsBypassOk = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+        method: 'POST',
+        headers: {
+          origin,
+          'content-type': 'application/json',
+          cookie: stagedForNoSms.pendingCookie,
+        },
+        body: JSON.stringify({
+          action: 'link_existing',
+          candidateToken: stagedForNoSms.candidateToken,
+          phoneNumber: bypassOnlyPhone,
+          code: '654321',
+        }),
+      });
+      expect(noSmsBypassOk.status).toBe(200);
+      expect(await noSmsBypassOk.json()).toEqual({
+        status: true,
+        action: 'link_existing',
+        userId: bypassExistingUser.userId,
+      });
     } finally {
       noSmsServer.closeAllConnections();
       await new Promise<void>((resolve) => noSmsServer.close(() => resolve()));
@@ -1583,6 +1670,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
 
     // 2. With real SMS configured + smsMode='disabled': returns 503 SMS_UNAVAILABLE and never invokes sender.
     await pool.query('DELETE FROM "mioSmsBudget"');
+    await pool.query('DELETE FROM "rateLimit"');
     smsSendCount = 0;
     const sub = `ol-path3-${randomUUID()}`;
     const staged = await stageLoginCandidate(sub);
@@ -1607,8 +1695,24 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     expect(await disabledComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
     expect(smsSendCount).toBe(0);
 
-    // 3. With real SMS configured + smsMode='bypass': STILL sends real SMS, debits persistent budget and rejects bypass code!
+    // 2b. With real SMS configured + smsMode='bypass': skips real SMS sender & persistent budget completely.
     authPolicy = { emailPasswordEnabled: true, smsMode: 'bypass', smsBypassCode: '654321' };
+    const bypassSendWithSms = await call('/api/auth/onelink/existing/send-otp', {
+      body: { phoneNumber: existingPhone },
+      cookie: staged.pendingCookie,
+    });
+    expect(bypassSendWithSms.status).toBe(200);
+    expect(await bypassSendWithSms.json()).toEqual({ status: true });
+    expect(smsSendCount).toBe(0);
+    expect(
+      Number(
+        (await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM "mioSmsBudget"'))
+          .rows[0]!.count,
+      ),
+    ).toBe(0);
+
+    // 3. With real SMS configured + smsMode='live': sends real SMS, debits persistent budget and rejects fixed code!
+    authPolicy = { emailPasswordEnabled: true, smsMode: 'live', smsBypassCode: '654321' };
     const unregSend = await call('/api/auth/onelink/existing/send-otp', {
       body: { phoneNumber: unregisteredPhone },
       cookie: staged.pendingCookie,
@@ -1666,7 +1770,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     expect(findSetCookie(unverifiedComplete, 'mio.onelink_pending')).toBeUndefined();
     expect(await countUsersAndAccounts()).toEqual(beforeUnverified);
 
-    // Now reuse the SAME pending row for the verified existing phone while smsMode='bypass' is still active!
+    // Now reuse the SAME pending row for the verified existing phone in live mode!
     const realSend = await call('/api/auth/onelink/existing/send-otp', {
       body: { phoneNumber: existingPhone },
       cookie: staged.pendingCookie,
@@ -1675,7 +1779,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     const realCode = delivered.get(`+86${existingPhone}`)!;
     const bypassProbeCode = realCode === '654321' ? '000000' : '654321';
 
-    // Fixed bypass code is rejected and preserves pending cookie for retry!
+    // Fixed bypass code is rejected in live mode and preserves pending cookie for retry!
     const bypassAttempt = await call('/api/auth/onelink/complete', {
       body: {
         action: 'link_existing',

@@ -372,7 +372,36 @@ interface Probe {
   streams: ProbeStream[];
 }
 
-async function probe(path: string, signal: AbortSignal): Promise<Probe> {
+/** The transcode envelope compares rotated encoded dimensions with conservative rounding. */
+function transcodeDisplaySize(stream: ProbeStream | undefined) {
+  if (
+    !stream?.width ||
+    !stream.height ||
+    !Number.isSafeInteger(stream.width) ||
+    !Number.isSafeInteger(stream.height) ||
+    stream.width < 1 ||
+    stream.height < 1
+  )
+    return null;
+  const rotation =
+    stream.side_data_list?.find((item) => item.rotation !== undefined)?.rotation ??
+    Number(stream.tags?.rotate ?? 0);
+  if (!Number.isFinite(rotation)) return null;
+  const angle = ((rotation % 360) * Math.PI) / 180;
+  const cosine = Math.abs(Math.cos(angle));
+  const sine = Math.abs(Math.sin(angle));
+  return {
+    width: Math.ceil(stream.width * cosine + stream.height * sine - 1e-8),
+    height: Math.ceil(stream.width * sine + stream.height * cosine - 1e-8),
+  };
+}
+
+async function probe(
+  path: string,
+  signal: AbortSignal,
+  includeSampleAspectRatio = false,
+): Promise<Probe> {
+  const aspectField = includeSampleAspectRatio ? ',sample_aspect_ratio' : '';
   const result = await runProcess(
     'ffprobe',
     [
@@ -383,7 +412,7 @@ async function probe(path: string, signal: AbortSignal): Promise<Probe> {
       '-format_whitelist',
       'mov,matroska,webm,avi,mpegts',
       '-show_entries',
-      'format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,sample_aspect_ratio:stream_side_data=rotation:stream_tags=rotate',
+      `format=duration,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate${aspectField}:stream_side_data=rotation:stream_tags=rotate`,
       '-of',
       'json',
       path,
@@ -427,7 +456,7 @@ export async function probeVideoFile(
   signal: AbortSignal,
 ): Promise<VideoProbeMetadata> {
   try {
-    const media = await probe(path, signal);
+    const media = await probe(path, signal, true);
     const video = media.streams.find((stream) => stream.codec_type === 'video');
     const size = video ? videoDisplayGeometry(video) : null;
     if (
@@ -435,6 +464,10 @@ export async function probeVideoFile(
       video.codec_name.length > 128 ||
       !/^[A-Za-z0-9_,.+-]+$/.test(video.codec_name) ||
       !size ||
+      !Number.isSafeInteger(size.width) ||
+      !Number.isSafeInteger(size.height) ||
+      size.width < 1 ||
+      size.height < 1 ||
       size.width > 65536 ||
       size.height > 65536
     )
@@ -557,8 +590,8 @@ export async function transcode(
   }
   const video = output.streams.find((stream) => stream.codec_type === 'video');
   const inputVideo = input.streams.find((stream) => stream.codec_type === 'video');
-  const inputDisplay = displaySize(inputVideo);
-  const outputDisplay = displaySize(video);
+  const inputDisplay = transcodeDisplaySize(inputVideo);
+  const outputDisplay = transcodeDisplaySize(video);
   const audio = output.streams.find((stream) => stream.codec_type === 'audio');
   if (
     video?.codec_name !== 'h264' ||

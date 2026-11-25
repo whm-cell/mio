@@ -65,3 +65,5 @@ mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 
 `tests/foundation/m6-fork-checkpoints.test.ts` 核对持久序号、未 flush 的活事件、未闭合工具和 resume 后的中断记录。`tests/onelink/m6-fork.test.ts` 核对旧日志分叉、原生继承、冷启模型出站和私有项目槽、混合存储下的目标恢复，以及纯文本请求对图片占位的实际编码。
 
 调整版本、装配、scope、持久根、flush/关闭顺序或恢复策略时，重验受影响路径和打包。模拟模型、真实存储、正式 Profile、真实供应商、公共 API、生产及远端门禁分别报告；内核验证不等于公共对话服务已接受。
+
+视频对话工具沿当前轮次的服务端 userId 和持久会话授权，桥接 A 的视频任务能力查询、单次受理和状态读取；只有显式视频配置及 A/B 媒体检测均装配时开放。`mio.video-job` 仅投影经白名单校验的任务和已登记 Asset 元数据，持久恢复及媒体核验归[视频任务 HTTP](../apis/compute.md#post-apiv1computevideos)，不交给模型重发供应商请求。

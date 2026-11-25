@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { afterEach, expect, it, vi } from 'vitest';
-import { paths } from '../src/adapters/media.ts';
+import { paths, probePath } from '../src/adapters/media.ts';
 
 const directories: string[] = [];
 afterEach(() => {
@@ -118,6 +118,92 @@ it('continues to hash the full downloaded content for video recovery verificatio
     store.verify('video-key', expected.length, sha256, AbortSignal.timeout(5000)),
   ).resolves.toBe(false);
   expect(getObjectStream).toHaveBeenCalledTimes(2);
+});
+
+it('downloads a private probe source conditionally and verifies the streamed bytes and digest', async () => {
+  const bytes = Buffer.from('private-video-probe-source');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const jobId = randomUUID();
+  const outputIndex = 0;
+  const attemptId = randomUUID();
+  const messageId = randomUUID();
+  const command = {
+    version: 1 as const,
+    type: 'video.probe' as const,
+    messageId,
+    jobId,
+    outputIndex,
+    attemptId,
+    attempt: 1 as const,
+    source: {
+      stagingKey: `mio/staging/video/${jobId}/${outputIndex}/${attemptId}.media`,
+      sizeBytes: bytes.length,
+      etag: '"staging-etag"',
+      sha256,
+    },
+  };
+  const headObject = vi.fn(async () => ({
+    ETag: command.source.etag,
+    headers: {
+      'content-length': String(bytes.length),
+      'x-cos-meta-sha256': sha256,
+    },
+  }));
+  const getObjectStream = vi.fn(() => Readable.from(bytes));
+  const store = await createObjectStore(async () => ({}), headObject, getObjectStream);
+  const root = mkdtempSync(join(tmpdir(), 'mio-video-probe-cos-'));
+  directories.push(root);
+  const path = await store.downloadVideoProbe(command, root, AbortSignal.timeout(5000));
+  expect(path).toBe(probePath(root, messageId));
+  expect(readFileSync(path)).toEqual(bytes);
+  expect(headObject).toHaveBeenCalledWith(
+    expect.objectContaining({ Key: command.source.stagingKey }),
+  );
+  expect(getObjectStream).toHaveBeenCalledWith(
+    expect.objectContaining({ Key: command.source.stagingKey, IfMatch: command.source.etag }),
+  );
+});
+
+it('rejects an ETag or streamed digest mismatch before returning a probe file', async () => {
+  const expected = Buffer.from('expected-private-video');
+  const changed = Buffer.from('mutated--private-video');
+  const sha256 = createHash('sha256').update(expected).digest('hex');
+  const jobId = randomUUID();
+  const outputIndex = 0;
+  const attemptId = randomUUID();
+  const messageId = randomUUID();
+  const command = {
+    version: 1 as const,
+    type: 'video.probe' as const,
+    messageId,
+    jobId,
+    outputIndex,
+    attemptId,
+    attempt: 1 as const,
+    source: {
+      stagingKey: `mio/staging/video/${jobId}/${outputIndex}/${attemptId}.media`,
+      sizeBytes: expected.length,
+      etag: '"staging-etag"',
+      sha256,
+    },
+  };
+  const store = await createObjectStore(
+    async () => ({}),
+    async () => ({
+      ETag: command.source.etag,
+      headers: {
+        'content-length': String(expected.length),
+        'x-cos-meta-sha256': sha256,
+      },
+    }),
+    () => Readable.from(changed),
+  );
+  const root = mkdtempSync(join(tmpdir(), 'mio-video-probe-cos-'));
+  directories.push(root);
+  await expect(store.downloadVideoProbe(command, root, AbortSignal.timeout(5000))).rejects.toThrow(
+    'SOURCE_CHANGED',
+  );
+  expect(() => readFileSync(probePath(root, messageId))).toThrow();
 });
 
 it('sets private ACL and immutable checksums on both media outputs and the manifest PUT', async () => {

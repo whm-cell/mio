@@ -7,6 +7,7 @@ import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import type { ModelTransport } from '../../src/integrations/onelink/models.ts';
+import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { findFixtureRoute, makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
@@ -45,10 +46,10 @@ async function resolveRawIdFromRef(ref: string): Promise<string> {
   return ref;
 }
 
-async function fixture(transport: ModelTransport) {
+async function fixture(transport: ModelTransport, videoRuntime = false) {
   const config = { databaseURL: database.url, masterKey, masterKeyId: 'refresh-fixture' };
   const store = await createProviderStore(config);
-  const service = createProviderService(store, config, transport);
+  const service = createProviderService(store, config, transport, videoRuntime);
   services.push(service);
   const actor = { userId: randomUUID(), sessionId: 'fixture' };
   await service.save(actor, 0, 'synthetic-refresh-private-key');
@@ -462,6 +463,103 @@ it('requires an enabled async route for Vidu without inferring it from a discove
   });
 });
 
+it('projects declared video modes as unavailable until a runtime driver is implemented', async () => {
+  const f = await fixture(async () => metadata(['fixture-video-member']));
+  await f.service.discover(f.actor);
+  const item = (await f.service.catalog(f.actor)).items[0]!;
+  const missingRoute = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(missingRoute).toMatchObject({
+    modelRef: item.modelRef,
+    available: false,
+    unavailableReason: 'ROUTE_NOT_CONFIGURED',
+    modes: [],
+    cancellation: { supported: false },
+  });
+
+  await f.store.importRoutes([
+    {
+      rawModelId: 'fixture-video-member',
+      operation: 'video.generate',
+      vendor: 'kling',
+      driver: 'kling-videos',
+      classification: 'video',
+      submitPath: '/kling/v1/videos/text2video',
+      queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+      paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+      sourceKind: 'protocol-reference',
+      source: 'fixture video protocol',
+      sourceVersion: 'v1',
+      enabled: true,
+    },
+  ]);
+  const pending = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(pending).toMatchObject({
+    available: false,
+    unavailableReason: 'ADAPTER_PENDING',
+    modes: [
+      { mode: 'text_to_video', supported: false },
+      { mode: 'first_frame', supported: false },
+    ],
+    cancellation: { supported: false },
+  });
+  expect(pending.capabilitiesVersion).not.toBe(missingRoute.capabilitiesVersion);
+  expect(pending).not.toHaveProperty('apiKey');
+  expect(pending).not.toHaveProperty('credential');
+  await expect(f.service.snapshotVideo(f.actor, item.modelRef)).rejects.toThrow('ADAPTER_PENDING');
+
+  await f.store.importRoutes([
+    {
+      rawModelId: 'fixture-video-member',
+      operation: 'video.generate',
+      vendor: 'kling',
+      driver: 'kling-videos',
+      classification: 'video',
+      submitPath: '/kling/v1/videos/text2video',
+      queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+      paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+      sourceKind: 'protocol-reference',
+      source: 'fixture video protocol',
+      sourceVersion: 'v1',
+      enabled: false,
+    },
+  ]);
+  const disabled = await f.service.videoCapabilities(f.actor, item.modelRef);
+  expect(disabled).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_ROUTE_DISABLED',
+  });
+  expect(disabled.capabilitiesVersion).not.toBe(pending.capabilitiesVersion);
+
+  const provider = await f.service.get(f.actor);
+  await pool.query(
+    `INSERT INTO mio_provider_catalog_models (
+       provider_type, raw_model_id, category, user_visible, allow_undiscovered
+     ) VALUES ('onelink', 'fixture-video-hidden', 'video', false, false)`,
+  );
+  await pool.query(
+    `INSERT INTO mio_provider_models (
+       provider_id, raw_model_id, supplier_metadata, metadata_source,
+       credential_version, catalog_version, first_seen_at, last_seen_at, membership_state
+     ) VALUES ($1, 'fixture-video-hidden', '{}', 'onelink-v1-models', 1, 1, now(), now(), 'current')`,
+    [provider!.id],
+  );
+  const hidden = await f.service.videoCapabilities(f.actor, 'onelink:video:fixture-video-hidden');
+  const unknown = await f.service.videoCapabilities(
+    f.actor,
+    'onelink:video:fixture-video-does-not-exist',
+  );
+  expect(hidden).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_NOT_AVAILABLE',
+    modes: [],
+  });
+  expect(unknown).toMatchObject({
+    available: false,
+    unavailableReason: 'MODEL_NOT_AVAILABLE',
+    modes: [],
+  });
+});
+
 it('requires an explicit Volcengine route and freezes the image driver without guessing the model name', async () => {
   const f = await fixture(async () => metadata(['doubao-seedream-4.0-freeze']));
   await f.service.discover(f.actor);
@@ -781,4 +879,50 @@ it('does not manufacture members or verification through route data and isolates
   });
   expect(await one.service.discover(one.actor)).toMatchObject({ status: 'connected' });
   await expect(one.service.selectChat(one.actor)).rejects.toThrow('PROVIDER_DISABLED');
+});
+
+it('records only successful current video route tuples and ignores late observations after a version change', async () => {
+  const f = await fixture(async () => metadata(['vega-1.5-pro']), true);
+  await f.service.discover(f.actor);
+  const modelRef = (await f.service.catalog(f.actor)).items[0]!.modelRef;
+  const route = legacyVideoRouteEntries(['vega-1.5-pro'])[0]!;
+  await f.store.importRoutes([route]);
+
+  const original = await f.service.snapshotVideo(f.actor, modelRef);
+  const verificationSnapshot = (snapshot: typeof original) => ({
+    providerConfigId: snapshot.providerConfigId,
+    credentialVersion: snapshot.credentialVersion,
+    catalogVersion: snapshot.catalogVersion,
+    adaptationVersion: snapshot.adaptationVersion,
+    modelKey: snapshot.modelKey,
+    operation: 'video.generate' as const,
+    profile: snapshot.profile,
+  });
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(original),
+    'video:materialized-output-v1',
+  );
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'verified', evidence: 'video:materialized-output-v1' },
+  );
+
+  await f.store.importRoutes([{ ...route, sourceVersion: 'protocol-v2' }]);
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'unverified', evidence: 'video:materialized-output-v1' },
+  );
+  const current = await f.service.snapshotVideo(f.actor, modelRef);
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(current),
+    'video:materialized-output-v2',
+  );
+  await f.store.recordVerification(
+    f.actor.userId,
+    verificationSnapshot(original),
+    'video:late-old-output',
+  );
+  expect((await f.service.catalog(f.actor)).items[0]!.video.adaptation!.verification).toMatchObject(
+    { status: 'verified', evidence: 'video:materialized-output-v2' },
+  );
 });

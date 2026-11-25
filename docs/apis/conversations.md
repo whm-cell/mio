@@ -76,7 +76,7 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 输入：`afterSeq`（默认 -1，可原样复用空页/末页 cursor）、`limit`（默认 20、1–100）。
 
-成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job',job}`（`job` 为脱敏图片任务视图 `{jobId,status,requestedCount,errorCode,assetIds,outputs}`）、`{seq,role:'tool',tool:'submit_audio_job'|'get_audio_job'|'clone_audio_voice',job}`（`job` 为公开音频任务视图）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job` 和 `mio.audio-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
+成功：200 `{items,nextAfterSeq,hasMore}`；items 为 `{seq,role:'user'|'assistant',text,interrupted?}`、`{seq,role:'tool',tool:'submit_image_job'|'get_image_job'|'submit_video_job'|'get_video_job',job}`（`job` 为脱敏图片或视频任务视图）、`{seq,role:'tool',tool:'submit_audio_job'|'get_audio_job'|'clone_audio_voice',job}`（`job` 为公开音频任务视图）或 `{seq,role:'status',status}`。带图的 user 项另有有序 `imageAssetIds`，无图时省略。状态白名单为 completed/cancelled/failed/interrupted/unknown。只展示已记录的文本、图片资产 ID、通过严格结构校验的 `mio.image-job`、`mio.video-job` 和 `mio.audio-job` 工具结果卡片与终态（包括无文本取消及旧中断）；`tool/call` 原始参数、`list_image_models` 结果、工具失败/拒绝详情与瞬态 chunk 均不展示。live 读取先 flush，cold interrupted 可为只读合成，cursor 只随实际返回项推进。
 
 原生日志证明轮次达到输出上限时，轮次末尾的 status 项为 completed，带 `truncation: {reason:'max-tokens', message:'已达输出上限'}`。同轮助手项按原顺序返回已保存正文。跨页时使用返回的 cursor 继续读到轮次末尾。
 
@@ -103,6 +103,8 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 副作用：PG 保存请求身份和输入摘要，DSH 保存内容并执行一个受控轮次；不同对话独立，同对话一个活动请求。根级与非授权会话工具仍全部拒绝；通用和剧本会话的 BYOK 与图片计算桥接均就绪时，该活动轮次可在单轮预算（最多 12 次工具调用、4 次图片提交、8 步模型调用）内通过 `list_image_models`、`submit_image_job`、`get_image_job` 访问当前用户本人的目录摘要与图片任务，轮次结束立即撤销授权。
 
 视觉路由与资产桥可用时，活动轮次还可只读调用 `inspect_image_asset({assetId})` 检查本人 ready 图片，不依赖生图工具。图片请求按路由限制出现次数和 Base64 总字节数；服务可在内存生成有界预览，并为满足预算卸载本轮之前的旧图片。旧图占位提示可用同一资产 ID 重新检查；本轮图片不能静默卸载。原图、签名 URL 和对象键不写入 DSH 日志。
+
+视频执行配置就绪的会话还可在当前受控轮次内使用 `list_video_models`、`submit_video_job`、`get_video_job`、`recover_video_job`。用户要求找回保存失败的历史视频时，恢复工具仅对本人带结果检查点的任务重新执行物化，不重新提交生成；返回后结束本轮，后续轮次查询同一 jobId。已完成或正在恢复的任务返回当前状态；没有可恢复检查点时拒绝恢复。只读模型目录不代表完成生成；提交返回持久视频任务后应结束本轮。提交、查询和恢复卡片按严格 `mio.video-job` 白名单投影到 SSE 与持久历史；任务、资产和凭据归当前用户，模型不能指定 owner。模型列表或请求失败详情不写成公开卡片。视频执行边界见[计算 HTTP](compute.md#post-apiv1computevideos)。
 
 ## POST /api/v1/conversations/:id/compact
 
@@ -179,9 +181,9 @@ BYOK 选模和 fresh 输入另可返回 404 PROVIDER_NOT_CONFIGURED；409 PROVID
 
 输入：无正文；先用历史/原请求回执恢复，当前流没有可跨进程重放的 Last-Event-ID 协议。单 A HTTP 实例中 pending＋open 全局至多 256 条，其中首次鉴权尚未完成至多 64 条；已验证的每用户跨会话、跨对话合计至多 8 条。全局和未鉴权名额在首次异步鉴权前预留，用户名额在验证身份后、归属与快照读取前核对。超过相应边界返回 429 `SSE_LIMITED`；断开、失败与关闭释放名额，可再次建立订阅。
 
-成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?,audioSelection?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、reasoning `{requestId,text}`、tool-status `{requestId,tool,status}`、tool `{requestId,tool:'submit_image_job'|'get_image_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`。每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
+成功：200 text/event-stream。先发 snapshot `{conversationId,activeRequestId,receipt,contextUsage?,audioSelection?}`（receipt 为最近回执或 null），再发 text `{requestId,text}`、reasoning `{requestId,text}`、tool-status `{requestId,tool,status}`、tool `{requestId,tool:'submit_image_job'|'get_image_job'|'submit_video_job'|'get_video_job',job}`（仅限非错误且通过严格结构校验的 `mio.image-job` 或 `mio.video-job` 卡片）、state `{receipt,contextUsage?}` 或 error `{code}`。每个 data 对象也含 type。完成归属检查并安装 listener 后，在同一次数据库查询中读取活动请求和最近回执。交接期间事件有界缓冲，服务会省略快照已覆盖的同一请求状态。事件按 requestId 关联，重连可查持久历史和回执，瞬态事件仅在流上可见。
 
-reasoning 来自声明支持推理的路由本轮产生的真实思考增量。tool-status 只含请求 ID、已授权工具名称及 `running`、`completed` 或 `failed`。工具名称以本轮实际授权为准。通用和剧本会话使用已获授权的图片工具。音频工具见下文。此状态对应工具本次执行，图片任务的进度和产物仍查卡片或任务回执。思考增量与工具状态仅在连接期间可见，公开 GET history 继续投影正式消息、有效图片任务卡片和轮次状态。
+reasoning 来自声明支持推理的路由本轮产生的真实思考增量。tool-status 只含请求 ID、已授权工具名称及 `running`、`completed` 或 `failed`。工具名称以本轮实际授权为准。通用和剧本会话使用已获授权的图片工具；视频执行配置就绪时该集合另含视频工具。音频工具见下文。此状态对应工具本次执行，图片和视频任务的进度与产物仍查卡片或任务回执。思考增量与工具状态仅在连接期间可见，公开 GET history 继续投影正式消息、有效图片与视频任务卡片和轮次状态。
 
 音频会话的快照携带 `audioSelection`。`audio-selection` 事件携带 `{conversationId,selection}`，用于同步最新版本。`tool-status` 可携带 `list_audio_models`、`list_audio_voices`、`select_audio_voice`、`submit_audio_job`、`clone_audio_voice`、`get_audio_job`。通过持久化检查且合法的后三项结果可发布 `tool` 帧，形状为 `{requestId,tool,job}`。断线后查询同一消息回执和持久历史，作品状态由音频 `jobId` 独立查询。
 

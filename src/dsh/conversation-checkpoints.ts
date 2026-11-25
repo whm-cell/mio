@@ -9,6 +9,7 @@ import type { ConversationEvent } from '../conversations/contracts.ts';
 import { ConversationCompaction } from './conversation-compaction.ts';
 import { parseImageJobPresentationMeta } from './image-tools.ts';
 import { parseAudioJobPresentationMeta } from './audio-tools.ts';
+import { parseVideoJobPresentationMeta } from './video-tools.ts';
 import type {} from './kernel.ts';
 
 export const CHECKPOINT_INTERRUPTED = 'MIO_CHECKPOINT_INTERRUPTED';
@@ -78,7 +79,8 @@ export function trackConversationToolCheckpoints(
     const card =
       parseImageJobPresentationMeta(event.data.meta) ??
       parseAudioJobPresentationMeta(event.data.meta);
-    if (!card) return;
+    const video = parseVideoJobPresentationMeta(event.data.meta);
+    if (!card && !video) return;
     // Session event observers are synchronous. Start the write after native
     // routing has enqueued the result, then wait at the next step.
     cards = cards.then(async () => {
@@ -88,7 +90,8 @@ export function trackConversationToolCheckpoints(
         return;
       }
       try {
-        emit({ type: 'tool', requestId, ...card });
+        if (card) emit({ type: 'tool', requestId, ...card });
+        else if (video) emit({ type: 'tool', requestId, tool: video.tool, job: video.job });
       } catch {
         // Delivery is independent of the committed result.
       }

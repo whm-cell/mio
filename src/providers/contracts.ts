@@ -5,6 +5,7 @@ import type {
   ImageOperation,
   ImageRouteConfig,
 } from '../generations/contracts.ts';
+import type { VideoDriver, VideoMode } from '../generations/video-contracts.ts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {
@@ -16,12 +17,30 @@ export type Category = (typeof categories)[number];
 export const providerOperations = [
   'chat',
   'image.generate',
+  'video.generate',
   'audio.voices.list',
   'audio.tts',
   'audio.clone',
 ] as const;
 export type ProviderOperation = (typeof providerOperations)[number];
 export type AudioDriver = 'minimax-voices' | 'minimax-tts' | 'minimax-clone';
+export type ChatCacheRetention = 'none' | 'short' | 'long';
+export type ChatReasoningEffort = 'low' | 'medium' | 'high';
+export type ChatReasoningCapability =
+  | { readonly supported: false }
+  | { readonly supported: true; readonly efforts?: readonly ChatReasoningEffort[] };
+export const DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS = 30_000;
+
+export function isChatReasoningEffort(value: unknown): value is ChatReasoningEffort {
+  return value === 'low' || value === 'medium' || value === 'high';
+}
+
+export function supportsChatReasoning(
+  capability: ChatReasoningCapability | undefined,
+  effort: ChatReasoningEffort,
+): boolean {
+  return capability?.supported === true && capability.efforts?.includes(effort) === true;
+}
 
 export function isProviderOperation(value: unknown): value is ProviderOperation {
   return providerOperations.some((operation) => operation === value);
@@ -73,24 +92,6 @@ export interface ModelPreference {
 
 export const CHAT_PROFILES = ['openai-chat', 'anthropic-messages'] as const;
 export type ChatProfile = (typeof CHAT_PROFILES)[number];
-export type ChatCacheRetention = 'none' | 'short' | 'long';
-export type ChatReasoningEffort = 'low' | 'medium' | 'high';
-export type ChatReasoningCapability =
-  | { readonly supported: false }
-  | { readonly supported: true; readonly efforts?: readonly ChatReasoningEffort[] };
-export const DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS = 30_000;
-
-export function isChatReasoningEffort(value: unknown): value is ChatReasoningEffort {
-  return value === 'low' || value === 'medium' || value === 'high';
-}
-
-export function supportsChatReasoning(
-  capability: ChatReasoningCapability | undefined,
-  effort: ChatReasoningEffort,
-): boolean {
-  return capability?.supported === true && capability.efforts?.includes(effort) === true;
-}
-
 /** Evidence for an implemented protocol route; catalog membership is deliberately absent. */
 export type AdaptationSourceKind = 'protocol-reference' | 'runtime-observation';
 export interface ImageCapabilityMetadata {
@@ -103,6 +104,10 @@ export interface ImageCapabilityMetadata {
     maxQueries: number;
     maxAgeSeconds: number;
   };
+}
+export interface VideoCapabilityMetadata {
+  readonly modes: readonly VideoMode[];
+  readonly cancellation: { readonly supported: false };
 }
 export interface ImageParameterView {
   readonly supportedOperations: ImageOperation[];
@@ -138,6 +143,7 @@ export interface AdaptationCapabilityMetadata {
   requestImagePixelBudget?: number;
   requestImageMaxBytes?: number;
   image?: ImageCapabilityMetadata;
+  video?: VideoCapabilityMetadata;
 }
 
 export interface ChatImageBudget {
@@ -251,7 +257,7 @@ export interface ModelRouteInput {
   rawModelId: string;
   operation: ProviderOperation;
   vendor: string;
-  driver: ChatProfile | ImageDriver | AudioDriver;
+  driver: ChatProfile | ImageDriver | VideoDriver | AudioDriver;
   classification: Category;
   submitPath: string;
   editPath?: string | null;
@@ -330,4 +336,53 @@ export interface ImageAdmissionSnapshot extends AccountCredentialSnapshot {
   readonly providerRevision: number;
   readonly catalogVersion: number;
   readonly adaptationVersion: number;
+}
+
+/** Durable video admission keeps encrypted provider bytes; only an outbound action opens them. */
+export interface VideoRouteConfig {
+  readonly driver: VideoDriver;
+  readonly vendor: string;
+  readonly submitPath: string;
+  readonly queryPathTemplate: string;
+  readonly paramSpec: {
+    readonly supportedModes: readonly VideoMode[];
+    readonly parameters?: VideoParameterSpec;
+  };
+  readonly requestDefaults: Readonly<Record<string, never>>;
+  readonly outputSpec: Readonly<Record<string, never>>;
+}
+
+/** Exact model declaration. Missing constraints keep legacy V1 routes unavailable. */
+export interface VideoParameterSpec {
+  readonly ratios: readonly string[];
+  readonly resolutions: readonly string[];
+  readonly durations: readonly number[];
+  readonly maxPromptCodepoints: number;
+  readonly maxImages: number;
+  readonly maxVideos: number;
+  readonly maxAudios: number;
+  readonly maxInputs: number;
+  readonly maxSubjects: number;
+  readonly maxSubjectImages: number;
+  readonly generateAudio: boolean;
+  readonly watermark: boolean;
+  readonly offPeak: boolean;
+  readonly audioSettings: readonly string[];
+  readonly requiresResolution: boolean;
+  readonly referenceAudioRequiresVisual: boolean;
+  readonly referenceDurations: readonly number[];
+}
+
+export interface VideoAdmissionSnapshot extends AccountCredentialSnapshot {
+  readonly modelRef: string;
+  readonly modelId: string;
+  readonly modelKey: string;
+  readonly vendor: string;
+  readonly profile: VideoDriver;
+  readonly route: VideoRouteConfig;
+  readonly defaultVideoWatermark: boolean;
+  readonly providerRevision: number;
+  readonly catalogVersion: number;
+  readonly adaptationVersion: number;
+  readonly capabilitiesVersion: string;
 }

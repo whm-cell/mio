@@ -1,9 +1,20 @@
 import COS from 'cos-nodejs-sdk-v5';
-import type { ComputeCommandV1, MediaInputSnapshot } from '@mio/compute-contracts';
+import type {
+  ComputeCommandV1,
+  MediaInputSnapshot,
+  VideoProbeCommandV1,
+} from '@mio/compute-contracts';
 import { PassThrough } from 'node:stream';
 import type { Readable } from 'node:stream';
 import type { ObjectInfo } from '../types.ts';
-import { digestStream, drainInput, fileDigest, paths, readOutput } from './media.ts';
+import {
+  digestStream,
+  drainInput,
+  drainProbeInput,
+  fileDigest,
+  paths,
+  readOutput,
+} from './media.ts';
 import type { MediaFiles } from './media-files.ts';
 import type { MediaDigest } from './media-journal.ts';
 
@@ -93,6 +104,37 @@ export class ObjectStore {
       IfMatch: command.input.etag,
     }) as Readable;
     await drainInput(stream, directory, command.attemptId, command.input.sizeBytes, signal);
+  }
+
+  async downloadVideoProbe(
+    command: VideoProbeCommandV1,
+    directory: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    if (signal.aborted) throw new Error('EXECUTION_TIMEOUT');
+    const source = command.source;
+    const actual = await this.head(source.stagingKey, signal);
+    if (!actual) throw new Error('SOURCE_INVALID');
+    if (
+      actual.sizeBytes !== source.sizeBytes ||
+      actual.etag !== source.etag ||
+      (actual.sha256 !== null && actual.sha256 !== source.sha256)
+    )
+      throw new Error('SOURCE_CHANGED');
+    const stream = this.#client.getObjectStream({
+      Bucket: this.#bucket,
+      Region: this.#region,
+      Key: source.stagingKey,
+      IfMatch: source.etag,
+    }) as Readable;
+    return drainProbeInput(
+      stream,
+      directory,
+      command.messageId,
+      source.sizeBytes,
+      source.sha256,
+      signal,
+    );
   }
 
   async #readMedia<T>(

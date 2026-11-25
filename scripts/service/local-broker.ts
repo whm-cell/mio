@@ -46,9 +46,18 @@ export async function prepareLocalBroker(name: 'dev' | 'test', values: NodeJS.Pr
     const current = await api('GET', path);
     if (current === null || (binding && Array.isArray(current) && current.length === 0))
       return true;
-    const actual = (
-      binding && Array.isArray(current) && current.length === 1 ? current[0] : current
-    ) as Json;
+    if (binding && Array.isArray(current)) {
+      const exists = current.some(
+        (value) =>
+          value &&
+          typeof value === 'object' &&
+          Object.entries(expected).every(([key, item]) =>
+            isDeepStrictEqual((value as Json)[key], item),
+          ),
+      );
+      return !exists;
+    }
+    const actual = current as Json;
     if (!Object.entries(expected).every(([key, value]) => isDeepStrictEqual(actual[key], value)))
       throw new Error(
         `LOCAL_BROKER_CONFLICT: ${path}; preserve data and inspect configuration drift`,

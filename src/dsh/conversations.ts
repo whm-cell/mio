@@ -29,12 +29,14 @@ import type {
   ConversationAudioTools,
   ConversationImageTools,
   ConversationRunResult,
+  ConversationVideoTools,
   ConversationVision,
   HistoryItem,
   ModelFailure,
 } from '../conversations/contracts.ts';
 import { buildConversationSystemPrompt } from '../conversations/prompt.ts';
 import { parseImageJobPresentationMeta, registerConversationImageTools } from './image-tools.ts';
+import { parseVideoJobPresentationMeta, registerConversationVideoTools } from './video-tools.ts';
 import { parseAudioJobPresentationMeta, registerConversationAudioTools } from './audio-tools.ts';
 import {
   CHECKPOINT_INTERRUPTED,
@@ -126,6 +128,7 @@ export function createDshConversationEngine(
   imageTools?: ConversationImageTools,
   vision?: ConversationVision,
   audioTools?: ConversationAudioTools,
+  videoTools?: ConversationVideoTools,
 ): ConversationEngine {
   const active = new Map<string, ActiveRequest>();
   const sessionActions = new Map<string, Promise<unknown>>();
@@ -381,6 +384,14 @@ export function createDshConversationEngine(
             parseImageJobPresentationMeta(event.data.meta) ??
             parseAudioJobPresentationMeta(event.data.meta);
           if (projected) items.push({ seq: event.seq, role: 'tool', ...projected });
+          const videoProjected = parseVideoJobPresentationMeta(event.data.meta);
+          if (videoProjected)
+            items.push({
+              seq: event.seq,
+              role: 'tool',
+              tool: videoProjected.tool,
+              job: videoProjected.job,
+            });
         }
         if (event.type === 'turn/end') {
           const reason = event.data.reason;
@@ -484,13 +495,19 @@ export function createDshConversationEngine(
             Boolean(vision && observedBinding?.snapshot.inputModalities?.includes('image'));
           const hasGenerationTools =
             !audioPurpose && Boolean(observedBinding && onelink && imageTools);
+          const hasVideoGenerationTools =
+            !audioPurpose && Boolean(observedBinding && onelink && videoTools);
           const hasInspectionTool = Boolean(observedBinding && onelink && inspection);
           agentCtx.systemPrompt.section({
             name: PERSONA_PREFIX_SECTION,
             order: 0,
             interpolate: false,
             text: buildConversationSystemPrompt(
-              { imageGeneration: hasGenerationTools, imageInspection: hasInspectionTool },
+              {
+                imageGeneration: hasGenerationTools,
+                imageInspection: hasInspectionTool,
+                videoGeneration: hasVideoGenerationTools,
+              },
               turnContext?.purpose,
             ),
           });
@@ -515,14 +532,23 @@ export function createDshConversationEngine(
               emit,
             );
             registerConversationAudioTools(agentCtx, audioTurn, audioTools);
-          } else if (!audioPurpose && observedBinding && onelink && (imageTools || inspection)) {
+          } else if (
+            !audioPurpose &&
+            observedBinding &&
+            onelink &&
+            (imageTools || videoTools || inspection)
+          ) {
             revokeTools = authorizeConversationImageTools(
               agentCtx,
               agent,
-              { generation: hasGenerationTools, inspection: hasInspectionTool },
+              {
+                generation: hasGenerationTools,
+                inspection: hasInspectionTool,
+                videoGeneration: hasVideoGenerationTools,
+              },
               (tool, status) => emit({ type: 'tool-status', requestId, tool, status }),
             );
-            if (imageTools) {
+            if (imageTools || videoTools) {
               waitForToolCheckpoints = trackConversationToolCheckpoints(
                 agentCtx,
                 agent,
@@ -530,7 +556,8 @@ export function createDshConversationEngine(
                 requestId,
                 emit,
               );
-              registerConversationImageTools(agentCtx, observedBinding, imageTools);
+              if (imageTools) registerConversationImageTools(agentCtx, observedBinding, imageTools);
+              if (videoTools) registerConversationVideoTools(agentCtx, observedBinding, videoTools);
             }
             if (inspection) registerVisionTool(agentCtx, observedBinding, vision!);
           }

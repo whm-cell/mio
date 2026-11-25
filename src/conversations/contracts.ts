@@ -1,4 +1,10 @@
 import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
+import type {
+  VideoCapabilitiesView,
+  VideoCreateRequest,
+  VideoJobView,
+  VideoMode,
+} from '../generations/video-contracts.ts';
 import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HttpError } from '@mio/foundation/errors';
 import type {
@@ -184,6 +190,9 @@ export type ConversationToolName =
   | ConversationImageToolName
   | 'list_image_models'
   | 'inspect_image_asset'
+  | ConversationVideoToolName
+  | 'list_video_models'
+  | 'recover_video_job'
   | ConversationAudioToolName
   | 'list_audio_models'
   | 'list_audio_voices'
@@ -232,6 +241,42 @@ export interface ConversationImageTools {
   ): Promise<ConversationImageJobView>;
   getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
 }
+export type ConversationVideoToolName = 'submit_video_job' | 'get_video_job';
+export interface ConversationVideoModelSummary {
+  readonly modelRef: string;
+  readonly modelId: string;
+  readonly name: string;
+  readonly vendor: string;
+  readonly available: boolean;
+  readonly unavailableReason: string | null;
+  readonly supportedModes: { mode: VideoMode; supported: boolean }[];
+}
+export interface ConversationVideoJobOutput {
+  readonly index: number;
+  readonly assetId: string | null;
+  readonly status: string;
+  readonly errorCode: string | null;
+  readonly width: number | null;
+  readonly height: number | null;
+  readonly durationSeconds: number | null;
+  readonly hasAudio: boolean | null;
+}
+export interface ConversationVideoJobView {
+  readonly jobId: string;
+  readonly status: VideoJobView['state'];
+  readonly mode: VideoMode;
+  readonly modelRef: string;
+  readonly createdAt: string;
+  readonly errorCode: string | null;
+  readonly outputs: ConversationVideoJobOutput[];
+}
+export interface ConversationVideoTools {
+  listModels(actor: { userId: string }): Promise<ConversationVideoModelSummary[]>;
+  capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
+  createVideo(actor: { userId: string }, request: VideoCreateRequest): Promise<VideoJobView>;
+  getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
+  recoverVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
+}
 export interface ConversationAudioTools {
   listModels(actor: { userId: string }, operation: AudioOperation): Promise<unknown[]>;
   listVoices(actor: { userId: string }, query: URLSearchParams): Promise<unknown>;
@@ -261,6 +306,7 @@ export type HistoryItem =
       imageAssetIds?: string[];
     }
   | { seq: number; role: 'tool'; tool: ConversationImageToolName; job: ConversationImageJobView }
+  | { seq: number; role: 'tool'; tool: ConversationVideoToolName; job: ConversationVideoJobView }
   | { seq: number; role: 'tool'; tool: ConversationAudioToolName; job: AudioJobView }
   | {
       seq: number;
@@ -287,6 +333,12 @@ export type ConversationEvent =
       requestId: string;
       tool: ConversationImageToolName;
       job: ConversationImageJobView;
+    }
+  | {
+      type: 'tool';
+      requestId: string;
+      tool: ConversationVideoToolName;
+      job: ConversationVideoJobView;
     }
   | { type: 'tool'; requestId: string; tool: ConversationAudioToolName; job: AudioJobView }
   | { type: 'audio-selection'; conversationId: string; selection: AudioSelection }

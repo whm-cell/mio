@@ -3,6 +3,7 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs, utcISOString } from '@mio/foundation/time';
 import { randomBytes } from 'node:crypto';
 import { IMAGE_DRIVERS } from '../generations/contracts.ts';
+import { VIDEO_DRIVERS } from '../generations/video-contracts.ts';
 import { DiscoveryError, discoverModels } from '../integrations/onelink/models.ts';
 import type { DiscoveredModel, ModelTransport } from '../integrations/onelink/models.ts';
 import { registerOneLinkSsoClient } from '../integrations/onelink/sso.ts';
@@ -954,10 +955,12 @@ export function createAdminService(
       const statsMap = new Map(raw.userStatsRows.map((row) => [row.raw_model_id, row]));
       const chatRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       const imageRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
+      const videoRoutes = new Map<string, PlatformRouteRecord & { updated_at: Date }>();
       const audioRoutes = new Map<string, AdminAudioRouteView[]>();
       for (const route of raw.routeRows) {
         if (route.operation === 'chat') chatRoutes.set(route.raw_model_id, route);
         else if (route.operation === 'image.generate') imageRoutes.set(route.raw_model_id, route);
+        else if (route.operation === 'video.generate') videoRoutes.set(route.raw_model_id, route);
         else {
           const stats = statsMap.get(route.raw_model_id);
           const verifiedUserCount = {
@@ -988,9 +991,11 @@ export function createAdminService(
           const stats = statsMap.get(rawModelId);
           const chat = chatRoutes.get(rawModelId);
           const image = imageRoutes.get(rawModelId);
+          const video = videoRoutes.get(rawModelId);
           const voice = audioRoutes.get(rawModelId) ?? [];
           const category: Category | null =
             cat.category ??
+            video?.classification ??
             image?.classification ??
             chat?.classification ??
             (voice.length ? 'voice' : null);
@@ -1001,7 +1006,7 @@ export function createAdminService(
           return {
             rawModelId,
             displayLabel: cat.display_label,
-            vendorLabel: cat.vendor_label ?? image?.vendor ?? chat?.vendor ?? null,
+            vendorLabel: cat.vendor_label ?? video?.vendor ?? image?.vendor ?? chat?.vendor ?? null,
             category,
             description: cat.description,
             originSource: cat.origin_source,
@@ -1012,6 +1017,7 @@ export function createAdminService(
             userDiscoveredCount: stats?.discovered_users ?? 0,
             userVerifiedChatCount: stats?.verified_chat_users ?? 0,
             userVerifiedImageCount: stats?.verified_image_users ?? 0,
+            userVerifiedVideoCount: stats?.verified_video_users ?? 0,
             audioRoutes: voice.sort((a, b) => a.operation.localeCompare(b.operation)),
             policy: {
               userVisible: cat.user_visible,
@@ -1023,6 +1029,7 @@ export function createAdminService(
             },
             chatRoute: chat ? serializeRouteInputSnapshot(chat) : null,
             imageRoute: image ? serializeRouteInputSnapshot(image) : null,
+            videoRoute: video ? serializeRouteInputSnapshot(video) : null,
             chatRouteMeta: chat
               ? {
                   enabled: chat.enabled,
@@ -1041,13 +1048,22 @@ export function createAdminService(
                   updatedAt: image.updated_at.toISOString(),
                 }
               : null,
+            videoRouteMeta: video
+              ? {
+                  enabled: video.enabled,
+                  declarationVersion: video.declaration_version,
+                  driver: video.driver,
+                  vendor: video.vendor,
+                  updatedAt: video.updated_at.toISOString(),
+                }
+              : null,
             createdAt: cat.created_at.toISOString(),
             updatedAt: cat.updated_at.toISOString(),
           };
         });
 
       const routes = (item: AdminModelCatalogItem) =>
-        [...item.audioRoutes, item.chatRouteMeta, item.imageRouteMeta].filter(
+        [...item.audioRoutes, item.chatRouteMeta, item.imageRouteMeta, item.videoRouteMeta].filter(
           (route) => route !== null,
         );
       const routeStates = new Map(
@@ -1214,6 +1230,7 @@ export function createAdminService(
         drivers: {
           chat: [...CHAT_PROFILES],
           image: [...IMAGE_DRIVERS],
+          video: [...VIDEO_DRIVERS],
           audio: [VOICE_DRIVER, AUDIO_ROUTES.tts.driver, AUDIO_ROUTES.clone.driver],
         },
         categories: [...categories],

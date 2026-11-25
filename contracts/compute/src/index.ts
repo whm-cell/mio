@@ -9,6 +9,8 @@ export const COMMAND_ROUTING_KEY = 'transcode.v1';
 export const RESULT_EXCHANGE = 'mio.compute.results.v1';
 export const RESULT_QUEUE = 'mio.compute.results.v1';
 export const RESULT_ROUTING_KEY = 'transcode.result.v1';
+export const VIDEO_PROBE_COMMAND_ROUTING_KEY = 'video.probe.v1';
+export const VIDEO_PROBE_RESULT_ROUTING_KEY = 'video.probe.result.v1';
 
 export type ComputeAttempt = 1 | 2 | 3;
 export type ComputeProfileV1 = typeof COMPUTE_PROFILE;
@@ -59,6 +61,62 @@ export type ComputeResultV1 = ResultEnvelopeV1 &
     | { state: 'unknown'; errorCode: ComputeUnknownCodeV1 }
   );
 
+export interface VideoProbeSourceV1 {
+  stagingKey: string;
+  sizeBytes: number;
+  etag: string;
+  sha256: string;
+}
+
+/** Read-only media inspection over private COS staging; it never runs a transcode. */
+export interface VideoProbeCommandV1 {
+  version: 1;
+  type: 'video.probe';
+  messageId: string;
+  jobId: string;
+  outputIndex: number;
+  attemptId: string;
+  attempt: ComputeAttempt;
+  source: VideoProbeSourceV1;
+}
+
+export interface VideoProbeMetadataV1 {
+  container: string;
+  videoCodec: string;
+  width: number;
+  height: number;
+  durationSeconds: number;
+  hasAudio: boolean;
+  audioCodec: string | null;
+}
+
+export type VideoProbeFailureCodeV1 =
+  | 'SOURCE_INVALID'
+  | 'SOURCE_TOO_LARGE'
+  | 'SOURCE_CHANGED'
+  | 'PROBE_FAILED'
+  | 'EXECUTION_TIMEOUT'
+  | 'STORAGE_FAILURE'
+  | 'WORKER_INTERRUPTED';
+
+interface VideoProbeResultEnvelopeV1 {
+  version: 1;
+  type: 'video.probe.result';
+  messageId: string;
+  commandId: string;
+  jobId: string;
+  outputIndex: number;
+  attemptId: string;
+  attempt: ComputeAttempt;
+  source: VideoProbeSourceV1;
+}
+
+export type VideoProbeResultV1 = VideoProbeResultEnvelopeV1 &
+  (
+    | { state: 'succeeded'; media: VideoProbeMetadataV1 }
+    | { state: 'failed'; errorCode: VideoProbeFailureCodeV1 }
+  );
+
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const digest = /^[a-f0-9]{64}$/;
 const failures = new Set<ComputeFailureCodeV1>([
@@ -76,6 +134,15 @@ const unknowns = new Set<ComputeUnknownCodeV1>([
   'PROCESS_UNKNOWN',
   'UPLOAD_UNKNOWN',
   'OUTPUT_MISMATCH',
+]);
+const videoProbeFailures = new Set<VideoProbeFailureCodeV1>([
+  'SOURCE_INVALID',
+  'SOURCE_TOO_LARGE',
+  'SOURCE_CHANGED',
+  'PROBE_FAILED',
+  'EXECUTION_TIMEOUT',
+  'STORAGE_FAILURE',
+  'WORKER_INTERRUPTED',
 ]);
 
 function invalid(): never {
@@ -215,6 +282,194 @@ export function parseComputeResultV1(value: unknown): ComputeResultV1 {
     return { ...envelope, state: 'failed', errorCode: message.errorCode as ComputeFailureCodeV1 };
   if (message.state === 'unknown' && unknowns.has(message.errorCode as ComputeUnknownCodeV1))
     return { ...envelope, state: 'unknown', errorCode: message.errorCode as ComputeUnknownCodeV1 };
+  return invalid();
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === 'string' && digest.test(value);
+}
+
+function parseVideoProbeSource(
+  value: unknown,
+  jobId: string,
+  outputIndex: number,
+  attemptId: string,
+): VideoProbeSourceV1 {
+  const source = object(value);
+  fields(source, ['stagingKey', 'sizeBytes', 'etag', 'sha256']);
+  if (
+    typeof source.stagingKey !== 'string' ||
+    source.stagingKey !== `mio/staging/video/${jobId}/${outputIndex}/${attemptId}.media` ||
+    !isSize(source.sizeBytes) ||
+    source.sizeBytes > COMPUTE_MAX_MEDIA_BYTES ||
+    !isEtag(source.etag) ||
+    !isDigest(source.sha256)
+  )
+    return invalid();
+  return {
+    stagingKey: source.stagingKey,
+    sizeBytes: source.sizeBytes,
+    etag: source.etag,
+    sha256: source.sha256,
+  };
+}
+
+function validVideoProbeIdentity(value: Record<string, unknown>): boolean {
+  return (
+    value.version === 1 &&
+    isUuid(value.messageId) &&
+    isUuid(value.jobId) &&
+    typeof value.outputIndex === 'number' &&
+    Number.isSafeInteger(value.outputIndex) &&
+    (value.outputIndex as number) >= 0 &&
+    (value.outputIndex as number) <= 15 &&
+    isUuid(value.attemptId) &&
+    isAttempt(value.attempt)
+  );
+}
+
+export function parseVideoProbeCommandV1(value: unknown): VideoProbeCommandV1 {
+  const message = object(value);
+  fields(message, [
+    'version',
+    'type',
+    'messageId',
+    'jobId',
+    'outputIndex',
+    'attemptId',
+    'attempt',
+    'source',
+  ]);
+  if (message.type !== 'video.probe' || !validVideoProbeIdentity(message)) return invalid();
+  const source = parseVideoProbeSource(
+    message.source,
+    message.jobId as string,
+    message.outputIndex as number,
+    message.attemptId as string,
+  );
+  return {
+    version: 1,
+    type: 'video.probe',
+    messageId: message.messageId as string,
+    jobId: message.jobId as string,
+    outputIndex: message.outputIndex as number,
+    attemptId: message.attemptId as string,
+    attempt: message.attempt as ComputeAttempt,
+    source,
+  };
+}
+
+function parseVideoProbeMetadata(value: unknown): VideoProbeMetadataV1 {
+  const media = object(value);
+  fields(media, [
+    'container',
+    'videoCodec',
+    'width',
+    'height',
+    'durationSeconds',
+    'hasAudio',
+    'audioCodec',
+  ]);
+  const validName = (name: unknown): name is string =>
+    typeof name === 'string' &&
+    name.length > 0 &&
+    name.length <= 128 &&
+    /^[A-Za-z0-9_,.+-]+$/.test(name);
+  const audioCodec = media.audioCodec;
+  if (
+    !validName(media.container) ||
+    !validName(media.videoCodec) ||
+    typeof media.width !== 'number' ||
+    !Number.isSafeInteger(media.width) ||
+    (media.width as number) < 1 ||
+    (media.width as number) > 65536 ||
+    typeof media.height !== 'number' ||
+    !Number.isSafeInteger(media.height) ||
+    (media.height as number) < 1 ||
+    (media.height as number) > 65536 ||
+    typeof media.durationSeconds !== 'number' ||
+    !Number.isFinite(media.durationSeconds) ||
+    media.durationSeconds <= 0 ||
+    media.durationSeconds > 1800 ||
+    typeof media.hasAudio !== 'boolean' ||
+    (audioCodec !== null && !validName(audioCodec)) ||
+    (!media.hasAudio && audioCodec !== null)
+  )
+    return invalid();
+  return {
+    container: media.container,
+    videoCodec: media.videoCodec,
+    width: media.width as number,
+    height: media.height as number,
+    durationSeconds: media.durationSeconds,
+    hasAudio: media.hasAudio,
+    audioCodec: audioCodec as string | null,
+  };
+}
+
+export function parseVideoProbeResultV1(value: unknown): VideoProbeResultV1 {
+  const message = object(value);
+  const state = message.state;
+  if (state === 'succeeded')
+    fields(message, [
+      'version',
+      'type',
+      'messageId',
+      'commandId',
+      'jobId',
+      'outputIndex',
+      'attemptId',
+      'attempt',
+      'source',
+      'state',
+      'media',
+    ]);
+  else if (state === 'failed')
+    fields(message, [
+      'version',
+      'type',
+      'messageId',
+      'commandId',
+      'jobId',
+      'outputIndex',
+      'attemptId',
+      'attempt',
+      'source',
+      'state',
+      'errorCode',
+    ]);
+  else return invalid();
+  if (
+    message.type !== 'video.probe.result' ||
+    !validVideoProbeIdentity(message) ||
+    !isUuid(message.commandId)
+  )
+    return invalid();
+  const source = parseVideoProbeSource(
+    message.source,
+    message.jobId as string,
+    message.outputIndex as number,
+    message.attemptId as string,
+  );
+  const envelope = {
+    version: 1 as const,
+    type: 'video.probe.result' as const,
+    messageId: message.messageId as string,
+    commandId: message.commandId as string,
+    jobId: message.jobId as string,
+    outputIndex: message.outputIndex as number,
+    attemptId: message.attemptId as string,
+    attempt: message.attempt as ComputeAttempt,
+    source,
+  };
+  if (state === 'succeeded')
+    return { ...envelope, state: 'succeeded', media: parseVideoProbeMetadata(message.media) };
+  if (videoProbeFailures.has(message.errorCode as VideoProbeFailureCodeV1))
+    return {
+      ...envelope,
+      state: 'failed',
+      errorCode: message.errorCode as VideoProbeFailureCodeV1,
+    };
   return invalid();
 }
 

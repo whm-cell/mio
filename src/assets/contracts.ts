@@ -1,3 +1,4 @@
+import type { Readable } from 'node:stream';
 import { HttpError } from '@mio/foundation/errors';
 
 export const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
@@ -22,6 +23,13 @@ export interface AssetObjectStore {
     key: string,
     bytes: Uint8Array,
     format: string,
+    sha256: string,
+    signal: AbortSignal,
+  ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
+  putVideo?(
+    key: string,
+    stream: Readable,
+    sizeBytes: number,
     sha256: string,
     signal: AbortSignal,
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;

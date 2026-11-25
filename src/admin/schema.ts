@@ -465,6 +465,8 @@ CREATE TABLE IF NOT EXISTS mio_admin_route_templates (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE mio_admin_route_templates
+  DROP CONSTRAINT IF EXISTS mio_admin_route_templates_operation_v1_check;
 ${upgradeProviderOperationSQL('mio_admin_route_templates')}
 CREATE TABLE IF NOT EXISTS mio_admin_audit_logs (
   id uuid PRIMARY KEY,

@@ -31,12 +31,14 @@ import {
   modelReference,
   resolveEffectiveChat,
   resolveEffectiveImage,
+  resolveEffectiveVideo,
 } from './catalog.ts';
 import {
   canonicalRouteComparable,
   serializeRouteInputSnapshot,
   validateRouteImportPayload,
 } from './onelink/router.ts';
+import { videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { resolveProviderAudioRoute, selectAudioModel } from './audio-admission.ts';
 
 const log = createLogger('app', 'provider-store');
@@ -718,19 +720,25 @@ export class ProviderStore {
       const state = (await client.query<ProviderState>(providerStateSQL(false), [owner])).rows[0];
       const model = state?.models.find((item) => item.model_key === snapshot.modelKey);
       if (!state || !model) return;
+      const video =
+        snapshot.operation === 'video.generate' ? resolveEffectiveVideo(state, model) : undefined;
       const effective =
         snapshot.operation === 'chat'
           ? resolveEffectiveChat(state, model)
           : snapshot.operation === 'image.generate'
             ? resolveEffectiveImage(state, model)
-            : resolveProviderAudioRoute(
-                state,
-                model,
-                snapshot.operation,
-                Boolean(this.config.catalogWhitelist),
-              );
+            : snapshot.operation === 'video.generate'
+              ? video
+              : resolveProviderAudioRoute(
+                  state,
+                  model,
+                  snapshot.operation,
+                  Boolean(this.config.catalogWhitelist),
+                );
       if (
         !effective ||
+        (snapshot.operation === 'video.generate' &&
+          (!video?.enabled || !videoRouteRuntimeAvailable(video.route))) ||
         effective.declarationVersion !== snapshot.adaptationVersion ||
         effective.profile !== snapshot.profile
       )

@@ -33,6 +33,15 @@ describe('conversation platform system prompt', () => {
     );
   });
 
+  it('states the video generation boundary only when the current conversation has video tools', () => {
+    const disabled = buildConversationSystemPrompt({ videoGeneration: false });
+    expect(disabled).toContain('未开放视频任务工具');
+    expect(disabled).not.toContain('submit_video_job');
+    const enabled = buildConversationSystemPrompt({ videoGeneration: true });
+    expect(enabled).toContain('submit_video_job');
+    expect(enabled).toContain('不得在同一轮轮询');
+  });
+
   it.each(CAPABILITY_COMBINATIONS)(
     'enforces identity, moderately permissive topic policy, anti-leakage, and accurate tool claims (%o)',
     (capabilities) => {
@@ -112,7 +121,7 @@ describe('conversation platform system prompt', () => {
       return general;
     });
     expect(createHash('sha256').update(JSON.stringify(outputs)).digest('hex')).toBe(
-      '5c9f8bff49588dbb5428c62a27d04f88a36ec5a82e832582da4b94673dd4cbbb',
+      'a94141db09074897ae2bc8dbe13ad9e0e0f0d1910b82fd92f400958db97a51f0',
     );
   });
 

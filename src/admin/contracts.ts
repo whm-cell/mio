@@ -73,6 +73,7 @@ export interface AdminModelCatalogItem {
   readonly userDiscoveredCount: number;
   readonly userVerifiedChatCount: number;
   readonly userVerifiedImageCount: number;
+  readonly userVerifiedVideoCount: number;
   readonly audioRoutes: readonly AdminAudioRouteView[];
   readonly policy: {
     readonly userVisible: boolean;
@@ -84,6 +85,7 @@ export interface AdminModelCatalogItem {
   };
   readonly chatRoute: Record<string, unknown> | null;
   readonly imageRoute: Record<string, unknown> | null;
+  readonly videoRoute: Record<string, unknown> | null;
   readonly chatRouteMeta: {
     readonly enabled: boolean;
     readonly declarationVersion: number;
@@ -92,6 +94,13 @@ export interface AdminModelCatalogItem {
     readonly updatedAt: string;
   } | null;
   readonly imageRouteMeta: {
+    readonly enabled: boolean;
+    readonly declarationVersion: number;
+    readonly driver: string;
+    readonly vendor: string;
+    readonly updatedAt: string;
+  } | null;
+  readonly videoRouteMeta: {
     readonly enabled: boolean;
     readonly declarationVersion: number;
     readonly driver: string;
@@ -199,6 +208,7 @@ export interface UnifiedModelRawSources {
     discovered_users: number;
     verified_chat_users: number;
     verified_image_users: number;
+    verified_video_users: number;
     verified_voice_users: number;
     verified_tts_users: number;
     verified_clone_users: number;

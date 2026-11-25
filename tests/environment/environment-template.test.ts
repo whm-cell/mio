@@ -87,6 +87,7 @@ const enableSwitches = {
   MIO_GENERATIONS_ENABLED: 'true',
   MIO_MATERIALS_ENABLED: 'true',
   MIO_PROVIDERS_CATALOG_WHITELIST: 'true',
+  MIO_VIDEO_GENERATIONS_ENABLED: 'true',
 };
 
 async function temporaryDirectory() {

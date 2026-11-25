@@ -10,6 +10,13 @@ const ALLOWED_CONVERSATION_IMAGE_TOOLS = [
   'inspect_image_asset',
 ] as const satisfies readonly ConversationToolName[];
 
+const ALLOWED_CONVERSATION_VIDEO_TOOLS = [
+  'list_video_models',
+  'submit_video_job',
+  'get_video_job',
+  'recover_video_job',
+] as const satisfies readonly ConversationToolName[];
+
 const ALLOWED_CONVERSATION_AUDIO_TOOLS = [
   'list_audio_models',
   'list_audio_voices',
@@ -21,11 +28,13 @@ const ALLOWED_CONVERSATION_AUDIO_TOOLS = [
 
 const MAX_TOOL_CALLS_PER_TURN = 12;
 const MAX_IMAGE_SUBMITS_PER_TURN = 4;
+const MAX_VIDEO_SUBMITS_PER_TURN = 1;
 
 interface TurnToolGrant {
   active: boolean;
   totalCalls: number;
   imageSubmits: number;
+  videoSubmits: number;
   audioSubmits: number;
   readonly allowed: ReadonlyMap<string, ConversationToolName>;
   readonly countedTokens: WeakSet<object>;
@@ -49,13 +58,17 @@ export function denyModelTools(ctx: Context): void {
 }
 
 /**
- * Authorize only the selected image tools on one live conversation Agent turn,
+ * Authorize only the selected image and video tools on one live conversation Agent turn,
  * enforcing per-turn call and submission budgets before any tool body can run.
  */
 export function authorizeConversationImageTools(
   agentCtx: Context,
   agent: Agent,
-  options: { generation: boolean; inspection: boolean } = { generation: true, inspection: false },
+  options: {
+    generation: boolean;
+    inspection: boolean;
+    videoGeneration?: boolean;
+  } = { generation: true, inspection: false },
   progress?: (
     tool: ConversationToolName,
     status: Extract<ConversationEvent, { type: 'tool-status' }>['status'],
@@ -64,9 +77,12 @@ export function authorizeConversationImageTools(
   return authorizeTurnTools(
     agentCtx,
     agent,
-    ALLOWED_CONVERSATION_IMAGE_TOOLS.filter((name) =>
-      name === 'inspect_image_asset' ? options.inspection : options.generation,
-    ),
+    [
+      ...ALLOWED_CONVERSATION_IMAGE_TOOLS.filter((name) =>
+        name === 'inspect_image_asset' ? options.inspection : options.generation,
+      ),
+      ...(options.videoGeneration === true ? ALLOWED_CONVERSATION_VIDEO_TOOLS : []),
+    ],
     progress,
   );
 }
@@ -95,6 +111,7 @@ function authorizeTurnTools(
     active: true,
     totalCalls: 0,
     imageSubmits: 0,
+    videoSubmits: 0,
     audioSubmits: 0,
     allowed,
     countedTokens: new WeakSet<object>(),
@@ -122,12 +139,16 @@ function authorizeTurnTools(
     if (exec.name === 'submit_image_job' && grant.imageSubmits >= MAX_IMAGE_SUBMITS_PER_TURN) {
       return `MIO_TOOL_BUDGET_EXCEEDED: max ${MAX_IMAGE_SUBMITS_PER_TURN} image submissions per turn`;
     }
+    if (exec.name === 'submit_video_job' && grant.videoSubmits >= MAX_VIDEO_SUBMITS_PER_TURN) {
+      return `MIO_TOOL_BUDGET_EXCEEDED: max ${MAX_VIDEO_SUBMITS_PER_TURN} video submission per turn`;
+    }
     const audioSubmit = exec.name === 'submit_audio_job' || exec.name === 'clone_audio_voice';
     if (audioSubmit && grant.audioSubmits > 0)
       return 'MIO_TOOL_BUDGET_EXCEEDED: one audio submission per turn';
     grant.countedTokens.add(exec);
     grant.totalCalls++;
     if (exec.name === 'submit_image_job') grant.imageSubmits++;
+    if (exec.name === 'submit_video_job') grant.videoSubmits++;
     if (audioSubmit) grant.audioSubmits++;
     return undefined;
   });

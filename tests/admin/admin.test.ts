@@ -411,7 +411,7 @@ it('seeds dynamic DB protocol templates once, supports full template CRUD, and n
   const list1 = (await (
     await requestApi('/api/v1/admin/templates', 'GET', undefined, adminCookie)
   ).json()) as {
-    drivers: { chat: string[]; image: string[] };
+    drivers: { chat: string[]; image: string[]; video: string[] };
     items: {
       id: string;
       templateKey: string;
@@ -422,6 +422,13 @@ it('seeds dynamic DB protocol templates once, supports full template CRUD, and n
   };
   expect(list1.drivers.chat).toEqual(['openai-chat', 'anthropic-messages']);
   expect(list1.drivers.image).toContain('volcengine-ark-images');
+  expect(list1.drivers.video).toEqual([
+    'volcengine-ark-videos',
+    'kling-videos',
+    'vidu-videos',
+    'veo-videos',
+    'happyhorse-videos',
+  ]);
   expect(list1.items).toHaveLength(7);
 
   // Invalid routeTemplate is rejected with 400 ROUTE_INVALID
@@ -477,6 +484,30 @@ it('seeds dynamic DB protocol templates once, supports full template CRUD, and n
   );
   expect(createdRes.status).toBe(201);
 
+  const videoTemplateRes = await requestApi(
+    '/api/v1/admin/templates',
+    'POST',
+    {
+      templateKey: 'kling-video-v1',
+      label: 'Kling 视频基础路由',
+      routeTemplate: {
+        operation: 'video.generate',
+        vendor: 'kling',
+        driver: 'kling-videos',
+        classification: 'video',
+        submitPath: '/kling/v1/videos/text2video',
+        queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+        paramSpec: { supportedModes: ['text_to_video'] },
+        sourceKind: 'protocol-reference',
+        source: 'Kling video route fixture',
+        sourceVersion: 'v1',
+        enabled: true,
+      },
+    },
+    adminCookie,
+  );
+  expect(videoTemplateRes.status).toBe(201);
+
   // Edit a seeded template & delete another seeded template (kling-omni)
   const seedream = list1.items.find((i) => i.templateKey === 'seedream-5')!;
   const klingOmni = list1.items.find((i) => i.templateKey === 'kling-omni')!;
@@ -511,6 +542,7 @@ it('seeds dynamic DB protocol templates once, supports full template CRUD, and n
   ).json()) as { items: { templateKey: string; label: string }[] };
   expect(listAfterRemigrate.items.some((i) => i.templateKey === 'kling-omni')).toBe(false);
   expect(listAfterRemigrate.items.some((i) => i.templateKey === 'custom-vision-chat')).toBe(true);
+  expect(listAfterRemigrate.items.some((i) => i.templateKey === 'kling-video-v1')).toBe(true);
   expect(listAfterRemigrate.items.find((i) => i.templateKey === 'seedream-5')?.label).toBe(
     '火山 Seedream 定制版模板',
   );
@@ -831,6 +863,93 @@ it('enforces platform catalog whitelist on C-end users, previews OneLink candida
       defaultWatermark: false,
     },
   });
+
+  const videoRouteV1 = {
+    rawModelId: 'doubao-seedream-4.5',
+    operation: 'video.generate',
+    vendor: 'kling',
+    driver: 'kling-videos',
+    classification: 'video',
+    submitPath: '/kling/v1/videos/text2video',
+    queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+    paramSpec: { supportedModes: ['text_to_video', 'first_frame'] },
+    sourceKind: 'protocol-reference',
+    source: 'Kling video protocol fixture',
+    sourceVersion: 'v1',
+    enabled: true,
+  };
+  const videoPublishV1 = await requestApi(
+    '/api/v1/admin/routes',
+    'POST',
+    { route: videoRouteV1 },
+    adminCookie,
+  );
+  expect(videoPublishV1.status).toBe(200);
+  const videoRevisionId = ((await videoPublishV1.json()) as { revisions: { id: string }[] })
+    .revisions[0]!.id;
+  const adminVideoProjection = (await (
+    await requestApi('/api/v1/admin/models?q=doubao-seedream-4.5', 'GET', undefined, adminCookie)
+  ).json()) as {
+    items: {
+      rawModelId: string;
+      videoRoute: Record<string, unknown> | null;
+      videoRouteMeta: { enabled: boolean; driver: string } | null;
+      userVerifiedVideoCount: number;
+    }[];
+  };
+  expect(
+    adminVideoProjection.items.find((i) => i.rawModelId === 'doubao-seedream-4.5'),
+  ).toMatchObject({
+    videoRoute: { operation: 'video.generate', driver: 'kling-videos' },
+    videoRouteMeta: { enabled: true, driver: 'kling-videos' },
+    userVerifiedVideoCount: 0,
+  });
+  const userWithVideoRoute = (await (
+    await requestApi('/api/v1/providers/onelink/models', 'GET', undefined, userCookie)
+  ).json()) as {
+    items: {
+      modelId: string;
+      video: {
+        runnable: boolean;
+        unavailableReason: string | null;
+        modes: { mode: string; supported: boolean }[];
+        adaptation: { implementation: string; sourceVersion: string } | null;
+      };
+    }[];
+  };
+  expect(
+    userWithVideoRoute.items.find((i) => i.modelId === 'doubao-seedream-4.5')?.video,
+  ).toMatchObject({
+    runnable: false,
+    unavailableReason: 'ADAPTER_PENDING',
+    modes: [
+      { mode: 'text_to_video', supported: false },
+      { mode: 'first_frame', supported: false },
+    ],
+    adaptation: { implementation: 'pending', sourceVersion: 'v1' },
+  });
+  const videoRouteV2 = { ...videoRouteV1, sourceVersion: 'v2' };
+  const videoPublishV2 = await requestApi(
+    '/api/v1/admin/routes',
+    'POST',
+    { route: videoRouteV2 },
+    adminCookie,
+  );
+  expect(videoPublishV2.status).toBe(200);
+  const videoRollback = await requestApi(
+    '/api/v1/admin/routes/rollback',
+    'POST',
+    { revisionId: videoRevisionId },
+    adminCookie,
+  );
+  expect(videoRollback.status).toBe(200);
+  const videoDelete = await requestApi(
+    '/api/v1/admin/routes',
+    'DELETE',
+    { rawModelId: 'doubao-seedream-4.5', operation: 'video.generate' },
+    adminCookie,
+  );
+  expect(videoDelete.status).toBe(200);
 
   // Verify listImageModels reuses deriveImageParameterView + display_label fallback and keeps strictly 19 fields
   const ownerRow = (

@@ -1,6 +1,6 @@
 # 计算任务协议 v1 与 Worker 恢复边界
 
-本协议约束 A/B 之间经 RabbitMQ 传输的视频转码命令和结果。云端图片生成、查询和物化恢复已迁入 A，由 PostgreSQL 持久任务和 A 的专用恢复目录承接。[图片 HTTP 契约](../../apis/compute.md#post-apiv1computeimages) · [图片迁移变更](../onelink-image-generation/changes/image-generation-in-a/change.md)
+本协议约束 A/B 之间经 RabbitMQ 传输的视频转码命令/结果，以及只读视频媒体探测命令/结果。`transcode.request` 与 `transcode.result` 的 v1 身份、字段和行为保持兼容；`video.probe` 是独立的 v1 消息类型，不启动转码、不生成视频，也不携带供应商凭据或媒体字节。云端图片生成、查询和物化恢复已迁入 A，由 PostgreSQL 持久任务和 A 的专用恢复目录承接。[图片 HTTP 契约](../../apis/compute.md#post-apiv1computeimages) · [图片迁移变更](../onelink-image-generation/changes/image-generation-in-a/change.md)
 
 本页是经本期协调审阅的 P3/P4 v1 实施边界；双方以它对齐，改变消息、身份、数据或副作用边界须重新核对。协议冻结不表示源码、云权限、消息或结果已经交付。需求和资源限制见[本期 PRD](prd.md)，服务边界见[设计](design.md)。共享包为 `@mio/compute-contracts`，源码入口为 `contracts/compute/src/index.ts`，构建生成 `dist/index.js` 与 `dist/index.d.ts`；A/B 不导入对方内部模块。
 
@@ -37,16 +37,48 @@ A 从登录会话取得 owner，按 owner 查询已登记资产；HEAD 该 raw �
 
 succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio/derived/<jobId>/<attemptId>/result.mp4`，`sizeBytes` 为 1 至 1073741824，SHA-256 是小写 64 位十六进制。B 对输出及未知上传恢复的 GET 流式执行同一上限，再持久记录最终文件大小与 SHA-256；PUT 传内容校验及 SHA-256 元数据，完成后 HEAD 获取 derived 对象的实际 ETag。A 在登记前 HEAD 该对象，核对 key、实际长度、ETag 与 SHA-256 元数据，并从本地 job 事实取得 owner。HEAD 核对元数据不等同重新读取并计算全部对象字节。A 不以消息内的 owner 或 URL 决定资源归属。结果资产与 job 终态在同一 PG 事务发布；由既有媒体域作增量迁移，保留原数据。
 
+## 只读视频媒体探测 `video.probe` v1
+
+`video.probe` 仅对 A 已准备的私有 COS staging 媒体进行限时字节完整性校验和 ffprobe；不执行任何转码/写入 COS/供应商调用，不经消息传递媒体字节或供应商凭据。字段集严格封闭；身份为 `(jobId, outputIndex, attemptId, attempt)`，`outputIndex` 为 0–15，`attempt` 为 1–3。`source.stagingKey` 必须精确是 `mio/staging/video/<jobId>/<outputIndex>/<attemptId>.media`；不接收 URL、bucket、命令行或本机路径。`source.sizeBytes` 限为 1 至 1073741824；`etag` 为最长 256 且不含控制字符的原样值；`sha256` 为小写 64 位十六进制。
+
+```json
+{
+  "version": 1,
+  "type": "video.probe",
+  "messageId": "<message-id>",
+  "jobId": "<job-id>",
+  "outputIndex": 0,
+  "attemptId": "<attempt-id>",
+  "attempt": 1,
+  "source": {
+    "stagingKey": "mio/staging/video/<job-id>/0/<attempt-id>.media",
+    "sizeBytes": 12345,
+    "etag": "<opaque-cos-etag>",
+    "sha256": "<lowercase-64-hex-sha256>"
+  }
+}
+```
+
+B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/可用的 SHA-256 元数据，再用条件 GET `If-Match: <etag>` 流式下载到 worker 受限临时目录（目录 0700，文件 0600）。过流逐块累计实际字节并计算 SHA-256，必须与消息 size/digest 完全相同才启动 ffprobe；失配、过大、超时或 worker 停机均不返回可消费媒体。COS 下载和 ffprobe 共用 300 秒本地 AbortSignal 上限，取消时销毁流/子进程并清除这个 UUID 推导的临时文件。ffprobe 只从固定本地文件路径运行，使用固定参数和已有文件格式 whitelist，不使用 shell。保留当前 1800 秒视频时长上限；JSON 输出限 64 KiB，错误输出限 256 KiB。
+
+成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份；`media` 只包含 ffprobe 得出的 `container`/`videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。尺寸使用已采用的 display rotation 规则，返回 1–65536 的安全整数；时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
+
+### `video.probe` 路由的同步要求
+
+保持 `version: 1`，无需换新 exchange 或 queue，但分别要在 `mio.compute.commands.v1` 交换机绑定 `video.probe.v1` 到现有 `mio.compute.commands.v1` 持久队列，以及将 `video.probe.result.v1` 绑定至现有 `mio.compute.results.v1` 队列。这是加性的 v1 topology 绑定；这些 bindings 与 A 端命令发布/结果消费适配未同步部署前，不能发送 probe。使用 `mandatory` 发布时新 routing key 没有 binding 必须被退回并保留上游重试现场，不能回退使用 `transcode.v1` 假装为转码。
+
 ## 路由、回执与状态
 
 以下单路转码路由在隔离 vhost 内使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
 
-| 路由     | 交换机                        | Routing key                | 队列                          |
-| -------- | ----------------------------- | -------------------------- | ----------------------------- |
-| A 发命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`     |
-| 命令死信 | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1` |
-| B 发结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`      |
-| 结果死信 | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`  |
+| 路由         | 交换机                        | Routing key                | 队列                          |
+| ------------ | ----------------------------- | -------------------------- | ----------------------------- |
+| A 发转码命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`     |
+| A 发探测命令 | `mio.compute.commands.v1`     | `video.probe.v1`           | `mio.compute.commands.v1`     |
+| 命令死信     | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1` |
+| B 发转码结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`      |
+| B 发探测结果 | `mio.compute.results.v1`      | `video.probe.result.v1`    | `mio.compute.results.v1`      |
+| 结果死信     | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`  |
 
 两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。未配置 Worker 观测的 B 保留单路转码命令消费 `prefetch=1`。已配置的实例有界接收 `prefetch=32`，并经[独立 Worker 共享槽](../../../compute/README.md#worker-观测与调限)限制实际准入。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
 

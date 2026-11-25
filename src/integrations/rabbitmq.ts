@@ -29,6 +29,8 @@ import {
   parseAudioInspectResultV1,
   parseComputeResultV1,
   parseMediaResult,
+  parseVideoProbeResultV1,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
 } from '@mio/compute-contracts';
 import type {
   AudioInspectCommandV1,
@@ -38,6 +40,8 @@ import type {
   MediaCommand,
   MediaControl,
   MediaResult,
+  VideoProbeCommandV1,
+  VideoProbeResultV1,
   WorkerTelemetry,
   WorkerLimitsResult,
   WorkerLimitsCommand,
@@ -234,8 +238,11 @@ export class ComputeBroker {
     }
   }
 
-  publish(message: ComputeCommandV1): Promise<void> {
-    return this.publishCommand(COMMAND_ROUTING_KEY, message);
+  publish(message: ComputeCommandV1 | VideoProbeCommandV1): Promise<void> {
+    return this.publishCommand(
+      message.type === 'video.probe' ? VIDEO_PROBE_COMMAND_ROUTING_KEY : COMMAND_ROUTING_KEY,
+      message,
+    );
   }
 
   publishAudio(message: AudioInspectCommandV1): Promise<void> {
@@ -273,7 +280,12 @@ export class ComputeBroker {
   private async publishCommand(
     routingKey: string,
     message:
-      ComputeCommandV1 | AudioInspectCommandV1 | MediaCommand | MediaControl | WorkerLimitsCommand,
+      | ComputeCommandV1
+      | VideoProbeCommandV1
+      | AudioInspectCommandV1
+      | MediaCommand
+      | MediaControl
+      | WorkerLimitsCommand,
   ): Promise<void> {
     let returned = false;
     const onReturn = (value: Message) => {
@@ -319,10 +331,28 @@ export class ComputeBroker {
     }
   }
 
-  consume(handle: (result: ComputeResultV1) => Promise<void>, failed: () => void): Promise<void> {
+  consume(
+    handle: (result: ComputeResultV1) => Promise<void>,
+    failed: () => void,
+    handleProbe?: (result: VideoProbeResultV1) => Promise<void>,
+  ): Promise<void> {
     return this.consumeResults(
-      { queue: RESULT_QUEUE, maxBytes: COMPUTE_MAX_MESSAGE_BYTES, parse: parseComputeResultV1 },
-      handle,
+      {
+        queue: RESULT_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse(value) {
+          return (value as { type?: unknown } | null)?.type === 'video.probe.result'
+            ? parseVideoProbeResultV1(value)
+            : parseComputeResultV1(value);
+        },
+      },
+      async (result) => {
+        if (result.type === 'video.probe.result') {
+          if (!handleProbe)
+            throw Object.assign(new Error('VIDEO_PROBE_UNAVAILABLE'), { permanent: true });
+          await handleProbe(result);
+        } else await handle(result);
+      },
       failed,
       this.transport.signal,
     );
@@ -345,10 +375,7 @@ export class ComputeBroker {
     );
   }
 
-  async consumeMedia(
-    handle: (result: MediaResult) => Promise<void>,
-    failed: () => void,
-  ): Promise<void> {
+  async consumeMedia(handle: (result: MediaResult) => Promise<void>, failed: () => void) {
     // Media progress has no wire sequence field. Keep dispatch order through
     // the inbox of this dedicated media result consumer.
     await untilAborted(this.consumer.prefetch(1), this.transport.signal);

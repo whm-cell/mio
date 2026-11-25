@@ -748,6 +748,7 @@ export class AdminStore {
         discovered_users: number;
         verified_chat_users: number;
         verified_image_users: number;
+        verified_video_users: number;
         verified_voice_users: number;
         verified_tts_users: number;
         verified_clone_users: number;
@@ -774,6 +775,12 @@ export class AdminStore {
               AND r_img.declaration_version = v.declaration_version
               AND c.catalog_credential_version = c.credential_version
              THEN c.id END)::int AS verified_image_users,
+           COUNT(DISTINCT CASE
+             WHEN v.operation = 'video.generate'
+              AND v.verification_status = 'verified'
+              AND r_video.declaration_version = v.declaration_version
+              AND c.catalog_credential_version = c.credential_version
+             THEN c.id END)::int AS verified_video_users,
            COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.voices.list')::int AS verified_voice_users,
            COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.tts')::int AS verified_tts_users,
            COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.clone')::int AS verified_clone_users,
@@ -793,6 +800,11 @@ export class AdminStore {
           AND r_img.raw_model_id = m.raw_model_id COLLATE "C"
           AND r_img.operation = 'image.generate'
           AND r_img.enabled = true
+         LEFT JOIN mio_provider_model_routes r_video
+           ON r_video.provider_type = c.provider_type
+          AND r_video.raw_model_id = m.raw_model_id COLLATE "C"
+          AND r_video.operation = 'video.generate'
+          AND r_video.enabled = true
          LEFT JOIN mio_provider_model_routes r_audio
            ON r_audio.provider_type = c.provider_type
           AND r_audio.raw_model_id = m.raw_model_id COLLATE "C"

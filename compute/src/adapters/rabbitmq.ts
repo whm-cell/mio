@@ -24,6 +24,7 @@ import {
   RESULT_ROUTING_KEY,
   WORKER_TELEMETRY_ROUTING_KEY,
   WORKER_MAX_MESSAGE_BYTES,
+  VIDEO_PROBE_RESULT_ROUTING_KEY,
   parseWorkerLimitsCommand,
   workerControlQueue,
   mediaResourceClass,
@@ -31,6 +32,7 @@ import {
   parseComputeCommandV1,
   parseMediaCommand,
   parseMediaControl,
+  parseVideoProbeCommandV1,
 } from '@mio/compute-contracts';
 import type {
   AudioInspectCommandV1,
@@ -40,6 +42,8 @@ import type {
   MediaCommand,
   MediaControl,
   MediaResult,
+  VideoProbeCommandV1,
+  VideoProbeResultV1,
   WorkerResourceClass,
   WorkerTelemetry,
   WorkerLimitsResult,
@@ -264,6 +268,9 @@ export class Broker {
   publish(message: ComputeResultV1): Promise<void> {
     return this.publishMessage(message, RESULT_ROUTING_KEY);
   }
+  publishVideoProbe(message: VideoProbeResultV1): Promise<void> {
+    return this.publishMessage(message, VIDEO_PROBE_RESULT_ROUTING_KEY);
+  }
 
   publishAudio(message: AudioInspectResultV1): Promise<void> {
     return this.publishMessage(message, AUDIO_RESULT_ROUTING_KEY);
@@ -283,7 +290,12 @@ export class Broker {
 
   private async publishMessage(
     message:
-      ComputeResultV1 | AudioInspectResultV1 | MediaResult | WorkerTelemetry | WorkerLimitsResult,
+      | ComputeResultV1
+      | VideoProbeResultV1
+      | AudioInspectResultV1
+      | MediaResult
+      | WorkerTelemetry
+      | WorkerLimitsResult,
     routingKey: string,
   ): Promise<void> {
     if (this.#state.closed) throw new Error('BROKER_CLOSED');
@@ -339,10 +351,28 @@ export class Broker {
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
     canAdmit: () => boolean,
+    handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
   ): Promise<void> {
     return this.consumeCommands(
-      { queue: COMMAND_QUEUE, maxBytes: COMPUTE_MAX_MESSAGE_BYTES, parse: parseComputeCommandV1 },
-      handle,
+      {
+        queue: COMMAND_QUEUE,
+        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+        parse(value): ComputeCommandV1 | VideoProbeCommandV1 {
+          return value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            (value as Record<string, unknown>).type === 'video.probe'
+            ? parseVideoProbeCommandV1(value)
+            : parseComputeCommandV1(value);
+        },
+      },
+      async (command, ack) => {
+        if (command.type === 'video.probe') {
+          if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+          return handleVideoProbe(command, ack);
+        }
+        return handle(command, ack);
+      },
       failed,
       canAdmit,
     );

@@ -1,3 +1,4 @@
+import { videoModeParameters, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { categories } from './contracts.ts';
 import type {
   Category,
@@ -13,9 +14,14 @@ import {
   deriveImageParameterView,
   resolveChatRoute,
   resolveImageRoute,
+  resolveVideoRoute,
   resolveVerificationView,
 } from './onelink/router.ts';
-import type { ResolvedChatRoute, ResolvedImageRoute } from './onelink/router.ts';
+import type {
+  ResolvedChatRoute,
+  ResolvedImageRoute,
+  ResolvedVideoRoute,
+} from './onelink/router.ts';
 
 export const modelReference = (key: string) => `onelink:model:${key}`;
 
@@ -41,6 +47,14 @@ export function findCatalogModel(
   return catalogModels.find((item) => item.raw_model_id === rawModelId);
 }
 
+export function indexCatalogModels(
+  catalogModels: readonly PlatformCatalogModelRecord[] | undefined,
+): Map<string, PlatformCatalogModelRecord> {
+  const byRawId = new Map<string, PlatformCatalogModelRecord>();
+  for (const model of catalogModels ?? []) byRawId.set(model.raw_model_id, model);
+  return byRawId;
+}
+
 export function membershipError(
   row: ProviderRow & {
     catalog_models?: readonly PlatformCatalogModelRecord[];
@@ -48,11 +62,15 @@ export function membershipError(
   model?: ModelRecord,
   whitelist = false,
   allowUndiscovered = true,
+  catalogByRawId?: ReadonlyMap<string, PlatformCatalogModelRecord>,
 ): string | null {
   return catalogMembershipError(
     row,
     model,
-    findCatalogModel(row.catalog_models, model?.raw_model_id),
+    model?.raw_model_id
+      ? (catalogByRawId?.get(model.raw_model_id) ??
+          findCatalogModel(row.catalog_models, model.raw_model_id))
+      : undefined,
     whitelist,
     allowUndiscovered,
   );
@@ -125,15 +143,42 @@ export function resolveEffectiveImage(
   return route ? resolveImageRoute(route) : undefined;
 }
 
+export function resolveEffectiveVideo(
+  state: ProviderState,
+  model: ModelRecord,
+): ResolvedVideoRoute | undefined {
+  if (!model.raw_model_id) return undefined;
+  const route = (state.routes ?? []).find(
+    (item) => item.raw_model_id === model.raw_model_id && item.operation === 'video.generate',
+  );
+  return route ? resolveVideoRoute(route) : undefined;
+}
+
+export function indexVideoRouteDeclarations(
+  routes: readonly PlatformRouteRecord[] | undefined,
+): Map<string, ResolvedVideoRoute> {
+  const byRawId = new Map<string, ResolvedVideoRoute>();
+  for (const route of routes ?? []) {
+    if (route.operation !== 'video.generate') continue;
+    const resolved = resolveVideoRoute(route);
+    if (resolved) byRawId.set(route.raw_model_id, resolved);
+  }
+  return byRawId;
+}
+
 function buildAdaptationView(
   state: ProviderState,
   verifications: ReadonlyMap<string, VerificationRecord>,
   modelKey: string,
-  route: ResolvedChatRoute | ResolvedImageRoute | undefined,
+  route: ResolvedChatRoute | ResolvedImageRoute | ResolvedVideoRoute | undefined,
+  implementation: 'implemented' | 'pending' = 'implemented',
 ) {
   if (!route) return null;
   const verification = resolveVerificationView({
-    verification: verifications.get(`${modelKey}\0${route.operation}`),
+    verification:
+      implementation === 'implemented'
+        ? verifications.get(`${modelKey}\0${route.operation}`)
+        : undefined,
     operation: route.operation,
     declarationVersion: route.declarationVersion,
     profile: route.profile,
@@ -144,7 +189,7 @@ function buildAdaptationView(
     operation: route.operation,
     vendor: route.vendor,
     profile: route.profile,
-    implementation: 'implemented' as const,
+    implementation,
     declarationVersion: route.declarationVersion,
     source: route.source,
     sourceKind: route.sourceKind,
@@ -155,9 +200,15 @@ function buildAdaptationView(
 }
 
 /** O(models + routes + preferences + verifications); no supplier I/O, decryption or bundled product model list. */
-export function catalogView(state: ProviderState | null, category?: Category, whitelist = false) {
+export function catalogView(
+  state: ProviderState | null,
+  category?: Category,
+  whitelist = false,
+  videoRuntime = false,
+) {
   const chatByRawId = new Map<string, ResolvedChatRoute>();
   const imageByRawId = indexEffectiveImageRoutes(state?.routes);
+  const videoByRawId = indexVideoRouteDeclarations(state?.routes);
   for (const route of state?.routes ?? []) {
     if (route.operation === 'chat') {
       const resolved = resolveChatRoute(route);
@@ -175,10 +226,7 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
     verifications.set(`${item.model_key}\0${item.operation}`, item);
   }
 
-  const catalogByRawId = new Map<string, PlatformCatalogModelRecord>();
-  for (const item of state?.catalog_models ?? []) {
-    catalogByRawId.set(item.raw_model_id, item);
-  }
+  const catalogByRawId = indexCatalogModels(state?.catalog_models);
 
   const effectiveChatByKey = new Map<string, ResolvedChatRoute>();
   for (const model of state?.models ?? []) {
@@ -204,7 +252,16 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
       const cat = model.raw_model_id ? catalogByRawId.get(model.raw_model_id) : undefined;
       const chatRoute = model.raw_model_id ? chatByRawId.get(model.raw_model_id) : undefined;
       const imageRoute = model.raw_model_id ? imageByRawId.get(model.raw_model_id) : undefined;
-      const matchedRoute = chatRoute ?? imageRoute;
+      const videoRoute = model.raw_model_id ? videoByRawId.get(model.raw_model_id) : undefined;
+      const requestedRoute =
+        category === 'chat'
+          ? chatRoute
+          : category === 'image'
+            ? imageRoute
+            : category === 'video'
+              ? videoRoute
+              : undefined;
+      const matchedRoute = requestedRoute ?? chatRoute ?? imageRoute ?? videoRoute;
       const effectiveCategory = matchedRoute?.classification ?? cat?.category ?? null;
       const effectiveClassificationSource = matchedRoute
         ? `route:${matchedRoute.source}@${matchedRoute.sourceVersion}`
@@ -216,13 +273,22 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
         cat,
         chatRoute,
         imageRoute,
+        videoRoute,
         effectiveCategory,
         effectiveClassificationSource,
       };
     })
     .filter((entry) => !category || entry.effectiveCategory === category)
     .map(
-      ({ model, cat, chatRoute, imageRoute, effectiveCategory, effectiveClassificationSource }) => {
+      ({
+        model,
+        cat,
+        chatRoute,
+        imageRoute,
+        videoRoute,
+        effectiveCategory,
+        effectiveClassificationSource,
+      }) => {
         const displayLabel = cat?.display_label ?? null;
         const callNotes = cat?.call_notes ?? null;
         const allowUndiscovered = Boolean(cat?.allow_undiscovered);
@@ -233,21 +299,33 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
           effectiveDefault:
             pref.is_default &&
             pref.enabled &&
-            !membershipError(state!, model, whitelist) &&
+            !membershipError(state!, model, whitelist, true, catalogByRawId) &&
             pref.usage === 'chat' &&
             !!chatRoute,
         }));
         const chat = preferences.find((pref) => pref.usage === 'chat');
         const image = preferences.find((pref) => pref.usage === 'image');
         const imageReason =
-          membershipError(state!, model, whitelist) ??
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!imageRoute || !imageRoute.asyncReady
             ? 'ADAPTER_PENDING'
             : image?.enabled === false
               ? 'MODEL_DISABLED'
               : null);
+        const videoPreference = preferences.find((pref) => pref.usage === 'video');
+        const videoReason =
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
+          (!videoRoute
+            ? 'ADAPTER_PENDING'
+            : !videoRoute.enabled
+              ? 'MODEL_ROUTE_DISABLED'
+              : videoPreference?.enabled === false
+                ? 'MODEL_DISABLED'
+                : !(videoRuntime && videoRouteRuntimeAvailable(videoRoute.route))
+                  ? 'ADAPTER_PENDING'
+                  : null);
         const reason =
-          membershipError(state!, model, whitelist) ??
+          membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!chatRoute ? 'ADAPTER_PENDING' : chat?.enabled === false ? 'MODEL_DISABLED' : null);
         const discovered =
           model.membership_state === 'current' &&
@@ -288,6 +366,30 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
             runnable: imageReason === null,
             unavailableReason: imageReason,
           },
+          video: {
+            adaptation: buildAdaptationView(
+              state!,
+              verifications,
+              model.model_key,
+              videoRoute,
+              videoRoute && videoRuntime && videoRouteRuntimeAvailable(videoRoute.route)
+                ? undefined
+                : 'pending',
+            ),
+            modes:
+              videoRoute?.route.paramSpec.supportedModes.map((mode) => {
+                const parameters = videoModeParameters(videoRoute.route, mode);
+                return {
+                  mode,
+                  supported: videoRuntime && videoRouteRuntimeAvailable(videoRoute.route),
+                  ...(parameters ? { parameters } : {}),
+                };
+              }) ?? [],
+            cancellation: { supported: false as const },
+            enabled: videoPreference?.enabled ?? true,
+            runnable: videoReason === null,
+            unavailableReason: videoReason,
+          },
           preferences,
           enabled: chat?.enabled ?? true,
           isDefault: chat?.isDefault ?? false,
@@ -311,7 +413,7 @@ export function catalogView(state: ProviderState | null, category?: Category, wh
         preference && state?.models.find((item) => item.model_key === preference.model_key);
       const reason = !preference
         ? 'MODEL_DEFAULT_NOT_SET'
-        : (membershipError(state!, model, whitelist) ??
+        : (membershipError(state!, model, whitelist, true, catalogByRawId) ??
           (!preference.enabled
             ? 'MODEL_DISABLED'
             : usage !== 'chat'

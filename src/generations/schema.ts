@@ -42,7 +42,65 @@ CREATE INDEX IF NOT EXISTS mio_image_executions_pending ON mio_image_executions(
   WHERE phase <> 'done';
 CREATE INDEX IF NOT EXISTS mio_image_executions_cleanup ON mio_image_executions(job_id)
   WHERE phase='done' AND checkpoint IS NOT NULL
-    AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb;`;
+    AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb;
+CREATE TABLE IF NOT EXISTS mio_video_jobs (
+  id uuid PRIMARY KEY,
+  owner_id text NOT NULL,
+  request_id uuid NOT NULL,
+  input_hash text NOT NULL,
+  command jsonb NOT NULL,
+  admitted jsonb NOT NULL DEFAULT '{}',
+  route_snapshot jsonb,
+  state text NOT NULL CHECK (state IN (
+    'accepted','submitted','processing','materializing','completed','partial',
+    'materialization_failed','unknown','failed','rejected','cancelled'
+  )),
+  error_code text,
+  cancellation_requested boolean NOT NULL DEFAULT false,
+  cancellation_supported boolean NOT NULL DEFAULT false,
+  cancellation_status text CHECK (cancellation_status IS NULL OR cancellation_status IN (
+    'pending','confirmed','not_supported','rejected','unknown','too_late'
+  )),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  UNIQUE(owner_id,request_id)
+);
+CREATE INDEX IF NOT EXISTS mio_video_jobs_active_owner ON mio_video_jobs(state,owner_id)
+  WHERE state IN ('accepted','submitted','processing','materializing');
+CREATE INDEX IF NOT EXISTS mio_video_jobs_owner_created ON mio_video_jobs(owner_id,created_at DESC,id DESC);
+CREATE TABLE IF NOT EXISTS mio_video_executions (
+  job_id uuid PRIMARY KEY REFERENCES mio_video_jobs(id),
+  phase text NOT NULL CHECK (phase IN ('ready','submitting','waiting','querying','materializing','done')),
+  claim_id uuid,
+  snapshot jsonb NOT NULL,
+  upstream_task_id text,
+  query_attempt integer NOT NULL DEFAULT 0 CHECK (query_attempt >= 0),
+  async_max_queries integer CHECK (async_max_queries IS NULL OR async_max_queries > 0),
+  async_deadline timestamptz,
+  next_query_at timestamptz,
+  checkpoint jsonb,
+  storage_failed boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS mio_video_executions_pending ON mio_video_executions(phase,next_query_at)
+  WHERE phase <> 'done';
+CREATE TABLE IF NOT EXISTS mio_video_outputs (
+  job_id uuid NOT NULL REFERENCES mio_video_jobs(id),
+  output_index integer NOT NULL CHECK (output_index BETWEEN 0 AND 15),
+  asset_id uuid REFERENCES mio_assets(id),
+  phase text NOT NULL CHECK (phase IN ('pending','staging','probed','registered','failed')),
+  error_code text,
+  content_type text,
+  size_bytes bigint CHECK (size_bytes IS NULL OR size_bytes > 0),
+  sha256 text,
+  width integer CHECK (width IS NULL OR width > 0),
+  height integer CHECK (height IS NULL OR height > 0),
+  duration_ms bigint CHECK (duration_ms IS NULL OR duration_ms > 0),
+  has_audio boolean,
+  PRIMARY KEY(job_id,output_index),
+  CHECK (phase <> 'registered' OR asset_id IS NOT NULL)
+);`;
 
 export async function checkGenerationSchema(database: Pick<Pool, 'query'>): Promise<void> {
   await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
@@ -52,6 +110,15 @@ export async function checkGenerationSchema(database: Pick<Pool, 'query'>): Prom
   await database.query('SELECT job_id,output_index,asset_id FROM mio_image_outputs LIMIT 0');
   await database.query(
     'SELECT job_id,phase,claim_id,snapshot,checkpoint,updated_at,storage_failed FROM mio_image_executions LIMIT 0',
+  );
+  await database.query(
+    'SELECT id,owner_id,request_id,input_hash,command,admitted,route_snapshot,state,error_code,cancellation_requested,cancellation_supported,cancellation_status,created_at,updated_at,completed_at FROM mio_video_jobs LIMIT 0',
+  );
+  await database.query(
+    'SELECT job_id,phase,claim_id,snapshot,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,checkpoint,storage_failed,updated_at FROM mio_video_executions LIMIT 0',
+  );
+  await database.query(
+    'SELECT job_id,output_index,asset_id,phase,error_code,content_type,size_bytes,sha256,width,height,duration_ms,has_audio FROM mio_video_outputs LIMIT 0',
   );
   const constraint = await database.query<{ definition: string }>(
     "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='mio_image_jobs'::regclass AND conname='mio_image_jobs_state_check' AND contype='c' AND convalidated",

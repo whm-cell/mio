@@ -86,9 +86,19 @@
       "typecheck": "compute/tsconfig.json",
       "build": "compute/tsconfig.build.json",
       "capabilities": {
-        "sqlite": ["compute/src/adapters/journal.ts"],
-        "fs": ["compute/src/adapters/media.ts"],
-        "child_process": ["compute/src/adapters/media.ts"]
+        "sqlite": [
+          "compute/src/adapters/journal.ts",
+          "compute/src/adapters/media-journal.ts",
+          "compute/src/adapters/media-journal-schema.ts",
+          "compute/src/adapters/worker-observability-journal.ts"
+        ],
+        "fs": [
+          "compute/src/adapters/media.ts",
+          "compute/src/adapters/media-files.ts",
+          "compute/src/adapters/media-process.ts",
+          "compute/src/adapters/fonts.ts"
+        ],
+        "child_process": ["compute/src/adapters/media.ts", "compute/src/adapters/media-process.ts"]
       },
       "packageAdapters": {
         "amqplib": ["compute/src/adapters/rabbitmq.ts"],
@@ -153,6 +163,9 @@
     "deploy/rabbitmq/compose.yaml",
     "deploy/rabbitmq/rabbitmq.conf",
     "compute/package.json",
+    "compute/fonts/NotoSansCJKsc-Regular.otf",
+    "compute/fonts/NotoSerifCJKsc-Regular.otf",
+    "compute/fonts/OFL.txt",
     "compute/tsconfig.json",
     "compute/tsconfig.build.json",
     "contracts/compute/package.json",

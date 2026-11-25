@@ -2,11 +2,12 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
-import type { PoolClient } from 'pg';
 import { COMPUTE_PROFILE, COMPUTE_VERSION } from '@mio/compute-contracts';
 import type { ComputeAttempt, ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import { checkComputeSchema } from './schema.ts';
 import { ComputeError } from './errors.ts';
+import { checkComputeCapacity, lockComputeCapacity } from './capacity.ts';
+import { computeTransaction } from './database.ts';
 const log = createLogger('app', 'compute-store');
 
 export interface JobRow {
@@ -45,21 +46,6 @@ function command(job: JobRow): ComputeCommandV1 {
   };
 }
 
-async function transaction<T>(pool: Pool, run: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await run(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 const retryable = new Set([
   'TRANSCODE_FAILED',
   'EXECUTION_TIMEOUT',
@@ -67,19 +53,6 @@ const retryable = new Set([
   'WORKER_INTERRUPTED',
   'OUTPUT_INVALID',
 ]);
-
-const VIDEO_QUOTA_LOCK = 672049923;
-
-async function checkVideoCapacity(client: PoolClient, owner: string): Promise<void> {
-  const video = (
-    await client.query<{ global_count: string; owner_count: string }>(
-      "SELECT count(*) AS global_count, count(*) FILTER (WHERE owner_id=$1) AS owner_count FROM mio_compute_jobs WHERE state IN ('accepted','queued','running')",
-      [owner],
-    )
-  ).rows[0]!;
-  if (Number(video.global_count) >= 500 || Number(video.owner_count) >= 10)
-    throw new ComputeError(HTTP_STATUS.TOO_MANY_REQUESTS, 'COMPUTE_QUOTA_EXCEEDED');
-}
 
 export class ComputeStore {
   private readonly pool: Pool;
@@ -123,9 +96,8 @@ export class ComputeStore {
     size: number,
     etag: string,
   ): Promise<{ job: JobRow; created: boolean }> {
-    return transaction(this.pool, async (client) => {
-      // Serializing video admission keeps per-user and global video quotas exact.
-      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+    return computeTransaction(this.pool, async (client) => {
+      await lockComputeCapacity(client);
       const existing = (
         await client.query<JobRow>(
           'SELECT * FROM mio_compute_jobs WHERE owner_id=$1 AND request_id=$2',
@@ -137,7 +109,7 @@ export class ComputeStore {
           throw new ComputeError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
         return { job: existing, created: false };
       }
-      await checkVideoCapacity(client, owner);
+      await checkComputeCapacity(client, owner);
       const asset = (
         await client.query<{ raw_key: string; size_bytes: string }>(
           "SELECT raw_key,size_bytes FROM mio_assets WHERE id=$1 AND owner_id=$2 AND state='ready' AND asset_kind='original' FOR SHARE",
@@ -179,7 +151,7 @@ export class ComputeStore {
   }
 
   async sent(message: ComputeCommandV1, lease: string): Promise<void> {
-    await transaction(this.pool, async (client) => {
+    await computeTransaction(this.pool, async (client) => {
       const sent = await client.query(
         'UPDATE mio_compute_outbox SET sent_at=now(),lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL RETURNING id',
         [message.messageId, lease],
@@ -212,7 +184,7 @@ export class ComputeStore {
   }
 
   async accept(result: ComputeResultV1): Promise<void> {
-    await transaction(this.pool, async (client) => {
+    await computeTransaction(this.pool, async (client) => {
       const recorded = await client.query(
         'INSERT INTO mio_compute_inbox(id,payload) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id',
         [result.messageId, JSON.stringify(result)],

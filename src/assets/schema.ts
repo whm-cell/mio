@@ -13,7 +13,17 @@ CREATE TABLE IF NOT EXISTS mio_assets (
   staging_deleted_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS mio_assets_cleanup ON mio_assets(expires_at)
-  WHERE staging_deleted_at IS NULL;`;
+  WHERE staging_deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS mio_asset_derivative_intents (
+  asset_id uuid NOT NULL REFERENCES mio_assets(id), owner_id text NOT NULL,
+  profile text NOT NULL CHECK (profile='ordinary'),
+  request_id uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(), job_id uuid UNIQUE,
+  error_code text, next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(asset_id,profile)
+);
+CREATE INDEX IF NOT EXISTS mio_asset_derivatives_due
+  ON mio_asset_derivative_intents(next_attempt_at,asset_id,profile)
+  WHERE job_id IS NULL AND error_code IS NULL;`;
 
 export async function checkAssetSchema(database: Pick<Pool, 'query'>): Promise<void> {
   const result = await database.query(
@@ -22,4 +32,7 @@ export async function checkAssetSchema(database: Pick<Pool, 'query'>): Promise<v
   const types = [2950, 25, 25, 25, 20, 25, 25, 25, 25, 2950, 1184, 1184, 1184, 1184];
   if (result.fields.some((field, index) => field.dataTypeID !== types[index]))
     throw new Error('ASSET_SCHEMA: incompatible metadata columns');
+  await database.query(
+    'SELECT asset_id,owner_id,profile,request_id,job_id,error_code,next_attempt_at FROM mio_asset_derivative_intents LIMIT 0',
+  );
 }

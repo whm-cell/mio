@@ -57,12 +57,27 @@ import { createAudioJobService } from './audio/jobs/service.ts';
 import type { AudioJobService } from './audio/jobs/service.ts';
 import { createAudioMediaClient } from './audio/media.ts';
 import { createAssetService } from './assets/service.ts';
+import { startAssetDerivatives } from './assets/derivatives.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
 import { readComputeConfig } from './compute/config.ts';
 import { createComputeStore } from './compute/store.ts';
 import { createComputeService } from './compute/service.ts';
 import { createComputeHandler } from './compute/http.ts';
+import { createMediaHandler } from './compute/media-http.ts';
+import { createMediaService } from './compute/media-service.ts';
+import { createMediaStore } from './compute/media-store.ts';
+import { createComputeOpsHandler } from './compute/ops-http.ts';
+import {
+  openWorkerObservabilityPool,
+  WorkerObservabilityStore,
+} from './compute/worker-observability-store.ts';
+import { WorkerObservabilityQueries } from './compute/worker-observability-queries.ts';
+import {
+  startWorkerObservability,
+  WorkerControlStore,
+} from './compute/worker-observability-control.ts';
+import { ComputeBroker } from './integrations/rabbitmq.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
 import { createMaterialStore } from './materials/store.ts';
@@ -83,7 +98,7 @@ import { readAdminConfig } from './admin/config.ts';
 import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
 import type { AdminService } from './admin/service.ts';
-import { createAdminHandler } from './admin/http.ts';
+import { createAdminHandler, readAdminSessionCookie } from './admin/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
@@ -218,6 +233,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let generations: GenerationService | undefined;
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
     let audio: AudioJobService | undefined;
     let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
@@ -239,7 +255,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     };
     const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
     if (assetConfig) {
-      const store = await createAssetStore(assetConfig.databaseURL);
+      const store = await createAssetStore(assetConfig.databaseURL, Boolean(computeConfig));
       try {
         const objects = createCosStorage(assetConfig);
         assetResources = { store, objects };
@@ -253,6 +269,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => conversations?.close(),
               () => materials?.close(),
               () => audio?.close(),
+              () => derivatives?.close(),
               () => acquired.close(),
             ),
         );
@@ -295,6 +312,83 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       } catch (error) {
         await (ownedCompute ? ownedCompute.close() : store.close());
+        throw error;
+      }
+    }
+    if (computeConfig && assetConfig && assetResources) {
+      const store = await createMediaStore(assetConfig.databaseURL);
+      let media: ReturnType<typeof createMediaService> | undefined;
+      try {
+        const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
+        derivatives = startAssetDerivatives(assetResources.store, acquired);
+        ctx.effect(() => () => {
+          const scheduler = derivatives?.close();
+          return closeMioResources(
+            () => acquired.close(),
+            () => scheduler,
+          );
+        });
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/compute/media',
+            handler: createMediaHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        const scheduler = derivatives?.close();
+        await closeMioResources(
+          () => (media ? media.close() : store.close()),
+          () => scheduler,
+        );
+        throw error;
+      }
+    }
+    let computeOps:
+      | {
+          view: WorkerObservabilityQueries;
+          control: WorkerControlStore;
+          wake: () => void;
+        }
+      | undefined;
+    if (computeConfig?.workerInstances?.length && assetConfig) {
+      const pool = await openWorkerObservabilityPool(assetConfig.databaseURL);
+      let telemetry: ReturnType<typeof startWorkerObservability> | undefined;
+      try {
+        const instances = computeConfig.workerInstances;
+        const observations = new WorkerObservabilityStore(pool, instances);
+        const control = adminConfig ? new WorkerControlStore(pool, instances) : undefined;
+        const ownedTelemetry = (telemetry = startWorkerObservability(
+          (stop) =>
+            ComputeBroker.connect(
+              computeConfig.brokerURL,
+              computeConfig.brokerUser,
+              computeConfig.expectedResultUser,
+              stop,
+              computeConfig.workerUsers,
+            ),
+          observations,
+          control,
+        ));
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => ownedTelemetry.close(),
+              () => pool.end(),
+            ),
+        );
+        if (adminConfig && control) {
+          computeOps = {
+            view: new WorkerObservabilityQueries(pool, instances),
+            control,
+            wake: ownedTelemetry.wake,
+          };
+        }
+      } catch (error) {
+        await closeMioResources(
+          () => telemetry?.close(),
+          () => pool.end(),
+        );
         throw error;
       }
     }
@@ -378,11 +472,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               },
             ));
         ctx.effect(() => () => acquired.close());
+        const computeHandler = computeOps
+          ? createComputeOpsHandler(
+              computeOps.view,
+              computeOps.control,
+              async (headers) => {
+                const principal = await acquired.authenticate(
+                  readAdminSessionCookie(headers.get('cookie')),
+                );
+                return principal
+                  ? {
+                      id: principal.admin.id,
+                      username: principal.admin.username,
+                      sessionId: principal.sessionId,
+                    }
+                  : null;
+              },
+              adminConfig.allowedOrigins,
+              computeOps.wake,
+            )
+          : undefined;
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/admin',
-            handler: createAdminHandler(acquired, adminConfig.allowedOrigins),
+            handler: createAdminHandler(acquired, adminConfig.allowedOrigins, computeHandler),
           }),
         );
       } catch (error) {

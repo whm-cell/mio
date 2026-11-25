@@ -380,3 +380,48 @@ it('leaves the new stream absent until its own scoped retention policy exists', 
   await prepareLocalBroker('test', testEnv);
   expect(writes.filter((path) => path.endsWith('/mio.compute.audio.results.v1'))).toHaveLength(2);
 });
+
+it('upgrades an existing video and audio topology after exact operator ACL provisioning', async () => {
+  const instanceId = `mio-test-${'1'.repeat(64)}`;
+  const env = { ...testEnv, MIO_LOCAL_COMPUTE_INSTANCE_ID: instanceId };
+  const { values, writes } = brokerFixture();
+  values.set('vhosts/mio-test', { description: 'existing vhost' });
+  values.set(policyPath, testPolicy);
+  const aPath = 'permissions/mio-test/mio-test-a';
+  const bPath = 'permissions/mio-test/mio-test-b';
+  for (const role of ['a', 'b'] as const)
+    values.set(`users/mio-test-${role}`, { ...userMetadata, passwordMarker: role });
+  values.set(aPath, {
+    ...computePermissions('a'),
+    read: '^(?:mio\\.compute\\.results\\.v1|mio\\.compute\\.audio\\.results\\.v1)$',
+  });
+  values.set(bPath, {
+    ...computePermissions('b'),
+    read: '^(?:mio\\.compute\\.commands\\.v1|mio\\.compute\\.audio\\.commands\\.v1)$',
+  });
+  const topology = computeTopology('mio-test', [instanceId]);
+  const additions = topology.filter(({ path }) => /mio\.compute\.(media|worker)[.-]/.test(path));
+  for (const scope of topology.filter((entry) => !additions.includes(entry)))
+    values.set(scope.path, scope.method === 'POST' ? [scope.body] : { ...scope.body, messages: 3 });
+  const audioStreamPath = 'queues/mio-test/mio.compute.audio.results.v1';
+  const audioStream = values.get(audioStreamPath);
+  expect(audioStream).toMatchObject({ messages: 3, arguments: { 'x-queue-type': 'stream' } });
+  await expect(prepareLocalBroker('test', env)).rejects.toThrow(`LOCAL_BROKER_CONFLICT: ${aPath}`);
+  expect(writes).toEqual([]);
+
+  // Only the deployment administrator changes role ACLs. The initializer never writes them.
+  values.set(aPath, computePermissions('a'));
+  values.set(bPath, computePermissions('b', instanceId));
+  const connect = vi
+    .spyOn(ComputeBroker, 'connect')
+    .mockResolvedValue({ close: async () => {} } as ComputeBroker);
+  await prepareLocalBroker('test', env);
+  expect(writes).toEqual(additions.map(({ path }) => path));
+  const before = [...writes];
+  await prepareLocalBroker('test', env);
+  expect(writes).toEqual(before);
+  expect(connect).toHaveBeenCalledTimes(4);
+  expect(values.get('users/mio-test-a')).toMatchObject({ passwordMarker: 'a', tags: [] });
+  expect(values.get('users/mio-test-b')).toMatchObject({ passwordMarker: 'b', tags: [] });
+  expect(values.get(audioStreamPath)).toBe(audioStream);
+});

@@ -1,14 +1,16 @@
 # 管理后台 HTTP 契约
 
-[API 导航](index.md)；模型路由与平台目录白名单存储见[用户万联配置](../providers.md)，万联 SSO 配置与注册约束见[万联 OneLink SSO 契约](../integrations/onelink-sso.md)，中间件只读监控约束见[Redis 契约](../integrations/redis.md)与[RabbitMQ 契约](../integrations/rabbitmq.md)，需求与架构背景见[Web 管理后台 PRD](../tasks/web-admin-console/prd.md)与[万联第三方登录 PRD](../tasks/onelink-login/prd.md)。仅在完整配置认证、供应商域并显式设置 `MIO_ADMIN_ENABLED=true` 后注册。
+[API 导航](index.md)；模型路由与平台目录白名单存储见[用户万联配置](../providers.md)，万联 SSO 配置与注册约束见[万联 OneLink SSO 契约](../integrations/onelink-sso.md)，计算任务与 Worker 遥测规则见[计算任务 HTTP](compute.md)与[Worker 并发观测与动态上限 PRD](../tasks/compute-service/changes/worker-observability/change.md)，中间件只读监控约束见[Redis 契约](../integrations/redis.md)与[RabbitMQ 契约](../integrations/rabbitmq.md)，需求与架构背景见[Web 管理后台 PRD](../tasks/web-admin-console/prd.md)与[万联第三方登录 PRD](../tasks/onelink-login/prd.md)。仅在完整配置认证、供应商域并显式设置 `MIO_ADMIN_ENABLED=true` 后注册。
 
 ## 本域共同约定
 
 管理员身份独立于普通用户会话，仅由 HttpOnly Cookie `mio.admin_session`（`SameSite=Lax; Path=/api/v1/admin`，HTTPS Origin 下附加 `Secure`）提供；普通用户登录 Cookie 与 Foundation 服务 Bearer 均不能替代管理员会话。
 
-所有写入请求（`POST`、`PUT`、`PATCH`、`DELETE`）必须携带允许列表内的精确 `Origin`（合并 `MIO_AUTH_ALLOWED_ORIGINS`、`MIO_AUTH_BASE_URL` 与可选 `MIO_ADMIN_ALLOWED_ORIGINS`）；携带正文的写入接口要求 `application/json`，常规接口上限 16384 字节，路由与模板写入上限 65536 字节，批量模型导入上限 262144 字节，读取期限均为 10 秒。`GET` 提供 `Origin` 时也须匹配。`OPTIONS` 预检无需登录但须匹配允许的 `Origin`。修改类入口在读取完请求体后重新核验管理员会话仍然有效。
+所有写入请求（`POST`、`PUT`、`PATCH`、`DELETE`）必须携带允许列表内的精确 `Origin`（合并 `MIO_AUTH_ALLOWED_ORIGINS`、`MIO_AUTH_BASE_URL` 与可选 `MIO_ADMIN_ALLOWED_ORIGINS`）；携带正文的写入接口要求 `application/json`，常规接口上限 16384 字节，计算 Worker 动态调限写入上限 4096 字节，路由与模板写入上限 65536 字节，批量模型导入上限 262144 字节，读取期限均为 10 秒。`GET` 提供 `Origin` 时也须匹配。`OPTIONS` 预检无需登录但须匹配允许的 `Origin`。修改类入口在读取完请求体后重新核验管理员会话仍然有效。
 
-所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、OneLink SSO 加密密钥、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`/`ONELINK_SSO_NOT_CONFIGURED`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`/`ONELINK_REGISTER_IN_PROGRESS`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`/`ONELINK_SSO_UNAVAILABLE`。
+计算 Worker 观测与调限接口（`/api/v1/admin/compute/*`）均为纯 JSON 管理接口，由独立管理前端 `mio-admin-web`（「计算 Worker」一级菜单）消费，本后端不托管任何静态前端页。只要配置 `MIO_COMPUTE_WORKER_INSTANCE_IDS`，A 即持续消费并落盘 Worker 遥测以防队列积压；启用 `MIO_ADMIN_ENABLED=true` 后经同一 `/api/v1/admin` 前缀开放查询与动态调限。启用管理后台但未配置计算 Worker 实例时，`/api/v1/admin/compute/*` 的 `OPTIONS` 仍返回合法 CORS 预检，其余请求先完成管理员会话鉴权（未登录严格返回 401 `ADMIN_UNAUTHORIZED`，不泄露配置状态），鉴权通过后返回 503 `COMPUTE_OPS_UNAVAILABLE`。Worker 观测跟踪最近一次观测和 A 接收时间，按 5 秒采样与轮询，超过 15 秒为过期，超过 60 秒为离线；`PUT /api/v1/admin/compute/workers/{id}/limits` 的审计操作人 `requestedBy` 记录当前管理员用户名 `admin.username`。
+
+所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、OneLink SSO 加密密钥、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`/`ONELINK_SSO_NOT_CONFIGURED`/`WORKER_HARD_LIMIT_EXCEEDED`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`/`WORKER_NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`/`ONELINK_REGISTER_IN_PROGRESS`/`WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`/`ONELINK_SSO_UNAVAILABLE`/`COMPUTE_OPS_UNAVAILABLE`。
 
 ## POST /api/v1/admin/auth/login
 
@@ -333,3 +335,99 @@
 错误：输入非法为 400 `ADMIN_INPUT_INVALID`；`expectedRevision` 与数据库当前版本不一致为 409 `SETTINGS_CONFLICT`；其余见共同约定。
 
 副作用：在单事务内按乐观锁写入 `mio_admin_global_settings` 并记录 `action='settings.global.update'`、`target_id='auth'` 的审计日志（`summary`、`before_state` 与 `after_state` 均绝不写入 `smsBypassCode` 明文，仅以 `smsBypassCodeMasked` 保存前两位加 `****` 或 `null`）；事务提交后立即热更新内存认证策略快照，无需重启服务即可作用于下一次认证请求（详见[认证 HTTP 契约](auth.md)）。
+
+## GET /api/v1/admin/compute/summary
+
+身份：当前登录管理员。
+
+输入：无查询参数。
+
+成功：200 返回实例新鲜度计数、在线实例已采样的实际占用、生效与部署硬上限、待槽、HOLD、A 侧转码/媒体待发数和最近一小时每实例事件峰值。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`（未登录或普通用户 Cookie），403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/workers
+
+身份：当前登录管理员。
+
+输入：可选 `limit` 为 1–64，默认 32；可选 `offset` 为 0–64，默认 0。
+
+成功：200 按实例 ID 返回分页，以 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 配置实例为范围。无心跳的实例保留身份及未观测状态。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/workers/{id}
+
+身份：当前登录管理员。
+
+输入：部署清单中的实例 ID，无查询参数。
+
+成功：200 返回最近 boot、心跳与接收时间、实际/生效/硬限、等待、HOLD、活动执行、排空和 desired 状态。过期快照不代表当前进程仍在或已经退出。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，404 `NOT_FOUND`（路径非法或实例不在部署清单内），503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/executions
+
+身份：当前登录管理员。
+
+输入：可选 `instanceId`、`jobId`、`state` 及 `limit`。状态支持 `queued`、`active`、`released`、`cancelled`、`unknown`。默认 40，最多 100 条。
+
+成功：200 返回最新优先的执行、协议、资源、归属、任务/attempt/inspection 身份与已知占槽时间。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/executions/{id}
+
+身份：当前登录管理员。
+
+输入：执行 UUID，无查询参数。
+
+成功：200 返回一条执行及至多 1000 条按同 boot sequence 排序的真实阶段/占槽事件。无法确认释放时保留未知，只有实际记录可建立结束时间。同实例同次启动的实际事件缺口若可能改变此前记录的等待状态，该状态也标为未知。缺口和排队事件可以乱序到达。业务结果仍由计算任务接口管理。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，404 `NOT_FOUND`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/history
+
+身份：当前登录管理员。
+
+输入：可选 `instanceId`、`since`、`until`、`limit`。默认最近 1 小时与 720 点。起止使用 UTC ISO 8601 整秒或毫秒，最大 7 天、1000 点。
+
+成功：200 返回范围内最新 N 点，按时间正序。单实例保留原始样本。汇总取各实例在该时刻之前 15 秒内的最新样本并求和，缺测区间与时钟差分别标记。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## GET /api/v1/admin/compute/limits
+
+身份：当前登录管理员。
+
+输入：可选 `instanceId`、`limit`。默认 40，最多 100 条。
+
+成功：200 返回最新调限审计，含操作管理员用户名（`requestedBy`）、前后值、revision、派发后的实际结果和已知确认时间。
+
+错误：400 `QUERY_INVALID`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或查询不可用）。
+
+副作用：只读查询，无副作用。
+
+## PUT /api/v1/admin/compute/workers/{id}/limits
+
+身份：当前登录管理员；读取最多 4096 字节、10 秒的 JSON 后复核原管理员会话仍有效且为同一管理员，`requestedBy` 记录当前管理员用户名 `admin.username`。
+
+输入：实例 ID 与 JSON `{expectedRevision,total,encode,probe}`，四项均为非负安全整数，无查询参数。各项上限由此实例部署硬限约束；零表示暂停相应新准入。
+
+成功：202 保存修订并等待 Worker 回执。只有匹配的应用结果表示已生效。离线也可保存已观测过实例的修订并保留待生效。
+
+错误：400 `BODY_INVALID`/`QUERY_INVALID`/`WORKER_HARD_LIMIT_EXCEEDED`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`，404 `NOT_FOUND`/`WORKER_NOT_FOUND`，409 `WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`，408 `BODY_TIMEOUT`，413 `BODY_TOO_LARGE`，415 `JSON_REQUIRED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或写入不可用）。
+
+副作用：事务写入不可变审计（`requested_by` 为当前 `admin.username`）、desired 配置和控制 outbox，并立即唤醒控制派发。B 取得后持久化校验结果，降限让占槽任务继续完成；上调或暂停只改变该实例的新准入。

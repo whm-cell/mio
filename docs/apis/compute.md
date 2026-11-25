@@ -1,6 +1,6 @@
 # 计算任务 HTTP 契约
 
-[API 导航](index.md)；消息与恢复见[计算协议](../tasks/compute-service/protocol.md)。重媒体接口在认证、资产和计算配置启用时注册；图片接口由独立生成配置启用，不依赖 B 或 RabbitMQ。身份来自登录 Cookie，POST 要求允许的精确 Origin 和 JSON；GET 提供 Origin 时也须匹配。正文上限 8192 字节和 10 秒，拒绝额外字段，读取后复核会话。响应 no-store，错误为 `{error:{code,message,requestId}}`，不暴露内部对象键、存储凭据或数据库异常。
+[API 导航](index.md)；消息与恢复见[计算协议](../tasks/compute-service/protocol.md)。重媒体接口在认证、资产和计算配置启用时注册；图片接口由独立生成配置启用，不依赖 B 或 RabbitMQ。身份来自登录 Cookie，POST 要求允许的精确 Origin 和 JSON；GET 提供 Origin 时也须匹配。单路转码正文上限 8192 字节和 10 秒，拒绝额外字段，读取后复核会话。响应 no-store，错误为 `{error:{code,message,requestId}}`，不暴露内部对象键、存储凭据或数据库异常。
 
 JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCode,createdAt,updatedAt}`；status 为 accepted、queued、running、succeeded 或 failed。`resultAssetId` 在成功前为 null，成功后可用本人[资产查询](assets.md)获取短期下载地址；errorCode 可为空，unknown 表示仍需对账而非终态。时长由 Worker 对实际媒体核验，最多 30 分钟。
 
@@ -14,7 +14,7 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 错误：400 BODY_INVALID/COMPUTE_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 ASSET_NOT_FOUND、409 REQUEST_CONFLICT/ASSET_SIZE_MISMATCH、429 COMPUTE_QUOTA_EXCEEDED、503 COMPUTE_STORAGE_UNAVAILABLE/COMPUTE_UNAVAILABLE；正文读取还可能返回 408 或 413。
 
-副作用：受理时独立统计活动视频任务（`accepted`、`queued`、`running`），限制每用户最多 10 个、全局最多 500 个未结束视频任务（与图片任务配额及事务锁分离）；向持久 outbox 写入固定 profile 命令并立即唤醒有界批量排空发布至 `mio.compute.commands.v1`（`transcode.v1`），发布确认与业务成功分别记录。
+副作用：视频任务在 `accepted`、`queued`、`running` 时占用名额。准入事务与通用媒体任务共享锁，合计每用户最多 10 个、全局最多 500 个活动任务，图片配额和锁单独计算。幂等命中仍返回原任务，同键冲突仍返回 409。新受理时向持久 outbox 写入固定 profile 命令并立即唤醒有界批量排空发布至 `mio.compute.commands.v1`（`transcode.v1`），发布确认与业务成功分别记录。
 
 ## GET /api/v1/compute/jobs/{id}
 
@@ -27,6 +27,127 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 错误：401 UNAUTHORIZED、403 ORIGIN_DENIED、404 JOB_NOT_FOUND/NOT_FOUND、503 COMPUTE_UNAVAILABLE。
 
 副作用：只读取任务状态；重复或晚到的消息不使任务终态回退。
+
+## 本域共同约定
+
+### 通用媒体处理
+
+本组接口与单路转码共用认证、资产和计算开关及活动任务配额。所有请求以本人登录 Cookie 鉴权。POST 与 OPTIONS 要求允许的精确 Origin，POST 还须为 `application/json` 并在读取正文后复核会话。GET 提供 Origin 时也须匹配。只允许无查询参数的以下路径。
+
+`requestId` 和资产 ID 为小写 UUID v4，`inputs` 为最多 64 个有序且不重复的 `{assetId}`。资产必须为本人已登记的 ready 原件或计算产物。受理核对真实对象长度，将真实 raw ETag、长度、对象键、操作及参数与 `profile: "standard-media"` 冻结在当前任务。请求和带内部快照的命令各限 256 KiB 且须为合法 UTF-8。两个大小检查均在任务和命令持久化前生效。每个输入和每个输出不超过 1 GiB。修改冻结请求须新建任务。
+
+同一 owner 和 `requestId` 的相同操作及有序输入与参数返回原任务，参数对象字段顺序不影响比较。同键异参返回 409 `REQUEST_CONFLICT`。重试使用独立请求身份，重复请求返回同一任务，输入沿用原快照。计算的 `accepted`、`queued`、`running`、`reconciling`、`cancel_requested` 合计占用每人 10、全局 500 个活动任务，与单路转码共用。
+
+MediaJobView 含 `jobId`、`requestId`、`operation`、`profile`、`inputs`、`parameters`、`status`、`attempt`、`stage`、`progress`、`errorCode`、`cancelRequested`、`data`、`outputs`、`createdAt`、`updatedAt`。进度为 0 至 1，阶段和错误码可为空。`outputs` 在成功前为空，成功后按 manifest 顺序返回 `{assetId,name,role,contentType,sizeBytes}`；可下载产物通过本人[资产查询](assets.md)取得短期下载地址，支持的音频 MIME 同时签发播放地址。内部 HLS 清单与分片通过[私有 HLS](#私有-hls)消费。状态与产物来自同一数据库快照。私有对象键、ETag 和内部 manifest 描述保留在服务端。manifest 正文按 SHA-256 验证，每个文件核对 HEAD 中的长度、ETag、SHA-256 元数据，当前 attempt 仍匹配时同事务登记所有结果资产、结构化 `data` 和成功终态。
+
+参数和返回信息见[操作设计](../tasks/compute-service/media-compute.md#操作与参数)。接口支持 `media.probe`、`video.reference_prepare`、`video.derivatives`、`video.trim`、`frames.extract`、`scenes.detect`、`video.split`、`media.export`、`audio.extract`、`audio.waveform`、`audio.remux`、`audio.concat`、`composition.render`、`video.mix`、`video.narration_render`、`subtitle.burn`。执行器根据媒体内容识别独立音视频容器，能够使用 MP4、MOV、Matroska、WebM、AVI、MPEG、常用音频及静态图像容器中的实际音视频流。输入须为单个冻结对象中的媒体，外部清单、播放列表及其他对象引用无法提交为媒体源。合规的参考视频只探测，返回 `data={compressed:false,trimmed:false}` 与空 `outputs`，继续使用原输入资产。
+
+`media.probe` 的 `data.probe.width`、`height` 是应用源像素宽高比与旋转后的显示尺寸。`rotation` 报告归一化至 0–360 度的源旋转，`sampleAspectRatio` 报告源像素宽高比。编码尺寸 240×180、SAR 4:3、旋转 +90° 的源返回 `width=180`、`height=320`。显示时直接使用这对尺寸，无需重复变换。
+
+当音轨长于画面流时，`frames.extract` 的 `first_last` 返回实际最后一帧。`audio.remux` 使用首个实际视频流的结束位置裁剪较长的新音轨，较短的新音轨自然结束。`sourceDurationSeconds` 可指定更短的输出窗口，超出画面末尾的请求返回任务错误 `INPUT_INVALID`。
+
+`video.derivatives` 接受一个本人 ready 视频与 `parameters.profile` 为 `ordinary` 或 `canvas`。两档均交付私有 H.264 MP4 预览、JPEG 封面及 MPEG-TS HLS 播放包，`data.probe` 保留原件探测值。普通档以一次 FFmpeg HLS 打包步骤产生清单与全部分片，主清单使用已核对的实际编码尺寸。亚秒视频保留实测的分片时长，子清单的整数目标时长至少为 1 秒。画布档源视频最长 720 秒，按 6 秒目标独立编码，每档最多 120 片、每片不超过 4 MiB。720p/480p 沿显示方向等比适配，不放大，实际尺寸相同只保留一档。分片核对长度、时间、音轨和连续性，时间误差最多 0.35 秒。带源音轨的产物保留首条音轨为 AAC，音轨比画面短的区间补静音。画布音轨连续编码为 48 kHz AAC，各视频片按同一帧时钟复用完整音频包。末尾不足以容纳下一 AAC 帧时与前片合并，时间误差仍受 0.35 秒限制。普通档与通用探测的输入时长上限一致，为 3600 秒。
+
+四种渲染操作各返回一份 `primary` H.264 MP4。输入引用一律为冻结 `inputs` 的零基下标，时间单位为秒。
+
+| 操作                     | 参数及时间线                                                                                                                                                                                                                                                               |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `composition.render`     | `resolution` 为 `720p`、`1080p` 或 `4k`，`durationSeconds` 最长 3600 秒，支持可选 `fps`（1–60，默认 30）。`tracks` 每类画面、音频、字幕各至多六轨，`items` 共至多 256 项。按照首个可见画面的实际显示比例选画布，短边使用所选规格。纯音频、字幕或空画面时间线用 16:9 黑底。 |
+| `video.mix`              | 提交 `clips`（每项含 `inputIndex`、`startSeconds`、`durationSeconds`）和整数 `seed`，可选 `bgmInputIndex`、`bgmVolume`。源窗口冻结，种子决定重放顺序。1920×1080，保留源显示比例，合成时长由窗口长度之和决定，长背景音乐截断，短背景音乐补静音。仅显式 BGM 进入输出音轨。   |
+| `video.narration_render` | 提交 `videoInputIndex`、`narrationInputIndex`，可选 `bgmInputIndex`、`bgmVolume`、`cues` 和 `style`。1920×1080，保留源显示比例。以首条配音音轨解码后的实测时长决定输出，短画面冻结真实末帧，长画面截断。配音经过响度处理，背景音乐限于口播窗口。                           |
+| `subtitle.burn`          | 提交一个视频与 `cues`，可选 `style`。按源旋转和 SAR 规范化显示尺寸，原有音轨转 AAC。                                                                                                                                                                                       |
+
+画面、音频和字幕轨通过 `kind` 与 `index` 标识，轨号为 0–5。各项使用 `track`、`startSeconds` 和 `durationSeconds`。图片放在画面轨并保持首帧。隐藏轨和隐藏项从导出过滤，锁定轨照常导出。画面和字幕各自从低轨号向高轨号叠加，同轨按开始时间稳定排序。画面未覆盖的区间呈现黑底。视频原声和显式音轨参与归一化混音，遮挡画面不关闭原声。可设 `muted` 与增益，原声保留相对画面的音轨起始位置。`sourceStartSeconds` 与 `speed`（0.5–4）决定源窗口，源窗口完全早于所引用流的首帧或超出其实际结束位置时返回 `INPUT_INVALID`。窗口起点早于首帧且包含首帧时，混剪保持前段为黑底，合成在首帧前继续显示下层画面或黑底，音轨保留前导静音。输出帧按同一全局帧时钟量化。`transform` 以画布中心为基准，支持 `contain`、`cover` 及 `manual`，`x`、`y` 为位移，`rotation` 为角度。显式 `manual` 宽高可以非等比，并允许画布边缘裁剪。4K 使用相同的单文件 1 GiB、工作目录 10 GiB 和空闲 2 GiB 预算。
+
+字幕项提供文本与可选样式；`cues` 每项含 `startSeconds`、`endSeconds` 和 `text`。`font` 为 `sans` 或 `serif`，使用随 B 发布的 Noto CJK。字号 `fontSize`、边距 `margin` 和描边 `outline` 按 1080p 像素设置并随输出高度换算。`color`、`outlineColor`、`background` 为 `#RRGGBB` 或 `#RRGGBBAA`。`alignment` 为 `bottom`、`middle` 或 `top`。字幕烧录和带字幕的口播在 `data.subtitles` 返回原始提示文本和时间。媒体输入、参数与字幕均使用结构化字段。ASS 覆盖、FFmpeg 表达式和路径由 B 生成。
+
+启用新增操作的 A 前，应将全部媒体编码消费者 B 更新至支持该操作的版本，完成字体和 libass 能力自检后再切换 A。B 缺少必需能力时按 `CAPABILITY_UNAVAILABLE` 报告通用媒体任务。
+
+A 与 B 对同一 attempt 仲裁取消和成功。A 已提交成功时，取消返回原成功结果。取消先持久化时，后续已完成的结果结束为 `cancelled`，输出保留在内部对账中。B 收到取消后跳过未开始作业，运行中先终止并回收实际进程，再报告取消。已知回收中断、执行超时及瞬时存储失败可自动开启下一 attempt。人工重试需要 `failed` 状态，自动与人工合计最多三次。已取消及待对账的任务禁止新 attempt。
+
+`PROCESS_UNKNOWN`、`UPLOAD_UNKNOWN`、`OUTPUT_MISMATCH` 或 A 核验摘要失败时保留原 attempt 与对象身份。`recover` 重新核对该次的子进程、旧键及已保留输出。仍无法证明安全时继续对账。B 在条件 GET 返回 412 时报告 `INPUT_CHANGED`，仅网络中断或 408、429、5xx 读取错误报告可重试的 `STORAGE_FAILURE`，存储权限拒绝保留为不可自动重试的失败。自动或人工取消、失败及恢复均保留原件和已登记资产。
+
+常见错误为 400 `BODY_INVALID`、`QUERY_INVALID`、`MEDIA_INPUT_INVALID`、`MEDIA_OPERATION_UNAVAILABLE`，401 `UNAUTHORIZED`，403 `ORIGIN_DENIED`、`ORIGIN_REQUIRED`，404 `ASSET_NOT_FOUND`、`JOB_NOT_FOUND` 或无效路径 `NOT_FOUND`，409 `REQUEST_CONFLICT`、`ASSET_SIZE_MISMATCH`、`ASSET_SOURCE_CHANGED`、`MEDIA_RETRY_NOT_ALLOWED`、`MEDIA_RECOVER_NOT_ALLOWED`，429 `COMPUTE_QUOTA_EXCEEDED`，503 `COMPUTE_UNAVAILABLE` 或 `COMPUTE_STORAGE_UNAVAILABLE`。错误方法返回 405，JSON 介质不符返回 415，超时或正文过大返回 408 或 413。
+
+## POST /api/v1/compute/media
+
+身份：当前登录用户。
+
+输入：`{requestId,operation,inputs,parameters}`，输入顺序、大小和身份要求见[通用媒体约定](#通用媒体处理)。
+
+成功：首次受理 202，幂等重放 200，均返回 MediaJobView。
+
+错误：见[通用媒体约定](#通用媒体处理)。
+
+副作用：按本人 ready 资产和真实 raw 对象冻结输入，事务性建立任务及待发命令。
+
+## GET /api/v1/compute/media
+
+身份：当前登录用户。
+
+输入：无查询参数。
+
+成功：200 `{jobs:[MediaJobView]}`。按创建时间、ID 倒序，最多 100 条。
+
+错误：见[通用媒体约定](#通用媒体处理)。
+
+副作用：读取本人任务及同一快照的已登记产物。
+
+## GET /api/v1/compute/media/{id}
+
+身份：任务所有者。
+
+输入：服务端生成的任务 UUID，无查询参数。
+
+成功：200 MediaJobView。
+
+错误：其他用户或不存在的任务返回 404 `JOB_NOT_FOUND`，其余见[通用媒体约定](#通用媒体处理)。
+
+副作用：读取本人任务及同一快照的已登记产物。
+
+## POST /api/v1/compute/media/{id}/cancel
+
+身份：任务所有者。
+
+输入：任务 UUID 和正文 `{}`。
+
+成功：200 MediaJobView，可能先返回 `cancel_requested` 直至 B 回报。
+
+错误：见[通用媒体约定](#通用媒体处理)。
+
+副作用：同事务持久化取消意图与独立待发控制消息。已有终态时返回该状态。
+
+## POST /api/v1/compute/media/{id}/retry
+
+身份：任务所有者。
+
+输入：任务 UUID 和正文 `{requestId}`，该请求 ID 是小写 UUID v4。
+
+成功：200 MediaJobView。重复的重试请求返回同一任务。
+
+错误：不允许重试时返回 409 `MEDIA_RETRY_NOT_ALLOWED`，其余见[通用媒体约定](#通用媒体处理)。
+
+副作用：沿原快照建立新 attempt，自动与人工重试合计最多三次。
+
+## POST /api/v1/compute/media/{id}/recover
+
+身份：任务所有者。
+
+输入：任务 UUID 和正文 `{}`。
+
+成功：200 MediaJobView。旧结果尚待确认时保持当前对账状态。
+
+错误：活动任务尚未进入对账或取消时返回 409 `MEDIA_RECOVER_NOT_ALLOWED`，其余见[通用媒体约定](#通用媒体处理)。
+
+副作用：沿当前 attempt 持久化对账控制。A 若已保存待核验成功回报，会重新核对其 manifest。
+
+### 私有 HLS
+
+`GET /api/v1/compute/media/{id}/hls` 返回本人成功的 `video.derivatives` 主清单。`GET /api/v1/compute/media/{id}/hls/{assetId}` 返回该主清单所列的本人子清单。两条路由只接受任务和子清单 UUID，使用登录 Cookie 和本组 GET Origin 规则，返回 `application/vnd.apple.mpegurl` 与 `Cache-Control: private, no-store`。没有成功播放包、非本人任务或未列出的子清单返回 404 `MEDIA_HLS_NOT_FOUND`。
+
+A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主清单的变体引用改写成本组鉴权子路径。子清单只可引用同一任务和 attempt 已登记的本档 MPEG-TS 分片，所有引用通过后才重写成短期私有 COS inline GET。循环、外部引用、未知 URI 标签以及登记内容不符返回 409 `MEDIA_HLS_INVALID`。
+
+每个分片的签名寿命为在子清单中累计的播放开始秒数向上取整后加 300 秒。普通档最多 3900 秒，画布档最多 1020 秒，并受临时 COS 凭据剩余寿命限制。连续 1× 播放可按同一子清单在不同时间取得分片。长时间暂停、延迟播放或过期后回放时可重新请求本人子清单取得新签名。签名不得公开或写入日志。
 
 ## POST /api/v1/compute/images
 
@@ -81,3 +202,5 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 A 使用 `MIO_GENERATIONS_ENABLED=true` 和绝对持久目录 `MIO_GENERATIONS_DATA_DIR`；身份、媒体数据库、COS 及 provider master key 仍须配置。先迁移 assets，再显式执行 `pnpm generations:migrate --apply`（本地为 `pnpm migrate:dev generations --apply`）。历史任务及输出原表继续使用；没有 A 执行记录的旧 B 任务只读查询，不被 A 重新提交。内部密文、上游 ID、执行阶段和文件定位不进入公开视图。
 
 切换沿[常驻环境](../local-environments.md#图片生成迁移与切换)先暂停新提交、排空并对账旧任务/outbox/MQ/B journal 和未确认上传，再停旧图片执行器、启动 A 并恢复接单。未对账 unknown、恢复数据缺失、存储权限不足阻止切换。A 接过新任务后先对账新任务，不能直接交旧 B 重跑。成功 COS/DB 对账后清理已确认临时图。进程在已完成提交后中断时，后台按确切完成检查点和 COS 输出补清；只处理全部完成且尝试键无歧义的文件，清理可幂等续接，失败项分页推进并后续回访。失败、部分完成与未知检查点保留；磁盘不足停止新任务准入，不自动删除恢复数据。
+
+跨任务的 Worker 容量、占槽历史和动态调限统一收口至[管理后台 HTTP 契约](admin.md)的 `/api/v1/admin/compute/*` 纯 JSON 接口，由超级管理员通过独立前端 `mio-admin-web` 使用。本人任务接口和结果归属规则不变。

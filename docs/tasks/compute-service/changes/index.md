@@ -4,3 +4,4 @@
 | ------------------------- | ---------- | ------------------------------------------------- | ---------------- | --------------------------------------------- |
 | image-io-concurrency      | feature    | 图片 I/O 计算队列解耦、独立配额与 Worker 有界并发 | 目标与边界       | [详情](./image-io-concurrency/change.md)      |
 | image-upload-verification | adjustment | 图片上传完整性与对象关联                          | 本期验收与延期项 | [详情](./image-upload-verification/change.md) |
+| worker-observability      | feature    | Worker 并发观测、任务占槽历史与动态上限 PRD       | 目标与边界       | [详情](./worker-observability/change.md)      |

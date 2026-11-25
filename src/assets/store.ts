@@ -3,6 +3,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import { checkAssetSchema } from './schema.ts';
 import { AssetError } from './contracts.ts';
+import { mediaHlsPath } from '../compute/media-hls.ts';
 
 const log = createLogger('app', 'asset-store');
 
@@ -33,11 +34,30 @@ interface AudioPublication {
   etag: string;
 }
 
+interface DerivativeIntent {
+  asset_id: string;
+  owner_id: string;
+  request_id: string;
+  profile: 'ordinary';
+}
+interface DerivativeProfile {
+  profile: 'ordinary';
+  jobId: string | null;
+  status: 'pending' | 'scheduled' | 'succeeded' | 'failed';
+  errorCode: string | null;
+  outputs: { assetId: string; name: string; role: string }[];
+}
+// Both the immutable request and its payload must belong to this intent.
+const intentJob = `j.owner_id=i.owner_id AND j.request_id=i.request_id AND j.operation='video.derivatives'
+  AND j.parameters->>'profile'=i.profile AND j.inputs->0->>'assetId'=i.asset_id::text`;
+
 export class AssetStore {
   private readonly pool: Pool;
+  private readonly derivativesEnabled: boolean;
 
-  constructor(pool: Pool) {
+  constructor(pool: Pool, derivativesEnabled = false) {
     this.pool = pool;
+    this.derivativesEnabled = derivativesEnabled;
   }
 
   async create(id: string, owner: string, filename: string, contentType: string, size: number) {
@@ -122,14 +142,87 @@ export class AssetStore {
     return (
       (
         await this.pool.query<AssetRow>(
-          `UPDATE mio_assets SET state='ready', raw_key=$4, lease_id=NULL, lease_until=NULL
-         WHERE id=$1 AND owner_id=$2 AND state='finalizing' AND lease_id=$3
-         AND lease_until>now() AND expires_at>now()
-         RETURNING *`,
-          [id, owner, lease, rawKey],
+          `WITH ready AS (
+             UPDATE mio_assets SET state='ready', raw_key=$4, lease_id=NULL, lease_until=NULL
+             WHERE id=$1 AND owner_id=$2 AND state='finalizing' AND lease_id=$3
+             AND lease_until>now() AND expires_at>now() RETURNING *
+           ), intent AS (
+             INSERT INTO mio_asset_derivative_intents(asset_id,owner_id,profile)
+             SELECT id,owner_id,'ordinary' FROM ready
+             WHERE $5 AND lower(content_type) LIKE 'video/%' AND staging_key='mio/staging/'||id
+             ON CONFLICT(asset_id,profile) DO NOTHING
+           )
+           SELECT * FROM ready`,
+          [id, owner, lease, rawKey, this.derivativesEnabled],
         )
       ).rows[0] ?? null
     );
+  }
+
+  async claimDerivative(): Promise<DerivativeIntent | undefined> {
+    return (
+      await this.pool.query<DerivativeIntent>(`
+        WITH due AS (
+          SELECT asset_id, profile FROM mio_asset_derivative_intents
+          WHERE job_id IS NULL AND error_code IS NULL AND next_attempt_at<=now()
+          ORDER BY next_attempt_at, asset_id, profile
+          LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        UPDATE mio_asset_derivative_intents i SET next_attempt_at=now()+interval '5 seconds'
+        FROM due WHERE i.asset_id=due.asset_id AND i.profile=due.profile
+        RETURNING i.asset_id,i.owner_id,i.request_id,i.profile
+      `)
+    ).rows[0];
+  }
+
+  async linkDerivative(intent: DerivativeIntent, jobId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE mio_asset_derivative_intents i SET job_id=j.id, error_code=NULL
+       FROM mio_media_jobs j WHERE i.asset_id=$1 AND i.profile=$2 AND j.id=$3 AND ${intentJob}
+       AND i.job_id IS NULL`,
+      [intent.asset_id, intent.profile, jobId],
+    );
+  }
+
+  async rejectDerivative(intent: DerivativeIntent, errorCode: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE mio_asset_derivative_intents i SET error_code=$3
+       WHERE i.asset_id=$1 AND i.profile=$2 AND i.job_id IS NULL AND i.error_code IS NULL
+       AND NOT EXISTS (SELECT 1 FROM mio_media_jobs j WHERE ${intentJob})`,
+      [intent.asset_id, intent.profile, errorCode],
+    );
+  }
+
+  async derivativeView(assetId: string, owner: string) {
+    if (!this.derivativesEnabled)
+      return { enabled: false as const, status: 'disabled' as const, profiles: [] };
+    const { rows } = await this.pool.query<DerivativeProfile>(
+      `SELECT i.profile,j.id AS "jobId",
+        CASE WHEN j.state='succeeded' THEN 'succeeded'
+             WHEN j.state IN ('failed','cancelled') OR i.error_code IS NOT NULL THEN 'failed'
+             WHEN j.id IS NULL THEN 'pending' ELSE 'scheduled' END AS status,
+        CASE WHEN j.state='cancelled' THEN 'MEDIA_CANCELLED' ELSE COALESCE(j.error_code,i.error_code) END AS "errorCode",
+        COALESCE((
+          SELECT jsonb_agg(jsonb_build_object('assetId',f.asset_id,'name',f.name,'role',f.role)
+                           ORDER BY f.ordinal,f.name)
+          FROM mio_media_files f WHERE f.job_id=j.id AND j.state='succeeded'
+        ),'[]'::jsonb) AS outputs
+       FROM mio_asset_derivative_intents i
+       LEFT JOIN mio_media_jobs j ON j.id=i.job_id AND j.owner_id=i.owner_id
+       WHERE i.asset_id=$1 AND i.owner_id=$2 ORDER BY i.profile`,
+      [assetId, owner],
+    );
+    return {
+      enabled: true as const,
+      status: rows.length ? ('enabled' as const) : ('not_applicable' as const),
+      profiles: rows.map((row) => ({
+        ...row,
+        ...(row.jobId &&
+        row.outputs.some((file) => file.role === 'hls' && file.name === 'master.m3u8')
+          ? { playbackUrl: mediaHlsPath(row.jobId) }
+          : {}),
+      })),
+    };
   }
 
   async release(id: string, lease: string): Promise<void> {
@@ -174,7 +267,10 @@ export class AssetStore {
   }
 }
 
-export async function createAssetStore(databaseURL: string): Promise<AssetStore> {
+export async function createAssetStore(
+  databaseURL: string,
+  derivativesEnabled = false,
+): Promise<AssetStore> {
   const pool = new Pool({
     connectionString: databaseURL,
     max: 5,
@@ -186,7 +282,7 @@ export async function createAssetStore(databaseURL: string): Promise<AssetStore>
   pool.on('error', () => log.error('ASSET_DATABASE_CONNECTION_ERROR'));
   try {
     await checkAssetSchema(pool);
-    return new AssetStore(pool);
+    return new AssetStore(pool, derivativesEnabled);
   } catch {
     await pool.end();
     throw new Error('ASSET_SCHEMA: run assets:migrate and check database access');

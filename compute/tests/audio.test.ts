@@ -14,6 +14,7 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { drainInput, prepareAudioDirectory } from '../src/adapters/media.ts';
 import { AudioWorker } from '../src/audio-worker.ts';
+import { ResourceSlots } from '../src/resource-slots.ts';
 
 const sampleRate = 16000;
 let directory: string;
@@ -59,7 +60,7 @@ function command(sizeBytes = 100): AudioInspectCommandV1 {
   };
 }
 
-function fixture(body: Buffer, headDigest?: string) {
+function fixture(body: Buffer, headDigest?: string, slots?: ResourceSlots) {
   const sha256 = createHash('sha256').update(body).digest('hex');
   const head = vi.fn(async () => ({
     sizeBytes: body.length,
@@ -78,6 +79,7 @@ function fixture(body: Buffer, headDigest?: string) {
     directory,
     scratch,
     stop.signal,
+    slots,
   );
   const req = command(body.length);
   return { worker, req, head, download, publishAudio, sha256, scratch, stop };
@@ -200,4 +202,30 @@ it('rejects changed object identity before downloading and leaves a failed publi
   expect(publishAudio).toHaveBeenCalledWith(
     expect.objectContaining({ state: 'failed', errorCode: 'AUDIO_INPUT_CHANGED' }),
   );
+});
+
+it('uses the process-wide probe slot through confirmation and keeps encode admission independent', async () => {
+  const slots = new ResourceSlots();
+  const releaseReserved = slots.acquire('probe');
+  expect(releaseReserved).not.toBeNull();
+  const { worker, req, head, publishAudio } = fixture(wave(11), undefined, slots);
+  const confirmed = Promise.withResolvers<void>();
+  publishAudio.mockReturnValueOnce(confirmed.promise);
+  const ack = vi.fn();
+  const work = worker.handle(req, ack);
+  try {
+    await Promise.resolve();
+    expect(head).not.toHaveBeenCalled();
+    releaseReserved!();
+    await vi.waitFor(() => expect(publishAudio).toHaveBeenCalledOnce(), { timeout: 5000 });
+    expect(slots.available('probe')).toBe(false);
+    expect(slots.available('encode')).toBe(true);
+    expect(ack).not.toHaveBeenCalled();
+  } finally {
+    releaseReserved!();
+    confirmed.resolve();
+    await work;
+  }
+  expect(slots.available('probe')).toBe(true);
+  expect(ack).toHaveBeenCalledOnce();
 });

@@ -46,13 +46,17 @@ export function readBody(request: IncomingMessage, limit = 8192): Promise<Buffer
 export async function readJsonBody(
   request: IncomingMessage,
   limit = 8192,
+  strictUtf8 = false,
 ): Promise<Record<string, unknown>> {
-  return parseJsonBody(await readBody(request, limit));
+  return parseJsonBody(await readBody(request, limit), strictUtf8);
 }
 
-export function parseJsonBody(bytes: Buffer): Record<string, unknown> {
+export function parseJsonBody(bytes: Buffer, strictUtf8 = false): Record<string, unknown> {
   try {
-    const value: unknown = JSON.parse(bytes.toString('utf8'));
+    const text = strictUtf8
+      ? new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      : bytes.toString('utf8');
+    const value: unknown = JSON.parse(text);
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
     return value as Record<string, unknown>;
   } catch {

@@ -3,20 +3,26 @@ import type { Worker } from './worker.ts';
 
 /** One serial maintenance window for this worker's consumer and journal. */
 export class Maintenance {
-  readonly #broker: Pick<Broker, 'consuming' | 'pause' | 'consume'>;
+  readonly #broker: Pick<Broker, 'consuming' | 'pause' | 'consume'> &
+    Partial<Pick<Broker, 'consumeTranscodes'>>;
   readonly #worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'>;
   readonly #failed: (error: unknown) => void;
   #active = true;
+  #parallelSubscribed = false;
+  readonly #buffered: boolean;
   #flight: Promise<void> | null = null;
 
   constructor(
-    broker: Pick<Broker, 'consuming' | 'pause' | 'consume'>,
+    broker: Pick<Broker, 'consuming' | 'pause' | 'consume'> &
+      Partial<Pick<Broker, 'consumeTranscodes'>>,
     worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'>,
     failed: (error: unknown) => void,
+    buffered = false,
   ) {
     this.#broker = broker;
     this.#worker = worker;
     this.#failed = failed;
+    this.#buffered = buffered;
   }
 
   tick(): Promise<void> {
@@ -38,6 +44,18 @@ export class Maintenance {
 
   async #run(): Promise<void> {
     if (!this.#active) return;
+    if (this.#buffered) {
+      // Waiting deliveries cannot drain while paused at zero; reconcile different attempts in place.
+      await this.#worker.reconcileOne();
+      if (this.#active && !this.#parallelSubscribed) {
+        await this.#broker.consumeTranscodes!(
+          (command, ack) => this.#worker.handle(command, ack, true),
+          this.#failed,
+        );
+        this.#parallelSubscribed = true;
+      }
+      return;
+    }
     const needsCycle = !this.#broker.consuming || this.#worker.needsMaintenance();
     if (!needsCycle) return;
     await this.#broker.pause();

@@ -20,6 +20,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   ADMIN_USERNAME_TAKEN: 'Username is already taken',
   ADMIN_INPUT_INVALID: 'Administrator request input is invalid',
   ADMIN_UNAVAILABLE: 'Administrator service is unavailable',
+  COMPUTE_OPS_UNAVAILABLE: 'Compute worker observability service is unavailable',
   MODEL_ALREADY_EXISTS: 'Model ID already exists in platform catalog',
   MODEL_NOT_FOUND: 'Target model was not found in platform catalog',
   TEMPLATE_KEY_TAKEN: 'Template key already exists',
@@ -60,6 +61,10 @@ function parseCookie(header: string | undefined, targetName: string): string | n
     }
   }
   return null;
+}
+
+export function readAdminSessionCookie(header: string | null | undefined): string | null {
+  return parseCookie(header ?? undefined, COOKIE_NAME);
 }
 
 function shouldSetSecureCookie(origin: string | undefined): boolean {
@@ -195,7 +200,7 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
     }
     const body = await readJsonBody(request, DEFAULT_BODY_LIMIT);
     assertExactKeys(body, []);
-    const token = parseCookie(request.headers.cookie, COOKIE_NAME);
+    const token = readAdminSessionCookie(request.headers.cookie);
     await service.logout(token);
     response.setHeader('Set-Cookie', formatSessionCookie('', 0, shouldSetSecureCookie(rawOrigin)));
     sendJson(response, HTTP_STATUS.OK, { ok: true });
@@ -371,13 +376,36 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
   },
 };
 
-export function createAdminHandler(service: AdminService, allowedOrigins: readonly string[]) {
+export function createAdminHandler(
+  service: AdminService,
+  allowedOrigins: readonly string[],
+  computeHandler?: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
+) {
   const origins = new Set(allowedOrigins);
 
   return async function handleAdminRequest(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
+    let url: URL | null = null;
+    try {
+      url = new URL(request.url ?? '/', 'http://mio.local');
+    } catch {
+      url = null;
+    }
+
+    const subPath = !url
+      ? null
+      : url.pathname === ADMIN_BASE
+        ? '/'
+        : url.pathname.startsWith(`${ADMIN_BASE}/`)
+          ? url.pathname.slice(ADMIN_BASE.length)
+          : null;
+    if (computeHandler && (subPath === '/compute' || subPath?.startsWith('/compute/'))) {
+      await computeHandler(request, response);
+      return;
+    }
+
     const requestId = startHttpResponse(response);
     const fail = (status: number, code: string) => {
       writeApiError(
@@ -395,20 +423,51 @@ export function createAdminHandler(service: AdminService, allowedOrigins: readon
       return;
     }
 
-    let url: URL;
-    try {
-      url = new URL(request.url ?? '/', 'http://mio.local');
-    } catch {
+    if (!url) {
       fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       return;
     }
 
-    const subPath =
-      url.pathname === ADMIN_BASE
-        ? '/'
-        : url.pathname.startsWith(`${ADMIN_BASE}/`)
-          ? url.pathname.slice(ADMIN_BASE.length)
-          : null;
+    const requireAdmin = async (): Promise<AdminPrincipal> => {
+      const token = readAdminSessionCookie(request.headers.cookie);
+      const principal = await service.authenticate(token);
+      if (!principal) throw new AdminError(HTTP_STATUS.UNAUTHORIZED, 'ADMIN_UNAUTHORIZED');
+      return principal;
+    };
+
+    if (subPath === '/compute' || subPath?.startsWith('/compute/')) {
+      const method = request.method ?? 'GET';
+      if (method === 'OPTIONS') {
+        if (!rawOrigin) {
+          fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+          return;
+        }
+        setCorsHeaders(response, rawOrigin);
+        response.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
+        response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        response.statusCode = HTTP_STATUS.NO_CONTENT;
+        response.end();
+        return;
+      }
+      setCorsHeaders(response, rawOrigin);
+      try {
+        await requireAdmin();
+      } catch (error) {
+        if (response.writableEnded) return;
+        if (error instanceof AdminError) {
+          fail(error.status, error.code);
+          return;
+        }
+        fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ADMIN_UNAVAILABLE');
+        return;
+      }
+      if (method !== 'GET' && !rawOrigin) {
+        fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+        return;
+      }
+      fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_OPS_UNAVAILABLE');
+      return;
+    }
     const methods = subPath ? KNOWN_ROUTES[subPath] : undefined;
     if (!methods) {
       fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
@@ -439,13 +498,6 @@ export function createAdminHandler(service: AdminService, allowedOrigins: readon
       return;
     }
     setCorsHeaders(response, rawOrigin);
-
-    const requireAdmin = async (): Promise<AdminPrincipal> => {
-      const token = parseCookie(request.headers.cookie, COOKIE_NAME);
-      const principal = await service.authenticate(token);
-      if (!principal) throw new AdminError(HTTP_STATUS.UNAUTHORIZED, 'ADMIN_UNAUTHORIZED');
-      return principal;
-    };
 
     const readAuthJson = async (
       allowedKeys: readonly string[],

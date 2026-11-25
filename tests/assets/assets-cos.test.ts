@@ -82,6 +82,27 @@ it('uses the official SDK to bind PUT length and host and signs a private attach
   expect(playback.searchParams.get('q-signature')).toBeTruthy();
 });
 
+it('signs a private HLS segment GET for inline MPEG-TS using the official SDK', () => {
+  const storage = createCosStorage({
+    databaseURL: 'postgresql://example.invalid/media',
+    bucket: 'mio-test-1234567890',
+    region: 'ap-shanghai',
+    secretId: 'example-id',
+    secretKey: 'example-key',
+    sessionToken: 'synthetic+token=/&%#?',
+  });
+  const key = 'mio/media/example-job/example-attempt/seg-720-000.ts';
+  const playback = new URL(storage.hlsSegmentUrl!(key, 1014));
+  expect(playback.protocol).toBe('https:');
+  expect(playback.pathname).toBe('/' + key);
+  expect(playback.searchParams.get('response-content-disposition')).toBe('inline');
+  expect(playback.searchParams.get('response-content-type')).toBe('video/mp2t');
+  expect(playback.searchParams.get('x-cos-security-token')).toBe('synthetic+token=/&%#?');
+  expect(playback.searchParams.get('q-signature')).toBeTruthy();
+  const [start, end] = playback.searchParams.get('q-sign-time')!.split(';').map(Number);
+  expect(end! - start!).toBe(1014);
+});
+
 it('passes conditional copy and non-overwrite headers to the official SDK', async () => {
   const copy = vi.spyOn(COS.prototype, 'putObjectCopy').mockResolvedValue({
     ETag: 'etag',

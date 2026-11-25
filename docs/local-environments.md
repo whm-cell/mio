@@ -59,6 +59,8 @@ W1/W2 的供应商和文本服务不需要资产/COS 配置。转码使用媒体
 
 `pnpm migrate:dev` / `pnpm migrate:test` 默认预览认证迁移，`--apply` 才执行。可以在环境文件配置相应业务后指定 `conversations`、`providers`、`assets`、`compute`、`generations`、`materials` 或 `admin`，例如 `pnpm migrate:dev conversations --apply`；资产必须先于计算、生成或素材迁移，供应商迁移先于或随 `admin` 迁移执行，分库供应商引用迁移沿[供应商规范](providers.md)。供应商单轨模型路由通过 `pnpm route:dev <routes.json | --stdin>`（或 `pnpm route:test`）受控导入所选环境库，不向运行时暴露管理密码。管理后台在设置 `MIO_ADMIN_ENABLED=true`（及可选前端 Origin 白名单 `MIO_ADMIN_ALLOWED_ORIGINS`）并完成 `pnpm migrate:dev admin --apply` 后启用，超级管理员账号通过 `pnpm admin:dev --username <name> --password-stdin` 显式初始化，RabbitMQ 与 Redis 完整档只读监控账号通过 `pnpm monitor:init:dev`（或 `pnpm monitor:init:test`）一键生成最小权限监控凭据并完成探针核验，详见[管理后台 HTTP](apis/admin.md)。未启用域不自动迁移。
 
+视频上传自动派生随计算开关启用。已有媒体数据库升级时先显式执行 `pnpm migrate:dev assets --apply`，为资产库增设派生意图表。启用了资产服务的部署都需要此迁移，含计算关闭的部署。计算启用时再核对通用媒体计算迁移、A/B 配置及媒体队列；test 环境使用对应 `migrate:test`。升级保留既有资产和任务，启动不回填历史上传。升级计算服务时先部署支持视频派生的新 Worker B，并排空旧 Worker B 的在途任务、停止旧进程，再启动会自动派生的新 A。旧 A 的通用媒体基础命令可由新 B 继续执行。旧 B 若先收到 `video.derivatives`，会以 `CAPABILITY_UNAVAILABLE` 结束该次派生，已登记原件仍可读取和下载。计算未启用时，新视频上传仍可登记、读取和下载，派生状态为 disabled。真实 COS 的 HLS 读取与浏览器跨域条件见[私有 HLS 存储契约](integrations/cos.md#私有-hls-读取)。
+
 [语音任务和音色](apis/audio.md)沿供应商库迁移。认证和供应商启用后可读取本地音色库。执行配音及复刻还需具备资产库、私有 COS 和包含音频队列的计算服务配置。启用前预览供应商和会话迁移，备份实际的供应商与资产库，并在隔离现场恢复和重跑。先完成两域结构，再为确认过的本人模型受控导入语音路由和登记音色。已有音色和成功作品继续按原引用查询，待处理任务按原输出检查点恢复。
 
 语音回归使用隔离的模型、音色、COS 协议替身和测试队列。开发环境的真实验证可以用本机私有旁库和临时 vhost 限定一名测试用户，并沿用其现成供应商配置和私有 COS。用可识别的最小测试任务记录实际供应商提交次数和回执，断线继续原任务，发布后通过原 assetId 重新签发地址。上游操作范围、音色导入和回退边界分别见[供应商配置](providers.md)和[语音 PRD](tasks/onelink-audio-generation/prd.md#53-验证启用与回退)。
@@ -178,3 +180,7 @@ MQ 显式探针 `node tests/environment/local-brokers-live.ts --restart-local-br
 新的 `live-image-loop.ts dev` 只启动 A，并在进程中安装单次生成 POST 审计；入口不配置 RabbitMQ 或启动 B，继续走正式登录、目录刷新、图片 HTTP、资产下载、重启和幂等读取。用户指示推进开发或验收时，默认允许复用常驻 `mio_dev` 既有账号／凭据与私有测试 COS 执行单次有界、最小规格的真实供应商验收（脚本的 `MIO_RUN_LIVE_IMAGE=yes` 环境变量保留为防普通测试误触发的脚本安全阀，不再要求为此二次索要口令），正式验收取证仍须基于干净候选且未执行不算通过；若传入新 `apiKey` 覆盖既有凭据或改写影响他人的全局路由，仍须最小必要触发或由用户明确指定。该入口保留测试用户、业务任务、COS 产物及私有审计证据。
 
 临时手机验收可使用 Cloudflare Quick Tunnel，但 tunnel 只能指向本任务回环过滤代理 `scripts/service/material-auth-proxy.ts`。代理在转发前只允许精确 `GET /api/v1/materials/auth-sessions/{UUID}/launch` 与 `/complete`，其余登录、metadata、health、恢复 POST、管理端及其他方法一律拒绝；不转发 Cookie/Authorization/Origin，不记录 query/token，单代理最多 4 个在途。隧道的 HTTPS origin 明确注入当前候选，不改 DNS 或既有生产路由；Cloudflare 转发属于用户已选择的本次临时暴露边界，验收后关闭任务隧道/代理。公开 origin 不能通过这段说明获得任意生产部署授权。
+
+### Worker 观测与调限
+
+启用前先执行计算增量迁移，再用部署拓扑入口预置 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 中的准确实例。只要配置了该实例清单，A 即使未启用管理后台也会持续消费并保存这些实例的遥测以防队列积压。需要查询与在线动态调限时，A 启用管理后台 `MIO_ADMIN_ENABLED=true`（并按需配置 `MIO_ADMIN_ALLOWED_ORIGINS`），开放 `/api/v1/admin/compute/*` 纯 JSON 接口，统一复用超级管理员会话 Cookie（`mio.admin_session`）与精确 `Origin`，由独立同级前端工程 `mio-admin-web`（「计算 Worker」菜单）访问。PG 保留样本 7 天、执行或事件 30 天、调限审计 90 天。仍待投递的控制及必要审计保留到可安全清理。隔离回归使用本机专属 PG schema 和 RabbitMQ 临时 vhost。更多见[管理后台 HTTP](apis/admin.md)。

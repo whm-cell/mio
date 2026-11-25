@@ -143,6 +143,20 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     const sha256 = object.headers?.['x-cos-meta-sha256'];
     return { size, etag: object.ETag, ...(typeof sha256 === 'string' ? { sha256 } : {}) };
   };
+  const inlinePlaybackUrl = (Key: string, contentType: string, expiresIn = 300) =>
+    encodeUrlToken(
+      cos.getObjectUrl({
+        Bucket,
+        Region,
+        Key,
+        Method: 'GET',
+        Expires: expiresIn,
+        Query: {
+          'response-content-disposition': 'inline',
+          'response-content-type': contentType,
+        },
+      }),
+    );
   return {
     uploadUrl(Key, size, acl) {
       return encodeUrlToken(
@@ -171,26 +185,16 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         }),
       );
     },
-    audioPlaybackUrl(Key, contentType) {
-      return encodeUrlToken(
-        cos.getObjectUrl({
-          Bucket,
-          Region,
-          Key,
-          Method: 'GET',
-          Expires: 300,
-          Query: {
-            'response-content-disposition': 'inline',
-            'response-content-type': contentType,
-          },
-        }),
-      );
+    audioPlaybackUrl: inlinePlaybackUrl,
+    hlsSegmentUrl(Key, expiresIn) {
+      return inlinePlaybackUrl(Key, 'video/mp2t', expiresIn);
     },
     materialUrl(Key) {
       return encodeUrlToken(cos.getObjectUrl({ Bucket, Region, Key, Method: 'GET', Expires: 600 }));
     },
     head,
     readImage: readObject,
+    readMedia: readObject,
     readAudio: readObject,
     putImage(Key, bytes, format, sha256, signal) {
       if (!['png', 'jpeg', 'webp'].includes(format)) throw new Error('IMAGE_OUTPUT_INVALID');

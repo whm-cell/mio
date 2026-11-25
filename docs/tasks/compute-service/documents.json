@@ -12,9 +12,19 @@
       "path": "docs/tasks/compute-service/changes/image-upload-verification/change.md"
     },
     {
+      "identity": "docs/tasks/compute-service/changes/worker-observability/change.md",
+      "kind": "change",
+      "path": "docs/tasks/compute-service/changes/worker-observability/change.md"
+    },
+    {
       "identity": "docs/tasks/compute-service/design.md",
       "kind": "design",
       "path": "docs/tasks/compute-service/design.md"
+    },
+    {
+      "identity": "docs/tasks/compute-service/media-compute.md",
+      "kind": "design",
+      "path": "docs/tasks/compute-service/media-compute.md"
     },
     {
       "identity": "docs/tasks/compute-service/prd.md",

@@ -15,6 +15,11 @@
       "identity": "docs/tasks/onelink-video-generation/prd.md",
       "kind": "prd",
       "path": "docs/tasks/onelink-video-generation/prd.md"
+    },
+    {
+      "identity": "docs/tasks/onelink-video-generation/changes/video-input-storage-remediation/change.md",
+      "kind": "change",
+      "path": "docs/tasks/onelink-video-generation/changes/video-input-storage-remediation/change.md"
     }
   ]
 }

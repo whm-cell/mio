@@ -215,11 +215,11 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 身份：当前登录用户；要求允许的 Origin 和 JSON。
 
-输入：`{requestId,modelRef,expectedCapabilitiesVersion,parameters}`。requestId 为 UUID v4；modelRef 必须属于本人当前目录。parameters 接受封闭模式、本人 ready Asset 引用及分型号参数，不接受任意 URL、对象键或上游任务 ID。提示词最多 5000 码点，正文 256 KiB，总媒体引用最多 16；路由可施加更小限制。准入和真正提交前都复核输入归属及对象存在。受支持的水印省略值采用本人供应商默认值并冻结。
+输入：`{requestId,modelRef,expectedCapabilitiesVersion,parameters}`。requestId 为 UUID v4；modelRef 必须属于本人当前目录。parameters 接受封闭模式、本人 ready Asset 引用及分型号参数，不接受任意 URL、对象键或上游任务 ID。提示词最多 5000 码点，正文 256 KiB，总媒体引用最多 16；路由可施加更小限制。首次准入核对归属、状态、媒体类型与实际对象长度，并在内部冻结实际 raw 对象键和 ETag。生成 POST 前再次核对这些条件，符合后才签发私有输入 URL，引用顺序沿用请求。缺少新对象快照的旧任务仍校验当前本人 ready 资产和实际对象。受支持的水印省略值采用本人供应商默认值并冻结。
 
 成功：202 持久 VideoJobView。同 owner/requestId 和同输入返回 200 原任务；不同输入返回 409。accepted 仅表示受理。执行器在 POST 前持久化 submitting，丢失提交回执进入 unknown，不自动重新生成。已知上游身份每 5 秒有界查询，最多 360 次或 30 分钟。重启沿原身份查询。成功 URL 先持久化，再流式下载到恢复目录并上传私有 staging，由 B 核验容器、视频流、尺寸、时长与声音；随后写不可覆盖的 raw 对象，并在同一数据库事务登记本人 derived Asset 与输出。单输出最多 512 MiB，物化最多三次，上传回执丢失先按键、长度和摘要对账，不盲目覆盖。
 
-错误：400 VIDEO_INPUT_INVALID/VIDEO_MODE_UNSUPPORTED、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、409 REQUEST_CONFLICT/VIDEO_CAPABILITIES_STALE、429 VIDEO_QUOTA_EXCEEDED、503 VIDEO_UNAVAILABLE；读取正文可能返回 408 或 413。失败、未知和物化失败分别呈现，不能当作完成。
+错误：400 `VIDEO_INPUT_INVALID`（包括媒体类型不符）或 `VIDEO_MODE_UNSUPPORTED`，401 `UNAUTHORIZED`，403 `ORIGIN_DENIED` 或 `ORIGIN_REQUIRED`，404 `ASSET_NOT_FOUND`（引用资产不存在、不属于本人或未就绪），409 `REQUEST_CONFLICT`、`VIDEO_CAPABILITIES_STALE` 或 `VIDEO_INPUT_CHANGED`（已登记的对象缺失、长度或可核对的 ETag 不符），429 `VIDEO_QUOTA_EXCEEDED`，503 `VIDEO_UNAVAILABLE`（包括 PostgreSQL 或 COS 调用故障）；读取正文可能返回 408 或 413。已受理任务在发送前复核失败时以 `rejected` / `VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE` 结束，生成 POST 为零。失败、未知和物化失败分别呈现，不能当作完成。
 
 副作用：创建持久意图和执行密文快照，单次真实生成可能计费。活动任务限制每用户 5、全局 50；后台最多 4 个并发操作。普通自动化回归只连接隔离数据库和协议替身。
 

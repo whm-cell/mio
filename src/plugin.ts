@@ -277,6 +277,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => materials?.close(),
               () => audio?.close(),
               () => derivatives?.close(),
+              () => videoGenerations?.close(),
               () => acquired.close(),
             ),
         );
@@ -575,7 +576,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
-    if (generationConfig && assetConfig) {
+    if (generationConfig && assetConfig && assetResources) {
       const store = await createGenerationStore(assetConfig.databaseURL);
       let ownedGenerations: GenerationService | undefined;
       let videoExecutor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined;
@@ -592,9 +593,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             ));
         const videoStore = store.videoStore();
         if (compute && generationConfig.videoEnabled) {
-          const objects = createCosStorage(assetConfig);
+          const { store: assetStore, objects } = assetResources;
           const probe = compute.probeVideo;
-          videoInputs = createVideoInputResolver(assetConfig.databaseURL, objects);
+          const inputs = (videoInputs = createVideoInputResolver(assetStore, objects));
           videoExecutor = await createVideoExecutor(
             videoStore,
             () => providers,
@@ -603,7 +604,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               protocol: createVideoProtocol,
               cleanup: createVideoCleanup(objects, generationConfig.dataDirectory),
               references: (row, signal) =>
-                videoInputs!.resolve(row.owner_id, row.command.inputSnapshot, signal),
+                inputs.resolve(
+                  row.owner_id,
+                  row.command.inputSnapshot,
+                  signal,
+                  row.command.inputObjects,
+                ),
             },
           );
         }
@@ -611,7 +617,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           videoStore,
           () => providers,
           videoExecutor,
-          videoInputs?.resolve,
+          videoInputs?.inspect,
         );
         let videoClosing: Promise<void> | undefined;
         const ownedVideoGenerations = (videoGenerations = {
@@ -620,7 +626,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             (videoClosing ??= closeMioResources(
               () => admission.close(),
               () => videoExecutor?.close(),
-              () => videoInputs?.close(),
             )),
         });
         ctx.effect(
@@ -661,7 +666,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         await closeMioResources(
           () => videoGenerations?.close(),
           () => videoExecutor?.close(),
-          () => videoInputs?.close(),
           () => (ownedGenerations ? ownedGenerations.close() : store.close()),
         );
         throw error;

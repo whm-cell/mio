@@ -6,7 +6,7 @@ import type { VideoGenerationStore } from './video-store.ts';
 import { GenerationError } from './errors.ts';
 import { videoRequestHash } from './video-contracts.ts';
 import { validateVideoParameters } from '../providers/onelink/video-route.ts';
-import type { VideoAssetReference } from './video-contracts.ts';
+import type { createVideoInputResolver } from './video-inputs.ts';
 import type { VideoCreateRequest, VideoCapabilitiesView } from './video-contracts.ts';
 import type { VideoJobCommand } from './video-store.ts';
 import type { VideoJobCursor } from './video-store.ts';
@@ -92,11 +92,7 @@ export function createVideoGenerationService(
   store: VideoGenerationStore,
   provider: () => ProviderService | undefined,
   executor?: { wake(): void },
-  validateInputs?: (
-    ownerId: string,
-    references: readonly VideoAssetReference[],
-    signal: AbortSignal,
-  ) => Promise<unknown>,
+  inspectInputs?: ReturnType<typeof createVideoInputResolver>['inspect'],
 ) {
   let stopping = false;
   let closing: Promise<void> | undefined;
@@ -173,12 +169,19 @@ export function createVideoGenerationService(
           request: { ...request, parameters: effective },
           inputSnapshot: inputSnapshot(request),
         };
-        if (command.inputSnapshot.length && !validateInputs)
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-        try {
-          await validateInputs?.(actor.userId, command.inputSnapshot, AbortSignal.timeout(30_000));
-        } catch {
-          throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
+        if (command.inputSnapshot.length) {
+          if (!inspectInputs)
+            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          try {
+            command.inputObjects = await inspectInputs(
+              actor.userId,
+              command.inputSnapshot,
+              AbortSignal.timeout(30_000),
+            );
+          } catch (error) {
+            if (error instanceof GenerationError) throw error;
+            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          }
         }
         const admitted = Object.fromEntries(
           [

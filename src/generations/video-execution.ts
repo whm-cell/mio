@@ -1,5 +1,6 @@
 import type { AccountCredentialSnapshot, VideoRouteConfig } from '../providers/contracts.ts';
 import type {
+  VideoAssetReference,
   VideoCreateRequest,
   VideoJobState,
   VideoRequestParameters,
@@ -7,7 +8,8 @@ import type {
 
 export interface VideoJobCommand {
   request: VideoCreateRequest;
-  inputSnapshot: { assetId: string; mediaType?: 'image' | 'audio' | 'video'; role?: string }[];
+  inputSnapshot: VideoAssetReference[];
+  inputObjects?: Record<string, { key: string; etag: string }>;
 }
 
 export const VIDEO_EXECUTOR_MAX_QUERIES = 360;

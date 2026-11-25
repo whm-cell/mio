@@ -104,9 +104,6 @@ export function createVideoRunner(
     let refs: Record<string, string>;
     let key: string;
     try {
-      refs = transports.references ? await transports.references(row, bounded) : {};
-      if (row.command.inputSnapshot.some((input) => !refs[input.assetId]))
-        throw new Error('VIDEO_INPUT_UNAVAILABLE');
       const current = await providers.snapshotVideo(
         { userId: row.owner_id },
         row.command.request.modelRef,
@@ -117,6 +114,9 @@ export function createVideoRunner(
       )
         throw new Error('VIDEO_ADMISSION_CHANGED');
       key = providers.openImageSnapshot(row.owner_id, row.snapshot);
+      refs = transports.references ? await transports.references(row, bounded) : {};
+      if (row.command.inputSnapshot.some((input) => !refs[input.assetId]))
+        throw new Error('VIDEO_INPUT_UNAVAILABLE');
     } catch {
       if (stop.aborted) await store.release(row);
       else await store.terminal(row, 'rejected', 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE');

@@ -179,11 +179,16 @@ describe('real FFmpeg media plans through production process/file adapters', () 
   });
   it('preserves each probe operation’s duration boundary', async () => {
     const source = join(root, 'long-video.mp4');
+    // Keep frame starts at 0 and 1800 seconds and the final frame one second long.
     ffmpeg([
       '-f',
       'lavfi',
       '-i',
-      'color=black:size=32x32:rate=1:duration=1801',
+      'color=black:size=32x32:rate=1:duration=2',
+      '-vf',
+      'setpts=1800*N',
+      '-fps_mode',
+      'passthrough',
       '-c:v',
       'libx264',
       '-threads',

@@ -24,6 +24,8 @@ import { Worker } from '../../compute/src/worker.ts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { withLocalTestBroker } from '../support/local-broker-fixture.ts';
 
+const videoProbeCommandDlq = 'mio.compute.video.probe.commands.dlq.v1';
+
 async function assertQueueBoundary(url: string, drainedQueue: string, forbiddenQueue: string) {
   const socket: SocketOptions & { signal: AbortSignal } = { signal: AbortSignal.timeout(5_000) };
   const connection = await connect(url, socket);
@@ -114,8 +116,9 @@ it.each([
 ] as const)(
   'routes probes with observed=$monitored and legacy binding=$legacyVideoProbeBinding',
   async ({ monitored, legacyVideoProbeBinding }) => {
+    const observerInstance = 'video-probe-observer';
     await withLocalTestBroker(
-      async ({ appBrokerUrl, workerBrokerUrl, userA, userB }) => {
+      async ({ appBrokerUrl, workerBrokerUrl, userA, userB, restrictWorkerToObservation }) => {
         const jobId = randomUUID();
         const attemptId = randomUUID();
         const command: VideoProbeCommandV1 = {
@@ -132,6 +135,11 @@ it.each([
             etag: '"etag"',
             sha256: 'a'.repeat(64),
           },
+        };
+        const invalid = {
+          ...command,
+          messageId: randomUUID(),
+          source: { ...command.source, stagingKey: 'mio/staging/video/foreign' },
         };
         const expired = { ...command, messageId: randomUUID() };
         const expiredDeadline = Date.now() - 1;
@@ -237,11 +245,7 @@ it.each([
                   );
                 }
                 if (!legacyVideoProbeBinding) {
-                  await app.publish({
-                    ...command,
-                    messageId: randomUUID(),
-                    source: { ...command.source, stagingKey: 'mio/staging/video/foreign' },
-                  });
+                  await app.publish(invalid);
                   await app.publish(command, admitBy);
                   await app.publish(expired, expiredDeadline);
                 }
@@ -313,8 +317,42 @@ it.each([
         await assertQueueBoundary(workerBrokerUrl, COMMAND_QUEUE, RESULT_QUEUE);
         await assertQueueBoundary(workerBrokerUrl, VIDEO_PROBE_COMMAND_QUEUE, RESULT_QUEUE);
         await assertQueueBoundary(appBrokerUrl, RESULT_QUEUE, VIDEO_PROBE_COMMAND_QUEUE);
+        if (!legacyVideoProbeBinding) {
+          if (!restrictWorkerToObservation) throw new Error('DLQ observation unavailable');
+          const observer = await connect(await restrictWorkerToObservation(), { timeout: 5_000 });
+          observer.on('error', () => {});
+          try {
+            const channel = await observer.createChannel();
+            channel.on('error', () => {});
+            const delivery = await vi.waitFor(
+              async () => {
+                const message = await channel.get(videoProbeCommandDlq, { noAck: false });
+                if (!message) throw new Error(`No delivery in ${videoProbeCommandDlq}`);
+                return message;
+              },
+              { timeout: 8_000 },
+            );
+            expect(delivery.properties.messageId).toBe(invalid.messageId);
+            expect(delivery.content).toEqual(Buffer.from(JSON.stringify(invalid)));
+            expect(delivery.properties.headers?.['x-death']).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({ queue: VIDEO_PROBE_COMMAND_QUEUE, reason: 'rejected' }),
+              ]),
+            );
+            channel.ack(delivery);
+            await channel.prefetch(1);
+          } finally {
+            await observer.close();
+          }
+        }
       },
-      undefined,
+      legacyVideoProbeBinding
+        ? undefined
+        : {
+            instanceId: observerInstance,
+            instanceIds: [observerInstance],
+            observeQueue: videoProbeCommandDlq,
+          },
       legacyVideoProbeBinding ? { legacyVideoProbeBinding: true } : undefined,
     );
   },

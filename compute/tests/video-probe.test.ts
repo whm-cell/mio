@@ -125,11 +125,11 @@ function lastAudioPacketOffset(file: string): number {
   return Number(last.pos);
 }
 
-function command(file: string, sizeBytes?: number): VideoProbeCommandV1 {
+function command(source: string | Buffer, sizeBytes?: number): VideoProbeCommandV1 {
   const jobId = randomUUID();
   const outputIndex = 0;
   const attemptId = randomUUID();
-  const bytes = readFileSync(file);
+  const bytes = typeof source === 'string' ? readFileSync(source) : source;
   return parseVideoProbeCommandV1({
     version: 1,
     type: 'video.probe',
@@ -298,7 +298,7 @@ it('sweeps orphaned probe files only on worker start after acquiring the journal
 });
 
 it('accepts only a small v1 identity envelope with a fixed private staging key', () => {
-  const input = command(fixture(directory()));
+  const input = command(Buffer.from('probe source'));
   expect(parseVideoProbeCommandV1(input)).toEqual(input);
   expect(() =>
     parseVideoProbeCommandV1({
@@ -876,7 +876,8 @@ it('aborts the download at the execution deadline and releases the slot and file
 
 it('cleans up on an unconfirmed result, accepts redelivery, and cancels a waiting probe on stop', async () => {
   const root = directory();
-  const input = command(fixture(root));
+  const bytes = Buffer.from('not media');
+  const input = command(bytes);
   const journal = new Journal(root, 'probe-test', true);
   const event: VideoProbeResultV1[] = [];
   const publishVideoProbe = vi
@@ -891,7 +892,7 @@ it('cleans up on an unconfirmed result, accepts redelivery, and cancels a waitin
     slots,
     async (command, directory) => {
       const destination = probePath(directory, command.messageId);
-      writeFileSync(destination, Buffer.from('not media'));
+      writeFileSync(destination, bytes);
       return destination;
     },
     publishVideoProbe,

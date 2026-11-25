@@ -64,15 +64,16 @@ describe('video request contract', () => {
     ).toThrowError(expect.objectContaining({ code: 'VIDEO_INPUT_INVALID' }));
 
     const requestId = randomUUID();
-    const first = request(
-      { mode: 'full', prompt: 'hello', references: references.slice(0, 2) },
+    const parameters = { mode: 'full', prompt: 'hello', references: references.slice(0, 2) };
+    const first = request(parameters, requestId);
+    const sameOrder = request(structuredClone(parameters), requestId);
+    const reversed = request(
+      { ...parameters, references: parameters.references.toReversed() },
       requestId,
     );
-    const second = request(
-      { mode: 'full', prompt: 'hello', references: [...references.slice(0, 2)].reverse() },
-      requestId,
-    );
-    expect(videoRequestHash(first)).not.toBe(videoRequestHash(second));
+    const hash = videoRequestHash(first);
+    expect(videoRequestHash(sameOrder)).toBe(hash);
+    expect(videoRequestHash(reversed)).not.toBe(hash);
   });
 
   it.each([

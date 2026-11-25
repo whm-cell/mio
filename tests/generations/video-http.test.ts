@@ -9,6 +9,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
 import COS from 'cos-nodejs-sdk-v5';
 import { describe, expect, it, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { probeVideoFile } from '../../compute/src/adapters/media.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
@@ -167,19 +168,72 @@ describe('video generation HTTP boundary', () => {
   });
 });
 
-async function assetHttpFixture(
-  withExecutor = false,
-  realOutput?: Buffer<ArrayBuffer>,
-  alternate?: { route: VideoRouteConfig; modelId: string },
+type VideoHttpDatabase = Awaited<ReturnType<typeof authDatabase>>;
+
+interface AssetHttpFixtureOptions {
+  withExecutor?: boolean;
+  realOutput?: Buffer<ArrayBuffer>;
+  alternate?: { route: VideoRouteConfig; modelId: string };
+  migrateGenerations?: (pool: Pool, database: VideoHttpDatabase) => Promise<unknown>;
+}
+
+async function assetHttpFixture(options: AssetHttpFixtureOptions = {}) {
+  const cleanups: (() => Promise<void>)[] = [];
+  const close = async () => {
+    const errors: unknown[] = [];
+    for (const cleanup of cleanups.splice(0).reverse()) {
+      try {
+        await cleanup();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, 'video HTTP fixture cleanup failed');
+  };
+  try {
+    return { ...(await startAssetHttpFixture(options, cleanups)), close };
+  } catch (error) {
+    try {
+      await close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        'video HTTP fixture setup and cleanup failed',
+        {
+          cause: error,
+        },
+      );
+    }
+    throw error;
+  }
+}
+
+async function startAssetHttpFixture(
+  {
+    withExecutor = false,
+    realOutput,
+    alternate,
+    migrateGenerations = (pool) => pool.query(generationSchemaSQL),
+  }: AssetHttpFixtureOptions,
+  cleanups: (() => Promise<void>)[],
 ) {
   const database = await authDatabase();
+  cleanups.push(() => database.close());
   const pool = new Pool({ connectionString: database.url });
+  cleanups.push(() => pool.end());
   await pool.query(assetSchemaSQL);
-  await pool.query(generationSchemaSQL);
+  await migrateGenerations(pool, database);
   const assets = await createAssetStore(database.url);
   let assetsClosed = false;
+  const closeAssets = async () => {
+    if (assetsClosed) return;
+    await assets.close();
+    assetsClosed = true;
+  };
+  cleanups.push(closeAssets);
   const store = new VideoGenerationStore(pool);
   const execution = store.executorStore();
+  cleanups.push(() => execution.close());
   const resumeClaim = Promise.withResolvers<void>();
   if (withExecutor) {
     const claim = execution.claim.bind(execution);
@@ -190,6 +244,7 @@ async function assetHttpFixture(
     });
   } else await execution.startExecutor(() => {});
   const directory = await mkdtemp(join(tmpdir(), 'mio-video-http-'));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const heads = new Map<string, Awaited<ReturnType<AssetObjectStore['head']>>>();
   const inputBytes = new Map<string, Uint8Array>();
   const generatedVideo = 'https://video.fixture/render.mp4';
@@ -306,6 +361,7 @@ async function assetHttpFixture(
   });
   const stop = new AbortController();
   const receipts = new VideoSubmissionReceipts(directory);
+  cleanups.push(() => receipts.close());
   let expiredResult = false;
   let downloads = 0;
   const download: typeof withPublicHttps = async (url, signal, consume) => {
@@ -356,6 +412,12 @@ async function assetHttpFixture(
   const worker = withExecutor
     ? await createVideoExecutor(store, () => provider, materialize, transports, directory)
     : undefined;
+  if (worker)
+    cleanups.push(async () => {
+      const workerClose = worker.close();
+      resumeClaim.resolve();
+      await workerClose;
+    });
   const wake = vi.fn(() => worker?.wake());
   const service = createVideoGenerationService(
     store,
@@ -363,6 +425,7 @@ async function assetHttpFixture(
     { wake, signal: worker?.signal ?? stop.signal },
     inputs.inspect,
   );
+  cleanups.push(service.close);
   const otherActor = { userId: randomUUID(), sessionId: 'video-http-other' };
   const handler = createVideoGenerationHandler(
     service,
@@ -375,7 +438,13 @@ async function assetHttpFixture(
     [origin],
   );
   const server = createServer(handler);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  cleanups.push(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const listening = once(server, 'listening');
+  server.listen(0, '127.0.0.1');
+  await listening;
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('video test server address missing');
   const endpoint = `http://127.0.0.1:${address.port}/api/v1/compute/videos`;
@@ -410,6 +479,7 @@ async function assetHttpFixture(
     snapshotVideo,
     heads,
     inputBytes,
+    inputs,
     objects,
     probe,
     upstream,
@@ -476,24 +546,7 @@ async function assetHttpFixture(
       await run(row);
       return row;
     },
-    async closeAssets() {
-      await assets.close();
-      assetsClosed = true;
-    },
-    async close() {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await service.close();
-      const workerClose = worker?.close();
-      resumeClaim.resolve();
-      await workerClose;
-      if (!assetsClosed) await assets.close();
-      await receipts.close();
-      await execution.close();
-      await pool.end();
-      await database.close();
-      await rm(directory, { recursive: true, force: true });
-    },
+    closeAssets,
   };
 }
 
@@ -507,7 +560,7 @@ it.each(['mp4', 'attached-cover', 'truncated-mp4', 'corrupt-mp4', 'mov', '3gp'] 
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-    const f = await assetHttpFixture(false, bytes);
+    const f = await assetHttpFixture({ realOutput: bytes });
     try {
       const reference = await f.addAsset();
       const accepted = await f.post([{ assetId: reference.assetId }]);
@@ -1106,7 +1159,7 @@ describe('video admission after executor lease loss', () => {
   it.each(['object inspection', 'quota lock', 'unrelated PostgreSQL error'] as const)(
     'preserves the request outcome after losing the lease during %s',
     async (stage) => {
-      const f = await assetHttpFixture(true);
+      const f = await assetHttpFixture({ withExecutor: true });
       const gate = await f.pool.connect();
       const entered = Promise.withResolvers<void>();
       const resume = Promise.withResolvers<void>();
@@ -1199,7 +1252,7 @@ describe('video admission after executor lease loss', () => {
   it.each(['quota lock', 'both inserts'] as const)(
     'rolls back writes at the %s and keeps owner reads and old-hash replay available',
     async (stage) => {
-      const f = await assetHttpFixture(true);
+      const f = await assetHttpFixture({ withExecutor: true });
       const gate = await f.pool.connect();
       const lock = stage === 'quota lock' ? VIDEO_QUOTA_LOCK : randomInt(1, 2147483647);
       let pending: Promise<Response> | undefined;
@@ -1360,7 +1413,7 @@ it.each([true, false])(
         parameters: { ...original.paramSpec.parameters!, generateAudio: override },
       },
     };
-    const f = await assetHttpFixture(false, undefined, { route, modelId });
+    const f = await assetHttpFixture({ alternate: { route, modelId } });
     try {
       const request: VideoCreateRequest = {
         ...f.request([]),
@@ -1442,7 +1495,7 @@ it('rejects an over-budget HappyHorse prompt before admission and submits the ex
   const limit = route.paramSpec.parameters!.maxPromptCodepoints;
   const header = '[Image 1]、[Image 2] 为 "领队🐎"；[Image 3] 为 "旅人"。\n';
   const prompt = '跃' + '😀'.repeat(limit - [...header].length - 1);
-  const f = await assetHttpFixture(false, undefined, { route, modelId });
+  const f = await assetHttpFixture({ alternate: { route, modelId } });
   try {
     const first = await f.addAsset();
     const second = await f.addAsset();
@@ -1499,6 +1552,150 @@ it('rejects an over-budget HappyHorse prompt before admission and submits the ex
 });
 
 describe('video asset admission over HTTP', () => {
+  it('disposes the pool and random schema when later setup DDL fails', async () => {
+    let setup:
+      | {
+          pool: Pool;
+          database: VideoHttpDatabase;
+          endPool: MockInstance<Pool['end']>;
+          closeDatabase: MockInstance<VideoHttpDatabase['close']>;
+        }
+      | undefined;
+    let ddlError: unknown;
+    try {
+      const failure = await assetHttpFixture({
+        async migrateGenerations(pool, database) {
+          setup = {
+            pool,
+            database,
+            endPool: vi.spyOn(pool, 'end'),
+            closeDatabase: vi.spyOn(database, 'close'),
+          };
+          expect((await pool.query('SELECT current_schema() AS schema')).rows).toEqual([
+            { schema: database.applicationName },
+          ]);
+          try {
+            await pool.query(`${generationSchemaSQL}\nCREATE TABLE mio_video_jobs (id uuid);`);
+          } catch (error) {
+            ddlError = error;
+            throw error;
+          }
+        },
+      }).then(
+        async (fixture) => {
+          await fixture.close();
+          throw new Error('generation DDL unexpectedly succeeded');
+        },
+        (error: unknown) => error,
+      );
+      expect(failure).toMatchObject({
+        code: '42P07',
+        message: 'relation "mio_video_jobs" already exists',
+      });
+      expect(failure).toBe(ddlError);
+      if (!setup) throw new Error('generation DDL was not reached');
+      const observer = new Pool({
+        connectionString: setup.database.observerURL,
+        connectionTimeoutMillis: 5000,
+      });
+      try {
+        if (process.env.MIO_TEST_DATABASE_URL) {
+          const { rows } = await observer.query(
+            'SELECT nspname FROM pg_namespace WHERE nspname=$1',
+            [setup.database.applicationName],
+          );
+          expect(rows).toEqual([]);
+        } else {
+          // With a temporary cluster the fixture also owns the listening process.
+          await expect(observer.query('SELECT 1')).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+        }
+      } finally {
+        await observer.end();
+      }
+      expect(setup.endPool).toHaveBeenCalledOnce();
+    } finally {
+      if (setup) {
+        try {
+          if (!setup.endPool.mock.calls.length) await setup.pool.end();
+        } finally {
+          if (!setup.closeDatabase.mock.calls.length) await setup.database.close();
+        }
+      }
+    }
+  });
+
+  it('submits from persisted frozen input objects with ordered, duplicated reference slots', async () => {
+    const f = await assetHttpFixture();
+    try {
+      const audio = await f.addAsset(actor.userId, 'ready', 'audio/x-wav', false, wave);
+      const image = await f.addAsset();
+      const references: VideoAssetReference[] = [
+        { assetId: image.assetId },
+        { assetId: audio.assetId, mediaType: 'audio' },
+        { assetId: image.assetId },
+        { assetId: image.assetId },
+      ];
+      const frozen = {
+        [image.assetId]: { key: image.key, etag: image.head.etag },
+        [audio.assetId]: { key: audio.key, etag: audio.head.etag },
+      };
+      const accepted = await f.post(references);
+      expect(accepted.status).toBe(202);
+      const job: VideoJobView = await accepted.json();
+      expect(job).toMatchObject({ state: 'accepted', inputSnapshot: references });
+      const persisted = await f.pool.query(
+        "SELECT command->'inputObjects' AS input_objects FROM mio_video_jobs WHERE id=$1",
+        [job.id],
+      );
+      expect(persisted.rows).toEqual([{ input_objects: frozen }]);
+      expect(f.objects.materialUrl).not.toHaveBeenCalled();
+      expect(f.upstream).not.toHaveBeenCalled();
+
+      const resolve = vi.spyOn(f.inputs, 'resolve');
+      expect((await f.runNext()).id).toBe(job.id);
+      expect(resolve).toHaveBeenCalledExactlyOnceWith(
+        actor.userId,
+        references,
+        expect.any(AbortSignal),
+        frozen,
+      );
+      expect(f.objects.materialUrl.mock.calls).toEqual([[image.key], [audio.key]]);
+      expect(f.upstream).toHaveBeenCalledOnce();
+      const [endpoint, outbound] = f.upstream.mock.calls[0]!;
+      expect(new URL(String(endpoint)).pathname).toBe('/volc/api/v3/contents/generations/tasks');
+      expect(outbound?.method).toBe('POST');
+      const imageContent = {
+        type: 'image_url',
+        image_url: { url: `https://cos.fixture/${image.key}?signature=fixture` },
+        role: 'reference_image',
+      };
+      expect(JSON.parse(String(outbound?.body)).content).toEqual([
+        { type: 'text', text: 'ordered references' },
+        imageContent,
+        {
+          type: 'audio_url',
+          audio_url: { url: `https://cos.fixture/${audio.key}?signature=fixture` },
+          role: 'reference_audio',
+        },
+        imageContent,
+        imageContent,
+      ]);
+      const submitted = await f.pool.query(
+        `SELECT j.state, e.phase, e.upstream_task_id
+         FROM mio_video_jobs j JOIN mio_video_executions e ON e.job_id=j.id WHERE j.id=$1`,
+        [job.id],
+      );
+      expect(submitted.rows).toEqual([
+        { state: 'submitted', phase: 'waiting', upstream_task_id: 'fixture-task' },
+      ]);
+      const read = await f.get(job.id);
+      expect(read.status).toBe(200);
+      expect(await read.json()).toMatchObject({ id: job.id, state: 'submitted' });
+    } finally {
+      await f.close();
+    }
+  });
+
   it('checks real PNG, WAV and MP4 bytes over conditional COS reads at both boundaries', async () => {
     const f = await assetHttpFixture();
     const requests: {

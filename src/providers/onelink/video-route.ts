@@ -4,6 +4,11 @@ import type {
   VideoMode,
   VideoRequestParameters,
 } from '../../generations/video/contracts.ts';
+import {
+  KLING_OMNI_MODEL,
+  KLING_OMNI_SUBMIT_PATH,
+  KLING_TURBO_MODEL,
+} from '../../generations/video/driver-capabilities.ts';
 import { isSafeRouteIdentifier } from '../../generations/image/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../contracts.ts';
 
@@ -21,7 +26,7 @@ const SUBMIT_PATHS: Readonly<Record<VideoDriver, readonly string[]>> = {
     '/kling/v1/videos/text2video',
     '/kling/v1/videos/image2video',
     '/kling/v1/videos/multi-image2video',
-    '/kling/v1/videos/omni-video',
+    KLING_OMNI_SUBMIT_PATH,
   ],
   'vidu-videos': [
     '/vidu/ent/v2/text2video',
@@ -32,6 +37,22 @@ const SUBMIT_PATHS: Readonly<Record<VideoDriver, readonly string[]>> = {
   'veo-videos': ['/v1beta/models/{model}:predictLongRunning'],
   'happyhorse-videos': ['/happyhorse/v1/services/aigc/video-generation/video-synthesis'],
 };
+const FRAME_MODES: readonly VideoMode[] = ['text_to_video', 'first_frame', 'start_end'];
+const SUBJECT_MODES: readonly VideoMode[] = ['text_to_video', 'reference_subjects'];
+const KLING_OMNI_MODES: readonly VideoMode[] = [...FRAME_MODES, 'video_ref'];
+const DRIVER_MODES: Readonly<Record<VideoDriver, readonly VideoMode[]>> = {
+  'volcengine-ark-videos': [...FRAME_MODES, 'last_frame', 'full', 'video_ref'],
+  'kling-videos': FRAME_MODES,
+  'vidu-videos': [...FRAME_MODES, 'reference_subjects'],
+  'veo-videos': [...FRAME_MODES, 'reference_subjects'],
+  'happyhorse-videos': ['text_to_video', 'first_frame', 'reference_subjects', 'video_edit'],
+};
+const HAPPYHORSE_VARIANT_MODES: ReadonlyMap<string, VideoMode> = new Map([
+  ['t2v', 'text_to_video'],
+  ['i2v', 'first_frame'],
+  ['r2v', 'reference_subjects'],
+  ['video-edit', 'video_edit'],
+]);
 const PARAMETER_FIELDS = new Set([
   'ratios',
   'resolutions',
@@ -194,6 +215,41 @@ export function validateVideoRouteConfig(value: {
   };
 }
 
+function executableRouteModes(route: VideoRouteConfig, model?: string): readonly VideoMode[] {
+  const { driver, submitPath } = route;
+  if (driver === 'volcengine-ark-videos') {
+    if (model === 'doubao-seedance-1.5-pro' || model === 'vega-1.5-pro') return FRAME_MODES;
+  } else if (driver === 'kling-videos') {
+    if (
+      model === KLING_OMNI_MODEL ||
+      (model === undefined && submitPath === KLING_OMNI_SUBMIT_PATH)
+    )
+      return KLING_OMNI_MODES;
+    if (model === KLING_TURBO_MODEL) return ['text_to_video', 'first_frame'];
+  } else if (driver === 'vidu-videos') {
+    if (model === 'video-vidu-q2') return SUBJECT_MODES;
+    if (model === 'video-viduq3-pro') return FRAME_MODES;
+  } else if (driver === 'happyhorse-videos') {
+    const variant = model && /^happyhorse-1\.[01]-(.+)$/.exec(model)?.[1];
+    const mode = variant && HAPPYHORSE_VARIANT_MODES.get(variant);
+    if (mode) return [mode];
+  }
+  return DRIVER_MODES[driver];
+}
+
+/** Check live declarations. Already admitted jobs retain their frozen route shape. */
+export function validateVideoRouteModes(route: VideoRouteConfig, model?: string): boolean {
+  const supported = executableRouteModes(route, model);
+  const { supportedModes, parameters } = route.paramSpec;
+  if (!supportedModes.every((mode) => supported.includes(mode))) return false;
+  if (!parameters) return true;
+  if (route.driver === 'kling-videos' && supportedModes.includes('video_ref'))
+    return parameters.maxVideos === 1 && parameters.maxAudios === 0;
+  if (route.driver === 'happyhorse-videos' && supportedModes.includes('video_edit'))
+    return parameters.maxAudios === 0;
+  return true;
+}
+
 /** Legacy declarations without complete limits remain discoverable, but cannot admit requests. */
 export function videoRouteRuntimeAvailable(route: VideoRouteConfig): boolean {
   return (
@@ -213,9 +269,11 @@ export function videoModeParameters(
   return result;
 }
 
+/** Only validation of a frozen submit command supplies the encoder default. */
 export function validateVideoParameters(
   input: VideoRequestParameters,
   route: VideoRouteConfig,
+  effectiveAudioDefault?: boolean,
 ): boolean {
   const spec = route.paramSpec.parameters;
   if (!spec || !route.paramSpec.supportedModes.includes(input.mode)) return false;
@@ -230,7 +288,12 @@ export function validateVideoParameters(
   if (spec.requiresResolution && input.resolution === undefined) return false;
   if (input.durationSeconds !== undefined && !spec.durations.includes(input.durationSeconds))
     return false;
-  if (input.generateAudio !== undefined && !spec.generateAudio) return false;
+  if (
+    input.generateAudio !== undefined &&
+    !spec.generateAudio &&
+    input.generateAudio !== effectiveAudioDefault
+  )
+    return false;
   if (input.watermark !== undefined && !spec.watermark) return false;
   if (
     input.audioType !== undefined ||

@@ -1,6 +1,7 @@
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -34,7 +35,9 @@ import { createVideoProtocol } from '../../src/integrations/onelink/video/index.
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
 import { ProviderError } from '../../src/providers/contracts.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
+import { validateVideoRouteConfig } from '../../src/providers/onelink/video-route.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
+import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { authDatabase } from '../support/auth-database.ts';
 import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
 
@@ -42,6 +45,14 @@ const actor = { userId: randomUUID(), sessionId: 'video-http-test' };
 const origin = 'https://demo.fixture';
 const jobId = randomUUID();
 const requestId = randomUUID();
+const png = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==',
+  'base64',
+);
+const wave = Buffer.from(
+  '524946462800000057415645666d74201000000001000100401f0000803e000002001000646174610400000000000000',
+  'hex',
+);
 
 type ResponseFixture = {
   status: number;
@@ -156,7 +167,11 @@ describe('video generation HTTP boundary', () => {
   });
 });
 
-async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayBuffer>) {
+async function assetHttpFixture(
+  withExecutor = false,
+  realOutput?: Buffer<ArrayBuffer>,
+  alternate?: { route: VideoRouteConfig; modelId: string },
+) {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
@@ -176,6 +191,7 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
   } else await execution.startExecutor(() => {});
   const directory = await mkdtemp(join(tmpdir(), 'mio-video-http-'));
   const heads = new Map<string, Awaited<ReturnType<AssetObjectStore['head']>>>();
+  const inputBytes = new Map<string, Uint8Array>();
   const generatedVideo = 'https://video.fixture/render.mp4';
   const outputBytes = realOutput ?? Buffer.from('video for a fixture Worker');
   const probePath = realOutput && join(directory, 'worker-input.media');
@@ -197,6 +213,18 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
       if (!head) throw Object.assign(new Error('private COS error'), { statusCode: 404 });
       return head;
     }),
+    readPrefix: vi.fn<NonNullable<AssetObjectStore['readPrefix']>>(
+      async (key, etag, size, limit, signal) => {
+        signal.throwIfAborted();
+        const object = heads.get(key);
+        const bytes = inputBytes.get(key);
+        if (!object || !bytes)
+          throw Object.assign(new Error('missing COS object'), { statusCode: 404 });
+        if (etag !== object.etag || object.size !== size || bytes.byteLength !== size)
+          throw Object.assign(new Error('changed COS object'), { statusCode: 412 });
+        return bytes.subarray(0, Math.min(size - 1, limit));
+      },
+    ),
     putVideo: vi.fn<NonNullable<AssetObjectStore['putVideo']>>(
       async (key, stream, sizeBytes, sha256) => {
         const chunks: Buffer[] = [];
@@ -213,7 +241,7 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
   } satisfies AssetObjectStore;
   const inputs = createVideoInputResolver(assets, objects);
   const capabilitiesVersion = 'asset-http-capabilities';
-  const route: VideoRouteConfig = {
+  const route: VideoRouteConfig = alternate?.route ?? {
     driver: 'volcengine-ark-videos',
     vendor: 'volcengine',
     submitPath: '/volc/api/v3/contents/generations/tasks',
@@ -246,12 +274,12 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
   const videoCapabilities = vi.fn(async () => ({
     capabilitiesVersion,
     available: true,
-    modes: [{ mode: 'full', supported: true }],
+    modes: route.paramSpec.supportedModes.map((mode) => ({ mode, supported: true })),
   }));
   const snapshotVideo = vi.fn(async () => ({
     capabilitiesVersion,
     route,
-    modelId: 'doubao-seedance-2-0-fast',
+    modelId: alternate?.modelId ?? 'doubao-seedance-2-0-fast',
     providerConfigId: randomUUID(),
     credentialVersion: 1,
     credential: {},
@@ -264,7 +292,11 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
   } as unknown as ProviderService;
   const upstream = vi.fn<typeof fetch>(async (_url, options) =>
     options?.method === 'POST'
-      ? Response.json({ id: 'fixture-task' })
+      ? Response.json(
+          route.driver === 'kling-videos'
+            ? { code: 0, data: { task_id: 'fixture-task' } }
+            : { id: 'fixture-task' },
+        )
       : Response.json({
           id: 'fixture-task',
           status: 'succeeded',
@@ -369,12 +401,14 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
     service,
     execution,
     server,
+    directory,
     applicationName: database.applicationName,
     request,
     postRequest,
     videoCapabilities,
     snapshotVideo,
     heads,
+    inputBytes,
     objects,
     probe,
     upstream,
@@ -401,11 +435,13 @@ async function assetHttpFixture(withExecutor = false, realOutput?: Buffer<ArrayB
       state = 'ready',
       contentType = 'image/png',
       derived = false,
+      bytes: Uint8Array = png,
     ) {
       const assetId = randomUUID();
       const key = `mio/raw/${assetId}/${randomUUID()}`;
-      const head = { size: 100, etag: 'raw-etag' };
+      const head = { size: bytes.byteLength, etag: '"raw-etag"' };
       heads.set(key, head);
+      inputBytes.set(key, bytes);
       await pool.query(
         `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,
          raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind)
@@ -1305,7 +1341,245 @@ describe('video admission after executor lease loss', () => {
   });
 });
 
+it.each([true, false])(
+  'freezes the Kling audio default and preserves the raw intent on HTTP replay (override: %s)',
+  async (override) => {
+    const modelId = 'video-kling-v3';
+    const declaration = legacyVideoRouteEntries([modelId])[0]!;
+    const original = validateVideoRouteConfig({
+      ...declaration,
+      editPath: null,
+      requestDefaults: {},
+      outputSpec: {},
+    })!;
+    const route = {
+      ...original,
+      paramSpec: {
+        ...original.paramSpec,
+        parameters: { ...original.paramSpec.parameters!, generateAudio: override },
+      },
+    };
+    const f = await assetHttpFixture(false, undefined, { route, modelId });
+    try {
+      const request: VideoCreateRequest = {
+        ...f.request([]),
+        parameters: { mode: 'text_to_video', prompt: 'A pebble falls in a pond.' },
+      };
+      const initial = await f.postRequest(request);
+      expect(initial.status).toBe(202);
+      const first = await initial.json();
+      expect(first.effectiveParameters.generateAudio).toBe(true);
+      const persisted = (
+        await f.pool.query('SELECT command,input_hash FROM mio_video_jobs WHERE id=$1', [first.id])
+      ).rows[0];
+      expect(persisted.command.request.parameters.generateAudio).toBe(true);
+      expect(persisted.input_hash).toBe(
+        createHash('sha256').update(JSON.stringify(request)).digest('hex'),
+      );
+      expect(f.upstream).not.toHaveBeenCalled();
+      expect((await f.runNext()).id).toBe(first.id);
+      expect(f.upstream).toHaveBeenCalledTimes(1);
+      const [endpoint, outbound] = f.upstream.mock.calls[0]!;
+      expect(new URL(String(endpoint)).pathname).toBe('/kling/v1/videos/text2video');
+      expect(JSON.parse(String(outbound?.body))).toMatchObject({
+        model_name: modelId,
+        sound: 'on',
+        settings: { audio: 'native' },
+      });
+
+      f.snapshotVideo.mockClear();
+      const replay = await f.postRequest(request);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({
+        id: first.id,
+        state: 'submitted',
+        effectiveParameters: { generateAudio: true },
+      });
+      const different = await f.postRequest({
+        ...request,
+        parameters: { ...request.parameters, generateAudio: true },
+      });
+      expect(different.status).toBe(409);
+      expect(await different.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
+      expect(f.snapshotVideo).not.toHaveBeenCalled();
+      expect(f.upstream).toHaveBeenCalledTimes(1);
+
+      const explicit = await f.postRequest({
+        ...request,
+        requestId: randomUUID(),
+        parameters: { ...request.parameters, generateAudio: false },
+      });
+      if (override) {
+        expect(explicit.status).toBe(202);
+        const second = await explicit.json();
+        expect(second.effectiveParameters.generateAudio).toBe(false);
+        expect((await f.runNext()).id).toBe(second.id);
+        expect(f.upstream).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(String(f.upstream.mock.calls[1]![1]?.body))).toMatchObject({
+          sound: 'off',
+          settings: { audio: 'off' },
+        });
+      } else {
+        expect(explicit.status).toBe(400);
+        expect(await explicit.json()).toMatchObject({ error: { code: 'VIDEO_INPUT_INVALID' } });
+        expect(f.upstream).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      await f.close();
+    }
+  },
+);
+
 describe('video asset admission over HTTP', () => {
+  it('checks real PNG, WAV and MP4 bytes over conditional COS reads at both boundaries', async () => {
+    const f = await assetHttpFixture();
+    const requests: {
+      method?: string | undefined;
+      key: string;
+      range?: string | undefined;
+      etag?: string | undefined;
+    }[] = [];
+    const rangeErrors = new Map<string, number>();
+    const cos = createServer((request, response) => {
+      const key = request.url?.slice(1) ?? '';
+      const range = request.headers.range;
+      const etag = request.headers['if-match'];
+      requests.push({ method: request.method, key, range, etag });
+      const head = f.heads.get(key);
+      const body = f.inputBytes.get(key);
+      if (!head || !body) return response.writeHead(404).end();
+      if (request.method === 'HEAD')
+        return response
+          .writeHead(200, {
+            'content-length': head.size,
+            etag: head.etag,
+            'content-type': 'application/octet-stream',
+          })
+          .end();
+      if (etag !== head.etag) return response.writeHead(412).end();
+      const failed = rangeErrors.get(key);
+      if (failed) return response.writeHead(failed).end();
+      const end = /^bytes=0-(\d+)$/.exec(range ?? '');
+      if (!end) return response.writeHead(400).end();
+      const length = Number(end[1]) + 1;
+      return response
+        .writeHead(206, {
+          'content-length': length,
+          'content-range': `bytes 0-${length - 1}/${head.size}`,
+          etag: head.etag,
+        })
+        .end(body.subarray(0, length));
+    });
+    await new Promise<void>((resolve) => cos.listen(0, '127.0.0.1', resolve));
+    const address = cos.address();
+    if (!address || typeof address === 'string') throw new Error('COS fixture address missing');
+    const original = COS.prototype.headObject;
+    const pointToFixture = vi.spyOn(COS.prototype, 'headObject').mockImplementation(function (
+      this: COS,
+      ...args
+    ) {
+      const client = this as unknown as { options: { Domain: string; Protocol: string } };
+      client.options.Domain = `http://127.0.0.1:${address.port}`;
+      client.options.Protocol = 'http:';
+      return original.apply(this, args);
+    });
+    try {
+      const storage = createCosStorage({
+        databaseURL: 'postgresql://example.invalid/media',
+        bucket: 'mio-test-1234567890',
+        region: 'ap-shanghai',
+        secretId: 'fixture',
+        secretKey: 'fixture',
+      });
+      f.objects.head.mockImplementation(storage.head);
+      f.objects.readPrefix.mockImplementation(storage.readPrefix!);
+      const image = await f.addAsset(actor.userId, 'ready', 'Image/PNG');
+      const fake = await f.addAsset(actor.userId, 'ready', 'Image/PNG', false, wave);
+      const audio = await f.addAsset(actor.userId, 'ready', 'audio/x-wav', false, wave);
+      const videos = new Map(
+        await Promise.all(
+          (['mp4', 'mov', '3gp'] as const).map(
+            async (kind) =>
+              [kind, await readFile(writeVideoProbeFixture(f.directory, kind))] as const,
+          ),
+        ),
+      );
+      const video = await f.addAsset(actor.userId, 'ready', 'video/mp4', true, videos.get('mp4')!);
+      const invalid = await f.post([{ assetId: fake.assetId }]);
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: { code: 'VIDEO_INPUT_INVALID' } });
+      for (const kind of ['mov', '3gp'] as const) {
+        const wrong = await f.addAsset(actor.userId, 'ready', 'video/mp4', true, videos.get(kind)!);
+        const response = await f.post([{ assetId: wrong.assetId, mediaType: 'video' }]);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: { code: 'VIDEO_INPUT_INVALID' } });
+      }
+      for (const [status, expected, code] of [
+        [412, 409, 'VIDEO_INPUT_CHANGED'],
+        [409, 503, 'VIDEO_UNAVAILABLE'],
+        [206, 503, 'VIDEO_UNAVAILABLE'],
+        [503, 503, 'VIDEO_UNAVAILABLE'],
+      ] as const) {
+        rangeErrors.set(image.key, status);
+        const response = await f.post([{ assetId: image.assetId }]);
+        expect(response.status).toBe(expected);
+        expect(await response.json()).toMatchObject({ error: { code } });
+      }
+      rangeErrors.delete(image.key);
+      expect((await f.pool.query('SELECT count(*) FROM mio_video_jobs')).rows[0].count).toBe('0');
+      expect(f.objects.materialUrl).not.toHaveBeenCalled();
+      expect(f.upstream).not.toHaveBeenCalled();
+
+      const refs: VideoAssetReference[] = [
+        { assetId: image.assetId },
+        { assetId: audio.assetId, mediaType: 'audio' },
+        { assetId: video.assetId, mediaType: 'video' },
+      ];
+      requests.length = 0;
+      const expectedReads = [image, audio, video].flatMap(({ key, head }) => [
+        { method: 'HEAD', key, range: undefined, etag: undefined },
+        {
+          method: 'GET',
+          key,
+          range: `bytes=0-${Math.min(head.size - 1, 1024) - 1}`,
+          etag: head.etag,
+        },
+      ]);
+      const accepted = await f.post(refs);
+      expect(accepted.status).toBe(202);
+      const job = await accepted.json();
+      expect(job.inputSnapshot).toEqual(refs);
+      expect(requests).toEqual(expectedReads);
+      expect(f.objects.materialUrl).not.toHaveBeenCalled();
+      const row = await f.runNext();
+      expect(row.id).toBe(job.id);
+      expect(row.command.inputObjects).toEqual(
+        Object.fromEntries(
+          [image, audio, video].map(({ assetId, key, head }) => [
+            assetId,
+            { key, etag: head.etag },
+          ]),
+        ),
+      );
+      expect(requests).toEqual([...expectedReads, ...expectedReads]);
+      expect(f.objects.materialUrl.mock.calls).toEqual([[image.key], [audio.key], [video.key]]);
+      expect(f.upstream).toHaveBeenCalledTimes(1);
+      expect(f.upstream.mock.calls[0]![1]?.method).toBe('POST');
+      expect(JSON.parse(String(f.upstream.mock.calls[0]![1]?.body)).content).toMatchObject([
+        { type: 'text' },
+        { type: 'image_url' },
+        { type: 'audio_url' },
+        { type: 'video_url' },
+      ]);
+    } finally {
+      pointToFixture.mockRestore();
+      cos.closeAllConnections();
+      cos.close();
+      await once(cos, 'close');
+      await f.close();
+    }
+  });
+
   it('distinguishes asset rejection from PG and COS failure with zero upstream POSTs', async () => {
     const f = await assetHttpFixture();
     try {
@@ -1351,7 +1625,8 @@ describe('video asset admission over HTTP', () => {
     const f = await assetHttpFixture();
     try {
       const first = await f.addAsset();
-      const second = await f.addAsset(actor.userId, 'ready', 'video/mp4', true);
+      const bytes = await readFile(writeVideoProbeFixture(f.directory, 'mp4'));
+      const second = await f.addAsset(actor.userId, 'ready', 'video/mp4', true, bytes);
       const references: VideoAssetReference[] = [
         { assetId: second.assetId, mediaType: 'video' },
         { assetId: first.assetId },
@@ -1407,6 +1682,43 @@ describe('video asset admission over HTTP', () => {
       await f.close();
     }
   });
+
+  it.each(['key', 'condition'] as const)(
+    'rejects before signing when the frozen input %s changes after admission',
+    async (change) => {
+      const f = await assetHttpFixture();
+      try {
+        const input = await f.addAsset();
+        const response = await f.post([{ assetId: input.assetId }]);
+        expect(response.status).toBe(202);
+        const job = await response.json();
+        if (change === 'key') {
+          const replacement = input.key + '-replaced';
+          f.heads.set(replacement, input.head);
+          f.inputBytes.set(replacement, png);
+          await f.pool.query('UPDATE mio_assets SET raw_key=$1 WHERE id=$2', [
+            replacement,
+            input.assetId,
+          ]);
+        } else {
+          f.objects.readPrefix.mockRejectedValueOnce(
+            Object.assign(new Error('COS conditional read failed'), { statusCode: 412 }),
+          );
+        }
+        await f.runNext();
+        expect(await (await f.get(job.id)).json()).toMatchObject({
+          state: 'rejected',
+          error: { code: 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE' },
+        });
+        expect(f.objects.readPrefix).toHaveBeenCalledTimes(change === 'key' ? 1 : 2);
+        expect(f.objects.readPrefix.mock.calls.every(([key]) => key === input.key)).toBe(true);
+        expect(f.objects.materialUrl).not.toHaveBeenCalled();
+        expect(f.upstream).not.toHaveBeenCalled();
+      } finally {
+        await f.close();
+      }
+    },
+  );
 
   it('replays a persisted pre-Foundation input hash and rejects changed new inputs', async () => {
     const f = await assetHttpFixture();
@@ -1505,7 +1817,10 @@ describe('video asset admission over HTTP', () => {
             stage: 'ready',
           });
         }
-        reply.resolve({ ETag: asset.head.etag, headers: { 'content-length': '100' } });
+        reply.resolve({
+          ETag: asset.head.etag,
+          headers: { 'content-length': String(asset.head.size) },
+        });
         await reply.promise;
         expect(f.objects.materialUrl).not.toHaveBeenCalled();
         expect(f.upstream).not.toHaveBeenCalled();

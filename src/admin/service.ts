@@ -353,10 +353,10 @@ function validateTemplatePayload(input: {
   }
   let validated;
   try {
-    validated = validateModelRouteEntry({
-      ...input.routeTemplate,
-      rawModelId: '__template_validation__',
-    });
+    validated = validateModelRouteEntry(
+      { ...input.routeTemplate, rawModelId: '__template_validation__' },
+      'template',
+    );
   } catch (error) {
     if (error instanceof ProviderError) {
       throw new AdminError(error.status, error.code);

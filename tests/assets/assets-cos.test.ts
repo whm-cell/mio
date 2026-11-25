@@ -36,6 +36,16 @@ function redirectCosRequests(port: number, onSend?: () => void) {
   });
 }
 
+function redirectCosDownloads(port: number) {
+  const original = COS.prototype.getObject;
+  return vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (this: COS, ...args) {
+    const client = this as unknown as { options: { Domain: string; Protocol: string } };
+    client.options.Domain = `http://127.0.0.1:${port}`;
+    client.options.Protocol = 'http:';
+    return original.apply(this, args);
+  });
+}
+
 it('uses a supplied temporary session token in signed URLs without changing long-term key support', () => {
   const token = 'synthetic+token=/&%#?';
   const getObjectUrl = vi.spyOn(COS.prototype, 'getObjectUrl');
@@ -696,6 +706,120 @@ it.each([
     await once(server, 'close');
   }
 });
+
+it('validates a conditional prefix on the actual SDK wire and distinguishes identity from storage failures', async () => {
+  const tag = '"fixture-etag"';
+  const good = { 'content-range': 'bytes 0-7/1000000', etag: tag };
+  const cases = {
+    exact: { status: 206, headers: { ...good, 'content-length': '8' }, body: '12345678' },
+    'small-object': { status: 206, headers: { 'content-range': 'bytes 0-3/5' }, body: '1234' },
+    'wrong-start': { status: 206, headers: { ...good, 'content-range': 'bytes 1-8/1000000' } },
+    'wrong-end': { status: 206, headers: { ...good, 'content-range': 'bytes 0-6/1000000' } },
+    'wrong-total': { status: 206, headers: { ...good, 'content-range': 'bytes 0-7/1000001' } },
+    'missing-range': { status: 206, headers: { etag: tag } },
+    'malformed-range': { status: 206, headers: { ...good, 'content-range': 'bytes 0-7/*' } },
+    'wrong-etag': { status: 206, headers: { ...good, etag: '"other"' } },
+    'wrong-length': { status: 206, headers: { ...good, 'content-length': '9' } },
+    short: { status: 206, headers: good, body: '123' },
+    overlong: { status: 206, headers: good, body: '123456789' },
+    'ignored-range': { status: 200 },
+    changed: { status: 412 },
+    unavailable: { status: 503 },
+  } satisfies Record<string, { status: number; headers?: Record<string, string>; body?: string }>;
+  const requests: IncomingMessage[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request);
+    const entry: { status: number; headers?: Record<string, string>; body?: string } =
+      cases[request.url?.slice(1) as keyof typeof cases];
+    response.writeHead(entry.status, entry.headers).flushHeaders();
+    if (entry.body !== undefined) {
+      // A chunked response tests length from the stream when no Content-Length is sent.
+      response.write(entry.body.slice(0, 2));
+      response.end(entry.body.slice(2));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const get = redirectCosDownloads(address.port);
+  try {
+    const storage = createCosStorage(copyFixture);
+    const read = (key: keyof typeof cases, size = 1_000_000) =>
+      storage.readPrefix!(key, tag, size, 8, AbortSignal.timeout(3000));
+    await expect(read('exact')).resolves.toEqual(Buffer.from('12345678'));
+    await expect(read('small-object', 5)).resolves.toEqual(Buffer.from('1234'));
+    for (const key of ['wrong-start', 'wrong-end', 'missing-range', 'malformed-range'] as const)
+      await expect(read(key)).rejects.toThrow('ASSET_RANGE_RESPONSE');
+    for (const key of ['wrong-total', 'wrong-etag', 'wrong-length'] as const)
+      await expect(read(key)).rejects.toMatchObject({ status: 409, code: 'ASSET_SOURCE_CHANGED' });
+    for (const key of ['short', 'overlong'] as const)
+      await expect(read(key)).rejects.toMatchObject({ status: 409, code: 'ASSET_SIZE_MISMATCH' });
+    await expect(read('ignored-range')).rejects.toMatchObject({ statusCode: 200 });
+    await expect(read('changed')).rejects.toMatchObject({ statusCode: 412 });
+    await expect(read('unavailable')).rejects.toMatchObject({ statusCode: 503 });
+    expect(requests.map(({ url }) => url).sort()).toEqual(
+      Object.keys(cases)
+        .map((key) => '/' + key)
+        .sort(),
+    );
+    for (const request of requests) {
+      expect(request.method).toBe('GET');
+      expect(request.headers).toMatchObject({
+        'if-match': tag,
+        range: request.url === '/small-object' ? 'bytes=0-3' : 'bytes=0-7',
+      });
+      expect(request.headers.authorization).toMatch(/q-header-list=[^&]*if-match[^&]*range/);
+    }
+  } finally {
+    get.mockRestore();
+    server.closeAllConnections();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+it.each([false, true])(
+  'closes the conditional range socket on abort (headers sent: %s)',
+  async (sent) => {
+    const entered = Promise.withResolvers<void>();
+    const disconnected = Promise.withResolvers<void>();
+    const server = createServer((_request, response) => {
+      response.on('close', () => disconnected.resolve());
+      if (sent) response.writeHead(206, { 'content-range': 'bytes 0-7/1000000' }).write('1234');
+      entered.resolve();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+    const get = redirectCosDownloads(address.port);
+    const controller = new AbortController();
+    try {
+      const storage = createCosStorage(copyFixture);
+      const read = storage.readPrefix!(
+        'waiting',
+        '"fixture-etag"',
+        1_000_000,
+        8,
+        controller.signal,
+      );
+      await entered.promise;
+      controller.abort();
+      await expect(read).rejects.toThrow();
+      await disconnected.promise;
+      const calls = get.mock.calls.length;
+      await expect(
+        storage.readPrefix!('never-started', '"fixture-etag"', 1_000_000, 8, controller.signal),
+      ).rejects.toThrow();
+      expect(get).toHaveBeenCalledTimes(calls);
+    } finally {
+      controller.abort();
+      get.mockRestore();
+      server.closeAllConnections();
+      server.close();
+      await once(server, 'close');
+    }
+  },
+);
 
 it('streams video staging with MD5, private access and non-overwrite metadata', async () => {
   const bytes = Buffer.from('generated video fixture');

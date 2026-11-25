@@ -22,6 +22,14 @@ export interface AssetObjectStore {
   ): Promise<{ size: number; etag: string; sha256?: string; contentType?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   readMedia?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  /** Read at most maxBytes under the given ETag and verify the range against the object size. */
+  readPrefix?(
+    key: string,
+    etag: string,
+    size: number,
+    maxBytes: number,
+    signal: AbortSignal,
+  ): Promise<Uint8Array>;
   putImage?(
     key: string,
     bytes: Uint8Array,

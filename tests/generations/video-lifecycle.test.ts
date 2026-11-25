@@ -831,18 +831,27 @@ describe('durable video execution', () => {
   });
 });
 
-it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy'] as const)(
+it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy', 'legacy-invalid'] as const)(
   'checks the current admission after resolving the frozen input when %s',
   async (scenario) => {
-    const f = await fixture(scenario === 'legacy' ? 'legacy' : 'frozen');
+    const f = await fixture(scenario.startsWith('legacy') ? 'legacy' : 'frozen');
     const headStarted = Promise.withResolvers<void>();
     const headRelease = Promise.withResolvers<void>();
+    const prefix = Buffer.alloc(255);
+    // The historical ready PNG record may refer to actual WAVE data.
+    Buffer.from(
+      scenario === 'legacy-invalid'
+        ? '52494646f800000057415645666d74201000000001000100401f0000803e00000200100064617461d4000000'
+        : '89504e470d0a1a0a',
+      'hex',
+    ).copy(prefix);
     const objects: AssetObjectStore = {
       uploadUrl: vi.fn(),
       downloadUrl: vi.fn(),
       copy: vi.fn(),
       delete: vi.fn(),
       materialUrl: vi.fn(() => 'https://cos.fixture/first-frame'),
+      readPrefix: vi.fn(async () => prefix),
       head: vi.fn(async () => {
         headStarted.resolve();
         await headRelease.promise;
@@ -878,7 +887,16 @@ it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy'] as const
       await pending;
     }
     expect(objects.head).toHaveBeenCalledWith(f.asset.key, expect.any(AbortSignal));
-    if (scenario === 'asset-changed') {
+    if (scenario === 'asset-changed') expect(objects.readPrefix).not.toHaveBeenCalled();
+    else
+      expect(objects.readPrefix).toHaveBeenCalledWith(
+        f.asset.key,
+        f.asset.etag,
+        256,
+        1024,
+        expect.any(AbortSignal),
+      );
+    if (scenario === 'asset-changed' || scenario === 'legacy-invalid') {
       expect(f.provider.snapshotVideo).not.toHaveBeenCalled();
       expect(objects.materialUrl).not.toHaveBeenCalled();
     } else {
@@ -888,6 +906,9 @@ it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy'] as const
       );
       expect(vi.mocked(objects.materialUrl!).mock.invocationCallOrder[0]).toBeLessThan(
         f.provider.snapshotVideo.mock.invocationCallOrder[0]!,
+      );
+      expect(vi.mocked(objects.readPrefix!).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(objects.materialUrl!).mock.invocationCallOrder[0]!,
       );
     }
     if (accepted) {
@@ -909,6 +930,13 @@ it.each(['rotated', 'disabled', 'asset-changed', 'unchanged', 'legacy'] as const
         async_max_queries: null,
         upstream_task_id: null,
       });
+      if (scenario === 'legacy-invalid') {
+        expect(row.command.inputObjects).toBeUndefined();
+        expect(await f.store.get(f.actor.userId, f.job.jobId)).toMatchObject({
+          state: 'rejected',
+          error: { code: 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE' },
+        });
+      }
     }
   },
 );

@@ -8,9 +8,9 @@ import {
 
 const modelRef = `onelink:model:${randomUUID()}`;
 
-function request(parameters: Record<string, unknown>) {
+function request(parameters: Record<string, unknown>, requestId = randomUUID()) {
   return decodeVideoCreateRequest({
-    requestId: randomUUID(),
+    requestId,
     modelRef,
     expectedCapabilitiesVersion: 'cap-v1',
     parameters,
@@ -63,13 +63,36 @@ describe('video request contract', () => {
       }),
     ).toThrowError(expect.objectContaining({ code: 'VIDEO_INPUT_INVALID' }));
 
-    const first = request({ mode: 'full', prompt: 'hello', references: references.slice(0, 2) });
-    const second = request({
-      mode: 'full',
-      prompt: 'hello',
-      references: [...references.slice(0, 2)].reverse(),
-    });
+    const requestId = randomUUID();
+    const first = request(
+      { mode: 'full', prompt: 'hello', references: references.slice(0, 2) },
+      requestId,
+    );
+    const second = request(
+      { mode: 'full', prompt: 'hello', references: [...references.slice(0, 2)].reverse() },
+      requestId,
+    );
     expect(videoRequestHash(first)).not.toBe(videoRequestHash(second));
+  });
+
+  it.each([
+    [undefined, 'd07ca2e2c1ddf66382a1d50dd695b1f2bb9189e3850906494383b00789a116f4'],
+    [true, '249348d3bcb5ab084258204f84e224cf76cf81f557d74b84692d79b49f112183'],
+    [false, 'a04b1a370cbf1ddb4da095bc4bd217840b4450175628baf69050ea7e130d7bdd'],
+  ])('keeps persisted request hash bytes for generateAudio=%s', (generateAudio, hash) => {
+    const decoded = decodeVideoCreateRequest({
+      parameters: {
+        prompt: 'Sail past the reeds.',
+        ...(generateAudio !== undefined ? { generateAudio } : {}),
+        durationSeconds: 8,
+        ratio: '16:9',
+        mode: 'text_to_video',
+      },
+      expectedCapabilitiesVersion: 'cap-v1',
+      modelRef: 'onelink:model:00000000-0000-4000-8000-000000000036',
+      requestId: '00000000-0000-4000-8000-000000000032',
+    });
+    expect(videoRequestHash(decoded)).toBe(hash);
   });
 
   it('requires an explicitly typed video reference for video reference modes', () => {

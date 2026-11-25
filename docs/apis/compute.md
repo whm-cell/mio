@@ -207,7 +207,7 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 输入：本人目录 modelRef；不接受查询参数。
 
-成功：200 `{modelRef,capabilitiesVersion,available,unavailableReason,modes,cancellation}`。模式按当前目录、精确平台路由和已装配驱动的交集投影，包含分型号、分模式参数限制；例如 Vidu 比例仅在文生视频模式提供。旧的仅声明模式而缺少参数边界的路线保持不可用。目录或路由存在不代表已真实验证。
+成功：200 `{modelRef,capabilitiesVersion,available,unavailableReason,modes,cancellation}`。模式按当前目录、精确平台路由和已装配驱动的交集投影，包含分型号、分模式参数限制。例如 Vidu 比例仅在文生视频模式提供。路由声明的模式和对应媒体引用上限须与驱动实际载荷编码一致。缺少参数边界或声明尚无实际编码的路由保持不可用。目录或路由存在不代表已真实验证。已提交的旧任务沿用冻结协议查询和恢复。
 
 错误：400 VIDEO_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED、503 VIDEO_UNAVAILABLE。不可用成员正常返回 available=false，不暴露他人配置。
 
@@ -217,7 +217,13 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 身份：当前登录用户；要求允许的 Origin 和 JSON。
 
-输入：`{requestId,modelRef,expectedCapabilitiesVersion,parameters}`。requestId 为 UUID v4；modelRef 必须属于本人当前目录。parameters 接受封闭模式、本人 ready Asset 引用及分型号参数，不接受任意 URL、对象键或上游任务 ID。提示词最多 5000 码点，正文 256 KiB，总媒体引用最多 16；路由可施加更小限制。首次准入核对归属、状态、媒体类型与实际对象长度，并在内部冻结实际 raw 对象键和 ETag。生成 POST 前再次核对这些条件，符合后才签发私有输入 URL，引用顺序沿用请求。缺少新对象快照的旧任务仍校验当前本人 ready 资产和实际对象。受支持的水印省略值采用本人供应商默认值并冻结。
+输入：`{requestId,modelRef,expectedCapabilitiesVersion,parameters}`。requestId 为 UUID v4；modelRef 必须属于本人当前目录。parameters 接受封闭模式、本人 ready Asset 引用及分型号参数，不接受任意 URL、对象键或上游任务 ID。提示词最多 5000 码点，正文 256 KiB，总媒体引用最多 16；路由可施加更小限制。
+
+首次准入核对归属、ready 状态、MIME 和实际长度。MIME 不区分大小写。服务对每个不同的对象使用 HEAD 返回的 ETag 发出条件范围 GET，流式读取至多 1 KiB 的开头字节。读取须返回 206，范围须与请求相符，总长度须与 HEAD 和资产登记相同。实际收到的字节数须与范围相符，响应携带 ETag 时须与条件值相同。服务按声明 MIME 比对文件签名或容器标识。例如声明为 PNG 的资产须含 PNG 签名，MP4 和 MOV 分别核对文件品牌。确认共享容器的具体音轨、视频轨及可播放性仍需完整媒体探测。
+
+准入后内部冻结实际原件键和 ETag。生成 POST 前按同一份对象身份重新执行上述验证，全部验证通过才签发私有地址。请求中的引用顺序保留。缺少对象快照的旧任务同样校验本人当前 ready 资产的实际对象字节。准入阶段，对象身份或长度变化返回 `VIDEO_INPUT_CHANGED`。忽略范围、范围响应格式不符或 COS 读失败返回 `VIDEO_UNAVAILABLE`。MIME 或字节签名不匹配返回 `VIDEO_INPUT_INVALID`。
+
+支持水印的路由在省略 `watermark` 时冻结本人供应商的默认值。发送原生声音默认值的 Kling 型号在省略 `generateAudio` 时冻结启用值，路由声明决定是否允许调用方显式设置。未提供本地声音默认值的驱动保留字段的省略语义。重放按原输入查找已受理任务，沿用该任务的有效参数。
 
 成功：202 持久 VideoJobView。同 owner/requestId 和同输入返回 200 原任务；不同输入返回 409。accepted 仅表示受理。执行器在 POST 前持久化 submitting，收到上游任务 ID 后先写入持久 `MIO_GENERATIONS_DATA_DIR` 的私有回执，再更新数据库。数据库写入中断后，执行器凭同一目录内已持久化的原回执，在可用配额和剩余预算内自动恢复同一任务的查询。若回执尚未持久化且任务无法重新取得配额，数据库可用时可保留上游 ID 供对账，任务维持 unknown。无法确认上游身份时进入 unknown，生成 POST 至多一次。
 

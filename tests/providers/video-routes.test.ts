@@ -1,6 +1,10 @@
 import { expect, it } from 'vitest';
 import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
-import { validateModelRouteEntry } from '../../src/providers/onelink/router.ts';
+import {
+  resolveVideoRoute,
+  validateModelRouteEntry,
+  validateRouteImportPayload,
+} from '../../src/providers/onelink/router.ts';
 import {
   validateVideoParameters,
   videoModeParameters,
@@ -8,7 +12,7 @@ import {
   videoRouteRuntimeAvailable,
 } from '../../src/providers/onelink/video-route.ts';
 import type { VideoRequestParameters } from '../../src/generations/video/contracts.ts';
-import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
+import type { PlatformRouteRecord, VideoRouteConfig } from '../../src/providers/contracts.ts';
 
 const MODELS = [
   'doubao-seedance-1.5-pro',
@@ -55,6 +59,33 @@ function input(patch: Partial<VideoRequestParameters> = {}): VideoRequestParamet
   return { mode: 'text_to_video', prompt: 'A paper boat floats on a quiet lake.', ...patch };
 }
 
+function storedRoute(
+  declaration: ReturnType<typeof legacyVideoRouteEntries>[number],
+): PlatformRouteRecord {
+  return {
+    provider_type: 'onelink',
+    raw_model_id: declaration.rawModelId,
+    operation: declaration.operation,
+    vendor: declaration.vendor,
+    driver: declaration.driver,
+    classification: declaration.classification,
+    submit_path: declaration.submitPath,
+    edit_path: null,
+    query_path_template: declaration.queryPathTemplate,
+    param_spec: { ...declaration.paramSpec },
+    request_defaults: {},
+    output_spec: {},
+    capability_metadata: {
+      video: { modes: declaration.paramSpec.supportedModes, cancellation: { supported: false } },
+    },
+    source_kind: declaration.sourceKind,
+    source: declaration.source,
+    source_version: declaration.sourceVersion,
+    declaration_version: 1,
+    enabled: true,
+  };
+}
+
 it('migrates only 26 exact discovered identities with independently validated sourced declarations', () => {
   const declarations = legacyVideoRouteEntries([
     ...MODELS,
@@ -68,6 +99,10 @@ it('migrates only 26 exact discovered identities with independently validated so
     expect(validateModelRouteEntry(declaration)).toMatchObject({
       operation: 'video.generate',
       rawModelId: declaration.rawModelId,
+      capabilityMetadata: { video: { modes: declaration.paramSpec.supportedModes } },
+    });
+    expect(resolveVideoRoute(storedRoute(declaration))).toMatchObject({
+      route: { paramSpec: { supportedModes: declaration.paramSpec.supportedModes } },
     });
     expect(declaration.sourceVersion).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(declaration.paramSpec.parameters).toBeDefined();
@@ -76,6 +111,96 @@ it('migrates only 26 exact discovered identities with independently validated so
     [],
   );
 });
+
+it.each([
+  ['doubao-seedance-1.5-pro', 'full'],
+  ['vega-1.5-pro', 'last_frame'],
+  ['doubao-seedance-2-0', 'reference_subjects'],
+  ['video-kling-v3', 'video_ref'],
+  ['video-kling-v3-omni', 'full'],
+  ['kling-v2-5-turbo', 'start_end'],
+  ['video-vidu-q2', 'first_frame'],
+  ['video-vidu-q2', 'start_end'],
+  ['video-viduq3-pro', 'full'],
+  ['video-viduq3-pro', 'last_frame'],
+  ['video-viduq3-pro', 'reference_subjects'],
+  ['veo-3.1', 'video_ref'],
+  ['happyhorse-1.0-i2v', 'reference_subjects'],
+  ['happyhorse-1.1-r2v', 'video_edit'],
+] as const)(
+  'rejects %s declarations that include %s at import and live resolution',
+  (model, mode) => {
+    const seed = legacyVideoRouteEntries([model])[0]!;
+    const declared = {
+      ...seed,
+      paramSpec: { ...seed.paramSpec, supportedModes: [...seed.paramSpec.supportedModes, mode] },
+    };
+    expect(() => validateRouteImportPayload({ routes: [declared] })).toThrow('ROUTE_INVALID');
+    expect(resolveVideoRoute(storedRoute(declared))).toBeUndefined();
+  },
+);
+
+it('allows a sourced dynamic Vidu model and binds Kling video_ref to exact Omni', () => {
+  const dynamic = {
+    ...legacyVideoRouteEntries(['video-vidu-q2'])[0]!,
+    rawModelId: 'video-vidu-fixture-new-subject-model',
+  };
+  expect(validateModelRouteEntry(dynamic).paramSpec.supportedModes).toEqual([
+    'text_to_video',
+    'reference_subjects',
+  ]);
+  expect(resolveVideoRoute(storedRoute(dynamic))?.route.paramSpec.supportedModes).toEqual([
+    'text_to_video',
+    'reference_subjects',
+  ]);
+
+  const omniAlias = {
+    ...legacyVideoRouteEntries(['video-kling-v3-omni'])[0]!,
+    rawModelId: 'video-kling-v3-omni-fixture-alias',
+  };
+  expect(() => validateModelRouteEntry(omniAlias)).toThrow('ROUTE_INVALID');
+  expect(resolveVideoRoute(storedRoute(omniAlias))).toBeUndefined();
+});
+
+it.each([
+  ['video-kling-v3-omni', 'video_ref', { maxAudios: 1 }],
+  ['video-kling-v3-omni', 'video_ref', { maxVideos: 2 }],
+  ['video-kling-v3-omni', 'video_ref', { maxVideos: 0 }],
+  ['happyhorse-1.0-video-edit', 'video_edit', { maxAudios: 1 }],
+] as const)(
+  'rejects %s %s media limits %j at import and live resolution',
+  (model, _mode, limits) => {
+    const seed = legacyVideoRouteEntries([model])[0]!;
+    const declared = {
+      ...seed,
+      paramSpec: {
+        ...seed.paramSpec,
+        parameters: { ...seed.paramSpec.parameters!, ...limits },
+      },
+    };
+    expect(
+      validateVideoRouteConfig({
+        ...declared,
+        editPath: null,
+        requestDefaults: {},
+        outputSpec: {},
+      }),
+    ).toBeDefined();
+    expect(() => validateRouteImportPayload(declared)).toThrow('ROUTE_INVALID');
+    expect(resolveVideoRoute(storedRoute(declared))).toBeUndefined();
+  },
+);
+
+it.each(['video-kling-v3-omni', 'happyhorse-1.0-video-edit'])(
+  'keeps incomplete %s declarations visible and pending',
+  (model) => {
+    const seed = legacyVideoRouteEntries([model])[0]!;
+    const legacy = { ...seed, paramSpec: { supportedModes: seed.paramSpec.supportedModes } };
+    const resolved = resolveVideoRoute(storedRoute(legacy));
+    expect(resolved?.route.paramSpec.supportedModes).toEqual(seed.paramSpec.supportedModes);
+    expect(videoRouteRuntimeAvailable(resolved!.route)).toBe(false);
+  },
+);
 
 it('keeps incomplete V1 declarations visible but rejects their execution parameters', () => {
   const complete = route('doubao-seedance-1.5-pro');

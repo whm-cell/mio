@@ -152,11 +152,16 @@ describe('bounded OneLink video protocol', () => {
       key,
       signal,
     );
-    expect(
-      JSON.parse(String(fetcher.mock.calls[2]![1]?.body)).content.map(
-        (item: { role?: string }) => item.role,
-      ),
-    ).toEqual([undefined, 'reference_video', 'reference_image', 'reference_audio']);
+    const fullPayload = JSON.parse(String(fetcher.mock.calls[2]![1]?.body)) as {
+      content: { role?: string }[];
+    };
+    expect(fullPayload.content.map((item) => item.role)).toEqual([
+      undefined,
+      'reference_video',
+      'reference_image',
+      'reference_audio',
+    ]);
+    expect(fullPayload).not.toHaveProperty('generate_audio');
   });
 
   it('persists the original Kling image endpoint in its task token', async () => {
@@ -217,7 +222,7 @@ describe('bounded OneLink video protocol', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('uses Omni contents/settings and never flattens a reference video', async () => {
+  it('encodes Omni video_ref as feature_video with its own settings', async () => {
     const fetcher = transport({ code: 0, data: { task_id: 'omni-1' } }, {});
     const protocol = createVideoProtocol(
       route('kling-videos', ['video_ref']),
@@ -246,6 +251,47 @@ describe('bounded OneLink video protocol', () => {
       ],
       settings: { duration: 4, aspect_ratio: '16:9', resolution: '1080p', audio: 'off' },
     });
+  });
+
+  it.each([
+    ['video-kling-v3', '/kling/v1/videos/text2video'],
+    ['video-kling-v3-omni', '/kling/v1/videos/omni-video'],
+  ])('encodes omitted and frozen native audio for %s', async (model, path) => {
+    const fetcher = transport({ code: 0, data: { task_id: 'kling-audio' } }, {});
+    for (const canOverride of [true, false]) {
+      const protocol = createVideoProtocol(
+        route('kling-videos', ['text_to_video'], {
+          generateAudio: canOverride,
+          offPeak: false,
+        }),
+        model,
+        fetcher,
+      );
+      for (const generateAudio of [undefined, true, false]) {
+        const testInput = {
+          mode: 'text_to_video' as const,
+          prompt: 'Listen to the wind.',
+          ...(generateAudio !== undefined ? { generateAudio } : {}),
+        };
+        fetcher.mockClear();
+        const result = await protocol.submit(testInput, {}, key, signal);
+        if (!canOverride && generateAudio === false) {
+          expect(result).toEqual({ state: 'rejected', code: 'VIDEO_INPUT_INVALID' });
+          expect(fetcher).not.toHaveBeenCalled();
+          continue;
+        }
+        expect(result).toMatchObject({ state: 'submitted' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect(new URL(String(fetcher.mock.calls[0]![0])).pathname).toBe(path);
+        expect(body(fetcher)).toHaveProperty(
+          'settings.audio',
+          generateAudio === false ? 'off' : 'native',
+        );
+        if (model === 'video-kling-v3')
+          expect(body(fetcher)).toHaveProperty('sound', generateAudio === false ? 'off' : 'on');
+        else expect(body(fetcher)).not.toHaveProperty('sound');
+      }
+    }
   });
 
   it('retains Kling supplier ordinals for mixed results and rejects invalid envelopes', async () => {
@@ -293,8 +339,8 @@ describe('bounded OneLink video protocol', () => {
     ).toEqual(Array.from({ length: 6 }, () => ['/kling/v1/videos/image2video/old-task', 'GET']));
   });
 
-  it('rejects turbo tail frames and explicit sound before POST', async () => {
-    const fetcher = transport({}, {});
+  it('rejects turbo tail frames and explicit sound and omits audio on valid POST', async () => {
+    const fetcher = transport({ code: 0, data: { task_id: 'kling-turbo' } }, {});
     const protocol = createVideoProtocol(
       route('kling-videos', ['text_to_video', 'first_frame'], {
         generateAudio: false,
@@ -330,6 +376,11 @@ describe('bounded OneLink video protocol', () => {
       ).state,
     ).toBe('rejected');
     expect(fetcher).not.toHaveBeenCalled();
+    expect(
+      await protocol.submit({ mode: 'text_to_video', prompt: 'A boat.' }, {}, key, signal),
+    ).toMatchObject({ state: 'submitted' });
+    expect(body(fetcher)).not.toHaveProperty('sound');
+    expect(body(fetcher)).not.toHaveProperty('settings.audio');
   });
 
   it('encodes Vidu q2 named subjects without q3-only fields', async () => {
@@ -404,6 +455,24 @@ describe('bounded OneLink video protocol', () => {
       off_peak: true,
     });
     expect(await protocol.query('q3-1', key, signal)).toEqual({ state: 'processing' });
+  });
+
+  it('uses the original Vidu query path for a frozen route that declared full mode', async () => {
+    const fetcher = transport({ task_id: 'new-vidu' }, { state: 'processing' });
+    const protocol = createVideoProtocol(
+      route('vidu-videos', ['text_to_video', 'full']),
+      'video-viduq3-pro',
+      fetcher,
+    );
+    expect(
+      await protocol.submit({ mode: 'text_to_video', prompt: 'A boat.' }, {}, key, signal),
+    ).toMatchObject({ state: 'submitted' });
+    expect(body(fetcher)).not.toHaveProperty('audio');
+    expect(await protocol.query('legacy-vidu-full', key, signal)).toEqual({ state: 'processing' });
+    expect(new URL(String(fetcher.mock.calls[1]![0])).pathname).toBe(
+      '/vidu/ent/v2/tasks/legacy-vidu-full/creations',
+    );
+    expect(fetcher.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
   });
 
   it('retains the Veo full operation path and waits for done=true', async () => {

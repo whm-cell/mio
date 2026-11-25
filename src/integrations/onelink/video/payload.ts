@@ -1,4 +1,9 @@
 import type { VideoRequestParameters } from '../../../generations/video/contracts.ts';
+import {
+  defaultVideoGenerateAudio,
+  KLING_OMNI_MODEL,
+  KLING_OMNI_SUBMIT_PATH,
+} from '../../../generations/video/driver-capabilities.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
 import { resultUrls } from './shared.ts';
 
@@ -51,7 +56,10 @@ function kling(
   input: VideoRequestParameters,
   refs: Record<string, string>,
 ): Submission {
-  if (model === 'video-kling-v3-omni') {
+  const audioDefault = defaultVideoGenerateAudio('kling-videos', model);
+  const nativeAudio = input.generateAudio ?? audioDefault;
+  const audio = nativeAudio ? 'native' : 'off';
+  if (model === KLING_OMNI_MODEL) {
     const contents: Record<string, unknown>[] = [{ type: 'prompt', text: input.prompt }];
     if (input.firstFrame)
       contents.push({ type: 'first_frame', url: reference(refs, input.firstFrame.assetId) });
@@ -69,7 +77,7 @@ function kling(
         });
     }
     return {
-      path: '/kling/v1/videos/omni-video',
+      path: KLING_OMNI_SUBMIT_PATH,
       body: {
         model_name: model,
         contents,
@@ -77,7 +85,7 @@ function kling(
           ...(input.durationSeconds !== undefined ? { duration: input.durationSeconds } : {}),
           ...(input.ratio !== undefined ? { aspect_ratio: input.ratio } : {}),
           ...(input.resolution !== undefined ? { resolution: input.resolution.toLowerCase() } : {}),
-          audio: input.generateAudio === false ? 'off' : 'native',
+          audio,
         },
       },
     };
@@ -95,11 +103,11 @@ function kling(
       ...(input.resolution !== undefined ? { resolution: input.resolution.toLowerCase() } : {}),
       ...(input.firstFrame ? { image: reference(refs, input.firstFrame.assetId) } : {}),
       ...(input.lastFrame ? { image_tail: reference(refs, input.lastFrame.assetId) } : {}),
-      ...(model === 'kling-v2-5-turbo'
+      ...(audioDefault === undefined
         ? {}
         : {
-            sound: input.generateAudio === false ? 'off' : 'on',
-            settings: { audio: input.generateAudio === false ? 'off' : 'native' },
+            sound: nativeAudio ? 'on' : 'off',
+            settings: { audio },
           }),
     },
   };

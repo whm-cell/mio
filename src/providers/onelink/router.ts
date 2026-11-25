@@ -16,7 +16,7 @@ import type {
 import type { VideoDriver, VideoMode } from '../../generations/video/contracts.ts';
 import { AUDIO_ROUTES, audioCapabilities, validAudioRoute } from './audio.ts';
 import { VOICE_DRIVER, VOICE_OPERATION, VOICE_PATH, validVoiceRoute } from './voices.ts';
-import { validateVideoRouteConfig } from './video-route.ts';
+import { validateVideoRouteConfig, validateVideoRouteModes } from './video-route.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,
@@ -301,7 +301,10 @@ function validateChatMetadata(value: unknown): AdaptationCapabilityMetadata {
   };
 }
 
-export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
+export function validateModelRouteEntry(
+  value: unknown,
+  context: 'model' | 'template' = 'model',
+): ValidatedModelRoute {
   if (!isPlainObject(value)) invalidRoute();
   for (const key of Object.keys(value)) {
     if (!ROUTE_INPUT_FIELDS.has(key)) invalidRoute();
@@ -386,7 +389,11 @@ export function validateModelRouteEntry(value: unknown): ValidatedModelRoute {
       requestDefaults: value.requestDefaults,
       outputSpec: value.outputSpec,
     });
-    if (!canonical) invalidRoute();
+    if (
+      !canonical ||
+      !validateVideoRouteModes(canonical, context === 'model' ? rawModelId : undefined)
+    )
+      invalidRoute();
     validateVideoCapabilityMetadata(value.capabilityMetadata, canonical.paramSpec.supportedModes);
     return {
       providerType: 'onelink',
@@ -768,7 +775,7 @@ export function resolveVideoRoute(row: PlatformRouteRecord): ResolvedVideoRoute 
     requestDefaults: row.request_defaults,
     outputSpec: row.output_spec,
   });
-  if (!route) return undefined;
+  if (!route || !validateVideoRouteModes(route, row.raw_model_id)) return undefined;
   let video: VideoCapabilityMetadata;
   try {
     video = validateVideoCapabilityMetadata(

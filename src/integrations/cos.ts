@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
 import { sha256Bytes } from '@mio/foundation/hash';
 import COS from 'cos-nodejs-sdk-v5';
 import { PassThrough, Readable } from 'node:stream';
@@ -6,6 +7,24 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { AssetError, waitForObjectHead } from '../assets/contracts.ts';
 import type { AssetConfig } from '../assets/config.ts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
+
+function prefixResponseError(
+  headers: IncomingHttpHeaders,
+  length: number,
+  objectSize: number,
+  etag: string,
+): Error | undefined {
+  const range = headers['content-range']?.match(/^bytes 0-(\d+)\/(\d+)$/i);
+  const total = Number(range?.[2]);
+  if (Number(range?.[1]) !== length - 1 || !Number.isSafeInteger(total) || total < length)
+    return new Error('ASSET_RANGE_RESPONSE');
+  if (
+    total !== objectSize ||
+    (headers['content-length'] !== undefined && headers['content-length'] !== String(length)) ||
+    (headers.etag !== undefined && headers.etag !== etag)
+  )
+    return new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+}
 
 /** Server-side credentials are scoped to this private bucket and are never returned to clients. */
 export function createCosStorage(config: AssetConfig): AssetObjectStore {
@@ -56,8 +75,16 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     if (!url.includes(rawToken)) throw new Error('COS_SIGNED_URL_TOKEN_MISSING');
     return url.replace(rawToken, () => `&x-cos-security-token=${encodeURIComponent(token)}`);
   };
-  const readObject = async (Key: string, etag: string, size: number, signal: AbortSignal) => {
+  const readObject = async (
+    Key: string,
+    etag: string,
+    size: number,
+    signal: AbortSignal,
+    objectSize?: number,
+  ) => {
     signal.throwIfAborted();
+    const range = objectSize === undefined ? undefined : `bytes=0-${size - 1}`;
+    const expectedStatus = range ? 206 : 200;
     const stream = new PassThrough();
     // The SDK can report a late sender error after cancellation. Keep an error listener
     // on this one-shot stream until it is collected, including after our iterator exits.
@@ -65,24 +92,37 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     // getObjectStream exposes the response body but not its status, and the SDK pipes
     // 412 bodies before reporting an error. Install the listener before the SDK pipes.
     stream.once('pipe', (sender: NodeJS.ReadableStream) => {
-      sender.once('response', (response: { statusCode?: number }) => {
-        if (response.statusCode !== 200)
-          stream.destroy(
-            Object.assign(new Error('ASSET_OBJECT_RESPONSE'), {
-              statusCode: response.statusCode,
-            }),
-          );
-      });
+      sender.once(
+        'response',
+        ({ statusCode, headers }: Pick<IncomingMessage, 'statusCode' | 'headers'>) => {
+          if (statusCode !== expectedStatus) {
+            stream.destroy(Object.assign(new Error('ASSET_OBJECT_RESPONSE'), { statusCode }));
+            return;
+          }
+          if (objectSize !== undefined) {
+            const invalid = prefixResponseError(headers, size, objectSize, etag);
+            if (invalid) stream.destroy(invalid);
+          }
+        },
+      );
     });
     const completed = new Promise<void>((resolve, reject) => {
-      cos.getObject({ Bucket, Region, Key, IfMatch: etag, Output: stream }, (error, result) => {
+      const options = {
+        Bucket,
+        Region,
+        Key,
+        IfMatch: etag,
+        ...(range === undefined ? {} : { Range: range }),
+        Output: stream,
+      };
+      cos.getObject(options, (error, result) => {
         if (error) {
           const failure = Object.assign(new Error('ASSET_OBJECT_RESPONSE'), {
             statusCode: error.statusCode,
           });
           if (!stream.destroyed) stream.destroy(failure);
           reject(failure);
-        } else if (result.statusCode !== 200) {
+        } else if (result.statusCode !== expectedStatus) {
           reject(
             Object.assign(new Error('ASSET_OBJECT_RESPONSE'), { statusCode: result.statusCode }),
           );
@@ -231,6 +271,12 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     head,
     readImage: readObject,
     readMedia: readObject,
+    readPrefix(Key, etag, size, maxBytes, signal) {
+      // COS requires an actual subrange for a 206 response, even for small objects.
+      const length = Math.min(size - 1, maxBytes);
+      if (length < 1) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
+      return readObject(Key, etag, length, signal, size);
+    },
     readAudio: readObject,
     putImage(Key, bytes, format, sha256, signal) {
       if (!['png', 'jpeg', 'webp'].includes(format)) throw new Error('IMAGE_OUTPUT_INVALID');

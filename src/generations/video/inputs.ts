@@ -1,10 +1,28 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
-import { MAX_ASSET_BYTES, waitForObjectHead } from '../../assets/contracts.ts';
+import { AssetError, MAX_ASSET_BYTES, waitForObjectHead } from '../../assets/contracts.ts';
 import type { AssetObjectStore } from '../../assets/contracts.ts';
 import type { AssetStore } from '../../assets/store.ts';
 import { GenerationError } from '../errors.ts';
 import type { VideoAssetReference } from './contracts.ts';
 import type { VideoJobCommand } from './execution.ts';
+import { matchesVideoInputFormat } from './input-format.ts';
+
+const MAX_SIGNATURE_BYTES = 1024;
+
+function objectReadFailure(error: unknown, signal: AbortSignal, conditional = false): never {
+  signal.throwIfAborted();
+  const status = (error as { statusCode?: number } | null)?.statusCode;
+  // COS can lose the object, refuse If-Match or find the known range unsatisfiable.
+  if (
+    status === HTTP_STATUS.NOT_FOUND ||
+    (conditional &&
+      (status === 412 ||
+        status === 416 ||
+        (error instanceof AssetError && error.status === HTTP_STATUS.CONFLICT)))
+  )
+    throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
+  throw error;
+}
 
 /** Resolve only ready objects owned by the requesting user. Sign after all checks pass. */
 export function createVideoInputResolver(
@@ -21,26 +39,26 @@ export function createVideoInputResolver(
     signal.throwIfAborted();
     const ids = [...new Set(references.map((input) => input.assetId))];
     const assets = await store.readyOwned(ownerId, ids);
-    const byId = new Map(assets.map((asset) => [asset.id, asset]));
+    const byId = new Map(
+      assets.map((asset) => [
+        asset.id,
+        { ...asset, content_type: asset.content_type.toLowerCase() },
+      ]),
+    );
     for (const reference of references) {
       const asset = byId.get(reference.assetId);
       if (!asset) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
       if (!asset.content_type.startsWith(`${reference.mediaType ?? 'image'}/`))
         throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
     }
-    if (!objects.materialUrl)
+    if (!objects.materialUrl || !objects.readPrefix)
       throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
     const identities: NonNullable<VideoJobCommand['inputObjects']> = {};
     for (const id of ids) {
       signal.throwIfAborted();
       const asset = byId.get(id)!;
       const head = await waitForObjectHead(() => objects.head(asset.raw_key, signal), signal).catch(
-        (error: unknown) => {
-          signal.throwIfAborted();
-          if ((error as { statusCode?: number } | null)?.statusCode === HTTP_STATUS.NOT_FOUND)
-            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
-          throw error;
-        },
+        (error: unknown) => objectReadFailure(error, signal),
       );
       signal.throwIfAborted();
       const frozen = expected?.[id];
@@ -53,6 +71,13 @@ export function createVideoInputResolver(
         (expected && (frozen?.key !== asset.raw_key || frozen.etag !== head.etag))
       )
         throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
+      if (head.size < 2) throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
+      const bytes = await objects
+        .readPrefix(asset.raw_key, head.etag, head.size, MAX_SIGNATURE_BYTES, signal)
+        .catch((error: unknown) => objectReadFailure(error, signal, true));
+      signal.throwIfAborted();
+      if (!matchesVideoInputFormat(bytes, asset.content_type))
+        throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
       identities[id] = { key: asset.raw_key, etag: head.etag };
     }
     return identities;

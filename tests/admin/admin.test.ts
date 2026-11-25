@@ -548,6 +548,54 @@ it('seeds dynamic DB protocol templates once, supports full template CRUD, and n
   );
 });
 
+it('saves an Omni video template and rejects publishing that declaration on a standard Kling model', async () => {
+  const routeTemplate = {
+    operation: 'video.generate',
+    classification: 'video',
+    vendor: 'kling',
+    driver: 'kling-videos',
+    submitPath: '/kling/v1/videos/omni-video',
+    queryPathTemplate: '/kling/v1/videos/omni-video/{task_id}',
+    paramSpec: { supportedModes: ['text_to_video', 'video_ref'] },
+    sourceKind: 'protocol-reference',
+    source: 'Kling video protocol fixture',
+    sourceVersion: 'v1',
+  };
+  const template = {
+    templateKey: 'kling-video-ref',
+    label: 'Kling video reference',
+    routeTemplate,
+  };
+  const wrongPath = await requestApi(
+    '/api/v1/admin/templates',
+    'POST',
+    {
+      ...template,
+      routeTemplate: {
+        ...routeTemplate,
+        submitPath: '/kling/v1/videos/text2video',
+        queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+      },
+    },
+    adminCookie,
+  );
+  expect(wrongPath.status).toBe(400);
+  expect(await wrongPath.json()).toMatchObject({ error: { code: 'ROUTE_INVALID' } });
+
+  const created = await requestApi('/api/v1/admin/templates', 'POST', template, adminCookie);
+  expect(created.status).toBe(201);
+  expect(await created.json()).toMatchObject({ template: { routeTemplate } });
+
+  const wrongModel = await requestApi(
+    '/api/v1/admin/routes',
+    'POST',
+    { route: { ...routeTemplate, rawModelId: 'video-kling-v3' } },
+    adminCookie,
+  );
+  expect(wrongModel.status).toBe(400);
+  expect(await wrongModel.json()).toMatchObject({ error: { code: 'ROUTE_INVALID' } });
+});
+
 it('enforces platform catalog whitelist on C-end users, previews OneLink candidates without auto-import, and supports full model & route CRUD', async () => {
   // 0. Before importing any models into platform catalog, C-end user sees 0 models!
   const userInitial = (await (

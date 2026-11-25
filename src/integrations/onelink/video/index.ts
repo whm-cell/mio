@@ -1,4 +1,5 @@
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
+import { defaultVideoGenerateAudio } from '../../../generations/video/driver-capabilities.ts';
 import {
   validateVideoParameters,
   validateVideoRouteConfig,
@@ -72,9 +73,10 @@ export function createVideoProtocol(
   const validated = validateVideoRouteConfig({ ...route, editPath: null });
   if (!validated || !/^[A-Za-z0-9._:-]{1,256}$/.test(modelId))
     throw new Error('VIDEO_ROUTE_INVALID');
+  const audioDefault = defaultVideoGenerateAudio(validated.driver, modelId);
   return {
     async submit(parameters, refs, key, signal): Promise<VideoSubmitResult> {
-      if (!validateVideoParameters(parameters, validated))
+      if (!validateVideoParameters(parameters, validated, audioDefault))
         return { state: 'rejected', code: 'VIDEO_INPUT_INVALID' };
       let submission;
       try {

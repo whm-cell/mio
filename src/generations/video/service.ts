@@ -6,6 +6,7 @@ import type { ProviderService } from '../../providers/service.ts';
 import type { VideoGenerationStore } from './store.ts';
 import { GenerationError } from '../errors.ts';
 import { videoRequestHash } from './contracts.ts';
+import { defaultVideoGenerateAudio } from './driver-capabilities.ts';
 import { validateVideoParameters } from '../../providers/onelink/video-route.ts';
 import type { createVideoInputResolver } from './inputs.ts';
 import type { VideoCreateRequest, VideoCapabilitiesView } from './contracts.ts';
@@ -195,6 +196,9 @@ export function createVideoGenerationService(
         const effective = { ...request.parameters };
         if (effective.watermark === undefined && snapshot.route.paramSpec.parameters?.watermark)
           effective.watermark = snapshot.defaultVideoWatermark;
+        const audioDefault = defaultVideoGenerateAudio(snapshot.route.driver, snapshot.modelId);
+        if (effective.generateAudio === undefined && audioDefault !== undefined)
+          effective.generateAudio = audioDefault;
         const snapshotRecord = snapshot as unknown as Record<string, unknown>;
         const route = snapshotRecord.route;
         const credential = snapshotRecord.credential;

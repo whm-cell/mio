@@ -3,8 +3,16 @@ import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AssetPrincipal } from '../assets/contracts.ts';
 import { ProviderError } from '../providers/contracts.ts';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import {
+  allowJsonWrite,
+  allowRouteMethod,
+  applyAllowedOrigin,
+  readJsonAndRecheck,
+  replyToPreflight,
+  requestCookieHeaders,
+} from '../http-route-guard.ts';
 import { GenerationError } from './errors.ts';
 import { decodeVideoCreateRequest, VIDEO_MAX_HTTP_BODY_BYTES } from './video-contracts.ts';
 import type { createVideoGenerationService } from './video-service.ts';
@@ -26,14 +34,7 @@ export function createVideoGenerationHandler(
     const fail = (status: number, code: string) =>
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     try {
-      const origin = request.headers.origin;
-      if (origin !== undefined && !allowed.has(origin))
-        return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
-      if (origin !== undefined) {
-        response.setHeader('access-control-allow-origin', origin);
-        response.setHeader('access-control-allow-credentials', 'true');
-        response.setHeader('vary', 'Origin');
-      }
+      if (!applyAllowedOrigin(request, response, allowed, fail)) return;
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       const capabilityPath = url.pathname.startsWith(CAPABILITIES)
         ? url.pathname.slice(CAPABILITIES.length)
@@ -48,20 +49,9 @@ export function createVideoGenerationHandler(
       const route = capability ? 'capabilities' : collection ? 'collection' : get ? 'get' : null;
       if (!route) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const allowedMethods = route === 'collection' ? ['GET', 'POST'] : ['GET'];
-      if (request.method === 'OPTIONS') {
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        response
-          .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': `${allowedMethods.join(', ')}, OPTIONS`,
-            'access-control-allow-headers': 'Content-Type',
-          })
-          .end();
-        return;
-      }
-      if (!allowedMethods.includes(request.method ?? '')) {
-        response.setHeader('allow', `${allowedMethods.join(', ')}, OPTIONS`);
-        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
-      }
+      if (request.method === 'OPTIONS')
+        return replyToPreflight(request, response, allowedMethods, fail);
+      if (!allowRouteMethod(request, response, allowedMethods, fail)) return;
       const write = route === 'collection' && request.method === 'POST';
       const list = route === 'collection' && request.method === 'GET';
       const queryKeys = list ? new Set(['cursor', 'limit']) : new Set<string>();
@@ -71,18 +61,18 @@ export function createVideoGenerationHandler(
           return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
         seenQueryKeys.add(key);
       }
-      if (write && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-      if (write && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
-        return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
-      const headers = new Headers();
-      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
-      let actor = await identity(headers);
+      if (write && !allowJsonWrite(request, fail)) return;
+      const headers = requestCookieHeaders(request);
+      const actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       if (write) {
-        const body = await readJsonBody(request, VIDEO_MAX_HTTP_BODY_BYTES);
-        actor = await identity(headers);
-        if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
-        const result = await service.create(actor, decodeVideoCreateRequest(body));
+        const { body, actor: confirmed } = await readJsonAndRecheck(
+          request,
+          VIDEO_MAX_HTTP_BODY_BYTES,
+          () => identity(headers),
+        );
+        if (!confirmed) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        const result = await service.create(confirmed, decodeVideoCreateRequest(body));
         response
           .writeHead(result.created ? HTTP_STATUS.ACCEPTED : HTTP_STATUS.OK, {
             'content-type': 'application/json',

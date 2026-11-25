@@ -201,7 +201,7 @@ it('submits only a current text-to-video capability, then defers same-turn polli
       generateAudio: false,
     },
   });
-  expect(request.requestId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(request.requestId).toBe('7f6b32ee-a8cd-4129-aa3e-c865877a3bbb');
   const submitMeta = firstTurn.get('submit_video_job')!.output.presentationMeta!(
     {},
     submitted as never,

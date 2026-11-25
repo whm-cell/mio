@@ -3,8 +3,16 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { MEDIA_MAX_MESSAGE_BYTES } from '@mio/compute-contracts';
 import type { AssetPrincipal } from '../assets/contracts.ts';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import {
+  allowJsonWrite,
+  allowRouteMethod,
+  applyAllowedOrigin,
+  readJsonAndRecheck,
+  replyToPreflight,
+  requestCookieHeaders,
+} from '../http-route-guard.ts';
 import { HLS_PLAYLIST_CONTENT_TYPE } from './media-hls.ts';
 import { MediaError } from './media-model.ts';
 import { ComputeError } from './errors.ts';
@@ -21,14 +29,7 @@ export function createMediaHandler(
     const fail = (status: number, code: string) =>
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     try {
-      const origin = request.headers.origin;
-      if (origin !== undefined && !allowed.has(origin))
-        return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
-      if (origin !== undefined) {
-        response.setHeader('access-control-allow-origin', origin);
-        response.setHeader('access-control-allow-credentials', 'true');
-        response.setHeader('vary', 'Origin');
-      }
+      if (!applyAllowedOrigin(request, response, allowed, fail)) return;
       response.setHeader('cache-control', 'private, no-store');
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       if (url.search) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
@@ -43,28 +44,13 @@ export function createMediaHandler(
         return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const collection = !id;
       const hls = action === 'hls';
-      const methods = collection ? 'GET, POST' : action && !hls ? 'POST' : 'GET';
-      if (request.method === 'OPTIONS') {
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        response
-          .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': methods + ', OPTIONS',
-            'access-control-allow-headers': 'Content-Type',
-          })
-          .end();
-        return;
-      }
-      if (!request.method || !methods.split(', ').includes(request.method)) {
-        response.setHeader('allow', methods + ', OPTIONS');
-        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
-      }
+      const methods = collection ? ['GET', 'POST'] : [action && !hls ? 'POST' : 'GET'];
+      if (request.method === 'OPTIONS') return replyToPreflight(request, response, methods, fail);
+      if (!allowRouteMethod(request, response, methods, fail)) return;
       const write = request.method === 'POST';
-      if (write && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-      if (write && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
-        return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
-      const headers = new Headers();
-      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
-      let actor = await identity(headers);
+      if (write && !allowJsonWrite(request, fail)) return;
+      const headers = requestCookieHeaders(request);
+      const actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       if (hls) {
         const text = await service.hls(actor, id!, assetId);
@@ -74,23 +60,27 @@ export function createMediaHandler(
       let result: unknown;
       let status: number = HTTP_STATUS.OK;
       if (write) {
-        const body = await readJsonBody(request, MEDIA_MAX_MESSAGE_BYTES, true);
-        actor = await identity(headers);
-        if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        const { body, actor: confirmed } = await readJsonAndRecheck(
+          request,
+          MEDIA_MAX_MESSAGE_BYTES,
+          () => identity(headers),
+          true,
+        );
+        if (!confirmed) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
         if (collection) {
-          const created = await service.create(actor, body);
+          const created = await service.create(confirmed, body);
           result = created.job;
           status = created.created ? HTTP_STATUS.ACCEPTED : HTTP_STATUS.OK;
         } else if (action === 'retry') {
           if (Object.keys(body).length !== 1 || typeof body.requestId !== 'string')
             return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-          result = await service.retry(actor, id!, body.requestId);
+          result = await service.retry(confirmed, id!, body.requestId);
         } else {
           if (Object.keys(body).length) return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
           result =
             action === 'cancel'
-              ? await service.cancel(actor, id!)
-              : await service.recover(actor, id!);
+              ? await service.cancel(confirmed, id!)
+              : await service.recover(confirmed, id!);
         }
       } else result = collection ? await service.list(actor) : await service.get(actor, id!);
       response

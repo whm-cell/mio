@@ -1,12 +1,9 @@
-import { ApplicationError } from '@mio/foundation/errors';
-import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { IMAGE_DRIVERS } from '../generations/contracts.ts';
 import type { ImageRequestParameters } from '../generations/contracts.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
-import { defineTool, isPlainJsonRecord, ToolArgsError } from '@deepseek-ai/dsh-tools';
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
+import { defineTool, isPlainJsonRecord } from '@deepseek-ai/dsh-tools';
 import type {
   ConversationImageJobOutput,
   ConversationImageJobView,
@@ -14,6 +11,13 @@ import type {
   ConversationImageTools,
   ConversationRun,
 } from '../conversations/contracts.ts';
+import {
+  assertAllowedArguments,
+  closedParametersTool,
+  deriveMediaToolRequestId,
+  hasAllowedArguments,
+  sanitizedMediaToolError,
+} from './media-tool-helpers.ts';
 
 const CLIENT_OPERATION_KEY_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const ERROR_CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
@@ -133,35 +137,6 @@ const imageModelSummarySchema = {
   },
 } as const;
 
-function closedParametersTool(definition: ToolDefinition): ToolDefinition {
-  return {
-    ...definition,
-    parameters: {
-      ...definition.parameters,
-      additionalProperties: false,
-    },
-  };
-}
-
-function assertAllowedArguments(args: unknown, allowedKeys: ReadonlySet<string>): void {
-  if (!isPlainJsonRecord(args)) {
-    throw new ToolArgsError(['arguments must be a JSON object']);
-  }
-  for (const key of Object.keys(args)) {
-    if (!allowedKeys.has(key)) {
-      throw new ToolArgsError(['unexpected parameter']);
-    }
-  }
-}
-
-function toSanitizedToolError(error: unknown): never {
-  if (error instanceof HarnessError) throw error;
-  if (error instanceof ApplicationError) {
-    throw new HarnessError(`MIO_IMAGE_TOOL_ERROR: ${error.code}`, error.code);
-  }
-  throw new HarnessError('MIO_IMAGE_TOOL_ERROR: IMAGE_UNAVAILABLE', 'IMAGE_UNAVAILABLE');
-}
-
 function sanitizeJobView(job: ConversationImageJobView) {
   return {
     jobId: job.jobId,
@@ -171,22 +146,6 @@ function sanitizeJobView(job: ConversationImageJobView) {
     assetIds: [...job.assetIds],
     outputs: job.outputs.map((item) => ({ index: item.index, assetId: item.assetId })),
   };
-}
-
-/** Deterministic lowercase UUID v4 derived from trusted turn identity and operation key. */
-function deriveConversationImageRequestId(
-  userId: string,
-  conversationId: string,
-  turnRequestId: string,
-  operationKey: string,
-): string {
-  const hex = sha256Utf8(
-    `mio:conv-image:v1:${userId}:${conversationId}:${turnRequestId}:${operationKey}`,
-  );
-  const variant = ((Number.parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80)
-    .toString(16)
-    .padStart(2, '0');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(18, 20)}-${hex.slice(20, 32)}`;
 }
 
 /** Strict whitelist validation before projecting persisted/live tool metadata outside DSH. */
@@ -275,8 +234,7 @@ export function registerConversationImageTools(
         description:
           'List runnable image generation/editing models in the current user catalog with their route capability constraints.',
         parameters: {},
-        isConcurrencySafe: (args) =>
-          isPlainJsonRecord(args) && Object.keys(args).every((key) => LIST_MODELS_KEYS.has(key)),
+        isConcurrencySafe: (args) => hasAllowedArguments(args, LIST_MODELS_KEYS),
         output: {
           schema: {
             type: 'object',
@@ -306,7 +264,7 @@ export function registerConversationImageTools(
               })),
             };
           } catch (error) {
-            return toSanitizedToolError(error);
+            return sanitizedMediaToolError(error, 'image');
           }
         },
       }),
@@ -449,10 +407,9 @@ export function registerConversationImageTools(
                 ? { output_compression: args.output_compression }
                 : {}),
             };
-            const requestId = deriveConversationImageRequestId(
-              run.userId,
-              run.conversationId,
-              run.requestId,
+            const requestId = deriveMediaToolRequestId(
+              'image',
+              run,
               args.clientOperationKey ?? exec.callId,
             );
             const job = await bridge.createImage(
@@ -469,7 +426,7 @@ export function registerConversationImageTools(
             }
             return sanitizeJobView(job);
           } catch (error) {
-            return toSanitizedToolError(error);
+            return sanitizedMediaToolError(error, 'image');
           }
         },
       }),
@@ -489,8 +446,7 @@ export function registerConversationImageTools(
             description: 'Mio image job UUID v4 returned by submit_image_job.',
           },
         },
-        isConcurrencySafe: (args) =>
-          isPlainJsonRecord(args) && Object.keys(args).every((key) => GET_JOB_KEYS.has(key)),
+        isConcurrencySafe: (args) => hasAllowedArguments(args, GET_JOB_KEYS),
         output: {
           schema: imageJobViewSchema,
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -531,7 +487,7 @@ export function registerConversationImageTools(
             }
             return sanitizeJobView(job);
           } catch (error) {
-            return toSanitizedToolError(error);
+            return sanitizedMediaToolError(error, 'image');
           } finally {
             inFlightPollByJobId.delete(args.jobId);
             releaseInFlight();

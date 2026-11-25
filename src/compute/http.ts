@@ -1,8 +1,16 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import {
+  allowJsonWrite,
+  allowRouteMethod,
+  applyAllowedOrigin,
+  readJsonAndRecheck,
+  replyToPreflight,
+  requestCookieHeaders,
+} from '../http-route-guard.ts';
 import type { AssetPrincipal } from '../assets/contracts.ts';
 import { ComputeError } from './errors.ts';
 import type { createComputeService } from './service.ts';
@@ -20,14 +28,7 @@ export function createComputeHandler(
     const fail = (status: number, code: string) =>
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     try {
-      const origin = request.headers.origin;
-      if (origin !== undefined && !allowed.has(origin))
-        return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
-      if (origin !== undefined) {
-        response.setHeader('access-control-allow-origin', origin);
-        response.setHeader('access-control-allow-credentials', 'true');
-        response.setHeader('vary', 'Origin');
-      }
+      if (!applyAllowedOrigin(request, response, allowed, fail)) return;
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       if (url.search) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
       const parts = url.pathname.split('/').slice(4);
@@ -36,39 +37,25 @@ export function createComputeHandler(
       const get = parts.length === 2 && parts[0] === 'jobs' && id && isUuidV4(id);
       if (!create && !get) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       const write = create;
-      const method = write ? 'POST' : 'GET';
-      if (request.method === 'OPTIONS') {
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        response
-          .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': `${method}, OPTIONS`,
-            'access-control-allow-headers': 'Content-Type',
-          })
-          .end();
-        return;
-      }
-      if (request.method !== method) {
-        response.setHeader('allow', `${method}, OPTIONS`);
-        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
-      }
-      if (write && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-      if (write && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
-        return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
-      const headers = new Headers();
-      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
-      let actor = await identity(headers);
+      const methods = [write ? 'POST' : 'GET'];
+      if (request.method === 'OPTIONS') return replyToPreflight(request, response, methods, fail);
+      if (!allowRouteMethod(request, response, methods, fail)) return;
+      if (write && !allowJsonWrite(request, fail)) return;
+      const headers = requestCookieHeaders(request);
+      const actor = await identity(headers);
       if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
       if (write) {
-        const value = await readJsonBody(request, 8192);
-        actor = await identity(headers);
-        if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        const { body: value, actor: confirmed } = await readJsonAndRecheck(request, 8192, () =>
+          identity(headers),
+        );
+        if (!confirmed) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
         if (
           Object.keys(value).length !== 2 ||
           typeof value.requestId !== 'string' ||
           typeof value.assetId !== 'string'
         )
           return fail(HTTP_STATUS.BAD_REQUEST, 'BODY_INVALID');
-        const result = await service.create(actor, value.requestId, value.assetId);
+        const result = await service.create(confirmed, value.requestId, value.assetId);
         response
           .writeHead(result.created ? HTTP_STATUS.ACCEPTED : HTTP_STATUS.OK, {
             'content-type': 'application/json',

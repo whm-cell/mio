@@ -3,8 +3,16 @@ import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { epochMs } from '@mio/foundation/time';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { readJsonBody, RequestBodyError } from '../http-request.ts';
+import { RequestBodyError } from '../http-request.ts';
 import { startHttpResponse, writeApiError } from '../http-response.ts';
+import {
+  allowJsonWrite,
+  allowRouteMethod,
+  applyAllowedOrigin,
+  readJsonAndRecheck,
+  replyToPreflight,
+  requestCookieHeaders,
+} from '../http-route-guard.ts';
 import { WorkerOpsError } from './worker-observability-control.ts';
 import type { WorkerControlStore } from './worker-observability-control.ts';
 import { workerExecutionStates } from './worker-observability-queries.ts';
@@ -159,29 +167,13 @@ export function createComputeOpsHandler(
     const fail = (status: number, code: string) =>
       writeApiError(response, status, { code, message: code, requestId }, 'application/json');
     try {
-      const origin = request.headers.origin;
-      if (origin !== undefined && !allowed.has(origin))
-        return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
-      if (origin !== undefined) {
-        response.setHeader('access-control-allow-origin', origin);
-        response.setHeader('access-control-allow-credentials', 'true');
-        response.setHeader('vary', 'Origin');
-      }
+      if (!applyAllowedOrigin(request, response, allowed, fail)) return;
       const url = new URL(request.url ?? '', 'http://mio.invalid');
       if (url.pathname !== base && !url.pathname.startsWith(prefix))
         return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      if (request.method === 'OPTIONS') {
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        response
-          .writeHead(HTTP_STATUS.NO_CONTENT, {
-            'access-control-allow-methods': 'GET, PUT, OPTIONS',
-            'access-control-allow-headers': 'Content-Type',
-          })
-          .end();
-        return;
-      }
-      const headers = new Headers();
-      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
+      if (request.method === 'OPTIONS')
+        return replyToPreflight(request, response, ['GET', 'PUT'], fail);
+      const headers = requestCookieHeaders(request);
       const actor = await identity(headers);
       if (!actor?.sessionId) return fail(HTTP_STATUS.UNAUTHORIZED, 'ADMIN_UNAUTHORIZED');
 
@@ -200,22 +192,16 @@ export function createComputeOpsHandler(
         !(write && instanceIdValid(id))
       )
         return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
-      const method = write ? 'PUT' : 'GET';
-
-      if (request.method !== method) {
-        response.setHeader('allow', method + ', OPTIONS');
-        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
-      }
+      if (!allowRouteMethod(request, response, [write ? 'PUT' : 'GET'], fail)) return;
       if (write) {
         checkQuery(url.searchParams, []);
-        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-        if (
-          request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !==
-          'application/json'
-        )
-          return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
-        const body = await readJsonBody(request, 4096, true);
-        const confirmed = await identity(headers);
+        if (!allowJsonWrite(request, fail)) return;
+        const { body, actor: confirmed } = await readJsonAndRecheck(
+          request,
+          4096,
+          () => identity(headers),
+          true,
+        );
         if (
           !confirmed?.sessionId ||
           confirmed.id !== actor.id ||

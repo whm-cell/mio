@@ -428,6 +428,8 @@
 
 输入：实例 ID 与 JSON `{expectedRevision,total,encode,probe}`，四项均为非负安全整数，无查询参数。各项上限由此实例部署硬限约束；零表示暂停相应新准入。
 
+请求媒体类型为 `application/json`，按大小写不敏感比较并允许携带类型参数。
+
 成功：202 保存修订并等待 Worker 回执。只有匹配的应用结果表示已生效。离线也可保存已观测过实例的修订并保留待生效。
 
 错误：400 `BODY_INVALID`/`QUERY_INVALID`/`WORKER_HARD_LIMIT_EXCEEDED`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`，404 `NOT_FOUND`/`WORKER_NOT_FOUND`，409 `WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`，408 `BODY_TIMEOUT`，413 `BODY_TOO_LARGE`，415 `JSON_REQUIRED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或写入不可用）。

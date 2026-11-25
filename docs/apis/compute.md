@@ -30,6 +30,8 @@ JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCod
 
 ## 本域共同约定
 
+单路转码、通用媒体和视频生成的 JSON 写入接受大小写不敏感的 `application/json` 媒体类型，可携带 `charset` 等类型参数。读取正文前验证登录会话，读取并解析后再次取得当前身份，再执行业务写入。
+
 ### 通用媒体处理
 
 本组接口与单路转码共用认证、资产和计算开关及活动任务配额。所有请求以本人登录 Cookie 鉴权。POST 与 OPTIONS 要求允许的精确 Origin，POST 还须为 `application/json` 并在读取正文后复核会话。GET 提供 Origin 时也须匹配。只允许无查询参数的以下路径。

@@ -88,19 +88,32 @@ function routeSnapshot(snapshot: Record<string, unknown>): Record<string, unknow
   return Object.fromEntries(Object.entries(snapshot).filter(([key]) => allowed.has(key)));
 }
 
+function videoUnavailable(): GenerationError {
+  return new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+}
+
 /** Exposes video capability, durable job reads, and admission through the wired executor. */
 export function createVideoGenerationService(
   store: VideoGenerationStore,
   provider: () => ProviderService | undefined,
-  executor?: { wake(): void },
+  executor?: { readonly signal: AbortSignal; wake(): void },
   inspectInputs?: ReturnType<typeof createVideoInputResolver>['inspect'],
 ) {
   let closing: Promise<void> | undefined;
   const stop = new AbortController();
+  const executorStop = new AbortController();
+  // Normalize the executor's stop reason without interrupting durable reads or replay.
+  const stopExecutorAdmission = () => executorStop.abort(videoUnavailable());
+  if (!executor || executor.signal.aborted) stopExecutorAdmission();
+  else
+    executor.signal.addEventListener('abort', stopExecutorAdmission, {
+      once: true,
+      signal: stop.signal,
+    });
+  const writable = AbortSignal.any([stop.signal, executorStop.signal]);
   const active = new Set<Promise<unknown>>();
   const admit = <T>(run: () => Promise<T>): Promise<T> => {
-    if (stop.signal.aborted)
-      throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+    stop.signal.throwIfAborted();
     const action = run();
     active.add(action);
     void action.then(
@@ -118,7 +131,7 @@ export function createVideoGenerationService(
       if (!/^onelink:model:[a-z0-9-]{1,256}$/.test(modelRef))
         throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
       const current = provider();
-      if (!current) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+      if (!current) throw videoUnavailable();
       return current.videoCapabilities(actor, modelRef);
     });
 
@@ -130,34 +143,33 @@ export function createVideoGenerationService(
       turnSignal?: AbortSignal,
     ) {
       return admit(async () => {
-        const signal = turnSignal ? AbortSignal.any([turnSignal, stop.signal]) : undefined;
-        signal?.throwIfAborted();
+        const readSignal = turnSignal ? AbortSignal.any([turnSignal, stop.signal]) : stop.signal;
+        readSignal.throwIfAborted();
         const hash = videoRequestHash(request);
         const replay = async () => {
           const previous = await store.byRequest(actor.userId, request.requestId);
-          signal?.throwIfAborted();
+          readSignal.throwIfAborted();
           if (!previous) return;
           if (previous.inputHash !== hash)
             throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
           const job = await store.get(actor.userId, previous.jobId);
-          signal?.throwIfAborted();
+          readSignal.throwIfAborted();
           return { created: false, job };
         };
         const previous = await replay();
         if (previous) return previous;
 
+        const signal = turnSignal ? AbortSignal.any([turnSignal, writable]) : writable;
+        signal.throwIfAborted();
         let snapshot: VideoAdmissionSnapshot;
         try {
-          signal?.throwIfAborted();
           const current = provider();
-          if (!current)
-            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          if (!current) throw videoUnavailable();
           const capability = await current.videoCapabilities(actor, request.modelRef);
-          signal?.throwIfAborted();
+          signal.throwIfAborted();
           if (capability.capabilitiesVersion !== request.expectedCapabilitiesVersion)
             throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
-          if (!capability.available)
-            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          if (!capability.available) throw videoUnavailable();
           if (
             !capability.modes.some(
               (mode) => mode.mode === request.parameters.mode && mode.supported,
@@ -165,20 +177,19 @@ export function createVideoGenerationService(
           )
             throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_MODE_UNSUPPORTED');
           snapshot = await current.snapshotVideo(actor, request.modelRef);
-          signal?.throwIfAborted();
+          signal.throwIfAborted();
           if (snapshot.capabilitiesVersion !== request.expectedCapabilitiesVersion)
             throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
         } catch (error) {
-          signal?.throwIfAborted();
+          readSignal.throwIfAborted();
           // A concurrent admission may commit before the fresh provider preflight fails.
           if (error instanceof ProviderError || error instanceof GenerationError) {
             const concurrent = await replay();
             if (concurrent) return concurrent;
           }
+          signal.throwIfAborted();
           throw error;
         }
-        if (!executor)
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
         if (!validateVideoParameters(request.parameters, snapshot.route))
           throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_INPUT_INVALID');
         const effective = { ...request.parameters };
@@ -195,26 +206,11 @@ export function createVideoGenerationService(
           typeof credential !== 'object' ||
           Array.isArray(credential)
         )
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          throw videoUnavailable();
         const command: VideoJobCommand = {
           request: { ...request, parameters: effective },
           inputSnapshot: inputSnapshot(request),
         };
-        if (command.inputSnapshot.length) {
-          if (!inspectInputs)
-            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-          try {
-            command.inputObjects = await inspectInputs(
-              actor.userId,
-              command.inputSnapshot,
-              AbortSignal.any([signal ?? stop.signal, AbortSignal.timeout(30_000)]),
-            );
-          } catch (error) {
-            signal?.throwIfAborted();
-            if (error instanceof GenerationError) throw error;
-            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-          }
-        }
         const admitted = Object.fromEntries(
           [
             'providerConfigId',
@@ -239,18 +235,43 @@ export function createVideoGenerationService(
           credentialVersion: snapshotRecord.credentialVersion,
           credential,
         };
-        (signal ?? stop.signal).throwIfAborted();
-        const stored = await store.create(
-          actor.userId,
-          request,
-          hash,
-          command,
-          admitted,
-          executionSnapshot,
-          routeSnapshot(snapshotRecord),
-          signal,
-        );
-        if (stored.created && !stop.signal.aborted) executor.wake();
+        let stored;
+        try {
+          if (command.inputSnapshot.length) {
+            if (!inspectInputs) throw videoUnavailable();
+            try {
+              command.inputObjects = await inspectInputs(
+                actor.userId,
+                command.inputSnapshot,
+                AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+              );
+            } catch (error) {
+              readSignal.throwIfAborted();
+              if (error instanceof GenerationError && (!signal.aborted || error === signal.reason))
+                throw error;
+              throw videoUnavailable();
+            }
+          }
+          signal.throwIfAborted();
+          stored = await store.create(
+            actor.userId,
+            request,
+            hash,
+            command,
+            admitted,
+            executionSnapshot,
+            routeSnapshot(snapshotRecord),
+            signal,
+          );
+        } catch (error) {
+          // The losing write was stopped, but another admission may have committed its request.
+          if (!executorStop.signal.aborted || error !== executorStop.signal.reason) throw error;
+          readSignal.throwIfAborted();
+          const concurrent = await replay();
+          if (!concurrent) throw error;
+          return concurrent;
+        }
+        if (stored.created && !writable.aborted) executor?.wake();
         return { created: stored.created, job: await store.get(actor.userId, stored.jobId) };
       });
     },
@@ -263,10 +284,9 @@ export function createVideoGenerationService(
     recover(actor: Pick<ProviderPrincipal, 'userId'>, jobId: string) {
       return admit(async () => {
         if (!isUuidV4(jobId)) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
-        if (!executor)
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-        await store.recover(actor.userId, jobId);
-        if (!stop.signal.aborted) executor.wake();
+        writable.throwIfAborted();
+        await store.recover(actor.userId, jobId, writable);
+        if (!writable.aborted) executor?.wake();
         return store.get(actor.userId, jobId);
       });
     },
@@ -279,7 +299,7 @@ export function createVideoGenerationService(
     },
     close() {
       if (!closing) {
-        stop.abort(new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE'));
+        stop.abort(videoUnavailable());
         closing = (async () => {
           await Promise.allSettled([...active]);
         })();

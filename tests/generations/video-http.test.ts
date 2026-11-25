@@ -12,11 +12,13 @@ import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { createAssetStore } from '../../src/assets/store.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
+import { createVideoExecutor } from '../../src/generations/video/executor.ts';
 import { VIDEO_QUOTA_LOCK } from '../../src/generations/video/execution.ts';
 import { createVideoGenerationHandler } from '../../src/generations/video/http.ts';
 import { createVideoInputResolver } from '../../src/generations/video/inputs.ts';
 import { createVideoMaterializer } from '../../src/generations/video/media.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
+import type { VideoTransports } from '../../src/generations/video/runner.ts';
 import { createVideoGenerationService } from '../../src/generations/video/service.ts';
 import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import { VideoSubmissionReceipts } from '../../src/generations/video/submission-receipts.ts';
@@ -150,7 +152,7 @@ describe('video generation HTTP boundary', () => {
   });
 });
 
-async function assetHttpFixture() {
+async function assetHttpFixture(withExecutor = false) {
   const database = await authDatabase();
   const pool = new Pool({ connectionString: database.url });
   await pool.query(assetSchemaSQL);
@@ -159,7 +161,15 @@ async function assetHttpFixture() {
   let assetsClosed = false;
   const store = new VideoGenerationStore(pool);
   const execution = store.executorStore();
-  await execution.startExecutor(() => {});
+  const resumeClaim = Promise.withResolvers<void>();
+  if (withExecutor) {
+    const claim = execution.claim.bind(execution);
+    vi.spyOn(execution, 'claim').mockImplementation(async (...args) => {
+      // Keep the real executor from picking up the jobs used to exercise HTTP admission.
+      await resumeClaim.promise;
+      return claim(...args);
+    });
+  } else await execution.startExecutor(() => {});
   const directory = await mkdtemp(join(tmpdir(), 'mio-video-http-'));
   const heads = new Map<string, Awaited<ReturnType<AssetObjectStore['head']>>>();
   const generatedVideo = 'https://video.fixture/render.mp4';
@@ -254,7 +264,6 @@ async function assetHttpFixture() {
           content: { video_url: generatedVideo },
         }),
   );
-  const wake = vi.fn();
   const stop = new AbortController();
   const receipts = new VideoSubmissionReceipts(directory);
   const download: typeof withPublicHttps = async (url, signal, consume) => {
@@ -276,25 +285,30 @@ async function assetHttpFixture() {
     }),
     download,
   );
+  const transports: VideoTransports = {
+    protocol: createVideoProtocol,
+    transport: upstream,
+    references: (row, signal) =>
+      inputs.resolve(row.owner_id, row.command.inputSnapshot, signal, row.command.inputObjects),
+  };
   const run = createVideoRunner(
     execution,
     () => provider,
     materialize,
     stop.signal,
-    {
-      protocol: createVideoProtocol,
-      transport: upstream,
-      references: (row, activeSignal) =>
-        inputs.resolve(
-          row.owner_id,
-          row.command.inputSnapshot,
-          activeSignal,
-          row.command.inputObjects,
-        ),
-    },
+    transports,
     receipts,
   );
-  const service = createVideoGenerationService(store, () => provider, { wake }, inputs.inspect);
+  const worker = withExecutor
+    ? await createVideoExecutor(store, () => provider, materialize, transports, directory)
+    : undefined;
+  const wake = vi.fn(() => worker?.wake());
+  const service = createVideoGenerationService(
+    store,
+    () => provider,
+    { wake, signal: worker?.signal ?? stop.signal },
+    inputs.inspect,
+  );
   const otherActor = { userId: randomUUID(), sessionId: 'video-http-other' };
   const handler = createVideoGenerationHandler(
     service,
@@ -344,7 +358,18 @@ async function assetHttpFixture() {
     upstream,
     wake,
     closeAdmissions: service.close,
-    stopRunner: () => stop.abort(),
+    stopRunner: (reason?: unknown) => stop.abort(reason),
+    async loseExecutorLease() {
+      if (!worker) throw new Error('real video executor required');
+      const { rows } = await pool.query(
+        `SELECT pg_terminate_backend(a.pid) AS terminated
+         FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+         WHERE a.application_name=$1 AND l.locktype='advisory' AND l.objsubid=2 AND l.granted`,
+        [database.applicationName],
+      );
+      expect(rows).toEqual([{ terminated: true }]);
+      await vi.waitFor(() => expect(worker.signal.aborted).toBe(true));
+    },
     async addAsset(
       assetOwner = actor.userId,
       state = 'ready',
@@ -379,6 +404,9 @@ async function assetHttpFixture() {
     get(id: string) {
       return fetch(`${endpoint}/${id}`, { headers: { cookie: 'session=fixture' } });
     },
+    list(session = 'fixture') {
+      return fetch(endpoint, { headers: { cookie: `session=${session}` } });
+    },
     async runNext() {
       const row = await execution.claim();
       if (!row) throw new Error('video fixture has no ready execution');
@@ -393,6 +421,9 @@ async function assetHttpFixture() {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await service.close();
+      const workerClose = worker?.close();
+      resumeClaim.resolve();
+      await workerClose;
       if (!assetsClosed) await assets.close();
       await receipts.close();
       await execution.close();
@@ -834,6 +865,273 @@ describe('video admission replay', () => {
     } finally {
       resume.resolve();
       await Promise.allSettled([pending]);
+      await f.close();
+    }
+  });
+});
+
+describe('video admission after executor lease loss', () => {
+  async function expectUnavailable(response: Response) {
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: 'VIDEO_UNAVAILABLE' } });
+  }
+
+  function waitForLock(
+    f: Awaited<ReturnType<typeof assetHttpFixture>>,
+    key: number,
+    query: string,
+    count: number,
+  ) {
+    return vi.waitFor(
+      async () => {
+        const { rows } = await f.pool.query<{ pid: number; query: string }>(
+          `SELECT a.pid,a.query FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+           WHERE a.application_name=$1 AND l.locktype='advisory'
+             AND l.classid=0 AND l.objid=$2::oid AND NOT l.granted`,
+          [f.applicationName, key],
+        );
+        expect(rows).toHaveLength(count);
+        for (const row of rows) expect(row.query).toContain(query);
+        return rows.map((row) => row.pid);
+      },
+      { timeout: 4000 },
+    );
+  }
+
+  it.each(['object inspection', 'quota lock', 'unrelated PostgreSQL error'] as const)(
+    'preserves the request outcome after losing the lease during %s',
+    async (stage) => {
+      const f = await assetHttpFixture(true);
+      const gate = await f.pool.connect();
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const pending: Promise<Response>[] = [];
+      const lookup = vi.spyOn(f.store, 'byRequest');
+      let locked = false;
+      try {
+        const asset = await f.addAsset();
+        const request = f.request([{ assetId: asset.assetId }]);
+        const changed = { ...request, parameters: { ...request.parameters, prompt: 'changed' } };
+        const head = f.objects.head.getMockImplementation()!;
+        let inspecting = 0;
+        const pause: AssetObjectStore['head'] = async (...args) => {
+          if (++inspecting === 2) entered.resolve();
+          await resume.promise;
+          return head(...args);
+        };
+        f.objects.head.mockImplementationOnce(pause).mockImplementationOnce(pause);
+        const same = f.postRequest(request);
+        const conflict = f.postRequest(changed);
+        pending.push(same, conflict);
+        await Promise.race([
+          entered.promise,
+          ...pending.map((reply) =>
+            reply.then(() => {
+              throw new Error('video POST replied before the object inspection barrier');
+            }),
+          ),
+        ]);
+        expect(lookup.mock.calls).toEqual([
+          [actor.userId, request.requestId],
+          [actor.userId, request.requestId],
+        ]);
+
+        const winner = await f.postRequest(request);
+        expect(winner.status).toBe(202);
+        const job = await winner.json();
+        let waiters: number[] = [];
+        if (stage !== 'object inspection') {
+          await gate.query('SELECT pg_advisory_lock($1)', [VIDEO_QUOTA_LOCK]);
+          locked = true;
+          resume.resolve();
+          waiters = await waitForLock(f, VIDEO_QUOTA_LOCK, 'pg_advisory_xact_lock', 2);
+        }
+        await f.loseExecutorLease();
+        if (stage === 'unrelated PostgreSQL error') {
+          // Fail the SQL statement itself while the executor signal is already aborted.
+          const { rows } = await f.pool.query(
+            'SELECT pg_cancel_backend(pid) AS canceled FROM unnest($1::int[]) AS waiters(pid)',
+            [waiters],
+          );
+          expect(rows).toEqual([{ canceled: true }, { canceled: true }]);
+        } else if (locked) {
+          await gate.query('SELECT pg_advisory_unlock($1)', [VIDEO_QUOTA_LOCK]);
+          locked = false;
+        }
+
+        const [repeated, rejected] = await Promise.all([same, conflict]);
+        if (stage === 'unrelated PostgreSQL error') {
+          await expectUnavailable(repeated);
+          await expectUnavailable(rejected);
+          expect(lookup).toHaveBeenCalledTimes(3);
+        } else {
+          expect(repeated.status).toBe(200);
+          expect(await repeated.json()).toEqual(job);
+          expect(rejected.status).toBe(409);
+          expect(await rejected.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
+          expect(lookup).toHaveBeenCalledTimes(5);
+        }
+        expect(f.videoCapabilities).toHaveBeenCalledTimes(3);
+        expect(f.snapshotVideo).toHaveBeenCalledTimes(3);
+        expect((await f.pool.query('SELECT id,state FROM mio_video_jobs')).rows).toEqual([
+          { id: job.id, state: 'accepted' },
+        ]);
+        expect((await f.pool.query('SELECT job_id FROM mio_video_executions')).rows).toEqual([
+          { job_id: job.id },
+        ]);
+        expect(f.wake).toHaveBeenCalledOnce();
+        expect(f.upstream).not.toHaveBeenCalled();
+      } finally {
+        if (locked) await gate.query('SELECT pg_advisory_unlock($1)', [VIDEO_QUOTA_LOCK]);
+        gate.release();
+        resume.resolve();
+        await Promise.allSettled(pending);
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['quota lock', 'both inserts'] as const)(
+    'rolls back writes at the %s and keeps owner reads and old-hash replay available',
+    async (stage) => {
+      const f = await assetHttpFixture(true);
+      const gate = await f.pool.connect();
+      const lock = stage === 'quota lock' ? VIDEO_QUOTA_LOCK : randomInt(1, 2147483647);
+      let pending: Promise<Response> | undefined;
+      let recovery: ReturnType<typeof f.service.recover> | undefined;
+      try {
+        const asset = await f.addAsset();
+        const references = [{ assetId: asset.assetId }];
+        const original = f.request(references);
+        const accepted = await f.postRequest(original);
+        expect(accepted.status).toBe(202);
+        const { id } = await accepted.json();
+        const hash = createHash('sha256').update(JSON.stringify(original), 'utf8').digest('hex');
+        await f.pool.query(
+          `UPDATE mio_video_jobs SET state='materialization_failed',error_code='VIDEO_MATERIALIZATION_FAILED',
+           completed_at=now(),input_hash=$2,command=command-'inputObjects' WHERE id=$1`,
+          [id, hash],
+        );
+        await f.pool.query(
+          `UPDATE mio_video_executions SET phase='done',checkpoint=$2 WHERE job_id=$1`,
+          [
+            id,
+            { videos: [{ url: 'https://fixture.invalid/output.mp4' }], materializationAttempts: 3 },
+          ],
+        );
+        const before = await f.store.get(actor.userId, id);
+        const executionState = 'SELECT job_id,phase,claim_id,checkpoint FROM mio_video_executions';
+        const beforeExecution = (await f.pool.query(executionState)).rows;
+        expect(before).toMatchObject({ recovery: { available: true } });
+
+        await gate.query('SELECT pg_advisory_lock($1)', [lock]);
+        if (stage === 'both inserts')
+          await f.pool
+            .query(`CREATE FUNCTION pause_video_execution_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_advisory_xact_lock(${lock}); RETURN NEW; END $$;
+            CREATE TRIGGER pause_video_execution_insert AFTER INSERT ON mio_video_executions
+              FOR EACH ROW EXECUTE FUNCTION pause_video_execution_insert()`);
+        pending = f.post(references);
+        void pending.catch(() => {});
+        await waitForLock(
+          f,
+          lock,
+          stage === 'quota lock' ? 'pg_advisory_xact_lock' : 'INSERT INTO mio_video_executions',
+          1,
+        );
+        recovery = f.service.recover(actor, id);
+        void recovery.catch(() => {});
+        await waitForLock(
+          f,
+          VIDEO_QUOTA_LOCK,
+          'pg_advisory_xact_lock',
+          stage === 'quota lock' ? 2 : 1,
+        );
+        await f.loseExecutorLease();
+        f.videoCapabilities.mockClear();
+        f.snapshotVideo.mockClear();
+        f.objects.head.mockClear();
+
+        await expectUnavailable(await f.post(references));
+        await expectUnavailable(await f.postRequest(original, 'other'));
+        await expect(f.service.recover(actor, id)).rejects.toMatchObject({
+          status: 503,
+          code: 'VIDEO_UNAVAILABLE',
+        });
+        const same = await f.postRequest(original);
+        expect(same.status).toBe(200);
+        expect(await same.json()).toEqual(before);
+        const changed = await f.postRequest({
+          ...original,
+          parameters: { ...original.parameters, prompt: 'different input' },
+        });
+        expect(changed.status).toBe(409);
+        expect(await changed.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
+        const detail = await f.get(id);
+        expect(detail.status).toBe(200);
+        expect(await detail.json()).toEqual(before);
+        const list = await f.list();
+        expect(list.status).toBe(200);
+        expect(await list.json()).toMatchObject({ items: [{ id }] });
+        expect(await (await f.list('other')).json()).toMatchObject({ items: [] });
+        expect(f.videoCapabilities).not.toHaveBeenCalled();
+        expect(f.snapshotVideo).not.toHaveBeenCalled();
+        expect(f.objects.head).not.toHaveBeenCalled();
+
+        await gate.query('SELECT pg_advisory_unlock($1)', [lock]);
+        await expectUnavailable(await pending);
+        await expect(recovery).rejects.toMatchObject({ status: 503, code: 'VIDEO_UNAVAILABLE' });
+        expect((await f.pool.query('SELECT id,state FROM mio_video_jobs')).rows).toEqual([
+          { id, state: 'materialization_failed' },
+        ]);
+        expect((await f.pool.query(executionState)).rows).toEqual(beforeExecution);
+        expect(await f.store.get(actor.userId, id)).toEqual(before);
+        expect(f.wake).toHaveBeenCalledTimes(1);
+        expect(f.upstream).not.toHaveBeenCalled();
+      } finally {
+        await gate.query('SELECT pg_advisory_unlock($1)', [lock]);
+        gate.release();
+        await Promise.allSettled([pending, recovery]);
+        await f.close();
+      }
+    },
+  );
+
+  it('returns an already committed HTTP job without waking a stopped executor', async () => {
+    const f = await assetHttpFixture();
+    const committed = Promise.withResolvers<string>();
+    const resume = Promise.withResolvers<void>();
+    const create = f.store.create.bind(f.store);
+    vi.spyOn(f.store, 'create').mockImplementationOnce(async (...args) => {
+      const result = await create(...args);
+      committed.resolve(result.jobId);
+      await resume.promise;
+      return result;
+    });
+    try {
+      const asset = await f.addAsset();
+      const references = [{ assetId: asset.assetId }];
+      const request = f.request(references);
+      const pending = f.postRequest(request);
+      const id = await Promise.race([
+        committed.promise,
+        pending.then(() => {
+          throw new Error('HTTP POST replied before the post-COMMIT barrier');
+        }),
+      ]);
+      f.stopRunner(new ProviderError(409, 'FIXTURE_PRIVATE_EXECUTOR_REASON'));
+      resume.resolve();
+      const reply = await pending;
+      expect(reply.status).toBe(202);
+      expect(await reply.json()).toMatchObject({ id, state: 'accepted' });
+      const replay = await f.postRequest(request);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ id });
+      await expectUnavailable(await f.post(references));
+      expect(f.wake).not.toHaveBeenCalled();
+      expect(f.upstream).not.toHaveBeenCalled();
+    } finally {
+      resume.resolve();
       await f.close();
     }
   });

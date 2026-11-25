@@ -86,46 +86,63 @@ export class VideoGenerationStore {
     return row ? { jobId: row.id, inputHash: row.input_hash } : undefined;
   }
 
-  async recover(ownerId: string, jobId: string): Promise<void> {
-    await transaction(this.pool, async (client) => {
-      await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
-      const result = await client.query<{ state: string; phase: string; checkpoint: unknown }>(
-        `SELECT j.state,e.phase,e.checkpoint FROM mio_video_jobs j
-         JOIN mio_video_executions e ON e.job_id=j.id
-         WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j,e`,
-        [jobId, ownerId],
-      );
-      const row = result.rows[0];
-      if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
-      if (
-        row.state === 'completed' ||
-        (row.state === 'materializing' && row.phase === 'materializing')
-      )
-        return;
-      const checkpoint = row.checkpoint as { videos?: unknown; cleaned?: boolean } | null;
-      if (
-        row.state !== 'materialization_failed' ||
-        row.phase !== 'done' ||
-        !checkpoint ||
-        checkpoint.cleaned ||
-        !Array.isArray(checkpoint.videos) ||
-        checkpoint.videos.length < 1 ||
-        checkpoint.videos.length > 16
-      )
-        throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
-      await capacity(client, ownerId);
-      await client.query(
-        `UPDATE mio_video_executions SET phase='materializing',claim_id=NULL,
-        next_query_at=NULL,checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','0'::jsonb),updated_at=now()
-        WHERE job_id=$1`,
-        [jobId],
-      );
-      await client.query(
-        `UPDATE mio_video_jobs SET state='materializing',error_code=NULL,
-        completed_at=NULL,updated_at=now() WHERE id=$1`,
-        [jobId],
-      );
-    });
+  async recover(ownerId: string, jobId: string, signal?: AbortSignal): Promise<void> {
+    await transaction(
+      this.pool,
+      async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock($1)', [VIDEO_QUOTA_LOCK]);
+        signal?.throwIfAborted();
+        // Match completion's lock order and read both rows after any execution lock wait.
+        const execution = await client.query(
+          `SELECT e.job_id FROM mio_video_executions e
+           JOIN mio_video_jobs j ON j.id=e.job_id
+           WHERE e.job_id=$1 AND j.owner_id=$2 FOR UPDATE OF e`,
+          [jobId, ownerId],
+        );
+        signal?.throwIfAborted();
+        if (!execution.rowCount) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
+        const result = await client.query<{ state: string; phase: string; checkpoint: unknown }>(
+          `SELECT j.state,e.phase,e.checkpoint FROM mio_video_jobs j
+           JOIN mio_video_executions e ON e.job_id=j.id
+           WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j`,
+          [jobId, ownerId],
+        );
+        signal?.throwIfAborted();
+        const row = result.rows[0];
+        if (!row) throw new GenerationError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
+        if (
+          row.state === 'completed' ||
+          (row.state === 'materializing' && row.phase === 'materializing')
+        )
+          return;
+        const checkpoint = row.checkpoint as { videos?: unknown; cleaned?: boolean } | null;
+        if (
+          row.state !== 'materialization_failed' ||
+          row.phase !== 'done' ||
+          !checkpoint ||
+          checkpoint.cleaned ||
+          !Array.isArray(checkpoint.videos) ||
+          checkpoint.videos.length < 1 ||
+          checkpoint.videos.length > 16
+        )
+          throw new GenerationError(HTTP_STATUS.CONFLICT, 'RESULT_CONFLICT');
+        await capacity(client, ownerId);
+        signal?.throwIfAborted();
+        await client.query(
+          `UPDATE mio_video_executions SET phase='materializing',claim_id=NULL,
+          next_query_at=NULL,checkpoint=jsonb_set(checkpoint,'{materializationAttempts}','0'::jsonb),updated_at=now()
+          WHERE job_id=$1`,
+          [jobId],
+        );
+        signal?.throwIfAborted();
+        await client.query(
+          `UPDATE mio_video_jobs SET state='materializing',error_code=NULL,
+          completed_at=NULL,updated_at=now() WHERE id=$1`,
+          [jobId],
+        );
+      },
+      signal,
+    );
   }
 
   async create(

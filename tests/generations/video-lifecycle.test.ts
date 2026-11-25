@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client, Pool } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
@@ -17,6 +18,7 @@ import { VideoGenerationStore } from '../../src/generations/video/store.ts';
 import { createVideoRunner } from '../../src/generations/video/runner.ts';
 import type { VideoExecutorProvider, VideoTransports } from '../../src/generations/video/runner.ts';
 import type {
+  VideoExecution,
   VideoJobCommand,
   VideoMaterializedOutput,
   VideoMaterializer,
@@ -223,6 +225,7 @@ async function fixture(reference?: 'frozen' | 'legacy', family: keyof typeof que
     upstreamTaskId: 'safe-task',
   };
   return {
+    databaseURL: database.url,
     pool,
     store,
     execution,
@@ -563,6 +566,16 @@ async function reopen(f: Awaited<ReturnType<typeof fixture>>) {
     replay: () => receipts.replay(execution.receive.bind(execution), new AbortController().signal),
     run: f.runner({}, execution, receipts),
   };
+}
+
+async function videoLeasePid(pool: Pool) {
+  const lease = await pool.query<{ pid: number }>(`
+    SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
+    WHERE l.locktype='advisory' AND l.objid=672049927
+      AND a.application_name=current_setting('application_name') AND a.datname=current_database()
+  `);
+  expect(lease.rows).toHaveLength(1);
+  return lease.rows[0]!.pid;
 }
 
 async function observeDirectorySync(directory: string, beforeSync: () => Promise<void>) {
@@ -1556,12 +1569,14 @@ describe('video query dispatch and shutdown', () => {
       cleanups.push(() => executor.close());
       const sentAt = await entered.promise;
       if (interruption === 'failed query settlement')
-        await vi.waitFor(async () =>
-          expect(await f.durableState()).toMatchObject({
-            phase: 'waiting',
-            claim_id: null,
-            query_attempt: 1,
-          }),
+        await vi.waitFor(
+          async () =>
+            expect(await f.durableState()).toMatchObject({
+              phase: 'waiting',
+              claim_id: null,
+              query_attempt: 1,
+            }),
+          { timeout: 5000 },
         );
       await executor.close();
       const released = await f.durableState();
@@ -1597,4 +1612,531 @@ describe('video query dispatch and shutdown', () => {
       ]);
     },
   );
+});
+
+describe('video executor ownership and capacity', () => {
+  it('retries the same query release after real PostgreSQL errors while keeping its lease', async () => {
+    const f = await fixture();
+    expect(await f.execution.submitting(await f.next())).toBe(true);
+    expect(await f.execution.receive(f.expectedReceipt, true)).toBe('confirmed');
+    await f.execution.close();
+    await f.makeDue();
+    await f.pool.query(`
+      CREATE TABLE fixture_release_gate (allowed boolean NOT NULL);
+      INSERT INTO fixture_release_gate VALUES (false);
+      CREATE FUNCTION decline_fixture_release() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.phase='querying' AND NEW.phase='waiting' AND NEW.claim_id IS NULL
+          AND NOT (SELECT allowed FROM fixture_release_gate) THEN
+          RAISE EXCEPTION USING ERRCODE='58000', MESSAGE='fixture cannot release',
+            DETAIL=(extract(epoch FROM clock_timestamp())*1000)::text;
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER decline_fixture_release BEFORE UPDATE ON mio_video_executions
+        FOR EACH ROW EXECUTE FUNCTION decline_fixture_release();
+    `);
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ id: 'safe-task', status: 'running' }));
+    const protocol: VideoProtocolFactory = (route, modelId, guardedTransport) => {
+      const upstream = createVideoProtocol(route, modelId, guardedTransport);
+      return {
+        submit: f.protocol.submit,
+        async query(id, key, signal) {
+          // Expire the dispatch window after reservation. The runner calls release directly.
+          const cutoff = (await f.durableState()).next_query_at.getTime() as number;
+          const wall = vi.spyOn(Date, 'now').mockReturnValue(cutoff);
+          try {
+            return await upstream.query(id, key, signal);
+          } finally {
+            wall.mockRestore();
+          }
+        },
+      };
+    };
+    const failures: { id: string; claim: string; time: number }[] = [];
+    const release = f.execution.release.bind(f.execution);
+    const releaseProbe = vi.spyOn(f.execution, 'release').mockImplementation(async (row) => {
+      try {
+        await release(row);
+      } catch (error) {
+        const failure = error as { code?: string; detail?: string };
+        if (failure.code === '58000')
+          failures.push({ id: row.id, claim: row.claim_id, time: Number(failure.detail) });
+        throw error;
+      }
+    });
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol, transport },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    try {
+      // PostgreSQL timestamps the failed direct release and the first fallback attempt.
+      await vi.waitFor(() => expect(failures.length).toBeGreaterThanOrEqual(2), { timeout: 5000 });
+      const blocked = await f.durableState();
+      expect(blocked).toMatchObject({ state: 'submitted', phase: 'querying', query_attempt: 1 });
+      expect(failures[0]).toMatchObject({ id: f.job.jobId, claim: blocked.claim_id });
+      expect(failures[1]).toMatchObject({ id: f.job.jobId, claim: blocked.claim_id });
+      expect(failures[1]!.time - failures[0]!.time).toBeGreaterThanOrEqual(1000);
+      const repairedAt = await f.databaseNow();
+      await f.pool.query('UPDATE fixture_release_gate SET allowed=true');
+      await vi.waitFor(
+        async () =>
+          expect(await f.durableState()).toMatchObject({ phase: 'waiting', claim_id: null }),
+        { timeout: 5000 },
+      );
+      const released = await f.durableState();
+      expect(released).toMatchObject({
+        state: 'submitted',
+        query_attempt: 1,
+        async_deadline: blocked.async_deadline,
+        upstream_task_id: blocked.upstream_task_id,
+      });
+      expect(released.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        repairedAt + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      expect(releaseProbe.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(executor.signal.aborted).toBe(false);
+      expect(transport).not.toHaveBeenCalled();
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+    } finally {
+      await f.pool.query('UPDATE fixture_release_gate SET allowed=true');
+      await executor.close();
+      releaseProbe.mockRestore();
+    }
+  });
+
+  it('stops synchronously on real lease loss and drains a late returned claim without submitting', async () => {
+    const f = await fixture();
+    await f.execution.close();
+    const claimed = Promise.withResolvers<VideoExecution>();
+    const resume = Promise.withResolvers<void>();
+    const claim = f.execution.claim.bind(f.execution);
+    const gate = vi.spyOn(f.execution, 'claim').mockImplementationOnce(async (signal) => {
+      const row = await claim(signal);
+      claimed.resolve(row!);
+      await resume.promise;
+      return row;
+    });
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol: () => f.protocol },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    try {
+      const row = await claimed.promise;
+      expect(await f.durableState()).toMatchObject({ phase: 'ready', claim_id: row.claim_id });
+      const leasePid = await videoLeasePid(f.pool);
+      const lost = Promise.withResolvers<void>();
+      executor.signal.addEventListener('abort', () => lost.resolve(), { once: true });
+      const terminated = await f.pool.query<{ terminated: boolean }>(
+        'SELECT pg_terminate_backend($1) AS terminated',
+        [leasePid],
+      );
+      expect(terminated.rows[0]?.terminated).toBe(true);
+      await lost.promise;
+      expect(executor.signal.reason).toMatchObject({ code: 'VIDEO_UNAVAILABLE', status: 503 });
+      executor.wake();
+      resume.resolve();
+      await vi.waitFor(async () =>
+        expect(await f.durableState()).toMatchObject({
+          state: 'accepted',
+          phase: 'ready',
+          claim_id: null,
+        }),
+      );
+      await delay(1100);
+      expect(gate).toHaveBeenCalledOnce();
+      const closing = executor.close();
+      expect(executor.close()).toBe(closing);
+      await closing;
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+      expect(await f.durableState()).toMatchObject({ phase: 'ready', claim_id: null });
+    } finally {
+      resume.resolve();
+      gate.mockRestore();
+      await executor.close();
+    }
+  });
+
+  it('releases and reclaims a committed claim after losing its COMMIT reply', async () => {
+    const f = await fixture();
+    expect(await f.execution.submitting(await f.next())).toBe(true);
+    expect(await f.execution.receive(f.expectedReceipt, true)).toBe('confirmed');
+    await f.execution.close();
+    await f.makeDue();
+    vi.mocked(f.protocol.query).mockResolvedValueOnce({ state: 'processing' });
+    const committed = Promise.withResolvers<string>();
+    const original = Client.prototype.query;
+    const claimants = new WeakSet<Client>();
+    let discarded = false;
+    const query = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
+      this: Client,
+      ...args: unknown[]
+    ) {
+      const sql = args[0];
+      if (typeof sql === 'string' && sql.startsWith('UPDATE mio_video_executions SET claim_id=$1'))
+        claimants.add(this);
+      const result = Reflect.apply(original, this, args);
+      if (sql === 'COMMIT' && claimants.has(this) && !discarded) {
+        discarded = true;
+        return Promise.resolve(result).then(async () => {
+          const durable = await f.durableState();
+          committed.resolve(durable.claim_id);
+          throw new Error('fixture discarded committed claim reply');
+        });
+      }
+      return result;
+    });
+    const release = vi.spyOn(f.execution, 'release');
+    const reserve = vi.spyOn(f.execution, 'beginQuery');
+    const start = vi.spyOn(f.execution, 'startExecutor');
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol: () => f.protocol },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    try {
+      const claim = await committed.promise;
+      expect(claim).toEqual(expect.any(String));
+      await vi.waitFor(
+        async () =>
+          expect(await f.durableState()).toMatchObject({
+            state: 'submitted',
+            phase: 'waiting',
+            claim_id: null,
+            query_attempt: 0,
+            upstream_task_id: 'safe-task',
+          }),
+        { timeout: 5000 },
+      );
+      expect(release).toHaveBeenCalledExactlyOnceWith({ id: f.job.jobId, claim_id: claim });
+      await vi.waitFor(
+        async () =>
+          expect(await f.durableState()).toMatchObject({ state: 'processing', query_attempt: 1 }),
+        { timeout: 5000 },
+      );
+      expect(reserve).toHaveBeenCalledOnce();
+      expect(reserve.mock.calls[0]![0].claim_id).not.toBe(claim);
+      expect(start).toHaveBeenCalledOnce();
+      expect(executor.signal.aborted).toBe(false);
+      expect(f.protocol.query).toHaveBeenCalledOnce();
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+    } finally {
+      query.mockRestore();
+      release.mockRestore();
+      reserve.mockRestore();
+      start.mockRestore();
+      await executor.close();
+    }
+  });
+
+  it('recovers when PostgreSQL terminates a checked-out claim client and keeps the lease', async () => {
+    const f = await fixture();
+    expect(await f.execution.submitting(await f.next())).toBe(true);
+    expect(await f.execution.receive(f.expectedReceipt, true)).toBe('confirmed');
+    await f.execution.close();
+    await f.makeDue();
+    vi.mocked(f.protocol.query).mockResolvedValueOnce({ state: 'processing' });
+    const updated = Promise.withResolvers<{ pid: number; claimId: string }>();
+    const disconnected = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const original = Client.prototype.query;
+    const doomed = new WeakSet<Client>();
+    const rollback = vi.fn();
+    let interrupted = false;
+    const probe = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
+      this: Client,
+      ...args: unknown[]
+    ) {
+      const sql = args[0];
+      if (sql === 'ROLLBACK' && doomed.has(this)) rollback();
+      const result = Reflect.apply(original, this, args);
+      if (
+        !interrupted &&
+        typeof sql === 'string' &&
+        sql.startsWith('UPDATE mio_video_executions SET claim_id=$1')
+      ) {
+        interrupted = true;
+        doomed.add(this);
+        return Promise.resolve(result).then(async (written) => {
+          const metadata = await Reflect.apply(original, this, ['SELECT pg_backend_pid() AS pid']);
+          this.once('end', () => disconnected.resolve());
+          updated.resolve({ pid: metadata.rows[0].pid, claimId: (args[1] as [string])[0] });
+          await resume.promise;
+          return written;
+        });
+      }
+      return result;
+    });
+    const release = vi.spyOn(f.execution, 'release');
+    const reserve = vi.spyOn(f.execution, 'beginQuery');
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol: () => f.protocol },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    try {
+      const { pid, claimId } = await updated.promise;
+      const lease = await videoLeasePid(f.pool);
+      expect(pid).not.toBe(lease);
+      const terminated = await f.pool.query<{ terminated: boolean }>(
+        'SELECT pg_terminate_backend($1) AS terminated',
+        [pid],
+      );
+      expect(terminated.rows[0]?.terminated).toBe(true);
+      await disconnected.promise;
+      expect(await f.durableState()).toMatchObject({
+        phase: 'waiting',
+        claim_id: null,
+        query_attempt: 0,
+      });
+      resume.resolve();
+      await vi.waitFor(
+        () =>
+          expect(release).toHaveBeenCalledExactlyOnceWith({ id: f.job.jobId, claim_id: claimId }),
+        { timeout: 5000 },
+      );
+      await vi.waitFor(
+        async () =>
+          expect(await f.durableState()).toMatchObject({ state: 'processing', query_attempt: 1 }),
+        { timeout: 5000 },
+      );
+      expect(reserve.mock.calls[0]![0].claim_id).not.toBe(claimId);
+      expect(await videoLeasePid(f.pool)).toBe(lease);
+      expect(executor.signal.aborted).toBe(false);
+      expect(rollback).not.toHaveBeenCalled();
+      expect(f.protocol.query).toHaveBeenCalledOnce();
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+    } finally {
+      resume.resolve();
+      await executor.close();
+      probe.mockRestore();
+      release.mockRestore();
+      reserve.mockRestore();
+    }
+  });
+
+  it('returns the original reservation from one statement when a new lease claims the job before its caller resumes', async () => {
+    const f = await fixture();
+    expect(await f.execution.submitting(await f.next())).toBe(true);
+    await f.execution.receive(f.expectedReceipt, true);
+    const claimed = await f.next();
+    const separate = new Pool({ connectionString: f.databaseURL });
+    cleanups.push(() => separate.end());
+    const takeover = new VideoGenerationStore(separate).executorStore();
+    cleanups.push(() => takeover.close());
+    const query = f.pool.query.bind(f.pool);
+    let renewed: VideoExecution | undefined;
+    const oldQuery = vi.spyOn(f.pool, 'query').mockImplementationOnce(async (sql, values) => {
+      const result = await query(sql, values);
+      const cutoff = result.rows[0].next_query_at as Date;
+      await f.execution.close();
+      await takeover.startExecutor(() => {});
+      const next = (
+        await separate.query<{ next_query_at: Date }>(
+          'SELECT next_query_at FROM mio_video_executions WHERE job_id=$1',
+          [claimed.id],
+        )
+      ).rows[0]!.next_query_at;
+      expect(next.getTime()).toBeGreaterThanOrEqual(
+        cutoff.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      expect(await takeover.claim()).toBeUndefined();
+      // Advance just the fixture's due time after checking the real takeover floor.
+      await separate.query(
+        'UPDATE mio_video_executions SET next_query_at=statement_timestamp() WHERE job_id=$1',
+        [claimed.id],
+      );
+      renewed = await takeover.claim();
+      expect(renewed?.claim_id).toEqual(expect.any(String));
+      expect(renewed?.claim_id).not.toBe(claimed.claim_id);
+      return result;
+    });
+    let reserved: Awaited<ReturnType<typeof f.execution.beginQuery>>;
+    try {
+      reserved = await f.execution.beginQuery(claimed);
+      expect(oldQuery).toHaveBeenCalledOnce();
+      expect(oldQuery.mock.calls[0]![0]).toMatch(/^UPDATE .*?[\s\S]+RETURNING/);
+      expect(reserved).toMatchObject({
+        id: claimed.id,
+        claim_id: claimed.claim_id,
+        phase: 'querying',
+        query_attempt: 1,
+      });
+    } finally {
+      oldQuery.mockRestore();
+    }
+    const current = await f.durableState();
+    expect(current).toMatchObject({
+      phase: 'waiting',
+      claim_id: renewed!.claim_id,
+      query_attempt: 1,
+    });
+    await f.execution.release(reserved!);
+    expect(await f.durableState()).toEqual(current);
+    expect(f.protocol.submit).not.toHaveBeenCalled();
+    expect(f.protocol.query).not.toHaveBeenCalled();
+  });
+
+  it('shares four slots between execution, cleanup and receipt reconciliation through pressure and shutdown', async () => {
+    const f = await fixture();
+    const original = await f.next();
+    expect(await f.execution.submitting(original)).toBe(true);
+    await f.execution.terminal(original, 'unknown', 'VIDEO_SUBMISSION_UNKNOWN');
+    await f.pool.query(
+      "UPDATE mio_video_executions SET async_deadline=now()-interval '1 second' WHERE job_id=$1",
+      [original.id],
+    );
+    const newCommand = (): VideoJobCommand => ({
+      request: { ...f.request, requestId: randomUUID() },
+      inputSnapshot: [],
+    });
+    const completed = await f.create(newCommand());
+    const materializeOwner = randomUUID();
+    const jobs = await Promise.all(
+      Array.from({ length: 5 }, () => f.create(newCommand(), materializeOwner)),
+    );
+    const ids = jobs.map(({ jobId }) => jobId);
+    await f.pool.query("UPDATE mio_video_jobs SET state='completed' WHERE id=$1", [
+      completed.jobId,
+    ]);
+    await f.pool.query("UPDATE mio_video_jobs SET state='materializing' WHERE id=ANY($1)", [ids]);
+    const videos = [{ url: 'https://media.fixture/background.mp4' }];
+    await f.pool.query(
+      "UPDATE mio_video_executions SET phase='done',checkpoint=$2 WHERE job_id=$1",
+      [completed.jobId, JSON.stringify({ videos, materializationAttempts: 1, cleaned: true })],
+    );
+    await f.pool.query(
+      "UPDATE mio_video_executions SET phase='materializing',checkpoint=$2 WHERE job_id=ANY($1)",
+      [ids, JSON.stringify({ videos, materializationAttempts: 0 })],
+    );
+    await f.execution.close();
+
+    let peak = 0;
+    const active = new Map<string, () => void>();
+    const entered: string[] = [];
+    const hold = async <T>(key: string, work: () => Promise<T>) => {
+      const gate = Promise.withResolvers<void>();
+      active.set(key, gate.resolve);
+      entered.push(key);
+      peak = Math.max(peak, active.size);
+      try {
+        const result = await work();
+        await gate.promise;
+        return result;
+      } finally {
+        active.delete(key);
+      }
+    };
+    const runners = () => entered.filter((key) => key.startsWith('runner:'));
+    const receive = f.execution.receive.bind(f.execution);
+    const receipt = vi
+      .spyOn(f.execution, 'receive')
+      .mockImplementation((row, canReplay) =>
+        hold('receipt:' + row.jobId, () => receive(row, canReplay)),
+      );
+    const closeSignals: AbortSignal[] = [];
+    const cleanup = async (row: VideoExecution, signal: AbortSignal) => {
+      await hold('cleanup:' + row.id, async () => {
+        closeSignals.push(signal);
+      });
+      signal.throwIfAborted();
+    };
+    const materialize: VideoMaterializer = async (row, _sources, signal) => {
+      await hold('runner:' + row.id, async () => {
+        closeSignals.push(signal);
+      });
+      signal.throwIfAborted();
+      return [{ ...f.output, assetId: randomUUID(), key: 'mio/derived/video/' + row.id + '.mp4' }];
+    };
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      materialize,
+      { protocol: () => f.protocol, cleanup },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    const cleanKey = 'cleanup:' + completed.jobId;
+    const receiptKey = 'receipt:' + original.id;
+    try {
+      await vi.waitFor(() => expect(runners()).toHaveLength(4), { timeout: 5000 });
+      await f.pool.query(
+        `UPDATE mio_video_executions SET checkpoint=checkpoint-'cleaned',updated_at='2000-01-01'
+         WHERE job_id=$1`,
+        [completed.jobId],
+      );
+      executor.wake();
+      await delay(1100);
+      expect(entered).toHaveLength(4);
+
+      active.get(runners()[0]!)!();
+      await vi.waitFor(() => expect(active.has(cleanKey)).toBe(true), { timeout: 5000 });
+      expect(runners()).toHaveLength(4);
+      expect(active.size).toBe(4);
+      active.get(runners()[1]!)!();
+      await vi.waitFor(() => expect(runners()).toHaveLength(5), { timeout: 5000 });
+      expect(active.has(cleanKey)).toBe(true);
+      expect(active.size).toBe(4);
+
+      await f.receipts.prepare();
+      await writeFile(f.receiptPath, JSON.stringify(f.expectedReceipt), { mode: 0o600 });
+      executor.wake();
+      await delay(1100);
+      expect(receipt).not.toHaveBeenCalled();
+      active.get(cleanKey)!();
+      await vi.waitFor(() => expect(active.has(receiptKey)).toBe(true), { timeout: 5000 });
+      expect(active.size).toBe(4);
+      expect(peak).toBe(4);
+      await vi.waitFor(async () =>
+        expect(await f.durableState()).toMatchObject({
+          state: 'unknown',
+          upstream_task_id: f.expectedReceipt.upstreamTaskId,
+        }),
+      );
+      expect(
+        (
+          await f.pool.query('SELECT checkpoint FROM mio_video_executions WHERE job_id=$1', [
+            completed.jobId,
+          ])
+        ).rows[0].checkpoint.cleaned,
+      ).toBe(true);
+
+      let closed = false;
+      const closing = executor.close().then(() => {
+        closed = true;
+      });
+      expect(executor.signal.aborted).toBe(true);
+      expect(closeSignals.every((signal) => signal.aborted)).toBe(true);
+      executor.wake();
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      for (const release of active.values()) release();
+      await closing;
+      expect(receipt).toHaveBeenCalledOnce();
+      expect(entered).toHaveLength(7);
+      expect(f.protocol.submit).not.toHaveBeenCalled();
+      expect(f.protocol.query).not.toHaveBeenCalled();
+    } finally {
+      const closing = executor.close();
+      for (const release of active.values()) release();
+      await closing;
+      receipt.mockRestore();
+    }
+  });
 });

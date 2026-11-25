@@ -199,7 +199,7 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 副作用：重新核验独立的图片活动任务名额（每用户 32／全局 1000 个 `accepted` 或 `materializing` 任务，不与视频共享），立即唤醒 A 的持久执行器恢复已保存结果，不再次提交生图；未知提交不能通过此入口重发。
 
-视频任务与图片任务分表持久化。视频提交和执行须显式设置 `MIO_VIDEO_GENERATIONS_ENABLED=true`，并具备生成、供应商、资产以及 B/RabbitMQ 计算配置；未装配的协议仍返回不可用。Veo 的受保护下载和内联结果尚未接入，因此保持 ADAPTER_PENDING。取消和手动恢复写入口尚未开放。
+视频任务与图片任务分表持久化。视频提交和执行须显式设置 `MIO_VIDEO_GENERATIONS_ENABLED=true`，并具备生成、供应商、资产以及 B/RabbitMQ 计算配置；未装配的协议仍返回不可用。Veo 的受保护下载和内联结果尚未接入，因此保持 ADAPTER_PENDING。取消和手动恢复尚无公开 HTTP 写入口。
 
 ## GET /api/v1/compute/video-capabilities/{modelRef}
 
@@ -231,9 +231,11 @@ A 对主、子清单按登记 ETag 条件读取并核对长度及 SHA-256。主�
 
 成功 URL 先持久化，再流式下载到恢复目录，以 Content-MD5 上传私有 staging。B 按实际 staging ETag 核验容器、视频流、尺寸、时长与声音。A 按探测绑定的 ETag 将同一对象在 COS 桶内条件复制到不可覆盖的私有 raw 键，核对长度、SHA-256 元数据、MIME 和已知复制 ETag，再在同一数据库事务登记本人 derived Asset 与输出。单输出最多 512 MiB，物化最多三次。复制回执丢失按原 raw 键对账，重用已核验的同一资产身份。
 
-错误：400 `VIDEO_INPUT_INVALID`（包括媒体类型不符）或 `VIDEO_MODE_UNSUPPORTED`，401 `UNAUTHORIZED`，403 `ORIGIN_DENIED` 或 `ORIGIN_REQUIRED`，404 `ASSET_NOT_FOUND`（引用资产不存在、不属于本人或未就绪），409 `REQUEST_CONFLICT`、`VIDEO_CAPABILITIES_STALE` 或 `VIDEO_INPUT_CHANGED`（已登记的对象缺失、长度或可核对的 ETag 不符），429 `VIDEO_QUOTA_EXCEEDED`，503 `VIDEO_UNAVAILABLE`（包括 PostgreSQL 或 COS 调用故障）；读取正文可能返回 408 或 413。已受理任务在发送前复核失败时以 `rejected` / `VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE` 结束，生成 POST 为零。失败、未知和物化失败分别呈现，不能当作完成。
+错误：400 `VIDEO_INPUT_INVALID`（包括媒体类型不符）或 `VIDEO_MODE_UNSUPPORTED`，401 `UNAUTHORIZED`，403 `ORIGIN_DENIED` 或 `ORIGIN_REQUIRED`，404 `ASSET_NOT_FOUND`（引用资产不存在、不属于本人或未就绪），409 `REQUEST_CONFLICT`、`VIDEO_CAPABILITIES_STALE` 或 `VIDEO_INPUT_CHANGED`（已登记的对象缺失、长度或可核对的 ETag 不符），429 `VIDEO_QUOTA_EXCEEDED`，503 `VIDEO_UNAVAILABLE`（包括执行器不可用、PostgreSQL 或 COS 调用故障）；读取正文可能返回 408 或 413。已受理任务在发送前复核失败时以 `rejected` / `VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE` 结束，生成 POST 为零。失败、未知和物化失败分别呈现，不能当作完成。
 
-副作用：创建持久意图和执行密文快照，单次真实生成可能计费。DSH 视频工具在服务向数据库发出 COMMIT 之前观察到轮次取消时回滚受理。受理提交后，执行器独立推进同一任务。HTTP 正文及身份确认后，客户端断开时准入照常执行。活动任务限制每用户 5、全局 50；后台最多 4 个并发操作。普通自动化回归只连接隔离数据库和协议替身。
+执行器未启用或服务观察到执行器失去租约后，首次受理和内部手动恢复返回 503 `VIDEO_UNAVAILABLE`。在向数据库发出 COMMIT 之前观察到执行器不可用，进行中的写入回滚，任务与活动任务名额保持原状。已发出 COMMIT 时，以数据库提交结果为准。服务仍运行时，本人列表、详情及同输入幂等重放继续可用，变更输入仍返回 409 `REQUEST_CONFLICT`。
+
+副作用：创建持久意图和执行密文快照，单次真实生成可能计费。DSH 视频工具在服务向数据库发出 COMMIT 之前观察到轮次取消时回滚受理。受理提交后，执行器独立推进同一任务。HTTP 正文及身份确认后，客户端断开时准入照常执行。活动任务限制每用户 5、全局 50。任务执行、已完成结果清理与持久回执重放合计最多 4 个后台并发操作，清理与回执重放共用其中至多 1 个名额。普通自动化回归只连接隔离数据库和协议替身。
 
 ## GET /api/v1/compute/videos
 

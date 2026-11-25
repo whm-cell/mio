@@ -21,16 +21,27 @@ import {
 } from './execution.ts';
 
 const EXECUTOR_LOCK = 672049927;
+const RELEASE_TIMEOUT_MS = 2000;
 const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
 const selection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
   e.phase,e.claim_id,e.snapshot,e.upstream_task_id,e.query_attempt,e.async_max_queries,
   e.async_deadline,e.checkpoint FROM mio_video_jobs j
   JOIN mio_video_executions e ON e.job_id=j.id`;
 
+export type VideoClaim = Pick<VideoExecution, 'id' | 'claim_id'>;
+
+export class VideoClaimUnsettled extends Error {
+  readonly claim: VideoClaim;
+
+  constructor(claim: VideoClaim, cause: unknown) {
+    super('VIDEO_CLAIM_OUTCOME_UNKNOWN', { cause });
+    this.claim = claim;
+  }
+}
+
 /** One session lock owns restart reconciliation; each operation also checks its claim. */
 export class VideoExecutionStore {
-  private executor: PoolClient | undefined;
-  private executorFailure: (() => void) | undefined;
+  private executor: { client: PoolClient; onError: () => void; lost: boolean } | undefined;
   private readonly pool: Pool;
   private readonly capacity: (client: PoolClient, ownerId: string) => Promise<void>;
 
@@ -41,15 +52,22 @@ export class VideoExecutionStore {
 
   async startExecutor(onLost: () => void): Promise<void> {
     const client = await this.pool.connect();
+    const executor = {
+      client,
+      lost: false,
+      onError: () => {
+        if (executor.lost) return;
+        executor.lost = true;
+        onLost();
+      },
+    };
+    client.on('error', executor.onError);
     try {
       const lock = await client.query<{ acquired: boolean }>(
         'SELECT pg_try_advisory_lock(hashtext(current_schema()),$1) AS acquired',
         [EXECUTOR_LOCK],
       );
       if (!lock.rows[0]?.acquired) throw new Error('VIDEO_EXECUTOR_ALREADY_RUNNING');
-      this.executorFailure = onLost;
-      client.on('error', onLost);
-      this.executor = client;
       // A previous executor may not have seen the lost lease yet. Let its dispatch
       // window end before applying the interval. Legacy rows have no such window.
       await client.query(
@@ -61,9 +79,10 @@ export class VideoExecutionStore {
         WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`,
         [VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
       );
+      this.executor = executor;
     } catch (error) {
+      client.removeListener('error', executor.onError);
       client.release(true);
-      this.executor = undefined;
       throw error;
     }
   }
@@ -72,20 +91,32 @@ export class VideoExecutionStore {
     const executor = this.executor;
     this.executor = undefined;
     if (!executor) return;
-    if (this.executorFailure) executor.removeListener('error', this.executorFailure);
     try {
-      await executor.query('SELECT pg_advisory_unlock(hashtext(current_schema()),$1)', [
-        EXECUTOR_LOCK,
-      ]);
+      if (!executor.lost) {
+        const unlock = {
+          text: 'SELECT pg_advisory_unlock(hashtext(current_schema()),$1)',
+          values: [EXECUTOR_LOCK],
+          query_timeout: RELEASE_TIMEOUT_MS,
+        };
+        await executor.client.query(unlock);
+      }
+    } catch (error) {
+      if (!executor.lost) throw error;
     } finally {
-      executor.release(true);
+      executor.client.removeListener('error', executor.onError);
+      executor.client.release(true);
     }
   }
 
-  async claim(): Promise<VideoExecution | undefined> {
-    return transaction(this.pool, async (client) => {
-      const result = await client.query<{ job_id: string }>(
-        `UPDATE mio_video_executions SET claim_id=$1,updated_at=now()
+  async claim(signal?: AbortSignal): Promise<VideoExecution | undefined> {
+    let claim: VideoClaim | undefined;
+    const claimId = createId();
+    try {
+      return await transaction(
+        this.pool,
+        async (client) => {
+          const result = await client.query<{ job_id: string }>(
+            `UPDATE mio_video_executions SET claim_id=$1,updated_at=now()
          WHERE job_id=(SELECT e.job_id FROM mio_video_executions e
            JOIN mio_video_jobs j ON j.id=e.job_id
            WHERE e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
@@ -94,13 +125,20 @@ export class VideoExecutionStore {
                OR e.query_attempt>=e.async_max_queries)))
            ORDER BY j.created_at LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
          RETURNING job_id`,
-        [createId()],
+            [claimId],
+          );
+          const id = result.rows[0]?.job_id;
+          if (!id) return;
+          claim = { id, claim_id: claimId };
+          return (await client.query<VideoExecution>(selection + ' WHERE j.id=$1', [id])).rows[0];
+        },
+        signal,
       );
-      const id = result.rows[0]?.job_id;
-      return id
-        ? (await client.query<VideoExecution>(selection + ' WHERE j.id=$1', [id])).rows[0]
-        : undefined;
-    });
+    } catch (error) {
+      // The commit may have succeeded even though the caller did not receive the row.
+      if (claim) throw new VideoClaimUnsettled(claim, error);
+      throw error;
+    }
   }
 
   async completedCleanup(): Promise<VideoExecution[]> {
@@ -123,16 +161,18 @@ export class VideoExecutionStore {
     );
   }
 
-  async release(row: VideoExecution): Promise<void> {
-    await this.pool.query(
-      `UPDATE mio_video_executions SET claim_id=NULL,
+  async release(row: VideoClaim): Promise<void> {
+    const release = {
+      text: `UPDATE mio_video_executions SET claim_id=NULL,
       phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END,
       next_query_at=GREATEST(next_query_at,CASE WHEN phase='querying'
         THEN clock_timestamp()+$3*interval '1 millisecond'
         ELSE statement_timestamp()+interval '1 second' END),updated_at=now()
       WHERE job_id=$1 AND claim_id=$2`,
-      [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
-    );
+      values: [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
+      query_timeout: RELEASE_TIMEOUT_MS,
+    };
+    await this.pool.query(release);
   }
 
   async submitting(row: VideoExecution): Promise<boolean> {

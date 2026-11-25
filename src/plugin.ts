@@ -141,6 +141,23 @@ async function closeMioResources(...steps: Array<() => Promise<void> | undefined
   if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
 }
 
+async function closeVideoResources(
+  admission: ReturnType<typeof createVideoGenerationService> | undefined,
+  executor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined,
+): Promise<void> {
+  // Each async call starts its stop synchronously and captures even a synchronous throw.
+  const settled = await Promise.allSettled([
+    (async () => admission?.close())(),
+    (async () => executor?.close())(),
+  ]);
+  const failures = settled.filter((result) => result.status === 'rejected');
+  if (failures.length)
+    throw new AggregateError(
+      failures.map((result) => result.reason),
+      'Video cleanup failed',
+    );
+}
+
 /** Mount foundation and configured account routes. No global model-facing tool is authorized. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // Deny before awaiting optional dependencies, including when authentication startup fails.
@@ -235,6 +252,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
     let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
+    const closeWithVideo = (
+      drains: Array<() => Promise<void> | undefined>,
+      ...dependencies: Array<() => Promise<void> | undefined>
+    ) => {
+      const video = videoGenerations?.close();
+      // Cordis disposes sibling effects concurrently. Stop video immediately, then join its drain
+      // before releasing any shared dependency, even if another consumer has a slow close.
+      void video?.catch(() => {});
+      return closeMioResources(...drains, () => video, ...dependencies);
+    };
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
     let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
@@ -269,12 +296,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
         ctx.effect(
           () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => materials?.close(),
-              () => audio?.close(),
-              () => derivatives?.close(),
-              () => videoGenerations?.close(),
+            closeWithVideo(
+              [
+                () => conversations?.close(),
+                () => materials?.close(),
+                () => audio?.close(),
+                () => derivatives?.close(),
+              ],
               () => acquired.close(),
             ),
         );
@@ -302,12 +330,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             createComputeService(store, assetResources.objects, computeConfig));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
-          () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => videoGenerations?.close(),
-              () => acquired.close(),
-            ),
+          () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
         );
         ctx.effect(() =>
           ctx.webServer.register({
@@ -421,10 +444,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
         ctx.effect(
           () => () =>
-            closeMioResources(
-              () => admin?.close(),
-              () => conversations?.close(),
-              () => videoGenerations?.close(),
+            closeWithVideo(
+              [() => admin?.close(), () => conversations?.close()],
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
@@ -576,8 +597,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (generationConfig && assetConfig && assetResources) {
       const store = await createGenerationStore(assetConfig.databaseURL);
       let ownedGenerations: GenerationService | undefined;
+      let videoAdmission: ReturnType<typeof createVideoGenerationService> | undefined;
       let videoExecutor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined;
       let videoInputs: ReturnType<typeof createVideoInputResolver> | undefined;
+      let videoClosing: Promise<void> | undefined;
+      const closeVideo = () =>
+        (videoClosing ??= closeVideoResources(videoAdmission, videoExecutor));
       try {
         const acquired =
           (generations =
@@ -611,28 +636,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             generationConfig.dataDirectory,
           );
         }
-        const admission = createVideoGenerationService(
+        const admission = (videoAdmission = createVideoGenerationService(
           videoStore,
           () => providers,
           videoExecutor,
           videoInputs?.inspect,
-        );
-        let videoClosing: Promise<void> | undefined;
+        ));
         const ownedVideoGenerations = (videoGenerations = {
           ...admission,
-          close: () =>
-            (videoClosing ??= closeMioResources(
-              () => admission.close(),
-              () => videoExecutor?.close(),
-            )),
+          close: closeVideo,
         });
         ctx.effect(
-          () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => ownedVideoGenerations.close(),
-              () => acquired.close(),
-            ),
+          () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
         );
         ctx.effect(() =>
           ctx.webServer.register({
@@ -661,11 +676,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
-        await closeMioResources(
-          () => videoGenerations?.close(),
-          () => videoExecutor?.close(),
-          () => (ownedGenerations ? ownedGenerations.close() : store.close()),
-        );
+        try {
+          await closeMioResources(closeVideo, () =>
+            ownedGenerations ? ownedGenerations.close() : store.close(),
+          );
+        } catch (failure) {
+          throw new AggregateError([error, failure], 'Generation startup cleanup failed');
+        }
         throw error;
       }
     }

@@ -68,12 +68,17 @@ export function createVideoRunner(
   };
 
   const materializeResult = async (row: VideoExecution) => {
+    if (stop.aborted) {
+      await store.release(row);
+      return;
+    }
     if (!row.checkpoint?.videos.length || !(await store.beginMaterialization(row))) {
       await store.terminal(row, 'materialization_failed', 'VIDEO_MATERIALIZATION_FAILED');
       return;
     }
     const bounded = AbortSignal.any([stop, AbortSignal.timeout(180_000)]);
     try {
+      bounded.throwIfAborted();
       const outputs = await materialize(row, row.checkpoint.videos, bounded);
       bounded.throwIfAborted();
       if (await store.complete(row, outputs)) await verify(row);
@@ -191,6 +196,10 @@ export function createVideoRunner(
     const row = hasVideoQueryBudget(claimed) ? await store.beginQuery(claimed) : undefined;
     if (!row) {
       await store.queryLimit(claimed);
+      return;
+    }
+    if (stop.aborted) {
+      await store.release(row);
       return;
     }
     const deadline = row.async_deadline!.getTime();

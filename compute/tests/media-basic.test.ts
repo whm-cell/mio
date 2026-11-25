@@ -372,6 +372,34 @@ describe('real FFmpeg media plans through production process/file adapters', () 
     expect(probe.hasAudio).toBe(true);
     expect(probe.hasVideo).toBe(false);
   });
+  it('extracts sound from video whose projected width rounds below one pixel', async () => {
+    const narrow = join(root, 'narrow-video.avi');
+    ffmpeg([
+      '-f',
+      'lavfi',
+      '-i',
+      'color=black:size=32x32:rate=10:duration=1',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:sample_rate=48000:duration=1',
+      '-vf',
+      'setsar=1/100',
+      '-c:v',
+      'mpeg4',
+      '-c:a',
+      'aac',
+      narrow,
+    ]);
+    const task = setup('audio.extract', { profile: 'original', format: 'wav' }, [narrow]);
+    const result = await executeBasic(task.command, task.context);
+    expect(
+      await probeFile(result.files[0]!.name, 'check-narrow-source-audio', task.context),
+    ).toMatchObject({ hasAudio: true, hasVideo: false });
+    await expect(probeVideoFile(narrow, AbortSignal.timeout(10_000))).rejects.toMatchObject({
+      code: 'SOURCE_INVALID',
+    });
+  });
   it('extracts ASR PCM as 16k mono and bounds waveform storage/reads', async () => {
     const task = setup('audio.extract', { profile: 'asr' });
     const result = await executeBasic(task.command, task.context);

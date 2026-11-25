@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
+import COS from 'cos-nodejs-sdk-v5';
 import { describe, expect, it, vi } from 'vitest';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
@@ -13,7 +14,11 @@ import { createVideoInputResolver } from '../../src/generations/video-inputs.ts'
 import { createVideoRunner } from '../../src/generations/video-runner.ts';
 import { createVideoGenerationService } from '../../src/generations/video-service.ts';
 import { VideoGenerationStore } from '../../src/generations/video-store.ts';
-import type { VideoAssetReference } from '../../src/generations/video-contracts.ts';
+import type {
+  VideoAssetReference,
+  VideoCreateRequest,
+} from '../../src/generations/video-contracts.ts';
+import { createCosStorage } from '../../src/integrations/cos.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
@@ -154,7 +159,7 @@ async function assetHttpFixture() {
     copy: vi.fn(),
     delete: vi.fn(),
     materialUrl: vi.fn((key) => `https://cos.fixture/${key}?signature=fixture`),
-    head: vi.fn(async (key) => {
+    head: vi.fn<AssetObjectStore['head']>(async (key) => {
       const head = heads.get(key);
       if (!head) throw Object.assign(new Error('private COS error'), { statusCode: 404 });
       return head;
@@ -210,8 +215,8 @@ async function assetHttpFixture() {
   } as unknown as ProviderService;
   const upstream = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ id: 'fixture-task' }));
   const wake = vi.fn();
-  const signal = new AbortController().signal;
-  const run = createVideoRunner(execution, () => provider, vi.fn(), signal, {
+  const stop = new AbortController();
+  const run = createVideoRunner(execution, () => provider, vi.fn(), stop.signal, {
     protocol: createVideoProtocol,
     transport: upstream,
     references: (row, activeSignal) =>
@@ -240,6 +245,8 @@ async function assetHttpFixture() {
     objects,
     upstream,
     wake,
+    closeAdmissions: service.close,
+    stopRunner: () => stop.abort(),
     async addAsset(
       assetOwner = actor.userId,
       state = 'ready',
@@ -363,7 +370,10 @@ describe('video asset admission over HTTP', () => {
       const job = await accepted.json();
       expect(job.inputSnapshot).toEqual(references);
       expect(JSON.stringify(job)).not.toMatch(/mio\/raw|raw-etag|signature=/);
-      expect(f.objects.head.mock.calls).toEqual([[second.key], [first.key]]);
+      expect(f.objects.head.mock.calls).toEqual([
+        [second.key, expect.any(AbortSignal)],
+        [first.key, expect.any(AbortSignal)],
+      ]);
       expect(f.objects.materialUrl).not.toHaveBeenCalled();
       f.heads.set(first.key, { ...first.head, etag: 'replaced-etag' });
       const row = await f.runNext();
@@ -404,4 +414,106 @@ describe('video asset admission over HTTP', () => {
       await f.close();
     }
   });
+
+  it('replays a persisted pre-Foundation input hash and rejects changed new inputs', async () => {
+    const f = await assetHttpFixture();
+    try {
+      const first = await f.addAsset();
+      const last = await f.addAsset();
+      const references = [{ assetId: first.assetId }, { assetId: last.assetId }];
+      const id = randomUUID();
+      const created = await f.post(references, id);
+      expect(created.status).toBe(202);
+      const job = await created.json();
+      const original: VideoCreateRequest = {
+        requestId: id,
+        modelRef: job.modelRef,
+        expectedCapabilitiesVersion: 'asset-http-capabilities',
+        parameters: { mode: 'full', prompt: 'ordered references', references },
+      };
+      const legacy = createHash('sha256').update(JSON.stringify(original), 'utf8').digest('hex');
+      const current = await f.pool.query('SELECT input_hash FROM mio_video_jobs WHERE id=$1', [
+        job.id,
+      ]);
+      expect(current.rows[0]?.input_hash).toBe(legacy);
+      await f.pool.query(
+        "UPDATE mio_video_jobs SET input_hash=$2,command=command-'inputObjects' WHERE id=$1",
+        [job.id, legacy],
+      );
+      f.objects.head.mockClear();
+      const replay = await f.post(references, id);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ id: job.id });
+      expect(f.objects.head).not.toHaveBeenCalled();
+
+      const freshId = randomUUID();
+      expect((await f.post(references, freshId)).status).toBe(202);
+      const conflicting = await f.post(references.toReversed(), freshId);
+      expect(conflicting.status).toBe(409);
+      expect(await conflicting.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
+      expect(f.wake).toHaveBeenCalledTimes(2);
+      expect(f.upstream).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each(['admission', 'submission'] as const)(
+    'halts a hung SDK HEAD during video %s without signing or submitting',
+    async (stage) => {
+      const f = await assetHttpFixture();
+      const reply = Promise.withResolvers<COS.HeadObjectResult>();
+      const started = Promise.withResolvers<void>();
+      const head = vi.spyOn(COS.prototype, 'headObject').mockImplementation(() => {
+        started.resolve();
+        return reply.promise;
+      });
+      const storage = createCosStorage({
+        databaseURL: 'postgresql://example.invalid/media',
+        bucket: 'mio-test-1234567890',
+        region: 'ap-shanghai',
+        secretId: 'fixture',
+        secretKey: 'fixture',
+      });
+      try {
+        const asset = await f.addAsset();
+        const references = [{ assetId: asset.assetId }];
+        if (stage === 'admission') {
+          f.objects.head.mockImplementationOnce(storage.head);
+          const pending = f.post(references);
+          await started.promise;
+          await f.closeAdmissions();
+          const response = await pending;
+          expect(response.status).toBe(503);
+          expect(await response.json()).toMatchObject({ error: { code: 'VIDEO_UNAVAILABLE' } });
+          expect((await f.pool.query('SELECT count(*) FROM mio_video_jobs')).rows[0].count).toBe(
+            '0',
+          );
+          expect(f.wake).not.toHaveBeenCalled();
+        } else {
+          const accepted = await f.post(references);
+          expect(accepted.status).toBe(202);
+          const job = await accepted.json();
+          f.objects.head.mockImplementationOnce(storage.head);
+          const pending = f.runNext();
+          await started.promise;
+          f.stopRunner();
+          await pending;
+          expect(await (await f.get(job.id)).json()).toMatchObject({
+            state: 'accepted',
+            stage: 'ready',
+          });
+        }
+        reply.resolve({ ETag: asset.head.etag, headers: { 'content-length': '100' } });
+        await reply.promise;
+        expect(f.objects.materialUrl).not.toHaveBeenCalled();
+        expect(f.upstream).not.toHaveBeenCalled();
+      } finally {
+        f.stopRunner();
+        reply.resolve({ ETag: '', headers: {} });
+        head.mockRestore();
+        await f.close();
+      }
+    },
+  );
 });

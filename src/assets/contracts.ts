@@ -16,7 +16,10 @@ export interface AssetObjectStore {
   audioPlaybackUrl?(key: string, contentType: string): string;
   hlsSegmentUrl?(key: string, expiresIn: number): string;
   materialUrl?(key: string): string;
-  head(key: string): Promise<{ size: number; etag: string; sha256?: string; contentType?: string }>;
+  head(
+    key: string,
+    signal?: AbortSignal,
+  ): Promise<{ size: number; etag: string; sha256?: string; contentType?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   readMedia?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   putImage?(

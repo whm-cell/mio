@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Bytes } from '@mio/foundation/hash';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createLogger } from '@mio/foundation/logging';
 import { isUuidV4 } from '@mio/foundation/identifiers';
@@ -55,7 +55,7 @@ async function materialize(
     );
   if (!objects.putAudio) throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');
   const sizeBytes = bytes.byteLength;
-  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const sha256 = sha256Bytes(bytes);
   let head = await objects.head(job.output_key).catch((error: unknown) => {
     if ((error as { statusCode?: number } | null)?.statusCode === 404) return;
     throw new AudioError(503, 'AUDIO_STORAGE_UNAVAILABLE');

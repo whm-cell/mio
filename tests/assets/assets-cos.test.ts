@@ -103,6 +103,50 @@ it('signs a private HLS segment GET for inline MPEG-TS using the official SDK', 
   expect(end! - start!).toBe(1014);
 });
 
+it('stops waiting for a hung SDK HEAD and detaches the abort listener', async () => {
+  const storage = createCosStorage({
+    databaseURL: 'postgresql://example.invalid/media',
+    bucket: 'mio-test-1234567890',
+    region: 'ap-shanghai',
+    secretId: 'fixture',
+    secretKey: 'fixture',
+  });
+  const work = Promise.withResolvers<COS.HeadObjectResult>();
+  const started = Promise.withResolvers<void>();
+  const head = vi.spyOn(COS.prototype, 'headObject').mockImplementation(() => {
+    started.resolve();
+    return work.promise;
+  });
+  const abort = new AbortController();
+  const add = vi.spyOn(abort.signal, 'addEventListener');
+  const remove = vi.spyOn(abort.signal, 'removeEventListener');
+  const reason = new Error('fixture HEAD shutdown');
+  try {
+    await expect(storage.head('staging', AbortSignal.abort(reason))).rejects.toBe(reason);
+    expect(head).not.toHaveBeenCalled();
+    const pending = storage.head('staging', abort.signal);
+    await started.promise;
+    abort.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(remove).toHaveBeenCalledWith('abort', add.mock.calls[0]![1]);
+    work.reject(new Error('late SDK failure'));
+
+    const active = new AbortController();
+    const settled = vi.spyOn(active.signal, 'removeEventListener');
+    head.mockResolvedValueOnce({ ETag: 'etag', headers: { 'content-length': '3' } });
+    await expect(storage.head('staging', active.signal)).resolves.toEqual({
+      size: 3,
+      etag: 'etag',
+    });
+    expect(settled).toHaveBeenCalledWith('abort', expect.any(Function));
+    head.mockRejectedValueOnce(new Error('SDK failure'));
+    await expect(storage.head('staging', active.signal)).rejects.toThrow('SDK failure');
+    expect(settled).toHaveBeenCalledTimes(2);
+  } finally {
+    head.mockRestore();
+  }
+});
+
 it('passes conditional copy and non-overwrite headers to the official SDK', async () => {
   const copy = vi.spyOn(COS.prototype, 'putObjectCopy').mockResolvedValue({
     ETag: 'etag',

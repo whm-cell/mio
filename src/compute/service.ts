@@ -12,6 +12,7 @@ import type { ComputeStore, JobRow } from './store.ts';
 import { createVideoProbeCoordinator } from './video-probe.ts';
 const log = createLogger('app', 'compute');
 const VIDEO_OUTBOX_BATCH = 10;
+const OBJECT_TIMEOUT_MS = 180_000;
 const BROKER_RETRY_INITIAL_MS = 1000;
 const BROKER_RETRY_MAX_MS = 30_000;
 
@@ -56,36 +57,8 @@ export function createComputeService(
     );
     return action;
   };
-  const head = (key: string) =>
-    new Promise<Awaited<ReturnType<AssetObjectStore['head']>>>((resolve, reject) => {
-      if (stop.signal.aborted) {
-        reject(new Error('COMPUTE_STOPPED'));
-        return;
-      }
-      const finish = () => {
-        clearTimeout(timer);
-        stop.signal.removeEventListener('abort', abort);
-      };
-      const abort = () => {
-        finish();
-        reject(new Error('COMPUTE_STOPPED'));
-      };
-      const timer = setTimeout(() => {
-        finish();
-        reject(new Error('COMPUTE_OBJECT_TIMEOUT'));
-      }, 180_000);
-      stop.signal.addEventListener('abort', abort, { once: true });
-      void objects.head(key).then(
-        (value) => {
-          finish();
-          resolve(value);
-        },
-        (error: unknown) => {
-          finish();
-          reject(error);
-        },
-      );
-    });
+  const objectReadSignal = () =>
+    AbortSignal.any([stop.signal, AbortSignal.timeout(OBJECT_TIMEOUT_MS)]);
   const receive = (result: ComputeResultV1) =>
     admit(async () => {
       const resultLog = log.child({
@@ -94,7 +67,9 @@ export function createComputeService(
         messageId: result.messageId,
       });
       if (result.state === 'succeeded' && (await store.current(result))) {
-        const object = await head(result.output.key);
+        const signal = objectReadSignal();
+        const object = await objects.head(result.output.key, signal);
+        signal.throwIfAborted();
         if (
           object.size !== result.output.sizeBytes ||
           object.etag !== result.output.etag ||
@@ -102,6 +77,7 @@ export function createComputeService(
         )
           throw Object.assign(new Error('RESULT_OBJECT_MISMATCH'), { permanent: true });
       }
+      stop.signal.throwIfAborted();
       try {
         await store.accept(result);
         resultLog.info('RESULT_COMMITTED');
@@ -243,7 +219,9 @@ export function createComputeService(
           throw new ComputeError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
         let object: Awaited<ReturnType<AssetObjectStore['head']>>;
         try {
-          object = await head(input.raw_key);
+          const signal = objectReadSignal();
+          object = await objects.head(input.raw_key, signal);
+          signal.throwIfAborted();
         } catch {
           throw new ComputeError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
         }
@@ -279,7 +257,7 @@ export function createComputeService(
       pollRequested = false;
       clearInterval(timer);
       closing = (async () => {
-        const deadline = setTimeout(() => stop.abort(), 5000);
+        const deadline = setTimeout(() => stop.abort(new Error('COMPUTE_STOPPED')), 5000);
         try {
           if (broker) await broker.close();
           if (disconnecting.size > 0) await Promise.allSettled([...disconnecting]);

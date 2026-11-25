@@ -37,34 +37,11 @@ export async function createGenerationService(
   const active = new Set<Promise<void>>();
   const admissions = new Set<Promise<unknown>>();
   const run = createGenerationRunner(store, files, objects, provider, stop.signal, transports);
-  const head = (key: string) =>
-    new Promise<Awaited<ReturnType<GenerationObjects['head']>>>((resolve, reject) => {
-      if (stop.signal.aborted) return reject(new Error('GENERATION_STOPPED'));
-      const finish = () => {
-        clearTimeout(timer);
-        stop.signal.removeEventListener('abort', abort);
-      };
-      const abort = () => {
-        finish();
-        reject(new Error('GENERATION_STOPPED'));
-      };
-      const timer = setTimeout(() => {
-        finish();
-        reject(new Error('GENERATION_OBJECT_TIMEOUT'));
-      }, 180_000);
-      timer.unref();
-      stop.signal.addEventListener('abort', abort, { once: true });
-      void objects.head(key).then(
-        (object) => {
-          finish();
-          resolve(object);
-        },
-        (error: unknown) => {
-          finish();
-          reject(error);
-        },
-      );
-    });
+  const head: GenerationObjects['head'] = (key, signal) =>
+    objects.head(
+      key,
+      AbortSignal.any([stop.signal, AbortSignal.timeout(180_000), ...(signal ? [signal] : [])]),
+    );
   const create = createGenerationAdmission(store, files, head, provider);
   let cleanup: Promise<void> | undefined;
   let cleanupCursor: string | undefined;

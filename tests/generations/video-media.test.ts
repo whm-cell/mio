@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { Pool } from 'pg';
+import COS from 'cos-nodejs-sdk-v5';
 import type { VideoProbe } from '../../src/generations/video-media.ts';
 import { createVideoMaterializer, createVideoCleanup } from '../../src/generations/video-media.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
@@ -14,6 +15,7 @@ import { VideoGenerationStore } from '../../src/generations/video-store.ts';
 import type { VideoCreateRequest } from '../../src/generations/video-contracts.ts';
 import type { VideoExecution, VideoProtocol } from '../../src/generations/video-execution.ts';
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
+import { createCosStorage } from '../../src/integrations/cos.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 const videos = [{ url: 'https://video.fixture/result.mp4' }];
@@ -160,6 +162,70 @@ describe('durable video materialization', () => {
       );
       expect([...f.saved.keys()].every((key) => key.startsWith('mio/staging/'))).toBe(true);
       expect(f.objects.copy).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('stops materialization while staging HEAD is hung and ignores a late response', async () => {
+    const f = await fixture();
+    const started = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<COS.HeadObjectResult>();
+    const head = vi.spyOn(COS.prototype, 'headObject').mockImplementation(() => {
+      started.resolve();
+      return reply.promise;
+    });
+    const storage = createCosStorage({
+      databaseURL: 'postgresql://example.invalid/media',
+      bucket: 'mio-test-1234567890',
+      region: 'ap-shanghai',
+      secretId: 'fixture',
+      secretKey: 'fixture',
+    });
+    const stop = new AbortController();
+    const reason = new Error('fixture shutdown');
+    try {
+      vi.mocked(f.objects.head).mockImplementationOnce(storage.head);
+      const pending = f.run(f.row, videos, stop.signal);
+      await started.promise;
+      stop.abort(reason);
+      await expect(pending).rejects.toBe(reason);
+      reply.reject(Object.assign(new Error('late staging miss'), { statusCode: 404 }));
+      await reply.promise.catch(() => {});
+      expect(f.objects.putVideo).not.toHaveBeenCalled();
+      expect(f.objects.copy).not.toHaveBeenCalled();
+      expect(f.probe).not.toHaveBeenCalled();
+    } finally {
+      head.mockRestore();
+      await f.close();
+    }
+  });
+
+  it('reconciles an in-flight copy after shutdown without a second write', async () => {
+    const f = await fixture();
+    const started = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<void>();
+    const stop = new AbortController();
+    const reason = new Error('fixture shutdown');
+    try {
+      const copy = vi.mocked(f.objects.copy).getMockImplementation()!;
+      vi.mocked(f.objects.copy).mockImplementationOnce(async (...args) => {
+        const result = await copy(...args);
+        started.resolve();
+        await reply.promise;
+        return result;
+      });
+      const pending = f.run(f.row, videos, stop.signal);
+      await started.promise;
+      stop.abort(reason);
+      reply.resolve();
+      await expect(pending).rejects.toBe(reason);
+      const original = vi.mocked(f.objects.copy).mock.calls[0]!;
+      const restored = await f.start()(f.row, videos, AbortSignal.timeout(5000));
+      expect(restored[0]?.key).toBe(original[1]);
+      expect(f.objects.copy).toHaveBeenCalledTimes(1);
+      expect(f.objects.putVideo).toHaveBeenCalledTimes(1);
+      expect(f.probe).toHaveBeenCalledTimes(1);
     } finally {
       await f.close();
     }

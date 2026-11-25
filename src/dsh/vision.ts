@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Bytes, sha256Utf8 } from '@mio/foundation/hash';
 import sharp from 'sharp';
 import { isImageAdmissionError, requestImageDimensions } from '@deepseek-ai/dsh-attachment';
 import { prepareImageFile } from '@deepseek-ai/dsh-attachment-local';
@@ -23,7 +23,6 @@ const LIMITS = {
 };
 const NORMALIZATION = { maxPixels: 16_777_216, maxDimension: 8192, maxBytes: 10 * 1024 * 1024 };
 const ID = /^mio-v1:([a-f0-9-]{36}):([a-f0-9]{64}):([a-f0-9]{64}):([a-f0-9]{64})$/;
-const digest = (value: Uint8Array | string) => createHash('sha256').update(value).digest('hex');
 
 type SourceReader = (
   ownerId: string,
@@ -161,9 +160,9 @@ async function previewPrepared(
     metadata.space !== 'srgb'
   )
     throw new ConversationError(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
-  const fingerprint = digest(preview.data);
+  const fingerprint = sha256Bytes(preview.data);
   return {
-    variantId: `sha256:${digest(JSON.stringify([ref.attachmentId, target, fingerprint]))}`,
+    variantId: `sha256:${sha256Utf8(JSON.stringify([ref.attachmentId, target, fingerprint]))}`,
     attachment: ref,
     data: preview.data,
     mediaType: preview.ref.mediaType as ConversationImagePreview['mediaType'],
@@ -185,7 +184,7 @@ export function createConversationVision(readSource: SourceReader): Conversation
     const source = await readSource(ownerId, assetId, undefined, signal);
     const prepared = await normalized(source, signal);
     const ref: ConversationImageReference = {
-      attachmentId: `mio-v1:${assetId}:${source.etagDigest}:${source.sourceDigest}:${digest(prepared.data)}`,
+      attachmentId: `mio-v1:${assetId}:${source.etagDigest}:${source.sourceDigest}:${sha256Bytes(prepared.data)}`,
       mediaType: prepared.ref.mediaType as ConversationImageReference['mediaType'],
       bytes: prepared.ref.bytes,
       width: prepared.ref.width,
@@ -228,7 +227,7 @@ export function createConversationVision(readSource: SourceReader): Conversation
         const source = await readSource(ownerId, key.assetId, key, signal);
         const prepared = await normalized(source, signal);
         if (
-          digest(prepared.data) !== key.normalized ||
+          sha256Bytes(prepared.data) !== key.normalized ||
           prepared.ref.mediaType !== ref.mediaType ||
           prepared.ref.bytes !== ref.bytes ||
           prepared.ref.width !== ref.width ||

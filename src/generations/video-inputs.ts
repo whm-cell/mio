@@ -34,7 +34,8 @@ export function createVideoInputResolver(
     for (const id of ids) {
       signal.throwIfAborted();
       const asset = byId.get(id)!;
-      const head = await objects.head(asset.raw_key).catch((error: unknown) => {
+      const head = await objects.head(asset.raw_key, signal).catch((error: unknown) => {
+        signal.throwIfAborted();
         if ((error as { statusCode?: number } | null)?.statusCode === HTTP_STATUS.NOT_FOUND)
           throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_INPUT_CHANGED');
         throw error;
@@ -63,6 +64,7 @@ export function createVideoInputResolver(
       expected?: VideoJobCommand['inputObjects'],
     ) {
       const identities = await inspect(ownerId, references, signal, expected);
+      signal.throwIfAborted();
       return Object.fromEntries(
         Object.entries(identities).map(([id, { key }]) => [id, objects.materialUrl!(key)]),
       );

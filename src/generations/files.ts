@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sha256Bytes } from '@mio/foundation/hash';
 import { createId, isUuidV4 } from '@mio/foundation/identifiers';
 import { mkdir, open, readFile, rename, statfs, unlink } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
@@ -7,10 +8,6 @@ import { GenerationError } from './errors.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { matchesImageSignature } from '../integrations/onelink/shared/index.ts';
 import type { ImageResult } from '../integrations/onelink/shared/index.ts';
-
-function digest(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
-}
 
 async function syncDirectory(directory: string): Promise<void> {
   const file = await open(directory, 'r');
@@ -85,7 +82,7 @@ export class GenerationFiles {
       checkpoint.revision = revision;
       return {
         file: join(checkpoint.jobId, 'receipt.json'),
-        sha256: digest(bytes),
+        sha256: sha256Bytes(bytes),
         revision,
       };
     } catch (error) {
@@ -153,7 +150,7 @@ export class GenerationFiles {
             file,
             format,
             sizeBytes: bytes.length,
-            sha256: digest(bytes),
+            sha256: sha256Bytes(bytes),
           });
         }
         ref = await this.save(checkpoint);
@@ -261,7 +258,7 @@ export class GenerationFiles {
       throw error;
     }
     const value = JSON.parse(bytes.toString('utf8')) as ImageCheckpoint;
-    const sha256 = digest(bytes);
+    const sha256 = sha256Bytes(bytes);
     if (
       value.version !== 1 ||
       value.jobId !== jobId ||
@@ -306,7 +303,7 @@ export class GenerationFiles {
 
   async read(jobId: string, image: SavedImage): Promise<Buffer> {
     const bytes = await readFile(this.path(jobId, image.file));
-    if (bytes.length !== image.sizeBytes || digest(bytes) !== image.sha256)
+    if (bytes.length !== image.sizeBytes || sha256Bytes(bytes) !== image.sha256)
       throw new Error('IMAGE_CHECKPOINT_INVALID');
     return bytes;
   }

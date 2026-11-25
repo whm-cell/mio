@@ -133,6 +133,7 @@ it('passes conditional copy and non-overwrite headers to the official SDK', asyn
         CopySource: 'mio-test-1234567890.cos.ap-shanghai.myqcloud.com/mio%2Fstaging%2Fsource',
         CopySourceIfMatch: 'etag',
         MetadataDirective: 'Replaced',
+        ContentType: 'application/octet-stream',
         Headers: { 'x-cos-forbid-overwrite': 'true' },
       }),
     );
@@ -141,6 +142,116 @@ it('passes conditional copy and non-overwrite headers to the official SDK', asyn
     head.mockRestore();
   }
 });
+
+it.each(['acknowledged', 'xml-error', 'connection-reset'] as const)(
+  'sends one conditional video copy at the SDK transport on %s',
+  async (outcome) => {
+    const size = 41;
+    const sha256 = 'a'.repeat(64);
+    const token = 'fixture-session-token';
+    const source = 'mio/staging/video/job/0/attempt.media';
+    const target = 'mio/raw/asset/attempt';
+    const seen: {
+      method: string | undefined;
+      url: string | undefined;
+      headers: Record<string, unknown>;
+    }[] = [];
+    let stored = false;
+    const server = createServer((request, response) => {
+      const { method, url, headers } = request;
+      seen.push({ method, url, headers });
+      request.resume();
+      request.once('end', () => {
+        if (method === 'HEAD') {
+          response
+            .writeHead(stored ? 200 : 404, {
+              'content-length': String(size),
+              'content-type': 'video/mp4',
+              'x-cos-meta-sha256': sha256,
+              etag: '"raw"',
+            })
+            .end();
+          return;
+        }
+        if (outcome === 'xml-error') {
+          response.end('<Error><Code>InternalError</Code><Message>fixture</Message></Error>');
+          return;
+        }
+        stored = true;
+        if (outcome === 'connection-reset') {
+          request.socket.destroy();
+          return;
+        }
+        response.end('<CopyObjectResult><ETag>&quot;raw&quot;</ETag></CopyObjectResult>');
+      });
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('COS fixture address missing');
+    const sdkRequest = COS.prototype.request;
+    const requestSpy = vi.spyOn(COS.prototype, 'request').mockImplementation(function (
+      this: COS,
+      params: COS.RequestParams,
+    ) {
+      this.on('before-send', (options: { url: string }) => {
+        const url = new URL(options.url);
+        options.url = `http://127.0.0.1:${address.port}${url.pathname}${url.search}`;
+      });
+      return sdkRequest.call(this, params);
+    });
+    try {
+      const storage = createCosStorage({
+        databaseURL: 'postgresql://example.invalid/media',
+        bucket: 'mio-test-1234567890',
+        region: 'ap-shanghai',
+        secretId: 'example-id',
+        secretKey: 'example-key',
+        sessionToken: token,
+      });
+      const result = storage.copy(source, target, '"source"', 'private', {
+        contentType: 'video/mp4',
+        sha256,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (outcome === 'acknowledged') await expect(result).resolves.toEqual({ etag: '"raw"' });
+      else if (outcome === 'xml-error')
+        await expect(result).rejects.toThrow('COS_VIDEO_COPY_ACK_INVALID');
+      else await expect(result).rejects.toMatchObject({ code: 'ECONNRESET' });
+      if (outcome !== 'xml-error') {
+        expect(await storage.head(target)).toEqual({
+          size,
+          etag: '"raw"',
+          contentType: 'video/mp4',
+          sha256,
+        });
+      }
+      expect(seen.map(({ method }) => method)).toEqual(
+        outcome === 'xml-error' ? ['PUT'] : ['PUT', 'HEAD'],
+      );
+      expect(seen[0]).toMatchObject({
+        url: '/' + target,
+        headers: {
+          authorization: expect.any(String),
+          'content-length': '0',
+          'content-type': 'video/mp4',
+          'x-cos-copy-source': `mio-test-1234567890.cos.ap-shanghai.myqcloud.com/${encodeURIComponent(source)}`,
+          'x-cos-copy-source-if-match': '"source"',
+          'x-cos-metadata-directive': 'Replaced',
+          'x-cos-acl': 'private',
+          'x-cos-meta-sha256': sha256,
+          'x-cos-forbid-overwrite': 'true',
+          'x-cos-security-token': token,
+        },
+      });
+    } finally {
+      requestSpy.mockRestore();
+      server.closeAllConnections();
+      server.close();
+      await once(server, 'close');
+    }
+  },
+);
 
 it('aborts the SDK sender on oversized and cancelled image streams and forwards If-Match', async () => {
   const seen = Promise.withResolvers<string | undefined>();
@@ -408,9 +519,10 @@ it.each([
   }
 });
 
-it('streams generated videos with explicit private access and non-overwrite metadata', async () => {
+it('streams video staging with MD5, private access and non-overwrite metadata', async () => {
   const bytes = Buffer.from('generated video fixture');
   const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const md5 = createHash('md5').update(bytes).digest('base64');
   const received: Buffer[] = [];
   const put = vi.spyOn(COS.prototype, 'putObject').mockImplementation(async (parameters) => {
     for await (const part of parameters.Body as Readable) received.push(Buffer.from(part));
@@ -424,13 +536,14 @@ it('streams generated videos with explicit private access and non-overwrite meta
     secretKey: 'fixture',
   });
   try {
-    const key = 'mio/raw/video-fixture/attempt';
+    const key = 'mio/staging/video/job/0/attempt.media';
     expect(
       await storage.putVideo!(
         key,
         Readable.from(bytes),
         bytes.length,
         sha256,
+        md5,
         AbortSignal.timeout(5000),
       ),
     ).toEqual({
@@ -447,12 +560,12 @@ it('streams generated videos with explicit private access and non-overwrite meta
         ContentLength: bytes.length,
         ContentType: 'video/mp4',
         'x-cos-meta-sha256': sha256,
-        Headers: { 'x-cos-forbid-overwrite': 'true' },
+        Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': md5 },
       }),
     );
     expect(Buffer.concat(received)).toEqual(bytes);
     await expect(
-      storage.putVideo!(key, Readable.from(bytes), bytes.length, sha256, AbortSignal.abort()),
+      storage.putVideo!(key, Readable.from(bytes), bytes.length, sha256, md5, AbortSignal.abort()),
     ).rejects.toThrow();
     expect(put).toHaveBeenCalledTimes(1);
   } finally {

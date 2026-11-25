@@ -1,3 +1,4 @@
+import { epochMs } from '@mio/foundation/time';
 import type { AccountCredentialSnapshot, VideoRouteConfig } from '../../providers/contracts.ts';
 import type {
   VideoAssetReference,
@@ -47,6 +48,7 @@ export interface VideoExecution {
   id: string;
   owner_id: string;
   state: VideoJobState;
+  error_code: string | null;
   command: VideoJobCommand;
   admitted: Record<string, unknown>;
   route_snapshot: { route: VideoRouteConfig; modelId: string };
@@ -58,6 +60,13 @@ export interface VideoExecution {
   async_max_queries: number | null;
   async_deadline: Date | null;
   checkpoint: VideoCheckpoint | null;
+}
+
+export function hasVideoQueryBudget(row: VideoExecution): boolean {
+  return (
+    row.query_attempt < (row.async_max_queries ?? 0) &&
+    (row.async_deadline?.getTime() ?? 0) > epochMs()
+  );
 }
 
 export interface VideoMaterializedOutput {
@@ -82,10 +91,22 @@ export type VideoMaterializer = (
 
 export type VideoSubmitResult =
   { state: 'submitted'; upstreamTaskId: string } | { state: 'rejected' | 'unknown'; code: string };
+export const VIDEO_QUERY_RETRY_CODES = [
+  'VIDEO_QUERY_AUTH',
+  'VIDEO_QUERY_RATE_LIMITED',
+  'VIDEO_QUERY_UPSTREAM_UNAVAILABLE',
+  'VIDEO_QUERY_TIMEOUT',
+  'VIDEO_QUERY_NETWORK_ERROR',
+  'VIDEO_QUERY_RESPONSE_INVALID',
+  'VIDEO_QUERY_CREDENTIAL_UNAVAILABLE',
+] as const;
+
+export type VideoQueryRetryCode = (typeof VIDEO_QUERY_RETRY_CODES)[number];
 export type VideoQueryResult =
   | { state: 'processing' }
   | { state: 'returned'; videos: VideoResultSource[] }
-  | { state: 'unknown'; code: 'VIDEO_QUERY_IDENTITY_INVALID' }
+  | { state: 'unknown'; code: 'VIDEO_QUERY_IDENTITY_INVALID' | 'VIDEO_QUERY_STATUS_UNKNOWN' }
+  | { state: 'retry'; code: VideoQueryRetryCode }
   | { state: 'failed'; code: string };
 export interface VideoProtocol {
   submit(

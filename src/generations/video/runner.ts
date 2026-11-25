@@ -10,7 +10,7 @@ import type {
   VideoResultSource,
   VideoSubmissionReceipt,
 } from './execution.ts';
-import { isVideoUpstreamTaskId } from './execution.ts';
+import { hasVideoQueryBudget, isVideoUpstreamTaskId } from './execution.ts';
 import type { VideoSubmissionReceipts } from './submission-receipts.ts';
 
 const log = createLogger('app', 'video-runner');
@@ -172,44 +172,70 @@ export function createVideoRunner(
   };
 
   const query = async (claimed: VideoExecution) => {
-    const row = await store.beginQuery(claimed);
-    if (!row) {
-      await store.terminal(claimed, 'failed', 'VIDEO_QUERY_LIMIT');
+    const taskId = claimed.upstream_task_id;
+    if (taskId === null || !hasVideoQueryBudget(claimed)) {
+      await store.queryLimit(claimed);
       return;
     }
-    const providers = provider();
-    let key: string;
-    try {
-      if (!providers) throw new Error('VIDEO_CREDENTIAL_UNAVAILABLE');
-      key = await providers.resolveImageTaskCredential(row.owner_id);
-    } catch {
-      await store.processing(row);
-      return;
-    }
+    const key = await provider()
+      ?.resolveImageTaskCredential(claimed.owner_id)
+      .catch(() => undefined);
     if (stop.aborted) {
-      await store.release(row);
+      await store.release(claimed);
       return;
     }
-    const remaining = row.async_deadline!.getTime() - epochMs();
+    if (!key) {
+      await store.continueQuery(claimed, 'VIDEO_QUERY_CREDENTIAL_UNAVAILABLE');
+      return;
+    }
+    const row = hasVideoQueryBudget(claimed) ? await store.beginQuery(claimed) : undefined;
+    if (!row) {
+      await store.queryLimit(claimed);
+      return;
+    }
+    const deadline = row.async_deadline!.getTime();
+    const remaining = deadline - epochMs();
     if (remaining <= 0) {
-      await store.terminal(row, 'failed', 'VIDEO_QUERY_LIMIT');
+      await store.queryLimit(row);
       return;
     }
     const bounded = AbortSignal.any([stop, AbortSignal.timeout(Math.min(60_000, remaining))]);
     const route = row.route_snapshot;
-    const protocol = transports.protocol(route.route, route.modelId, transports.transport);
-    let result;
-    try {
-      result = await protocol.query(row.upstream_task_id!, key, bounded);
-    } catch {
-      if (stop.aborted) await store.release(row);
-      else await store.processing(row);
-      return;
-    }
-    if (result.state === 'returned') await returned(row, result.videos);
+    const dispatchBefore = row.next_query_at.getTime();
+    const dispatch: { state: 'pending' | 'sent' | 'deadline' | 'reservation' } = {
+      state: 'pending',
+    };
+    const protocol = transports.protocol(route.route, route.modelId, async (url, options) => {
+      // Timers and lease loss notifications can be delayed. Guard the actual send
+      // with both the absolute budget and the durable reservation's dispatch window.
+      const now = epochMs();
+      if (now >= deadline || now >= dispatchBefore) {
+        dispatch.state = now >= deadline ? 'deadline' : 'reservation';
+        throw new Error('VIDEO_QUERY_DISPATCH_EXPIRED');
+      }
+      bounded.throwIfAborted();
+      dispatch.state = 'sent';
+      return (transports.transport ?? fetch)(url, options);
+    });
+    const result = await protocol.query(taskId, key, bounded).catch((error: unknown) => {
+      if (!stop.aborted && dispatch.state !== 'deadline' && dispatch.state !== 'reservation')
+        throw error;
+      return undefined;
+    });
+    const settledAt = epochMs();
+    if (dispatch.state === 'deadline' || (dispatch.state !== 'sent' && settledAt >= deadline))
+      await store.queryLimit(row);
+    else if (
+      !result ||
+      dispatch.state === 'reservation' ||
+      (dispatch.state === 'pending' && settledAt >= dispatchBefore)
+    )
+      await store.release(row);
+    // An already classified reply may be the last permitted attempt even during shutdown.
+    else if (result.state === 'returned') await returned(row, result.videos);
     else if (result.state === 'unknown') await store.terminal(row, 'unknown', result.code);
-    else if (stop.aborted) await store.release(row);
-    else if (result.state === 'processing') await store.processing(row);
+    else if (result.state === 'processing' || result.state === 'retry')
+      await store.continueQuery(row, result.state === 'retry' ? result.code : null);
     else await store.terminal(row, 'failed', result.code);
   };
 

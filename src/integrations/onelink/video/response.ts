@@ -8,6 +8,7 @@ const identityInvalid: VideoQueryResult = {
   state: 'unknown',
   code: 'VIDEO_QUERY_IDENTITY_INVALID',
 };
+const statusUnknown: VideoQueryResult = { state: 'unknown', code: 'VIDEO_QUERY_STATUS_UNKNOWN' };
 const KLING_TASK_FIELDS = [
   'task_id',
   'task_status',
@@ -76,10 +77,11 @@ function kling(data: Record<string, unknown>, expectedId: string): VideoQueryRes
     return identityInvalid;
   if (!Number.isInteger(code)) return invalid;
   if (code !== 0) return failed;
-  if (['submitted', 'processing', 'running'].includes(String(task.task_status)))
-    return { state: 'processing' };
-  if (['failed', 'cancelled', 'canceled'].includes(String(task.task_status))) return failed;
-  if (task.task_status !== 'succeed') return invalid;
+  const status = task.task_status;
+  if (typeof status !== 'string' || !status.trim()) return invalid;
+  if (['submitted', 'processing', 'running'].includes(status)) return { state: 'processing' };
+  if (['failed', 'cancelled', 'canceled'].includes(status)) return failed;
+  if (status !== 'succeed') return statusUnknown;
   const videos = object(task.task_result).videos;
   return Array.isArray(videos) ? returned(videos.map((video) => object(video).url)) : invalid;
 }
@@ -101,11 +103,12 @@ function happyhorse(data: Record<string, unknown>, expectedId: string): VideoQue
   const task = output.task_status === undefined || output.task_status === null ? data : output;
   if (task.task_id !== expectedId || identityConflicts(expectedId, [output.task_id, data.task_id]))
     return identityInvalid;
-  const status = String(task.task_status).toUpperCase();
+  if (typeof task.task_status !== 'string' || !task.task_status.trim()) return invalid;
+  const status = task.task_status.toUpperCase();
   if (['PENDING', 'RUNNING', 'QUEUED', 'PROCESSING'].includes(status))
     return { state: 'processing' };
-  if (['FAILED', 'CANCELED', 'CANCELLED', 'UNKNOWN'].includes(status)) return failed;
-  if (status !== 'SUCCEEDED') return invalid;
+  if (['FAILED', 'CANCELED', 'CANCELLED'].includes(status)) return failed;
+  if (status !== 'SUCCEEDED') return statusUnknown;
   return returned([task.video_url]);
 }
 

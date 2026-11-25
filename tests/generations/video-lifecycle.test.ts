@@ -21,8 +21,10 @@ import type {
   VideoMaterializedOutput,
   VideoMaterializer,
   VideoProtocol,
+  VideoProtocolFactory,
   VideoSubmitResult,
 } from '../../src/generations/video/execution.ts';
+import { VIDEO_EXECUTOR_QUERY_INTERVAL_MS } from '../../src/generations/video/execution.ts';
 import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
 import { VIDEO_USER_QUOTA } from '../../src/generations/video/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
@@ -32,7 +34,32 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function fixture(reference?: 'frozen' | 'legacy') {
+const queryRoutes = {
+  ark: {
+    modelId: 'doubao-seedance-1.5-pro',
+    driver: 'volcengine-ark-videos',
+    vendor: 'volcengine',
+    submitPath: '/volc/api/v3/contents/generations/tasks',
+    queryPathTemplate: '/volc/api/v3/contents/generations/tasks/{task_id}',
+  },
+  kling: {
+    modelId: 'video-kling-v3',
+    driver: 'kling-videos',
+    vendor: 'kling',
+    submitPath: '/kling/v1/videos/text2video',
+    queryPathTemplate: '/kling/v1/videos/text2video/{task_id}',
+  },
+  happyhorse: {
+    modelId: 'happyhorse-1.0-t2v',
+    driver: 'happyhorse-videos',
+    vendor: 'happyhorse',
+    submitPath: '/happyhorse/v1/services/aigc/video-generation/video-synthesis',
+    queryPathTemplate: '/happyhorse/v1/tasks/{task_id}',
+  },
+} as const;
+
+async function fixture(reference?: 'frozen' | 'legacy', family: keyof typeof queryRoutes = 'ark') {
+  const { modelId, ...route } = queryRoutes[family];
   const database = await authDatabase();
   cleanups.push(database.close);
   const pool = new Pool({ connectionString: database.url });
@@ -77,7 +104,7 @@ async function fixture(reference?: 'frozen' | 'legacy') {
         credentialVersion: 1,
         catalogVersion: 1,
         adaptationVersion: 1,
-        driver: 'volcengine-ark-videos',
+        driver: route.driver,
       },
       {
         providerConfigId: randomUUID(),
@@ -85,12 +112,9 @@ async function fixture(reference?: 'frozen' | 'legacy') {
         credential: {},
       },
       {
-        modelId: 'doubao-seedance-1.5-pro',
+        modelId,
         route: {
-          driver: 'volcengine-ark-videos',
-          vendor: 'volcengine',
-          submitPath: '/volc/api/v3/contents/generations/tasks',
-          queryPathTemplate: '/volc/api/v3/contents/generations/tasks/{task_id}',
+          ...route,
           paramSpec: {
             supportedModes: ['text_to_video', 'first_frame'],
             parameters: {
@@ -168,10 +192,13 @@ async function fixture(reference?: 'frozen' | 'legacy') {
       { protocol: () => protocol, ...overrides },
       durable,
     );
+  const makeDue = () =>
+    pool.query(
+      "UPDATE mio_video_executions SET next_query_at=clock_timestamp()-interval '1 millisecond' WHERE job_id=$1",
+      [job.jobId],
+    );
   const next = async (target = execution) => {
-    await pool.query('UPDATE mio_video_executions SET next_query_at=now() WHERE job_id=$1', [
-      job.jobId,
-    ]);
+    await makeDue();
     const row = await target.claim();
     expect(row).toBeDefined();
     return row!;
@@ -185,6 +212,8 @@ async function fixture(reference?: 'frozen' | 'legacy') {
         [job.jobId],
       )
     ).rows[0];
+  const databaseNow = async () =>
+    (await pool.query<{ time: Date }>('SELECT clock_timestamp() AS time')).rows[0]!.time.getTime();
   const receiptPath = join(directory, 'video-submissions', job.jobId + '.json');
   const expectedReceipt = {
     version: 1 as const,
@@ -212,8 +241,10 @@ async function fixture(reference?: 'frozen' | 'legacy') {
     materialize,
     run: runner(),
     runner,
+    makeDue,
     next,
     durableState,
+    databaseNow,
   };
 }
 
@@ -304,27 +335,79 @@ describe('durable video execution', () => {
     expect(f.protocol.submit).not.toHaveBeenCalled();
   });
 
-  it('resumes the same upstream GET after a lost querying process and preserves its budget', async () => {
-    const f = await fixture();
-    await f.run(await f.next());
-    const queried = await f.execution.beginQuery(await f.next());
-    expect(queried?.query_attempt).toBe(1);
-    await f.execution.close();
-    await f.execution.startExecutor(() => {});
-    const resumed = await f.next();
-    expect(resumed.phase).toBe('waiting');
-    expect(resumed.upstream_task_id).toBe('safe-task');
-    expect(resumed.query_attempt).toBe(1);
-    await f.run(resumed);
-    expect((await f.store.get(f.actor.userId, f.job.jobId)).state).toBe('completed');
-    expect(f.protocol.submit).toHaveBeenCalledTimes(1);
-    const row = (
-      await f.pool.query('SELECT query_attempt FROM mio_video_executions WHERE job_id=$1', [
-        f.job.jobId,
-      ])
-    ).rows[0];
-    expect(row.query_attempt).toBe(2);
-  });
+  it.each(['reserved floor', 'legacy null floor', 'later floor'])(
+    'defers the same upstream GET after a lost querying process with %s and preserves its budget',
+    async (floor) => {
+      const f = await fixture();
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(Response.json({ id: 'safe-task' }))
+        .mockResolvedValueOnce(Response.json({ id: 'safe-task', status: 'running' }));
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      const submitted = await f.durableState();
+      const claimed = await f.next();
+      const reserving = await f.databaseNow();
+      expect(await f.execution.beginQuery(claimed)).toMatchObject({
+        phase: 'querying',
+        query_attempt: 1,
+        claim_id: claimed.claim_id,
+      });
+      const reserved = await f.durableState();
+      expect(reserved.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        reserving + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      let laterFloor: Date | undefined;
+      if (floor === 'legacy null floor')
+        await f.pool.query('UPDATE mio_video_executions SET next_query_at=NULL WHERE job_id=$1', [
+          f.job.jobId,
+        ]);
+      if (floor === 'later floor')
+        laterFloor = (
+          await f.pool.query<{ next_query_at: Date }>(
+            `UPDATE mio_video_executions SET next_query_at=clock_timestamp()+interval '20 seconds'
+             WHERE job_id=$1 RETURNING next_query_at`,
+            [f.job.jobId],
+          )
+        ).rows[0]!.next_query_at;
+      await f.execution.close();
+      const takingOver = await f.databaseNow();
+      await f.execution.startExecutor(() => {});
+      const waiting = await f.durableState();
+      expect(waiting).toMatchObject({
+        phase: 'waiting',
+        claim_id: null,
+        upstream_task_id: 'safe-task',
+        query_attempt: 1,
+        async_deadline: submitted.async_deadline,
+        async_max_queries: submitted.async_max_queries,
+      });
+      expect(waiting.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        takingOver + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      if (floor === 'reserved floor')
+        expect(waiting.next_query_at.getTime()).toBeGreaterThanOrEqual(
+          reserved.next_query_at.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+        );
+      if (laterFloor)
+        expect(waiting.next_query_at.getTime()).toBe(
+          laterFloor.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+        );
+      expect(await f.execution.claim()).toBeUndefined();
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST']);
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({ state: 'processing', query_attempt: 2 });
+      expect(
+        transport.mock.calls.map(([url, options]) => [
+          new URL(String(url)).pathname,
+          options?.method,
+        ]),
+      ).toEqual([
+        [queryRoutes.ark.submitPath, 'POST'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET'],
+      ]);
+    },
+  );
 
   it('does not issue a GET after the persisted deadline or count is exhausted', async () => {
     const f = await fixture();
@@ -848,3 +931,670 @@ it.each([undefined, 'other-task'])(
     ]);
   },
 );
+
+function arkQueryTransport() {
+  return vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ id: 'safe-task' }));
+}
+
+describe('durable video query outcomes', () => {
+  it.each([
+    {
+      family: 'kling',
+      response: { code: 0, data: { task_id: 'safe-task', task_status: 'new_supplier_status' } },
+      expectedState: 'unknown',
+      expectedCode: 'VIDEO_QUERY_STATUS_UNKNOWN',
+    },
+    {
+      family: 'happyhorse',
+      response: { output: { task_id: 'safe-task', task_status: 'UNKNOWN' } },
+      expectedState: 'unknown',
+      expectedCode: 'VIDEO_QUERY_STATUS_UNKNOWN',
+    },
+    {
+      family: 'happyhorse',
+      response: { output: { task_id: 'safe-task', task_status: 'FAILED' } },
+      expectedState: 'failed',
+      expectedCode: 'VIDEO_UPSTREAM_FAILED',
+    },
+  ] as const)(
+    'persists $expectedState / $expectedCode for $family without assets or extra POST',
+    async ({ family, response, expectedState, expectedCode }) => {
+      const f = await fixture(undefined, family);
+      const route = queryRoutes[family];
+      const submission =
+        family === 'kling'
+          ? { code: 0, data: { task_id: 'safe-task' } }
+          : { output: { task_id: 'safe-task' } };
+      const upstreamTaskId =
+        family === 'kling'
+          ? JSON.stringify({ path: route.submitPath, id: 'safe-task' })
+          : 'safe-task';
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(Response.json(submission))
+        .mockResolvedValueOnce(Response.json(response));
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      const submitted = await f.durableState();
+      expect(submitted).toMatchObject({ state: 'submitted', upstream_task_id: upstreamTaskId });
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({
+        state: expectedState,
+        error_code: expectedCode,
+        phase: 'done',
+        upstream_task_id: upstreamTaskId,
+        async_deadline: submitted.async_deadline,
+        async_max_queries: submitted.async_max_queries,
+        query_attempt: 1,
+        checkpoint: null,
+      });
+      expect(await f.store.get(f.actor.userId, f.job.jobId)).toMatchObject({
+        state: expectedState,
+        error: { code: expectedCode },
+        outputs: [],
+      });
+      expect(f.materialize).not.toHaveBeenCalled();
+      expect((await f.pool.query('SELECT count(*) FROM mio_assets')).rows[0].count).toBe('0');
+      expect(await f.execution.claim()).toBeUndefined();
+      expect(
+        transport.mock.calls.map(([url, options]) => [
+          new URL(String(url)).pathname,
+          options?.method,
+        ]),
+      ).toEqual([
+        [route.submitPath, 'POST'],
+        [route.queryPathTemplate.replace('{task_id}', 'safe-task'), 'GET'],
+      ]);
+    },
+  );
+
+  it.each([401, 403])(
+    'polls the same ID with the rotated owner Key after HTTP %s',
+    async (status) => {
+      const f = await fixture();
+      const transport = arkQueryTransport()
+        .mockResolvedValueOnce(new Response('private supplier detail', { status }))
+        .mockResolvedValueOnce(Response.json({ id: 'safe-task', status: 'running' }))
+        .mockResolvedValueOnce(
+          Response.json({
+            id: 'safe-task',
+            status: 'succeeded',
+            content: { video_url: 'https://media.fixture/video.mp4' },
+          }),
+        );
+      f.provider.resolveImageTaskCredential
+        .mockResolvedValueOnce('old-owner-key')
+        .mockResolvedValue('rotated-owner-key');
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      const submitted = await f.durableState();
+      const polling = await f.databaseNow();
+      await run(await f.next());
+      const blocked = await f.durableState();
+      expect(blocked).toMatchObject({
+        state: 'submitted',
+        error_code: 'VIDEO_QUERY_AUTH',
+        phase: 'waiting',
+        upstream_task_id: 'safe-task',
+        query_attempt: 1,
+        async_deadline: submitted.async_deadline,
+        async_max_queries: submitted.async_max_queries,
+        completed_at: null,
+      });
+      expect(blocked.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        polling + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      expect(await f.store.get(f.actor.userId, f.job.jobId)).toMatchObject({
+        state: 'submitted',
+        error: { code: 'VIDEO_QUERY_AUTH' },
+        outputs: [],
+      });
+      expect(await f.execution.claim()).toBeUndefined();
+      const another = () =>
+        f.create({ request: { ...f.request, requestId: randomUUID() }, inputSnapshot: [] });
+      for (let slot = 1; slot < VIDEO_USER_QUOTA; slot++) await another();
+      await expect(another()).rejects.toMatchObject({ code: 'VIDEO_QUOTA_EXCEEDED' });
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({
+        state: 'processing',
+        error_code: null,
+        query_attempt: 2,
+      });
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({
+        state: 'completed',
+        error_code: null,
+        query_attempt: 3,
+        upstream_task_id: 'safe-task',
+      });
+      expect(f.provider.resolveImageTaskCredential.mock.calls).toEqual([
+        [f.actor.userId],
+        [f.actor.userId],
+        [f.actor.userId],
+      ]);
+      expect(f.provider.openImageSnapshot).toHaveBeenCalledTimes(1);
+      expect(
+        transport.mock.calls.map(([url, options]) => [
+          new URL(String(url)).pathname,
+          options?.method,
+          new Headers(options?.headers).get('Authorization'),
+        ]),
+      ).toEqual([
+        [queryRoutes.ark.submitPath, 'POST', 'Bearer frozen-test-key'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET', 'Bearer old-owner-key'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET', 'Bearer rotated-owner-key'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET', 'Bearer rotated-owner-key'],
+      ]);
+    },
+  );
+
+  it('records only outbound GET attempts across limited, unavailable, network, timeout and malformed responses', async () => {
+    const f = await fixture();
+    const transport = arkQueryTransport()
+      .mockResolvedValueOnce(new Response('private supplier detail', { status: 429 }))
+      .mockResolvedValueOnce(new Response('private supplier detail', { status: 502 }))
+      .mockRejectedValueOnce(new TypeError('private transport detail'))
+      .mockResolvedValueOnce(new Response('private supplier detail', { status: 408 }))
+      .mockResolvedValueOnce(new Response('private malformed payload'));
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    await f.pool.query('UPDATE mio_video_executions SET async_max_queries=5 WHERE job_id=$1', [
+      f.job.jobId,
+    ]);
+    const states = [
+      { state: 'submitted', code: 'VIDEO_QUERY_RATE_LIMITED' },
+      { state: 'submitted', code: 'VIDEO_QUERY_UPSTREAM_UNAVAILABLE' },
+      { state: 'submitted', code: 'VIDEO_QUERY_NETWORK_ERROR' },
+      { state: 'submitted', code: 'VIDEO_QUERY_TIMEOUT' },
+      { state: 'unknown', code: 'VIDEO_QUERY_RESPONSE_INVALID' },
+    ];
+    for (const [index, { state, code }] of states.entries()) {
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({
+        state,
+        error_code: code,
+        upstream_task_id: 'safe-task',
+        query_attempt: index + 1,
+      });
+    }
+    expect(await f.execution.claim()).toBeUndefined();
+    expect(f.materialize).not.toHaveBeenCalled();
+    expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual([
+      'POST',
+      'GET',
+      'GET',
+      'GET',
+      'GET',
+      'GET',
+    ]);
+  });
+
+  it('does not spend a GET while no owner credential is available and resumes with the repaired Key', async () => {
+    const f = await fixture();
+    f.provider.resolveImageTaskCredential
+      .mockRejectedValueOnce(new Error('private credential detail'))
+      .mockResolvedValueOnce('repaired-owner-key');
+    const transport = arkQueryTransport().mockResolvedValueOnce(
+      Response.json({ id: 'safe-task', status: 'running' }),
+    );
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    const submitted = await f.durableState();
+    const lookupStarted = await f.databaseNow();
+    await run(await f.next());
+    const blocked = await f.durableState();
+    expect(blocked).toMatchObject({
+      state: 'submitted',
+      error_code: 'VIDEO_QUERY_CREDENTIAL_UNAVAILABLE',
+      upstream_task_id: 'safe-task',
+      query_attempt: 0,
+      async_deadline: submitted.async_deadline,
+      async_max_queries: submitted.async_max_queries,
+    });
+    expect(blocked.next_query_at.getTime()).toBeGreaterThanOrEqual(
+      lookupStarted + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+    );
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(await f.execution.claim()).toBeUndefined();
+    await run(await f.next());
+    expect(await f.durableState()).toMatchObject({
+      state: 'processing',
+      error_code: null,
+      query_attempt: 1,
+    });
+    expect(transport).toHaveBeenCalledTimes(2);
+    const [url, options] = transport.mock.calls[1]!;
+    expect(new URL(String(url)).pathname).toBe(queryRoutes.ark.submitPath + '/safe-task');
+    expect(options?.method).toBe('GET');
+    expect(new Headers(options?.headers).get('Authorization')).toBe('Bearer repaired-owner-key');
+  });
+
+  it.each(['deadline', 'attempt count'] as const)(
+    'retains the last durable retry reason and never dispatches after restart with exhausted %s',
+    async (cutoff) => {
+      const f = await fixture();
+      const transport = arkQueryTransport().mockResolvedValueOnce(
+        new Response('private supplier detail', { status: 429 }),
+      );
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      await f.pool.query('UPDATE mio_video_executions SET async_max_queries=2 WHERE job_id=$1', [
+        f.job.jobId,
+      ]);
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({
+        state: 'submitted',
+        error_code: 'VIDEO_QUERY_RATE_LIMITED',
+        query_attempt: 1,
+      });
+      if (cutoff === 'attempt count') {
+        // A killed process may have used the second GET before persisting its response.
+        expect(await f.execution.beginQuery(await f.next())).toMatchObject({
+          phase: 'querying',
+          query_attempt: 2,
+        });
+      } else {
+        await f.pool.query(
+          "UPDATE mio_video_executions SET async_deadline=clock_timestamp()-interval '1 millisecond' WHERE job_id=$1",
+          [f.job.jobId],
+        );
+      }
+      const beforeRestart = await f.durableState();
+      await f.execution.close();
+      await f.execution.startExecutor(() => {});
+      const restored = await f.durableState();
+      expect(restored.next_query_at.getTime()).toBeGreaterThan(await f.databaseNow());
+      // A future transport schedule does not defer terminal accounting when budget is gone.
+      const claimed = await f.execution.claim();
+      expect(claimed).toBeDefined();
+      await run(claimed!);
+      expect(await f.durableState()).toMatchObject({
+        state: 'unknown',
+        error_code: 'VIDEO_QUERY_RATE_LIMITED',
+        phase: 'done',
+        upstream_task_id: 'safe-task',
+        query_attempt: beforeRestart.query_attempt,
+        async_deadline: beforeRestart.async_deadline,
+        async_max_queries: beforeRestart.async_max_queries,
+      });
+      expect(await f.execution.claim()).toBeUndefined();
+      expect(f.provider.resolveImageTaskCredential).toHaveBeenCalledTimes(1);
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+    },
+  );
+});
+
+describe('video query dispatch and shutdown', () => {
+  it.each(['key lookup', 'query reservation', 'protocol creation'] as const)(
+    'dispatches zero new GETs when the deadline passes during %s',
+    async (boundary) => {
+      const f = await fixture();
+      const transport = arkQueryTransport().mockResolvedValueOnce(
+        new Response(null, { status: 401 }),
+      );
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      await run(await f.next());
+      const blocked = await f.durableState();
+      const deadline = blocked.async_deadline.getTime();
+      const claimed = await f.next();
+      const wall = vi.spyOn(Date, 'now');
+      const keyRead = Promise.withResolvers<string>();
+      const readingKey = Promise.withResolvers<void>();
+      if (boundary === 'key lookup')
+        f.provider.resolveImageTaskCredential.mockImplementationOnce(() => {
+          readingKey.resolve();
+          return keyRead.promise;
+        });
+      const reserve = f.execution.beginQuery.bind(f.execution);
+      const reservation = vi.spyOn(f.execution, 'beginQuery');
+      if (boundary === 'query reservation')
+        reservation.mockImplementationOnce(async (row) => {
+          const reserved = await reserve(row);
+          wall.mockReturnValue(deadline);
+          return reserved;
+        });
+      const protocol = vi.fn<VideoProtocolFactory>(createVideoProtocol);
+      if (boundary === 'protocol creation')
+        protocol.mockImplementationOnce((route, model, guardedTransport) => {
+          const created = createVideoProtocol(route, model, guardedTransport);
+          wall.mockReturnValue(deadline);
+          return created;
+        });
+      const pending = f.runner({ protocol, transport })(claimed);
+      try {
+        if (boundary === 'key lookup') {
+          await readingKey.promise;
+          expect(reservation).not.toHaveBeenCalled();
+          wall.mockReturnValue(deadline);
+          keyRead.resolve('current-test-key');
+        }
+        await pending;
+      } finally {
+        wall.mockRestore();
+        reservation.mockRestore();
+        keyRead.resolve('current-test-key');
+        await pending;
+      }
+      expect(protocol).toHaveBeenCalledTimes(boundary === 'protocol creation' ? 1 : 0);
+      expect(await f.durableState()).toMatchObject({
+        state: 'unknown',
+        error_code: 'VIDEO_QUERY_AUTH',
+        phase: 'done',
+        upstream_task_id: 'safe-task',
+        query_attempt: boundary === 'key lookup' ? 1 : 2,
+        async_deadline: blocked.async_deadline,
+        async_max_queries: blocked.async_max_queries,
+      });
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+      expect(await f.execution.claim()).toBeUndefined();
+    },
+  );
+
+  it('bounds an in-flight GET by the remaining time and records a timeout when that budget expires', async () => {
+    const f = await fixture();
+    const entered = Promise.withResolvers<AbortSignal>();
+    const transport = arkQueryTransport().mockImplementationOnce(async (_url, options) => {
+      const signal = options!.signal!;
+      entered.resolve(signal);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    const { rows } = await f.pool.query<{ async_deadline: Date }>(
+      `UPDATE mio_video_executions SET async_deadline=clock_timestamp()+interval '4 seconds'
+       WHERE job_id=$1 RETURNING async_deadline`,
+      [f.job.jobId],
+    );
+    const deadline = rows[0]!.async_deadline;
+    const claimed = await f.next();
+    const deadlineAbort = new AbortController();
+    const timeoutError = new DOMException('fixture budget elapsed', 'TimeoutError');
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadlineAbort.signal);
+    const wall = vi.spyOn(Date, 'now').mockReturnValue(deadline.getTime() - 800);
+    const pending = run(claimed);
+    try {
+      const signal = await entered.promise;
+      expect(timeout).toHaveBeenCalledWith(800);
+      expect(signal.aborted).toBe(false);
+      wall.mockReturnValue(deadline.getTime());
+      deadlineAbort.abort(timeoutError);
+      await pending;
+      expect(signal.reason).toBe(timeoutError);
+    } finally {
+      deadlineAbort.abort(timeoutError);
+      timeout.mockRestore();
+      wall.mockRestore();
+      await pending;
+    }
+    expect(await f.durableState()).toMatchObject({
+      state: 'unknown',
+      error_code: 'VIDEO_QUERY_TIMEOUT',
+      phase: 'done',
+      upstream_task_id: 'safe-task',
+      query_attempt: 1,
+      async_deadline: deadline,
+    });
+    expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+  });
+
+  it.each([
+    { caseName: 'late dispatch before the cutoff after takeover', takeOver: true, send: true },
+    { caseName: 'dispatch at the cutoff after takeover', takeOver: true, send: false },
+    { caseName: 'dispatch at the cutoff with the original claim', takeOver: false, send: false },
+  ])('enforces the durable query window for $caseName', async ({ takeOver, send }) => {
+    const f = await fixture();
+    const transport = arkQueryTransport().mockResolvedValueOnce(
+      new Response(null, { status: 401 }),
+    );
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    await run(await f.next());
+    const beforeWindow = await f.durableState();
+    const claimed = await f.next();
+
+    // Hold the old runner after its PostgreSQL reservation. Closing the lock session
+    // without aborting that runner models a delayed lease loss notification.
+    const reserved = Promise.withResolvers<Date>();
+    const resume = Promise.withResolvers<void>();
+    const begin = f.execution.beginQuery.bind(f.execution);
+    const gate = vi.spyOn(f.execution, 'beginQuery').mockImplementationOnce(async (row) => {
+      const attempt = await begin(row);
+      reserved.resolve(attempt!.next_query_at);
+      await resume.promise;
+      return attempt;
+    });
+    const sent: number[] = [];
+    if (send) {
+      transport.mockImplementationOnce(async () => {
+        sent.push(Date.now());
+        return Response.json({
+          id: 'safe-task',
+          status: 'succeeded',
+          content: { video_url: 'https://media.fixture/stale-result.mp4' },
+        });
+      });
+    }
+    const wall = vi.spyOn(Date, 'now');
+    const pending = run(claimed);
+    let floor: Date | undefined;
+    let beforeRelease: number | undefined;
+    try {
+      const cutoff = await reserved.promise;
+      if (takeOver) {
+        await f.execution.close();
+        await f.execution.startExecutor(() => {});
+        floor = (await f.durableState()).next_query_at as Date;
+        expect(floor.getTime()).toBeGreaterThanOrEqual(
+          cutoff.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+        );
+        expect(await f.execution.claim()).toBeUndefined();
+      } else beforeRelease = await f.databaseNow();
+      wall.mockReturnValue(cutoff.getTime() - (send ? 1 : 0));
+      resume.resolve();
+      await pending;
+    } finally {
+      wall.mockRestore();
+      gate.mockRestore();
+      resume.resolve();
+      await pending;
+    }
+
+    const scheduled = await f.durableState();
+    expect(scheduled).toMatchObject({
+      state: 'submitted',
+      error_code: 'VIDEO_QUERY_AUTH',
+      phase: 'waiting',
+      claim_id: null,
+      upstream_task_id: 'safe-task',
+      query_attempt: 2,
+      async_deadline: beforeWindow.async_deadline,
+      async_max_queries: beforeWindow.async_max_queries,
+      checkpoint: null,
+    });
+    if (floor) expect(scheduled.next_query_at).toEqual(floor);
+    if (beforeRelease !== undefined)
+      expect(scheduled.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        beforeRelease + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+    expect(sent).toHaveLength(send ? 1 : 0);
+    if (send)
+      expect(scheduled.next_query_at.getTime() - sent[0]!).toBeGreaterThanOrEqual(
+        VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+    expect(await f.execution.claim()).toBeUndefined();
+    expect(f.materialize).not.toHaveBeenCalled();
+    expect(transport).toHaveBeenCalledTimes(send ? 3 : 2);
+
+    // Advance only the persisted due time to exercise the next attempt without a sleep.
+    transport.mockResolvedValueOnce(Response.json({ id: 'safe-task', status: 'running' }));
+    await run(await f.next());
+    expect(await f.durableState()).toMatchObject({
+      state: 'processing',
+      error_code: null,
+      query_attempt: 3,
+    });
+    expect(
+      transport.mock.calls.map(([url, options]) => [
+        options?.method,
+        new URL(String(url)).pathname,
+      ]),
+    ).toEqual([
+      ['POST', queryRoutes.ark.submitPath],
+      ...Array.from({ length: send ? 3 : 2 }, () => [
+        'GET',
+        queryRoutes.ark.submitPath + '/safe-task',
+      ]),
+    ]);
+  });
+
+  it('preserves the rate limit from the last GET when shutdown precedes settling it', async () => {
+    const f = await fixture();
+    const transport = arkQueryTransport().mockResolvedValueOnce(
+      new Response(null, { status: 429 }),
+    );
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    await f.pool.query('UPDATE mio_video_executions SET async_max_queries=1 WHERE job_id=$1', [
+      f.job.jobId,
+    ]);
+    await f.execution.close();
+    await f.makeDue();
+    const classified = Promise.withResolvers<AbortSignal>();
+    const settle = Promise.withResolvers<void>();
+    const protocol: VideoProtocolFactory = (route, modelId, guardedTransport) => {
+      const upstream = createVideoProtocol(route, modelId, guardedTransport);
+      return {
+        ...upstream,
+        async query(id, key, signal) {
+          const result = await upstream.query(id, key, signal);
+          classified.resolve(signal);
+          await settle.promise;
+          return result;
+        },
+      };
+    };
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol, transport },
+      f.directory,
+    );
+    cleanups.push(() => executor.close());
+    try {
+      const signal = await classified.promise;
+      expect(await f.durableState()).toMatchObject({
+        state: 'submitted',
+        error_code: null,
+        phase: 'querying',
+        query_attempt: 1,
+      });
+      const closing = executor.close();
+      expect(signal.aborted).toBe(true);
+      settle.resolve();
+      await closing;
+    } finally {
+      settle.resolve();
+      await executor.close();
+    }
+
+    await f.execution.startExecutor(() => {});
+    expect(await f.execution.claim()).toBeUndefined();
+    expect(await f.durableState()).toMatchObject({
+      state: 'unknown',
+      error_code: 'VIDEO_QUERY_RATE_LIMITED',
+      phase: 'done',
+      upstream_task_id: 'safe-task',
+      query_attempt: 1,
+    });
+    expect(f.materialize).not.toHaveBeenCalled();
+    expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
+  });
+
+  it.each(['orderly shutdown', 'failed query settlement'] as const)(
+    'persists the next query floor across %s while a GET was reserved',
+    async (interruption) => {
+      const f = await fixture();
+      const entered = Promise.withResolvers<number>();
+      const transport = arkQueryTransport().mockImplementationOnce(async (_url, options) => {
+        const time = await f.databaseNow();
+        if (interruption === 'orderly shutdown') {
+          const signal = options!.signal!;
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            entered.resolve(time);
+          });
+        }
+        entered.resolve(time);
+        return Response.json({ id: 'safe-task', status: 'running' });
+      });
+      const run = f.runner({ protocol: createVideoProtocol, transport });
+      await run(await f.next());
+      const submitted = await f.durableState();
+      if (interruption === 'failed query settlement')
+        await f.pool.query(`
+          CREATE FUNCTION decline_fixture_processing() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW.state = 'processing' THEN RAISE EXCEPTION 'fixture cannot settle query'; END IF;
+            RETURN NEW;
+          END $$;
+          CREATE TRIGGER decline_fixture_processing BEFORE UPDATE ON mio_video_jobs
+            FOR EACH ROW EXECUTE FUNCTION decline_fixture_processing();
+        `);
+      await f.execution.close();
+      await f.makeDue();
+      const executor = await createVideoExecutor(
+        f.store,
+        () => f.provider,
+        f.materialize,
+        { protocol: createVideoProtocol, transport },
+        f.directory,
+      );
+      cleanups.push(() => executor.close());
+      const sentAt = await entered.promise;
+      if (interruption === 'failed query settlement')
+        await vi.waitFor(async () =>
+          expect(await f.durableState()).toMatchObject({
+            phase: 'waiting',
+            claim_id: null,
+            query_attempt: 1,
+          }),
+        );
+      await executor.close();
+      const released = await f.durableState();
+      expect(released).toMatchObject({
+        state: 'submitted',
+        phase: 'waiting',
+        claim_id: null,
+        query_attempt: 1,
+        upstream_task_id: 'safe-task',
+        async_deadline: submitted.async_deadline,
+        async_max_queries: submitted.async_max_queries,
+      });
+      expect(released.next_query_at.getTime()).toBeGreaterThanOrEqual(
+        sentAt + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+      );
+      await f.execution.startExecutor(() => {});
+      expect((await f.durableState()).next_query_at).toEqual(released.next_query_at);
+      expect(await f.execution.claim()).toBeUndefined();
+      if (interruption === 'failed query settlement')
+        await f.pool.query('DROP TRIGGER decline_fixture_processing ON mio_video_jobs');
+      transport.mockResolvedValueOnce(Response.json({ id: 'safe-task', status: 'running' }));
+      await run(await f.next());
+      expect(await f.durableState()).toMatchObject({ state: 'processing', query_attempt: 2 });
+      expect(
+        transport.mock.calls.map(([url, options]) => [
+          new URL(String(url)).pathname,
+          options?.method,
+        ]),
+      ).toEqual([
+        [queryRoutes.ark.submitPath, 'POST'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET'],
+        [queryRoutes.ark.submitPath + '/safe-task', 'GET'],
+      ]);
+    },
+  );
+});

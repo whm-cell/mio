@@ -102,7 +102,7 @@ export function createVideoProtocol(
             : { state: 'unknown', code: 'VIDEO_SUBMISSION_UNKNOWN' };
         }
         const data = await readJson(response);
-        const id = submissionTask(validated.driver, data);
+        const id = data && submissionTask(validated.driver, data);
         if (!id) return { state: 'unknown', code: 'VIDEO_SUBMISSION_UNKNOWN' };
         const upstreamTaskId =
           validated.driver === 'kling-videos' ? JSON.stringify({ path: submission.path, id }) : id;
@@ -123,14 +123,24 @@ export function createVideoProtocol(
           headers: { Authorization: 'Bearer ' + key },
         });
         if (!response.ok) {
-          await response.body?.cancel();
-          if (response.status >= 500 || response.status === 429 || response.status === 408)
-            return { state: 'processing' };
-          return { state: 'failed', code: rejection(response.status) };
+          void response.body?.cancel().catch(() => {});
+          const { status } = response;
+          if (status === 401 || status === 403) return { state: 'retry', code: 'VIDEO_QUERY_AUTH' };
+          if (status === 429) return { state: 'retry', code: 'VIDEO_QUERY_RATE_LIMITED' };
+          if (status === 408) return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' };
+          if (status >= 500) return { state: 'retry', code: 'VIDEO_QUERY_UPSTREAM_UNAVAILABLE' };
+          return { state: 'failed', code: rejection(status) };
         }
-        return videoQueryResult(validated.driver, await readJson(response), target.expectedId);
+        const data = await readJson(response);
+        return data
+          ? videoQueryResult(validated.driver, data, target.expectedId)
+          : { state: 'retry', code: 'VIDEO_QUERY_RESPONSE_INVALID' };
       } catch {
-        return { state: 'processing' };
+        const reason: unknown = signal.reason;
+        if (reason instanceof DOMException && reason.name === 'TimeoutError')
+          return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' };
+        signal.throwIfAborted();
+        return { state: 'retry', code: 'VIDEO_QUERY_NETWORK_ERROR' };
       }
     },
   };

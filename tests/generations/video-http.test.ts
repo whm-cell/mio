@@ -27,6 +27,7 @@ import type {
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
+import { ProviderError } from '../../src/providers/contracts.ts';
 import type { VideoRouteConfig } from '../../src/providers/contracts.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
 import { authDatabase } from '../support/auth-database.ts';
@@ -294,9 +295,15 @@ async function assetHttpFixture() {
     receipts,
   );
   const service = createVideoGenerationService(store, () => provider, { wake }, inputs.inspect);
+  const otherActor = { userId: randomUUID(), sessionId: 'video-http-other' };
   const handler = createVideoGenerationHandler(
     service,
-    async (headers) => (headers.get('cookie') === 'session=fixture' ? actor : null),
+    async (headers) => {
+      const session = headers.get('cookie');
+      if (session === 'session=fixture') return actor;
+      if (session === 'session=other') return otherActor;
+      return null;
+    },
     [origin],
   );
   const server = createServer(handler);
@@ -314,6 +321,13 @@ async function assetHttpFixture() {
     expectedCapabilitiesVersion: capabilitiesVersion,
     parameters: { mode: 'full', prompt: 'ordered references', references },
   });
+  const postRequest = (body: VideoCreateRequest, session = 'fixture', signal?: AbortSignal) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { origin, 'content-type': 'application/json', cookie: `session=${session}` },
+      body: JSON.stringify(body),
+      signal: signal ?? null,
+    });
   return {
     pool,
     store,
@@ -322,6 +336,7 @@ async function assetHttpFixture() {
     server,
     applicationName: database.applicationName,
     request,
+    postRequest,
     videoCapabilities,
     snapshotVideo,
     heads,
@@ -359,12 +374,7 @@ async function assetHttpFixture() {
       return { assetId, key, head };
     },
     post(references: VideoAssetReference[], id?: string, signal?: AbortSignal) {
-      return fetch(endpoint, {
-        method: 'POST',
-        headers: { origin, 'content-type': 'application/json', cookie: 'session=fixture' },
-        body: JSON.stringify(request(references, id)),
-        signal: signal ?? null,
-      });
+      return postRequest(request(references, id), 'fixture', signal);
     },
     get(id: string) {
       return fetch(`${endpoint}/${id}`, { headers: { cookie: 'session=fixture' } });
@@ -623,6 +633,207 @@ describe('video admission cancellation', () => {
       expect(await f.store.get(actor.userId, durable!.jobId)).toMatchObject({ state: 'submitted' });
     } finally {
       resume.resolve();
+      await f.close();
+    }
+  });
+});
+
+describe('video admission replay', () => {
+  it.each([
+    ['changed capabilities lookup', 'VIDEO_CAPABILITIES_STALE'],
+    ['changed submission snapshot', 'VIDEO_CAPABILITIES_STALE'],
+    ['disabled submission route', 'MODEL_ROUTE_DISABLED'],
+  ] as const)(
+    'compares concurrent submissions to the committed winner after a %s',
+    async (stage, code) => {
+      const f = await assetHttpFixture();
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const pending: Promise<Response>[] = [];
+      let waiting = 0;
+      const pause = async () => {
+        if (++waiting === 3) entered.resolve();
+        await resume.promise;
+      };
+      const capabilities = f.videoCapabilities.getMockImplementation()!;
+      const snapshot = f.snapshotVideo.getMockImplementation()!;
+      try {
+        if (stage === 'changed capabilities lookup') {
+          f.videoCapabilities.mockImplementation(async () => {
+            await pause();
+            return { ...(await capabilities()), capabilitiesVersion: 'changed-capabilities' };
+          });
+        } else {
+          f.snapshotVideo.mockImplementation(async () => {
+            await pause();
+            if (stage === 'disabled submission route') throw new ProviderError(409, code);
+            return { ...(await snapshot()), capabilitiesVersion: 'changed-capabilities' };
+          });
+        }
+        const asset = await f.addAsset();
+        const request = f.request([{ assetId: asset.assetId }]);
+        const changed = {
+          ...request,
+          parameters: { ...request.parameters, prompt: 'different input' },
+        };
+        const replay = f.postRequest(request);
+        const conflict = f.postRequest(changed);
+        const otherOwner = f.postRequest(request, 'other');
+        pending.push(replay, conflict, otherOwner);
+        await Promise.race([
+          entered.promise,
+          ...pending.map((post) =>
+            post.then(() => {
+              throw new Error('video replied before reaching the provider barrier');
+            }),
+          ),
+        ]);
+        if (stage === 'changed capabilities lookup')
+          f.videoCapabilities.mockImplementationOnce(capabilities);
+        else f.snapshotVideo.mockImplementationOnce(snapshot);
+
+        const accepted = await f.postRequest(request);
+        expect(accepted.status).toBe(202);
+        const job = await accepted.json();
+        expect(f.upstream).not.toHaveBeenCalled();
+        // The worker sees the original route before the pending preflights observe the change.
+        if (stage !== 'changed capabilities lookup')
+          f.snapshotVideo.mockImplementationOnce(snapshot);
+        await f.runNext();
+        resume.resolve();
+        const repeated = await replay;
+        expect(repeated.status).toBe(200);
+        expect(await repeated.json()).toMatchObject({ id: job.id });
+        const rejected = await conflict;
+        expect(rejected.status).toBe(409);
+        expect(await rejected.json()).toMatchObject({ error: { code: 'REQUEST_CONFLICT' } });
+        const fresh = f.postRequest({ ...request, requestId: randomUUID() });
+        pending.push(fresh);
+        for (const response of await Promise.all([otherOwner, fresh])) {
+          expect(response.status).toBe(409);
+          expect(await response.json()).toMatchObject({ error: { code } });
+        }
+        const hash = createHash('sha256').update(JSON.stringify(request), 'utf8').digest('hex');
+        expect(
+          (await f.pool.query('SELECT id,owner_id,request_id,input_hash FROM mio_video_jobs')).rows,
+        ).toEqual([
+          { id: job.id, owner_id: actor.userId, request_id: request.requestId, input_hash: hash },
+        ]);
+        expect((await f.pool.query('SELECT job_id FROM mio_video_executions')).rows).toEqual([
+          { job_id: job.id },
+        ]);
+        expect(f.wake).toHaveBeenCalledTimes(1);
+        expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST']);
+        expect(await (await f.get(job.id)).json()).toMatchObject({ state: 'submitted' });
+      } finally {
+        resume.resolve();
+        await Promise.allSettled(pending);
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['tool cancellation', 'PostgreSQL failure'] as const)(
+    'preserves %s even if a concurrent request commits',
+    async (failure) => {
+      const f = await assetHttpFixture();
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const controller = new AbortController();
+      let pending: ReturnType<typeof f.service.create> | undefined;
+      try {
+        f.snapshotVideo.mockImplementationOnce(async () => {
+          entered.resolve();
+          await resume.promise;
+          if (failure === 'PostgreSQL failure') await f.pool.query('SELECT 1 / 0');
+          throw new ProviderError(409, 'MODEL_ROUTE_DISABLED');
+        });
+        const asset = await f.addAsset();
+        const request = f.request([{ assetId: asset.assetId }]);
+        pending = f.service.create(actor, request, controller.signal);
+        await Promise.race([
+          entered.promise,
+          pending.then(() => {
+            throw new Error('video admitted before reaching the provider barrier');
+          }),
+        ]);
+        const accepted = await f.postRequest(request);
+        expect(accepted.status).toBe(202);
+        await accepted.json();
+        if (failure === 'tool cancellation') controller.abort();
+        resume.resolve();
+        if (failure === 'tool cancellation')
+          await expect(pending).rejects.toBe(controller.signal.reason);
+        else await expect(pending).rejects.toMatchObject({ code: '22012' });
+        expect(f.wake).toHaveBeenCalledTimes(1);
+      } finally {
+        resume.resolve();
+        await Promise.allSettled([pending]);
+        await f.close();
+      }
+    },
+  );
+
+  it('preserves tool cancellation during the detail read for a concurrent replay', async () => {
+    const f = await assetHttpFixture();
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    let pending: ReturnType<typeof f.service.create> | undefined;
+    try {
+      f.snapshotVideo.mockImplementationOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        throw new ProviderError(409, 'MODEL_ROUTE_DISABLED');
+      });
+      const asset = await f.addAsset();
+      const request = f.request([{ assetId: asset.assetId }]);
+      pending = f.service.create(actor, request, controller.signal);
+      await Promise.race([
+        entered.promise,
+        pending.then(() => {
+          throw new Error('video admitted before reaching the provider barrier');
+        }),
+      ]);
+      const accepted = await f.postRequest(request);
+      expect(accepted.status).toBe(202);
+      const { id } = await accepted.json();
+
+      const gate = await f.pool.connect();
+      try {
+        await gate.query('BEGIN');
+        // The request lookup can finish while the job detail SELECT waits for its outputs.
+        await gate.query('LOCK TABLE mio_video_outputs IN ACCESS EXCLUSIVE MODE');
+        resume.resolve();
+        await vi.waitFor(
+          async () => {
+            const { rows } = await f.pool.query<{ query: string }>(
+              `SELECT a.query FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+               WHERE a.application_name=$1 AND l.relation='mio_video_outputs'::regclass AND NOT l.granted`,
+              [f.applicationName],
+            );
+            expect(rows).toHaveLength(1);
+            expect(rows[0]?.query).toContain('WHERE j.owner_id=$1 AND j.id=$2');
+          },
+          { timeout: 4000 },
+        );
+        controller.abort();
+      } finally {
+        await gate.query('ROLLBACK');
+        gate.release();
+      }
+      await expect(pending).rejects.toBe(controller.signal.reason);
+      expect((await f.pool.query('SELECT id FROM mio_video_jobs')).rows).toEqual([{ id }]);
+      expect((await f.pool.query('SELECT job_id FROM mio_video_executions')).rows).toEqual([
+        { job_id: id },
+      ]);
+      expect(f.wake).toHaveBeenCalledTimes(1);
+      expect(f.upstream).not.toHaveBeenCalled();
+      await f.runNext();
+      expect(f.upstream.mock.calls.map(([, options]) => options?.method)).toEqual(['POST']);
+    } finally {
+      resume.resolve();
+      await Promise.allSettled([pending]);
       await f.close();
     }
   });

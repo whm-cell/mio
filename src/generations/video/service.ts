@@ -1,6 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { isUuidV4 } from '@mio/foundation/identifiers';
-import type { ProviderPrincipal } from '../../providers/contracts.ts';
+import { ProviderError } from '../../providers/contracts.ts';
+import type { ProviderPrincipal, VideoAdmissionSnapshot } from '../../providers/contracts.ts';
 import type { ProviderService } from '../../providers/service.ts';
 import type { VideoGenerationStore } from './store.ts';
 import { GenerationError } from '../errors.ts';
@@ -132,30 +133,50 @@ export function createVideoGenerationService(
         const signal = turnSignal ? AbortSignal.any([turnSignal, stop.signal]) : undefined;
         signal?.throwIfAborted();
         const hash = videoRequestHash(request);
-        const previous = await store.byRequest(actor.userId, request.requestId);
-        signal?.throwIfAborted();
-        if (previous) {
+        const replay = async () => {
+          const previous = await store.byRequest(actor.userId, request.requestId);
+          signal?.throwIfAborted();
+          if (!previous) return;
           if (previous.inputHash !== hash)
             throw new GenerationError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
-          return { created: false, job: await store.get(actor.userId, previous.jobId) };
+          const job = await store.get(actor.userId, previous.jobId);
+          signal?.throwIfAborted();
+          return { created: false, job };
+        };
+        const previous = await replay();
+        if (previous) return previous;
+
+        let snapshot: VideoAdmissionSnapshot;
+        try {
+          signal?.throwIfAborted();
+          const current = provider();
+          if (!current)
+            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          const capability = await current.videoCapabilities(actor, request.modelRef);
+          signal?.throwIfAborted();
+          if (capability.capabilitiesVersion !== request.expectedCapabilitiesVersion)
+            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
+          if (!capability.available)
+            throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+          if (
+            !capability.modes.some(
+              (mode) => mode.mode === request.parameters.mode && mode.supported,
+            )
+          )
+            throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_MODE_UNSUPPORTED');
+          snapshot = await current.snapshotVideo(actor, request.modelRef);
+          signal?.throwIfAborted();
+          if (snapshot.capabilitiesVersion !== request.expectedCapabilitiesVersion)
+            throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
+        } catch (error) {
+          signal?.throwIfAborted();
+          // A concurrent admission may commit before the fresh provider preflight fails.
+          if (error instanceof ProviderError || error instanceof GenerationError) {
+            const concurrent = await replay();
+            if (concurrent) return concurrent;
+          }
+          throw error;
         }
-        const current = provider();
-        if (!current)
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-        const capability = await current.videoCapabilities(actor, request.modelRef);
-        signal?.throwIfAborted();
-        if (capability.capabilitiesVersion !== request.expectedCapabilitiesVersion)
-          throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
-        if (!capability.available)
-          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
-        if (
-          !capability.modes.some((mode) => mode.mode === request.parameters.mode && mode.supported)
-        )
-          throw new GenerationError(HTTP_STATUS.BAD_REQUEST, 'VIDEO_MODE_UNSUPPORTED');
-        const snapshot = await current.snapshotVideo(actor, request.modelRef);
-        signal?.throwIfAborted();
-        if (snapshot.capabilitiesVersion !== request.expectedCapabilitiesVersion)
-          throw new GenerationError(HTTP_STATUS.CONFLICT, 'VIDEO_CAPABILITIES_STALE');
         if (!executor)
           throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
         if (!validateVideoParameters(request.parameters, snapshot.route))

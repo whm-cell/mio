@@ -1,25 +1,28 @@
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
-import { epochMs } from '@mio/foundation/time';
 import { GenerationError } from '../errors.ts';
 import { transaction } from '../transaction.ts';
 import type { VideoJobState } from './contracts.ts';
 import type {
   VideoExecution,
   VideoMaterializedOutput,
+  VideoQueryRetryCode,
   VideoResultSource,
   VideoSubmissionDisposition,
   VideoSubmissionReceipt,
 } from './execution.ts';
 import {
+  hasVideoQueryBudget,
   VIDEO_EXECUTOR_MAX_AGE_SECONDS,
   VIDEO_EXECUTOR_MAX_QUERIES,
   VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+  VIDEO_QUERY_RETRY_CODES,
   VIDEO_QUOTA_LOCK,
 } from './execution.ts';
 
 const EXECUTOR_LOCK = 672049927;
-const selection = `SELECT j.id,j.owner_id,j.state,j.command,j.admitted,j.route_snapshot,
+const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
+const selection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
   e.phase,e.claim_id,e.snapshot,e.upstream_task_id,e.query_attempt,e.async_max_queries,
   e.async_deadline,e.checkpoint FROM mio_video_jobs j
   JOIN mio_video_executions e ON e.job_id=j.id`;
@@ -47,9 +50,17 @@ export class VideoExecutionStore {
       this.executorFailure = onLost;
       client.on('error', onLost);
       this.executor = client;
-      await client.query(`UPDATE mio_video_executions SET claim_id=NULL,
-        phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END,updated_at=now()
-        WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`);
+      // A previous executor may not have seen the lost lease yet. Let its dispatch
+      // window end before applying the interval. Legacy rows have no such window.
+      await client.query(
+        `UPDATE mio_video_executions SET claim_id=NULL,
+        phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END,
+        next_query_at=CASE WHEN phase='querying'
+          THEN GREATEST(next_query_at,clock_timestamp())+$1*interval '1 millisecond'
+          ELSE next_query_at END,updated_at=now()
+        WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`,
+        [VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
+      );
     } catch (error) {
       client.release(true);
       this.executor = undefined;
@@ -78,7 +89,9 @@ export class VideoExecutionStore {
          WHERE job_id=(SELECT e.job_id FROM mio_video_executions e
            JOIN mio_video_jobs j ON j.id=e.job_id
            WHERE e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
-           AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp())
+           AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp()
+             OR (e.phase='waiting' AND (e.async_deadline<=statement_timestamp()
+               OR e.query_attempt>=e.async_max_queries)))
            ORDER BY j.created_at LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
          RETURNING job_id`,
         [createId()],
@@ -114,9 +127,11 @@ export class VideoExecutionStore {
     await this.pool.query(
       `UPDATE mio_video_executions SET claim_id=NULL,
       phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END,
-      next_query_at=statement_timestamp()+interval '1 second',updated_at=now()
+      next_query_at=GREATEST(next_query_at,CASE WHEN phase='querying'
+        THEN clock_timestamp()+$3*interval '1 millisecond'
+        ELSE statement_timestamp()+interval '1 second' END),updated_at=now()
       WHERE job_id=$1 AND claim_id=$2`,
-      [row.id, row.claim_id],
+      [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
     );
   }
 
@@ -220,41 +235,45 @@ export class VideoExecutionStore {
     });
   }
 
-  async beginQuery(row: VideoExecution): Promise<VideoExecution | undefined> {
-    const changed = await this.pool.query(
-      `UPDATE mio_video_executions SET phase='querying',
-      query_attempt=query_attempt+1,next_query_at=NULL,updated_at=now()
+  async beginQuery(row: VideoExecution) {
+    const { rows } = await this.pool.query<
+      Pick<VideoExecution, 'phase' | 'query_attempt' | 'async_max_queries' | 'async_deadline'> & {
+        next_query_at: Date;
+      }
+    >(
+      `UPDATE mio_video_executions SET phase='querying',query_attempt=query_attempt+1,
+      next_query_at=GREATEST(next_query_at,clock_timestamp()+$3*interval '1 millisecond'),updated_at=now()
       WHERE job_id=$1 AND claim_id=$2 AND phase='waiting' AND upstream_task_id IS NOT NULL
-      AND query_attempt<async_max_queries AND async_deadline>statement_timestamp()
-      RETURNING job_id`,
-      [row.id, row.claim_id],
+      AND query_attempt<async_max_queries AND async_deadline>clock_timestamp()
+      RETURNING phase,query_attempt,async_max_queries,async_deadline,next_query_at`,
+      [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
     );
-    if (!changed.rowCount) return undefined;
-    return (await this.pool.query<VideoExecution>(selection + ' WHERE j.id=$1', [row.id])).rows[0];
+    return rows[0] ? { ...row, ...rows[0] } : undefined;
   }
 
-  async processing(row: VideoExecution): Promise<void> {
-    if (
-      !row.async_max_queries ||
-      row.query_attempt >= row.async_max_queries ||
-      !row.async_deadline ||
-      row.async_deadline.getTime() <= epochMs()
-    ) {
-      await this.terminal(row, 'failed', 'VIDEO_QUERY_LIMIT');
+  async queryLimit(row: VideoExecution): Promise<void> {
+    if (row.error_code && queryRetryCodes.has(row.error_code))
+      await this.terminal(row, 'unknown', row.error_code);
+    else await this.terminal(row, 'failed', 'VIDEO_QUERY_LIMIT');
+  }
+
+  async continueQuery(row: VideoExecution, code: VideoQueryRetryCode | null): Promise<void> {
+    if (!hasVideoQueryBudget(row)) {
+      await this.terminal(row, code ? 'unknown' : 'failed', code ?? 'VIDEO_QUERY_LIMIT');
       return;
     }
     await transaction(this.pool, async (client) => {
       const changed = await client.query(
-        `UPDATE mio_video_executions SET phase='waiting',
-        claim_id=NULL,next_query_at=statement_timestamp()+$3*interval '1 millisecond',updated_at=now()
+        `UPDATE mio_video_executions SET phase='waiting',claim_id=NULL,
+        next_query_at=GREATEST(next_query_at,clock_timestamp()+$3*interval '1 millisecond'),updated_at=now()
         WHERE job_id=$1 AND claim_id=$2 RETURNING job_id`,
         [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
       );
       if (changed.rowCount)
         await client.query(
           `UPDATE mio_video_jobs
-        SET state='processing',error_code=NULL,updated_at=now() WHERE id=$1`,
-          [row.id],
+           SET state=$2,error_code=$3,updated_at=now() WHERE id=$1`,
+          [row.id, code ? 'submitted' : 'processing', code],
         );
     });
   }

@@ -39,7 +39,9 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 成员支持点号、静态字符串下标及 `globalThis` 的相同入口，支持常见 TS 表达式包装。判断依据是实际值引用与 Node import binding；不会只因第三方对象名叫 Date、performance 或 crypto 就阻断。局部／参数／导入／解构／catch／for／block 遮蔽及 var 提升由 ESLint 作用域解析；函数体 var 不遮蔽参数默认表达式中的系统全局引用。library、contract、测试与开发脚本不启用此规则。规则不读取 foundation 导出以决定是否启用，最小 guard fixture 无须伪造库能力；`tests/harness/foundation-lint.test.ts` 独立核对真实仓库的公开入口和值导出，避免 API 改名静默失效。
 
-这是一组明确静态形式的防回退检查，不追踪任意变量／解构别名、函数传递、重导出包装、动态属性、反射及自定义对象语义。不推断 HTTP 数值用途：`HTTP_STATUS`、`sha256Utf8` 和 `ApplicationError` 均由既有 `quality-review` 的 reuse 维度审阅，包括 `fail`／`writeApiError` 和改写参数的错误构造器。此处移除旧 HTTP 静态断言是方案 A 的政策收窄，不是 HTTP 复用通过的证据。不禁止 `createHash`、HMAC/RSA/AES、二进制／流式摘要、MD5 或服务端时间，不强制所有 Error 继承 ApplicationError。
+这是一组明确静态形式的防回退检查，不追踪任意变量／解构别名、函数传递、重导出包装、动态属性、反射及自定义对象语义。不推断 HTTP 数值用途：`HTTP_STATUS`、`sha256Utf8`、`sha256Bytes` 和 `ApplicationError` 均由既有 `quality-review` 的 reuse 维度审阅，包括 `fail`／`writeApiError` 和改写参数的错误构造器。此处移除旧 HTTP 静态断言是方案 A 的政策收窄，不是 HTTP 复用通过的证据。不禁止 `createHash`、HMAC/RSA/AES、二进制／流式摘要、MD5 或服务端时间，不强制所有 Error 继承 ApplicationError。
+
+`@mio/foundation/hash` 的 `sha256Utf8` 计算 UTF-8 文本摘要，`sha256Bytes` 直接读取 `Uint8Array` 的当前视图，两者均输出小写十六进制。持久请求的序列化在所属业务维护；视频请求继续沿现有 JSON 字节，媒体请求沿其排序与数组规则。流式原件在同一遍读取中更新增量摘要。
 
 聚焦测试通过实际 ESLint 有效配置的 `lintText` 和 CLI stdin 验证正负例、作用域及角色；`tests/harness/guardrail-projects.test.ts` 保留真实 guard CLI 的项目／公开入口和最小桩兼容测试。既有 CI harness 路径及全量 `pnpm check` 均含 lint 与这些测试，静态命中不证明任意复用或业务行为正确。
 

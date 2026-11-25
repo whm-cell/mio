@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Bytes } from '@mio/foundation/hash';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import {
   MEDIA_MAX_MANIFEST_BYTES,
@@ -10,7 +10,6 @@ import type { MediaManifest, MediaObject } from '@mio/compute-contracts';
 import type { AssetObjectStore } from '../assets/contracts.ts';
 import type { MediaJobRow } from './media-model.ts';
 import { MediaError } from './media-model.ts';
-import { mediaHead } from './media-objects.ts';
 
 export async function verifyMediaManifest(
   objects: AssetObjectStore,
@@ -23,15 +22,13 @@ export async function verifyMediaManifest(
     !object.key.startsWith(mediaObjectPrefix(job.id, job.attempt_id))
   )
     throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
-  const meta = await mediaHead(objects, object.key, signal);
+  const meta = await objects.head(object.key, signal);
+  signal.throwIfAborted();
   if (meta.size !== object.sizeBytes || meta.etag !== object.etag || meta.sha256 !== object.sha256)
     throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
   const bytes = await objects.readMedia!(object.key, object.etag, object.sizeBytes, signal);
   signal.throwIfAborted();
-  if (
-    bytes.length !== object.sizeBytes ||
-    createHash('sha256').update(bytes).digest('hex') !== object.sha256
-  )
+  if (bytes.length !== object.sizeBytes || sha256Bytes(bytes) !== object.sha256)
     throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
   let manifest: MediaManifest;
   try {
@@ -52,7 +49,8 @@ export async function verifyMediaManifest(
     signal.throwIfAborted();
     if (file.key === object.key || !file.key.startsWith(mediaObjectPrefix(job.id, job.attempt_id)))
       throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
-    const head = await mediaHead(objects, file.key, signal);
+    const head = await objects.head(file.key, signal);
+    signal.throwIfAborted();
     if (head.size !== file.sizeBytes || head.etag !== file.etag || head.sha256 !== file.sha256)
       throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_FILE_MISMATCH');
   }

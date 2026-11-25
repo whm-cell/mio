@@ -1,5 +1,4 @@
-import { createHash } from 'node:crypto';
-import { sha256Utf8 } from '@mio/foundation/hash';
+import { sha256Bytes, sha256Utf8 } from '@mio/foundation/hash';
 import { isDeepStrictEqual } from 'node:util';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { AUDIO_INSPECTION_LIMITS } from '@mio/compute-contracts';
@@ -142,10 +141,7 @@ export async function readCloneSample(
         throw new AudioError(409, 'AUDIO_SAMPLE_CHANGED');
       throw error;
     });
-  if (
-    bytes.byteLength !== sample.sizeBytes ||
-    createHash('sha256').update(bytes).digest('hex') !== info.sha256
-  )
+  if (bytes.byteLength !== sample.sizeBytes || sha256Bytes(bytes) !== info.sha256)
     throw new AudioError(409, 'AUDIO_SAMPLE_CHANGED');
   // Legacy copies can lack SHA-256 metadata. Full inspection and the
   // conditional byte read above prove their contents before narrowing the ACL.

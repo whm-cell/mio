@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Bytes } from '@mio/foundation/hash';
 import { MEDIA_MAX_FILES, mediaObjectPrefix } from '@mio/compute-contracts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { AssetError } from '../assets/contracts.ts';
@@ -60,8 +60,7 @@ async function readPlaylist(
     throw error;
   }
   signal.throwIfAborted();
-  if (bytes.byteLength !== size || createHash('sha256').update(bytes).digest('hex') !== file.sha256)
-    invalid();
+  if (bytes.byteLength !== size || sha256Bytes(bytes) !== file.sha256) invalid();
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);

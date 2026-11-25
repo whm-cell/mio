@@ -69,6 +69,7 @@ export function createVideoRunner(
     const bounded = AbortSignal.any([stop, AbortSignal.timeout(180_000)]);
     try {
       const outputs = await materialize(row, row.checkpoint.videos, bounded);
+      bounded.throwIfAborted();
       if (await store.complete(row, outputs)) await verify(row);
     } catch {
       // The persisted URL checkpoint survives restarts; the store limits attempts to three.
@@ -115,6 +116,7 @@ export function createVideoRunner(
         throw new Error('VIDEO_ADMISSION_CHANGED');
       key = providers.openImageSnapshot(row.owner_id, row.snapshot);
       refs = transports.references ? await transports.references(row, bounded) : {};
+      bounded.throwIfAborted();
       if (row.command.inputSnapshot.some((input) => !refs[input.assetId]))
         throw new Error('VIDEO_INPUT_UNAVAILABLE');
     } catch {

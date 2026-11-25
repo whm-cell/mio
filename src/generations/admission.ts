@@ -218,6 +218,7 @@ async function inputAsset(
   id: string,
   asset: ImageInputAsset | undefined,
   mask = false,
+  signal?: AbortSignal,
 ): Promise<ImageAssetRef> {
   if (
     !asset ||
@@ -233,7 +234,8 @@ async function inputAsset(
     throw new GenerationError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
   let object: Awaited<ReturnType<AssetObjectStore['head']>>;
   try {
-    object = await head(asset.raw_key);
+    object = await head(asset.raw_key, signal);
+    signal?.throwIfAborted();
   } catch {
     throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
   }
@@ -325,9 +327,13 @@ export function createGenerationAdmission(
       const maskId = parameters.maskAssetId;
       const assetIds = maskId === undefined || ids.includes(maskId) ? ids : [...ids, maskId];
       const assets = await store.imageInputs(actor.userId, assetIds);
-      const images = await Promise.all(ids.map((id) => inputAsset(head, id, assets.get(id))));
+      const images = await Promise.all(
+        ids.map((id) => inputAsset(head, id, assets.get(id), false, tool?.signal)),
+      );
       const mask =
-        maskId === undefined ? undefined : await inputAsset(head, maskId, assets.get(maskId), true);
+        maskId === undefined
+          ? undefined
+          : await inputAsset(head, maskId, assets.get(maskId), true, tool?.signal);
       const {
         imageAssetId,
         imageAssetIds: _imageAssetIds,

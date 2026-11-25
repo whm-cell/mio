@@ -1006,8 +1006,8 @@ it('retains a committed output while a recovered second output fails HEAD', asyn
         ),
       { timeout: 6000 },
     );
-    expect(f.objects.head).toHaveBeenCalledWith(first.key);
-    expect(f.objects.head).toHaveBeenCalledWith(second.key);
+    expect(f.objects.head).toHaveBeenCalledWith(first.key, expect.any(AbortSignal));
+    expect(f.objects.head).toHaveBeenCalledWith(second.key, expect.any(AbortSignal));
     expect((await f.service.getImage(f.actor, job.jobId)).outputs).toEqual(partial.outputs);
     expect(
       (

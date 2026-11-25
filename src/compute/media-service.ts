@@ -13,7 +13,6 @@ import { MediaError, mediaRequestHash } from './media-model.ts';
 import type { MediaJobViewRow } from './media-model.ts';
 import type { MediaStore } from './media-store.ts';
 import { mediaDispatch } from './media-dispatch.ts';
-import { mediaHead } from './media-objects.ts';
 import { verifyMediaManifest } from './media-manifest.ts';
 import { mediaHls } from './media-hls.ts';
 
@@ -120,7 +119,11 @@ export function createMediaService(
         for (const id of ids) {
           const asset = byId.get(id)!;
           const size = Number(asset.size_bytes);
-          const head = await mediaHead(objects, asset.raw_key, signal);
+          const head = await objects.head(asset.raw_key, signal).catch(() => {
+            signal.throwIfAborted();
+            throw new MediaError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_STORAGE_UNAVAILABLE');
+          });
+          signal.throwIfAborted();
           if (head.size !== size || size < 1 || size > MAX_ASSET_BYTES)
             throw new MediaError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
           if (

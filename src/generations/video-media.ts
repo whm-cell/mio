@@ -158,8 +158,9 @@ export function createVideoMaterializer(
   probe: VideoProbe,
   download: typeof withPublicHttps = withPublicHttps,
 ): VideoMaterializer {
-  const existingObject = (key: string) =>
-    objects.head(key).catch((error: unknown) => {
+  const existingObject = (key: string, signal: AbortSignal) =>
+    objects.head(key, signal).catch((error: unknown) => {
+      signal.throwIfAborted();
       if ((error as { statusCode?: number } | null)?.statusCode === 404) return;
       throw error;
     });
@@ -197,7 +198,8 @@ export function createVideoMaterializer(
       }
       const key = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
       if (!saved.media) {
-        let object = await existingObject(key);
+        let object = await existingObject(key, signal);
+        signal.throwIfAborted();
         let uploadedEtag: string | undefined;
         if (!object) {
           contentMd5 ??= (await downloadVideo(video.url, file, signal, download, saved)).contentMd5;
@@ -218,7 +220,7 @@ export function createVideoMaterializer(
             stream.destroy();
             await handle.close();
           }
-          object = await objects.head(key);
+          object = await objects.head(key, signal);
         }
         verifyVideoObject(object, saved, uploadedEtag);
         signal.throwIfAborted();
@@ -251,7 +253,7 @@ export function createVideoMaterializer(
       )
         throw new Error('VIDEO_MEDIA_INVALID');
       const rawKey = `mio/raw/${saved.assetId}/${saved.attemptId}`;
-      let rawObject = await existingObject(rawKey);
+      let rawObject = await existingObject(rawKey, signal);
       signal.throwIfAborted();
       if (!rawObject) {
         if (saved.rawEtag || !saved.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
@@ -264,7 +266,7 @@ export function createVideoMaterializer(
         if (!copied?.etag) throw new Error('VIDEO_OBJECT_MISMATCH');
         saved.rawEtag = copied.etag;
         await save(receipt, saved);
-        rawObject = await objects.head(rawKey);
+        rawObject = await objects.head(rawKey, signal);
       }
       verifyVideoObject(rawObject, saved, saved.rawEtag);
       signal.throwIfAborted();
@@ -300,17 +302,19 @@ export function createVideoCleanup(objects: AssetObjectStore, dataDirectory: str
       const receipt = join(directory, String(index) + '.json');
       const saved = await readReceipt(receipt, row.id, index);
       if (!saved) continue;
-      const raw = await objects.head(`mio/raw/${saved.assetId}/${saved.attemptId}`);
+      const raw = await objects.head(`mio/raw/${saved.assetId}/${saved.attemptId}`, signal);
+      signal.throwIfAborted();
       verifyVideoObject(raw, saved, saved.rawEtag);
       const staging = `mio/staging/video/${row.id}/${index}/${saved.attemptId}.media`;
       try {
-        const value = await objects.head(staging);
+        const value = await objects.head(staging, signal);
         verifyVideoObject(value, saved, saved.etag);
         signal.throwIfAborted();
         await objects.delete(staging);
       } catch (error) {
         if ((error as { statusCode?: number }).statusCode !== 404) throw error;
       }
+      signal.throwIfAborted();
       try {
         await unlink(join(directory, String(index) + '.media'));
       } catch (error) {

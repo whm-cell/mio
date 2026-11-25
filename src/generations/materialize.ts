@@ -57,7 +57,7 @@ export async function cleanCompletedGeneration(
       imageOutputIndex(row.id, output.key, output.contentType) !== image.index ||
       output.sizeBytes !== image.sizeBytes ||
       output.sha256 !== image.sha256 ||
-      !matches(await head(output.key), image, output.etag)
+      !matches(await head(output.key, signal), image, output.etag)
     )
       return;
   }
@@ -82,10 +82,12 @@ async function findAttempt(
   objects: GenerationObjects,
   checkpoint: ImageCheckpoint,
   image: SavedImage,
+  signal: AbortSignal,
 ): Promise<GeneratedObject | undefined> {
   for (const key of checkpoint.attemptedKeys[image.index] ?? []) {
     try {
-      const head = await objects.head(key);
+      const head = await objects.head(key, signal);
+      signal.throwIfAborted();
       if (!head) continue;
       if (!matches(head, image)) throw new Error('IMAGE_OUTPUT_MISMATCH');
       return {
@@ -96,6 +98,7 @@ async function findAttempt(
         contentType: 'image/' + image.format,
       };
     } catch (error) {
+      signal.throwIfAborted();
       if ((error as { statusCode?: number }).statusCode !== 404) throw error;
     }
   }
@@ -112,14 +115,16 @@ async function materializeImage(
 ): Promise<GeneratedObject> {
   const saved = checkpoint.outputs[image.index];
   if (saved) {
-    if (!matches(await objects.head(saved.key), image, saved.etag))
+    if (!matches(await objects.head(saved.key, signal), image, saved.etag))
       throw new Error('IMAGE_OUTPUT_MISMATCH');
+    signal.throwIfAborted();
     return saved;
   }
   const bytes = await files.read(checkpoint.jobId, image);
   await decode(bytes, image.format);
   signal.throwIfAborted();
-  const existing = await findAttempt(objects, checkpoint, image);
+  const existing = await findAttempt(objects, checkpoint, image, signal);
+  signal.throwIfAborted();
   if (existing) return existing;
   if (!objects.putImage) throw new Error('IMAGE_STORAGE_UNAVAILABLE');
   const key = imageOutputKey(checkpoint.jobId, image.index, createId(), image.format);
@@ -132,9 +137,10 @@ async function materializeImage(
     uploaded.sizeBytes !== image.sizeBytes ||
     uploaded.sha256 !== image.sha256 ||
     uploaded.contentType !== 'image/' + image.format ||
-    !matches(await objects.head(key), image, uploaded.etag)
+    !matches(await objects.head(key, signal), image, uploaded.etag)
   )
     throw new Error('IMAGE_OUTPUT_MISMATCH');
+  signal.throwIfAborted();
   return uploaded;
 }
 

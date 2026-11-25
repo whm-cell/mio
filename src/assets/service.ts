@@ -1,7 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
-import { createHash } from 'node:crypto';
+import { sha256Bytes, sha256Utf8 } from '@mio/foundation/hash';
 import { HLS_PLAYLIST_CONTENT_TYPE } from '../compute/media-hls.ts';
 import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
 import {
@@ -153,7 +153,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         /[\x00-\x1f\x7f]/.test(head.etag)
       )
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-      const etagDigest = createHash('sha256').update(head.etag).digest('hex');
+      const etagDigest = sha256Utf8(head.etag);
       if (expected && expected.etagDigest !== etagDigest)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
       data = await waitObject(
@@ -163,7 +163,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       combined.throwIfAborted();
       if (data.byteLength !== size)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-      const sourceDigest = createHash('sha256').update(data).digest('hex');
+      const sourceDigest = sha256Bytes(data);
       if (expected && expected.sourceDigest !== sourceDigest)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
       const current = await store.owned(id, ownerId);

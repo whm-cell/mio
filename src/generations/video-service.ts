@@ -94,11 +94,12 @@ export function createVideoGenerationService(
   executor?: { wake(): void },
   inspectInputs?: ReturnType<typeof createVideoInputResolver>['inspect'],
 ) {
-  let stopping = false;
   let closing: Promise<void> | undefined;
+  const stop = new AbortController();
   const active = new Set<Promise<unknown>>();
   const admit = <T>(run: () => Promise<T>): Promise<T> => {
-    if (stopping) throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
+    if (stop.signal.aborted)
+      throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
     const action = run();
     active.add(action);
     void action.then(
@@ -176,7 +177,7 @@ export function createVideoGenerationService(
             command.inputObjects = await inspectInputs(
               actor.userId,
               command.inputSnapshot,
-              AbortSignal.timeout(30_000),
+              AbortSignal.any([stop.signal, AbortSignal.timeout(30_000)]),
             );
           } catch (error) {
             if (error instanceof GenerationError) throw error;
@@ -207,6 +208,8 @@ export function createVideoGenerationService(
           credentialVersion: snapshotRecord.credentialVersion,
           credential,
         };
+        if (stop.signal.aborted)
+          throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
         const stored = await store.create(
           actor.userId,
           request,
@@ -216,7 +219,7 @@ export function createVideoGenerationService(
           executionSnapshot,
           routeSnapshot(snapshotRecord),
         );
-        if (stored.created) executor.wake();
+        if (stored.created && !stop.signal.aborted) executor.wake();
         return { created: stored.created, job: await store.get(actor.userId, stored.jobId) };
       });
     },
@@ -232,7 +235,7 @@ export function createVideoGenerationService(
         if (!executor)
           throw new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE');
         await store.recover(actor.userId, jobId);
-        executor.wake();
+        if (!stop.signal.aborted) executor.wake();
         return store.get(actor.userId, jobId);
       });
     },
@@ -244,11 +247,12 @@ export function createVideoGenerationService(
       });
     },
     close() {
-      stopping = true;
-      if (!closing)
+      if (!closing) {
+        stop.abort();
         closing = (async () => {
           await Promise.allSettled([...active]);
         })();
+      }
       return closing;
     },
   };

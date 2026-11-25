@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { GenerationError } from './errors.ts';
@@ -431,7 +431,7 @@ export function decodeVideoCreateRequest(value: Record<string, unknown>): VideoC
   };
 }
 
-/** Input order and repeated positions are intentional parts of the request identity. */
+/** Keep the serialized bytes used before the first persisted video request. */
 export function videoRequestHash(request: VideoCreateRequest): string {
-  return createHash('sha256').update(JSON.stringify(request)).digest('hex');
+  return sha256Utf8(JSON.stringify(request));
 }

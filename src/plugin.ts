@@ -295,14 +295,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     let providers: ProviderService | undefined;
     let compute: ReturnType<typeof createComputeService> | undefined;
-    if (computeConfig && assetConfig) {
+    if (computeConfig && assetConfig && assetResources) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
       try {
         const acquired =
           (compute =
           ownedCompute =
-            createComputeService(store, createCosStorage(assetConfig), computeConfig));
+            createComputeService(store, assetResources.objects, computeConfig));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
           () => () =>
@@ -587,7 +587,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ownedGenerations =
             await createGenerationService(
               store,
-              createCosStorage(assetConfig),
+              assetResources.objects,
               generationConfig,
               () => providers,
             ));

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sha256Bytes } from '@mio/foundation/hash';
 import COS from 'cos-nodejs-sdk-v5';
 import { PassThrough, Readable } from 'node:stream';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
@@ -108,8 +109,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
   ) => {
     signal.throwIfAborted();
     const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    if (createHash('sha256').update(body).digest('hex') !== sha256)
-      throw new Error(label + '_OUTPUT_INVALID');
+    if (sha256Bytes(body) !== sha256) throw new Error(label + '_OUTPUT_INVALID');
     const uploaded = await cos.putObject({
       Bucket,
       Region,
@@ -135,8 +135,26 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       contentType,
     };
   };
-  const head: AssetObjectStore['head'] = async (Key) => {
-    const object = await cos.headObject({ Bucket, Region, Key });
+  const head: AssetObjectStore['head'] = async (Key, signal) => {
+    const read = () => cos.headObject({ Bucket, Region, Key });
+    let object: COS.HeadObjectResult;
+    if (signal) {
+      signal.throwIfAborted();
+      const aborted = Promise.withResolvers<never>();
+      const abort = () => aborted.reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        // HEAD has no SDK cancel handle. A late response is observed only by this race.
+        const pending = Promise.resolve().then(() => {
+          signal.throwIfAborted();
+          return read();
+        });
+        object = await Promise.race([pending, aborted.promise]);
+        signal.throwIfAborted();
+      } finally {
+        signal.removeEventListener('abort', abort);
+      }
+    } else object = await read();
     const size = Number(object.headers?.['content-length']);
     if (!Number.isSafeInteger(size) || size < 0 || !object.ETag)
       throw new Error('COS_INVALID_HEAD');
@@ -213,7 +231,8 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     },
     async ensureAudioPrivate(Key, expected, signal) {
       signal.throwIfAborted();
-      const current = await head(Key);
+      const current = await head(Key, signal);
+      signal.throwIfAborted();
       if (
         current.size !== expected.sizeBytes ||
         current.etag !== expected.etag ||

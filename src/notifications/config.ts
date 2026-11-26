@@ -1,4 +1,4 @@
-export interface NotificationsConfig {
+interface NotificationsConfig {
   readonly databaseURL: string;
 }
 

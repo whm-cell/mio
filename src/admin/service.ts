@@ -104,12 +104,12 @@ function validateGlobalSettingsUpdate(input: { expectedRevision?: unknown; auth?
   };
 }
 
-export interface AdminMonitorProbes {
+interface AdminMonitorProbes {
   readonly probeRabbitmq?: () => Promise<RabbitmqMonitorSnapshot>;
   readonly probeRedis?: () => Promise<RedisMonitorSnapshot>;
 }
 
-export interface AdminOneLinkSsoRuntimeOptions {
+interface AdminOneLinkSsoRuntimeOptions {
   readonly config?: OneLinkSsoConfig;
   readonly authBaseURL?: string;
   readonly registerTransport?: OneLinkSsoRegisterTransport;

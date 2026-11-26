@@ -23,13 +23,7 @@ export interface AnnouncementCard {
   isRead: boolean;
 }
 
-export interface AnnouncementInput {
-  title?: unknown;
-  body?: unknown;
-  enabled?: unknown;
-  popup?: unknown;
-  effectiveAt?: unknown;
-}
+export type AnnouncementInput = Partial<Record<keyof AnnouncementValues, unknown>>;
 
 export interface AnnouncementValues {
   title: string;

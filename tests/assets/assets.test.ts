@@ -20,8 +20,10 @@ const cloud = vi.hoisted(() => ({
   copies: [] as string[],
   failNext: false,
   failAfterCopy: false,
-  gate: undefined as undefined | { entered: () => void; release: Promise<void> },
-  deleteGate: undefined as undefined | { entered: () => void; release: Promise<void> },
+  gate: undefined as
+    undefined | { entered: (signal: AbortSignal | undefined) => void; release: Promise<void> },
+  deleteGate: undefined as
+    undefined | { entered: (signal: AbortSignal | undefined) => void; release: Promise<void> },
 }));
 
 vi.mock('../../src/integrations/cos.ts', () => ({
@@ -36,7 +38,13 @@ vi.mock('../../src/integrations/cos.ts', () => ({
       if (!value) throw { statusCode: 404 };
       return { size: value.length, etag: createHash('sha256').update(value).digest('hex') };
     },
-    async copy(source: string, target: string, etag: string) {
+    async copy(
+      source: string,
+      target: string,
+      etag: string,
+      _acl?: 'private',
+      options?: { signal: AbortSignal },
+    ) {
       if (cloud.failNext) {
         cloud.failNext = false;
         throw { statusCode: 503 };
@@ -44,7 +52,7 @@ vi.mock('../../src/integrations/cos.ts', () => ({
       if (cloud.gate) {
         const gate = cloud.gate;
         cloud.gate = undefined;
-        gate.entered();
+        gate.entered(options?.signal);
         await gate.release;
       }
       const value = cloud.bytes.get(source);
@@ -58,11 +66,11 @@ vi.mock('../../src/integrations/cos.ts', () => ({
         throw { statusCode: 503 };
       }
     },
-    async delete(key: string) {
+    async delete(key: string, signal?: AbortSignal) {
       if (cloud.deleteGate) {
         const gate = cloud.deleteGate;
         cloud.deleteGate = undefined;
-        gate.entered();
+        gate.entered(signal);
         await gate.release;
       }
       cloud.bytes.delete(key);
@@ -260,7 +268,7 @@ it('freezes source and recovers after a failed copy, rejecting changed source an
 
 it('rejects a source overwritten between HEAD and conditional copy and retries unknown copy results safely', async () => {
   const asset = await create(Buffer.from('first'));
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.gate = { entered: entered.resolve, release: release.promise };
   const completing = call(`/api/v1/assets/${asset.assetId}/complete`, {});
@@ -284,7 +292,7 @@ it('rejects a source overwritten between HEAD and conditional copy and retries u
 
 it('does not let a delayed expired lease overwrite a newer successful completion', async () => {
   const asset = await create();
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.gate = { entered: entered.resolve, release: release.promise };
   const first = call(`/api/v1/assets/${asset.assetId}/complete`, {});
@@ -307,7 +315,7 @@ it('does not let a delayed expired lease overwrite a newer successful completion
 
 it('does not publish a copy after its lease expires even without a replacement claimant', async () => {
   const asset = await create();
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.gate = { entered: entered.resolve, release: release.promise };
   const first = call(`/api/v1/assets/${asset.assetId}/complete`, {});
@@ -361,11 +369,12 @@ it('stops starting additional cleanup deletes when the service closes', async ()
     "UPDATE mio_assets SET expires_at=now()-interval '1 second' WHERE id=ANY($1::uuid[])",
     [[first.assetId, second.assetId]],
   );
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.deleteGate = { entered: entered.resolve, release: release.promise };
   const cleaning = service.clean();
-  await entered.promise;
+  const signal = await entered.promise;
+  expect(signal?.aborted).toBe(false);
   const closing = service.close();
   release.resolve();
   await Promise.all([cleaning, closing]);
@@ -380,14 +389,16 @@ it('stops starting additional cleanup deletes when the service closes', async ()
 
 it('bounds shutdown of a stalled copy without publishing a late result', async () => {
   const asset = await create();
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.gate = { entered: entered.resolve, release: release.promise };
   const completing = call(`/api/v1/assets/${asset.assetId}/complete`, {});
-  await entered.promise;
+  const signal = await entered.promise;
+  expect(signal?.aborted).toBe(false);
   const closing = plugin.dispose();
   expect((await completing).status).toBe(503);
   await closing;
+  expect(signal?.aborted).toBe(true);
   release.resolve();
   await new Promise((resolve) => setTimeout(resolve, 10));
   const row = await observer.query<{ state: string; raw_key: string | null }>(
@@ -406,7 +417,7 @@ it('drains an in-flight copy before closing the plugin and its metadata pool', a
     'SELECT owner_id FROM mio_assets WHERE id=$1',
     [asset.assetId],
   );
-  const entered = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<AbortSignal | undefined>();
   const release = Promise.withResolvers<void>();
   cloud.gate = { entered: entered.resolve, release: release.promise };
   const completing = call(`/api/v1/assets/${asset.assetId}/complete`, {});

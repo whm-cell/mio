@@ -1,6 +1,13 @@
-import type { VideoRequestParameters } from '../../../generations/video-contracts.ts';
+import type { VideoRequestParameters } from '../../../generations/video/contracts.ts';
+import {
+  defaultVideoGenerateAudio,
+  KLING_OMNI_MODEL,
+  KLING_OMNI_SUBMIT_PATH,
+  VIDU_Q2_MODEL,
+} from '../../../generations/video/driver-capabilities.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
-import { resultUrls } from './shared.ts';
+import { happyhorsePrompt } from './happyhorse-prompt.ts';
+import { parseVideoMediaUrl } from './shared.ts';
 
 interface Submission {
   path: string;
@@ -10,7 +17,7 @@ interface Submission {
 
 function reference(refs: Record<string, string>, assetId: string): string {
   const value = refs[assetId];
-  if (!resultUrls([value])) throw new Error('VIDEO_INPUT_INVALID');
+  if (!parseVideoMediaUrl(value)) throw new Error('VIDEO_INPUT_INVALID');
   return value!;
 }
 
@@ -51,7 +58,10 @@ function kling(
   input: VideoRequestParameters,
   refs: Record<string, string>,
 ): Submission {
-  if (model === 'video-kling-v3-omni') {
+  const audioDefault = defaultVideoGenerateAudio('kling-videos', model);
+  const nativeAudio = input.generateAudio ?? audioDefault;
+  const audio = nativeAudio ? 'native' : 'off';
+  if (model === KLING_OMNI_MODEL) {
     const contents: Record<string, unknown>[] = [{ type: 'prompt', text: input.prompt }];
     if (input.firstFrame)
       contents.push({ type: 'first_frame', url: reference(refs, input.firstFrame.assetId) });
@@ -69,7 +79,7 @@ function kling(
         });
     }
     return {
-      path: '/kling/v1/videos/omni-video',
+      path: KLING_OMNI_SUBMIT_PATH,
       body: {
         model_name: model,
         contents,
@@ -77,7 +87,7 @@ function kling(
           ...(input.durationSeconds !== undefined ? { duration: input.durationSeconds } : {}),
           ...(input.ratio !== undefined ? { aspect_ratio: input.ratio } : {}),
           ...(input.resolution !== undefined ? { resolution: input.resolution.toLowerCase() } : {}),
-          audio: input.generateAudio === false ? 'off' : 'native',
+          audio,
         },
       },
     };
@@ -95,11 +105,11 @@ function kling(
       ...(input.resolution !== undefined ? { resolution: input.resolution.toLowerCase() } : {}),
       ...(input.firstFrame ? { image: reference(refs, input.firstFrame.assetId) } : {}),
       ...(input.lastFrame ? { image_tail: reference(refs, input.lastFrame.assetId) } : {}),
-      ...(model === 'kling-v2-5-turbo'
+      ...(audioDefault === undefined
         ? {}
         : {
-            sound: input.generateAudio === false ? 'off' : 'on',
-            settings: { audio: input.generateAudio === false ? 'off' : 'native' },
+            sound: nativeAudio ? 'on' : 'off',
+            settings: { audio },
           }),
     },
   };
@@ -110,8 +120,6 @@ function vidu(
   input: VideoRequestParameters,
   refs: Record<string, string>,
 ): Submission {
-  if (input.ratio !== undefined && input.mode !== 'text_to_video')
-    throw new Error('VIDEO_INPUT_INVALID');
   const kind =
     input.mode === 'text_to_video'
       ? 'text2video'
@@ -123,6 +131,7 @@ function vidu(
   const images = [input.firstFrame, input.lastFrame].flatMap((frame) =>
     frame ? [reference(refs, frame.assetId)] : [],
   );
+  const isQ2 = model === VIDU_Q2_MODEL;
   return {
     path: '/vidu/ent/v2/' + kind,
     body: {
@@ -133,15 +142,11 @@ function vidu(
       ...(input.ratio !== undefined && input.mode === 'text_to_video'
         ? { aspect_ratio: input.ratio }
         : {}),
-      ...(model !== 'video-vidu-q2' && input.resolution !== undefined
+      ...(!isQ2 && input.resolution !== undefined
         ? { resolution: input.resolution.toLowerCase() }
         : {}),
-      ...(model !== 'video-vidu-q2' && input.watermark !== undefined
-        ? { watermark: input.watermark }
-        : {}),
-      ...(model !== 'video-vidu-q2' && input.offPeak !== undefined
-        ? { off_peak: input.offPeak }
-        : {}),
+      ...(!isQ2 && input.watermark !== undefined ? { watermark: input.watermark } : {}),
+      ...(!isQ2 && input.offPeak !== undefined ? { off_peak: input.offPeak } : {}),
       ...(images.length ? { images } : {}),
       ...(input.subjects
         ? {
@@ -213,16 +218,12 @@ function happyhorse(
   for (const subject of input.subjects ?? [])
     for (const image of subject.images)
       media.push({ type: 'reference_image', url: reference(refs, image.assetId) });
-  const prompt =
-    input.mode === 'reference_subjects'
-      ? media.map((_item, index) => '[Image ' + (index + 1) + ']').join(' ') + '\n' + input.prompt
-      : input.prompt;
   return {
     path: '/happyhorse/v1/services/aigc/video-generation/video-synthesis',
     headers: { 'X-DashScope-Async': 'enable' },
     body: {
       model,
-      input: { prompt, ...(media.length ? { media } : {}) },
+      input: { prompt: happyhorsePrompt(input), ...(media.length ? { media } : {}) },
       parameters: {
         ...(input.mode !== 'video_edit' && input.durationSeconds !== undefined
           ? { duration: input.durationSeconds }

@@ -6,7 +6,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **对话受控意图级生图工具闭环、单调预算守卫升级与多原厂资产流转**
 
-[src/dsh/policy.ts](../../../../src/dsh/policy.ts) · [src/dsh/image-tools.ts](../../../../src/dsh/image-tools.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [src/conversations/contracts.ts](../../../../src/conversations/contracts.ts) · [src/providers/service.ts](../../../../src/providers/service.ts) · [src/compute/service.ts](../../../../src/compute/service.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/tasks/onelink-agent-tools/prd.md](../prd.md) · [docs/conversations.md](../../../conversations.md) · [tests/conversations/conversation-image-tools.test.ts](../../../../tests/conversations/conversation-image-tools.test.ts)
+[src/dsh/policy.ts](../../../../src/dsh/policy.ts) · [src/dsh/image-tools.ts](../../../../src/dsh/image-tools.ts) · [src/dsh/conversations.ts](../../../../src/dsh/conversations.ts) · [src/conversations/contracts.ts](../../../../src/conversations/contracts.ts) · [src/providers/service.ts](../../../../src/providers/service.ts) · [src/generations/image/admission.ts](../../../../src/generations/image/admission.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [docs/tasks/onelink-agent-tools/prd.md](../prd.md) · [docs/conversations.md](../../../conversations.md) · [tests/conversations/conversation-image-tools.test.ts](../../../../tests/conversations/conversation-image-tools.test.ts)
 
 ```mio-prd-results
 {

@@ -4,7 +4,7 @@
 
 开发模块的 `developmentDependencies` 按源码根声明：护栏／任务协调只导入 `scripts/harness/` 内部模块；服务工具允许自身模块及认证、对话、供应商、资产、素材和计算迁移需要的精确配置与 schema，以及共享计算合同的构建公开类型入口。动态目录的受控部署导入另精确允许 `src/providers/store.ts`、`contracts.ts`，由存储入口统一完成归属、版本和声明校验，导入程序自持并关闭该域池；不开放整个业务目录、`catalog.ts` 或 `service.ts`。总检查入口可组合各自命令。开发角色不等于职责边界，类型、重导出和别名解析后的越界均受核对；静态规则不是任意子进程或网络副作用沙箱。
 
-认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/store.ts`、`src/compute/schema.ts`、`src/compute/media-schema.ts`、`src/compute/media-store.ts`、`src/compute/database.ts`、`src/compute/capacity.ts`、`src/generations/store.ts` 与 `src/generations/schema.ts`、`src/materials/store.ts` 与 `src/materials/schema.ts`、`src/materials/auth-store.ts` 与 `src/materials/auth-schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
+认证包的生产导入限定于 `src/auth/`；PG 驱动另允许精确的 `src/conversations/store.ts`、`src/conversations/schema.ts`、`src/providers/store.ts`、`src/providers/schema.ts`、`src/assets/store.ts`、`src/assets/schema.ts`、`src/compute/transcode/store.ts`、`src/compute/schema.ts`、`src/compute/media/schema.ts`、`src/compute/media/store.ts`、`src/compute/observability/control.ts`、`src/compute/observability/queries.ts`、`src/compute/observability/schema.ts`、`src/compute/observability/store.ts`、`src/compute/database.ts`、`src/compute/capacity.ts`、`src/generations/image/store.ts`、`src/generations/video/store.ts`、`src/generations/video/execution-store.ts`、`src/generations/schema.ts`、`src/generations/transaction.ts`、`src/materials/store.ts` 与 `src/materials/schema.ts`、`src/materials/auth-store.ts` 与 `src/materials/auth-schema.ts`，不放开整个业务目录。认证包和数据库包分别按导入名称、解析包身份及真实归属判定，PG 身份不能豁免同时识别出的认证身份。服务迁移与部署声明入口的精确导入集合见 developmentDependencies；不授予认证内部池或护栏模块权限。合法 PG/部署别名及临近非法目录、type-only、跨职责反例进入 `tests/harness/guardrails.test.ts`。
 
 根服务 A 中 COS SDK 包仅允许 `src/integrations/cos.ts` 导入，开发工具和其他 A 模块不得直接或经别名导入；B 的精确适配器按下述多项目声明约束。检查按导入名称、解析包身份和真实归属识别。类型、别名及邻近非法文件反例见同一 fixture；运行权限仍由 COS 凭据、桶策略与实际测试保证。
 
@@ -39,13 +39,15 @@ Redis 驱动包的生产导入只允许 `src/integrations/redis.ts`；开发工�
 
 成员支持点号、静态字符串下标及 `globalThis` 的相同入口，支持常见 TS 表达式包装。判断依据是实际值引用与 Node import binding；不会只因第三方对象名叫 Date、performance 或 crypto 就阻断。局部／参数／导入／解构／catch／for／block 遮蔽及 var 提升由 ESLint 作用域解析；函数体 var 不遮蔽参数默认表达式中的系统全局引用。library、contract、测试与开发脚本不启用此规则。规则不读取 foundation 导出以决定是否启用，最小 guard fixture 无须伪造库能力；`tests/harness/foundation-lint.test.ts` 独立核对真实仓库的公开入口和值导出，避免 API 改名静默失效。
 
-这是一组明确静态形式的防回退检查，不追踪任意变量／解构别名、函数传递、重导出包装、动态属性、反射及自定义对象语义。不推断 HTTP 数值用途：`HTTP_STATUS`、`sha256Utf8` 和 `ApplicationError` 均由既有 `quality-review` 的 reuse 维度审阅，包括 `fail`／`writeApiError` 和改写参数的错误构造器。此处移除旧 HTTP 静态断言是方案 A 的政策收窄，不是 HTTP 复用通过的证据。不禁止 `createHash`、HMAC/RSA/AES、二进制／流式摘要、MD5 或服务端时间，不强制所有 Error 继承 ApplicationError。
+这是一组明确静态形式的防回退检查，不追踪任意变量／解构别名、函数传递、重导出包装、动态属性、反射及自定义对象语义。不推断 HTTP 数值用途：`HTTP_STATUS`、`sha256Utf8`、`sha256Bytes` 和 `ApplicationError` 均由既有 `quality-review` 的 reuse 维度审阅，包括 `fail`／`writeApiError` 和改写参数的错误构造器。此处移除旧 HTTP 静态断言是方案 A 的政策收窄，不是 HTTP 复用通过的证据。不禁止 `createHash`、HMAC/RSA/AES、二进制／流式摘要、MD5 或服务端时间，不强制所有 Error 继承 ApplicationError。
+
+`@mio/foundation/hash` 的 `sha256Utf8` 计算 UTF-8 文本摘要，`sha256Bytes` 直接读取 `Uint8Array` 的当前视图，两者均输出小写十六进制。持久请求的序列化在所属业务维护；视频请求继续沿现有 JSON 字节，媒体请求沿其排序与数组规则。流式原件在同一遍读取中更新增量摘要。
 
 聚焦测试通过实际 ESLint 有效配置的 `lintText` 和 CLI stdin 验证正负例、作用域及角色；`tests/harness/guardrail-projects.test.ts` 保留真实 guard CLI 的项目／公开入口和最小桩兼容测试。既有 CI harness 路径及全量 `pnpm check` 均含 lint 与这些测试，静态命中不证明任意复用或业务行为正确。
 
 ## 其他源码依赖与检查边界
 
-非根服务可通过 `capabilities` 对 `fs`、`child_process`、`sqlite` 分别登记本项目内真实存在的精确 TS adapter 文件。B 的通用媒体执行将持久化、文件和子进程分别限定在 `compute/src/adapters/media-journal.ts`、`media-files.ts` 与 `media-process.ts`；三类能力不授予操作计划、运行时编排或邻近文件。`node:` 前缀及 `fs/promises` 按对应能力核对。根服务仅允许 `src/generations/files.ts` 使用 `fs` 保存 A 图片生成的持久化检查点，不允许根服务声明额外能力；邻近文件、其他业务模块、`child_process` 与 `sqlite` 仍禁止。直接的 `process.getBuiltinModule(...)` 和 `globalThis.process` 的静态属性/字符串下标形式也受检查：目标须为字面量，脱离调用的引用拒绝。计算属性、任意别名、第三方内部行为和运行时反射不在承诺内，静态规则不是进程沙箱。
+非根服务可通过 `capabilities` 对 `fs`、`child_process`、`sqlite` 分别登记本项目内真实存在的精确 TS adapter 文件。B 的通用媒体执行将持久化、文件和子进程分别限定在 `compute/src/adapters/media-journal.ts`、`media-files.ts` 与 `media-process.ts`；三类能力不授予操作计划、运行时编排或邻近文件。`node:` 前缀及 `fs/promises` 按对应能力核对。根服务的 `fs` 许可限于 `src/generations/image/files.ts`（A 图片持久检查点）、`src/generations/video/media.ts`（视频物化暂存文件）与 `src/generations/video/submission-receipts.ts`（视频提交 ID 的私有回执）。根服务不能自行声明额外能力；邻近文件、其他业务模块、`child_process` 与 `sqlite` 仍禁止。直接的 `process.getBuiltinModule(...)` 和 `globalThis.process` 的静态属性/字符串下标形式也受检查：目标须为字面量，脱离调用的引用拒绝。计算属性、任意别名、第三方内部行为和运行时反射不在承诺内，静态规则不是进程沙箱。
 
 `packageAdapters` 可按服务的真实 adapter 文件精确登记 `amqplib`，并允许非根服务登记 `cos-nodejs-sdk-v5`；未知包键、跨项目和不存在的文件拒绝。A 的 COS SDK 仍只允许 `src/integrations/cos.ts`，声明不覆盖 DSH、认证、PG 或 Redis 等既有边界。包名、类型包身份及解析目标的包归属共同参与核对。P2 增加这项声明是因为 B 使用独立凭据访问 COS、A/B 都可能需要各自的 MQ adapter；逐服务在检查器源码中硬编码路径会把正常新增服务变成护栏实现修改。代价是维护显式声明与正反例，不能据此推断运行时隔离。
 

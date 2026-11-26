@@ -164,21 +164,33 @@ it.each([
   ['src/assets/schema.ts', 0],
   ['src/assets/service.ts', 1],
   ['src/assets-extra/store.ts', 1],
-  ['src/compute/store.ts', 0],
+  ['src/compute/transcode/store.ts', 0],
+  ['src/compute/store.ts', 1],
   ['src/compute/schema.ts', 0],
-  ['src/compute/media-schema.ts', 0],
-  ['src/compute/media-store.ts', 0],
+  ['src/compute/media/schema.ts', 0],
+  ['src/compute/media/store.ts', 0],
+  ['src/compute/observability/store.ts', 0],
+  ['src/compute/observability/control.ts', 0],
+  ['src/compute/observability/queries.ts', 0],
+  ['src/compute/observability/schema.ts', 0],
+  ['src/compute/observability/http.ts', 1],
   ['src/compute/database.ts', 0],
-  ['src/compute/media-service.ts', 1],
-  ['src/compute-extra/media-store.ts', 1],
+  ['src/compute/media/service.ts', 1],
+  ['src/compute/media/store-extra.ts', 1],
+  ['src/compute-extra/media/store.ts', 1],
   ['src/compute/capacity.ts', 0],
   ['src/compute-extra/capacity.ts', 1],
-  ['src/compute/service.ts', 1],
-  ['src/compute-extra/store.ts', 1],
-  ['src/generations/store.ts', 0],
+  ['src/compute/transcode/service.ts', 1],
+  ['src/compute-extra/transcode/store.ts', 1],
+  ['src/generations/image/store.ts', 0],
+  ['src/generations/video/store.ts', 0],
+  ['src/generations/video/execution-store.ts', 0],
+  ['src/generations/transaction.ts', 0],
   ['src/generations/schema.ts', 0],
-  ['src/generations/service.ts', 1],
-  ['src/generations-extra/store.ts', 1],
+  ['src/generations/store.ts', 1],
+  ['src/generations/video/service.ts', 1],
+  ['src/generations/image/service.ts', 1],
+  ['src/generations-extra/image/store.ts', 1],
   ['src/admin/store.ts', 0],
   ['src/admin/schema.ts', 0],
   ['src/admin/service.ts', 1],
@@ -202,13 +214,13 @@ it.each([
   ['src/assets/store.ts', 'database-alias', 'pg', 0],
   ['src/assets/store.ts', 'pg', 'better-auth', 1],
   ['src/assets/service.ts', 'database-alias', 'pg', 1],
-  ['src/compute/store.ts', 'database-alias', 'pg', 0],
-  ['src/compute/store.ts', 'pg', 'better-auth', 1],
-  ['src/compute/service.ts', 'database-alias', 'pg', 1],
-  ['src/generations/store.ts', 'database-alias', 'pg', 0],
+  ['src/compute/transcode/store.ts', 'database-alias', 'pg', 0],
+  ['src/compute/transcode/store.ts', 'pg', 'better-auth', 1],
+  ['src/compute/transcode/service.ts', 'database-alias', 'pg', 1],
+  ['src/generations/image/store.ts', 'database-alias', 'pg', 0],
   ['src/generations/schema.ts', 'database-alias', 'pg', 0],
-  ['src/generations/service.ts', 'database-alias', 'pg', 1],
-  ['src/generations/store.ts', 'pg', 'better-auth', 1],
+  ['src/generations/image/service.ts', 'database-alias', 'pg', 1],
+  ['src/generations/image/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/store.ts', 'database-alias', 'pg', 0],
   ['src/admin/schema.ts', 'database-alias', 'pg', 0],
   ['src/admin/service.ts', 'database-alias', 'pg', 1],
@@ -265,19 +277,25 @@ async function check(root: string, env?: NodeJS.ProcessEnv) {
 }
 
 it.each([
-  ['src/generations/files.ts', "export { readFile } from 'fs';", 0],
-  ['src/generations/files.ts', "export { readFile } from 'node:fs/promises';", 0],
-  ['src/generations/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
+  ['src/generations/image/files.ts', "export { readFile } from 'fs';", 0],
+  ['src/generations/video/media.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/video/submission-receipts.ts', "export { open } from 'node:fs/promises';", 0],
+  ['src/generations/files.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video-media.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video/media-extra.ts', "export { readFile } from 'fs';", 1],
+  ['src/generations/video/submission-receipts-extra.ts', "export { open } from 'node:fs';", 1],
+  ['src/generations/image/files.ts', "export { readFile } from 'node:fs/promises';", 0],
+  ['src/generations/image/files.ts', "export const fs = process.getBuiltinModule('node:fs');", 0],
   [
-    'src/generations/files.ts',
+    'src/generations/image/files.ts',
     "export const fs = globalThis['process']['getBuiltinModule']('node:fs');",
     0,
   ],
-  ['src/generations/files-extra.ts', "export { readFile } from 'fs/promises';", 1],
-  ['src/generations-extra/files.ts', "export { readFile } from 'node:fs';", 1],
-  ['src/generations/service.ts', "export const fs = process.getBuiltinModule('fs');", 1],
-  ['src/generations/files.ts', "export { spawn } from 'node:child_process';", 1],
-  ['src/generations/files.ts', "export { DatabaseSync } from 'node:sqlite';", 1],
+  ['src/generations/image/files-extra.ts', "export { readFile } from 'fs/promises';", 1],
+  ['src/generations-extra/image/files.ts', "export { readFile } from 'node:fs';", 1],
+  ['src/generations/image/service.ts', "export const fs = process.getBuiltinModule('fs');", 1],
+  ['src/generations/image/files.ts', "export { spawn } from 'node:child_process';", 1],
+  ['src/generations/image/files.ts', "export { DatabaseSync } from 'node:sqlite';", 1],
 ] as const)(
   'confines A durable filesystem access to the exact adapter: %s %s',
   async (file, code, status) => {
@@ -601,6 +619,28 @@ it('accepts same-module development imports and rejects harness/service/type-exp
   expect((await check(root)).output).toContain('DEVELOPMENT_DEPENDENCY');
 });
 
+it('keeps service tooling access to generation contracts exact in the checked-in configuration', async () => {
+  const cutover = 'scripts/service/generation-cutover.ts';
+  const root = await fixture({
+    [cutover]: "import '../../src/generations/image/contracts.ts';",
+    'scripts/service/legacy-video-routes.ts': "import '../../src/generations/video/contracts.ts';",
+    'src/generations/image/contracts.ts': 'export const version = 1;',
+    'src/generations/video/contracts.ts': 'export const version = 1;',
+    'src/generations/image/service.ts': 'export const service = 1;',
+    'src/generations/contracts.ts': 'export const version = 1;',
+  });
+  const config = legacyHarness();
+  config.developmentDependencies = (await loadConfig(project)).developmentDependencies;
+  await writeFile(join(root, 'harness.config.json'), JSON.stringify(config));
+  const allowed = await check(root);
+  expect(allowed.status, allowed.output).toBe(0);
+  for (const path of ['src/generations/image/service.ts', 'src/generations/contracts.ts']) {
+    await writeFile(join(root, cutover), "import '../../" + path + "';");
+    const forbidden = await check(root);
+    expect(forbidden.output).toContain('DEVELOPMENT_DEPENDENCY ' + cutover + ': ' + path);
+  }
+});
+
 it('checks aliases and dynamic targets across development boundaries, and includes development cycles', async () => {
   const root = await fixture({
     // Keep resolution independent of the enclosing worktree's package type.
@@ -811,7 +851,8 @@ it.each([
 import type { ApiError } from './contracts.ts';
 export function start(response: ServerResponse): ApiError { return { error: { code: String(response.statusCode) } }; }`,
       'src/assets/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
-      'src/compute/http.ts': "import '../http-request.ts'; import '../http-response.ts';",
+      'src/compute/transcode/http.ts':
+        "import '../../http-request.ts'; import '../../http-response.ts';",
     });
     expect((await check(root)).status).toBe(0);
     const configPath = join(root, 'tsconfig.json');

@@ -36,7 +36,10 @@ node scripts/service/prepare-compute-broker.ts "$RABBITMQ_ENV_FILE" .runtime/com
 准备脚本先验证 `stream_queue` feature flag 和原 vhost 中能匹配 quorum 队列的 1 GiB operator policy，发现同名当前拓扑资源时停止。脚本记录计划，将随机 A/B 凭据写入 0600 文件，再在业务 vhost 和两个独立测试 vhost 中建立共享拓扑，包括以下既有视频队列及音频、媒体和 Worker 队列。
 
 - 视频命令队列 `mio.compute.commands.v1` 与对应死信队列 `mio.compute.commands.dlq.v1`
+- 独立视频探测命令队列 `mio.compute.video.probe.commands.v1` 与对应死信队列 `mio.compute.video.probe.commands.dlq.v1`
 - 视频结果队列 `mio.compute.results.v1` 与对应死信队列 `mio.compute.results.dlq.v1`
+
+已有 vhost 应先执行[独立视频探测队列迁移](../../docs/integrations/rabbitmq.md#独立视频探测队列迁移)，再启用新发布者和 Worker。探测结果沿用视频结果队列。
 
 交换机和 routing key 见[计算协议](../../docs/tasks/compute-service/protocol.md#路由回执与状态)。源队列配置 `dead-letter-strategy=at-least-once`，quorum 队列设置 `overflow=reject-publish` 和 `delivery-limit=-1`。初始化前可通过 `MIO_COMPUTE_WORKER_INSTANCE_IDS` 指定实例控制队列；指定多个 ID 时同时用 `MIO_COMPUTE_INSTANCE_ID` 选定本次生成 B 凭据对应的实例。部署者为其他实例单独发放各自精确 ACL。初始化完成前逐 quorum 队列核对 `mio-capacity` 及生效的 1 GiB 上限和 `reject-publish`，另核对音频结果 stream 的独立保留策略。出现策略冲突或网络请求结果未知时，查看输出目录的 `bootstrap-journal.jsonl` 和 broker 实际资源后再决定如何恢复。重试须保留已有业务队列和消息。
 

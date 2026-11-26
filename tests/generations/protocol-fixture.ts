@@ -1,4 +1,4 @@
-import { createImageDecoder } from '../../src/generations/decode.ts';
+import { createImageDecoder } from '../../src/generations/image/decode.ts';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
@@ -12,7 +12,7 @@ import {
   type ImageInput,
   type ImageRouteConfig,
   type ImageRouteParamSpec,
-} from '../../src/generations/contracts.ts';
+} from '../../src/generations/image/contracts.ts';
 import {
   createRoutedImageProtocol,
   defaultRouteAsyncTransport,

@@ -13,13 +13,13 @@ import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import {
   startWorkerObservability,
   WorkerControlStore,
-} from '../../src/compute/worker-observability-control.ts';
-import { WorkerObservabilityQueries } from '../../src/compute/worker-observability-queries.ts';
+} from '../../src/compute/observability/control.ts';
+import { WorkerObservabilityQueries } from '../../src/compute/observability/queries.ts';
 import {
   checkWorkerObservabilitySchema,
   workerObservabilitySchemaSQL,
-} from '../../src/compute/worker-observability-schema.ts';
-import { WorkerObservabilityStore } from '../../src/compute/worker-observability-store.ts';
+} from '../../src/compute/observability/schema.ts';
+import { WorkerObservabilityStore } from '../../src/compute/observability/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 const ids = ['worker-a', 'worker-b', 'worker-c', 'worker-unknown'];
@@ -195,6 +195,68 @@ it('returns fresh bounded histories, separates stale/offline, and aggregates onl
     instances: { online: 2, stale: 0, offline: 1, unseen: 1 },
     aggregate: { applied: { total: 4 } },
     broker: { ready: null, unacknowledged: null },
+  });
+});
+
+it('exposes a standalone video probe by job and attempt with its real slot timeline', async () => {
+  const now = Date.now();
+  const message = worker();
+  const probe: WorkerExecutionIdentity = {
+    ...execution(),
+    protocol: 'video.probe.v1',
+    resource: 'probe',
+  };
+  const acquired = message(1, now - 20, {
+    kind: 'execution',
+    state: 'acquired',
+    at: now - 20,
+    execution: probe,
+  });
+  acquired.usage = { total: 1, encode: 0, probe: 1 };
+  acquired.active = [{ ...probe, acquiredAt: now - 20 }];
+  await record(now - 20, parseWorkerTelemetry(acquired));
+  expect(await queries.worker('worker-a', now)).toMatchObject({
+    snapshot: { usage: acquired.usage, active: acquired.active },
+  });
+  await record(
+    now - 10,
+    parseWorkerTelemetry({
+      ...message(2, now - 10, {
+        kind: 'phase',
+        phase: 'processing',
+        at: now - 10,
+        execution: probe,
+      }),
+      active: acquired.active,
+      usage: acquired.usage,
+    }),
+  );
+  await record(
+    now,
+    parseWorkerTelemetry(
+      message(3, now, {
+        kind: 'execution',
+        state: 'released',
+        at: now,
+        execution: probe,
+      }),
+    ),
+  );
+  expect((await queries.executions({ jobId: probe.jobId, limit: 1 })).executions).toMatchObject([
+    { ...probe, state: 'released', acquiredAt: new Date(now - 20), endedAt: new Date(now) },
+  ]);
+  expect(await queries.execution(probe.executionId)).toMatchObject({
+    ...probe,
+    businessState: null,
+    businessStage: null,
+    timeline: [
+      { detail: { kind: 'execution', state: 'acquired' } },
+      { detail: { kind: 'phase', phase: 'processing' } },
+      { detail: { kind: 'execution', state: 'released' } },
+    ],
+  });
+  expect(await queries.worker('worker-a', now)).toMatchObject({
+    snapshot: { usage: zero, active: [] },
   });
 });
 

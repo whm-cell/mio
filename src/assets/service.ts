@@ -1,9 +1,9 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
-import { createHash } from 'node:crypto';
-import { HLS_PLAYLIST_CONTENT_TYPE } from '../compute/media-hls.ts';
-import { isValidImageAssetObjectKey } from '../generations/contracts.ts';
+import { sha256Bytes, sha256Utf8 } from '@mio/foundation/hash';
+import { HLS_PLAYLIST_CONTENT_TYPE } from '../compute/media/hls.ts';
+import { isValidImageAssetObjectKey } from '../generations/image/contracts.ts';
 import {
   AssetError,
   MAX_ASSET_BYTES,
@@ -87,8 +87,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
     );
     return action;
   };
-  // The SDK does not expose cancellation for these calls. Stop waiting after the drain
-  // deadline; a late copy has a unique key and cannot register through this operation.
+  // Keep a bounded wait for object calls, including adapters that ignore cancellation.
   const waitObject = <T>(start: () => Promise<T>, signal = stop.signal): Promise<T> => {
     if (signal.aborted)
       return Promise.reject(new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE'));
@@ -153,7 +152,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         /[\x00-\x1f\x7f]/.test(head.etag)
       )
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-      const etagDigest = createHash('sha256').update(head.etag).digest('hex');
+      const etagDigest = sha256Utf8(head.etag);
       if (expected && expected.etagDigest !== etagDigest)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
       data = await waitObject(
@@ -163,7 +162,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       combined.throwIfAborted();
       if (data.byteLength !== size)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SIZE_MISMATCH');
-      const sourceDigest = createHash('sha256').update(data).digest('hex');
+      const sourceDigest = sha256Bytes(data);
       if (expected && expected.sourceDigest !== sourceDigest)
         throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
       const current = await store.owned(id, ownerId);
@@ -206,7 +205,8 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
             log.error('ASSET_STAGING_KEY_INVALID');
             continue;
           }
-          await waitObject(() => objects.delete(row.staging_key));
+          await waitObject(() => objects.delete(row.staging_key, stop.signal));
+          stop.signal.throwIfAborted();
           await store.stagingDeleted(row.id, row.staging_key);
         } catch {
           log.error('ASSET_STAGING_CLEANUP_FAILED');
@@ -355,17 +355,19 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
         }
         const rawKey = `mio/raw/${id}/${createId()}`;
         try {
-          if (playableAudio.has(claimed.content_type.toLowerCase())) {
+          const acl = playableAudio.has(claimed.content_type.toLowerCase()) ? 'private' : undefined;
+          if (acl) {
             const ensurePrivate = objects.ensureAudioPrivate;
             if (!ensurePrivate)
               throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
             await waitObject(() =>
               ensurePrivate(stagingKey, { sizeBytes: head.size, etag: head.etag }, stop.signal),
             );
-            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag, 'private'));
-          } else {
-            await waitObject(() => objects.copy(stagingKey, rawKey, head.etag));
           }
+          await waitObject(() =>
+            objects.copy(stagingKey, rawKey, head.etag, acl, { signal: stop.signal }),
+          );
+          stop.signal.throwIfAborted();
         } catch (error) {
           await store.release(id, lease).catch(() => {});
           if (statusCode(error) === 412)

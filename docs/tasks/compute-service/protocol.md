@@ -39,7 +39,7 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 
 ## 只读视频媒体探测 `video.probe` v1
 
-`video.probe` 仅对 A 已准备的私有 COS staging 媒体进行限时字节完整性校验和 ffprobe；不执行任何转码/写入 COS/供应商调用，不经消息传递媒体字节或供应商凭据。字段集严格封闭；身份为 `(jobId, outputIndex, attemptId, attempt)`，`outputIndex` 为 0–15，`attempt` 为 1–3。`source.stagingKey` 必须精确是 `mio/staging/video/<jobId>/<outputIndex>/<attemptId>.media`；不接收 URL、bucket、命令行或本机路径。`source.sizeBytes` 限为 1 至 1073741824；`etag` 为最长 256 且不含控制字符的原样值；`sha256` 为小写 64 位十六进制。
+`video.probe` 仅对 A 已准备的私有 COS staging 媒体执行限时字节校验、MP4 容器及媒体包检查和视频帧抽检。解码帧丢弃，探测全程只读。字段集严格封闭；身份为 `(jobId, outputIndex, attemptId, attempt)`，`outputIndex` 为 0–15，`attempt` 为 1–3。`source.stagingKey` 必须精确是 `mio/staging/video/<jobId>/<outputIndex>/<attemptId>.media`；不接收 URL、bucket、命令行、本机路径、媒体字节或供应商凭据。`source.sizeBytes` 限为 1 至 1073741824；`etag` 为最长 256 且不含控制字符的原样值；`sha256` 为小写 64 位十六进制。
 
 ```json
 {
@@ -59,28 +59,35 @@ succeeded 另含 `output: {key, sizeBytes, etag, sha256}`，键严格等于 `mio
 }
 ```
 
-B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/可用的 SHA-256 元数据，再用条件 GET `If-Match: <etag>` 流式下载到 worker 受限临时目录（目录 0700，文件 0600）。过流逐块累计实际字节并计算 SHA-256，必须与消息 size/digest 完全相同才启动 ffprobe；失配、过大、超时或 worker 停机均不返回可消费媒体。COS 下载和 ffprobe 共用 300 秒本地 AbortSignal 上限，取消时销毁流/子进程并清除这个 UUID 推导的临时文件。ffprobe 只从固定本地文件路径运行，使用固定参数和已有文件格式 whitelist，不使用 shell。保留当前 1800 秒视频时长上限；JSON 输出限 64 KiB，错误输出限 256 KiB。
+B 使用本地已固定的私有 bucket，先 HEAD 完整 key 核对 size/ETag/可用的 SHA-256 元数据，再用条件 GET `If-Match: <etag>` 流式下载到 worker 受限临时目录（目录 0700，文件 0600）。实际流的 size/digest 与消息完全一致后才开始媒体检查。下载和所有媒体检查共用 300 秒本地 AbortSignal 上限，取消时销毁流/子进程并清除这个 UUID 推导的临时文件。FFprobe 和 FFmpeg 使用固定参数直接读取该本地文件，协议仅允许 `file`，解复用仅允许 `mov`，禁用外部媒体引用。元数据 JSON 限 64 KiB，各子进程的错误输出限 256 KiB。
 
-成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份；`media` 只包含 ffprobe 得出的 `container`/`videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。尺寸使用已采用的 display rotation 规则，返回 1–65536 的安全整数；时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
+B 检查实际 `ftyp` 品牌和 MP4 顶层 box 边界，要求完整的 `moov` 和非空 `mdat`，拒绝主品牌为 QuickTime 或 3GP/3G2 的文件。B 按 `media.probe` 相同的规则选择首个非附图视频流，按该流的实际索引解码；只有封面的音频文件判为无视频。B 流式扫描媒体包并拒绝损坏标志或读失败。若 `mdat` 声明延伸至文件结束，或最后一个分片声明后缺少媒体载荷，B 按轨道核对原始样本表和可见分片声明中的音视频样本数；例如 PCM 合并进同一初始媒体包的样本按采样数累计。
+
+定点解码须取得选中视频流的开头帧，再从可寻址的尾部位置解码至结束，取得达到该流最后一个显示时间戳的实际帧。音轨更长、可变帧率或分片封装时，尾帧判断仍按所选视频流。探测覆盖文件中可见的容器边界、包读取以及上述两处视频解码。顶层分片索引 `sidx` 声明的字节范围须全部落在实际文件内。
+
+成功回执为 `type: "video.probe.result"`，必须原样回传 commandId、jobId、outputIndex、attemptId/attempt 和完整 source 身份。`media` 包含已验证的 `container: "mp4"` 及 `videoCodec`/`width`/`height`/`durationSeconds`/`hasAudio`/`audioCodec`。宽高使用与 `media.probe` 一致的显示尺寸算法，对选中视频流应用 SAR 和旋转后取最近的整数，返回 1–65536 的安全整数。时长为有限正数且不大于 1800。源 sizeBytes 和 sha256 留在 `source` 中，作为实际流校验后的值。错误回执只使用 `SOURCE_INVALID`/`SOURCE_TOO_LARGE`/`SOURCE_CHANGED`/`PROBE_FAILED`/`EXECUTION_TIMEOUT`/`STORAGE_FAILURE`/`WORKER_INTERRUPTED`，不包含 COS 响应体、本机路径、stack 或凭据。回执可因 RabbitMQ 重投重复；A 按完整身份幂等并拒绝过时 attempt，B 不保存该读操作的跨重启 journal。
+
+普通与启用观测的 B 都有独立探测命令消费通道。探测与独立音频检测和通用媒体探测共用 `total`/`probe` 准入与相应 HOLD，转码使用 `total`/`encode`。原视频命令通道保留对已路由探测的严格解析和分发，以便迁移后排空。一个 Worker 上在途的相同探测命令只操作一份本地临时文件，各投递在同一结果获确认后 ACK。相同 `messageId` 携带不同内容时按冲突拒收。
 
 ### `video.probe` 路由的同步要求
 
-保持 `version: 1`，无需换新 exchange 或 queue，但分别要在 `mio.compute.commands.v1` 交换机绑定 `video.probe.v1` 到现有 `mio.compute.commands.v1` 持久队列，以及将 `video.probe.result.v1` 绑定至现有 `mio.compute.results.v1` 队列。这是加性的 v1 topology 绑定；这些 bindings 与 A 端命令发布/结果消费适配未同步部署前，不能发送 probe。使用 `mandatory` 发布时新 routing key 没有 binding 必须被退回并保留上游重试现场，不能回退使用 `transcode.v1` 假装为转码。
+继续使用 `version: 1`。部署者将 `mio.compute.commands.v1` 交换机的 `video.probe.v1` 路由切换到专属持久队列。A 在同一结果队列收到 `video.probe.result.v1`。部署按顺序暂停生产者、确认新绑定、解绑历史路由、启用 B 的专属消费后恢复 A。发布使用 `mandatory`，缺少有效绑定时返回上游错误并保留重试现场。见[独立视频探测队列迁移](../../integrations/rabbitmq.md#独立视频探测队列迁移)。
 
 ## 路由、回执与状态
 
-以下单路转码路由在隔离 vhost 内使用四个持久 direct exchange 和四条持久 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
+视频转码和独立探测使用持久 direct exchange 和 quorum 队列。[部署拓扑](../../../scripts/service/compute-broker-topology.ts)
 
-| 路由         | 交换机                        | Routing key                | 队列                          |
-| ------------ | ----------------------------- | -------------------------- | ----------------------------- |
-| A 发转码命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`     |
-| A 发探测命令 | `mio.compute.commands.v1`     | `video.probe.v1`           | `mio.compute.commands.v1`     |
-| 命令死信     | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1` |
-| B 发转码结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`      |
-| B 发探测结果 | `mio.compute.results.v1`      | `video.probe.result.v1`    | `mio.compute.results.v1`      |
-| 结果死信     | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`  |
+| 路由         | 交换机                        | Routing key                | 队列                                      |
+| ------------ | ----------------------------- | -------------------------- | ----------------------------------------- |
+| A 发转码命令 | `mio.compute.commands.v1`     | `transcode.v1`             | `mio.compute.commands.v1`                 |
+| A 发探测命令 | `mio.compute.commands.v1`     | `video.probe.v1`           | `mio.compute.video.probe.commands.v1`     |
+| 命令死信     | `mio.compute.commands.dlx.v1` | `transcode.dead.v1`        | `mio.compute.commands.dlq.v1`             |
+| 探测命令死信 | `mio.compute.commands.dlx.v1` | `video.probe.dead.v1`      | `mio.compute.video.probe.commands.dlq.v1` |
+| B 发转码结果 | `mio.compute.results.v1`      | `transcode.result.v1`      | `mio.compute.results.v1`                  |
+| B 发探测结果 | `mio.compute.results.v1`      | `video.probe.result.v1`    | `mio.compute.results.v1`                  |
+| 结果死信     | `mio.compute.results.dlx.v1`  | `transcode.result.dead.v1` | `mio.compute.results.dlq.v1`              |
 
-两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。未配置 Worker 观测的 B 保留单路转码命令消费 `prefetch=1`。已配置的实例有界接收 `prefetch=32`，并经[独立 Worker 共享槽](../../../compute/README.md#worker-观测与调限)限制实际准入。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
+两侧的发布和消费使用独立连接。消息以 persistent、JSON content type、mandatory 与 publisher confirm 发布。B 的转码和独立探测分别使用各自消费通道，未配置 Worker 观测时各自 `prefetch=1`，配置后各自 `prefetch=32`，并经[独立 Worker 共享槽](../../../compute/README.md#worker-观测与调限)限制实际准入。A 的结果消费使用 `prefetch=4`，关闭连接前排空在途结果处理及 COS HEAD 核验。旧图片消息若投到视频队列，按非法命令处理。
 
 A 在一个 PostgreSQL 事务写入视频 job 与 outbox，落库后触发 `wakePoll()`，合并并发唤醒，每轮认领并发布最多 10 条命令。Broker 故障后的重试从 1 秒起指数退避，最多 30 秒。结果消费者成功注册且同一 Broker 完成当轮 outbox 检查和发布后恢复初始退避。相同 owner/requestId 和输入返回原 job，输入冲突返回 409。收到发布确认且消息未退回时才将 outbox 标为已送达。B 在 journal 中持久化结果事件后发布，并在完成对应结果的确认后 ACK 命令。A 验证结果并提交 inbox 去重、资产及状态后 ACK 结果。连接中断后按稳定 messageId 幂等重投。
 
@@ -99,6 +106,8 @@ quorum 的可靠死信转发不能沿用默认 at-most-once：源队列需显式
 `media.encode`、`media.probe`、`media.control` 绑定既有命令交换机，`media.result` 绑定既有结果交换机，目标队列分别为 `mio.compute.media.encode`、`mio.compute.media.probe`、`mio.compute.media.control`、`mio.compute.media.results`。每条队列有专属 `.dlq`，死信沿既有方向的 DLX 可靠转发。`media.probe`、`scenes.detect` 和 `audio.waveform` 使用 probe 槽，其余使用 encode 槽。B 的单路转码和音频检测从同一进程内的 `total`、`encode`、`probe` 计数准入，占用保持至收尾，默认与最低部署硬上限为 `2/1/1`。各分类与总上限分别约束。
 
 Worker 控制使用 `worker.limits.command.<instanceId>` 绑定到对应实例的独立命令队列。`worker.telemetry` 结果路由同时承载 `worker.telemetry` 和 `worker.limits.result` 两种消息。两类回报均有 `instanceId`、`bootId`、`bootSequence`、`sequence` 和采样时间；遥测可携带实际执行身份、类别、占槽、待槽、HOLD 和事件。调限命令包含正整数 `revision`、操作者、请求时间和三维上限，回报绑定 `commandId` 及所处理的 `revision`。`applied` 的 `reason` 为 null，`rejected` 的 `reason` 使用枚举。Worker 协议消息以原始 UTF-8 字节计最多 64 KiB。发布与接收仍需 AMQP 身份校验，实例归属由实际接收方与部署身份核对。详见 [RabbitMQ 契约](../../integrations/rabbitmq.md#拓扑与权限)。
+
+独立视频探测的遥测执行身份使用 `protocol: "video.probe.v1"`、命令的 `jobId` 和 `attemptId`、`inspectionId: null`、`resource: "probe"` 与 `slots: 1`。进入待槽、取得和释放来自实际准入，阶段记录下载、探测和收尾。
 
 [通用媒体 HTTP](../../apis/compute.md#通用媒体处理)使用单独的媒体结果消费者，按发布顺序处理进度与终态。B 的媒体 encode、probe 和 control 各有自己的预取为一的通道。连接中断撤回该轮尚未占槽的等待并保留原任务身份，重新投递可继续原 attempt。待对账的早期副作用由同一 journal 接管。恢复已有输出占用同类容量，无需启动 FFmpeg。运行时遥测采集与持久调限的实现见相应开发单元。
 

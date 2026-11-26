@@ -27,8 +27,8 @@
           "purpose": "零联网零解密的 listImageModels 与 inspectImageRoute 动态目录与单轨路由能力读取"
         },
         {
-          "path": "src/compute/service.ts",
-          "purpose": "支持本人 ready 图片 derived 资产（经共享 isValidImageAssetObjectKey 协议校验）作为后续轮次编辑/参考图输入"
+          "path": "src/generations/image/admission.ts",
+          "purpose": "现行图片准入复用共享对象键协议，只接受本人的 ready 图片原件或 derived 资产。"
         },
         {
           "path": "src/plugin.ts",

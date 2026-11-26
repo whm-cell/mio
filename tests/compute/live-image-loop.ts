@@ -20,11 +20,14 @@ import { join, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { Pool } from 'pg';
-import { imageOutputIndex, isValidImageAssetObjectKey } from '../../src/generations/contracts.ts';
-import type { ImageAssetRef } from '../../src/generations/contracts.ts';
-import type { GenerationRequest } from '../../src/generations/execution.ts';
+import {
+  imageOutputIndex,
+  isValidImageAssetObjectKey,
+} from '../../src/generations/image/contracts.ts';
+import type { ImageAssetRef } from '../../src/generations/image/contracts.ts';
+import type { GenerationRequest } from '../../src/generations/image/execution.ts';
 import { launcher, prepareProfile } from '../../scripts/service/profile.ts';
-import { createImageDecoder } from '../../src/generations/decode.ts';
+import { createImageDecoder } from '../../src/generations/image/decode.ts';
 import { inspectGenerationCutover } from '../../scripts/service/generation-cutover.ts';
 import sharp from 'sharp';
 import { readAssetConfig } from '../../src/assets/config.ts';

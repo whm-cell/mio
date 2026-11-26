@@ -4,17 +4,34 @@ import type { Pool, PoolClient } from 'pg';
 export async function transaction<T>(
   pool: Pool,
   run: (client: PoolClient) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const client = await pool.connect();
+  let discard = false;
+  const disconnected = () => {
+    discard = true;
+  };
+  // The pool handles errors only while this client is idle.
+  client.on('error', disconnected);
   try {
     await client.query('BEGIN');
+    signal?.throwIfAborted();
     const result = await run(client);
+    // Once COMMIT is sent, PostgreSQL decides whether the durable job exists.
+    signal?.throwIfAborted();
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (!discard) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        discard = true;
+      }
+    }
     throw error;
   } finally {
-    client.release();
+    client.removeListener('error', disconnected);
+    client.release(discard);
   }
 }

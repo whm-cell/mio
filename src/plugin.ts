@@ -61,22 +61,19 @@ import { startAssetDerivatives } from './assets/derivatives.ts';
 import { createAssetHandler } from './assets/http.ts';
 import { createCosStorage } from './integrations/cos.ts';
 import { readComputeConfig } from './compute/config.ts';
-import { createComputeStore } from './compute/store.ts';
-import { createComputeService } from './compute/service.ts';
-import { createComputeHandler } from './compute/http.ts';
-import { createMediaHandler } from './compute/media-http.ts';
-import { createMediaService } from './compute/media-service.ts';
-import { createMediaStore } from './compute/media-store.ts';
-import { createComputeOpsHandler } from './compute/ops-http.ts';
+import { createComputeStore } from './compute/transcode/store.ts';
+import { createComputeService } from './compute/transcode/service.ts';
+import { createComputeHandler } from './compute/transcode/http.ts';
+import { createMediaHandler } from './compute/media/http.ts';
+import { createMediaService } from './compute/media/service.ts';
+import { createMediaStore } from './compute/media/store.ts';
+import { createComputeOpsHandler } from './compute/observability/http.ts';
 import {
   openWorkerObservabilityPool,
   WorkerObservabilityStore,
-} from './compute/worker-observability-store.ts';
-import { WorkerObservabilityQueries } from './compute/worker-observability-queries.ts';
-import {
-  startWorkerObservability,
-  WorkerControlStore,
-} from './compute/worker-observability-control.ts';
+} from './compute/observability/store.ts';
+import { WorkerObservabilityQueries } from './compute/observability/queries.ts';
+import { startWorkerObservability, WorkerControlStore } from './compute/observability/control.ts';
 import { ComputeBroker } from './integrations/rabbitmq.ts';
 import { createMaterialAuthService } from './materials/auth-service.ts';
 import { readMaterialConfig, readMaterialAuthConfig } from './materials/config.ts';
@@ -90,15 +87,15 @@ import {
 } from './integrations/onelink/materials.ts';
 import { readOneLinkSsoConfig } from './integrations/onelink/sso.ts';
 import { readGenerationConfig } from './generations/config.ts';
-import { createGenerationStore } from './generations/store.ts';
-import { createGenerationService } from './generations/service.ts';
-import type { GenerationService } from './generations/service.ts';
-import { createGenerationHandler } from './generations/http.ts';
-import { createVideoGenerationService } from './generations/video-service.ts';
-import { createVideoGenerationHandler } from './generations/video-http.ts';
-import { createVideoExecutor } from './generations/video-executor.ts';
-import { createVideoMaterializer, createVideoCleanup } from './generations/video-media.ts';
-import { createVideoInputResolver } from './generations/video-inputs.ts';
+import { createGenerationStore } from './generations/image/store.ts';
+import { createGenerationService } from './generations/image/service.ts';
+import type { GenerationService } from './generations/image/service.ts';
+import { createGenerationHandler } from './generations/image/http.ts';
+import { createVideoGenerationService } from './generations/video/service.ts';
+import { createVideoGenerationHandler } from './generations/video/http.ts';
+import { createVideoExecutor } from './generations/video/executor.ts';
+import { createVideoMaterializer, createVideoCleanup } from './generations/video/media.ts';
+import { createVideoInputResolver } from './generations/video/inputs.ts';
 import { createVideoProtocol } from './integrations/onelink/video/index.ts';
 import { readAdminConfig } from './admin/config.ts';
 import { createAdminStore } from './admin/store.ts';
@@ -142,6 +139,23 @@ async function closeMioResources(...steps: Array<() => Promise<void> | undefined
     }
   }
   if (failures.length) throw new AggregateError(failures, 'Mio resource cleanup failed');
+}
+
+async function closeVideoResources(
+  admission: ReturnType<typeof createVideoGenerationService> | undefined,
+  executor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined,
+): Promise<void> {
+  // Each async call starts its stop synchronously and captures even a synchronous throw.
+  const settled = await Promise.allSettled([
+    (async () => admission?.close())(),
+    (async () => executor?.close())(),
+  ]);
+  const failures = settled.filter((result) => result.status === 'rejected');
+  if (failures.length)
+    throw new AggregateError(
+      failures.map((result) => result.reason),
+      'Video cleanup failed',
+    );
 }
 
 /** Mount foundation and configured account routes. No global model-facing tool is authorized. */
@@ -238,6 +252,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     let conversations: ConversationService | undefined;
     let generations: GenerationService | undefined;
     let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
+    const closeWithVideo = (
+      drains: Array<() => Promise<void> | undefined>,
+      ...dependencies: Array<() => Promise<void> | undefined>
+    ) => {
+      const video = videoGenerations?.close();
+      // Cordis disposes sibling effects concurrently. Stop video immediately, then join its drain
+      // before releasing any shared dependency, even if another consumer has a slow close.
+      void video?.catch(() => {});
+      return closeMioResources(...drains, () => video, ...dependencies);
+    };
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
     let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
@@ -272,11 +296,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
         ctx.effect(
           () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => materials?.close(),
-              () => audio?.close(),
-              () => derivatives?.close(),
+            closeWithVideo(
+              [
+                () => conversations?.close(),
+                () => materials?.close(),
+                () => audio?.close(),
+                () => derivatives?.close(),
+              ],
               () => acquired.close(),
             ),
         );
@@ -294,22 +320,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     let providers: ProviderService | undefined;
     let compute: ReturnType<typeof createComputeService> | undefined;
-    if (computeConfig && assetConfig) {
+    if (computeConfig && assetConfig && assetResources) {
       const store = await createComputeStore(assetConfig.databaseURL);
       let ownedCompute: ReturnType<typeof createComputeService> | undefined;
       try {
         const acquired =
           (compute =
           ownedCompute =
-            createComputeService(store, createCosStorage(assetConfig), computeConfig));
+            createComputeService(store, assetResources.objects, computeConfig));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
-          () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => videoGenerations?.close(),
-              () => acquired.close(),
-            ),
+          () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
         );
         ctx.effect(() =>
           ctx.webServer.register({
@@ -423,10 +444,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         // Parent/child effects may unload concurrently: explicitly join admission and run teardown.
         ctx.effect(
           () => () =>
-            closeMioResources(
-              () => admin?.close(),
-              () => conversations?.close(),
-              () => videoGenerations?.close(),
+            closeWithVideo(
+              [() => admin?.close(), () => conversations?.close()],
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
@@ -575,26 +594,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
-    if (generationConfig && assetConfig) {
+    if (generationConfig && assetConfig && assetResources) {
       const store = await createGenerationStore(assetConfig.databaseURL);
       let ownedGenerations: GenerationService | undefined;
+      let videoAdmission: ReturnType<typeof createVideoGenerationService> | undefined;
       let videoExecutor: Awaited<ReturnType<typeof createVideoExecutor>> | undefined;
       let videoInputs: ReturnType<typeof createVideoInputResolver> | undefined;
+      let videoClosing: Promise<void> | undefined;
+      const closeVideo = () =>
+        (videoClosing ??= closeVideoResources(videoAdmission, videoExecutor));
       try {
         const acquired =
           (generations =
           ownedGenerations =
             await createGenerationService(
               store,
-              createCosStorage(assetConfig),
+              assetResources.objects,
               generationConfig,
               () => providers,
             ));
         const videoStore = store.videoStore();
         if (compute && generationConfig.videoEnabled) {
-          const objects = createCosStorage(assetConfig);
+          const { store: assetStore, objects } = assetResources;
           const probe = compute.probeVideo;
-          videoInputs = createVideoInputResolver(assetConfig.databaseURL, objects);
+          const inputs = (videoInputs = createVideoInputResolver(assetStore, objects));
           videoExecutor = await createVideoExecutor(
             videoStore,
             () => providers,
@@ -603,33 +626,28 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               protocol: createVideoProtocol,
               cleanup: createVideoCleanup(objects, generationConfig.dataDirectory),
               references: (row, signal) =>
-                videoInputs!.resolve(row.owner_id, row.command.inputSnapshot, signal),
+                inputs.resolve(
+                  row.owner_id,
+                  row.command.inputSnapshot,
+                  signal,
+                  row.command.inputObjects,
+                ),
             },
+            generationConfig.dataDirectory,
           );
         }
-        const admission = createVideoGenerationService(
+        const admission = (videoAdmission = createVideoGenerationService(
           videoStore,
           () => providers,
           videoExecutor,
-          videoInputs?.resolve,
-        );
-        let videoClosing: Promise<void> | undefined;
+          videoInputs?.inspect,
+        ));
         const ownedVideoGenerations = (videoGenerations = {
           ...admission,
-          close: () =>
-            (videoClosing ??= closeMioResources(
-              () => admission.close(),
-              () => videoExecutor?.close(),
-              () => videoInputs?.close(),
-            )),
+          close: closeVideo,
         });
         ctx.effect(
-          () => () =>
-            closeMioResources(
-              () => conversations?.close(),
-              () => ownedVideoGenerations.close(),
-              () => acquired.close(),
-            ),
+          () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
         );
         ctx.effect(() =>
           ctx.webServer.register({
@@ -658,12 +676,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
-        await closeMioResources(
-          () => videoGenerations?.close(),
-          () => videoExecutor?.close(),
-          () => videoInputs?.close(),
-          () => (ownedGenerations ? ownedGenerations.close() : store.close()),
-        );
+        try {
+          await closeMioResources(closeVideo, () =>
+            ownedGenerations ? ownedGenerations.close() : store.close(),
+          );
+        } catch (failure) {
+          throw new AggregateError([error, failure], 'Generation startup cleanup failed');
+        }
         throw error;
       }
     }
@@ -751,10 +770,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                         supportedModes: item.video.modes,
                       }));
                     },
-                    capabilities: (actor, modelRef) =>
-                      videoGenerations.capabilities(actor, modelRef),
-                    createVideo: (actor, request) =>
-                      videoGenerations.create(actor, request).then((result) => result.job),
+                    createVideo: (actor, request, signal) =>
+                      videoGenerations
+                        .createFromTool(actor, request, signal)
+                        .then((result) => result.job),
                     getVideo: (actor, jobId) => videoGenerations.get(actor, jobId),
                     recoverVideo: (actor, jobId) => videoGenerations.recover(actor, jobId),
                   }

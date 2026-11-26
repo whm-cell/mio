@@ -17,6 +17,7 @@ import {
   RESULT_EXCHANGE,
   RESULT_QUEUE,
   RESULT_ROUTING_KEY,
+  VIDEO_PROBE_COMMAND_QUEUE,
   VIDEO_PROBE_COMMAND_ROUTING_KEY,
   VIDEO_PROBE_RESULT_ROUTING_KEY,
   WORKER_TELEMETRY_QUEUE,
@@ -33,6 +34,14 @@ const audioDlq = 'mio.compute.audio.commands.dlq.v1';
 export const computeExchanges = [COMMAND_EXCHANGE, RESULT_EXCHANGE, commandDlx, resultDlx] as const;
 const sharedDeadLetters = new Map([
   [COMMAND_QUEUE, { exchange: commandDlx, queue: commandDlq, routingKey: 'transcode.dead.v1' }],
+  [
+    VIDEO_PROBE_COMMAND_QUEUE,
+    {
+      exchange: commandDlx,
+      queue: 'mio.compute.video.probe.commands.dlq.v1',
+      routingKey: 'video.probe.dead.v1',
+    },
+  ],
   [RESULT_QUEUE, { exchange: resultDlx, queue: resultDlq, routingKey: 'transcode.result.dead.v1' }],
   [
     AUDIO_COMMAND_QUEUE,
@@ -92,6 +101,7 @@ export function computePermissions(role: 'a' | 'b', workerInstanceId?: string) {
     ? [RESULT_QUEUE, AUDIO_RESULT_QUEUE, MEDIA_RESULT_QUEUE, WORKER_TELEMETRY_QUEUE]
     : [
         COMMAND_QUEUE,
+        VIDEO_PROBE_COMMAND_QUEUE,
         AUDIO_COMMAND_QUEUE,
         MEDIA_ENCODE_QUEUE,
         MEDIA_PROBE_QUEUE,
@@ -152,7 +162,7 @@ export function computeTopology(vhost: string, workerInstanceIds: readonly strin
   }
   const bindings: [string, string, string][] = [
     [COMMAND_EXCHANGE, COMMAND_QUEUE, COMMAND_ROUTING_KEY],
-    [COMMAND_EXCHANGE, COMMAND_QUEUE, VIDEO_PROBE_COMMAND_ROUTING_KEY],
+    [COMMAND_EXCHANGE, VIDEO_PROBE_COMMAND_QUEUE, VIDEO_PROBE_COMMAND_ROUTING_KEY],
     [RESULT_EXCHANGE, RESULT_QUEUE, RESULT_ROUTING_KEY],
     [RESULT_EXCHANGE, RESULT_QUEUE, VIDEO_PROBE_RESULT_ROUTING_KEY],
     [COMMAND_EXCHANGE, AUDIO_COMMAND_QUEUE, AUDIO_COMMAND_ROUTING_KEY],

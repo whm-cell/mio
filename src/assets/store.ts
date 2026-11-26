@@ -3,7 +3,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { Pool } from 'pg';
 import { checkAssetSchema } from './schema.ts';
 import { AssetError } from './contracts.ts';
-import { mediaHlsPath } from '../compute/media-hls.ts';
+import { mediaHlsPath } from '../compute/media/hls.ts';
 
 const log = createLogger('app', 'asset-store');
 
@@ -79,6 +79,26 @@ export class AssetStore {
     ).rows[0];
     if (!row) throw new AssetError(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
     return row;
+  }
+
+  /** Uploaded originals carry a staging ETag. Generated raw assets have no separate staging key. */
+  async readyOwned(ownerId: string, ids: readonly string[]) {
+    return (
+      await this.pool.query<{
+        id: string;
+        raw_key: string;
+        content_type: string;
+        size_bytes: string;
+        raw_etag: string | null;
+      }>(
+        `SELECT id,raw_key,content_type,size_bytes,
+         CASE WHEN raw_key LIKE 'mio/raw/%' AND staging_key<>raw_key THEN NULL
+              ELSE source_etag END AS raw_etag
+         FROM mio_assets
+         WHERE owner_id=$1 AND id=ANY($2::uuid[]) AND state='ready' AND raw_key IS NOT NULL`,
+        [ownerId, ids],
+      )
+    ).rows;
   }
 
   /** Check both unique identities before changing permissions on a recovered object. */

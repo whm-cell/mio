@@ -1,0 +1,113 @@
+import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { isUuidV4 } from '@mio/foundation/identifiers';
+import { IMAGE_MAX_MESSAGE_BYTES } from './contracts.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { AssetPrincipal } from '../../assets/contracts.ts';
+import { ProviderError } from '../../providers/contracts.ts';
+import { readJsonBody, RequestBodyError } from '../../http-request.ts';
+import { startHttpResponse, writeApiError } from '../../http-response.ts';
+import { GenerationError } from '../errors.ts';
+import type { GenerationService } from './service.ts';
+
+type Identity = (headers: Headers) => Promise<AssetPrincipal | null>;
+
+/** The public image paths stay under /compute while execution belongs to A. */
+export function createGenerationHandler(
+  service: GenerationService,
+  identity: Identity,
+  origins: readonly string[],
+) {
+  const allowed = new Set(origins);
+  return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    const requestId = startHttpResponse(response);
+    const fail = (status: number, code: string) =>
+      writeApiError(response, status, { code, message: code, requestId }, 'application/json');
+    try {
+      const origin = request.headers.origin;
+      if (origin !== undefined && !allowed.has(origin))
+        return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_DENIED');
+      if (origin !== undefined) {
+        response.setHeader('access-control-allow-origin', origin);
+        response.setHeader('access-control-allow-credentials', 'true');
+        response.setHeader('vary', 'Origin');
+      }
+      const url = new URL(request.url ?? '', 'http://mio.invalid');
+      if (url.search) return fail(HTTP_STATUS.BAD_REQUEST, 'QUERY_INVALID');
+      const parts = url.pathname.split('/').slice(4);
+      const create = parts.length === 1 && parts[0] === 'images';
+      const id = parts[1];
+      const get = parts.length === 2 && parts[0] === 'images' && id && isUuidV4(id);
+      const recover =
+        parts.length === 3 && parts[0] === 'images' && id && isUuidV4(id) && parts[2] === 'recover';
+      if (!create && !get && !recover) return fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
+      const write = create || recover;
+      const method = write ? 'POST' : 'GET';
+      if (request.method === 'OPTIONS') {
+        if (!origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+        response
+          .writeHead(HTTP_STATUS.NO_CONTENT, {
+            'access-control-allow-methods': method + ', OPTIONS',
+            'access-control-allow-headers': 'Content-Type',
+          })
+          .end();
+        return;
+      }
+      if (request.method !== method) {
+        response.setHeader('allow', method + ', OPTIONS');
+        return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
+      }
+      if (write && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
+      if (write && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
+        return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
+      const headers = new Headers();
+      if (request.headers.cookie) headers.set('cookie', request.headers.cookie);
+      let actor = await identity(headers);
+      if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+      if (write) {
+        const value = await readJsonBody(request, IMAGE_MAX_MESSAGE_BYTES);
+        actor = await identity(headers);
+        if (!actor) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        if (recover) {
+          if (Object.keys(value).length)
+            return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
+          const result = await service.recoverImage(actor, id!);
+          response
+            .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
+            .end(JSON.stringify(result));
+          return;
+        }
+        if (
+          Object.keys(value).length !== 3 ||
+          typeof value.requestId !== 'string' ||
+          typeof value.modelRef !== 'string' ||
+          !value.parameters ||
+          typeof value.parameters !== 'object' ||
+          Array.isArray(value.parameters)
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'IMAGE_INPUT_INVALID');
+        const result = await service.createImage(
+          actor,
+          value.requestId,
+          value.modelRef,
+          value.parameters as { prompt: string },
+        );
+        response
+          .writeHead(HTTP_STATUS.ACCEPTED, { 'content-type': 'application/json' })
+          .end(JSON.stringify(result));
+      } else {
+        const result = await service.getImage(actor, id!);
+        response
+          .writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' })
+          .end(JSON.stringify(result));
+      }
+    } catch (error) {
+      if (
+        error instanceof GenerationError ||
+        error instanceof ProviderError ||
+        error instanceof RequestBodyError
+      )
+        return fail(error.status, error.code);
+      return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_UNAVAILABLE');
+    }
+  };
+}

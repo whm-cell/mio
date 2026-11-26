@@ -6,7 +6,7 @@ import { startAssetDerivatives } from '../../src/assets/derivatives.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { createAssetService } from '../../src/assets/service.ts';
 import { AssetStore } from '../../src/assets/store.ts';
-import { MediaStore } from '../../src/compute/media-store.ts';
+import { MediaStore } from '../../src/compute/media/store.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { authDatabase } from '../support/auth-database.ts';
 

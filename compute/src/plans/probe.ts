@@ -1,29 +1,18 @@
 import type { MediaFailureCode, MediaProbe } from '@mio/compute-contracts';
 import type { MediaExecutionContext } from '../media-execution.ts';
+import { isVideoTrack, probeRatio, videoDisplayGeometry } from '../video-display.ts';
+import type { VideoDisplayStream } from '../video-display.ts';
 
 export function mediaError(code: MediaFailureCode): Error {
   return Object.assign(new Error(code), { code });
 }
 
-interface ProbeStream {
-  codec_type?: string;
+interface ProbeStream extends VideoDisplayStream {
   codec_name?: string;
   duration?: string;
-  width?: number;
-  height?: number;
-  sample_aspect_ratio?: string;
   avg_frame_rate?: string;
   sample_rate?: string;
   channels?: number;
-  tags?: { rotate?: string };
-  side_data_list?: { rotation?: number }[];
-  disposition?: { attached_pic?: number };
-}
-function ratio(value: string | undefined, separator: string): number | null {
-  const [a, b] = (value ?? '').split(separator).map(Number);
-  return a !== undefined && b !== undefined && a > 0 && b > 0 && Number.isFinite(a / b)
-    ? a / b
-    : null;
 }
 
 /** Shared by output verification; only the adapter can resolve the local name. */
@@ -65,9 +54,7 @@ export async function probeFile(
     throw mediaError('INPUT_INVALID');
   }
   if (!parsed || !Array.isArray(parsed.streams)) throw mediaError('INPUT_INVALID');
-  const video = parsed.streams.find(
-    (s) => s.codec_type === 'video' && !s.disposition?.attached_pic,
-  );
+  const video = parsed.streams.find(isVideoTrack);
   const audio = parsed.streams.find((s) => s.codec_type === 'audio');
   if (!video && !audio) throw mediaError('INPUT_INVALID');
   const durations = [parsed.format?.duration, video?.duration, audio?.duration]
@@ -77,49 +64,22 @@ export async function probeFile(
   const durationSeconds = Math.max(0, ...durations);
   if (durationSeconds > 3600) throw mediaError('INPUT_TOO_LONG');
   if (!durationSeconds && !video) throw mediaError('INPUT_INVALID');
-  const rawRotation =
-    video?.side_data_list?.find((s) => s.rotation !== undefined)?.rotation ??
-    Number(video?.tags?.rotate ?? 0);
-  if (!Number.isFinite(rawRotation)) throw mediaError('INPUT_INVALID');
-  const rotation = ((rawRotation % 360) + 360) % 360;
-  const sar = ratio(video?.sample_aspect_ratio, ':') ?? 1;
-  let width: number | null = null,
-    height: number | null = null;
-  if (video) {
-    if (
-      !video.width ||
-      !video.height ||
-      !Number.isSafeInteger(video.width) ||
-      !Number.isSafeInteger(video.height) ||
-      video.width < 1 ||
-      video.height < 1
-    )
-      throw mediaError('INPUT_INVALID');
-    const radians = (rotation * Math.PI) / 180;
-    width = Math.round(
-      Math.abs(Math.cos(radians)) * video.width * sar + Math.abs(Math.sin(radians)) * video.height,
-    );
-    height = Math.round(
-      Math.abs(Math.sin(radians)) * video.width * sar + Math.abs(Math.cos(radians)) * video.height,
-    );
-  }
+  const display = video ? videoDisplayGeometry(video) : null;
+  if (video && !display) throw mediaError('INPUT_INVALID');
   return {
     durationSeconds,
     format: parsed.format?.format_name ?? 'unknown',
     hasVideo: !!video,
     hasAudio: !!audio,
-    width,
-    height,
-    rotation,
-    sampleAspectRatio:
-      video?.sample_aspect_ratio && ratio(video.sample_aspect_ratio, ':')
-        ? video.sample_aspect_ratio
-        : '1:1',
+    width: display?.width ?? null,
+    height: display?.height ?? null,
+    rotation: display?.rotation ?? 0,
+    sampleAspectRatio: display?.sampleAspectRatio ?? '1:1',
     videoCodec: video?.codec_name ?? null,
     audioCodec: audio?.codec_name ?? null,
     sampleRate: audio && Number(audio.sample_rate) > 0 ? Number(audio.sample_rate) : null,
     channels: audio?.channels ?? null,
-    fps: ratio(video?.avg_frame_rate, '/'),
+    fps: probeRatio(video?.avg_frame_rate, '/'),
   };
 }
 

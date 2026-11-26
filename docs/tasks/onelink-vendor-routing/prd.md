@@ -1,5 +1,7 @@
 # 万联数据库模型路由目录与原厂协议解耦 PRD
 
+本文中旧图片执行链的 A→B 路径和行号对应当时设计。后续执行入口及退役范围见[图片迁入 A 的方案](../onelink-image-generation/changes/image-generation-in-a/change.md)。
+
 状态：Unit 1（`onelink-db-vendor-routing`）实施与待人类接受阶段；Unit 2（`onelink-route-live-expansion`）待推进。详细表结构、消息契约、修枝说明与全仓硬编码处置见[详细设计](design.md)。关联权威规范：[供应商配置](../../providers.md)、[万联集成](../../integrations/onelink.md)、[计算服务协议](../compute-service/protocol.md)、[协调协议](../../coordination.md#当前任务的生命周期)。既有已接受范围分别以[万联接入成果](../onelink-integration/complete/report.md)、[图片能力成果](../onelink-image-generation/complete/report.md)和[计算服务成果](../compute-service/complete/report.md)为准，本需求不重开或改写任何旧接受。返回[任务资料与成果](../index.md)。
 
 ## 1. 问题依据与现网模型实证

@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { expect, it } from 'vitest';
-import { GenerationFiles } from '../../src/generations/files.ts';
-import { createImageDecoder } from '../../src/generations/decode.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
+import { createImageDecoder } from '../../src/generations/image/decode.ts';
 
 it('fully decodes valid original bytes and rejects a damaged body with a valid PNG signature', async () => {
   const original = await sharp({

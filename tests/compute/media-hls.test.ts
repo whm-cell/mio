@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mediaObjectPrefix } from '@mio/compute-contracts';
 import { describe, expect, it, vi } from 'vitest';
-import { mediaHls, mediaHlsPath } from '../../src/compute/media-hls.ts';
-import type { MediaHlsPackage } from '../../src/compute/media-hls.ts';
+import { mediaHls, mediaHlsPath } from '../../src/compute/media/hls.ts';
+import type { MediaHlsPackage } from '../../src/compute/media/hls.ts';
 
 const header = '#EXTM3U\n#EXT-X-VERSION:3\n';
 const masterText = (reference: string) =>

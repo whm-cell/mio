@@ -1,9 +1,9 @@
 import type { Pool } from 'pg';
-import { checkMediaSchema, mediaSchemaSQL } from './media-schema.ts';
+import { checkMediaSchema, mediaSchemaSQL } from './media/schema.ts';
 import {
   checkWorkerObservabilitySchema,
   workerObservabilitySchemaSQL,
-} from './worker-observability-schema.ts';
+} from './observability/schema.ts';
 
 /** Incremental media-domain migration; existing original assets remain intact. */
 export const computeSchemaSQL = `

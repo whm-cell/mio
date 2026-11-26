@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { createImageDecoder } from '../../src/generations/decode.ts';
+import { createImageDecoder } from '../../src/generations/image/decode.ts';
 import { registerVendorRoutingCases } from './protocol-fixture.ts';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -9,7 +9,7 @@ import {
   validateImageRouteConfig,
   type ImageDriver,
   type ImageRouteConfig,
-} from '../../src/generations/contracts.ts';
+} from '../../src/generations/image/contracts.ts';
 import {
   createRoutedImageProtocol,
   type ReadImage,

@@ -1,5 +1,9 @@
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
 import {
+  defaultVideoGenerateAudio,
+  isVideoProtocolModelId,
+} from '../../../generations/video/driver-capabilities.ts';
+import {
   validateVideoParameters,
   validateVideoRouteConfig,
 } from '../../../providers/onelink/video-route.ts';
@@ -7,16 +11,11 @@ import type {
   VideoProtocol,
   VideoQueryResult,
   VideoSubmitResult,
-} from '../../../generations/video-execution.ts';
+} from '../../../generations/video/execution.ts';
+import { VideoProtocolRouteInvalid } from '../../../generations/video/execution.ts';
 import { endpoint, operationPath, readJson, TASK_ID } from './shared.ts';
 import { videoSubmission } from './payload.ts';
 import { submissionTask, videoQueryResult } from './response.ts';
-
-export type {
-  VideoProtocol,
-  VideoQueryResult,
-  VideoSubmitResult,
-} from '../../../generations/video-execution.ts';
 
 const KLING_QUERY_PATHS = new Set([
   '/kling/v1/videos/text2video',
@@ -24,8 +23,14 @@ const KLING_QUERY_PATHS = new Set([
   '/kling/v1/videos/omni-video',
 ]);
 
-function queryPath(route: VideoRouteConfig, taskId: string): string | undefined {
-  if (route.driver === 'veo-videos') return operationPath(taskId);
+function queryTarget(
+  route: VideoRouteConfig,
+  taskId: string,
+): { path: string; expectedId: string } | undefined {
+  if (route.driver === 'veo-videos') {
+    const path = operationPath(taskId);
+    return path ? { path, expectedId: path } : undefined;
+  }
   if (route.driver === 'kling-videos') {
     try {
       const token: unknown = JSON.parse(taskId);
@@ -39,13 +44,16 @@ function queryPath(route: VideoRouteConfig, taskId: string): string | undefined 
         !TASK_ID.test(value.id)
       )
         return;
-      return value.path + '/' + encodeURIComponent(value.id);
+      return { path: value.path + '/' + encodeURIComponent(value.id), expectedId: value.id };
     } catch {
       return;
     }
   }
   if (!TASK_ID.test(taskId)) return;
-  return route.queryPathTemplate.replace('{task_id}', encodeURIComponent(taskId));
+  return {
+    path: route.queryPathTemplate.replace('{task_id}', encodeURIComponent(taskId)),
+    expectedId: taskId,
+  };
 }
 
 function rejection(status: number): string {
@@ -61,11 +69,11 @@ export function createVideoProtocol(
   transport: typeof fetch = fetch,
 ): VideoProtocol {
   const validated = validateVideoRouteConfig({ ...route, editPath: null });
-  if (!validated || !/^[A-Za-z0-9._:-]{1,256}$/.test(modelId))
-    throw new Error('VIDEO_ROUTE_INVALID');
+  if (!validated || !isVideoProtocolModelId(modelId)) throw new VideoProtocolRouteInvalid();
+  const audioDefault = defaultVideoGenerateAudio(validated.driver, modelId);
   return {
     async submit(parameters, refs, key, signal): Promise<VideoSubmitResult> {
-      if (!validateVideoParameters(parameters, validated))
+      if (!validateVideoParameters(parameters, validated, audioDefault))
         return { state: 'rejected', code: 'VIDEO_INPUT_INVALID' };
       let submission;
       try {
@@ -93,7 +101,7 @@ export function createVideoProtocol(
             : { state: 'unknown', code: 'VIDEO_SUBMISSION_UNKNOWN' };
         }
         const data = await readJson(response);
-        const id = submissionTask(validated.driver, data);
+        const id = data && submissionTask(validated.driver, data);
         if (!id) return { state: 'unknown', code: 'VIDEO_SUBMISSION_UNKNOWN' };
         const upstreamTaskId =
           validated.driver === 'kling-videos' ? JSON.stringify({ path: submission.path, id }) : id;
@@ -103,25 +111,35 @@ export function createVideoProtocol(
       }
     },
     async query(taskId, key, signal): Promise<VideoQueryResult> {
-      const path = queryPath(validated, taskId);
-      if (!path) return { state: 'failed', code: 'VIDEO_TASK_INVALID' };
+      const target = queryTarget(validated, taskId);
+      if (!target) return { state: 'failed', code: 'VIDEO_TASK_INVALID' };
       try {
         signal.throwIfAborted();
-        const response = await transport(endpoint(path), {
+        const response = await transport(endpoint(target.path), {
           method: 'GET',
           redirect: 'error',
           signal,
           headers: { Authorization: 'Bearer ' + key },
         });
         if (!response.ok) {
-          await response.body?.cancel();
-          if (response.status >= 500 || response.status === 429 || response.status === 408)
-            return { state: 'processing' };
-          return { state: 'failed', code: rejection(response.status) };
+          void response.body?.cancel().catch(() => {});
+          const { status } = response;
+          if (status === 401 || status === 403) return { state: 'retry', code: 'VIDEO_QUERY_AUTH' };
+          if (status === 429) return { state: 'retry', code: 'VIDEO_QUERY_RATE_LIMITED' };
+          if (status === 408) return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' };
+          if (status >= 500) return { state: 'retry', code: 'VIDEO_QUERY_UPSTREAM_UNAVAILABLE' };
+          return { state: 'failed', code: rejection(status) };
         }
-        return videoQueryResult(validated.driver, await readJson(response));
+        const data = await readJson(response);
+        return data
+          ? videoQueryResult(validated.driver, data, target.expectedId)
+          : { state: 'retry', code: 'VIDEO_QUERY_RESPONSE_INVALID' };
       } catch {
-        return { state: 'processing' };
+        const reason: unknown = signal.reason;
+        if (reason instanceof DOMException && reason.name === 'TimeoutError')
+          return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' };
+        signal.throwIfAborted();
+        return { state: 'retry', code: 'VIDEO_QUERY_NETWORK_ERROR' };
       }
     },
   };

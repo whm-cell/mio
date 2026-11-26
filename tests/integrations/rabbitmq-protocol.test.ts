@@ -1,15 +1,30 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { connect, type SocketOptions } from 'amqplib';
 import { expect, it, vi } from 'vitest';
 import {
   COMMAND_QUEUE,
   RESULT_QUEUE,
+  VIDEO_PROBE_ADMISSION_HEADER,
+  VIDEO_PROBE_ADMISSION_MS,
+  VIDEO_PROBE_COMMAND_QUEUE,
+  parseVideoProbeCommandV1,
   type ComputeCommandV1,
   type ComputeResultV1,
+  type VideoProbeCommandV1,
+  type VideoProbeResultV1,
 } from '@mio/compute-contracts';
+import { Journal } from '../../compute/src/adapters/journal.ts';
 import { Broker } from '../../compute/src/adapters/rabbitmq.ts';
+import { Maintenance } from '../../compute/src/maintenance.ts';
+import { ResourceSlots } from '../../compute/src/resource-slots.ts';
+import { Worker } from '../../compute/src/worker.ts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import { withLocalTestBroker } from '../support/local-broker-fixture.ts';
+
+const videoProbeCommandDlq = 'mio.compute.video.probe.commands.dlq.v1';
 
 async function assertQueueBoundary(url: string, drainedQueue: string, forbiddenQueue: string) {
   const socket: SocketOptions & { signal: AbortSignal } = { signal: AbortSignal.timeout(5_000) };
@@ -93,6 +108,256 @@ it('routes an A command and B result, honors both ACKs, and refuses each role th
     await assertQueueBoundary(appBrokerUrl, RESULT_QUEUE, COMMAND_QUEUE);
   });
 }, 90_000);
+
+it.each([
+  { monitored: false, legacyVideoProbeBinding: false },
+  { monitored: true, legacyVideoProbeBinding: false },
+  { monitored: true, legacyVideoProbeBinding: true },
+] as const)(
+  'routes probes with observed=$monitored and legacy binding=$legacyVideoProbeBinding',
+  async ({ monitored, legacyVideoProbeBinding }) => {
+    const observerInstance = 'video-probe-observer';
+    await withLocalTestBroker(
+      async ({ appBrokerUrl, workerBrokerUrl, userA, userB, restrictWorkerToObservation }) => {
+        const jobId = randomUUID();
+        const attemptId = randomUUID();
+        const command: VideoProbeCommandV1 = {
+          version: 1,
+          type: 'video.probe',
+          messageId: randomUUID(),
+          jobId,
+          attemptId,
+          outputIndex: 0,
+          attempt: 1,
+          source: {
+            stagingKey: `mio/staging/video/${jobId}/0/${attemptId}.media`,
+            sizeBytes: 1,
+            etag: '"etag"',
+            sha256: 'a'.repeat(64),
+          },
+        };
+        const invalid = {
+          ...command,
+          messageId: randomUUID(),
+          source: { ...command.source, stagingKey: 'mio/staging/video/foreign' },
+        };
+        const expired = { ...command, messageId: randomUUID() };
+        const expiredDeadline = Date.now() - 1;
+        const admitBy = Date.now() + VIDEO_PROBE_ADMISSION_MS;
+        const received = vi.fn<(value: VideoProbeResultV1) => void>();
+        const transcodeResult = vi.fn();
+        const failed = vi.fn();
+        const assetId = randomUUID();
+        const transcodes: ComputeCommandV1[] = Array.from(
+          { length: monitored && !legacyVideoProbeBinding ? 32 : 0 },
+          () => ({
+            version: 1,
+            type: 'transcode.request',
+            messageId: randomUUID(),
+            jobId: randomUUID(),
+            attemptId: randomUUID(),
+            attempt: 1,
+            profile: 'mp4-h264-aac-720p24-v1',
+            input: {
+              assetId,
+              key: `mio/raw/${assetId}/${randomUUID()}`,
+              sizeBytes: 1,
+              etag: 'etag',
+            },
+          }),
+        );
+        const downloadVideoProbe = vi.fn(async () => {
+          throw new Error('SOURCE_CHANGED');
+        });
+        const slots = new ResourceSlots();
+        if (monitored) slots.setLimits({ total: 1, encode: 0, probe: 1 });
+        const directory = mkdtempSync(join(tmpdir(), 'mio-video-probe-broker-'));
+        try {
+          const journal = new Journal(directory, 'test-video-probe', true);
+          try {
+            const app = await ComputeBroker.connect(appBrokerUrl, userA, userB);
+            try {
+              await app.consume(
+                async (value) => {
+                  transcodeResult(value);
+                },
+                failed,
+                async (value) => {
+                  received(value);
+                },
+              );
+              const broker = await Broker.connect(workerBrokerUrl, userB, userA);
+              const worker = new Worker(
+                journal,
+                {
+                  async download() {
+                    throw Object.assign(new Error('changed input'), { statusCode: 412 });
+                  },
+                  async head() {
+                    return null;
+                  },
+                  async verify() {
+                    return false;
+                  },
+                  upload: vi.fn(),
+                  downloadVideoProbe,
+                },
+                broker,
+                directory,
+                slots,
+              );
+              const maintenance = new Maintenance(broker, worker, failed, monitored);
+              try {
+                if (legacyVideoProbeBinding) {
+                  // A previously routed delivery survives closing its unacknowledged consumer.
+                  await app.publish(command);
+                  await app.publish(expired, expiredDeadline);
+                  const old = await connect(workerBrokerUrl);
+                  old.on('error', () => {});
+                  try {
+                    const channel = await old.createChannel();
+                    const delivery = await channel.get(COMMAND_QUEUE, { noAck: false });
+                    expect(delivery).toMatchObject({
+                      properties: { messageId: command.messageId },
+                    });
+                    const marked = await channel.get(COMMAND_QUEUE, { noAck: false });
+                    if (!marked) throw new Error('Expected marked probe on the legacy queue');
+                    expect(marked.properties.headers?.[VIDEO_PROBE_ADMISSION_HEADER]).toBe(
+                      expiredDeadline,
+                    );
+                    expect(parseVideoProbeCommandV1(JSON.parse(marked.content.toString()))).toEqual(
+                      expired,
+                    );
+                  } finally {
+                    await old.close();
+                  }
+                }
+                await broker.consumeVideoProbes(
+                  worker.handleVideoProbe.bind(worker),
+                  failed,
+                  monitored,
+                );
+                await maintenance.tick();
+                if (transcodes.length) {
+                  for (const transcode of transcodes) await app.publish(transcode);
+                  await vi.waitFor(() =>
+                    expect(slots.snapshot().waiting.encode).toBe(transcodes.length),
+                  );
+                }
+                if (!legacyVideoProbeBinding) {
+                  await app.publish(invalid);
+                  await app.publish(command, admitBy);
+                  await app.publish(expired, expiredDeadline);
+                }
+                await vi.waitFor(
+                  () => {
+                    expect(downloadVideoProbe).toHaveBeenCalledExactlyOnceWith(
+                      legacyVideoProbeBinding ? command : { ...command, admitBy },
+                      directory,
+                      expect.any(AbortSignal),
+                    );
+                    expect(received).toHaveBeenCalledTimes(2);
+                    expect(received).toHaveBeenCalledWith(
+                      expect.objectContaining({
+                        type: 'video.probe.result',
+                        commandId: command.messageId,
+                        jobId,
+                        attemptId,
+                        outputIndex: 0,
+                        attempt: 1,
+                        source: command.source,
+                        state: 'failed',
+                        errorCode: 'SOURCE_CHANGED',
+                      }),
+                    );
+                    expect(received).toHaveBeenCalledWith(
+                      expect.objectContaining({
+                        commandId: expired.messageId,
+                        source: expired.source,
+                        state: 'failed',
+                        errorCode: 'EXECUTION_TIMEOUT',
+                      }),
+                    );
+                  },
+                  { timeout: 5_000 },
+                );
+                expect(transcodeResult).not.toHaveBeenCalled();
+                if (transcodes.length) {
+                  expect(slots.snapshot().waiting.encode).toBe(transcodes.length);
+                  slots.setLimits({ total: 1, encode: 1, probe: 1 });
+                  await vi.waitFor(
+                    () => expect(transcodeResult).toHaveBeenCalledTimes(transcodes.length * 2),
+                    { timeout: 5_000 },
+                  );
+                  expect(transcodeResult).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                      jobId: transcodes[0]!.jobId,
+                      state: 'failed',
+                      errorCode: 'INPUT_CHANGED',
+                    }),
+                  );
+                }
+                await worker.waitIdle();
+                expect(failed).not.toHaveBeenCalled();
+              } finally {
+                maintenance.stop();
+                worker.stop();
+                await broker.close();
+                await worker.waitIdle();
+              }
+            } finally {
+              await app.close();
+            }
+          } finally {
+            journal.close();
+          }
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+        await assertQueueBoundary(workerBrokerUrl, COMMAND_QUEUE, RESULT_QUEUE);
+        await assertQueueBoundary(workerBrokerUrl, VIDEO_PROBE_COMMAND_QUEUE, RESULT_QUEUE);
+        await assertQueueBoundary(appBrokerUrl, RESULT_QUEUE, VIDEO_PROBE_COMMAND_QUEUE);
+        if (!legacyVideoProbeBinding) {
+          if (!restrictWorkerToObservation) throw new Error('DLQ observation unavailable');
+          const observer = await connect(await restrictWorkerToObservation(), { timeout: 5_000 });
+          observer.on('error', () => {});
+          try {
+            const channel = await observer.createChannel();
+            channel.on('error', () => {});
+            const delivery = await vi.waitFor(
+              async () => {
+                const message = await channel.get(videoProbeCommandDlq, { noAck: false });
+                if (!message) throw new Error(`No delivery in ${videoProbeCommandDlq}`);
+                return message;
+              },
+              { timeout: 8_000 },
+            );
+            expect(delivery.properties.messageId).toBe(invalid.messageId);
+            expect(delivery.content).toEqual(Buffer.from(JSON.stringify(invalid)));
+            expect(delivery.properties.headers?.['x-death']).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({ queue: VIDEO_PROBE_COMMAND_QUEUE, reason: 'rejected' }),
+              ]),
+            );
+            channel.ack(delivery);
+            await channel.prefetch(1);
+          } finally {
+            await observer.close();
+          }
+        }
+      },
+      legacyVideoProbeBinding
+        ? undefined
+        : {
+            instanceId: observerInstance,
+            instanceIds: [observerInstance],
+            observeQueue: videoProbeCommandDlq,
+          },
+      legacyVideoProbeBinding ? { legacyVideoProbeBinding: true } : undefined,
+    );
+  },
+  90_000,
+);
 
 it('verifies the vhost and both users are gone even when the protocol case throws', async () => {
   const failure = new Error('deliberate protocol case failure');

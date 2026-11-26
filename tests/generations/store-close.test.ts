@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { expect, it, vi } from 'vitest';
-import { GenerationStore } from '../../src/generations/store.ts';
-import { createGenerationService } from '../../src/generations/service.ts';
+import { GenerationStore } from '../../src/generations/image/store.ts';
+import { createGenerationService } from '../../src/generations/image/service.ts';
 import { generationFixture } from './fixture.ts';
 
 it('only rewrites stale claims and interrupted queries after acquiring the executor lease', async () => {

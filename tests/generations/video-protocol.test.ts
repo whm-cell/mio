@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import type { VideoDriver, VideoMode } from '../../src/generations/video-contracts.ts';
+import type {
+  VideoDriver,
+  VideoMode,
+  VideoRequestParameters,
+} from '../../src/generations/video/contracts.ts';
 import type { VideoParameterSpec, VideoRouteConfig } from '../../src/providers/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
 
@@ -82,9 +86,14 @@ function body(fetcher: ReturnType<typeof transport>): Record<string, unknown> {
 
 describe('bounded OneLink video protocol', () => {
   it('retains ordered Ark frame/media roles and polls one original task', async () => {
+    const firstFrameUrl = 'https://MEDIA.fixture:443/first.png?token=fixture%2F+value';
     const fetcher = transport(
       { id: 'ark-task-1' },
-      { status: 'succeeded', content: { video_url: 'https://cdn.fixture/output.mp4' } },
+      {
+        id: 'ark-task-1',
+        status: 'succeeded',
+        content: { video_url: 'https://CDN.fixture:443/output.mp4' },
+      },
     );
     const protocol = createVideoProtocol(
       route('volcengine-ark-videos', ['start_end', 'full']),
@@ -103,7 +112,7 @@ describe('bounded OneLink video protocol', () => {
         firstFrame: { assetId: first },
         lastFrame: { assetId: last },
       },
-      refs,
+      { ...refs, [first]: firstFrameUrl },
       key,
       signal,
     );
@@ -112,7 +121,7 @@ describe('bounded OneLink video protocol', () => {
       model: 'doubao-seedance-2-0-fast',
       content: [
         { type: 'text', text: 'frames' },
-        { type: 'image_url', image_url: { url: refs[first] }, role: 'first_frame' },
+        { type: 'image_url', image_url: { url: firstFrameUrl }, role: 'first_frame' },
         { type: 'image_url', image_url: { url: refs[last] }, role: 'last_frame' },
       ],
       duration: 4,
@@ -148,11 +157,16 @@ describe('bounded OneLink video protocol', () => {
       key,
       signal,
     );
-    expect(
-      JSON.parse(String(fetcher.mock.calls[2]![1]?.body)).content.map(
-        (item: { role?: string }) => item.role,
-      ),
-    ).toEqual([undefined, 'reference_video', 'reference_image', 'reference_audio']);
+    const fullPayload = JSON.parse(String(fetcher.mock.calls[2]![1]?.body)) as {
+      content: { role?: string }[];
+    };
+    expect(fullPayload.content.map((item) => item.role)).toEqual([
+      undefined,
+      'reference_video',
+      'reference_image',
+      'reference_audio',
+    ]);
+    expect(fullPayload).not.toHaveProperty('generate_audio');
   });
 
   it('persists the original Kling image endpoint in its task token', async () => {
@@ -161,6 +175,7 @@ describe('bounded OneLink video protocol', () => {
       {
         code: 0,
         data: {
+          task_id: 'kling-1',
           task_status: 'succeed',
           task_result: { videos: [{ url: 'https://cdn.fixture/kling.mp4' }] },
         },
@@ -212,7 +227,7 @@ describe('bounded OneLink video protocol', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('uses Omni contents/settings and never flattens a reference video', async () => {
+  it('encodes Omni video_ref as feature_video with its own settings', async () => {
     const fetcher = transport({ code: 0, data: { task_id: 'omni-1' } }, {});
     const protocol = createVideoProtocol(
       route('kling-videos', ['video_ref']),
@@ -243,8 +258,106 @@ describe('bounded OneLink video protocol', () => {
     });
   });
 
-  it('rejects turbo tail frames and explicit sound before POST', async () => {
-    const fetcher = transport({}, {});
+  it.each([
+    ['video-kling-v3', '/kling/v1/videos/text2video'],
+    ['video-kling-v3-omni', '/kling/v1/videos/omni-video'],
+  ])('encodes omitted and frozen native audio for %s', async (model, path) => {
+    const fetcher = transport({ code: 0, data: { task_id: 'kling-audio' } }, {});
+    for (const canOverride of [true, false]) {
+      const protocol = createVideoProtocol(
+        route('kling-videos', ['text_to_video'], {
+          generateAudio: canOverride,
+          offPeak: false,
+        }),
+        model,
+        fetcher,
+      );
+      for (const generateAudio of [undefined, true, false]) {
+        const testInput = {
+          mode: 'text_to_video' as const,
+          prompt: 'Listen to the wind.',
+          ...(generateAudio !== undefined ? { generateAudio } : {}),
+        };
+        fetcher.mockClear();
+        const result = await protocol.submit(testInput, {}, key, signal);
+        if (!canOverride && generateAudio === false) {
+          expect(result).toEqual({ state: 'rejected', code: 'VIDEO_INPUT_INVALID' });
+          expect(fetcher).not.toHaveBeenCalled();
+          continue;
+        }
+        expect(result).toMatchObject({ state: 'submitted' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect(new URL(String(fetcher.mock.calls[0]![0])).pathname).toBe(path);
+        expect(body(fetcher)).toHaveProperty(
+          'settings.audio',
+          generateAudio === false ? 'off' : 'native',
+        );
+        if (model === 'video-kling-v3')
+          expect(body(fetcher)).toHaveProperty('sound', generateAudio === false ? 'off' : 'on');
+        else expect(body(fetcher)).not.toHaveProperty('sound');
+      }
+    }
+  });
+
+  it('retains Kling supplier ordinals for mixed results and rejects invalid envelopes', async () => {
+    const taskId = JSON.stringify({ path: '/kling/v1/videos/image2video', id: 'old-task' });
+    const result = (videos: unknown) => ({
+      code: 0,
+      data: {
+        task_id: 'old-task',
+        task_status: 'succeed',
+        task_result: { videos },
+      },
+    });
+    const good = { url: 'https://cdn.fixture/video.mp4' };
+    const last = { url: 'https://cdn.fixture/another.mp4?token=fixture' };
+    const invalidUrls = [
+      'http://cdn.fixture/insecure.mp4',
+      'https://cdn.fixture:8443/video.mp4',
+      'https://cdn.fixture/video.mp4#fragment',
+      `https://cdn.fixture/video.mp4?token=${'x'.repeat(8192)}`,
+    ];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json(result([good, null, ...invalidUrls.map((url) => ({ url })), last])),
+      );
+    const protocol = createVideoProtocol(route('kling-videos'), 'fixture-model', fetcher);
+    await expect(protocol.query(taskId, key, signal)).resolves.toEqual({
+      state: 'returned',
+      videos: [
+        good,
+        { errorCode: 'VIDEO_RESULT_INVALID' },
+        ...invalidUrls.map(() => ({ errorCode: 'VIDEO_RESULT_INVALID' })),
+        last,
+      ],
+    });
+    const full = Array.from({ length: 16 }, () => good);
+    fetcher.mockResolvedValueOnce(Response.json(result(full)));
+    await expect(protocol.query(taskId, key, signal)).resolves.toEqual({
+      state: 'returned',
+      videos: full,
+    });
+    for (const bad of [
+      null,
+      { 0: good },
+      [],
+      [{ url: 'https://user:pass@cdn.fixture/video.mp4' }, 'https://cdn.fixture/not-a-slot.mp4'],
+      Array.from({ length: 17 }, () => good),
+    ]) {
+      fetcher.mockResolvedValueOnce(Response.json(result(bad)));
+      await expect(protocol.query(taskId, key, signal)).resolves.toEqual({
+        state: 'failed',
+        code: 'VIDEO_RESPONSE_INVALID',
+      });
+    }
+    expect(
+      fetcher.mock.calls.map(([url, options]) => [new URL(String(url)).pathname, options?.method]),
+    ).toEqual(Array.from({ length: 7 }, () => ['/kling/v1/videos/image2video/old-task', 'GET']));
+  });
+
+  it('rejects turbo tail frames and explicit sound and omits audio on valid POST', async () => {
+    const fetcher = transport({ code: 0, data: { task_id: 'kling-turbo' } }, {});
     const protocol = createVideoProtocol(
       route('kling-videos', ['text_to_video', 'first_frame'], {
         generateAudio: false,
@@ -280,12 +393,20 @@ describe('bounded OneLink video protocol', () => {
       ).state,
     ).toBe('rejected');
     expect(fetcher).not.toHaveBeenCalled();
+    expect(
+      await protocol.submit({ mode: 'text_to_video', prompt: 'A boat.' }, {}, key, signal),
+    ).toMatchObject({ state: 'submitted' });
+    expect(body(fetcher)).not.toHaveProperty('sound');
+    expect(body(fetcher)).not.toHaveProperty('settings.audio');
   });
 
   it('encodes Vidu q2 named subjects without q3-only fields', async () => {
     const fetcher = transport(
       { task_id: 'vidu-1' },
-      { state: 'success', creations: [{ watermarked_url: 'https://cdn.fixture/vidu.mp4' }] },
+      {
+        state: 'success',
+        creations: [{ id: 'vidu-work-1', watermarked_url: 'https://cdn.fixture/vidu.mp4' }],
+      },
     );
     const protocol = createVideoProtocol(
       route('vidu-videos', ['reference_subjects'], {
@@ -351,6 +472,24 @@ describe('bounded OneLink video protocol', () => {
       off_peak: true,
     });
     expect(await protocol.query('q3-1', key, signal)).toEqual({ state: 'processing' });
+  });
+
+  it('uses the original Vidu query path for a frozen route that declared full mode', async () => {
+    const fetcher = transport({ task_id: 'new-vidu' }, { state: 'processing' });
+    const protocol = createVideoProtocol(
+      route('vidu-videos', ['text_to_video', 'full']),
+      'video-viduq3-pro',
+      fetcher,
+    );
+    expect(
+      await protocol.submit({ mode: 'text_to_video', prompt: 'A boat.' }, {}, key, signal),
+    ).toMatchObject({ state: 'submitted' });
+    expect(body(fetcher)).not.toHaveProperty('audio');
+    expect(await protocol.query('legacy-vidu-full', key, signal)).toEqual({ state: 'processing' });
+    expect(new URL(String(fetcher.mock.calls[1]![0])).pathname).toBe(
+      '/vidu/ent/v2/tasks/legacy-vidu-full/creations',
+    );
+    expect(fetcher.mock.calls.map(([, options]) => options?.method)).toEqual(['POST', 'GET']);
   });
 
   it('retains the Veo full operation path and waits for done=true', async () => {
@@ -458,10 +597,103 @@ describe('bounded OneLink video protocol', () => {
     }
   });
 
-  it('encodes HappyHorse exact i2v and video-edit media forms with async header', async () => {
+  it('maps every HappyHorse subject name to its own ordered image slots', async () => {
+    const fetcher = transport({ output: { task_id: 'horse-1' } }, {});
+    const protocol = createVideoProtocol(
+      route('happyhorse-videos', ['reference_subjects']),
+      'happyhorse-1.1-r2v',
+      fetcher,
+    );
+    const prompt = '领队看向旅人和[Image 3]后方。';
+    for (const [lead, traveler] of [
+      ['领队', '旅人'],
+      ['旅人', '领队'],
+    ] as const) {
+      expect(
+        await protocol.submit(
+          {
+            mode: 'reference_subjects',
+            prompt,
+            subjects: [
+              { name: lead, images: [{ assetId: first }, { assetId: last }] },
+              { name: traveler, images: [{ assetId: first }] },
+            ],
+          },
+          refs,
+          key,
+          signal,
+        ),
+      ).toEqual({ state: 'submitted', upstreamTaskId: 'horse-1' });
+    }
+    const media = [
+      { type: 'reference_image', url: refs[first] },
+      { type: 'reference_image', url: refs[last] },
+      { type: 'reference_image', url: refs[first] },
+    ];
+    expect(fetcher.mock.calls.map(([, request]) => JSON.parse(String(request?.body)))).toEqual([
+      {
+        model: 'happyhorse-1.1-r2v',
+        input: {
+          prompt: '[Image 1]、[Image 2] 为 "领队"；[Image 3] 为 "旅人"。\n' + prompt,
+          media,
+        },
+        parameters: {},
+      },
+      {
+        model: 'happyhorse-1.1-r2v',
+        input: {
+          prompt: '[Image 1]、[Image 2] 为 "旅人"；[Image 3] 为 "领队"。\n' + prompt,
+          media,
+        },
+        parameters: {},
+      },
+    ]);
+  });
+
+  it('escapes HappyHorse names and applies the exact wire prompt limit to frozen submissions', async () => {
+    const fetcher = transport({ output: { task_id: 'horse-1' } }, {});
+    const name = '阿"岚\\车\n[Image 9]\u2028🐎';
+    const quotedName = '"阿\\"岚\\\\车\\n\\u005bImage 9\\u005d\\u2028🐎"';
+    expect(JSON.parse(quotedName)).toBe(name);
+    const prompt = '追上云🚀\n转身';
+    const expected = '[Image 1] 为 ' + quotedName + '。\n' + prompt;
+    const protocol = createVideoProtocol(
+      route('happyhorse-videos', ['reference_subjects'], {
+        maxPromptCodepoints: [...expected].length,
+      }),
+      'happyhorse-1.0-r2v',
+      fetcher,
+    );
+    const input: VideoRequestParameters = {
+      mode: 'reference_subjects',
+      prompt,
+      subjects: [{ name, images: [{ assetId: first }] }],
+    };
+    expect(await protocol.submit({ ...input, prompt: prompt + '😀' }, refs, key, signal)).toEqual({
+      state: 'rejected',
+      code: 'VIDEO_INPUT_INVALID',
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await protocol.submit(input, refs, key, signal)).toEqual({
+      state: 'submitted',
+      upstreamTaskId: 'horse-1',
+    });
+    expect(body(fetcher).input).toEqual({
+      prompt: expected,
+      media: [{ type: 'reference_image', url: refs[first] }],
+    });
+  });
+
+  it('encodes HappyHorse video-edit media and the async header', async () => {
     const fetcher = transport(
       { output: { task_id: 'horse-1' } },
-      { output: { task_status: 'SUCCEEDED', video_url: 'https://cdn.fixture/horse.mp4' } },
+      {
+        output: {
+          task_id: 'horse-1',
+          task_status: 'SUCCEEDED',
+          video_url: 'https://cdn.fixture/horse.mp4',
+        },
+      },
     );
     const protocol = createVideoProtocol(
       route('happyhorse-videos', ['video_edit']),
@@ -498,6 +730,209 @@ describe('bounded OneLink video protocol', () => {
     expect((await protocol.query('horse-1', key, signal)).state).toBe('returned');
   });
 
+  it.each([
+    {
+      driver: 'volcengine-ark-videos',
+      success: {
+        data: { id: 'original', status: 'succeeded', content: { video_url: refs[video] } },
+      },
+      suspicious: [
+        { id: 'another', status: 'succeeded', content: { video_url: refs[video] } },
+        { id: null, status: 'failed' },
+        { status: 'running' },
+        { id: 'original', data: { status: 'succeeded', content: { video_url: refs[video] } } },
+        { id: 'original', data: { task_id: 'another', status: 'running' } },
+        { id: 'another', data: { id: 'original', status: 'failed' } },
+      ],
+    },
+    {
+      driver: 'kling-videos',
+      success: {
+        code: 0,
+        data: {
+          task_id: 'original',
+          task_status: 'succeed',
+          task_result: { videos: [{ id: 'kling-work-1', url: refs[video] }] },
+        },
+      },
+      suspicious: [
+        {
+          code: 0,
+          data: {
+            task_id: 'another',
+            task_status: 'succeed',
+            task_result: { videos: [{ url: refs[video] }] },
+          },
+        },
+        { code: 0, data: { task_id: {}, task_status: 'failed' } },
+        { code: 0 },
+        { code: 0, data: { task_status: 'processing' } },
+        { code: 0, data: { task_id: 'another', task_status: 'awaiting_worker' } },
+        { code: 0, data: { task_status: 'awaiting_worker' } },
+        { code: 17, data: { task_id: 'another' } },
+        { code: 17, data: { task_status: 'failed' } },
+        { data: { task_result: { videos: [{ url: refs[video] }] } } },
+        { code: '17', data: { task_info: {} } },
+        { code: 17, data: { created_at: 1722769557708 } },
+        { code: null, data: { task_id: null } },
+        { code: 17, task_id: 'another', data: { task_id: 'original' } },
+      ],
+    },
+    {
+      driver: 'vidu-videos',
+      success: {
+        id: 'original',
+        state: 'success',
+        creations: [{ id: 'vidu-work-3', url: refs[video] }],
+      },
+      suspicious: [
+        { id: 'another', state: 'success', creations: [{ id: 'original', url: refs[video] }] },
+        { id: 47, state: 'failed' },
+        { id: 'original', task_id: 'another', state: 'processing' },
+        { task_id: '', state: 'processing' },
+      ],
+    },
+    {
+      driver: 'happyhorse-videos',
+      success: { task_id: 'original', task_status: 'SUCCEEDED', video_url: refs[video] },
+      suspicious: [
+        { output: { task_id: 'another', task_status: 'SUCCEEDED', video_url: refs[video] } },
+        { output: { task_id: false, task_status: 'FAILED' } },
+        { output: { task_status: 'RUNNING' } },
+        { task_id: 'original', output: { task_status: 'SUCCEEDED', video_url: refs[video] } },
+        { task_id: 'another', output: { task_id: 'original', task_status: 'FAILED' } },
+        { task_id: 'original', output: { task_id: 'another', task_status: 'RUNNING' } },
+        { task_id: 'another', output: { task_id: 'original', task_status: 'UNKNOWN' } },
+        { output: { task_status: 'UNKNOWN' } },
+      ],
+    },
+  ] as const)('$driver validates task identity before status and media', async (fixture) => {
+    const config = route(fixture.driver);
+    const taskId =
+      fixture.driver === 'kling-videos'
+        ? JSON.stringify({ path: '/kling/v1/videos/image2video', id: 'original' })
+        : 'original';
+    const expectedPath =
+      fixture.driver === 'kling-videos'
+        ? '/kling/v1/videos/image2video/original'
+        : config.queryPathTemplate.replace('{task_id}', taskId);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(fixture.success));
+    for (const response of fixture.suspicious)
+      fetcher.mockResolvedValueOnce(Response.json(response));
+    const protocol = createVideoProtocol(config, 'fixture-model', fetcher);
+    expect(await protocol.query(taskId, key, signal)).toEqual({
+      state: 'returned',
+      videos: [{ url: refs[video] }],
+    });
+    for (const response of fixture.suspicious) {
+      expect(await protocol.query(taskId, key, signal), JSON.stringify(response)).toEqual({
+        state: 'unknown',
+        code: 'VIDEO_QUERY_IDENTITY_INVALID',
+      });
+    }
+    expect(
+      fetcher.mock.calls.map(([url, options]) => [new URL(String(url)).pathname, options?.method]),
+    ).toEqual(Array.from({ length: fixture.suspicious.length + 1 }, () => [expectedPath, 'GET']));
+  });
+
+  it('requires an integer gateway code for a taskless Kling rejection', async () => {
+    const task = JSON.stringify({ path: '/kling/v1/videos/text2video', id: 'original' });
+    for (const body of [{ code: 17 }, { code: 17, request_id: 'trace-id', data: null }]) {
+      const protocol = createVideoProtocol(
+        route('kling-videos'),
+        'fixture-model',
+        transport({}, body),
+      );
+      expect(await protocol.query(task, key, signal)).toEqual({
+        state: 'failed',
+        code: 'VIDEO_UPSTREAM_FAILED',
+      });
+    }
+    for (const body of [{}, { code: '17' }, { code: null }, { code: 1.7 }, { code: false }]) {
+      const protocol = createVideoProtocol(
+        route('kling-videos'),
+        'fixture-model',
+        transport({}, body),
+      );
+      expect(await protocol.query(task, key, signal), JSON.stringify(body)).toEqual({
+        state: 'failed',
+        code: 'VIDEO_RESPONSE_INVALID',
+      });
+    }
+  });
+
+  it.each([
+    {
+      driver: 'kling-videos',
+      taskId: JSON.stringify({ path: '/kling/v1/videos/image2video', id: 'original' }),
+      path: '/kling/v1/videos/image2video/original',
+      response: (status: unknown) => ({
+        code: 0,
+        data: { task_id: 'original', task_status: status },
+      }),
+      processing: 'processing',
+      unknown: ['awaiting worker'],
+      failed: ['failed', 'cancelled'],
+    },
+    {
+      driver: 'happyhorse-videos',
+      taskId: 'original',
+      path: '/happyhorse/v1/tasks/original',
+      response: (status: unknown) => ({
+        task_id: 'original',
+        output: { task_id: 'original', task_status: status },
+      }),
+      processing: 'RUNNING',
+      unknown: ['UNKNOWN', 'AWAITING_WORKER'],
+      failed: ['FAILED', 'CANCELED'],
+    },
+  ] as const)(
+    '$driver distinguishes unknown task states from failure and malformed states',
+    async ({ driver, taskId, path, response, processing, unknown, failed }) => {
+      const cases = [
+        { statuses: [processing], result: { state: 'processing' } },
+        { statuses: unknown, result: { state: 'unknown', code: 'VIDEO_QUERY_STATUS_UNKNOWN' } },
+        { statuses: failed, result: { state: 'failed', code: 'VIDEO_UPSTREAM_FAILED' } },
+        {
+          statuses: [undefined, null, '', '  ', 0, [processing], { status: processing }],
+          result: { state: 'failed', code: 'VIDEO_RESPONSE_INVALID' },
+        },
+      ];
+      const fetcher = vi.fn<typeof fetch>();
+      const protocol = createVideoProtocol(route(driver), 'fixture-model', fetcher);
+      for (const { statuses, result } of cases) {
+        for (const status of statuses) {
+          fetcher.mockResolvedValueOnce(Response.json(response(status)));
+          expect(await protocol.query(taskId, key, signal), JSON.stringify(status)).toEqual(result);
+        }
+      }
+      expect(
+        fetcher.mock.calls.map(([url, options]) => [
+          new URL(String(url)).pathname,
+          options?.method,
+        ]),
+      ).toEqual(cases.flatMap(({ statuses }) => statuses.map(() => [path, 'GET'])));
+    },
+  );
+
+  it('reads HappyHorse output from the same layer as its task identity and status', async () => {
+    const happyhorse = createVideoProtocol(
+      route('happyhorse-videos'),
+      'fixture-model',
+      transport(
+        {},
+        {
+          output: { task_id: 'original', task_status: 'SUCCEEDED' },
+          video_url: refs[video],
+        },
+      ),
+    );
+    expect(await happyhorse.query('original', key, signal)).toEqual({
+      state: 'failed',
+      code: 'VIDEO_RESPONSE_INVALID',
+    });
+  });
+
   it('makes a transport-unknown submission exactly once and hides upstream secrets', async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -509,7 +944,7 @@ describe('bounded OneLink video protocol', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it('distinguishes 4xx rejection from unknown submission and transient query errors', async () => {
+  it('distinguishes 4xx rejection from unknown submission', async () => {
     for (const [status, state] of [
       [401, 'rejected'],
       [429, 'rejected'],
@@ -523,14 +958,104 @@ describe('bounded OneLink video protocol', () => {
       ).toBe(state);
       expect(fetcher).toHaveBeenCalledTimes(1);
     }
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 503 }));
-    expect(
-      await createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher).query(
-        'task-1',
-        key,
-        signal,
-      ),
-    ).toEqual({ state: 'processing' });
+  });
+
+  it.each([
+    [401, 'retry', 'VIDEO_QUERY_AUTH'],
+    [403, 'retry', 'VIDEO_QUERY_AUTH'],
+    [429, 'retry', 'VIDEO_QUERY_RATE_LIMITED'],
+    [408, 'retry', 'VIDEO_QUERY_TIMEOUT'],
+    [500, 'retry', 'VIDEO_QUERY_UPSTREAM_UNAVAILABLE'],
+    [503, 'retry', 'VIDEO_QUERY_UPSTREAM_UNAVAILABLE'],
+    [404, 'failed', 'VIDEO_REJECTED'],
+  ] as const)('classifies HTTP %i during one original GET', async (status, state, code) => {
+    const cancel = vi.fn().mockRejectedValue(new Error('fixture response cleanup failed'));
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel }), { status });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(response);
+    const protocol = createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher);
+    expect(await protocol.query('task-1', key, signal)).toEqual({ state, code });
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      new URL('https://api.onelinkai.cloud/volc/api/v3/contents/generations/tasks/task-1'),
+      { method: 'GET', redirect: 'error', signal, headers: { Authorization: 'Bearer ' + key } },
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['headers', 'body'] as const)(
+    'identifies an expiring GET budget while reading %s',
+    async (stage) => {
+      const budget = AbortSignal.timeout(10);
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, options) => {
+        expect(options?.signal).toBe(budget);
+        if (stage === 'headers') {
+          return new Promise<Response>((_resolve, reject) => {
+            budget.addEventListener('abort', () => reject(budget.reason), { once: true });
+          });
+        }
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              budget.addEventListener('abort', () => controller.error(budget.reason), {
+                once: true,
+              });
+            },
+          }),
+        );
+      });
+      const protocol = createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher);
+      expect(await protocol.query('task-1', key, budget)).toEqual({
+        state: 'retry',
+        code: 'VIDEO_QUERY_TIMEOUT',
+      });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('propagates service stop without treating it as an upstream result', async () => {
+    const stop = new AbortController();
+    const stopping = new Error('fixture stopping');
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, options) => {
+      stop.abort(stopping);
+      options?.signal?.throwIfAborted();
+      return Response.json({ id: 'task-1', status: 'running' });
+    });
+    const protocol = createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher);
+    await expect(protocol.query('task-1', key, stop.signal)).rejects.toBe(stopping);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('distinguishes network and response stream errors from malformed JSON and processing', async () => {
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new TypeError('fixture response connection lost'));
+        },
+      }),
+    );
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('fixture connection lost'))
+      .mockResolvedValueOnce(response)
+      .mockResolvedValueOnce(new Response('{"id":'))
+      .mockResolvedValueOnce(new Response(new Uint8Array([0xff])))
+      .mockResolvedValueOnce(Response.json([]))
+      .mockResolvedValueOnce(new Response(null))
+      .mockResolvedValueOnce(new Response('x'.repeat(1024 * 1024 + 1)))
+      .mockResolvedValueOnce(Response.json({ id: 'task-1', status: 'running' }));
+    const protocol = createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher);
+    for (const code of [
+      'VIDEO_QUERY_NETWORK_ERROR',
+      'VIDEO_QUERY_NETWORK_ERROR',
+      'VIDEO_QUERY_RESPONSE_INVALID',
+      'VIDEO_QUERY_RESPONSE_INVALID',
+      'VIDEO_QUERY_RESPONSE_INVALID',
+      'VIDEO_QUERY_RESPONSE_INVALID',
+      'VIDEO_QUERY_RESPONSE_INVALID',
+    ]) {
+      expect(await protocol.query('task-1', key, signal)).toEqual({ state: 'retry', code });
+    }
+    expect(await protocol.query('task-1', key, signal)).toEqual({ state: 'processing' });
+    expect(fetcher.mock.calls.map(([, options]) => options?.method)).toEqual(Array(8).fill('GET'));
   });
 
   it('rejects untrusted route/task identity and never accepts success without media', async () => {
@@ -540,7 +1065,7 @@ describe('bounded OneLink video protocol', () => {
         'model',
       ),
     ).toThrow('VIDEO_ROUTE_INVALID');
-    const fetcher = transport({}, { status: 'succeeded', content: {} });
+    const fetcher = transport({}, { id: 'task-1', status: 'succeeded', content: {} });
     const protocol = createVideoProtocol(route('volcengine-ark-videos'), 'vega-1.5-pro', fetcher);
     expect(await protocol.query('../task', key, signal)).toEqual({
       state: 'failed',

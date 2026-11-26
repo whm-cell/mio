@@ -114,8 +114,8 @@ export class ObjectStore {
     if (signal.aborted) throw new Error('EXECUTION_TIMEOUT');
     const source = command.source;
     const actual = await this.head(source.stagingKey, signal);
-    if (!actual) throw new Error('SOURCE_INVALID');
     if (
+      !actual ||
       actual.sizeBytes !== source.sizeBytes ||
       actual.etag !== source.etag ||
       (actual.sha256 !== null && actual.sha256 !== source.sha256)

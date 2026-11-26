@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { expect, it, vi } from 'vitest';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { createGenerationHandler } from '../../src/generations/http.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
 import {
   IMAGE_MAX_REFERENCE_BYTES,
   IMAGE_MAX_TOTAL_REFERENCE_BYTES,
   type ImageRequestParameters,
-} from '../../src/generations/contracts.ts';
+} from '../../src/generations/image/contracts.ts';
 import { generationFixture } from './fixture.ts';
 
 type Fixture = Awaited<ReturnType<typeof generationFixture>>;
@@ -107,9 +107,12 @@ it('accepts inclusive limits and preserves original reference order and repeated
       imageAssetId: sources[0]!.assetId,
       maskAssetId: sources[0]!.assetId,
     });
-    expect(vi.mocked(f.objects.head).mock.calls.flat().sort()).toEqual(
-      [sources[0]!.key, sources[1]!.key, sources[0]!.key, sources[0]!.key].sort(),
-    );
+    expect(
+      vi
+        .mocked(f.objects.head)
+        .mock.calls.map(([key]) => key)
+        .sort(),
+    ).toEqual([sources[0]!.key, sources[1]!.key, sources[0]!.key, sources[0]!.key].sort());
     const service = await f.start();
     const single = await service.createImage(
       f.actor,

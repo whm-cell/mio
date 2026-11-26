@@ -9,6 +9,7 @@ import type { MediaCommand, MediaOperation, MediaParameters } from '@mio/compute
 import { MEDIA_PROFILE } from '@mio/compute-contracts';
 import type { MediaExecutionContext, MediaStep } from '../src/media-execution.ts';
 import { MediaFiles } from '../src/adapters/media-files.ts';
+import { probeVideoFile } from '../src/adapters/media.ts';
 import { Journal } from '../src/adapters/journal.ts';
 import { MediaProcessAdapter } from '../src/adapters/media-process.ts';
 import { waveform } from '../src/plans/audio.ts';
@@ -142,6 +143,11 @@ describe('real FFmpeg media plans through production process/file adapters', () 
       videoCodec: 'h264',
     });
     expect(result.data.probe!.durationSeconds).toBeCloseTo(2, 1);
+    expect(await probeVideoFile(video, AbortSignal.timeout(10_000))).toMatchObject({
+      width: 320,
+      height: 180,
+      hasAudio: true,
+    });
     expect(task.steps[0]).toMatchObject({ id: 'probe-input-0', capture: 'json', tool: 'ffprobe' });
     expect(task.steps[0]!.args.at(-1)).toBe('@file:input-0');
     await expect(probeInput(64, task.context)).rejects.toMatchObject({ code: 'INPUT_INVALID' });
@@ -158,6 +164,11 @@ describe('real FFmpeg media plans through production process/file adapters', () 
       rotation: 90,
       sampleAspectRatio: '2:1',
     });
+    expect(await probeVideoFile(rotated, AbortSignal.timeout(10_000))).toMatchObject({
+      width: 180,
+      height: 640,
+      hasAudio: false,
+    });
     const frameTask = setup('frames.extract', { mode: 'first_last', maxFrames: 1, width: 180 }, [
       rotated,
     ]);
@@ -165,6 +176,30 @@ describe('real FFmpeg media plans through production process/file adapters', () 
     expect(
       await probeFile(frames.files[0]!.name, 'check-display-frame', frameTask.context),
     ).toMatchObject({ width: 180, height: 640 });
+  });
+  it('preserves each probe operation’s duration boundary', async () => {
+    const source = join(root, 'long-video.mp4');
+    // Keep frame starts at 0 and 1800 seconds and the final frame one second long.
+    ffmpeg([
+      '-f',
+      'lavfi',
+      '-i',
+      'color=black:size=32x32:rate=1:duration=2',
+      '-vf',
+      'setpts=1800*N',
+      '-fps_mode',
+      'passthrough',
+      '-c:v',
+      'libx264',
+      '-threads',
+      '1',
+      source,
+    ]);
+    const task = setup('media.probe', {}, [source]);
+    expect((await executeBasic(task.command, task.context)).data.probe?.durationSeconds).toBe(1801);
+    await expect(probeVideoFile(source, AbortSignal.timeout(10_000))).rejects.toMatchObject({
+      code: 'SOURCE_INVALID',
+    });
   });
   it('rejects malformed media, actual overlong input and source windows beyond EOF', async () => {
     const bad = join(root, 'bad'),
@@ -341,6 +376,34 @@ describe('real FFmpeg media plans through production process/file adapters', () 
     const probe = await probeFile(result.files[0]!.name, 'check-audio', task.context);
     expect(probe.hasAudio).toBe(true);
     expect(probe.hasVideo).toBe(false);
+  });
+  it('extracts sound from video whose projected width rounds below one pixel', async () => {
+    const narrow = join(root, 'narrow-video.avi');
+    ffmpeg([
+      '-f',
+      'lavfi',
+      '-i',
+      'color=black:size=32x32:rate=10:duration=1',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:sample_rate=48000:duration=1',
+      '-vf',
+      'setsar=1/100',
+      '-c:v',
+      'mpeg4',
+      '-c:a',
+      'aac',
+      narrow,
+    ]);
+    const task = setup('audio.extract', { profile: 'original', format: 'wav' }, [narrow]);
+    const result = await executeBasic(task.command, task.context);
+    expect(
+      await probeFile(result.files[0]!.name, 'check-narrow-source-audio', task.context),
+    ).toMatchObject({ hasAudio: true, hasVideo: false });
+    await expect(probeVideoFile(narrow, AbortSignal.timeout(10_000))).rejects.toMatchObject({
+      code: 'SOURCE_INVALID',
+    });
   });
   it('extracts ASR PCM as 16k mono and bounds waveform storage/reads', async () => {
     const task = setup('audio.extract', { profile: 'asr' });

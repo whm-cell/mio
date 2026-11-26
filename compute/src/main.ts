@@ -8,7 +8,7 @@ import { createLogger } from '@mio/foundation/logging';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isJournalFailure, Journal } from './adapters/journal.ts';
 import { ObjectStore } from './adapters/cos.ts';
-import { processIdentity } from './adapters/media.ts';
+import { processIdentity, removeOrphanProbeFiles } from './adapters/media.ts';
 import { Broker } from './adapters/rabbitmq.ts';
 import { Worker } from './worker.ts';
 import { Maintenance } from './maintenance.ts';
@@ -90,7 +90,6 @@ async function start(): Promise<void> {
       : {}),
   });
   const journal = new Journal(directory, instance);
-  slots.setHold('encode', 'transcode', journal.hasUnknownProcess());
   const stopping = new AbortController();
   let worker: Worker | null = null;
   const stop = () => {
@@ -99,8 +98,10 @@ async function start(): Promise<void> {
   };
   let observability: ReturnType<typeof createWorkerObservability> | undefined;
   try {
+    slots.setHold('encode', 'transcode', journal.hasUnknownProcess());
     if (monitored)
       observability = createWorkerObservability(instance, journal.observability, slots);
+    removeOrphanProbeFiles(directory);
   } catch (error) {
     journal.close();
     throw error;
@@ -167,15 +168,22 @@ async function start(): Promise<void> {
         });
         void failed.catch(() => {});
         const closed = broker.closed();
-        maintenance = new Maintenance(broker, current, fail, monitored);
+        const cycle = new Maintenance(broker, current, fail, monitored);
+        maintenance = cycle;
         const initialized = await Promise.race([
-          maintenance.tick().then(() => true),
+          broker
+            .consumeVideoProbes(
+              (command, ack) => current.handleVideoProbe(command, ack),
+              fail,
+              monitored,
+            )
+            .then(() => cycle.tick())
+            .then(() => true),
           closed.then(() => false),
           stopped.then(() => false),
           failed,
         ]);
         if (!initialized) throw new Error('BROKER_CLOSED');
-        const cycle = maintenance;
         interval = setInterval(() => {
           void cycle.tick().catch(fail);
         }, 30_000);

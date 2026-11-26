@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { expect, it, vi } from 'vitest';
-import { createGenerationHandler } from '../../src/generations/http.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
 import { generationFixture } from '../generations/fixture.ts';
 
 it('preserves HTTP paths, closed input, origin checks, preflight and session recheck', async () => {

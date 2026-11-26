@@ -4,8 +4,8 @@ import type {
   ImageGeometryEdge,
   ImageOperation,
   ImageRouteConfig,
-} from '../generations/contracts.ts';
-import type { VideoDriver, VideoMode } from '../generations/video-contracts.ts';
+} from '../generations/image/contracts.ts';
+import type { VideoDriver, VideoMode } from '../generations/video/contracts.ts';
 
 /** Provider values are independent of the Agent framework and authentication library. */
 export interface ProviderPrincipal {

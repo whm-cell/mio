@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
-import { MEDIA_ENCODE_QUEUE } from '@mio/compute-contracts';
+import {
+  COMMAND_QUEUE,
+  MEDIA_ENCODE_QUEUE,
+  VIDEO_PROBE_COMMAND_QUEUE,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
+} from '@mio/compute-contracts';
 import {
   audioResultPolicy,
   computeCapacity,
@@ -128,7 +133,7 @@ function testDefinitions(
   vhost: string,
   users: readonly TestRole[],
   scope?: WorkerScope,
-  limitMediaEncode = false,
+  options?: { singleMessageMediaEncode?: true; legacyVideoProbeBinding?: true },
 ) {
   const exchanges = [];
   const queues = [];
@@ -143,13 +148,19 @@ function testDefinitions(
         ...body,
         vhost,
         name,
-        ...(limitMediaEncode && name === MEDIA_ENCODE_QUEUE
+        ...(options?.singleMessageMediaEncode && name === MEDIA_ENCODE_QUEUE
           ? { arguments: { ...argumentsForQueue, 'x-max-length': 1 } }
           : {}),
       });
     } else {
       assert(kind === 'bindings' && name === 'e' && destinationType === 'q');
-      bindings.push({ ...body, vhost, source, destination, destination_type: 'queue' });
+      const queue =
+        options?.legacyVideoProbeBinding &&
+        destination === VIDEO_PROBE_COMMAND_QUEUE &&
+        body.routing_key === VIDEO_PROBE_COMMAND_ROUTING_KEY
+          ? COMMAND_QUEUE
+          : destination;
+      bindings.push({ ...body, vhost, source, destination: queue, destination_type: 'queue' });
     }
   }
   return JSON.stringify({
@@ -167,7 +178,7 @@ function testDefinitions(
 export async function withLocalTestBroker<T>(
   exercise: (broker: TestBroker) => Promise<T>,
   scope?: WorkerScope,
-  options?: { singleMessageMediaEncode: true },
+  options?: { singleMessageMediaEncode?: true; legacyVideoProbeBinding?: true },
 ): Promise<T> {
   const { port, ctl } = await testBrokerTarget();
   const token = randomBytes(16).toString('hex');
@@ -288,10 +299,7 @@ export async function withLocalTestBroker<T>(
       JSON.stringify(retention.definition),
     ]);
     // The import only contains queues, exchanges, bindings and permissions in the owned vhost.
-    await ctl(
-      ['import_definitions', '/dev/stdin'],
-      testDefinitions(vhost, users, scope, options?.singleMessageMediaEncode),
-    );
+    await ctl(['import_definitions', '/dev/stdin'], testDefinitions(vhost, users, scope, options));
     result = await exercise({
       async queueDefinitions() {
         const output = await ctl([

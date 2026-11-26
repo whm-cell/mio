@@ -50,7 +50,7 @@ DESIGN-OVER-001 已采用为人工 review/report 规则：新增机制先说明�
 
 源码边界、AST 支持、编译覆盖与指标口径按[源码与依赖护栏](engineering/source-guardrails.md)维护；协调工具的记录、候选、质量审查和写入保证按[工具实现边界](engineering/work-tooling.md)核对。操作方法见[协调协议](coordination.md)，不在总览复制每轮实施经过。
 
-BOUNDARY-01 同时覆盖[Foundation 原语定向防回退](engineering/source-guardrails.md#foundation-原语定向防回退)：service 生产代码的 UUID／系统当前时间明确形式由 `pnpm lint` 阻断并引导至公开入口；合法日期解析、加密／字节摘要和其他源码角色保留。HTTP_STATUS、sha256Utf8、ApplicationError 的复用及未承诺的数据流由 QUALITY-01 的 reuse 维度审阅。
+BOUNDARY-01 同时覆盖[Foundation 原语定向防回退](engineering/source-guardrails.md#foundation-原语定向防回退)：service 生产代码的 UUID／系统当前时间明确形式由 `pnpm lint` 阻断并引导至公开入口；合法日期解析、加密／字节摘要和其他源码角色保留。HTTP_STATUS、sha256Utf8、sha256Bytes、ApplicationError 的复用及未承诺的数据流由 QUALITY-01 的 reuse 维度审阅。
 
 ## 验收与限制
 

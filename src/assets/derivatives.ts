@@ -1,7 +1,7 @@
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { ComputeError } from '../compute/errors.ts';
-import { MediaError } from '../compute/media-model.ts';
+import { MediaError } from '../compute/media/model.ts';
 import type { AssetPrincipal } from './contracts.ts';
 import type { AssetStore } from './store.ts';
 

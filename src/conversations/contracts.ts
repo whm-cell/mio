@@ -1,21 +1,21 @@
 import type { AudioJobView, AudioOperation } from '../audio/contracts.ts';
 import type {
-  VideoCapabilitiesView,
   VideoCreateRequest,
   VideoJobView,
   VideoMode,
-} from '../generations/video-contracts.ts';
+} from '../generations/video/contracts.ts';
 import type { FrozenAudioContext } from '../audio/jobs/service.ts';
 import { HttpError } from '@mio/foundation/errors';
 import type {
   ImageDriver,
   ImageOperation,
   ImageRequestParameters,
-} from '../generations/contracts.ts';
+} from '../generations/image/contracts.ts';
 import type {
   ChatReasoningEffort,
   ChatRuntimeSnapshot,
   ChatSelection,
+  VideoParameterSpec,
 } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
@@ -242,6 +242,16 @@ export interface ConversationImageTools {
   getImage(actor: { userId: string }, jobId: string): Promise<ConversationImageJobView>;
 }
 export type ConversationVideoToolName = 'submit_video_job' | 'get_video_job';
+export type ConversationVideoSubmitParameterSpec = Pick<
+  VideoParameterSpec,
+  | 'ratios'
+  | 'resolutions'
+  | 'durations'
+  | 'maxPromptCodepoints'
+  | 'requiresResolution'
+  | 'generateAudio'
+  | 'watermark'
+>;
 export interface ConversationVideoModelSummary {
   readonly modelRef: string;
   readonly modelId: string;
@@ -249,7 +259,14 @@ export interface ConversationVideoModelSummary {
   readonly vendor: string;
   readonly available: boolean;
   readonly unavailableReason: string | null;
-  readonly supportedModes: { mode: VideoMode; supported: boolean }[];
+  readonly supportedModes: (
+    | {
+        mode: 'text_to_video';
+        supported: boolean;
+        parameters?: ConversationVideoSubmitParameterSpec;
+      }
+    | { mode: Exclude<VideoMode, 'text_to_video'>; supported: boolean }
+  )[];
 }
 export interface ConversationVideoJobOutput {
   readonly index: number;
@@ -272,8 +289,11 @@ export interface ConversationVideoJobView {
 }
 export interface ConversationVideoTools {
   listModels(actor: { userId: string }): Promise<ConversationVideoModelSummary[]>;
-  capabilities(actor: { userId: string }, modelRef: string): Promise<VideoCapabilitiesView>;
-  createVideo(actor: { userId: string }, request: VideoCreateRequest): Promise<VideoJobView>;
+  createVideo(
+    actor: { userId: string },
+    request: Omit<VideoCreateRequest, 'expectedCapabilitiesVersion'>,
+    signal?: AbortSignal,
+  ): Promise<VideoJobView>;
   getVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
   recoverVideo(actor: { userId: string }, jobId: string): Promise<VideoJobView>;
 }

@@ -6,7 +6,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **A/B 公共运行时组件与持续治理**
 
-[docs/foundation.md](../../../foundation.md) · [src/http-request.ts](../../../../src/http-request.ts) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/compute/errors.ts](../../../../src/compute/errors.ts) · [src/compute/service.ts](../../../../src/compute/service.ts) · [scripts/harness/source-projects.ts](../../../../scripts/harness/source-projects.ts) · [docs/engineering/source-guardrails.md](../../../engineering/source-guardrails.md) · [docs/tasks/runtime-foundation/prd.md](../prd.md)
+[docs/foundation.md](../../../foundation.md) · [src/http-request.ts](../../../../src/http-request.ts) · [src/conversations/service.ts](../../../../src/conversations/service.ts) · [src/compute/errors.ts](../../../../src/compute/errors.ts) · [src/compute/transcode/service.ts](../../../../src/compute/transcode/service.ts) · [scripts/harness/source-projects.ts](../../../../scripts/harness/source-projects.ts) · [docs/engineering/source-guardrails.md](../../../engineering/source-guardrails.md) · [docs/tasks/runtime-foundation/prd.md](../prd.md)
 
 ```mio-prd-results
 {

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
@@ -244,7 +245,7 @@ it('pins the real foundation public exports independently of minimal guard fixtu
   );
   expect(manifest.name).toBe('@mio/foundation');
   expect(harness.projects.foundation.kind).toBe('library');
-  for (const entry of ['identifiers', 'time']) {
+  for (const entry of ['identifiers', 'time', 'hash']) {
     expect(harness.projects.foundation.publicEntries).toContainEqual({
       source: `packages/foundation/src/${entry}.ts`,
       export: `./${entry}`,
@@ -259,4 +260,14 @@ it('pins the real foundation public exports independently of minimal guard fixtu
   expect(identifiers.createId).toBeTypeOf('function');
   for (const name of ['epochMs', 'monotonicMs', 'utcISOString'] as const)
     expect(time[name]).toBeTypeOf('function');
+  const hash = await import('../../packages/foundation/src/hash.ts');
+  const bytes = Uint8Array.from([0, 3, 255, 25]);
+  expect(hash.sha256Bytes(bytes.subarray(1, 3))).toBe(
+    createHash('sha256')
+      .update(Uint8Array.from([3, 255]))
+      .digest('hex'),
+  );
+  expect(hash.sha256Utf8('视频录入')).toBe(
+    createHash('sha256').update(Buffer.from('视频录入', 'utf8')).digest('hex'),
+  );
 });

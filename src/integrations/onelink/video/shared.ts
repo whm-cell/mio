@@ -1,5 +1,3 @@
-import type { VideoResultSource } from '../../../generations/video-execution.ts';
-
 export const ONELINK_ORIGIN = 'https://api.onelinkai.cloud';
 const MAX_VIDEO_RESPONSE_BYTES = 1024 * 1024;
 export const TASK_ID = /^(?!\.{1,2}$)(?!.*\.\.)[A-Za-z0-9._:-]{1,256}$/;
@@ -10,12 +8,13 @@ export function object(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export async function readJson(response: Response): Promise<Record<string, unknown>> {
-  if (!response.body) throw new Error('VIDEO_RESPONSE_INVALID');
+/** Return undefined for malformed payloads. Stream read errors reach the caller. */
+export async function readJson(response: Response): Promise<Record<string, unknown> | undefined> {
+  if (!response.body) return;
   const length = response.headers.get('content-length');
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_VIDEO_RESPONSE_BYTES)) {
-    await response.body.cancel();
-    throw new Error('VIDEO_RESPONSE_INVALID');
+    void response.body.cancel().catch(() => {});
+    return;
   }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -25,17 +24,20 @@ export async function readJson(response: Response): Promise<Record<string, unkno
       const result = await reader.read();
       if (result.done) break;
       size += result.value.byteLength;
-      if (size > MAX_VIDEO_RESPONSE_BYTES) throw new Error('VIDEO_RESPONSE_INVALID');
+      if (size > MAX_VIDEO_RESPONSE_BYTES) return;
       chunks.push(result.value);
     }
-    const value: unknown = JSON.parse(
-      new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
-    );
-    if (!value || typeof value !== 'object' || Array.isArray(value))
-      throw new Error('VIDEO_RESPONSE_INVALID');
-    return value as Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
+      );
+      if (value && typeof value === 'object' && !Array.isArray(value))
+        return value as Record<string, unknown>;
+    } catch {
+      return;
+    }
   } finally {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
@@ -56,20 +58,15 @@ export function endpoint(path: string): URL {
   return url;
 }
 
-export function resultUrls(values: unknown[]): VideoResultSource[] | undefined {
-  if (values.length === 0 || values.length > 16) return;
-  const output: VideoResultSource[] = [];
-  for (const value of values) {
-    if (typeof value !== 'string' || value.length > 8192) return;
-    try {
-      const url = new URL(value);
-      if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) return;
-      output.push({ url: url.href });
-    } catch {
-      return;
-    }
+export function parseVideoMediaUrl(value: unknown): URL | undefined {
+  if (typeof value !== 'string' || value.length > 8192) return;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && !url.username && !url.password && !url.port && !url.hash)
+      return url;
+  } catch {
+    return;
   }
-  return output;
 }
 
 /** A Veo operation remains a scoped path; arbitrary URLs never become authenticated requests. */

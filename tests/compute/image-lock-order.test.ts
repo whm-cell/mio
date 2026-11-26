@@ -1,7 +1,7 @@
 import { randomInt } from 'node:crypto';
 import { Pool } from 'pg';
 import { expect, it, vi } from 'vitest';
-import { GenerationStore } from '../../src/generations/store.ts';
+import { GenerationStore } from '../../src/generations/image/store.ts';
 import { generationFixture } from '../generations/fixture.ts';
 
 it.each(['submitted', 'beginQuery'] as const)(

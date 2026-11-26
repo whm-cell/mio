@@ -16,9 +16,20 @@ export interface AssetObjectStore {
   audioPlaybackUrl?(key: string, contentType: string): string;
   hlsSegmentUrl?(key: string, expiresIn: number): string;
   materialUrl?(key: string): string;
-  head(key: string): Promise<{ size: number; etag: string; sha256?: string }>;
+  head(
+    key: string,
+    signal?: AbortSignal,
+  ): Promise<{ size: number; etag: string; sha256?: string; contentType?: string }>;
   readImage?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
   readMedia?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
+  /** Read at most maxBytes under the given ETag and verify the range against the object size. */
+  readPrefix?(
+    key: string,
+    etag: string,
+    size: number,
+    maxBytes: number,
+    signal: AbortSignal,
+  ): Promise<Uint8Array>;
   putImage?(
     key: string,
     bytes: Uint8Array,
@@ -31,6 +42,7 @@ export interface AssetObjectStore {
     stream: Readable,
     sizeBytes: number,
     sha256: string,
+    contentMd5: string,
     signal: AbortSignal,
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
   readAudio?(key: string, etag: string, size: number, signal: AbortSignal): Promise<Uint8Array>;
@@ -46,8 +58,39 @@ export interface AssetObjectStore {
     expected: { sizeBytes: number; etag: string; sha256?: string },
     signal: AbortSignal,
   ): Promise<void>;
-  copy(source: string, target: string, etag: string, acl?: 'private'): Promise<void>;
-  delete(key: string): Promise<void>;
+  copy(
+    source: string,
+    target: string,
+    etag: string,
+    acl: 'private' | undefined,
+    options: { signal: AbortSignal } & (
+      { contentType: string; sha256: string } | { contentType?: never; sha256?: never }
+    ),
+  ): Promise<{ etag: string } | void>;
+  delete(key: string, signal: AbortSignal): Promise<void>;
+}
+
+/** Bound caller wait even when a HEAD implementation ignores the optional signal. */
+export async function waitForObjectHead<T>(
+  read: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return read();
+  signal.throwIfAborted();
+  const aborted = Promise.withResolvers<never>();
+  const abort = () => aborted.reject(signal.reason);
+  signal.addEventListener('abort', abort, { once: true });
+  try {
+    const pending = Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return read();
+    });
+    const result = await Promise.race([pending, aborted.promise]);
+    signal.throwIfAborted();
+    return result;
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
 }
 
 export type AssetErrorCode =

@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { GenerationFiles } from '../../src/generations/files.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
 import { downloadResultImage } from '../../src/integrations/onelink/shared/index.ts';
 import type { ImageResult } from '../../src/integrations/onelink/shared/index.ts';
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';

@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { expect, it, vi } from 'vitest';
-import { createGenerationAdmission } from '../../src/generations/admission.ts';
-import { IMAGE_GEOMETRY_EDGES } from '../../src/generations/contracts.ts';
-import type { ImageGeometry } from '../../src/generations/contracts.ts';
-import type { GenerationRequest } from '../../src/generations/execution.ts';
-import { createGenerationHandler } from '../../src/generations/http.ts';
+import { createGenerationAdmission } from '../../src/generations/image/admission.ts';
+import { IMAGE_GEOMETRY_EDGES } from '../../src/generations/image/contracts.ts';
+import type { ImageGeometry } from '../../src/generations/image/contracts.ts';
+import type { GenerationRequest } from '../../src/generations/image/execution.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
 import type { ImageAdmissionSnapshot } from '../../src/providers/contracts.ts';
 import { generationFixture } from '../generations/fixture.ts';
 

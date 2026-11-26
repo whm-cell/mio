@@ -11,10 +11,45 @@ vi.mock('node:fs/promises', async (original) => ({
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import sharp from 'sharp';
-import { createGenerationHandler } from '../../src/generations/http.ts';
-import type { GenerationTransports } from '../../src/generations/runner.ts';
+import { createGenerationHandler } from '../../src/generations/image/http.ts';
+import type { GenerationTransports } from '../../src/generations/image/runner.ts';
 import { generationFixture } from './fixture.ts';
-import { GenerationFiles } from '../../src/generations/files.ts';
+import { GenerationFiles } from '../../src/generations/image/files.ts';
+
+it('closes image admission while a legacy HEAD is hung without creating a job', async () => {
+  const f = await generationFixture();
+  const started = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<{ size: number; etag: string }>();
+  try {
+    const source = await f.addImageSource();
+    const service = await f.start();
+    vi.mocked(f.objects.head).mockImplementationOnce(async (key: string) => {
+      expect(key).toBe(source.key);
+      started.resolve();
+      return reply.promise;
+    });
+    const result = service
+      .createImage(f.actor, randomUUID(), f.modelRef, {
+        operation: 'edit',
+        prompt: 'edit after asset validation',
+        imageAssetId: source.assetId,
+      })
+      .catch((error: unknown) => error);
+    await started.promise;
+    const closed = vi.fn();
+    const closing = service.close().then(closed);
+    await vi.waitFor(() => expect(closed).toHaveBeenCalledOnce());
+    await closing;
+    expect(await result).toMatchObject({ status: 503, code: 'COMPUTE_STORAGE_UNAVAILABLE' });
+    reply.resolve({ size: source.sizeBytes, etag: source.etag });
+    await reply.promise;
+    expect((await f.pool.query('SELECT count(*) FROM mio_image_jobs')).rows[0].count).toBe('0');
+    expect(f.transport).not.toHaveBeenCalled();
+  } finally {
+    reply.resolve({ size: 1, etag: 'cleanup' });
+    await f.close();
+  }
+});
 
 it.each(['before-delete', 'after-first-delete'] as const)(
   'cleans confirmed completed files after restart when cleanup failed %s',
@@ -1006,8 +1041,8 @@ it('retains a committed output while a recovered second output fails HEAD', asyn
         ),
       { timeout: 6000 },
     );
-    expect(f.objects.head).toHaveBeenCalledWith(first.key);
-    expect(f.objects.head).toHaveBeenCalledWith(second.key);
+    expect(f.objects.head).toHaveBeenCalledWith(first.key, expect.any(AbortSignal));
+    expect(f.objects.head).toHaveBeenCalledWith(second.key, expect.any(AbortSignal));
     expect((await f.service.getImage(f.actor, job.jobId)).outputs).toEqual(partial.outputs);
     expect(
       (

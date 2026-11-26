@@ -1,4 +1,13 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import {
+  COMMAND_EXCHANGE,
+  COMMAND_QUEUE,
+  COMMAND_ROUTING_KEY,
+  RESULT_QUEUE,
+  VIDEO_PROBE_COMMAND_QUEUE,
+  VIDEO_PROBE_COMMAND_ROUTING_KEY,
+  VIDEO_PROBE_RESULT_ROUTING_KEY,
+} from '@mio/compute-contracts';
 import { ComputeBroker } from '../../src/integrations/rabbitmq.ts';
 import {
   audioResultPolicy,
@@ -102,6 +111,18 @@ function brokerFixture(beforeWrite?: () => Promise<void>) {
       }
       writes.push(path);
       await beforeWrite?.();
+      if (init.method === 'DELETE') {
+        const slash = path.lastIndexOf('/');
+        const bindingPath = path.slice(0, slash);
+        const key = decodeURIComponent(path.slice(slash + 1));
+        const bindings = values.get(bindingPath);
+        if (!Array.isArray(bindings)) return new Response(null, { status: 404 });
+        values.set(
+          bindingPath,
+          bindings.filter((binding) => binding.properties_key !== key),
+        );
+        return new Response(null, { status: 204 });
+      }
       const body: unknown = JSON.parse(String(init.body));
       if (init.method === 'POST') {
         const bindings = values.get(path);
@@ -437,4 +458,73 @@ it('upgrades an existing video and audio topology after exact operator ACL provi
   expect(values.get('users/mio-test-a')).toMatchObject({ passwordMarker: 'a', tags: [] });
   expect(values.get('users/mio-test-b')).toMatchObject({ passwordMarker: 'b', tags: [] });
   expect(values.get(audioStreamPath)).toBe(audioStream);
+});
+
+it('requires an explicit probe cutover, then binds and verifies before removing the former route', async () => {
+  const oldPath = `bindings/mio-test/e/${COMMAND_EXCHANGE}/q/${COMMAND_QUEUE}`;
+  const newPath = `bindings/mio-test/e/${COMMAND_EXCHANGE}/q/${VIDEO_PROBE_COMMAND_QUEUE}`;
+  const former = {
+    routing_key: VIDEO_PROBE_COMMAND_ROUTING_KEY,
+    arguments: {},
+    properties_key: VIDEO_PROBE_COMMAND_ROUTING_KEY,
+  };
+  const transcode = {
+    routing_key: COMMAND_ROUTING_KEY,
+    arguments: {},
+    properties_key: COMMAND_ROUTING_KEY,
+  };
+  const executed = `${oldPath}/${former.properties_key}`;
+  let failBeforeBinding = false;
+  const { values, writes } = brokerFixture(async () => {
+    if (writes.at(-1) === newPath && failBeforeBinding) throw new Error('unknown binding reply');
+    if (writes.at(-1) === executed)
+      expect(values.get(newPath)).toMatchObject([{ routing_key: VIDEO_PROBE_COMMAND_ROUTING_KEY }]);
+  });
+  const commandQueue = `queues/mio-test/${COMMAND_QUEUE}`;
+  const original = {
+    ...computeTopology('mio-test').find((entry) => entry.path === commandQueue)!.body,
+    messages_ready: 2,
+    messages_unacknowledged: 1,
+  };
+  values.set('vhosts/mio-test', {});
+  values.set(policyPath, testPolicy);
+  values.set(commandQueue, original);
+  values.set(oldPath, [transcode, former]);
+  provisionTestRoles(values);
+  const connect = vi.spyOn(ComputeBroker, 'connect').mockResolvedValue({
+    close: async () => {},
+  } as ComputeBroker);
+
+  await expect(prepareLocalBroker('test', testEnv)).rejects.toThrow(
+    'LOCAL_BROKER_VIDEO_PROBE_MIGRATION_REQUIRED',
+  );
+  expect(writes).toEqual([]);
+  expect(connect).not.toHaveBeenCalled();
+  failBeforeBinding = true;
+  await expect(prepareLocalBroker('test', testEnv, true)).rejects.toThrow(
+    `LOCAL_BROKER_REQUEST_UNKNOWN: POST ${newPath}`,
+  );
+  expect(values.get(oldPath)).toEqual([transcode, former]);
+  expect(writes).not.toContain(executed);
+  failBeforeBinding = false;
+  writes.length = 0;
+  await prepareLocalBroker('test', testEnv, true);
+  expect(writes.indexOf(newPath)).toBeGreaterThanOrEqual(0);
+  expect(writes.indexOf(executed)).toBeGreaterThan(writes.indexOf(newPath));
+  expect(values.get(oldPath)).toEqual([transcode]);
+  expect(values.get(commandQueue)).toBe(original);
+  expect(computeTopology('mio-test')).toContainEqual(
+    expect.objectContaining({
+      path: expect.stringMatching(new RegExp(`/q/${RESULT_QUEUE}$`)),
+      body: { routing_key: VIDEO_PROBE_RESULT_ROUTING_KEY, arguments: {} },
+    }),
+  );
+  expect(new RegExp(computePermissions('a').read).test(VIDEO_PROBE_COMMAND_QUEUE)).toBe(false);
+  expect(new RegExp(computePermissions('b').read).test(VIDEO_PROBE_COMMAND_QUEUE)).toBe(true);
+  expect(
+    new RegExp(computePermissions('b').read).test('mio.compute.video.probe.commands.dlq.v1'),
+  ).toBe(false);
+  writes.length = 0;
+  await prepareLocalBroker('test', testEnv);
+  expect(writes).toEqual([]);
 });

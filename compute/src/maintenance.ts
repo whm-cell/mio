@@ -1,16 +1,16 @@
 import type { Broker } from './adapters/rabbitmq.ts';
 import type { Worker } from './worker.ts';
-import type { VideoProbeCommandV1 } from '@mio/compute-contracts';
+
+type MaintenanceBroker = Pick<Broker, 'consuming' | 'pause' | 'consume'>;
+type MaintenanceWorker = Pick<
+  Worker,
+  'handle' | 'handleVideoProbe' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'
+>;
 
 /** One serial maintenance window for this worker's consumer and journal. */
 export class Maintenance {
-  readonly #broker: Pick<Broker, 'consuming' | 'pause' | 'consume'> &
-    Partial<Pick<Broker, 'consumeTranscodes'>>;
-  readonly #worker: Pick<
-    Worker,
-    'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'
-  > &
-    Partial<Pick<Worker, 'handleVideoProbe'>>;
+  readonly #broker: MaintenanceBroker;
+  readonly #worker: MaintenanceWorker;
   readonly #failed: (error: unknown) => void;
   #active = true;
   #parallelSubscribed = false;
@@ -18,10 +18,8 @@ export class Maintenance {
   #flight: Promise<void> | null = null;
 
   constructor(
-    broker: Pick<Broker, 'consuming' | 'pause' | 'consume'> &
-      Partial<Pick<Broker, 'consumeTranscodes'>>,
-    worker: Pick<Worker, 'handle' | 'admissionReady' | 'needsMaintenance' | 'reconcileOne'> &
-      Partial<Pick<Worker, 'handleVideoProbe'>>,
+    broker: MaintenanceBroker,
+    worker: MaintenanceWorker,
     failed: (error: unknown) => void,
     buffered = false,
   ) {
@@ -50,13 +48,16 @@ export class Maintenance {
 
   async #run(): Promise<void> {
     if (!this.#active) return;
+    const handleProbe = this.#worker.handleVideoProbe.bind(this.#worker);
     if (this.#buffered) {
       // Waiting deliveries cannot drain while paused at zero; reconcile different attempts in place.
       await this.#worker.reconcileOne();
       if (this.#active && !this.#parallelSubscribed) {
-        await this.#broker.consumeTranscodes!(
+        await this.#broker.consume(
           (command, ack) => this.#worker.handle(command, ack, true),
           this.#failed,
+          undefined,
+          handleProbe,
         );
         this.#parallelSubscribed = true;
       }
@@ -67,15 +68,13 @@ export class Maintenance {
     await this.#broker.pause();
     if (!this.#active) return;
     await this.#worker.reconcileOne();
-    if (this.#active && this.#worker.admissionReady()) {
-      const handleProbe = this.#worker.handleVideoProbe;
+    if (this.#active && (this.#worker.admissionReady() || this.#worker.admissionReady('probe'))) {
       await this.#broker.consume(
         (command, ack) => this.#worker.handle(command, ack),
         this.#failed,
-        () => this.#worker.admissionReady(),
-        handleProbe
-          ? (command: VideoProbeCommandV1, ack) => handleProbe.call(this.#worker, command, ack)
-          : undefined,
+        (command) =>
+          this.#worker.admissionReady(command.type === 'video.probe' ? 'probe' : 'encode'),
+        handleProbe,
       );
     }
   }

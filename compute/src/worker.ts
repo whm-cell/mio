@@ -1,6 +1,8 @@
-import { epochMs } from '@mio/foundation/time';
+import { epochMs, monotonicMs } from '@mio/foundation/time';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
+import { isDeepStrictEqual } from 'node:util';
+import { VIDEO_PROBE_ADMISSION_MS, VIDEO_PROBE_EXECUTION_MS } from '@mio/compute-contracts';
 import type {
   ComputeCommandV1,
   ComputeFailureCodeV1,
@@ -12,6 +14,7 @@ import type {
   VideoProbeResultV1,
   WorkerExecutionIdentity,
   WorkerExecutionPhase,
+  WorkerResourceClass,
 } from '@mio/compute-contracts';
 import { isJournalFailure } from './adapters/journal.ts';
 import type { Journal } from './adapters/journal.ts';
@@ -19,22 +22,22 @@ import {
   MediaError,
   fileDigest,
   paths,
+  probePath,
+  probeVideoFile,
   processGone,
   processIdentity,
   removeFiles,
   removeProbeFile,
   requireProbeSpace,
   requireSpace,
-  probeVideoFile,
   transcode,
 } from './adapters/media.ts';
 import type { ObjectStore } from './adapters/cos.ts';
-import type { Broker } from './adapters/rabbitmq.ts';
+import type { Broker, VideoProbeDelivery } from './adapters/rabbitmq.ts';
 import { ResourceSlots } from './resource-slots.ts';
 import type { Attempt, Phase } from './types.ts';
 
 const ATTEMPT_MS = 60 * 60 * 1000;
-const VIDEO_PROBE_TIMEOUT_MS = 5 * 60 * 1000;
 const log = createLogger('worker', 'worker');
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -89,15 +92,8 @@ function videoProbeFailure(
   if (code === 'SOURCE_INVALID' || code === 'SOURCE_TOO_LARGE' || code === 'SOURCE_CHANGED')
     return code;
   if (code === 'EXECUTION_TIMEOUT') return 'EXECUTION_TIMEOUT';
-  if (error instanceof MediaError) {
-    if (error.code === 'SOURCE_INVALID' || error.code === 'SOURCE_TOO_LARGE') return error.code;
-    if (error.code === 'SOURCE_CHANGED') return 'SOURCE_CHANGED';
-    if (error.code === 'INPUT_INVALID' || error.code === 'INPUT_TOO_LONG') return 'SOURCE_INVALID';
-    if (error.code === 'PROBE_FAILED') return 'PROBE_FAILED';
-    if (error.code === 'EXECUTION_TIMEOUT') return 'EXECUTION_TIMEOUT';
-  }
+  if (error instanceof MediaError && error.code === 'PROBE_FAILED') return 'PROBE_FAILED';
   if ((error as { statusCode?: number } | null)?.statusCode === 412) return 'SOURCE_CHANGED';
-  if ((error as NodeJS.ErrnoException | null)?.code === 'ENOSPC') return 'STORAGE_FAILURE';
   if (code === 'WORKER_STOPPED') return 'WORKER_INTERRUPTED';
   return 'STORAGE_FAILURE';
 }
@@ -110,13 +106,17 @@ export class Worker {
   readonly #directory: string;
   readonly #slots: ResourceSlots;
   readonly #deliveries = new Map<string, Promise<void>>();
+  readonly #probeDeliveries = new Map<
+    string,
+    { command: VideoProbeDelivery; task: Promise<void> }
+  >();
+  readonly #probeDownloads = new Map<string, number>();
   readonly #executionIds = new Map<string, string>();
   readonly #ownedProcesses = new Set<string>();
   #maintenance: Promise<void> | undefined;
   #maintenanceAttempt: string | undefined;
   #cursor = '';
   #stopped = false;
-  #busy = false;
   readonly #stopController = new AbortController();
 
   constructor(
@@ -141,7 +141,8 @@ export class Worker {
   }
 
   async waitIdle(): Promise<void> {
-    while (this.#deliveries.size || this.#maintenance || this.#busy) await sleep(50);
+    while (this.#deliveries.size || this.#probeDeliveries.size || this.#maintenance)
+      await sleep(50);
   }
 
   #syncProcessHold(): void {
@@ -152,10 +153,11 @@ export class Worker {
     );
   }
 
-  admissionReady(): boolean {
-    if (this.#stopped || this.#busy || this.#deliveries.size || this.#maintenance) return false;
-    this.#syncProcessHold();
-    if (!this.#slots.available('encode')) return false;
+  admissionReady(resource: WorkerResourceClass = 'encode'): boolean {
+    if (this.#stopped || (resource === 'encode' && (this.#deliveries.size || this.#maintenance)))
+      return false;
+    if (resource === 'encode') this.#syncProcessHold();
+    if (!this.#slots.available(resource)) return false;
     try {
       requireSpace(this.#directory);
       return true;
@@ -167,7 +169,8 @@ export class Worker {
 
   needsMaintenance(): boolean {
     if (this.#stopped) return false;
-    if (!this.#busy && !this.#deliveries.size && !this.admissionReady()) return true;
+    if (!this.#deliveries.size && !this.admissionReady() && !this.admissionReady('probe'))
+      return true;
     return this.#nextIdleAttempt('') !== null;
   }
 
@@ -472,18 +475,93 @@ export class Worker {
     }
   }
 
-  async handleVideoProbe(command: VideoProbeCommandV1, ack: () => void): Promise<void> {
-    if (!this.admissionReady()) throw new Error('WORKER_NOT_READY');
+  async handleVideoProbe(command: VideoProbeDelivery, ack: () => void): Promise<void> {
+    const previous = this.#probeDeliveries.get(command.messageId);
+    if (previous) {
+      if (!isDeepStrictEqual(previous.command, command)) throw new Error('ATTEMPT_CONFLICT');
+      await previous.task;
+      ack();
+      return;
+    }
+    if (this.#stopped) throw new Error('WORKER_NOT_READY');
+    const task = this.#executeVideoProbe(command, ack);
+    this.#probeDeliveries.set(command.messageId, { command, task });
+    try {
+      await task;
+    } finally {
+      this.#probeDeliveries.delete(command.messageId);
+    }
+  }
+
+  async #executeVideoProbe(command: VideoProbeDelivery, ack: () => void): Promise<void> {
+    const download = this.#store.downloadVideoProbe;
+    const publish = this.#broker.publishVideoProbe;
+    if (!download || !publish) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+    const execution: WorkerExecutionIdentity = {
+      executionId: createId(),
+      protocol: 'video.probe.v1',
+      jobId: command.jobId,
+      attemptId: command.attemptId,
+      inspectionId: null,
+      resource: 'probe',
+      slots: 1,
+    };
+    const stopped = this.#stopController.signal;
+    const admitBy = command.admitBy ?? Infinity;
+    const admissionMs = Math.min(VIDEO_PROBE_ADMISSION_MS, admitBy - epochMs());
+    const localAdmitBy = monotonicMs() + admissionMs;
+    let release: (() => void) | undefined;
     const attemptLog = log.child({
       jobId: command.jobId,
       attemptId: command.attemptId,
       messageId: command.messageId,
     });
     attemptLog.info('VIDEO_PROBE_RECEIVED');
-    const download = this.#store.downloadVideoProbe;
-    const publish = this.#broker.publishVideoProbe;
-    if (!download || !publish) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
-    this.#busy = true;
+    try {
+      if (admissionMs > 0) {
+        const admission = new AbortController();
+        const timer = setTimeout(() => admission.abort(), admissionMs);
+        timer.unref();
+        try {
+          release = await this.#slots.wait(
+            'probe',
+            AbortSignal.any([stopped, admission.signal]),
+            execution,
+          );
+        } catch (error) {
+          if (!admission.signal.aborted || stopped.aborted) throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      stopped.throwIfAborted();
+      const result =
+        release && epochMs() < admitBy && monotonicMs() < localAdmitBy
+          ? await this.#inspectVideoProbe(command, execution.executionId, download)
+          : videoProbeEvent(command, { state: 'failed', errorCode: 'EXECUTION_TIMEOUT' });
+      this.#slots.phase(execution.executionId, 'finalizing');
+      await publish.call(this.#broker, result);
+      ack();
+      attemptLog.info('VIDEO_PROBE_ACK_DISPATCHED');
+    } finally {
+      try {
+        removeProbeFile(this.#directory, command.messageId);
+      } catch {
+        attemptLog.error('VIDEO_PROBE_FILE_CLEANUP_FAILED');
+      }
+      release?.();
+    }
+  }
+
+  async #inspectVideoProbe(
+    command: VideoProbeCommandV1,
+    executionId: string,
+    download: ObjectStore['downloadVideoProbe'],
+  ): Promise<VideoProbeResultV1> {
+    const executionDeadline = monotonicMs() + VIDEO_PROBE_EXECUTION_MS;
+    const timeout = new AbortController();
+    const executionTimer = setTimeout(() => timeout.abort(), VIDEO_PROBE_EXECUTION_MS);
+    executionTimer.unref();
     const diskController = new AbortController();
     const diskTimer = setInterval(() => {
       try {
@@ -493,41 +571,34 @@ export class Worker {
       }
     }, 5000);
     diskTimer.unref();
-    const signal = AbortSignal.any([
-      AbortSignal.timeout(VIDEO_PROBE_TIMEOUT_MS),
-      this.#stopController.signal,
-      diskController.signal,
-    ]);
+    const stopped = this.#stopController.signal;
+    const signal = AbortSignal.any([timeout.signal, stopped, diskController.signal]);
     try {
-      let result: VideoProbeResultV1;
+      removeProbeFile(this.#directory, command.messageId);
+      const downloadPath = probePath(this.#directory, command.messageId);
+      const bytes = command.source.sizeBytes;
+      requireProbeSpace(this.#directory, bytes, this.#probeDownloads);
+      this.#probeDownloads.set(downloadPath, bytes);
+      let path: string;
       try {
-        removeProbeFile(this.#directory, command.messageId);
-        requireProbeSpace(this.#directory, command.source.sizeBytes);
-        const path = await download.call(this.#store, command, this.#directory, signal);
-        const media = await probeVideoFile(path, signal);
-        result = videoProbeEvent(command, { state: 'succeeded', media });
-      } catch (error) {
-        result = videoProbeEvent(command, {
-          state: 'failed',
-          errorCode: videoProbeFailure(
-            error,
-            signal,
-            this.#stopController.signal,
-            diskController.signal,
-          ),
-        });
+        this.#slots.phase(executionId, 'downloading');
+        path = await download.call(this.#store, command, this.#directory, signal);
+      } finally {
+        this.#probeDownloads.delete(downloadPath);
       }
-      await publish.call(this.#broker, result);
-      ack();
-      attemptLog.info('VIDEO_PROBE_ACK_DISPATCHED');
+      this.#slots.phase(executionId, 'processing');
+      const media = await probeVideoFile(path, signal);
+      signal.throwIfAborted();
+      if (monotonicMs() >= executionDeadline) throw new Error('EXECUTION_TIMEOUT');
+      return videoProbeEvent(command, { state: 'succeeded', media });
+    } catch (error) {
+      return videoProbeEvent(command, {
+        state: 'failed',
+        errorCode: videoProbeFailure(error, signal, stopped, diskController.signal),
+      });
     } finally {
+      clearTimeout(executionTimer);
       clearInterval(diskTimer);
-      try {
-        removeProbeFile(this.#directory, command.messageId);
-      } catch {
-        attemptLog.error('VIDEO_PROBE_FILE_CLEANUP_FAILED');
-      }
-      this.#busy = false;
     }
   }
 

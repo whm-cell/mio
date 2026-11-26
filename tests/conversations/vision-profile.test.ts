@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
 import sharp from 'sharp';
-import { imageOutputKey } from '../../src/generations/contracts.ts';
+import { imageOutputKey } from '../../src/generations/image/contracts.ts';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import type { Conversation, HistoryPage } from '../../src/conversations/contracts.ts';
 import {

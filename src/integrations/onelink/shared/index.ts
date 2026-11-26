@@ -1,5 +1,9 @@
-import { isValidImageRoutePath } from '../../../generations/contracts.ts';
-import type { ImageAssetRef, ImageDriver, ImageInput } from '../../../generations/contracts.ts';
+import { isValidImageRoutePath } from '../../../generations/image/contracts.ts';
+import type {
+  ImageAssetRef,
+  ImageDriver,
+  ImageInput,
+} from '../../../generations/image/contracts.ts';
 import type { withPublicHttps } from '../public-https.ts';
 
 const ONELINK_ORIGIN = 'https://api.onelinkai.cloud';

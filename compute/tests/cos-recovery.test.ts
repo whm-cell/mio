@@ -162,6 +162,15 @@ it('downloads a private probe source conditionally and verifies the streamed byt
   expect(getObjectStream).toHaveBeenCalledWith(
     expect.objectContaining({ Key: command.source.stagingKey, IfMatch: command.source.etag }),
   );
+  headObject.mockRejectedValueOnce(
+    Object.assign(new Error('fixture missing object'), {
+      statusCode: 404,
+    }),
+  );
+  await expect(store.downloadVideoProbe(command, root, AbortSignal.timeout(5000))).rejects.toThrow(
+    'SOURCE_CHANGED',
+  );
+  expect(getObjectStream).toHaveBeenCalledOnce();
 });
 
 it('rejects an ETag or streamed digest mismatch before returning a probe file', async () => {

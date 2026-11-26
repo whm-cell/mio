@@ -24,6 +24,8 @@ import {
   RESULT_ROUTING_KEY,
   WORKER_TELEMETRY_ROUTING_KEY,
   WORKER_MAX_MESSAGE_BYTES,
+  VIDEO_PROBE_ADMISSION_HEADER,
+  VIDEO_PROBE_COMMAND_QUEUE,
   VIDEO_PROBE_RESULT_ROUTING_KEY,
   parseWorkerLimitsCommand,
   workerControlQueue,
@@ -74,7 +76,22 @@ interface ConsumerGate {
 interface CommandProtocol<T> {
   queue: string;
   maxBytes: number;
-  parse(value: unknown): T;
+  parse(value: unknown, properties: ConsumeMessage['properties']): T;
+}
+
+export type VideoProbeDelivery = VideoProbeCommandV1 & { admitBy?: number };
+type VideoCommand = ComputeCommandV1 | VideoProbeDelivery;
+
+function parseVideoProbeDelivery(
+  value: unknown,
+  properties: ConsumeMessage['properties'],
+): VideoProbeDelivery {
+  const command = parseVideoProbeCommandV1(value);
+  const admitBy: unknown = properties.headers?.[VIDEO_PROBE_ADMISSION_HEADER];
+  if (admitBy === undefined) return command;
+  if (typeof admitBy !== 'number' || !Number.isSafeInteger(admitBy) || admitBy <= 0)
+    throw new Error('COMMAND_INVALID');
+  return { ...command, admitBy };
 }
 
 async function closeConnection(
@@ -350,32 +367,28 @@ export class Broker {
   consume(
     handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
-    canAdmit: () => boolean,
-    handleVideoProbe?: (command: VideoProbeCommandV1, ack: () => void) => Promise<void>,
+    canAdmit: ((command: VideoCommand) => boolean) | undefined,
+    handleVideoProbe?: (command: VideoProbeDelivery, ack: () => void) => Promise<void>,
   ): Promise<void> {
-    return this.consumeCommands(
-      {
-        queue: COMMAND_QUEUE,
-        maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-        parse(value): ComputeCommandV1 | VideoProbeCommandV1 {
-          return value &&
-            typeof value === 'object' &&
-            !Array.isArray(value) &&
-            (value as Record<string, unknown>).type === 'video.probe'
-            ? parseVideoProbeCommandV1(value)
-            : parseComputeCommandV1(value);
-        },
+    const protocol: CommandProtocol<VideoCommand> = {
+      queue: COMMAND_QUEUE,
+      maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
+      parse(value, properties) {
+        return (value as { type?: unknown } | null)?.type === 'video.probe'
+          ? parseVideoProbeDelivery(value, properties)
+          : parseComputeCommandV1(value);
       },
-      async (command, ack) => {
-        if (command.type === 'video.probe') {
-          if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
-          return handleVideoProbe(command, ack);
-        }
-        return handle(command, ack);
-      },
-      failed,
-      canAdmit,
-    );
+    };
+    const dispatch = async (command: VideoCommand, ack: () => void) => {
+      if (command.type === 'video.probe') {
+        if (!handleVideoProbe) throw new Error('VIDEO_PROBE_HANDLER_UNAVAILABLE');
+        return handleVideoProbe(command, ack);
+      }
+      return handle(command, ack);
+    };
+    return canAdmit
+      ? this.consumeCommands(protocol, dispatch, failed, canAdmit)
+      : this.#consumeConcurrentChannel(protocol, dispatch, failed, 32);
   }
 
   consumeAudio(
@@ -395,19 +408,20 @@ export class Broker {
     );
   }
 
-  consumeTranscodes(
-    handle: (command: ComputeCommandV1, ack: () => void) => Promise<void>,
+  consumeVideoProbes(
+    handle: (command: VideoProbeDelivery, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
+    buffered: boolean,
   ): Promise<void> {
     return this.#consumeConcurrentChannel(
       {
-        queue: COMMAND_QUEUE,
+        queue: VIDEO_PROBE_COMMAND_QUEUE,
         maxBytes: COMPUTE_MAX_MESSAGE_BYTES,
-        parse: parseComputeCommandV1,
+        parse: parseVideoProbeDelivery,
       },
       handle,
       failed,
-      32,
+      buffered ? 32 : 1,
     );
   }
 
@@ -537,7 +551,7 @@ export class Broker {
     const value: unknown = JSON.parse(
       new TextDecoder('utf-8', { fatal: true }).decode(message.content),
     );
-    const command = protocol.parse(value);
+    const command = protocol.parse(value, message.properties);
     if (message.properties.messageId !== command.messageId) throw new Error('COMMAND_ID_MISMATCH');
     return command;
   }
@@ -546,7 +560,7 @@ export class Broker {
     protocol: CommandProtocol<T>,
     handle: (command: T, ack: () => void) => Promise<void>,
     failed: (error: unknown) => void,
-    canAdmit: () => boolean,
+    canAdmit: (command: T) => boolean,
   ): Promise<void> {
     if (this.#state.closed || this.#gate || this.#pause || this.#handling)
       throw new Error('BROKER_CONSUMER_BUSY');
@@ -575,13 +589,8 @@ export class Broker {
           report(new Error('CONSUMER_CANCELLED'));
           return;
         }
-        try {
-          if (this.#handling || !canAdmit()) {
-            void this.pause().catch(report);
-            return;
-          }
-        } catch (error) {
-          report(error);
+        if (this.#handling) {
+          void this.pause().catch(report);
           return;
         }
         let command: T;
@@ -593,6 +602,15 @@ export class Broker {
           } catch (error) {
             report(error);
           }
+          return;
+        }
+        try {
+          if (!canAdmit(command)) {
+            void this.pause().catch(report);
+            return;
+          }
+        } catch (error) {
+          report(error);
           return;
         }
         const tracked = Promise.resolve()
@@ -666,7 +684,7 @@ export class Broker {
   async close(): Promise<void> {
     if (this.#gate) this.#gate.open = false;
     this.#concurrentClosing = true;
-    // Preserve journal ownership until admitted transcodes finish.
+    // Preserve journal and scratch ownership until admitted work finishes.
     if (this.#handling) await this.#handling;
     await Promise.allSettled(this.#concurrentHandling);
     this.#state.markClosed();

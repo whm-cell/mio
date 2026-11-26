@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { generationFixture } from './fixture.ts';
 import type { ImageResult } from '../../src/integrations/onelink/shared/index.ts';
-import type { GenerationTransports } from '../../src/generations/runner.ts';
+import type { GenerationTransports } from '../../src/generations/image/runner.ts';
 
 it.each(['last-query', 'expired', 'credentials', 'query-failed', 'processing-limit'] as const)(
   'materializes its durable prefix when subsequent querying cannot continue (%s)',

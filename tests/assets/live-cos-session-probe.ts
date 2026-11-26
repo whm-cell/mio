@@ -4,7 +4,7 @@ import { resolve, sep } from 'node:path';
 import { parseEnv } from 'node:util';
 import COS from 'cos-nodejs-sdk-v5';
 import sharp from 'sharp';
-import { imageOutputKey } from '../../src/generations/contracts.ts';
+import { imageOutputKey } from '../../src/generations/image/contracts.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { readAssetConfig } from '../../src/assets/config.ts';
 

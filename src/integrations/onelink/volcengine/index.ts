@@ -1,4 +1,4 @@
-import type { ImageInput, ImageRouteConfig } from '../../../generations/contracts.ts';
+import type { ImageInput, ImageRouteConfig } from '../../../generations/image/contracts.ts';
 import { withPublicHttps } from '../public-https.ts';
 import {
   dataUrlFromBytes,

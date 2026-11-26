@@ -1,24 +1,29 @@
-import { ApplicationError } from '@mio/foundation/errors';
-import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import { HarnessError } from '@deepseek-ai/dsh-llm';
-import { defineTool, isPlainJsonRecord, ToolArgsError } from '@deepseek-ai/dsh-tools';
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
+import { defineTool, isPlainJsonRecord } from '@deepseek-ai/dsh-tools';
 import {
   VIDEO_JOB_STATES,
   VIDEO_MAX_PROMPT_CODEPOINTS,
   VIDEO_MODES,
-} from '../generations/video-contracts.ts';
-import type { VideoJobView } from '../generations/video-contracts.ts';
+} from '../generations/video/contracts.ts';
+import type { VideoJobView } from '../generations/video/contracts.ts';
 import type {
   ConversationRun,
   ConversationVideoJobOutput,
   ConversationVideoJobView,
   ConversationVideoModelSummary,
+  ConversationVideoSubmitParameterSpec,
   ConversationVideoToolName,
   ConversationVideoTools,
 } from '../conversations/contracts.ts';
+import {
+  assertAllowedArguments,
+  closedParametersTool,
+  deriveMediaToolRequestId,
+  hasAllowedArguments,
+  sanitizedMediaToolError,
+} from './media-tool-helpers.ts';
 
 const ERROR_CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
 const NON_TERMINAL_STATES = new Set(['accepted', 'submitted', 'processing', 'materializing']);
@@ -33,6 +38,7 @@ const SUBMIT_KEYS = new Set([
   'generateAudio',
   'watermark',
 ]);
+const VIDEO_SUBMIT_REQUIRED_FIELDS = ['modelRef', 'prompt', 'resolution'] as const;
 
 const modelSchema = {
   type: 'object',
@@ -52,6 +58,23 @@ const modelSchema = {
         properties: {
           mode: { type: 'string', required: true },
           supported: { type: 'boolean', required: true },
+          submitParameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              required: {
+                type: 'array',
+                items: { type: 'string', enum: VIDEO_SUBMIT_REQUIRED_FIELDS },
+                required: true,
+              },
+              maxPromptCodepoints: { type: 'integer', required: true },
+              ratios: { type: 'array', items: { type: 'string' }, required: true },
+              resolutions: { type: 'array', items: { type: 'string' }, required: true },
+              durationSeconds: { type: 'array', items: { type: 'integer' }, required: true },
+              supportsGenerateAudio: { type: 'boolean', required: true },
+              supportsWatermark: { type: 'boolean', required: true },
+            },
+          },
         },
       },
       required: true,
@@ -90,41 +113,26 @@ const videoJobSchema = {
   },
 } as const;
 
-function closedParametersTool(definition: ToolDefinition): ToolDefinition {
+function projectVideoSubmitParameters({
+  ratios,
+  resolutions,
+  durations,
+  maxPromptCodepoints,
+  requiresResolution,
+  generateAudio,
+  watermark,
+}: ConversationVideoSubmitParameterSpec) {
+  const required: (typeof VIDEO_SUBMIT_REQUIRED_FIELDS)[number][] = ['modelRef', 'prompt'];
+  if (requiresResolution) required.push('resolution');
   return {
-    ...definition,
-    parameters: { ...definition.parameters, additionalProperties: false },
+    required,
+    maxPromptCodepoints,
+    ratios: [...ratios],
+    resolutions: [...resolutions],
+    durationSeconds: [...durations],
+    supportsGenerateAudio: generateAudio,
+    supportsWatermark: watermark,
   };
-}
-
-function assertAllowedArguments(args: unknown, allowedKeys: ReadonlySet<string>): void {
-  if (!isPlainJsonRecord(args)) throw new ToolArgsError(['arguments must be a JSON object']);
-  for (const key of Object.keys(args)) {
-    if (!allowedKeys.has(key)) throw new ToolArgsError(['unexpected parameter']);
-  }
-}
-
-function sanitizedError(error: unknown): never {
-  if (error instanceof HarnessError) throw error;
-  if (error instanceof ApplicationError) {
-    throw new HarnessError(`MIO_VIDEO_TOOL_ERROR: ${error.code}`, error.code);
-  }
-  throw new HarnessError('MIO_VIDEO_TOOL_ERROR: VIDEO_UNAVAILABLE', 'VIDEO_UNAVAILABLE');
-}
-
-function deriveConversationVideoRequestId(
-  userId: string,
-  conversationId: string,
-  turnRequestId: string,
-  operationKey: string,
-): string {
-  const hex = sha256Utf8(
-    `mio:conv-video:v1:${userId}:${conversationId}:${turnRequestId}:${operationKey}`,
-  );
-  const variant = ((Number.parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80)
-    .toString(16)
-    .padStart(2, '0');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(18, 20)}-${hex.slice(20, 32)}`;
 }
 
 function codepointCount(value: string): number {
@@ -251,10 +259,9 @@ export function registerConversationVideoTools(
       defineTool({
         name: 'list_video_models',
         description:
-          'List the current user video models and exact runnable modes. Only models reported available may be submitted; never infer support from a model name.',
+          'List the current user video models and exact runnable modes. For submit_video_job, choose an available model with supported text_to_video. Follow its submitParameters to include every required field, select listed values, and omit optional fields with empty option lists or false support flags. Missing submitParameters means the limits are unknown.',
         parameters: {},
-        isConcurrencySafe: (args) =>
-          isPlainJsonRecord(args) && Object.keys(args).every((key) => LIST_KEYS.has(key)),
+        isConcurrencySafe: (args) => hasAllowedArguments(args, LIST_KEYS),
         output: {
           schema: {
             type: 'object',
@@ -272,17 +279,24 @@ export function registerConversationVideoTools(
             const models = await bridge.listModels(actor);
             return {
               models: models.map((model: ConversationVideoModelSummary) => ({
-                ...model,
-                supportedModes: model.supportedModes
-                  .filter(
-                    (entry) =>
-                      typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
-                  )
-                  .map(({ mode, supported }) => ({ mode, supported })),
+                modelRef: model.modelRef,
+                modelId: model.modelId,
+                name: model.name,
+                vendor: model.vendor,
+                available: model.available,
+                unavailableReason: model.unavailableReason,
+                supportedModes: model.supportedModes.map((entry) => {
+                  const { mode, supported } = entry;
+                  const submitParameters =
+                    model.available && supported && mode === 'text_to_video' && entry.parameters
+                      ? projectVideoSubmitParameters(entry.parameters)
+                      : undefined;
+                  return { mode, supported, ...(submitParameters ? { submitParameters } : {}) };
+                }),
               })),
             };
           } catch (error) {
-            return sanitizedError(error);
+            return sanitizedMediaToolError(error, 'video');
           }
         },
       }),
@@ -294,7 +308,7 @@ export function registerConversationVideoTools(
       defineTool({
         name: 'submit_video_job',
         description:
-          'Submit one text-to-video job for the current user. Check list_video_models first and use only an available model. After the job handle is returned, report its ID and state and finish this turn; never poll it in the same turn.',
+          'Submit one text-to-video job for the current user. Check list_video_models first and follow submitParameters for an available model with supported text_to_video. After the job handle is returned, report its ID and state and finish this turn. Poll only in later turns.',
         parameters: {
           modelRef: {
             type: 'string',
@@ -345,21 +359,9 @@ export function registerConversationVideoTools(
             );
           exec.signal.throwIfAborted();
           try {
-            const capabilities = await bridge.capabilities(actor, args.modelRef);
-            if (!capabilities.available) throw new ApplicationError('VIDEO_UNAVAILABLE');
-            if (
-              !capabilities.modes.some((entry) => entry.mode === 'text_to_video' && entry.supported)
-            )
-              throw new ApplicationError('VIDEO_MODE_UNSUPPORTED');
             const request = {
-              requestId: deriveConversationVideoRequestId(
-                run.userId,
-                run.conversationId,
-                run.requestId,
-                exec.callId,
-              ),
+              requestId: deriveMediaToolRequestId('video', run, exec.callId),
               modelRef: args.modelRef,
-              expectedCapabilitiesVersion: capabilities.capabilitiesVersion,
               parameters: {
                 mode: 'text_to_video' as const,
                 prompt: args.prompt,
@@ -372,11 +374,12 @@ export function registerConversationVideoTools(
                 ...(args.watermark !== undefined ? { watermark: args.watermark } : {}),
               },
             };
-            const job = sanitizeVideoJob(await bridge.createVideo(actor, request));
+            const job = sanitizeVideoJob(await bridge.createVideo(actor, request, exec.signal));
             if (NON_TERMINAL_STATES.has(job.status)) submittedPendingJobs.add(job.jobId);
             return job;
           } catch (error) {
-            return sanitizedError(error);
+            exec.signal.throwIfAborted();
+            return sanitizedMediaToolError(error, 'video');
           }
         },
       }),
@@ -416,7 +419,7 @@ export function registerConversationVideoTools(
             if (NON_TERMINAL_STATES.has(job.status)) polledPendingJobs.add(job.jobId);
             return job;
           } catch (error) {
-            return sanitizedError(error);
+            return sanitizedMediaToolError(error, 'video');
           }
         },
       }),
@@ -436,8 +439,7 @@ export function registerConversationVideoTools(
             description: 'Mio video job UUID returned by submit_video_job.',
           },
         },
-        isConcurrencySafe: (args) =>
-          isPlainJsonRecord(args) && Object.keys(args).every((key) => GET_KEYS.has(key)),
+        isConcurrencySafe: (args) => hasAllowedArguments(args, GET_KEYS),
         output: {
           schema: videoJobSchema,
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -471,7 +473,7 @@ export function registerConversationVideoTools(
             if (NON_TERMINAL_STATES.has(job.status)) polledPendingJobs.add(job.jobId);
             return job;
           } catch (error) {
-            return sanitizedError(error);
+            return sanitizedMediaToolError(error, 'video');
           } finally {
             if (inFlightPollByJobId.get(args.jobId) === inFlight)
               inFlightPollByJobId.delete(args.jobId);

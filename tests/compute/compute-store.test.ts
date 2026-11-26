@@ -5,7 +5,7 @@ import type { ComputeResultV1 } from '@mio/compute-contracts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { checkComputeSchema, computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
-import { ComputeStore } from '../../src/compute/store.ts';
+import { ComputeStore } from '../../src/compute/transcode/store.ts';
 import { checkComputeCapacity, lockComputeCapacity } from '../../src/compute/capacity.ts';
 import { authDatabase } from '../support/auth-database.ts';
 

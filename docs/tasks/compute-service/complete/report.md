@@ -6,7 +6,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **A 侧计算任务与可靠投递、结果登记**
 
-[src/compute/service.ts](../../../../src/compute/service.ts) · [src/compute/store.ts](../../../../src/compute/store.ts) · [docs/apis/compute.md](../../../apis/compute.md)
+[src/compute/transcode/service.ts](../../../../src/compute/transcode/service.ts) · [src/compute/transcode/store.ts](../../../../src/compute/transcode/store.ts) · [docs/apis/compute.md](../../../apis/compute.md)
 
 ## compute-local-artifacts
 
@@ -24,7 +24,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **图片 I/O 计算队列解耦、独立配额、批量唤醒排空与 Worker 有界并发**
 
-[scripts/service/compute-broker-topology.ts](../../../../scripts/service/compute-broker-topology.ts) · [scripts/service/local-broker.ts](../../../../scripts/service/local-broker.ts) · [src/compute/store.ts](../../../../src/compute/store.ts) · [src/compute/service.ts](../../../../src/compute/service.ts) · [src/integrations/rabbitmq.ts](../../../../src/integrations/rabbitmq.ts) · [docs/tasks/compute-service/changes/image-io-concurrency/change.md](../changes/image-io-concurrency/change.md) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/rabbitmq.md](../../../integrations/rabbitmq.md) · [docs/apis/compute.md](../../../apis/compute.md) · [tests/compute/image-concurrency.test.ts](../../../../tests/compute/image-concurrency.test.ts)
+[scripts/service/compute-broker-topology.ts](../../../../scripts/service/compute-broker-topology.ts) · [scripts/service/local-broker.ts](../../../../scripts/service/local-broker.ts) · [src/compute/transcode/store.ts](../../../../src/compute/transcode/store.ts) · [src/compute/transcode/service.ts](../../../../src/compute/transcode/service.ts) · [src/integrations/rabbitmq.ts](../../../../src/integrations/rabbitmq.ts) · [docs/tasks/compute-service/changes/image-io-concurrency/change.md](../changes/image-io-concurrency/change.md) · [docs/tasks/compute-service/protocol.md](../protocol.md) · [docs/integrations/rabbitmq.md](../../../integrations/rabbitmq.md) · [docs/apis/compute.md](../../../apis/compute.md) · [tests/compute/image-concurrency.test.ts](../../../../tests/compute/image-concurrency.test.ts) · [docs/tasks/onelink-image-generation/changes/image-generation-in-a/change.md](../../onelink-image-generation/changes/image-generation-in-a/change.md) · [src/generations/image/store.ts](../../../../src/generations/image/store.ts)
 
 ## image-upload-verification
 
@@ -36,13 +36,13 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **通用媒体处理内核与基础操作**
 
-[src/compute/media-http.ts](../../../../src/compute/media-http.ts) · [src/compute/media-results.ts](../../../../src/compute/media-results.ts) · [compute/src/media-runtime.ts](../../../../compute/src/media-runtime.ts) · [docs/apis/compute.md](../../../apis/compute.md)
+[src/compute/media/http.ts](../../../../src/compute/media/http.ts) · [src/compute/media/store.ts](../../../../src/compute/media/store.ts) · [compute/src/media-runtime.ts](../../../../compute/src/media-runtime.ts) · [docs/apis/compute.md](../../../apis/compute.md) · [src/compute/media/service.ts](../../../../src/compute/media/service.ts)
 
 ## media-compute-derivatives
 
 **视频自动派生与私有 HLS 播放**
 
-[compute/src/plans/derivatives.ts](../../../../compute/src/plans/derivatives.ts) · [src/assets/store.ts](../../../../src/assets/store.ts) · [src/assets/derivatives.ts](../../../../src/assets/derivatives.ts) · [src/compute/media-hls.ts](../../../../src/compute/media-hls.ts) · [docs/apis/assets.md](../../../apis/assets.md) · [docs/apis/compute.md](../../../apis/compute.md)
+[compute/src/plans/derivatives.ts](../../../../compute/src/plans/derivatives.ts) · [src/assets/store.ts](../../../../src/assets/store.ts) · [src/assets/derivatives.ts](../../../../src/assets/derivatives.ts) · [src/compute/media/hls.ts](../../../../src/compute/media/hls.ts) · [docs/apis/assets.md](../../../apis/assets.md) · [docs/apis/compute.md](../../../apis/compute.md)
 
 ## media-compute-foundation
 
@@ -66,7 +66,7 @@ PRD：[当前需求](../prd.md)。完成范围、接受结论、验证摘要与�
 
 **Worker 并发观测、占槽历史与每实例动态调限（管理后台收敛版）**
 
-[contracts/compute/src/worker-observability.ts](../../../../contracts/compute/src/worker-observability.ts) · [compute/src/main.ts](../../../../compute/src/main.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/compute/ops-http.ts](../../../../src/compute/ops-http.ts) · [docs/apis/admin.md](../../../apis/admin.md)
+[contracts/compute/src/worker-observability.ts](../../../../contracts/compute/src/worker-observability.ts) · [compute/src/main.ts](../../../../compute/src/main.ts) · [src/plugin.ts](../../../../src/plugin.ts) · [src/compute/observability/http.ts](../../../../src/compute/observability/http.ts) · [docs/apis/admin.md](../../../apis/admin.md)
 
 ```mio-prd-results
 {

@@ -41,6 +41,13 @@ it('validates boot and execution identity, hard limits and telemetry counts on t
     event: null,
   };
   expect(parseWorkerTelemetry(Buffer.from(JSON.stringify(message)))).toEqual(message);
+  const videoProbe = {
+    ...active,
+    protocol: 'video.probe.v1',
+    attemptId: randomUUID(),
+    inspectionId: null,
+  };
+  expect(parseWorkerTelemetry({ ...message, active: [videoProbe] }).active).toEqual([videoProbe]);
   for (const changes of [
     { version: 2 },
     { bootId: undefined },
@@ -49,6 +56,9 @@ it('validates boot and execution identity, hard limits and telemetry counts on t
     { active: [{ ...active, protocol: [active.protocol] }] },
     { active: [{ ...active, inspectionId: null, attemptId: randomUUID() }] },
     { active: [{ ...active, resource: 'encode' }] },
+    { active: [{ ...videoProbe, resource: 'encode' }], usage: { total: 1, encode: 1, probe: 0 } },
+    { active: [{ ...videoProbe, attemptId: null }] },
+    { active: [{ ...videoProbe, inspectionId: randomUUID() }] },
     { active: [active, active], usage: { total: 2, encode: 0, probe: 2 } },
     { active: [] },
     { holds: { encode: ['one', 'one'], probe: [] } },

@@ -14,7 +14,7 @@ export interface WorkerLimits {
 }
 export interface WorkerExecutionIdentity {
   executionId: string;
-  protocol: 'transcode.v1' | 'audio.inspect.v1' | 'media';
+  protocol: (typeof protocols)[number];
   jobId: string;
   attemptId: string | null;
   inspectionId: string | null;
@@ -90,7 +90,7 @@ export interface WorkerLimitsResult {
 }
 
 const instance = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
-const protocols = ['transcode.v1', 'audio.inspect.v1', 'media'] as const;
+const protocols = ['transcode.v1', 'audio.inspect.v1', 'video.probe.v1', 'media'] as const;
 const executionStates = ['queued', 'acquired', 'released', 'cancelled'] as const;
 const rejectionReasons = [
   'HARD_LIMIT_EXCEEDED',
@@ -178,7 +178,8 @@ function execution(value: unknown): WorkerExecutionIdentity {
   } else if (
     attemptId === null ||
     inspectionId !== null ||
-    (protocol === 'transcode.v1' && resourceClass !== 'encode')
+    (protocol === 'transcode.v1' && resourceClass !== 'encode') ||
+    (protocol === 'video.probe.v1' && resourceClass !== 'probe')
   )
     invalid();
   return {

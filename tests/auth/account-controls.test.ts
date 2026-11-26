@@ -105,10 +105,31 @@ async function signInWechat(openid: string, instance = 0) {
   expect(started.status, await started.clone().text()).toBe(200);
   const { url } = (await started.json()) as { url: string };
   const state = new URL(url).searchParams.get('state')!;
-  return call(`/api/auth/callback/wechat?code=${code}&state=${encodeURIComponent(state)}`, {
-    cookie: cookies(started),
+  const callback = await call(
+    `/api/auth/callback/wechat?code=${code}&state=${encodeURIComponent(state)}`,
+    {
+      cookie: cookies(started),
+      instance,
+    },
+  );
+  if (!callback.headers.getSetCookie().some((cookie) => cookie.startsWith('mio.wechat_pending=')))
+    return callback;
+  const pending = await call('/api/auth/wechat/pending', { cookie: cookies(callback), instance });
+  expect(pending.status).toBe(200);
+  const { candidateToken } = (await pending.json()) as { candidateToken: string };
+  const confirmed = await call('/api/auth/wechat/pending/confirm', {
+    body: { action: 'create', candidateToken },
+    cookie: cookies(callback),
     instance,
   });
+  expect(confirmed.status, await confirmed.clone().text()).toBe(200);
+  const headers = new Headers(callback.headers);
+  headers.delete('set-cookie');
+  for (const cookie of confirmed.headers.getSetCookie()) headers.append('set-cookie', cookie);
+  const location = new URL(headers.get('location')!);
+  location.searchParams.delete('wechat_result');
+  headers.set('location', location.href);
+  return new Response(null, { status: callback.status, headers });
 }
 
 beforeAll(async () => {

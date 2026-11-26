@@ -59,6 +59,7 @@ const schema = {
       purpose: { type: 'string' },
       userId: { type: 'string', required: false },
       sessionId: { type: 'string', required: false },
+      originalPhone: { type: 'string', required: false },
       status: { type: 'string' },
       attempts: { type: 'number' },
       expiresAt: { type: 'date', index: true },

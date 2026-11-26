@@ -11,7 +11,11 @@ export interface PhoneLimits {
   ipHour: number;
   ipDay: number;
   globalDay: number;
+  accountOpsDay: number;
 }
+
+export type AccountOperationSmsPurpose =
+  'phone_rebind' | 'wechat_existing' | 'onelink_existing' | 'account_deletion';
 
 /** The caller owns the transaction and commits this debit with the pending challenge. */
 export async function reserveSmsBudget(
@@ -20,10 +24,16 @@ export async function reserveSmsBudget(
   limits: PhoneLimits,
   phone: string,
   ip: string,
+  purpose: 'login' | 'bind' | AccountOperationSmsPurpose = 'login',
 ) {
   // Every writer takes the global, IP, and phone keys in that order.
   const keys = [
-    { id: 'global', hour: Infinity, day: limits.globalDay, cooldown: false },
+    {
+      id: purpose === 'login' || purpose === 'bind' ? 'global' : 'global:account_ops',
+      hour: Infinity,
+      day: purpose === 'login' || purpose === 'bind' ? limits.globalDay : limits.accountOpsDay,
+      cooldown: false,
+    },
     { id: `ip:${sha256Utf8(ip)}`, hour: limits.ipHour, day: limits.ipDay, cooldown: false },
     {
       id: `phone:${sha256Utf8(phone)}`,

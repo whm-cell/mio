@@ -4,15 +4,17 @@
 
 ## 本域共同约定
 
-只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST 与 PATCH 必须携带允许的 Origin 和 JSON，正文最多 16 KiB、读取超时 10 秒。浏览器请求使用 `credentials: 'include'`。
+只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST、PATCH 与 DELETE 必须携带允许的 Origin；POST 与 PATCH 另须为 JSON，正文最多 16 KiB、读取超时 10 秒。本文列出的 DELETE 不需要正文。浏览器请求使用 `credentials: 'include'`。
 
-OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和 Content-Type 请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH 与预检才返回 403。
+OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和相应请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH／DELETE 与预检才返回 403。
 
 邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink`、`/api/auth/onelink/pending`、`/api/auth/onelink/existing/send-otp` 与 `/api/auth/onelink/complete` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
 会话默认 7 天、1 天后可刷新；禁用 cookie 会话缓存，身份与撤销查询以 DB 为准。`/api/v1/me` 只校验身份，不刷新会话；客户端经 `/api/auth/get-session` 同时续期 DB 与 cookie。数据库池和路由随插件生命周期初始化/释放；重载且 secret/数据库不变时会话继续有效。
+
+微信与万联在账号归属事务完成后创建登录会话，在下发 Cookie 前再次核对账号有效、原外部身份仍归属该用户及本次授权未被解绑失效。若此时检查失败，只删除本次刚创建的会话并拒绝登录，保留其他原有效会话；账号归属提交与 Cookie 签发不宣称为一个原子事务。检查通过后的正常解绑仍按保留有效会话的规则处理。
 
 认证库响应沿固定版本契约，错误通常为 `{code,message}`，限流等保留库的状态、原始正文与响应头；多个 Set-Cookie 分别转发，库的 cache-control 不覆盖本服务禁缓存策略。适配器默认设置服务端生成的 `X-Request-Id`、`Cache-Control: no-store` 和 `X-Content-Type-Options: nosniff`；成功读取完整库响应后才复制上游响应头，除 cache-control 和 Set-Cookie 外，上游同名头优先，因此上游提供的 `X-Request-Id` 或 `X-Content-Type-Options` 可覆盖默认值。适配器的 Origin、方法、正文或基础设施错误采用 `{error:{code,message,requestId}}` 与 `Content-Type: application/json`；包装错误保留本地追踪头及 `nosniff`，其 requestId 与响应头一致。消费者按入口与 HTTP 状态处理，不能假定与 Foundation 错误体完全相同。共同实现入口见[运行时公共能力](index.md#运行时公共能力)。
 
@@ -23,11 +25,16 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | `/sign-in/email`                                                                                               | 60 秒 / 10 次        |
 | `/sign-up/email`                                                                                               | 60 秒 / 5 次         |
 | `/phone-number/send-otp`、`/phone-binding/send-otp`                                                            | 各自 60 秒 / 100 次  |
+| `/phone-rebind/send-otp`                                                                                       | 60 秒 / 100 次       |
+| `/phone-rebind/confirm`                                                                                        | 60 秒 / 10 次        |
 | `/phone-number/verify`、`/phone-binding/confirm`                                                               | 各自 60 秒 / 10 次   |
 | `/sign-in/social`、`/link-social`                                                                              | 各自 60 秒 / 10 次   |
 | `/wechat/qr-session`                                                                                           | 60 秒 / 20 次        |
 | `/wechat/qr-session/{qrcode_id}/poll`                                                                          | 各 ID 60 秒 / 300 次 |
 | `/callback/wechat`                                                                                             | 60 秒 / 100 次       |
+| `/wechat/pending`                                                                                              | 60 秒 / 60 次        |
+| `/wechat/pending/send-otp`                                                                                     | 60 秒 / 100 次       |
+| `/wechat/pending/confirm`                                                                                      | 60 秒 / 10 次        |
 | `/onelink/start`                                                                                               | 60 秒 / 20 次        |
 | `/onelink/pending`                                                                                             | 60 秒 / 60 次        |
 | `/onelink/cancel`                                                                                              | 60 秒 / 30 次        |
@@ -51,7 +58,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 成功：201 和 `{qrcode_id,authorization_url,expire_seconds:300}`。QR ID 为不透明 UUID v4；同时转发 Better Auth 的 OAuth state Cookie 并设置 `mio.wechat_qr` Cookie（HTTPS 名称带 `__Secure-` 前缀）。QR Cookie 为 HttpOnly、SameSite=Lax，HTTPS 带 Secure，路径精确到本 ID 的 poll 入口，Max-Age 为 900 秒；QR 本身仍只在 300 秒内有效，较长 Cookie 只用于观察过期。响应保持 `Cache-Control: no-store`。
 
-`authorization_url` 必须由微信官方授权页面或同源页面内嵌的微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）承载，不是可直接作为二维码图片加载的地址；不提供无同浏览器 Session Cookie 的跨设备凭据交接。同源内嵌容器（须满足 `SAMEORIGIN` / `frame-ancestors 'self'`）或同一浏览器的授权窗口在 callback 处设置 Session Cookie；主页面须与服务满足共同的同站点／同源 Cookie 部署条件。返回 URL 不表示已经授权或登录，本仓库不实现完成页。
+`authorization_url` 必须由微信官方授权页面或同源页面内嵌的微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）承载，不是可直接作为二维码图片加载的地址；不提供无同浏览器 Session Cookie 的跨设备凭据交接。同源内嵌容器（须满足 `SAMEORIGIN` / `frame-ancestors 'self'`）或同一浏览器的授权窗口在 callback 处设置会话或待处理候选 Cookie；主页面须与服务满足共同的同站点／同源 Cookie 部署条件。返回 URL 不表示已经授权或登录，本仓库不实现完成页。
 
 错误：无效输入为 400 `INVALID_INPUT`，未启用微信为 503 `WECHAT_UNAVAILABLE`，数据库或授权地址创建失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法、正文和 429 沿共同约定。
 
@@ -59,25 +66,28 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 ## GET /api/auth/wechat/qr-session/{qrcode_id}/poll
 
-身份：本 ID 对应的 QR state Cookie；返回 confirmed 还要求有效的 Mio Session Cookie，且数据库确认的用户与 QR 会话确认用户一致。服务 token 不能替代任一 Cookie。
+身份：本 ID 对应的 QR state Cookie。`pending_confirm` 另须持有与本次 QR 关联的有效微信待处理 Cookie，不要求 Mio 用户会话；`confirmed` 另要求有效的 Mio Session Cookie，且数据库确认用户与 QR 确认用户一致。服务 token 不能替代这些 Cookie。
 
 输入：路径 ID 为 UUID v4，无正文。Origin 可省略；提供时必须在允许列表内。除精确 QR poll 路径外，不开放其他动态认证路径或隐式 Better Auth 插件入口。
 
 成功：200 和以下一个状态；不返回用户资料、Session token 或供应商凭据。
 
-| status    | 含义                                                                                                                       |
-| --------- | -------------------------------------------------------------------------------------------------------------------------- |
-| pending   | 尚未由本次微信 callback 完成授权。                                                                                         |
-| confirmed | 本次 callback 已产生 Session，当前浏览器 Session 有效且属于该确认用户；服务端锁定该 QR 记录并重验期限后原子转为 consumed。 |
-| failed    | 对应 callback 授权失败；不返回供应商原始错误或内部失败原因码。                                                             |
-| expired   | 已超过 5 分钟；即使此前 confirmed、failed 或 consumed，过期检查也优先返回此状态。                                          |
-| consumed  | 有效期内的成功结果已经被首次 confirmed 轮询消费，不能再次取得确认结果。                                                    |
+| status          | 含义                                                                                                                       |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| pending         | 尚未由本次微信 callback 完成授权。                                                                                         |
+| pending_confirm | 已完成微信授权但身份当前未绑定；本浏览器持有匹配候选，可进入显式账号确认，尚未创建用户或会话。                             |
+| confirmed       | 本次 callback 已产生 Session，当前浏览器 Session 有效且属于该确认用户；服务端锁定该 QR 记录并重验期限后原子转为 consumed。 |
+| failed          | 对应 callback 授权失败；不返回供应商原始错误或内部失败原因码。                                                             |
+| expired         | 已超过 5 分钟；即使此前 confirmed、failed 或 consumed，过期检查也优先返回此状态。                                          |
+| consumed        | 有效期内的成功结果已经被首次 confirmed 轮询消费，不能再次取得确认结果。                                                    |
+
+`pending_confirm` 表示本次授权命中当前未绑定微信，浏览器须通过 `GET /api/auth/wechat/pending` 取得候选并显式选择绑定已有账号或创建新账号；此状态不证明已登录，不消费候选，也不生成用户或会话。普通 `sign-in/social` 使用同一候选确认接口。
 
 不提供无法可靠观察的 scanned。并发轮询至多一个返回 confirmed；其他请求读取 consumed。若记录已被后续创建清理，则返回未知 ID 的 404，不承诺永久保留 expired 状态。
 
 错误：未知或无效 ID 为 404 `NOT_FOUND`，此判断不要求 Cookie；已知 ID 缺少或错配 QR Cookie 为 400 `STATE_MISMATCH`。confirmed 状态下 Session 缺失、过期、撤销或用户不符为 401 `UNAUTHORIZED`，且不消费记录。微信关闭为 503 `WECHAT_UNAVAILABLE`，数据库或会话查询失败为脱敏 503 `AUTH_UNAVAILABLE`；来源、方法和限流沿共同约定。
 
-副作用：稳定 pending 只执行一次 QR 状态读取，无行锁或写入。确认事务先锁定已验证的 Session 并核对归属，再锁定原 QR 记录。取得锁后以同一数据库时刻核对两者有效期，首次合格请求按原 QR Cookie 和确认用户原子消费。到期记录按原 QR Cookie 收敛为 expired。poll 不新建、不续期也不发放 Session Cookie。前端在 confirmed 后调用现有 `/api/v1/me` 取得同一可信身份。响应始终禁缓存。
+副作用：稳定 pending 只读 QR 状态；`pending_confirm` 另只读并核对当前有效候选与本浏览器 Cookie 归属，不消费候选。成功确认流程建立归属及会话后，confirmed poll 先核对会话和确认用户，再在 QR 锁内以同一数据库时刻重验期限并原子转为 consumed。poll 不新建、续期或发放 Session Cookie，响应始终禁缓存；客户端确认后调用 `/api/v1/me` 取得同一可信身份。
 
 ## POST /api/auth/sign-in/social
 
@@ -89,7 +99,7 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 错误：输入无效为 400，未启用为 503；来源、限流和数据库错误沿共同约定。
 
-副作用：建立短期授权 state；首次通过微信授权可注册用户，不按相同邮箱自动合并已有账号。客户端不传微信主体或持久化 provider token。
+副作用：建立短期授权 state。回调命中当前已绑定身份时登录原账号；当前未绑定身份（含已解绑）进入短期待确认候选，确认前不自动建号或签发会话。客户端不传微信主体或持久化 provider token，不按相同邮箱自动合并账号。
 
 ## POST /api/auth/link-social
 
@@ -105,17 +115,57 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 ## GET /api/auth/callback/wechat
 
-身份：微信授权返回的 code、state 和发起浏览器的 state Cookie；绑定在回调执行权威会话核验时，还要求发起会话有效且当前浏览器使用同一 userId 和 sessionId。核验已通过的在途绑定不会因并发退出或撤销自动取消，可能在撤销成功后完成；后续请求仍受撤销约束。
+身份：微信授权返回的 code、state 和发起浏览器的 state Cookie；个人中心绑定仍要求创建不足 10 分钟的原有效会话、相同 userId 与 sessionId，最终写入在用户锁内重新核对账号未禁用。解绑前发起的旧回调必须失效。
 
 输入：库处理的 `code`、`state` 或微信授权错误；只开放 GET，不要求普通 POST 的 Origin，但如提供 Origin 仍必须获准。同源 iframe 桥接第二跳可附带内部参数 `mio_bridge`，适配器在转交认证库前将其移除。
 
-成功：库校验后为微信登录签发持久会话 Cookie，或将新微信绑定当前 userId；响应重定向到发起时批准的本站路径。当请求携带 `Sec-Fetch-Dest: iframe`、未携带 `mio_bridge`、缺少对应协议的 state Cookie（HTTPS 为 `__Secure-mio.state`，回环 HTTP 为 `mio.state`）且 `state` 为非空且不超过 512 字符的字符串时，适配器在完成 Origin、方法与微信启用检查后不进入认证库，直接返回 200 `text/html; charset=utf-8` 固定同源桥接页（无动态插值，内联脚本仅为当前 URL 添加 `mio_bridge=1` 并执行 `location.replace`），保留 `X-Request-Id`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`，并设置 `X-Frame-Options: SAMEORIGIN`、`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; frame-ancestors 'self'` 与 `Referrer-Policy: no-referrer`；浏览器在同源 iframe 内发起第二跳并附带 state Cookie 后，适配器移除 `mio_bridge` 并交由认证库完成校验与 302 重定向。
+成功：已绑定身份签发原用户会话；当前未绑定身份在建号前暂存 `candidate_ready` 并下发微信待处理 Cookie，确认前不生成用户或会话；个人中心绑定只写入发起用户的微信关联。均重定向到批准的本站路径；未绑定候选附带 `wechat_result=choose_account`，页面再读取 pending 确认信息。当请求携带 `Sec-Fetch-Dest: iframe`、未携带 `mio_bridge`、缺少对应协议的 state Cookie（HTTPS 为 `__Secure-mio.state`，回环 HTTP 为 `mio.state`）且 `state` 为非空且不超过 512 字符的字符串时，适配器在完成 Origin、方法与微信启用检查后不进入认证库，直接返回 200 `text/html; charset=utf-8` 固定同源桥接页（无动态插值，内联脚本仅为当前 URL 添加 `mio_bridge=1` 并执行 `location.replace`），保留 `X-Request-Id`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`，并设置 `X-Frame-Options: SAMEORIGIN`、`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; frame-ancestors 'self'` 与 `Referrer-Policy: no-referrer`；浏览器在同源 iframe 内发起第二跳并附带 state Cookie 后，适配器移除 `mio_bridge` 并交由认证库完成校验与 302 重定向。
 
 错误：缺少或错误 state Cookie、重复 state 为 400；已携带 `mio_bridge` 的第二跳若仍缺少或错配 state Cookie，直接交由认证库返回 400 `STATE_MISMATCH` 且不再返回桥接页（零循环）。非 iframe 请求、缺少或超长 `state` 不触发桥接；微信未启用时即使携带 `Sec-Fetch-Dest: iframe` 仍返回 503 `WECHAT_UNAVAILABLE`。库拒绝过期 state、供应商失败、被占用微信、已禁用账号（`ACCOUNT_DISABLED`）或失效绑定会话时按库错误重定向或返回失败。回调过程中如遇依赖故障，不得将失败推断为登录成功。
 
 副作用：第一跳 iframe 桥接不调用认证库，不消费 `/callback/wechat` 限流额度，也不触碰数据库或微信接口。进入微信兑换前原子保留 state；之后即使失败也需重新发起。微信出站、账号主体、token 加密和 AppID 生命周期见[微信契约](../integrations/wechat.md)。
 
-当 state 对应 QR 会话时，在原签名 Cookie 和单次保留检查后关联 QR；过期 QR 在供应商兑换前以 400 拒绝。只有本次 callback 的新 Session 用户能将 pending QR 标记为 confirmed，已有登录 Cookie 不会让失败回调变成成功；其余已进入的失败回调把对应 pending QR 标记为 failed。重复／并发 callback 不替换已经确认或消费的结果。QR 用户拒绝参数脱敏为 `WECHAT_AUTH_FAILED` 后回到批准的完成路径，普通 OAuth 重定向行为保持原契约。缺失或错误发起 Cookie 的请求在关联 QR 前拒绝，不将该 QR 标记失败。
+当 state 对应 QR 会话时，在原签名 Cookie 和单次保留检查后关联 QR；过期 QR 在供应商兑换前以 400 拒绝。已绑定登录由本次 callback 的新会话确认 QR；当前未绑定身份将 QR 关联至微信待处理候选，poll 返回 `pending_confirm`，最终确认后才建立账号归属及会话。已有登录 Cookie 不会让失败回调变成成功。重复／并发 callback 不替换已有候选、已确认或已消费结果；用户拒绝脱敏为 `WECHAT_AUTH_FAILED` 后回到批准路径。缺失或错误发起 Cookie 在关联 QR 前拒绝，不将该 QR 标记失败。
+
+## GET /api/auth/wechat/pending
+
+身份：当前浏览器的微信待处理 Cookie，普通 QR 与 `sign-in/social` 回调共用。Cookie 名为 `mio.wechat_pending`（HTTPS 带 `__Secure-` 前缀和 Secure），属性为 HttpOnly、SameSite=Lax、`Path=/api/auth`，不把原始 Cookie 或微信主体交给页面。
+
+输入：无正文。Origin 可省略，提供时须在允许列表内。
+
+成功：200 和 `{status:"candidate_ready",candidateToken,wechatNickname,expiresAt}`。`candidateToken` 为不透明确认令牌，`wechatNickname` 为服务端核实的微信昵称或 `null`，`expiresAt` 为 ISO 时间。候选期限继承本次 OAuth state；QR 路径还受原 5 分钟 QR 期限限制，以回执为准。待处理 Cookie 的 Max-Age 为 900 秒，不延长候选。未绑定候选不要求 Mio 会话，也不代表已登录。
+
+错误：Cookie 缺失、未知、候选过期或已非 `candidate_ready` 统一返回 404 `WECHAT_PENDING_NOT_FOUND`；微信未启用为 503 `WECHAT_UNAVAILABLE`，基础设施故障为 503 `AUTH_UNAVAILABLE`。本只读入口不把已完成候选重新返回给页面。
+
+副作用：只读候选，不创建用户、永久关联或会话，也不续期候选。确认必须携带本浏览器 Cookie 与回执候选令牌，客户端不能指定微信身份或目标 userId。
+
+## POST /api/auth/wechat/pending/send-otp
+
+身份：本浏览器有效、未过期的 `candidate_ready` 微信待处理 Cookie。
+
+输入：严格 `{phoneNumber}`，接受 11 位大陆手机号或其 `+86` 格式，不接受额外字段。
+
+成功：200 和 `{status:true,expiresIn:300}`。不暴露目标手机号是否已注册；live 表示供应商已受理，不证明送达。
+
+错误：输入非法为 400 `INVALID_INPUT`；Cookie 缺失、未知、过期或非待确认状态为 404 `WECHAT_PENDING_NOT_FOUND`；预算耗尽为 429 `SMS_RATE_LIMITED`；短信策略、固定码、发送或激活不可用为 503 `SMS_UNAVAILABLE`；微信未启用为 503 `WECHAT_UNAVAILABLE`，基础设施故障为 503 `AUTH_UNAVAILABLE`。
+
+副作用：创建 `wechat_existing` 专用挑战，绑定本候选、候选令牌摘要和规范化手机号。live 预约独立账号操作全局预算与共享手机号／IP 预算后发送；失败与未知不返预算、不重试。bypass 不发短信、不扣预算，但仍建立并激活同样范围的挑战，后续不能直接凭固定码跳过本入口。
+
+## POST /api/auth/wechat/pending/confirm
+
+身份：本浏览器有效的微信待处理 Cookie 与 `candidateToken`。`link_existing` 还须通过本候选手机挑战，或本次授权发起后取得、创建不足 10 分钟的有效目标会话证明目标账号归属。
+
+输入：仅接受以下精确字段集合，不接受客户端 userId、openid 或额外字段：
+
+- 创建新账号：`{action:"create",candidateToken}`。
+- 验证已有手机号账号：`{action:"link_existing",candidateToken,phoneNumber,code}`。
+- 使用近期目标会话：`{action:"link_existing",candidateToken}`。
+
+成功：200 和 `{status:true,action,userId}`，完成本候选并清理待处理 Cookie，使浏览器进入确认的目标账号；创建路径分配独立新 userId，绑定路径始终使用已有 userId。个人中心的微信绑定仍由 `link-social` 发起，不把此处近期目标会话路径当成隐式绑定。
+
+错误：输入非法为 400 `INVALID_INPUT`；缺失或未知候选为 404 `WECHAT_PENDING_NOT_FOUND`；过期、状态／令牌或旧回调失效栅栏不符为 400 `WECHAT_PENDING_INVALID`；已完成或重放为 409 `WECHAT_PENDING_ALREADY_COMPLETED`。手机挑战错误、过期、跨用途／跨候选或未发起为 400 `INVALID_OTP`，目标手机号未注册／未验证为 404 `EXISTING_PHONE_NOT_FOUND`；禁用目标为 403 `ACCOUNT_DISABLED`；无有效同流程近期会话为 401 `SESSION_REQUIRED`；身份已占用或目标已有其他微信为 409 `WECHAT_ALREADY_BOUND`。微信、短信路径或数据库不可用分别按对应 503 返回；短信停用不阻止近期目标会话路径。
+
+副作用：在短事务中重验候选期限、浏览器归属、目标账号／会话、旧回调失效栅栏和身份唯一性，再一次性完成候选及微信关联。手机路径在 live 与 bypass 下均要求存储挑战及单次消费；不按手机号暗中建号。`create` 对从未绑定和已解绑身份同样开放。并发、过期、迟到／重放、跨浏览器或失败确认不能覆盖已有归属或留下孤儿用户。
 
 ## POST /api/auth/onelink/start
 
@@ -171,34 +221,34 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 输入：严格 JSON 对象 `{phoneNumber}`，接受 11 位大陆手机号或其 `+86` 格式，拒绝任何额外字段；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定。
 
-成功：200 与 `{status:true}`；`smsMode='live'` 下表示真实短信供应商已受理（不证明送达），`smsMode='bypass'` 下在校验待处理状态、已配置合法 6 位固定测试码与直连客户端 IP 后直接返回 `{status:true}`（不调用短信供应商、不占预算）；两种模式均绝不暴露该手机号是否已在 Mio 注册。
+成功：200 与 `{status:true}`；live 表示供应商已受理，不证明送达；bypass 在校验候选、合法 6 位固定码及直连 IP 后建立并激活本候选专用挑战，不调用供应商或占预算。两种模式均不暴露手机号是否已注册。
 
 错误：输入无效返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、非 `candidate_ready` 或用途非 `login` 返回 400 `ONELINK_PENDING_INVALID`；短信预算耗尽返回 429 `SMS_RATE_LIMITED`；未配置服务端万联 `.env` 或万联热开关关闭返回 503 `ONELINK_UNAVAILABLE`；运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用真实短信供应商、`smsMode='bypass'` 下未配置合法 6 位固定测试码、缺失客户端 IP 或供应商拒绝／激活失败返回 503 `SMS_UNAVAILABLE`；数据库异常返回脱敏 503 `AUTH_UNAVAILABLE`。
 
-副作用：`smsMode='live'` 下在单事务内扣减持久短信预算并写入 `purpose="onelink_existing"` 挑战（绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，不同浏览器与待处理操作互不覆盖，亦不与 `login`/`bind` 挑战互通），调用真实短信供应商成功后激活挑战；失败或未知不返预算、不自动重发，亦不清除待处理 Cookie。`smsMode='bypass'` 下不调用短信供应商、不占用短信预算，但仍受认证路由限流与待处理状态校验约束。
+副作用：live 预约独立账号操作全局预算及跨用途共享手机号／IP 预算，并写入 `onelink_existing` 挑战，绑定本 `pendingId`、候选令牌摘要和规范化手机号；供应商受理后激活。失败与未知不返预算、不重发，也不清除候选。bypass 不调用供应商、不扣预算，但同样建立并激活操作挑战；确认仍须先经过本入口并核对归属、期限与单次消费。
 
 ## POST /api/auth/onelink/complete
 
-身份：持有有效待处理 Cookie 的当前浏览器；`action="link_existing"` 另须持有当前待处理操作对应的单次 `onelink_existing` 真实短信验证码；`action="bind_current"` 另须持有与发起时一致且创建时间不足 10 分钟、未撤销、未禁用的 C 端会话。
+身份：持有有效待处理 Cookie 的当前浏览器。登录意图的 `action="link_existing"` 通过本候选专用手机号验证码，或在同一登录流程取得的创建不足 10 分钟的有效目标会话核验已有账号；客户端不指定目标 userId。`action="bind_current"` 仍只接受由原有效近期会话发起的绑定意图。
 
 输入：严格 JSON 对象，按 `action` 仅允许精确字段集合，拒绝任何额外字段（包括客户端传入的目标 `userId` 或万联 `sub`）；Origin、JSON 正文类型、16 KiB 与读取期限沿共同约定：
 
 - `action="create"`：`{action:"create", candidateToken}`
-- `action="link_existing"`：`{action:"link_existing", candidateToken, phoneNumber, code}`（规范化大陆手机号与 6 位数字验证码）
+- `action="link_existing"`：手机路径为 `{action:"link_existing", candidateToken, phoneNumber, code}`（规范化大陆手机号与 6 位数字码）；近期目标会话路径为 `{action:"link_existing", candidateToken}`，不混入手机字段。
 - `action="bind_current"`：`{action:"bind_current", candidateToken}`
 
 成功：按 `action` 返回 200 与 `{status:true, action, userId}`（`bind_current` 幂等命中时附带 `alreadyBound:true`），并始终清除待处理 Cookie：
 
 - `action="create"`：200 与 `{status:true, action:"create", userId}`，签发新用户 C 端会话 Cookie 并清除待处理 Cookie。
-- `action="link_existing"`：200 与 `{status:true, action:"link_existing", userId}`，签发已有手机号用户 C 端会话 Cookie 并清除待处理 Cookie。
+- `action="link_existing"`：200 与 `{status:true, action:"link_existing", userId}`，进入已核验的原目标账号并清除待处理 Cookie。
 - `action="bind_current"`：200 与 `{status:true, action:"bind_current", userId}`（若当前用户已绑定同一万联 `sub`，额外返回 `alreadyBound:true`），仅清除待处理 Cookie，**不修改或重建现有 C 端会话 Cookie**。
 
-错误：输入非法或携带额外字段返回 400 `INVALID_INPUT`；缺失待处理 Cookie 或记录不存在返回 404 `ONELINK_PENDING_NOT_FOUND`；待处理记录已完成（含重放已完成 Cookie）返回 409 `ONELINK_PENDING_ALREADY_COMPLETED`；待处理记录过期、状态非 `candidate_ready`、用途不匹配或 `candidateToken` 不匹配返回 400 `ONELINK_PENDING_INVALID`；`link_existing` 验证码错误（含 `bypass` 模式下固定码不匹配）、过期、跨用途／跨待处理重放或连续错 3 次锁定返回 400 `INVALID_OTP`；`link_existing` 手机号未注册或未验证返回 404 `EXISTING_PHONE_NOT_FOUND`（**绝不自动建号**且保留待处理状态）；`link_existing` 目标账号已禁用返回 403 `ACCOUNT_DISABLED`；`bind_current` 缺失、过期、切换或已禁用原近期会话返回 401 `SESSION_REQUIRED`；唯一约束冲突（该万联 `sub` 已归属他人，或目标用户已绑定另一万联身份）返回 409 `ONELINK_ALREADY_BOUND` 并保留原归属；未配置万联 `.env` 或热开关关闭返回 503 `ONELINK_UNAVAILABLE`；`link_existing` 在 `smsMode='disabled'`、`smsMode='live'` 下未配置真实短信供应商或 `smsMode='bypass'` 下未配置合法 6 位固定测试码时返回 503 `SMS_UNAVAILABLE`；数据库或会话基础设施异常返回脱敏 503 `AUTH_UNAVAILABLE`。
+错误：输入非法或额外字段为 400 `INVALID_INPUT`；缺失待处理记录为 404 `ONELINK_PENDING_NOT_FOUND`；已完成或重放为 409 `ONELINK_PENDING_ALREADY_COMPLETED`；候选过期、状态／用途或令牌不符为 400 `ONELINK_PENDING_INVALID`。手机路径的错误、过期、跨用途／跨候选、未发起挑战或已锁定验证码为 400 `INVALID_OTP`，未注册或未验证号码为 404 `EXISTING_PHONE_NOT_FOUND`（不自动建号，保留候选），短信策略不可用为 503 `SMS_UNAVAILABLE`。近期目标会话路径或 `bind_current` 缺失、过期、撤销、切换及账号失效时为 401 `SESSION_REQUIRED`；禁用目标账号为 403 `ACCOUNT_DISABLED`；身份或目标用户绑定冲突为 409 `ONELINK_ALREADY_BOUND`，保留原归属。万联关闭为 503 `ONELINK_UNAVAILABLE`，数据库／会话故障为 503 `AUTH_UNAVAILABLE`；近期目标会话路径不受短信停用阻断。
 
-副作用：所有写入均在单 PostgreSQL 事务内锁定 `mioOneLinkPending` 并执行原子提交，唯一约束冲突完整回滚且保留原归属：
+副作用：最终账号归属写入在单 PostgreSQL 事务内锁定 `mioOneLinkPending` 并执行原子提交，唯一约束冲突完整回滚且保留原归属：
 
 - `create`：在同一 PostgreSQL 事务内锁定待处理记录、分配唯一 `displayId` 并创建 `name="万联用户"`、保留域占位邮箱 `onelink-…@auth.mio.invalid`（`emailVerified=false`）、`phoneNumber=null` 的新用户、插入 `(providerId='onelink', accountId=sub)` 关联并更新待处理为 `completed`；若遭遇 `account` 唯一冲突则整个事务回滚（零孤儿用户）。成功后签发会话并清除待处理 Cookie；新用户后续可经 `/api/auth/phone-binding/*` 补绑空闲手机号。
-- `link_existing`：验码前先核验待处理状态与 `candidateToken`；`smsMode='live'` 下单次消费 `onelink_existing` 验证码（错误尝试在独立事务中递增并在第 3 次失败后删除），`smsMode='bypass'` 下无需前置 `send-otp` 或真实短信运行时，以恒定时间比对后台配置的 6 位固定测试码；随后在单事务内依序锁定目标用户与待处理记录（先校验待处理状态再校验目标用户）并写入万联关联，不创建任何新用户；成功后标记 `completed`、签发原用户会话并清除待处理 Cookie。
+- `link_existing`：先复核登录意图、候选状态与 `candidateToken`。手机路径在 live 与 bypass 下均须先调用 `existing/send-otp` 建立本候选专用挑战，再验证并单次消费；bypass 只替换发送与码值，不绕过候选或挑战归属。近期目标会话路径不依赖短信，在最终事务内复核目标用户、同一近期有效会话及候选，适用于无手机号或短信停用的目标账号。两条路径均不创建用户，绑定成功后完成待处理状态并进入目标账号。
 - `bind_current`：非续期校验近期会话后，在同一事务内依次锁定用户、原近期会话与 `intent="bind"` 待处理记录并复核发起身份与 `candidateToken`；若当前用户已绑定同一 `sub` 则幂等完成待处理，否则写入万联关联并标记 `completed`，成功后仅清除待处理 Cookie。
 
 ## POST /api/auth/phone-number/send-otp
@@ -248,6 +298,30 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 错误：输入、验证码（含 `bypass` 模式下固定码不匹配）、用途或发起会话不符为 400，无近期会话为 401，号码已占用或当前用户已有号码为 409，运行时策略 `smsMode='disabled'`、`smsMode='live'` 下未启用真实短信供应商或 `smsMode='bypass'` 下未配置合法 6 位固定测试码为 503 `SMS_UNAVAILABLE`。
 
 副作用：`smsMode='live'` 下消费验证码并在事务中检查原会话、更新当前用户；`smsMode='bypass'` 下无需前置 `send-otp` 或真实短信运行时，在校验近期会话并以恒定时间比对固定测试码后，以相同行锁顺序（`"user"` → `"session"`）在事务中复核原会话并写入空闲号码；不转移或合并账号。持久预算及恢复边界见[认证底座](../auth.md#手机验证码与发送预算)。
+
+## POST /api/auth/phone-rebind/send-otp
+
+身份：创建不足 10 分钟、未撤销且账号有效的原 C 端会话；当前用户必须已有验证手机号。
+
+输入：严格 `{phoneNumber}`，接受 11 位大陆手机号或其 `+86` 格式，不接受额外字段。拒绝与当前号相同或已被其他账号占用的新号。
+
+成功：200 和 `{status:true,expiresIn:300}`。live 表示供应商已受理，不证明送达；bypass 建立同样的操作挑战，不调用供应商。
+
+错误：无有效近期会话为 401 `SESSION_REQUIRED`；无当前已验证号码为 409 `PHONE_REQUIRED`；当前号或已占用号为 409 `PHONE_CONFLICT`；持久预算耗尽为 429 `SMS_RATE_LIMITED`；短信停用、live 未配置供应商、bypass 未配置合法固定码、缺少直连 IP、发送或挑战激活失败为 503 `SMS_UNAVAILABLE`。输入、来源、方法和正文错误沿共同约定。
+
+副作用：创建 `phone_rebind` 挑战，绑定本用户、原会话、原已验证号和新号。live 预约独立 `global:account_ops` 预算，并受跨用途共享手机号与 IP 限制；失败或未知不退预算、不自动重试。bypass 仍须经过本入口，不能只凭固定码提交换绑。
+
+## POST /api/auth/phone-rebind/confirm
+
+身份：与发送时相同且仍创建不足 10 分钟的有效原会话，以及本次操作的新号验证码。
+
+输入：严格 `{phoneNumber,code}`，手机号格式同发码，code 为 6 位数字字符串；不接受额外字段。
+
+成功：200 和 `{status:true}`。新号仍进入原 `userId`，旧号不能再登录原账号；当前及其他设备原本有效的会话全部保留，客户端随后回读个人资料。
+
+错误：会话失效、过期或切换为 401 `SESSION_REQUIRED`；并发唯一性或原号变化冲突为 409 `PHONE_CONFLICT`；错误、过期、重放、未发起挑战或跨会话／用途验证码为 400 `INVALID_OTP`；短信策略或依赖不可用为 503 `SMS_UNAVAILABLE`。
+
+副作用：在最终短事务内重新核对用户、原会话、原号码与新号唯一性，一次性消费本操作挑战并替换手机号。live 与 bypass 均核对存储挑战及其归属；成功不撤销、续期或重建既有会话。
 
 ## POST /api/auth/sign-up/email
 
@@ -368,6 +442,30 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 错误：无效、过期、撤销、账号已禁用或仅有服务 token 时返回 401；其他错误见共同约定。
 
 副作用：只校验身份，不刷新会话或 cookie，也不授予项目/资产访问权。
+
+## DELETE /api/v1/me/wechat
+
+身份：当前有效 C 端 Cookie 会话，服务 token 和管理员 Cookie 不能替代。只作用于当前用户的微信关联。
+
+输入：无正文，必须携带精确匹配允许列表的 Origin。OPTIONS 仅放行该路径声明的 DELETE；缺失或非法 Origin 拒绝后才处理身份与解绑。
+
+成功：200 和 `{status:true}`；重复移除本来未绑定的微信按幂等成功处理。移除关联及 `account.wechatNickname`，客户端回读 U1 展示资料。
+
+错误：无有效会话为 401 `UNAUTHORIZED`；将移除最后一种实际可用登录方式时为 409 `LAST_LOGIN_METHOD`；来源、方法和基础设施故障按本域包装错误返回。
+
+副作用：以用户为单位串行处理并发解绑，最终复核本人有效会话及剩余方式。剩余方式必须实际可用：本人已验证号且短信登录可用、可登录邮箱已设置真实密码且邮箱登录开启，或另一已绑定且当前启用的服务商。占位邮箱、空密码、未验证号和停用服务商不计入。保留当前及其他设备全部原有效会话，不改写独立万联供应商凭据；已退出、撤销或到期会话不恢复。仅移除当前归属，不写永久解绑历史；解绑前发起的旧回调失效，后续重新授权仍可显式创建或绑定账号。
+
+## DELETE /api/v1/me/onelink
+
+身份：当前有效 C 端 Cookie 会话，仅移除当前用户的万联登录关联；服务 token 和管理员 Cookie 不能替代。
+
+输入：无正文，精确 Origin 与 OPTIONS 校验沿[微信解绑](#delete-apiv1mewechat)的共同规则。
+
+成功：200 和 `{status:true}`，未绑定时幂等成功。客户端随后回读 U1 的 `onelinkBound`。
+
+错误：无有效会话为 401 `UNAUTHORIZED`，移除最后一种实际可用登录方式为 409 `LAST_LOGIN_METHOD`；其余错误沿共同约定。
+
+副作用：串行复核剩余实际可用登录方式并使解绑前发起的旧回调失效；保留全部原有效 Mio 会话，以及按独立供应商配置契约保存的万联凭据，不设置永久解绑历史。剩余方式的判定沿微信解绑规则。
 
 ## GET /api/v1/me/profile
 

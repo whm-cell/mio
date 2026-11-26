@@ -20,6 +20,8 @@ const SESSION_GUARDED_PATHS = new Set([
   '/link-social',
   '/phone-binding/send-otp',
   '/phone-binding/confirm',
+  '/phone-rebind/send-otp',
+  '/phone-rebind/confirm',
 ]);
 
 export interface UserProfile {

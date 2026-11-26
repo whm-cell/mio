@@ -851,6 +851,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         handler: authHandler,
       }),
     );
+    for (const path of ['/api/v1/me/wechat', '/api/v1/me/onelink']) {
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path, handler: authHandler }));
+    }
   }
 
   // Registered on this fiber, so the guard and routes are removed together on disposal.

@@ -1622,7 +1622,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
       expect(noSmsWrongCode.status).toBe(400);
       expect(await noSmsWrongCode.json()).toMatchObject({ code: 'INVALID_OTP' });
 
-      // Unregistered phone under bypass still returns 404 EXISTING_PHONE_NOT_FOUND with zero users created.
+      // A bypass code without a pending-and-phone-scoped send cannot prove any target account.
       const beforeNoSmsUnreg = await countUsersAndAccounts();
       const noSmsUnreg = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
         method: 'POST',
@@ -1638,8 +1638,8 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
           code: '654321',
         }),
       });
-      expect(noSmsUnreg.status).toBe(404);
-      expect(await noSmsUnreg.json()).toMatchObject({ code: 'EXISTING_PHONE_NOT_FOUND' });
+      expect(noSmsUnreg.status).toBe(400);
+      expect(await noSmsUnreg.json()).toMatchObject({ code: 'INVALID_OTP' });
       expect(await countUsersAndAccounts()).toEqual(beforeNoSmsUnreg);
 
       const noSmsBypassOk = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {

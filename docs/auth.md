@@ -23,6 +23,7 @@
 | `MIO_AUTH_SMS_ENABLED`                                                                                                                                                    | 默认 `false`；设为 `true` 时须完整配置腾讯短信，见[短信契约](integrations/tencent-sms.md)                                                                                             |
 | `MIO_TENCENT_SMS_SECRET_ID`、`MIO_TENCENT_SMS_SECRET_KEY`、`MIO_TENCENT_SMS_APP_ID`、`MIO_TENCENT_SMS_SIGN_NAME`、`MIO_TENCENT_SMS_TEMPLATE_ID`、`MIO_TENCENT_SMS_REGION` | 启用短信时全部必填；模板须接受验证码和有效分钟数两个参数                                                                                                                              |
 | `MIO_AUTH_SMS_PHONE_HOUR_LIMIT`、`MIO_AUTH_SMS_PHONE_DAY_LIMIT`、`MIO_AUTH_SMS_IP_HOUR_LIMIT`、`MIO_AUTH_SMS_IP_DAY_LIMIT`、`MIO_AUTH_SMS_GLOBAL_DAY_LIMIT`               | 可选正整数，只允许收紧默认额度，依次最多 5、10、20、100、1000                                                                                                                         |
+| `MIO_AUTH_SMS_ACCOUNT_OPS_DAY_LIMIT`                                                                                                                                      | 可选正整数，只允许收紧账号操作桶的默认滚动 24 小时 300 次；不改变日常登录／注册全局额度                                                                                               |
 | `MIO_AUTH_WECHAT_ENABLED`、`MIO_AUTH_WECHAT_APP_ID`、`MIO_AUTH_WECHAT_APP_SECRET`                                                                                         | 默认关闭；启用时须完整配置网站应用凭据与实际回调域，见[微信契约](integrations/wechat.md)                                                                                              |
 | `MIO_ONELINK_SSO_ENC_KEY`、`MIO_ONELINK_SSO_AUTHORIZE_URL`、`MIO_ONELINK_SSO_REGISTER_URL`（及可选 `CLIENT_NAME` / `APP_NAME` / `ENV`）                                   | 可选服务端凭据组，默认未配置；须同时经管理端开启运行期热开关后对外开放，见[万联 OneLink SSO 契约](integrations/onelink-sso.md)                                                        |
 
@@ -49,6 +50,8 @@ pnpm start:dev
 
 微信 QR polling 使用同一认证库中的 `mioWechatQR` 模型，包含不透明 ID、唯一且可空的 OAuth state 摘要、QR Cookie 摘要、带索引的状态与过期时间，以及可空的确认用户、确认时间和失败原因码。模型通过 `authOptions` 的插件 schema 进入现有显式迁移与启动检查；即使微信关闭，升级后也须先显式迁移 QR 结构才能启用认证。QR 表不保存 state、Cookie、Session secret 或供应商 token 明文；Better Auth 自身的数据库 OAuth state 仍沿用原策略，不受这条 QR 表存储规则替代。
 
+U2 另以 `mioWechatPending` 保存未绑定微信的短期候选、浏览器 Cookie 摘要、候选令牌及期限，并给 `mioWechatQR` 增加可空候选关联，保留既有 QR 与用户／会话行。模型和约束通过显式 `auth:migrate` 预览／`--apply` 幂等增量安装；启动仅做只读结构检查，供应商关闭也不隐式跳过所需结构。SMS 预算仍复用原两表，本次不做预算数据迁移。解绑后的旧回调失效使用有期限的瞬态记录，不写永久解绑历史或阻止后续显式建号。
+
 万联 OneLink 授权流程使用同一认证库中的 `mioOneLinkPending` 模型，记录唯一 `tokenDigest`（待处理 Cookie 的 SHA-256 摘要）、用途 `intent`（`login` / `bind`）、带索引的 `status`（`started` / `candidate_ready` / `completed` / `rejected` / `cancelled`）与 `expiresAt`、可选发起身份（`initiatorUserId` / `initiatorSessionId`）、暂存候选信息（`candidateSub` / `candidateClientId` / `candidateToken`）、受限回跳路径 `returnPath` 以及 `createdAt` / `updatedAt`。`oneLinkPlugin` 无条件注册在 `authOptions().plugins` 中，因此无论是否配置 `MIO_ONELINK_SSO_*` 环境变量，`auth:migrate` 与启动 `getMigrations` 均始终检查并保持 `mioOneLinkPending` 结构同步。该表绝不保存待处理 Cookie 原文、上游 `access_token`、`refresh_token` 或 AES 密钥。
 
 认证与 `MIO_API_TOKEN` 分离，后者仍只保护 foundation 能力查询，不能作为 userId。认证启用失败时插件不注册 readyz 或业务路由；成功后 readyz 只表明本次装载就绪，不持续查询数据库健康。
@@ -73,11 +76,15 @@ Better Auth 继续选择规则和 IP/路径键；[认证消费者](../src/auth/r
 
 ### 手机验证码与发送预算
 
-大陆手机号统一为 `+86` 和 11 位号码；随机六位验证码有效 5 分钟，最多错误 3 次。登录（`login`）、手机绑定（`bind`）与万联绑定已有手机号账号（`onelink_existing`）三类挑战严格按用途隔离：`bind` 另绑定发起的 `userId` 和 `sessionId`，确认时重新核对不超过 10 分钟且未撤销的原会话；`onelink_existing` 复用既有 `mioPhoneChallenge` 表（零结构迁移），挑战键与 HMAC 摘要绑定当前 `pendingId`、`sha256(candidateToken)` 与规范化手机号，确保不同浏览器或待处理操作互不覆盖且不同用途验证码不可跨入口重放。验证码仅保存带挑战和用途上下文的 HMAC，不保存明文；短期挑战与账号用户均由认证 PostgreSQL 管理。已登录用户只可首次绑定空闲号码，不能换绑、合并或转移。
+大陆手机号统一为 `+86` 和 11 位号码；随机六位验证码有效 5 分钟，最多错误 3 次。登录（`login`）、首次绑号（`bind`）、换绑（`phone_rebind`）、微信与万联绑定已有手机号账号（`wechat_existing`、`onelink_existing`）以及账号注销（`account_deletion`）按用途隔离，复用既有 `mioPhoneChallenge`。首次绑号和换绑挑战绑定发起的 `userId`、`sessionId` 与规范化手机号；换绑还核对发起时的原已验证号码。第三方绑定已有账号的挑战绑定本次待处理候选、候选令牌摘要与目标手机号。验证码只保存含用途和操作上下文的 HMAC，不同会话、候选或用途不可交叉消费。
 
-短信验证运行时受管理后台「全局配置」`smsMode`（`live` / `bypass` / `disabled`，默认 `live`）热控制：`live` 走原有真实腾讯短信与持久预算流程；`disabled` 使全部 4 个手机入口（`/phone-number/*` 与 `/phone-binding/*`）及万联已有账号短信入口（`/onelink/existing/send-otp` 与 `/onelink/complete` 的 `action="link_existing"`）直接返回 `503 SMS_UNAVAILABLE` 且不调用供应商；`bypass` 同步作用于登录入口（`/phone-number/*`）、手机补绑入口（`/phone-binding/*`）与万联已有账号绑定短信入口（`/onelink/existing/send-otp`、`POST /onelink/complete` 的 `action="link_existing"`）：各 `send-otp` 在完成输入、会话／待处理状态、已配置合法 6 位固定测试码与直连 IP 校验后跳过短信供应商与持久预算直接返回 `{status:true}`，对应验证／提交入口无需前置 `send-otp` 或腾讯短信配置，以恒定时间 `timingSafeEqual` 比对管理员配置的 6 位固定测试码并执行相同的近期会话、手机号存在性／冲突、禁用拦截、自动分配 `displayId` 与会话签发流程，且保留 Better Auth 路由限流。该模式存在高账号接管风险，仅限受控开发／测试环境，严禁在公开生产长期开启。
+`/phone-binding/*` 继续只负责空号账号的首次绑号。已有验证号通过 `/phone-rebind/*` 换绑：发送前拒绝当前号与已占用号，最终在短事务内重新核对账号、创建不足 10 分钟的原有效会话、原号码及新号唯一性并一次性消费挑战。成功后原 `userId`、当前设备及其他设备原本有效的 Mio 会话均保留；旧号不再登录原账号。未绑定手机的账号不能借换绑入口首次绑号。
 
-短信预算独立于挑战和现有请求限流：同一手机号 60 秒冷却、滚动 1 小时至多 5 次及 24 小时至多 10 次，IP 分别至多 20/100 次，整个应用 24 小时至多 1000 次；配置只能收紧。使用直接连接地址及与认证相同的 IP 规范化，代理后共享代理地址额度。预算保存在 PostgreSQL，号码和 IP 键采用稳定 SHA-256，仅为固定长度而非匿名化。正常重启、验证码消费、认证 secret 轮换及 Redis 的 65 秒恢复不会清除预算；数据库恢复到旧快照可能丢失近期预算，需按最长窗口排清后恢复发送。
+短信验证运行时受管理后台「全局配置」`smsMode`（`live` / `bypass` / `disabled`，默认 `live`）热控制。`live` 调用腾讯短信并预约持久预算；`disabled` 拒绝所有短信发码和短信验码路径，不调用供应商。第三方 `link_existing` 的近期目标会话路径不依赖短信，可在目标无手机号或短信停用时继续使用。
+
+`bypass` 使用管理员配置的合法 6 位固定测试码，以恒定时间比较，不调用供应商或占用持久预算，仍执行输入、身份、账号状态与路由限流检查。普通登录和首次绑号沿用各自现行测试码契约；换绑及第三方绑定已有账号必须先调用本操作的 `send-otp` 建立挑战，再核对原会话或待处理候选归属并单次消费，固定码不能绕过挑战、期限或跨操作保护。该模式仅限受控开发／测试环境，不能用作真实短信送达证据。
+
+短信预算独立于挑战和请求限流，复用 `mioSmsBudget` 与 `mioSmsBudgetEvent`，本次不迁移预算结构。同一手机号在各用途之间共享 60 秒冷却、滚动 1 小时 5 次及 24 小时 10 次；IP 共享 20/100 次。日常登录／注册保留原全局 24 小时 1000 次额度；`phone_rebind`、`wechat_existing`、`onelink_existing` 与 `account_deletion` 使用独立 `global:account_ops` 桶，默认 24 小时 300 次，配置只允许收紧。账号操作不扣减日常登录／注册全局额度，但仍受共享手机号和 IP 限制。使用直接连接地址及相同的 IP 规范化，代理后共享代理地址额度；号码和 IP 键的 SHA-256 仅用于固定长度，不代表匿名化。正常重启、验证码消费、认证 secret 轮换及 Redis 恢复不会清除预算；数据库恢复到旧快照可能丢失近期预约，须按最长窗口排清后恢复发送。
 
 发送前按全局、IP、手机的固定顺序取得预算键行锁，再以数据库毫秒时间检查窗口。每个预算键追加一条带毫秒时间的事件，与 pending 挑战同事务提交；只有供应商明确受理才激活匹配的挑战。失败和未知不返额度，不自动重发。若供应商已受理、数据库激活提交结果未知，客户端会收到失败，但挑战可能已生效，不能据此推断短信未发出。后续成功预约清理触达键中已过期的事件，并分批清理过期挑战和长期未更新的预算键；删除预算键会一并删除对应的过期事件。正确码由数据库锁和条件删除保证单次消费；绑定同时检查原会话并更新用户。登录的用户／会话创建在消费之后，若后续失败，该码不会恢复，用户需重新发码；不能宣称包括认证库调用的全过程原子。手机号自注册用户获得 `phone-…@auth.mio.invalid` 占位邮箱，该域不允许邮箱密码注册认领，不等于已验证联系邮箱。
 
@@ -102,11 +109,13 @@ pnpm auth:migrate --rollback-sms-budget --apply
 
 ### 微信登录与绑定
 
-微信可独立登录或注册，手机号绑定可选；已有用户必须从本人会话主动绑定，不能凭相同邮箱自动合并或转移另一个账号的微信。身份键、授权回调、state 防重放、供应商请求和 AppID 变更前置条件见[微信契约](integrations/wechat.md)。仅开放指定微信 provider 和 GET 回调，不支持换绑、解绑、账号合并或旧账号迁移。微信生成的占位邮箱保持 `emailVerified=false`；微信授权本身不验证邮箱。
+微信可独立登录，手机号可选。当前已绑定身份沿原归属登录；当前未绑定身份（从未绑定与已解绑一致）在回调建号前进入 `mioWechatPending` 的 `candidate_ready`，不自动创建用户或签发会话。浏览器显式选择 `create`，或以已有账号的验证号短信／同一登录流程取得的近期目标会话执行 `link_existing`，最终复核候选期限、浏览器归属、账号有效及身份唯一性后完成。微信授权只证明持有该微信身份，不证明目标 Mio 账号或邮箱所有权。占位邮箱仍为 `emailVerified=false`，不按同邮箱合并账号。
 
-匿名 QR 登录在原微信流程外增加短期会话与轮询，不提供微信绑定入口。Mio 主页面保持打开，支持同源内嵌微信官方 `WxLogin({ self_redirect: true })` 自定义容器（iframe）或同一浏览器的授权窗口完成微信 callback 并接收原 Session Cookie；主页面凭单个 QR 的 Cookie 轮询，确认后调用现有 `/api/v1/me`。`authorization_url` 须由微信官方页面或 `WxLogin` 渲染，不提供独立二维码图片 URL，也不提供无同浏览器 Session Cookie 的跨设备凭据交接。QR 有效期为 5 分钟，Cookie 保留 15 分钟以便观察过期；创建时最多删除 100 条已过期至少 10 分钟的记录，不另启清理 Worker。清理后该 ID 按未知处理，不能永久查询历史状态。
+个人中心从创建不足 10 分钟的原会话调用 `link-social` 发起微信绑定，回调沿用原身份核验、用户锁和最终禁用检查。解绑只删除当前关联及微信昵称，不保留永久解绑墓碑；解绑前发起的旧回调必须失效，之后的新授权仍可显式创建新账号或绑定已有账号。身份键、供应商调用及 AppID 变更前置条件见[微信契约](integrations/wechat.md)。
 
-针对跨站 `WxLogin` iframe 回调省略 `SameSite=Lax` state Cookie 的场景，认证 HTTP 适配器在 `/api/auth/callback/wechat` 提供单跳同源 HTML 桥接（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'` CSP、`Referrer-Policy: no-referrer`、`Cache-Control: no-store` 与 `mio_bridge` 防循环），使第二跳同源携带 state Cookie 进入认证库；QR callback 沿现有签名 state Cookie 和数据库单次保留栅栏进入；过期 QR 在兑换身份前拒绝。仅本次 callback 新建的 Session 能确认该 QR，已有登录 Cookie 本身不能证明本次授权成功。首次确认轮询同时检查数据库中的有效 Session 与确认用户一致，并在 QR 行锁内转为 consumed；缺失、撤销或其他用户的 Session 返回 401 且不消费。轮询不创建、续期或发放 Session，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态、Cookie 路径、限流和剩余状态语义见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
+匿名 QR 与普通 `sign-in/social` 共用未绑定候选及显式确认。电脑主页面保持打开，由同源内嵌微信官方 `WxLogin({ self_redirect: true })`（iframe）或同一浏览器授权窗口完成 callback；已绑定身份取得会话后轮询确认，未绑定身份轮询返回 `pending_confirm`，凭本次 QR 与候选 Cookie 归属进入确认流程，不要求先有 Mio 会话。候选 Cookie 为 `Path=/api/auth`、HttpOnly、SameSite=Lax，HTTPS 带 Secure。授权 URL 仍须由微信官方页面或 `WxLogin` 渲染，不是二维码图片 URL；不提供无同浏览器 Cookie 的跨设备凭据交接。QR 有效 5 分钟，QR Cookie 保留 15 分钟，创建时最多清理 100 条已过期至少 10 分钟的记录；清理后旧 ID 为未知。
+
+跨站 `WxLogin` iframe 省略 Lax state Cookie 时，认证适配器保留原单跳同源 HTML 桥接和 `mio_bridge` 防循环。第二跳仍须通过签名 state Cookie、数据库单次保留和 QR 期限检查；旧登录 Cookie 不能把失败回调变成成功。`pending_confirm` 只表示存在待确认候选；`confirmed` 则要求本次流程已签发的有效会话归属正确，并在行锁内原子转为 `consumed`。poll 不创建、续期或发放会话，也不扩大 `Authentication.identity` 的通用含义。HTTP 状态和 Cookie 细节见[认证 HTTP 契约](apis/auth.md#post-apiauthwechatqr-session)。
 
 ### 万联 OneLink 登录、回调与账号归属
 
@@ -117,10 +126,16 @@ pnpm auth:migrate --rollback-sms-budget --apply
 待绑候选通过 `POST /api/auth/onelink/complete` 完成显式账号归属（客户端绝不传入目标 `userId` 或万联 `sub`）；认证域跨表行锁统一遵守 `mioPhoneChallenge` → `user` → `session` → `mioOneLinkPending` → `account` 固定顺序，且待处理过期判断始终在取得 `FOR UPDATE` 行锁后重新取库时钟核验：
 
 - `action="create"`：在同一 PostgreSQL 事务内锁定待处理记录、分配唯一 `displayId` 并创建 `name="万联用户"`、占位邮箱 `onelink-…@auth.mio.invalid`（`emailVerified=false`）、空手机号的新用户、写入 `(providerId='onelink', accountId=sub)` 关联并标记待处理为 `completed`；若遭遇并发唯一约束冲突（`23505`），整个事务回滚不留孤儿用户并返回 `409 ONELINK_ALREADY_BOUND`。成功后签发 C 端会话 Cookie 并清理待处理 Cookie；新用户后续可经 `/api/auth/phone-binding/*` 补绑空闲手机号。
-- `action="link_existing"`：在 `smsMode='live'` 下须先经 `POST /api/auth/onelink/existing/send-otp` 发送 `onelink_existing` 专用真实短信验证码（消耗持久短信预算、无手机号注册枚举）；在 `smsMode='bypass'` 下跳过真实短信与持久预算，以恒定时间比对后台配置的 6 位固定测试验证码（未配置合法 6 位固定码时按 `503 SMS_UNAVAILABLE` 关闭失败）。完成提交在验码前先复核待处理状态与 `candidateToken`；验码通过后在同一事务内依序锁定目标手机号用户与待处理记录（先校验待处理状态再校验用户状态），绝不自动建号（未注册或未验证返回 `404 EXISTING_PHONE_NOT_FOUND` 且保留待处理状态，禁用账号返回 `403 ACCOUNT_DISABLED`，唯一约束冲突回滚并保留原归属返回 `409 ONELINK_ALREADY_BOUND`），绑定成功后标记 `completed`、签发原用户会话并清理待处理 Cookie。
+- `action="link_existing"`：仅用于 `intent="login"` 的显式确认。手机路径在 live 与 bypass 下均须先经 `POST /api/auth/onelink/existing/send-otp` 建立 `onelink_existing` 挑战，绑定 pending 与候选令牌摘要后单次消费；bypass 不调用短信或扣预算，但固定码不能跳过挑战。另一条路径使用同一登录流程取得的创建不足 10 分钟的目标会话，不依赖手机号或短信。最终短事务重新检查候选、目标账号、会话或挑战与万联身份唯一性，不自动建号；禁用、过期、已占用或重放均不能改变原归属。
 - `action="bind_current"`：在非续期核验 10 分钟内有效且未禁用的当前 C 端会话后，于同一事务内依序锁定用户、原近期会话与 `intent="bind"` 待处理记录并比对发起 `userId`/`sessionId` 与 `candidateToken`；若当前用户已绑定同一 `sub` 则幂等完成待处理并返回 `alreadyBound=true`，其余冲突回滚并保留原归属返回 `409 ONELINK_ALREADY_BOUND`。成功后仅清理待处理 Cookie，不改写或重建当前 C 端会话 Cookie。
 
 `GET /api/v1/me/profile` 与 `PATCH /api/v1/me/profile` 返回只读布尔字段 `onelinkBound`，实时反映当前用户在 `account` 表是否存在 `providerId='onelink'` 绑定记录。
+
+### 登录方式解绑与会话
+
+`DELETE /api/v1/me/wechat` 与 `DELETE /api/v1/me/onelink` 从当前 C 端会话取本人身份，执行精确 Origin 校验，并在同一用户锁下串行检查和移除关联。允许移除前必须还剩至少一种实际可用方法：已验证手机号且短信登录可用、可登录邮箱已设置真实密码且邮箱登录开启，或另一已绑定且当前启用的服务商。仅有手机号字段、占位邮箱、空密码或停用服务商不计入可用方式；并发解绑不能分别通过检查后清空全部方式。
+
+成功删除登录关联，微信同时删除 `account.wechatNickname`，不撤销当前或其他设备的有效会话，不修改万联独立供应商凭据。只保存当前归属，不建立永久解绑墓碑；解绑前发起的旧授权回调失效，之后的新授权仍可正常显式创建或绑定。自然过期、已退出、已撤销和禁用账号的会话继续无效。
 
 ## 职责与限制
 

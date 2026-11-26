@@ -1,10 +1,14 @@
 import { createId } from '@mio/foundation/identifiers';
-import { timingSafeEqual } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
-import { generateUniqueDisplayId } from './account.ts';
-import { bindingSessionIsActive } from './phone-store.ts';
+import { bindingSessionIsActive, consumePendingPhoneChallenge } from './phone-store.ts';
 import type { BindingIdentity } from './phone-store.ts';
 import { withAuthTransaction } from './transaction.ts';
+import {
+  candidateTokenMatches as oneLinkCandidateTokensMatch,
+  createLoginUser,
+  lockLoginIdentity,
+  loginCallbackIsCurrent,
+} from './login-methods.ts';
 
 export const oneLinkPendingSchema = {
   mioOneLinkPending: {
@@ -138,6 +142,18 @@ export function transitionStartedPendingToCandidate(
   candidate: OneLinkPendingCandidateInput,
 ): Promise<boolean> {
   return withAuthTransaction(pool, async (client) => {
+    const pending = (
+      await client.query<{ createdAt: Date }>(
+        'SELECT "createdAt" FROM "mioOneLinkPending" WHERE id=$1 FOR UPDATE',
+        [id],
+      )
+    ).rows[0];
+    if (!pending) return false;
+    await lockLoginIdentity(client, 'onelink', candidate.candidateSub);
+    if (
+      !(await loginCallbackIsCurrent(client, 'onelink', candidate.candidateSub, pending.createdAt))
+    )
+      return false;
     const result = await client.query(
       `UPDATE "mioOneLinkPending"
        SET status = 'candidate_ready',
@@ -154,8 +170,32 @@ export function transitionStartedPendingToCandidate(
   });
 }
 
-export function completeStartedPendingLogin(pool: Pool, id: string): Promise<boolean> {
+export function completeStartedPendingLogin(
+  pool: Pool,
+  id: string,
+  sub: string,
+  userId: string,
+): Promise<boolean> {
   return withAuthTransaction(pool, async (client) => {
+    const user = await client.query(
+      'SELECT id FROM "user" WHERE id=$1 AND COALESCE(disabled,false)=false FOR UPDATE',
+      [userId],
+    );
+    if (!user.rowCount) return false;
+    const pending = (
+      await client.query<{ createdAt: Date }>(
+        'SELECT "createdAt" FROM "mioOneLinkPending" WHERE id=$1 FOR UPDATE',
+        [id],
+      )
+    ).rows[0];
+    if (!pending) return false;
+    await lockLoginIdentity(client, 'onelink', sub);
+    if (!(await loginCallbackIsCurrent(client, 'onelink', sub, pending.createdAt))) return false;
+    const bound = await client.query(
+      'SELECT 1 FROM "account" WHERE "providerId"=\'onelink\' AND "accountId"=$1 AND "userId"=$2',
+      [sub, userId],
+    );
+    if (!bound.rowCount) return false;
     const result = await client.query(
       `UPDATE "mioOneLinkPending"
        SET status = 'completed',
@@ -229,12 +269,9 @@ export async function userHasOneLinkAccount(pool: Pool, userId: string): Promise
 }
 
 class OneLinkAlreadyBoundError extends Error {}
+class OneLinkPendingExpiredError extends Error {}
 
-export function oneLinkCandidateTokensMatch(expected: string, supplied: string): boolean {
-  const expectedBuf = Buffer.from(expected, 'utf8');
-  const suppliedBuf = Buffer.from(supplied, 'utf8');
-  return expectedBuf.length === suppliedBuf.length && timingSafeEqual(expectedBuf, suppliedBuf);
-}
+export { oneLinkCandidateTokensMatch };
 
 async function lockOneLinkPendingByDigest(
   client: PoolClient,
@@ -282,7 +319,13 @@ function validateLoginCandidatePending(
 }
 
 export type CompleteOneLinkCreateResult =
-  | { readonly status: 'ok'; readonly user: BoundOneLinkUser }
+  | {
+      readonly status: 'ok';
+      readonly user: BoundOneLinkUser;
+      readonly subject: string;
+      readonly startedAt: Date;
+      readonly expiresAt: Date;
+    }
   | { readonly status: 'not_found' }
   | { readonly status: 'already_completed' }
   | { readonly status: 'invalid' }
@@ -302,43 +345,11 @@ export async function completeOneLinkCreate(
       const row = await lockOneLinkPendingByDigest(client, input.tokenDigest);
       const pending = validateLoginCandidatePending(row, input.candidateToken);
       if (pending.status !== 'ok') return pending;
+      await lockLoginIdentity(client, 'onelink', pending.candidateSub);
+      if (!(await loginCallbackIsCurrent(client, 'onelink', pending.candidateSub, row!.createdAt)))
+        return { status: 'invalid' };
 
-      const userId = createId();
-      let user: BoundOneLinkUser | undefined;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const displayId = await generateUniqueDisplayId(async (candidate) => {
-          const existing = await client.query(
-            'SELECT 1 FROM "user" WHERE "displayId" = $1 LIMIT 1',
-            [candidate],
-          );
-          return Boolean(existing.rowCount);
-        });
-        const email = `onelink-${createId()}@${input.placeholderDomain}`;
-        await client.query('SAVEPOINT onelink_create_user');
-        try {
-          const inserted = await client.query<BoundOneLinkUser>(
-            `INSERT INTO "user" (
-               id, name, email, "emailVerified", image,
-               "phoneNumber", "phoneNumberVerified", "displayId",
-               disabled, "disabledAt", "createdAt", "updatedAt"
-             ) VALUES (
-               $1, '万联用户', $2, false, NULL,
-               NULL, false, $3,
-               false, NULL, clock_timestamp(), clock_timestamp()
-             )
-             RETURNING id, email, "emailVerified", name, image,
-                       "createdAt", "updatedAt", COALESCE(disabled, false) AS disabled`,
-            [userId, email, displayId],
-          );
-          await client.query('RELEASE SAVEPOINT onelink_create_user');
-          user = inserted.rows[0]!;
-          break;
-        } catch (error) {
-          if ((error as { code?: string }).code !== '23505') throw error;
-          await client.query('ROLLBACK TO SAVEPOINT onelink_create_user');
-        }
-      }
-      if (!user) throw new Error('AUTH_DISPLAY_ID_EXHAUSTED');
+      const user = await createLoginUser(client, 'onelink', input.placeholderDomain, '万联用户');
 
       try {
         await client.query(
@@ -351,27 +362,43 @@ export async function completeOneLinkCreate(
         throw error;
       }
 
-      await client.query(
+      const completed = await client.query(
         `UPDATE "mioOneLinkPending"
          SET status = 'completed', "updatedAt" = clock_timestamp()
-         WHERE id = $1`,
+         WHERE id = $1 AND "expiresAt">clock_timestamp()`,
         [pending.id],
       );
-      return { status: 'ok', user };
+      if (!completed.rowCount) throw new OneLinkPendingExpiredError();
+      return {
+        status: 'ok',
+        user,
+        subject: pending.candidateSub,
+        startedAt: row!.createdAt,
+        expiresAt: row!.expiresAt,
+      };
     });
   } catch (error) {
     if (error instanceof OneLinkAlreadyBoundError) return { status: 'already_bound' };
+    if (error instanceof OneLinkPendingExpiredError) return { status: 'invalid' };
     throw error;
   }
 }
 
 export type CompleteOneLinkLinkExistingResult =
-  | { readonly status: 'ok'; readonly user: BoundOneLinkUser }
+  | {
+      readonly status: 'ok';
+      readonly user: BoundOneLinkUser;
+      readonly subject: string;
+      readonly startedAt: Date;
+      readonly expiresAt: Date;
+    }
   | { readonly status: 'not_found' }
   | { readonly status: 'already_completed' }
   | { readonly status: 'invalid' }
   | { readonly status: 'existing_not_found' }
   | { readonly status: 'account_disabled' }
+  | { readonly status: 'session_required' }
+  | { readonly status: 'invalid_otp' }
   | { readonly status: 'already_bound' };
 
 /** Atomically link a staged OneLink login candidate to an existing verified, active phone user without creating users. */
@@ -380,12 +407,32 @@ export async function completeOneLinkLinkExisting(
   input: {
     readonly tokenDigest: string;
     readonly candidateToken: string;
-    readonly phone: string;
+    readonly phone?: string;
+    readonly code?: string;
+    readonly secret?: string;
+    readonly session?: BindingIdentity;
   },
 ): Promise<CompleteOneLinkLinkExistingResult> {
+  const observed = await readOneLinkPendingByDigest(pool, input.tokenDigest);
+  if (!observed) return { status: 'not_found' };
+  const initial = validateLoginCandidatePending(observed, input.candidateToken);
+  if (initial.status !== 'ok') return initial;
   try {
     return await withAuthTransaction<CompleteOneLinkLinkExistingResult>(pool, async (client) => {
-      // Lock "user" before "mioOneLinkPending" to enforce global lock order ("user" -> "session" -> "mioOneLinkPending" -> "account").
+      if (
+        input.phone &&
+        (!input.code ||
+          !input.secret ||
+          !(await consumePendingPhoneChallenge(
+            client,
+            input.secret,
+            'onelink_existing',
+            input.phone,
+            input.code,
+            { pendingId: observed.id, candidateToken: input.candidateToken },
+          )))
+      )
+        return { status: 'invalid_otp' };
       const userResult = await client.query<
         BoundOneLinkUser & { readonly phoneNumberVerified: boolean | null }
       >(
@@ -394,17 +441,30 @@ export async function completeOneLinkLinkExisting(
                 COALESCE(disabled, false) AS disabled,
                 "phoneNumberVerified"
          FROM "user"
-         WHERE "phoneNumber" = $1
+         WHERE ${input.session ? 'id' : '"phoneNumber"'} = $1
          FOR UPDATE`,
-        [input.phone],
+        [input.session?.userId ?? input.phone],
       );
+      if (input.session && !(await bindingSessionIsActive(client, input.session)))
+        return { status: 'session_required' };
       const row = await lockOneLinkPendingByDigest(client, input.tokenDigest);
       const pending = validateLoginCandidatePending(row, input.candidateToken);
       if (pending.status !== 'ok') return pending;
 
       const userRow = userResult.rows[0];
-      if (!userRow || !userRow.phoneNumberVerified) return { status: 'existing_not_found' };
+      if (!userRow || (!input.session && !userRow.phoneNumberVerified))
+        return { status: 'existing_not_found' };
       if (userRow.disabled) return { status: 'account_disabled' };
+      if (input.session) {
+        const sameFlow = await client.query(
+          'SELECT 1 FROM "session" WHERE id=$1 AND "createdAt">=$2 AND "expiresAt">clock_timestamp()',
+          [input.session.sessionId, row!.createdAt],
+        );
+        if (!sameFlow.rowCount) return { status: 'session_required' };
+      }
+      await lockLoginIdentity(client, 'onelink', pending.candidateSub);
+      if (!(await loginCallbackIsCurrent(client, 'onelink', pending.candidateSub, row!.createdAt)))
+        return { status: 'invalid' };
 
       try {
         await client.query(
@@ -417,12 +477,13 @@ export async function completeOneLinkLinkExisting(
         throw error;
       }
 
-      await client.query(
+      const completed = await client.query(
         `UPDATE "mioOneLinkPending"
          SET status = 'completed', "updatedAt" = clock_timestamp()
-         WHERE id = $1`,
+         WHERE id = $1 AND "expiresAt">clock_timestamp()`,
         [pending.id],
       );
+      if (!completed.rowCount) throw new OneLinkPendingExpiredError();
       const user: BoundOneLinkUser = {
         id: userRow.id,
         email: userRow.email,
@@ -433,10 +494,17 @@ export async function completeOneLinkLinkExisting(
         updatedAt: userRow.updatedAt,
         disabled: userRow.disabled,
       };
-      return { status: 'ok', user };
+      return {
+        status: 'ok',
+        user,
+        subject: pending.candidateSub,
+        startedAt: row!.createdAt,
+        expiresAt: row!.expiresAt,
+      };
     });
   } catch (error) {
     if (error instanceof OneLinkAlreadyBoundError) return { status: 'already_bound' };
+    if (error instanceof OneLinkPendingExpiredError) return { status: 'invalid' };
     throw error;
   }
 }
@@ -461,7 +529,7 @@ export async function completeOneLinkBindCurrent(
   try {
     return await withAuthTransaction<CompleteOneLinkBindCurrentResult>(pool, async (client) => {
       const lockedUser = await client.query(
-        'SELECT id FROM "user" WHERE id = $1 AND COALESCE(disabled, false) = false FOR SHARE',
+        'SELECT id FROM "user" WHERE id = $1 AND COALESCE(disabled, false) = false FOR UPDATE',
         [input.session.userId],
       );
       if (!lockedUser.rowCount || !(await bindingSessionIsActive(client, input.session))) {
@@ -487,6 +555,9 @@ export async function completeOneLinkBindCurrent(
       ) {
         return { status: 'invalid' };
       }
+      await lockLoginIdentity(client, 'onelink', row.candidateSub);
+      if (!(await loginCallbackIsCurrent(client, 'onelink', row.candidateSub, row.createdAt)))
+        return { status: 'invalid' };
 
       const existing = await client.query(
         `SELECT 1 FROM "account"
@@ -518,16 +589,18 @@ export async function completeOneLinkBindCurrent(
         }
       }
 
-      await client.query(
+      const completed = await client.query(
         `UPDATE "mioOneLinkPending"
          SET status = 'completed', "updatedAt" = clock_timestamp()
-         WHERE id = $1`,
+         WHERE id = $1 AND "expiresAt">clock_timestamp()`,
         [row.id],
       );
+      if (!completed.rowCount) throw new OneLinkPendingExpiredError();
       return { status: 'ok', userId: input.session.userId, alreadyBound };
     });
   } catch (error) {
     if (error instanceof OneLinkAlreadyBoundError) return { status: 'already_bound' };
+    if (error instanceof OneLinkPendingExpiredError) return { status: 'invalid' };
     throw error;
   }
 }

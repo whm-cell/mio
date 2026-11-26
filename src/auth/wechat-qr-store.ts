@@ -12,17 +12,19 @@ export const wechatQRSchema = {
       confirmedAt: { type: 'date', required: false },
       expiresAt: { type: 'date', index: true },
       failureCode: { type: 'string', required: false },
+      pendingId: { type: 'string', required: false, index: true },
     },
   },
 } as const;
 
-type QRStatus = 'pending' | 'confirmed' | 'failed' | 'expired' | 'consumed';
+type QRStatus = 'pending' | 'pending_confirm' | 'confirmed' | 'failed' | 'expired' | 'consumed';
 interface QRRow {
   id: string;
   cookieHash: string;
   status: QRStatus;
   userId: string | null;
   expiresAt: Date;
+  pendingId: string | null;
 }
 
 interface SessionIdentity {
@@ -74,31 +76,39 @@ export function admitWechatQR(pool: Pool, stateHash: string) {
       return { error: 'QR_EXPIRED' } as const;
     }
     if (row.status !== 'pending') return { error: 'QR_REPLAY' } as const;
-    return { id: row.id };
+    return { id: row.id, expiresAt: row.expiresAt };
   });
 }
 
-export function finishWechatQR(pool: Pool, id: string, userId?: string) {
+export function finishWechatQR(pool: Pool, id: string, userId?: string, pendingId?: string) {
   return withAuthTransaction(pool, async (client) => {
     await client.query(
       `UPDATE "mioWechatQR" SET status = $2, "userId" = $3,
        "confirmedAt" = CASE WHEN $3::text IS NOT NULL THEN clock_timestamp() ELSE NULL END,
-       "failureCode" = $4
-       WHERE id = $1 AND status = 'pending' AND "expiresAt" > clock_timestamp()`,
-      [id, userId ? 'confirmed' : 'failed', userId ?? null, userId ? null : 'OAUTH_FAILED'],
+       "failureCode" = $4, "pendingId" = $5
+       WHERE id = $1 AND status IN ('pending', 'pending_confirm') AND "expiresAt" > clock_timestamp()`,
+      [
+        id,
+        pendingId ? 'pending_confirm' : userId ? 'confirmed' : 'failed',
+        userId ?? null,
+        pendingId || userId ? null : 'OAUTH_FAILED',
+        pendingId ?? null,
+      ],
     );
   });
 }
 
 async function readWechatQRPoll(pool: Pool, id: string) {
   const query = {
-    text: `SELECT "cookieHash",status,"userId","expiresAt"<=statement_timestamp() AS expired
+    text: `SELECT "cookieHash",status,"userId","pendingId","expiresAt"<=statement_timestamp() AS expired
            FROM "mioWechatQR" WHERE id=$1`,
     values: [id],
     query_timeout: 5000,
   };
   return (
-    await pool.query<Pick<QRRow, 'cookieHash' | 'status' | 'userId'> & { expired: boolean }>(query)
+    await pool.query<
+      Pick<QRRow, 'cookieHash' | 'status' | 'userId' | 'pendingId'> & { expired: boolean }
+    >(query)
   ).rows[0];
 }
 
@@ -140,8 +150,22 @@ export async function pollWechatQR(
   id: string,
   cookieHash: string,
   loadIdentity: () => Promise<SessionIdentity | undefined>,
+  pendingDigest?: string,
 ) {
   let row = await readWechatQRPoll(pool, id);
+  if (row?.cookieHash === cookieHash && !row.expired && row.status === 'pending_confirm') {
+    const pending = (
+      await pool.query<{ status: string; expired: boolean }>(
+        `SELECT status,"expiresAt"<=clock_timestamp() AS expired FROM "mioWechatPending"
+       WHERE id=$1 AND "tokenDigest"=$2`,
+        [row.pendingId, pendingDigest ?? ''],
+      )
+    ).rows[0];
+    if (!pending) return { error: 'UNAUTHORIZED' } as const;
+    if (pending.expired) return { status: 'expired' } as const;
+    if (pending.status === 'candidate_ready') return { status: 'pending_confirm' } as const;
+    row = await readWechatQRPoll(pool, id);
+  }
   if (row?.cookieHash === cookieHash && !row.expired && row.status === 'confirmed') {
     const identity = await loadIdentity();
     if (identity && identity.userId === row.userId) {

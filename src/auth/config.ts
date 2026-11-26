@@ -7,10 +7,12 @@ import { accountPlugin, isUserDisabled } from './account.ts';
 import { oneLinkPlugin } from './onelink.ts';
 import type { OneLinkSsoPolicyReader, OneLinkSsoRuntimePolicy } from './onelink.ts';
 import { phonePlugin } from './phone.ts';
+import { phoneRebindPlugin } from './phone-rebind.ts';
 import type { AuthSmsMode, PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
 import { validateWechatUser, wechatPlugin } from './wechat.ts';
 import { wechatQRPlugin } from './wechat-qr.ts';
+import { wechatPendingPlugin } from './wechat-pending.ts';
 import { AuthPostgresDialect } from './database.ts';
 
 export const AUTH_BASE_PATH = '/api/auth';
@@ -106,6 +108,7 @@ function readSmsConfig(env: NodeJS.ProcessEnv) {
     ipHour: bounded('MIO_AUTH_SMS_IP_HOUR_LIMIT', 20),
     ipDay: bounded('MIO_AUTH_SMS_IP_DAY_LIMIT', 100),
     globalDay: bounded('MIO_AUTH_SMS_GLOBAL_DAY_LIMIT', 1000),
+    accountOpsDay: bounded('MIO_AUTH_SMS_ACCOUNT_OPS_DAY_LIMIT', 300),
   };
   if (enabled === 'false') return { smsLimits };
   const keys = [
@@ -216,8 +219,10 @@ export function authOptions(
     plugins: [
       accountPlugin(),
       phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
+      phoneRebindPlugin(config, pool, sms, getPolicy),
       wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
       wechatQRPlugin(config.baseURL, pool),
+      wechatPendingPlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       oneLinkPlugin(
         config,
         pool,
@@ -281,10 +286,15 @@ export function authOptions(
         '/sign-up/email': { window: 60, max: 5 },
         '/phone-number/verify': { window: 60, max: 10 },
         '/phone-binding/confirm': { window: 60, max: 10 },
+        '/phone-rebind/send-otp': { window: 60, max: 100 },
+        '/phone-rebind/confirm': { window: 60, max: 10 },
         '/sign-in/social': { window: 60, max: 10 },
         '/link-social': { window: 60, max: 10 },
         '/wechat/qr-session': { window: 60, max: 20 },
         '/wechat/qr-session/*/poll': { window: 60, max: 300 },
+        '/wechat/pending': { window: 60, max: 60 },
+        '/wechat/pending/send-otp': { window: 60, max: 100 },
+        '/wechat/pending/confirm': { window: 60, max: 10 },
         '/onelink/start': { window: 60, max: 20 },
         '/onelink/pending': { window: 60, max: 60 },
         '/onelink/cancel': { window: 60, max: 30 },

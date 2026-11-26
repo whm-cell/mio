@@ -11,6 +11,7 @@ import {
   parseOneLinkAccessToken,
 } from '../integrations/onelink/sso.ts';
 import type { OneLinkSsoConfig } from '../integrations/onelink/sso.ts';
+import { validateNewProviderSession } from './login-methods.ts';
 import { isUserDisabled } from './account.ts';
 import {
   cancelActiveOneLinkPending,
@@ -35,11 +36,7 @@ import type {
 import { isSixDigitCode, normalizeMainlandPhone, parsePhoneInput } from './phone.ts';
 import type { PhoneSmsPolicy, PhoneSmsRuntime } from './phone.ts';
 import type { PhoneLimits } from './phone-budget.ts';
-import {
-  activatePhoneChallenge,
-  consumeOneLinkExistingPhoneChallenge,
-  reserveOneLinkExistingPhoneChallenge,
-} from './phone-store.ts';
+import { activatePhoneChallenge, reserveOneLinkExistingPhoneChallenge } from './phone-store.ts';
 
 export interface OneLinkSsoRuntimePolicy {
   readonly enabled: boolean;
@@ -218,8 +215,8 @@ type OneLinkCompleteInput =
   | {
       readonly action: 'link_existing';
       readonly candidateToken: string;
-      readonly phone: string;
-      readonly code: string;
+      readonly phone?: string;
+      readonly code?: string;
     }
   | { readonly action: 'bind_current'; readonly candidateToken: string };
 
@@ -229,7 +226,7 @@ function parseCompleteBody(body: unknown): OneLinkCompleteInput | null {
   const action = input.action;
   if (action !== 'create' && action !== 'link_existing' && action !== 'bind_current') return null;
   const expectedKeys =
-    action === 'link_existing'
+    action === 'link_existing' && ('phoneNumber' in input || 'code' in input)
       ? ['action', 'candidateToken', 'phoneNumber', 'code']
       : ['action', 'candidateToken'];
   const actualKeys = Object.keys(input);
@@ -240,7 +237,7 @@ function parseCompleteBody(body: unknown): OneLinkCompleteInput | null {
     return null;
   }
   if (typeof input.candidateToken !== 'string' || input.candidateToken.length === 0) return null;
-  if (action === 'link_existing') {
+  if (action === 'link_existing' && expectedKeys.length === 4) {
     const phone = normalizeMainlandPhone(input.phoneNumber);
     if (!phone || !isSixDigitCode(input.code)) return null;
     return { action, candidateToken: input.candidateToken, phone, code: input.code };
@@ -290,7 +287,12 @@ type OneLinkCompleteFailureStatus =
   | 'account_disabled'
   | 'session_required';
 
-function failCompleteStatus(status: OneLinkCompleteFailureStatus): never {
+function failCompleteStatus(status: OneLinkCompleteFailureStatus | 'invalid_otp'): never {
+  if (status === 'invalid_otp')
+    throw new APIError('BAD_REQUEST', {
+      code: 'INVALID_OTP',
+      message: 'Invalid verification code',
+    });
   if (status === 'not_found') {
     throw new APIError('NOT_FOUND', {
       code: 'ONELINK_PENDING_NOT_FOUND',
@@ -336,6 +338,8 @@ function failCompleteStatus(status: OneLinkCompleteFailureStatus): never {
 async function issueOneLinkLoginSession(
   ctx: GenericEndpointContext,
   user: BoundOneLinkUser,
+  pool: Pool,
+  proof: { subject: string; startedAt: Date; expiresAt: Date },
 ): Promise<void> {
   let session;
   try {
@@ -355,6 +359,15 @@ async function issueOneLinkLoginSession(
     clearPendingCookie(ctx);
     return authUnavailable(ctx.responseHeaders);
   }
+  if (
+    !(await validateNewProviderSession(pool, {
+      userId: user.id,
+      sessionId: session.id,
+      provider: 'onelink',
+      ...proof,
+    }))
+  )
+    return failCompleteStatus('invalid');
   await setSessionCookie(ctx, { session, user });
   clearPendingCookie(ctx);
 }
@@ -439,7 +452,7 @@ async function finishLoginCallback(
   if (isUserDisabled(boundUser)) {
     return rejectStartedOrHandleRace(ctx, pool, baseURL, row, 'account_disabled');
   }
-  const completed = await completeStartedPendingLogin(pool, row.id);
+  const completed = await completeStartedPendingLogin(pool, row.id, parsed.sub, boundUser.id);
   if (!completed) {
     return handleLostTransition(ctx, pool, baseURL, row);
   }
@@ -460,6 +473,17 @@ async function finishLoginCallback(
     clearPendingCookie(ctx);
     return authUnavailable(CALLBACK_HEADERS);
   }
+  if (
+    !(await validateNewProviderSession(pool, {
+      userId: boundUser.id,
+      sessionId: session.id,
+      provider: 'onelink',
+      subject: parsed.sub,
+      startedAt: row.createdAt,
+      expiresAt: row.expiresAt,
+    }))
+  )
+    return redirect303(ctx, buildCleanRedirectLocation(row.returnPath, baseURL, 'invalid_state'));
   await setSessionCookie(ctx, { session, user: boundUser });
   clearPendingCookie(ctx);
   return redirect303(ctx, buildCleanRedirectLocation(row.returnPath, baseURL, 'logged_in'));
@@ -679,26 +703,23 @@ export function oneLinkPlugin(
           const pending = assertLoginCandidatePending(row);
           const authPolicy = readAuthPolicy();
           if (authPolicy.smsMode === 'disabled') return smsUnavailable();
-          if (authPolicy.smsMode === 'bypass') {
-            if (!isSixDigitCode(authPolicy.smsBypassCode)) return smsUnavailable();
-            const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
-            if (!ip) return smsUnavailable();
-            return ctx.json({ status: true });
-          }
-          if (!sms) return smsUnavailable();
+          if (authPolicy.smsMode === 'bypass' && !isSixDigitCode(authPolicy.smsBypassCode))
+            return smsUnavailable();
+          if (authPolicy.smsMode === 'live' && !sms) return smsUnavailable();
           const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
           if (!ip) return smsUnavailable();
           try {
             const challenge = await reserveOneLinkExistingPhoneChallenge(
               pool,
-              sms.tables,
+              sms?.tables,
               config.secret,
               config.smsLimits,
               phone,
               ip,
               { pendingId: pending.id, candidateToken: pending.candidateToken },
+              authPolicy.smsMode === 'bypass' ? authPolicy.smsBypassCode! : undefined,
             );
-            await sms.sender(phone, challenge.code);
+            if (authPolicy.smsMode === 'live') await sms!.sender(phone, challenge.code);
             if (!(await activatePhoneChallenge(pool, challenge.id))) {
               throw new Error('SMS_UNAVAILABLE');
             }
@@ -730,10 +751,22 @@ export function oneLinkPlugin(
               placeholderDomain,
             });
             if (result.status !== 'ok') return failCompleteStatus(result.status);
-            await issueOneLinkLoginSession(ctx, result.user);
+            await issueOneLinkLoginSession(ctx, result.user, pool, result);
             return ctx.json({ status: true, action: 'create', userId: result.user.id });
           }
           if (input.action === 'link_existing') {
+            if (!input.phone) {
+              const session = await readValidRecentSession(ctx);
+              if (!session) return failCompleteStatus('session_required');
+              const result = await completeOneLinkLinkExisting(pool, {
+                tokenDigest,
+                candidateToken: input.candidateToken,
+                session,
+              });
+              if (result.status !== 'ok') return failCompleteStatus(result.status);
+              await issueOneLinkLoginSession(ctx, result.user, pool, result);
+              return ctx.json({ status: true, action: 'link_existing', userId: result.user.id });
+            }
             const authPolicy = readAuthPolicy();
             if (authPolicy.smsMode === 'disabled') return smsUnavailable();
             if (authPolicy.smsMode === 'bypass') {
@@ -742,7 +775,7 @@ export function oneLinkPlugin(
               const row = await readOneLinkPendingByDigest(pool, tokenDigest);
               assertLoginCandidatePending(row, input.candidateToken);
               if (
-                !timingSafeEqual(Buffer.from(input.code, 'utf8'), Buffer.from(expected, 'utf8'))
+                !timingSafeEqual(Buffer.from(input.code!, 'utf8'), Buffer.from(expected, 'utf8'))
               ) {
                 throw new APIError('BAD_REQUEST', {
                   code: 'INVALID_OTP',
@@ -751,29 +784,16 @@ export function oneLinkPlugin(
               }
             } else {
               if (!sms) return smsUnavailable();
-              const row = await readOneLinkPendingByDigest(pool, tokenDigest);
-              const pending = assertLoginCandidatePending(row, input.candidateToken);
-              const consumed = await consumeOneLinkExistingPhoneChallenge(
-                pool,
-                config.secret,
-                input.phone,
-                input.code,
-                { pendingId: pending.id, candidateToken: pending.candidateToken },
-              );
-              if (consumed !== 'ok') {
-                throw new APIError('BAD_REQUEST', {
-                  code: 'INVALID_OTP',
-                  message: 'Invalid verification code',
-                });
-              }
             }
             const result = await completeOneLinkLinkExisting(pool, {
               tokenDigest,
               candidateToken: input.candidateToken,
               phone: input.phone,
+              code: input.code!,
+              secret: config.secret,
             });
             if (result.status !== 'ok') return failCompleteStatus(result.status);
-            await issueOneLinkLoginSession(ctx, result.user);
+            await issueOneLinkLoginSession(ctx, result.user, pool, result);
             return ctx.json({ status: true, action: 'link_existing', userId: result.user.id });
           }
           const session = await readValidRecentSession(ctx);

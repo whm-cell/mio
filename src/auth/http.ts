@@ -87,10 +87,15 @@ const routes = new Map([
   ['/phone-number/verify', 'POST'],
   ['/phone-binding/send-otp', 'POST'],
   ['/phone-binding/confirm', 'POST'],
+  ['/phone-rebind/send-otp', 'POST'],
+  ['/phone-rebind/confirm', 'POST'],
   ['/sign-in/social', 'POST'],
   ['/link-social', 'POST'],
   ['/callback/wechat', 'GET'],
   ['/wechat/qr-session', 'POST'],
+  ['/wechat/pending', 'GET'],
+  ['/wechat/pending/send-otp', 'POST'],
+  ['/wechat/pending/confirm', 'POST'],
   ['/onelink/start', 'POST'],
   ['/callback/onelink', 'GET'],
   ['/onelink/pending', 'GET'],
@@ -190,6 +195,7 @@ function allowedMethodsFor(pathname: string, qrPoll: boolean): readonly string[]
   if (pathname === '/api/v1/me' || qrPoll) return ['GET'];
   if (pathname === '/api/v1/me/profile') return ['GET', 'PATCH'];
   if (pathname === '/api/v1/me/profile/avatar/normalize') return ['POST'];
+  if (pathname === '/api/v1/me/wechat' || pathname === '/api/v1/me/onelink') return ['DELETE'];
   if (!pathname.startsWith(`${AUTH_BASE_PATH}/`)) return undefined;
   const method = routes.get(pathname.slice(AUTH_BASE_PATH.length));
   return method ? [method] : undefined;
@@ -239,6 +245,7 @@ export function createAuthHandler(
         `${AUTH_BASE_PATH}/link-social`,
         wechatCallbackPath,
       ].includes(pathname) ||
+      pathname.startsWith(`${AUTH_BASE_PATH}/wechat/pending`) ||
       qrCreate ||
       qrPoll;
     const allowedMethods = allowedMethodsFor(pathname, qrPoll);
@@ -258,9 +265,13 @@ export function createAuthHandler(
       response.setHeader('allow', allowHeader);
       return fail(HTTP_STATUS.METHOD_NOT_ALLOWED, 'METHOD_NOT_ALLOWED');
     }
-    const isMutation = method === 'POST' || method === 'PATCH';
+    const isMutation = method === 'POST' || method === 'PATCH' || method === 'DELETE';
     if (isMutation && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
-    if (isMutation && request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json')
+    if (
+      isMutation &&
+      method !== 'DELETE' &&
+      request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
+    )
       return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
     if (emailPasswordPaths.has(pathname) && !readPolicy().emailPasswordEnabled)
       return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'EMAIL_PASSWORD_UNAVAILABLE');
@@ -300,6 +311,19 @@ export function createAuthHandler(
         if (value !== undefined) headers.set(name, value);
       }
       headers.set('x-mio-client-ip', request.socket.remoteAddress ?? '127.0.0.1');
+      if (pathname === '/api/v1/me/wechat' || pathname === '/api/v1/me/onelink') {
+        const identity = await auth.identity(headers);
+        if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        const result = await auth.unlinkLoginMethod(
+          identity,
+          pathname.endsWith('/wechat') ? 'wechat' : 'onelink',
+        );
+        if (result === 'session_required') return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        if (result === 'last_login_method') return fail(HTTP_STATUS.CONFLICT, 'LAST_LOGIN_METHOD');
+        response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ status: true }));
+        return;
+      }
       if (pathname === '/api/v1/me') {
         const identity = await auth.identity(headers);
         if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
@@ -345,7 +369,10 @@ export function createAuthHandler(
         method === 'POST'
           ? (await readBody(request, AUTH_BODY_LIMIT_BYTES)).toString('utf8')
           : undefined;
-      if (wechatRoute && !qrCreate && method === 'POST') {
+      if (
+        [`${AUTH_BASE_PATH}/sign-in/social`, `${AUTH_BASE_PATH}/link-social`].includes(pathname) &&
+        method === 'POST'
+      ) {
         body = wechatStartBody(body!, config.baseURL);
         if (!body) return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
       }

@@ -39,7 +39,14 @@ it('preserves raw UTF-8 authentication input and does not forward an aborted bod
       databaseURL: 'unused',
       origins: ['http://client.test'],
       emailPasswordEnabled: true,
-      smsLimits: { phoneHour: 5, phoneDay: 10, ipHour: 20, ipDay: 100, globalDay: 1000 },
+      smsLimits: {
+        phoneHour: 5,
+        phoneDay: 10,
+        ipHour: 20,
+        ipDay: 100,
+        globalDay: 1000,
+        accountOpsDay: 300,
+      },
     },
     auth,
   );
@@ -99,7 +106,14 @@ it('does not copy upstream headers when the upstream response body fails', async
       databaseURL: 'unused',
       origins: ['http://client.test'],
       emailPasswordEnabled: true,
-      smsLimits: { phoneHour: 5, phoneDay: 10, ipHour: 20, ipDay: 100, globalDay: 1000 },
+      smsLimits: {
+        phoneHour: 5,
+        phoneDay: 10,
+        ipHour: 20,
+        ipDay: 100,
+        globalDay: 1000,
+        accountOpsDay: 300,
+      },
     },
     auth,
   );

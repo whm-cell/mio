@@ -56,6 +56,7 @@ ALTER TABLE mio_conversations
 CREATE UNIQUE INDEX IF NOT EXISTS mio_conversations_fork_request
   ON mio_conversations(owner_id, forked_from_conversation_id, fork_request_id)
   WHERE fork_request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mio_conversation_requests_created_idx ON mio_conversation_requests(created_at DESC);
 CREATE INDEX IF NOT EXISTS mio_conversation_requests_latest
   ON mio_conversation_requests(conversation_id, created_at DESC, request_id DESC);
 CREATE INDEX IF NOT EXISTS mio_conversation_requests_recovery

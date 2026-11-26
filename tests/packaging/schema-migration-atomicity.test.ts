@@ -43,7 +43,7 @@ const migrations = [
     name: 'assets',
     ddl: assetSchemaSQL,
     legacy: `${assetSchemaSQL}
-      DROP INDEX mio_assets_cleanup;
+      DROP INDEX mio_assets_cleanup_order;
       ${originalAsset}`,
     damage: 'ALTER TABLE mio_assets ALTER COLUMN source_etag TYPE varchar(128)',
     repair: 'ALTER TABLE mio_assets ALTER COLUMN source_etag TYPE text',
@@ -190,7 +190,7 @@ const lockingMigrations = [
     name: 'assets',
     ddl: assetSchemaSQL,
     table: 'mio_assets',
-    damage: 'DROP INDEX mio_assets_cleanup',
+    damage: 'DROP INDEX mio_assets_cleanup_order',
   },
   {
     name: 'compute',

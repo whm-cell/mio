@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS mio_compute_jobs (
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(owner_id,request_id)
 );
+CREATE INDEX IF NOT EXISTS mio_compute_jobs_created_idx ON mio_compute_jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS mio_compute_jobs_unfinished ON mio_compute_jobs(owner_id)
   WHERE state IN ('accepted','queued','running');
 CREATE TABLE IF NOT EXISTS mio_compute_outbox (

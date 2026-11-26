@@ -24,6 +24,7 @@ ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS route_snapshot jsonb;
 ALTER TABLE mio_image_jobs DROP CONSTRAINT IF EXISTS mio_image_jobs_state_check;
 ALTER TABLE mio_image_jobs ADD CONSTRAINT mio_image_jobs_state_check
   CHECK(state IN ('accepted','submitted','processing','materializing','completed','partial','materialization_failed','unknown','failed','rejected'));
+CREATE INDEX IF NOT EXISTS mio_image_jobs_created_idx ON mio_image_jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS mio_image_jobs_unfinished ON mio_image_jobs(owner_id)
   WHERE state IN ('accepted','submitted','processing','materializing');
 CREATE TABLE IF NOT EXISTS mio_image_outputs (

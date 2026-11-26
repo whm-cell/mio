@@ -477,6 +477,11 @@ BEGIN
   ORDER BY provider_type, raw_model_id, updated_at DESC
   ON CONFLICT (provider_type, raw_model_id) DO NOTHING;
 END $$;
+CREATE INDEX IF NOT EXISTS mio_provider_models_metadata_sample
+  ON mio_provider_models(raw_model_id COLLATE "C", last_seen_at DESC NULLS LAST)
+  WHERE metadata_source='onelink-v1-models';
+CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_recent_idx
+  ON mio_provider_model_route_revisions(provider_type, created_at DESC, declaration_version DESC);
 CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_lookup
   ON mio_provider_model_route_revisions (provider_type, raw_model_id, operation, created_at DESC);
 ${voiceSchemaSQL}

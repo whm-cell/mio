@@ -274,6 +274,9 @@ export class AdminStore {
   private readonly ownsConversationsPool: boolean;
   private readonly mediaPool: Pool | null;
   private closing: Promise<void> | undefined;
+  private imageSchemaAvailable = false;
+  private conversationSchemaAvailable = false;
+  private computeSchemaAvailable = false;
 
   constructor(
     pool: Pool,
@@ -563,26 +566,6 @@ export class AdminStore {
     ignoredIds: Set<string>;
   }> {
     return this.transaction(async (client) => {
-      if (input.status === 'connected') {
-        await client.query(
-          "UPDATE mio_admin_catalog_models SET in_latest_probe=false WHERE provider_type='onelink'",
-        );
-        if (input.models.length > 0) {
-          await client.query(
-            `INSERT INTO mio_admin_catalog_models (
-              provider_type, raw_model_id, supplier_metadata, in_latest_probe, probe_seq, first_seen_at, last_seen_at
-            )
-            SELECT 'onelink', m.id, m.metadata, true, 1, now(), now()
-            FROM jsonb_to_recordset($1::jsonb) AS m(id text, metadata jsonb)
-            ON CONFLICT (provider_type, raw_model_id) DO UPDATE SET
-              supplier_metadata = EXCLUDED.supplier_metadata,
-              in_latest_probe = true,
-              probe_seq = mio_admin_catalog_models.probe_seq + 1,
-              last_seen_at = now()`,
-            [JSON.stringify(input.models)],
-          );
-        }
-      }
       if (input.savedEnvelope) {
         const { keyVersion, maskedHint, envelope } = input.savedEnvelope;
         await client.query(
@@ -641,6 +624,30 @@ export class AdminStore {
           ],
         );
       }
+      // The existing singleton UPSERT serializes probes before either touches model rows.
+      if (input.status === 'connected') {
+        await client.query(
+          `UPDATE mio_admin_catalog_models SET in_latest_probe=false
+           WHERE provider_type='onelink' AND in_latest_probe=true
+             AND raw_model_id <> ALL($1::text[])`,
+          [input.models.map((model) => model.id)],
+        );
+        if (input.models.length > 0) {
+          await client.query(
+            `INSERT INTO mio_admin_catalog_models (
+              provider_type, raw_model_id, supplier_metadata, in_latest_probe, probe_seq, first_seen_at, last_seen_at
+            )
+            SELECT 'onelink', m.id, m.metadata, true, 1, now(), now()
+            FROM jsonb_to_recordset($1::jsonb) AS m(id text, metadata jsonb)
+            ON CONFLICT (provider_type, raw_model_id) DO UPDATE SET
+              supplier_metadata = EXCLUDED.supplier_metadata,
+              in_latest_probe = true,
+              probe_seq = mio_admin_catalog_models.probe_seq + 1,
+              last_seen_at = now()`,
+            [JSON.stringify(input.models)],
+          );
+        }
+      }
       await client.query(
         `INSERT INTO mio_admin_audit_logs (
           id, actor_id, actor_name, action, target_id, summary, after_state
@@ -660,14 +667,12 @@ export class AdminStore {
           }),
         ],
       );
-      const [existingRes, ignoredRes] = await Promise.all([
-        client.query<{ raw_model_id: string }>(
-          "SELECT raw_model_id FROM mio_provider_catalog_models WHERE provider_type='onelink'",
-        ),
-        client.query<{ raw_model_id: string }>(
-          "SELECT raw_model_id FROM mio_admin_ignored_models WHERE provider_type='onelink'",
-        ),
-      ]);
+      const existingRes = await client.query<{ raw_model_id: string }>(
+        "SELECT raw_model_id FROM mio_provider_catalog_models WHERE provider_type='onelink'",
+      );
+      const ignoredRes = await client.query<{ raw_model_id: string }>(
+        "SELECT raw_model_id FROM mio_admin_ignored_models WHERE provider_type='onelink'",
+      );
       return {
         totalCatalogCount: existingRes.rows.length,
         existingIds: new Set(existingRes.rows.map((r) => r.raw_model_id)),
@@ -730,7 +735,7 @@ export class AdminStore {
   }
 
   async readUnifiedModelSources(): Promise<UnifiedModelRawSources> {
-    const [catalog, benchmark, ignored, userStats, routes] = await Promise.all([
+    const [catalog, benchmark, userStats, routes] = await Promise.all([
       this.pool.query<CatalogModelDbRow>(
         "SELECT * FROM mio_provider_catalog_models WHERE provider_type='onelink'",
       ),
@@ -745,15 +750,6 @@ export class AdminStore {
       ),
       this.pool.query<{
         raw_model_id: string;
-        reason: string | null;
-        ignored_by: string | null;
-        ignored_at: Date;
-      }>(
-        `SELECT raw_model_id, reason, ignored_by, ignored_at
-         FROM mio_admin_ignored_models WHERE provider_type='onelink'`,
-      ),
-      this.pool.query<{
-        raw_model_id: string;
         discovered_users: number;
         verified_chat_users: number;
         verified_image_users: number;
@@ -763,74 +759,62 @@ export class AdminStore {
         verified_clone_users: number;
         sample_metadata: Record<string, unknown> | null;
       }>(
-        `SELECT
-           m.raw_model_id,
-           COUNT(DISTINCT CASE
-             WHEN m.membership_state = 'current'
-              AND m.metadata_source = 'onelink-v1-models'
-              AND c.catalog_credential_version = c.credential_version
-              AND m.credential_version = c.credential_version
-              AND m.catalog_version = c.catalog_version
-             THEN c.id END)::int AS discovered_users,
-           COUNT(DISTINCT CASE
-             WHEN v.operation = 'chat'
-              AND v.verification_status = 'verified'
-              AND r_chat.declaration_version = v.declaration_version
-              AND c.catalog_credential_version = c.credential_version
-             THEN c.id END)::int AS verified_chat_users,
-           COUNT(DISTINCT CASE
-             WHEN v.operation = 'image.generate'
-              AND v.verification_status = 'verified'
-              AND r_img.declaration_version = v.declaration_version
-              AND c.catalog_credential_version = c.credential_version
-             THEN c.id END)::int AS verified_image_users,
-           COUNT(DISTINCT CASE
-             WHEN v.operation = 'video.generate'
-              AND v.verification_status = 'verified'
-              AND r_video.declaration_version = v.declaration_version
-              AND c.catalog_credential_version = c.credential_version
-             THEN c.id END)::int AS verified_video_users,
-           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.voices.list')::int AS verified_voice_users,
-           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.tts')::int AS verified_tts_users,
-           COUNT(DISTINCT c.id) FILTER (WHERE current_audio.valid AND v.operation='audio.clone')::int AS verified_clone_users,
-           (ARRAY_AGG(m.supplier_metadata ORDER BY m.last_seen_at DESC NULLS LAST)
-             FILTER (WHERE m.metadata_source = 'onelink-v1-models'))[1] AS sample_metadata
-         FROM mio_provider_models m
-         JOIN mio_provider_configs c ON c.id = m.provider_id
-         LEFT JOIN mio_provider_model_verifications v
-           ON v.provider_id = m.provider_id AND v.model_key = m.model_key
-         LEFT JOIN mio_provider_model_routes r_chat
-           ON r_chat.provider_type = c.provider_type
-          AND r_chat.raw_model_id = m.raw_model_id COLLATE "C"
-          AND r_chat.operation = 'chat'
-          AND r_chat.enabled = true
-         LEFT JOIN mio_provider_model_routes r_img
-           ON r_img.provider_type = c.provider_type
-          AND r_img.raw_model_id = m.raw_model_id COLLATE "C"
-          AND r_img.operation = 'image.generate'
-          AND r_img.enabled = true
-         LEFT JOIN mio_provider_model_routes r_video
-           ON r_video.provider_type = c.provider_type
-          AND r_video.raw_model_id = m.raw_model_id COLLATE "C"
-          AND r_video.operation = 'video.generate'
-          AND r_video.enabled = true
-         LEFT JOIN mio_provider_model_routes r_audio
-           ON r_audio.provider_type = c.provider_type
-          AND r_audio.raw_model_id = m.raw_model_id COLLATE "C"
-          AND r_audio.operation = v.operation
-          AND r_audio.operation IN ('audio.voices.list','audio.tts','audio.clone')
-          AND r_audio.enabled = true
-         CROSS JOIN LATERAL (SELECT
-           v.verification_status='verified' AND r_audio.declaration_version=v.declaration_version
-           AND r_audio.driver=v.driver AND c.catalog_credential_version=c.credential_version
-           AND v.tested_tuple->>'credentialVersion'=c.credential_version::text
-           AND v.tested_tuple->>'catalogVersion'=c.catalog_version::text
-           AND v.tested_tuple->>'adaptationVersion'=r_audio.declaration_version::text
-           AND v.tested_tuple->>'operation'=v.operation
-           AND v.tested_tuple->>'profile'=v.driver AS valid
-         ) current_audio
-         WHERE m.raw_model_id IS NOT NULL
-         GROUP BY m.raw_model_id`,
+        `WITH discovered AS (
+           SELECT m.raw_model_id,
+             COUNT(*) FILTER (WHERE m.membership_state='current'
+               AND m.metadata_source='onelink-v1-models'
+               AND c.catalog_credential_version=c.credential_version
+               AND m.credential_version=c.credential_version
+               AND m.catalog_version=c.catalog_version)::int AS discovered_users
+           FROM mio_provider_models m
+           JOIN mio_provider_configs c ON c.id=m.provider_id
+           JOIN mio_provider_catalog_models cat ON cat.provider_type=c.provider_type
+             AND cat.raw_model_id=m.raw_model_id COLLATE "C"
+           GROUP BY m.raw_model_id
+         ), verified AS (
+           SELECT m.raw_model_id,
+             COUNT(*) FILTER (WHERE v.operation='chat' AND eligibility.valid)::int AS verified_chat_users,
+             COUNT(*) FILTER (WHERE v.operation='image.generate' AND eligibility.valid)::int AS verified_image_users,
+             COUNT(*) FILTER (WHERE v.operation='video.generate' AND eligibility.valid)::int AS verified_video_users,
+             COUNT(*) FILTER (WHERE v.operation='audio.voices.list' AND eligibility.valid)::int AS verified_voice_users,
+             COUNT(*) FILTER (WHERE v.operation='audio.tts' AND eligibility.valid)::int AS verified_tts_users,
+             COUNT(*) FILTER (WHERE v.operation='audio.clone' AND eligibility.valid)::int AS verified_clone_users
+           FROM mio_provider_models m
+           JOIN mio_provider_configs c ON c.id=m.provider_id
+           JOIN mio_provider_catalog_models cat ON cat.provider_type=c.provider_type
+             AND cat.raw_model_id=m.raw_model_id COLLATE "C"
+           JOIN mio_provider_model_verifications v ON v.provider_id=m.provider_id AND v.model_key=m.model_key
+           JOIN mio_provider_model_routes r ON r.provider_type=c.provider_type
+             AND r.raw_model_id=m.raw_model_id COLLATE "C" AND r.operation=v.operation
+           CROSS JOIN LATERAL (SELECT r.enabled AND v.verification_status='verified'
+             AND r.declaration_version=v.declaration_version AND r.driver=v.driver
+             AND c.catalog_version IS NOT NULL AND c.catalog_credential_version=c.credential_version
+             AND jsonb_typeof(v.tested_tuple)='object'
+             AND v.tested_tuple @> jsonb_build_object(
+               'credentialVersion',c.credential_version,'catalogVersion',c.catalog_version,
+               'adaptationVersion',r.declaration_version,'operation',v.operation,'profile',r.driver) AS valid
+           ) eligibility
+           GROUP BY m.raw_model_id
+         )
+         SELECT cat.raw_model_id,COALESCE(d.discovered_users,0) AS discovered_users,
+           COALESCE(v.verified_chat_users,0) AS verified_chat_users,
+           COALESCE(v.verified_image_users,0) AS verified_image_users,
+           COALESCE(v.verified_video_users,0) AS verified_video_users,
+           COALESCE(v.verified_voice_users,0) AS verified_voice_users,
+           COALESCE(v.verified_tts_users,0) AS verified_tts_users,
+           COALESCE(v.verified_clone_users,0) AS verified_clone_users,
+           sample.supplier_metadata AS sample_metadata
+         FROM mio_provider_catalog_models cat
+         LEFT JOIN discovered d ON d.raw_model_id=cat.raw_model_id COLLATE "C"
+         LEFT JOIN verified v ON v.raw_model_id=cat.raw_model_id COLLATE "C"
+         LEFT JOIN LATERAL (
+           SELECT m.supplier_metadata FROM mio_provider_models m
+           WHERE m.raw_model_id=cat.raw_model_id COLLATE "C" AND m.metadata_source='onelink-v1-models'
+             AND cat.supplier_metadata='{}'::jsonb
+             AND NOT EXISTS (SELECT 1 FROM mio_admin_catalog_models b
+               WHERE b.provider_type=cat.provider_type AND b.raw_model_id=cat.raw_model_id COLLATE "C")
+           ORDER BY m.last_seen_at DESC NULLS LAST LIMIT 1
+         ) sample ON true WHERE cat.provider_type='onelink'`,
       ),
       this.pool.query<PlatformRouteRecord & { updated_at: Date }>(
         "SELECT * FROM mio_provider_model_routes WHERE provider_type='onelink'",
@@ -839,7 +823,6 @@ export class AdminStore {
     return {
       catalogRows: catalog.rows,
       benchmarkRows: benchmark.rows,
-      ignoredRows: ignored.rows,
       userStatsRows: userStats.rows,
       routeRows: routes.rows,
     };
@@ -1448,14 +1431,17 @@ export class AdminStore {
         inboxProcessed: 0,
       };
     }
-    const exists = (
-      await this.mediaPool.query<{ jobs: string | null; outbox: string | null }>(
-        `SELECT
-           to_regclass('mio_compute_jobs')::text AS jobs,
-           to_regclass('mio_compute_outbox')::text AS outbox`,
-      )
-    ).rows[0];
-    if (!exists?.jobs || !exists.outbox) {
+    if (!this.computeSchemaAvailable) {
+      const exists = (
+        await this.mediaPool.query<{ jobs: string | null; outbox: string | null }>(
+          `SELECT
+             to_regclass('mio_compute_jobs')::text AS jobs,
+             to_regclass('mio_compute_outbox')::text AS outbox`,
+        )
+      ).rows[0];
+      if (exists?.jobs && exists.outbox) this.computeSchemaAvailable = true;
+    }
+    if (!this.computeSchemaAvailable) {
       return {
         enabled: false,
         jobs: { total: 0, accepted: 0, queued: 0, running: 0, succeeded: 0, failed: 0 },
@@ -1494,7 +1480,7 @@ export class AdminStore {
            COUNT(*) FILTER (WHERE sent_at IS NULL)::int AS pending,
            COUNT(*) FILTER (WHERE sent_at IS NULL AND lease_until > now())::int AS leased,
            (MAX(EXTRACT(EPOCH FROM (now() - created_at))) FILTER (WHERE sent_at IS NULL))::int AS oldest_age_sec
-         FROM mio_compute_outbox`,
+         FROM mio_compute_outbox WHERE sent_at IS NULL`,
       ),
       this.mediaPool.query<{ count: number }>(
         'SELECT COUNT(*)::int AS count FROM mio_compute_inbox',
@@ -1537,12 +1523,15 @@ export class AdminStore {
         recentJobs: [],
       };
     }
-    const exists = (
-      await this.mediaPool.query<{ reg: string | null }>(
-        "SELECT to_regclass('mio_image_jobs')::text AS reg",
-      )
-    ).rows[0]?.reg;
-    if (!exists) {
+    if (!this.imageSchemaAvailable) {
+      const exists = (
+        await this.mediaPool.query<{ reg: string | null }>(
+          "SELECT to_regclass('mio_image_jobs')::text AS reg",
+        )
+      ).rows[0]?.reg;
+      if (exists) this.imageSchemaAvailable = true;
+    }
+    if (!this.imageSchemaAvailable) {
       return {
         enabled: false,
         totals: {
@@ -1559,27 +1548,7 @@ export class AdminStore {
     }
     const whereClause = interval ? 'WHERE j.created_at >= now() - $1::interval' : '';
     const params = interval ? [interval] : [];
-    const [totalsRes, byModelRes, recentRes] = await Promise.all([
-      this.mediaPool.query<{
-        total: number;
-        completed: number;
-        in_flight: number;
-        rejected: number;
-        upstream_failed: number;
-        storage_failed: number;
-      }>(
-        `SELECT
-           COUNT(*)::int AS total,
-           COUNT(*) FILTER (WHERE j.state='completed')::int AS completed,
-           COUNT(*) FILTER (WHERE j.state IN ('accepted','submitted','processing','materializing'))::int AS in_flight,
-           COUNT(*) FILTER (WHERE j.state='rejected')::int AS rejected,
-           COUNT(*) FILTER (WHERE j.state IN ('failed','unknown') AND NOT COALESCE(e.storage_failed, false))::int AS upstream_failed,
-           COUNT(*) FILTER (WHERE j.state IN ('materialization_failed','partial') OR COALESCE(e.storage_failed, false))::int AS storage_failed
-         FROM mio_image_jobs j
-         LEFT JOIN mio_image_executions e ON e.job_id = j.id
-         ${whereClause}`,
-        params,
-      ),
+    const [byModelRes, recentRes] = await Promise.all([
       this.mediaPool.query<{
         model_id: string;
         driver: string;
@@ -1629,35 +1598,43 @@ export class AdminStore {
            j.error_code,
            (SELECT COUNT(*)::int FROM mio_image_outputs o WHERE o.job_id = j.id) AS output_count,
            j.created_at
-         FROM mio_image_jobs j
+         FROM (
+           SELECT j.id, j.command, j.route_snapshot, j.state, j.query_attempt, j.error_code, j.created_at
+           FROM mio_image_jobs j
+           ${whereClause}
+           ORDER BY j.created_at DESC LIMIT 30
+         ) j
          LEFT JOIN mio_image_executions e ON e.job_id = j.id
-         ${whereClause}
          ORDER BY j.created_at DESC
          LIMIT 30`,
         params,
       ),
     ]);
-    const totals = totalsRes.rows[0]!;
+    const byModel = byModelRes.rows.map((row) => ({
+      modelId: row.model_id,
+      driver: row.driver,
+      total: row.total,
+      completed: row.completed,
+      inFlight: row.in_flight,
+      rejected: row.rejected,
+      upstreamFailed: row.upstream_failed,
+      storageFailed: row.storage_failed,
+    }));
+    const totals = byModel.reduce(
+      (sum, row) => ({
+        total: sum.total + row.total,
+        completed: sum.completed + row.completed,
+        inFlight: sum.inFlight + row.inFlight,
+        rejected: sum.rejected + row.rejected,
+        upstreamFailed: sum.upstreamFailed + row.upstreamFailed,
+        storageFailed: sum.storageFailed + row.storageFailed,
+      }),
+      { total: 0, completed: 0, inFlight: 0, rejected: 0, upstreamFailed: 0, storageFailed: 0 },
+    );
     return {
       enabled: true,
-      totals: {
-        total: totals.total,
-        completed: totals.completed,
-        inFlight: totals.in_flight,
-        rejected: totals.rejected,
-        upstreamFailed: totals.upstream_failed,
-        storageFailed: totals.storage_failed,
-      },
-      byModel: byModelRes.rows.map((row) => ({
-        modelId: row.model_id,
-        driver: row.driver,
-        total: row.total,
-        completed: row.completed,
-        inFlight: row.in_flight,
-        rejected: row.rejected,
-        upstreamFailed: row.upstream_failed,
-        storageFailed: row.storage_failed,
-      })),
+      totals,
+      byModel,
       recentJobs: recentRes.rows.map((row) => ({
         id: row.id,
         modelId: row.model_id,
@@ -1682,12 +1659,15 @@ export class AdminStore {
         recentRequests: [],
       };
     }
-    const exists = (
-      await this.conversationsPool.query<{ reg: string | null }>(
-        "SELECT to_regclass('mio_conversation_requests')::text AS reg",
-      )
-    ).rows[0]?.reg;
-    if (!exists) {
+    if (!this.conversationSchemaAvailable) {
+      const exists = (
+        await this.conversationsPool.query<{ reg: string | null }>(
+          "SELECT to_regclass('mio_conversation_requests')::text AS reg",
+        )
+      ).rows[0]?.reg;
+      if (exists) this.conversationSchemaAvailable = true;
+    }
+    if (!this.conversationSchemaAvailable) {
       return {
         enabled: false,
         totals: { total: 0, completed: 0, inFlight: 0, failed: 0, cancelled: 0, unknown: 0 },
@@ -1697,32 +1677,15 @@ export class AdminStore {
     }
     const whereClause = interval ? 'WHERE r.created_at >= now() - $1::interval' : '';
     const params = interval ? [interval] : [];
-    const [totalsRes, byModelRes, recentRes] = await Promise.all([
-      this.conversationsPool.query<{
-        total: number;
-        completed: number;
-        in_flight: number;
-        failed: number;
-        cancelled: number;
-        unknown: number;
-      }>(
-        `SELECT
-           COUNT(*)::int AS total,
-           COUNT(*) FILTER (WHERE r.status='completed')::int AS completed,
-           COUNT(*) FILTER (WHERE r.status IN ('accepted','input-persisted'))::int AS in_flight,
-           COUNT(*) FILTER (WHERE r.status='failed')::int AS failed,
-           COUNT(*) FILTER (WHERE r.status='cancelled')::int AS cancelled,
-           COUNT(*) FILTER (WHERE r.status='unknown')::int AS unknown
-         FROM mio_conversation_requests r
-         ${whereClause}`,
-        params,
-      ),
+    const [byModelRes, recentRes] = await Promise.all([
       this.conversationsPool.query<{
         model_id: string;
         protocol: string;
         total: number;
         completed: number;
         failed: number;
+        unknown: number;
+        in_flight: number;
         cancelled: number;
       }>(
         `SELECT
@@ -1730,7 +1693,9 @@ export class AdminStore {
            COALESCE(r.model_binding->>'protocol', 'default') AS protocol,
            COUNT(*)::int AS total,
            COUNT(*) FILTER (WHERE r.status='completed')::int AS completed,
-           COUNT(*) FILTER (WHERE r.status IN ('failed','unknown'))::int AS failed,
+           COUNT(*) FILTER (WHERE r.status='failed')::int AS failed,
+           COUNT(*) FILTER (WHERE r.status='unknown')::int AS unknown,
+           COUNT(*) FILTER (WHERE r.status IN ('accepted','input-persisted'))::int AS in_flight,
            COUNT(*) FILTER (WHERE r.status='cancelled')::int AS cancelled
          FROM mio_conversation_requests r
          ${whereClause}
@@ -1762,23 +1727,26 @@ export class AdminStore {
         params,
       ),
     ]);
-    const totals = totalsRes.rows[0]!;
+    const totals = byModelRes.rows.reduce(
+      (sum, row) => ({
+        total: sum.total + row.total,
+        completed: sum.completed + row.completed,
+        inFlight: sum.inFlight + row.in_flight,
+        failed: sum.failed + row.failed,
+        cancelled: sum.cancelled + row.cancelled,
+        unknown: sum.unknown + row.unknown,
+      }),
+      { total: 0, completed: 0, inFlight: 0, failed: 0, cancelled: 0, unknown: 0 },
+    );
     return {
       enabled: true,
-      totals: {
-        total: totals.total,
-        completed: totals.completed,
-        inFlight: totals.in_flight,
-        failed: totals.failed,
-        cancelled: totals.cancelled,
-        unknown: totals.unknown,
-      },
+      totals,
       byModel: byModelRes.rows.map((row) => ({
         modelId: row.model_id,
         protocol: row.protocol,
         total: row.total,
         completed: row.completed,
-        failed: row.failed,
+        failed: row.failed + row.unknown,
         cancelled: row.cancelled,
       })),
       recentRequests: recentRes.rows.map((row) => ({
@@ -2129,7 +2097,7 @@ export class AdminStore {
         if (this.ownsConversationsPool && this.conversationsPool) {
           tasks.push(this.conversationsPool.end());
         }
-        if (this.mediaPool) {
+        if (this.mediaPool && this.mediaPool !== this.pool) {
           tasks.push(this.mediaPool.end());
         }
         await Promise.allSettled(tasks);
@@ -2175,7 +2143,10 @@ export async function createAdminStore(
       }
     }
     if (config.mediaDatabaseURL) {
-      mediaPool = createManagedPool(config.mediaDatabaseURL, 'mio-admin-media', 2);
+      mediaPool =
+        config.mediaDatabaseURL === config.databaseURL
+          ? pool
+          : createManagedPool(config.mediaDatabaseURL, 'mio-admin-media', 2);
     }
     return new AdminStore(
       pool,
@@ -2190,7 +2161,7 @@ export async function createAdminStore(
     await Promise.allSettled([
       pool.end(),
       ...(ownsConversationsPool && conversationsPool ? [conversationsPool.end()] : []),
-      ...(mediaPool ? [mediaPool.end()] : []),
+      ...(mediaPool && mediaPool !== pool ? [mediaPool.end()] : []),
     ]);
     throw error instanceof Error &&
       (error.message.startsWith('ADMIN_SCHEMA') || error.message.startsWith('PROVIDER_SCHEMA'))

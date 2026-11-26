@@ -17,12 +17,6 @@ import { endpoint, operationPath, readJson, TASK_ID } from './shared.ts';
 import { videoSubmission } from './payload.ts';
 import { submissionTask, videoQueryResult } from './response.ts';
 
-export type {
-  VideoProtocol,
-  VideoQueryResult,
-  VideoSubmitResult,
-} from '../../../generations/video/execution.ts';
-
 const KLING_QUERY_PATHS = new Set([
   '/kling/v1/videos/text2video',
   '/kling/v1/videos/image2video',

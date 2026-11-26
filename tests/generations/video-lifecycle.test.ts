@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, Pool } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
+import { observeDirectorySync } from '../support/directory-sync.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { AssetStore } from '../../src/assets/store.ts';
@@ -1243,19 +1243,6 @@ async function videoLeasePid(pool: Pool) {
   return lease.rows[0]!.pid;
 }
 
-async function observeDirectorySync(directory: string, beforeSync: () => Promise<void>) {
-  const handle = await open(directory, 'r');
-  const { ino, dev } = await handle.stat();
-  const prototype = Object.getPrototypeOf(handle) as FileHandle;
-  await handle.close();
-  const sync = prototype.sync;
-  return vi.spyOn(prototype, 'sync').mockImplementation(async function (this: FileHandle) {
-    const current = await this.stat();
-    if (current.ino === ino && current.dev === dev) await beforeSync();
-    await sync.call(this);
-  });
-}
-
 describe('paid video submission receipt', () => {
   it('keeps a private received ID when PostgreSQL declines it and the executor restarts', async () => {
     const f = await fixture();
@@ -1565,51 +1552,6 @@ describe('paid video submission receipt', () => {
   });
 });
 
-it.each([undefined, 'other-task'])(
-  'keeps the original ID and produces no asset when actual Ark query reports identity %s',
-  async (id) => {
-    const f = await fixture();
-    const transport = vi
-      .fn<typeof fetch>()
-      .mockImplementationOnce(async () => Response.json({ id: 'safe-task' }))
-      .mockImplementationOnce(async () =>
-        Response.json({
-          id,
-          status: 'succeeded',
-          content: { video_url: 'https://media.fixture/unrelated.mp4' },
-        }),
-      );
-    const run = f.runner({ protocol: createVideoProtocol, transport });
-    await run(await f.next());
-    const submitted = await f.durableState();
-    expect(submitted).toMatchObject({ state: 'submitted', upstream_task_id: 'safe-task' });
-    await run(await f.next());
-    expect(await f.durableState()).toMatchObject({
-      state: 'unknown',
-      error_code: 'VIDEO_QUERY_IDENTITY_INVALID',
-      phase: 'done',
-      upstream_task_id: 'safe-task',
-      query_attempt: 1,
-      async_deadline: submitted.async_deadline,
-      async_max_queries: submitted.async_max_queries,
-      checkpoint: null,
-    });
-    expect((await f.store.get(f.actor.userId, f.job.jobId)).outputs).toEqual([]);
-    expect((await f.pool.query('SELECT count(*) FROM mio_assets')).rows[0].count).toBe('0');
-    expect(f.materialize).not.toHaveBeenCalled();
-    expect(await f.execution.claim()).toBeUndefined();
-    expect(
-      transport.mock.calls.map(([url, options]) => [
-        new URL(String(url)).pathname,
-        options?.method,
-      ]),
-    ).toEqual([
-      ['/volc/api/v3/contents/generations/tasks', 'POST'],
-      ['/volc/api/v3/contents/generations/tasks/safe-task', 'GET'],
-    ]);
-  },
-);
-
 function arkQueryTransport() {
   return vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ id: 'safe-task' }));
 }
@@ -1673,41 +1615,63 @@ describe('durable video query outcomes', () => {
     expect(f.provider.snapshotVideo).not.toHaveBeenCalled();
   });
 
+  const arkSuccess = {
+    status: 'succeeded',
+    content: { video_url: 'https://media.fixture/unrelated.mp4' },
+  };
   it.each([
     {
+      family: 'ark',
+      scenario: 'missing task ID',
+      response: arkSuccess,
+      expectedState: 'unknown',
+      expectedCode: 'VIDEO_QUERY_IDENTITY_INVALID',
+    },
+    {
+      family: 'ark',
+      scenario: 'conflicting task ID',
+      response: { id: 'other-task', ...arkSuccess },
+      expectedState: 'unknown',
+      expectedCode: 'VIDEO_QUERY_IDENTITY_INVALID',
+    },
+    {
       family: 'kling',
+      scenario: 'unrecognized supplier status',
       response: { code: 0, data: { task_id: 'safe-task', task_status: 'new_supplier_status' } },
       expectedState: 'unknown',
       expectedCode: 'VIDEO_QUERY_STATUS_UNKNOWN',
     },
     {
       family: 'happyhorse',
+      scenario: 'UNKNOWN status',
       response: { output: { task_id: 'safe-task', task_status: 'UNKNOWN' } },
       expectedState: 'unknown',
       expectedCode: 'VIDEO_QUERY_STATUS_UNKNOWN',
     },
     {
       family: 'happyhorse',
+      scenario: 'FAILED status',
       response: { output: { task_id: 'safe-task', task_status: 'FAILED' } },
       expectedState: 'failed',
       expectedCode: 'VIDEO_UPSTREAM_FAILED',
     },
   ] as const)(
-    'persists $expectedState / $expectedCode for $family without assets or extra POST',
+    'persists $expectedState / $expectedCode for $family with $scenario without assets or extra POST',
     async ({ family, response, expectedState, expectedCode }) => {
       const f = await fixture(undefined, family);
       const route = queryRoutes[family];
-      const submission =
-        family === 'kling'
-          ? { code: 0, data: { task_id: 'safe-task' } }
-          : { output: { task_id: 'safe-task' } };
+      const submissions = {
+        ark: { id: 'safe-task' },
+        kling: { code: 0, data: { task_id: 'safe-task' } },
+        happyhorse: { output: { task_id: 'safe-task' } },
+      };
       const upstreamTaskId =
         family === 'kling'
           ? JSON.stringify({ path: route.submitPath, id: 'safe-task' })
           : 'safe-task';
       const transport = vi
         .fn<typeof fetch>()
-        .mockResolvedValueOnce(Response.json(submission))
+        .mockResolvedValueOnce(Response.json(submissions[family]))
         .mockResolvedValueOnce(Response.json(response));
       const run = f.runner({ protocol: createVideoProtocol, transport });
       await run(await f.next());

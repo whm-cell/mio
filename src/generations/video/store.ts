@@ -10,7 +10,6 @@ import {
   VIDEO_QUOTA_LOCK,
 } from './execution.ts';
 import type { VideoCheckpoint, VideoJobCommand } from './execution.ts';
-export type { VideoJobCommand } from './execution.ts';
 import { VIDEO_GLOBAL_QUOTA, VIDEO_USER_QUOTA } from './contracts.ts';
 import type { VideoCreateRequest, VideoJobView } from './contracts.ts';
 
@@ -26,10 +25,6 @@ interface VideoJobRow {
   cancellation_supported: boolean;
   cancellation_status: VideoJobView['cancellation']['status'];
   phase: VideoJobView['stage'];
-  upstream_task_id: string | null;
-  query_attempt: number;
-  async_max_queries: number | null;
-  async_deadline: Date | null;
   checkpoint: VideoCheckpoint | null;
   created_at: Date;
   updated_at: Date;
@@ -223,7 +218,7 @@ export class VideoGenerationStore {
       await this.pool.query<VideoJobRow>(
         `SELECT j.id,j.request_id,j.command,j.state,j.error_code,
           j.cancellation_requested,j.cancellation_supported,j.cancellation_status,
-          e.phase,e.upstream_task_id,e.query_attempt,e.async_max_queries,e.async_deadline,e.checkpoint,
+          e.phase,e.checkpoint,
           j.created_at,j.updated_at,j.completed_at,
           COALESCE((
             SELECT jsonb_agg(jsonb_build_object(

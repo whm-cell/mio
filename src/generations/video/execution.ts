@@ -3,7 +3,7 @@ import type { AccountCredentialSnapshot, VideoRouteConfig } from '../../provider
 import type {
   VideoAssetReference,
   VideoCreateRequest,
-  VideoJobState,
+  VideoJobView,
   VideoRequestParameters,
 } from './contracts.ts';
 
@@ -60,7 +60,6 @@ export interface VideoCheckpoint {
   videos: VideoResultSource[];
   materializationAttempts: number;
   cleaned?: boolean;
-  cleanupRetryAt?: string;
   expired?: Record<number, true>;
   invalidOutputs?: Record<number, true>;
   refreshAt?: string;
@@ -70,12 +69,11 @@ export interface VideoCheckpoint {
 export interface VideoExecution {
   id: string;
   owner_id: string;
-  state: VideoJobState;
   error_code: string | null;
   command: VideoJobCommand;
   admitted: Record<string, unknown>;
   route_snapshot: { route: VideoRouteConfig; modelId: string };
-  phase: 'ready' | 'submitting' | 'waiting' | 'querying' | 'materializing' | 'done';
+  phase: VideoJobView['stage'];
   claim_id: string;
   snapshot: AccountCredentialSnapshot;
   upstream_task_id: string | null;

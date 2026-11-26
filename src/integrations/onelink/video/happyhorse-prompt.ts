@@ -3,9 +3,8 @@ import type { VideoRequestParameters } from '../../../generations/video/contract
 export function happyhorsePrompt(input: VideoRequestParameters): string {
   if (input.mode !== 'reference_subjects') return input.prompt;
 
-  // Frozen inputs use the same slot order as the encoder: frame, references, then subjects.
-  let image = Number(Boolean(input.firstFrame)) + (input.references?.length ?? 0);
-  const labels = Array.from({ length: image }, (_, index) => '[Image ' + (index + 1) + ']');
+  let image = 0;
+  const labels: string[] = [];
   for (const subject of input.subjects ?? []) {
     const slots = subject.images.map(() => '[Image ' + ++image + ']').join('、');
     // Brackets in a quoted name must not introduce upstream image references.

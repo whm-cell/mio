@@ -14,7 +14,6 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import type * as AsyncFileSystem from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -37,6 +36,7 @@ import type { VideoExecution, VideoProtocol } from '../../src/generations/video/
 import type { withPublicHttps } from '../../src/integrations/onelink/public-https.ts';
 import { createCosStorage } from '../../src/integrations/cos.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { observeDirectorySync } from '../support/directory-sync.ts';
 import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
 
 vi.mock('node:fs', async (original) => {
@@ -180,17 +180,18 @@ async function fixture() {
   };
 }
 
-async function observeDirectorySync(directory: string, beforeSync: () => Promise<void>) {
-  const handle = await open(directory, 'r');
-  const { ino, dev } = await handle.stat();
-  const prototype = Object.getPrototypeOf(handle) as FileHandle;
-  await handle.close();
-  const sync = prototype.sync;
-  return vi.spyOn(prototype, 'sync').mockImplementation(async function (this: FileHandle) {
-    const info = await this.stat();
-    if (info.ino === ino && info.dev === dev) await beforeSync();
-    await sync.call(this);
-  });
+async function interruptCopy(
+  f: Awaited<ReturnType<typeof fixture>>,
+  index: number,
+  signal: AbortSignal,
+) {
+  const copy = vi.mocked(f.objects.copy);
+  copy.mockRejectedValueOnce(new Error('interrupted before copy'));
+  await expect(f.run(f.row, video, index, signal)).rejects.toThrow('interrupted before copy');
+  const path = f.checkpoint(`${index}.json`);
+  const firstReceipt = await readFile(path, 'utf8');
+  const source = f.probe.mock.calls[0]![0].source;
+  return { copy, path, firstReceipt, source };
 }
 
 describe('durable video materialization', () => {
@@ -966,13 +967,8 @@ describe('durable video materialization', () => {
     try {
       const index = 3;
       const signal = AbortSignal.timeout(5000);
-      const copy = vi.mocked(f.objects.copy);
-      copy.mockRejectedValueOnce(new Error('interrupted before copy'));
-      await expect(f.run(f.row, video, index, signal)).rejects.toThrow('interrupted before copy');
-      const path = f.checkpoint(`${index}.json`);
-      const firstReceipt = await readFile(path, 'utf8');
+      const { copy, path, firstReceipt, source } = await interruptCopy(f, index, signal);
       const { assetId, attemptId, sha256, sizeBytes, etag } = JSON.parse(firstReceipt);
-      const source = f.probe.mock.calls[0]![0].source;
       const rawKey = `mio/raw/${assetId}/${attemptId}`;
       expect(JSON.parse(firstReceipt)).toMatchObject({
         jobId: f.row.id,
@@ -1034,12 +1030,9 @@ describe('durable video materialization', () => {
     try {
       const index = 3;
       const signal = AbortSignal.timeout(5000);
-      const copy = vi.mocked(f.objects.copy);
-      copy.mockRejectedValueOnce(new Error('interrupted before copy'));
-      await expect(f.run(f.row, video, index, signal)).rejects.toThrow('interrupted before copy');
-      const path = f.checkpoint(`${index}.json`);
-      const { assetId, attemptId, sha256, sizeBytes } = JSON.parse(await readFile(path, 'utf8'));
-      const { stagingKey, etag } = f.probe.mock.calls[0]![0].source;
+      const { copy, path, firstReceipt, source } = await interruptCopy(f, index, signal);
+      const { assetId, attemptId, sha256, sizeBytes } = JSON.parse(firstReceipt);
+      const { stagingKey, etag } = source;
       expect(f.saved.delete(stagingKey)).toBe(true);
 
       const put = vi.mocked(f.objects.putVideo!);

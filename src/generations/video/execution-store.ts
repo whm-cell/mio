@@ -27,7 +27,7 @@ const EXECUTOR_LOCK = 672049927;
 const CLAIM_SETTLEMENT_TIMEOUT_MS = 2000;
 const CLEANUP_RETRY_INTERVAL_MS = 30_000;
 const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
-const executionSelection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
+const executionSelection = `SELECT j.id,j.owner_id,j.error_code,j.command,j.admitted,j.route_snapshot,
   e.phase,e.claim_id,e.snapshot,e.upstream_task_id,e.query_attempt,e.async_max_queries,
   e.async_deadline,e.checkpoint FROM mio_video_jobs j`;
 const runnable = `e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')

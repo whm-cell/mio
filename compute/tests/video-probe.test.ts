@@ -797,7 +797,6 @@ it.each(['already expired', 'held until timeout', 'granted at deadline'] as cons
   'publishes a timeout without download when a delivery is %s',
   async (admission) => {
     const root = directory();
-    const file = fixture(root);
     const journal = new Journal(root, 'probe-test', true);
     const slots = new ResourceSlots();
     slots.setHold('probe', 'other-probe', true);
@@ -808,7 +807,7 @@ it.each(['already expired', 'held until timeout', 'granted at deadline'] as cons
     // Most of the admission window was already spent in the broker before delivery.
     const remaining = 100;
     const input = {
-      ...command(file),
+      ...command(Buffer.from('probe input identity')),
       admitBy: Date.now() + (admission === 'already expired' ? 0 : remaining),
     };
     const ack = vi.fn();

@@ -455,16 +455,7 @@ it('aborts the SDK sender on oversized and cancelled image streams and forwards 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
-  const original = COS.prototype.getObject;
-  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
-    this: COS,
-    ...args
-  ) {
-    const client = this as unknown as { options: { Domain: string; Protocol: string } };
-    client.options.Domain = `http://127.0.0.1:${address.port}`;
-    client.options.Protocol = 'http:';
-    return original.apply(this, args);
-  });
+  const get = redirectCosDownloads(address.port);
   try {
     const storage = createCosStorage({
       databaseURL: 'postgresql://example.invalid/media',
@@ -508,16 +499,7 @@ it('cancels an SDK image request while the server has not responded', async () =
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
-  const original = COS.prototype.getObject;
-  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
-    this: COS,
-    ...args
-  ) {
-    const client = this as unknown as { options: { Domain: string; Protocol: string } };
-    client.options.Domain = `http://127.0.0.1:${address.port}`;
-    client.options.Protocol = 'http:';
-    return original.apply(this, args);
-  });
+  const get = redirectCosDownloads(address.port);
   try {
     const storage = createCosStorage({
       databaseURL: 'postgresql://example.invalid/media',
@@ -560,16 +542,7 @@ it.each([
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
-  const original = COS.prototype.getObject;
-  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
-    this: COS,
-    ...args
-  ) {
-    const client = this as unknown as { options: { Domain: string; Protocol: string } };
-    client.options.Domain = `http://127.0.0.1:${address.port}`;
-    client.options.Protocol = 'http:';
-    return original.apply(this, args);
-  });
+  const get = redirectCosDownloads(address.port);
   try {
     const storage = createCosStorage({
       databaseURL: 'postgresql://example.invalid/media',
@@ -655,16 +628,7 @@ it.each([
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
-  const original = COS.prototype.getObject;
-  const get = vi.spyOn(COS.prototype, 'getObject').mockImplementation(function (
-    this: COS,
-    ...args
-  ) {
-    const client = this as unknown as { options: { Domain: string; Protocol: string } };
-    client.options.Domain = `http://127.0.0.1:${address.port}`;
-    client.options.Protocol = 'http:';
-    return original.apply(this, args);
-  });
+  const get = redirectCosDownloads(address.port);
   const head = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
     statusCode: 200,
     ETag: '"etag"',

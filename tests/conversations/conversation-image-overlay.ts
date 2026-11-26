@@ -101,19 +101,6 @@ export function apply(ctx: Context) {
     return { statusCode: deleted.status, headers: {} };
   };
 
-  type RequestCallback = (error: COS.CosError, result: COS.RequestResult) => void;
-
-  function request(params: COS.RequestParams, callback: RequestCallback): void;
-  function request(params: COS.RequestParams): Promise<COS.RequestResult>;
-  function request(params: COS.RequestParams, callback?: RequestCallback) {
-    const pending = requestObject(params);
-    if (!callback) return pending;
-    void pending.then(
-      (result) => callback(null, result),
-      (error: unknown) => Reflect.apply(callback, undefined, [error]),
-    );
-  }
-
   ctx.effect(() => {
     globalThis.fetch = interceptedFetch;
     COS.prototype.getObjectUrl = function (params: { Key: string; Method?: string }) {
@@ -159,7 +146,7 @@ export function apply(ctx: Context) {
       await deleteObject(params.Key);
       return { statusCode: 204, headers: {} };
     } as unknown as typeof COS.prototype.deleteObject;
-    COS.prototype.request = request;
+    COS.prototype.request = requestObject;
 
     return () => {
       if (globalThis.fetch === interceptedFetch) globalThis.fetch = originalFetch;

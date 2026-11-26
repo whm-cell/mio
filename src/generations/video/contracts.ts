@@ -47,20 +47,9 @@ export const VIDEO_JOB_STATES = [
 ] as const;
 export type VideoJobState = (typeof VIDEO_JOB_STATES)[number];
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Execution phases define the VideoJobView stage type.
-const VIDEO_EXECUTION_PHASES = [
-  'ready',
-  'submitting',
-  'waiting',
-  'querying',
-  'materializing',
-  'done',
-] as const;
-type VideoExecutionPhase = (typeof VIDEO_EXECUTION_PHASES)[number];
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Output phases define the VideoOutputView status type.
-const VIDEO_OUTPUT_PHASES = ['pending', 'staging', 'probed', 'registered', 'failed'] as const;
-type VideoOutputPhase = (typeof VIDEO_OUTPUT_PHASES)[number];
+type VideoExecutionPhase =
+  'ready' | 'submitting' | 'waiting' | 'querying' | 'materializing' | 'done';
+type VideoOutputPhase = 'pending' | 'staging' | 'probed' | 'registered' | 'failed';
 
 export interface VideoAssetReference {
   assetId: string;
@@ -373,7 +362,6 @@ function decodeParameters(value: unknown): VideoRequestParameters {
     (!hasSegments || hasFrames || hasReferences || hasSubjects || hasShots || value.multiShot)
   )
     return invalid();
-  if (mode !== 'multiframe' && hasSegments) return invalid();
   if (hasShots && (!value.multiShot || !['text_to_video', 'first_frame'].includes(mode)))
     return invalid();
   if (value.multiShot && !['text_to_video', 'first_frame'].includes(mode)) return invalid();

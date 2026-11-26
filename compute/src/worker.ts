@@ -92,15 +92,8 @@ function videoProbeFailure(
   if (code === 'SOURCE_INVALID' || code === 'SOURCE_TOO_LARGE' || code === 'SOURCE_CHANGED')
     return code;
   if (code === 'EXECUTION_TIMEOUT') return 'EXECUTION_TIMEOUT';
-  if (error instanceof MediaError) {
-    if (error.code === 'SOURCE_INVALID' || error.code === 'SOURCE_TOO_LARGE') return error.code;
-    if (error.code === 'SOURCE_CHANGED') return 'SOURCE_CHANGED';
-    if (error.code === 'INPUT_INVALID' || error.code === 'INPUT_TOO_LONG') return 'SOURCE_INVALID';
-    if (error.code === 'PROBE_FAILED') return 'PROBE_FAILED';
-    if (error.code === 'EXECUTION_TIMEOUT') return 'EXECUTION_TIMEOUT';
-  }
+  if (error instanceof MediaError && error.code === 'PROBE_FAILED') return 'PROBE_FAILED';
   if ((error as { statusCode?: number } | null)?.statusCode === 412) return 'SOURCE_CHANGED';
-  if ((error as NodeJS.ErrnoException | null)?.code === 'ENOSPC') return 'STORAGE_FAILURE';
   if (code === 'WORKER_STOPPED') return 'WORKER_INTERRUPTED';
   return 'STORAGE_FAILURE';
 }

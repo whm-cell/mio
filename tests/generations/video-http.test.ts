@@ -44,6 +44,7 @@ import type { ProviderService } from '../../src/providers/service.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { observeOwnerStateReads } from '../support/provider-state-queries.ts';
 import { writeVideoProbeFixture } from '../support/video-probe-fixtures.ts';
 
 const actor = { userId: randomUUID(), sessionId: 'video-http-test' };
@@ -738,6 +739,28 @@ it('recovers the private video from its downloaded checkpoint after the supplier
   }
 });
 
+function waitForLock(
+  f: Awaited<ReturnType<typeof assetHttpFixture>>,
+  key: number,
+  query: string,
+  count: number,
+) {
+  return vi.waitFor(
+    async () => {
+      const { rows } = await f.pool.query<{ pid: number; query: string }>(
+        `SELECT a.pid,a.query FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+         WHERE a.application_name=$1 AND l.locktype='advisory'
+           AND l.classid=0 AND l.objid=$2::oid AND NOT l.granted`,
+        [f.applicationName, key],
+      );
+      expect(rows).toHaveLength(count);
+      for (const row of rows) expect(row.query).toContain(query);
+      return rows.map((row) => row.pid);
+    },
+    { timeout: 4000 },
+  );
+}
+
 describe('video admission cancellation', () => {
   const expectUnadmitted = async (f: Awaited<ReturnType<typeof assetHttpFixture>>) => {
     const { rows } = await f.pool.query(`SELECT
@@ -832,20 +855,11 @@ describe('video admission cancellation', () => {
           controller.signal,
         );
         void pending.catch(() => {});
-        await vi.waitFor(
-          async () => {
-            const { rows } = await f.pool.query<{ query: string }>(
-              `SELECT a.query FROM pg_locks l JOIN pg_stat_activity a USING(pid)
-             WHERE a.application_name=$1 AND l.locktype='advisory'
-               AND l.classid=0 AND l.objid=$2::oid AND NOT l.granted`,
-              [f.applicationName, lock],
-            );
-            expect(rows).toHaveLength(1);
-            expect(rows[0]?.query).toContain(
-              stage === 'quota lock' ? 'pg_advisory_xact_lock' : 'INSERT INTO mio_video_executions',
-            );
-          },
-          { timeout: 4000 },
+        await waitForLock(
+          f,
+          lock,
+          stage === 'quota lock' ? 'pg_advisory_xact_lock' : 'INSERT INTO mio_video_executions',
+          1,
         );
         controller.abort();
         await gate.query('SELECT pg_advisory_unlock($1)', [lock]);
@@ -971,20 +985,7 @@ describe('video admission cancellation', () => {
 describe('video admission replay', () => {
   it('reads current owner state once at HTTP admission and refreshes it after dispatch reference checks', async () => {
     const f = await assetHttpFixture({ providerModelIds: ['vega-1.5-pro'] });
-    const queries = vi.spyOn(Pool.prototype, 'query');
-    const expectStateReads = (count: number) => {
-      const reads = queries.mock.calls.filter(
-        ([sql]) =>
-          typeof sql === 'string' &&
-          sql.includes('FROM mio_provider_configs c WHERE c.owner_id=$1'),
-      );
-      expect(reads).toHaveLength(count);
-      for (const [sql, parameters] of reads) {
-        expect(parameters).toEqual([actor.userId]);
-        expect(sql).not.toContain('mio_provider_model_verifications');
-      }
-      queries.mockClear();
-    };
+    const { expectReads: expectStateReads, restore } = observeOwnerStateReads(actor.userId);
     const entered = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     let dispatch: ReturnType<typeof f.runNext> | undefined;
@@ -1091,7 +1092,7 @@ describe('video admission replay', () => {
       expectStateReads(1);
       expect(f.wake).toHaveBeenCalledOnce();
     } finally {
-      queries.mockRestore();
+      restore();
       resume.resolve();
       await Promise.allSettled([dispatch]);
       await f.close();
@@ -1294,28 +1295,6 @@ describe('video admission after executor lease loss', () => {
   async function expectUnavailable(response: Response) {
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: { code: 'VIDEO_UNAVAILABLE' } });
-  }
-
-  function waitForLock(
-    f: Awaited<ReturnType<typeof assetHttpFixture>>,
-    key: number,
-    query: string,
-    count: number,
-  ) {
-    return vi.waitFor(
-      async () => {
-        const { rows } = await f.pool.query<{ pid: number; query: string }>(
-          `SELECT a.pid,a.query FROM pg_locks l JOIN pg_stat_activity a USING(pid)
-           WHERE a.application_name=$1 AND l.locktype='advisory'
-             AND l.classid=0 AND l.objid=$2::oid AND NOT l.granted`,
-          [f.applicationName, key],
-        );
-        expect(rows).toHaveLength(count);
-        for (const row of rows) expect(row.query).toContain(query);
-        return rows.map((row) => row.pid);
-      },
-      { timeout: 4000 },
-    );
   }
 
   it.each(['object inspection', 'quota lock', 'unrelated PostgreSQL error'] as const)(

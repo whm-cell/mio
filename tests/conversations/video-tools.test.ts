@@ -33,6 +33,7 @@ import { createProviderService } from '../../src/providers/service.ts';
 import type { ProviderService } from '../../src/providers/service.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { observeOwnerStateReads } from '../support/provider-state-queries.ts';
 
 const USER_ID = '00000000-0000-4000-8000-000000000001';
 const CONVERSATION_ID = '00000000-0000-4000-8000-000000000002';
@@ -574,24 +575,12 @@ it('uses one owner state statement per DSH submit and preserves the persisted to
     },
   };
   const hash = createHash('sha256').update(JSON.stringify(legacyRequest)).digest('hex');
-  const queries = vi.spyOn(Pool.prototype, 'query');
-  onTestFinished(() => {
-    queries.mockRestore();
-  });
-  const expectOneStateStatement = () => {
-    const reads = queries.mock.calls.filter(
-      ([sql]) =>
-        typeof sql === 'string' && sql.includes('FROM mio_provider_configs c WHERE c.owner_id=$1'),
-    );
-    expect(reads).toHaveLength(1);
-    expect(reads[0]![1]).toEqual([USER_ID]);
-    expect(reads[0]![0]).not.toContain('mio_provider_model_verifications');
-    queries.mockClear();
-  };
+  const { expectReads, restore } = observeOwnerStateReads(USER_ID);
+  onTestFinished(restore);
 
   const accepted = await submit();
   expect(accepted).toMatchObject({ status: 'accepted', modelRef });
-  expectOneStateStatement();
+  expectReads(1);
   expect(await store.byRequest(USER_ID, legacyRequest.requestId)).toEqual({
     jobId: accepted.jobId,
     inputHash: hash,
@@ -599,18 +588,18 @@ it('uses one owner state statement per DSH submit and preserves the persisted to
 
   stop.abort();
   expect(await submit()).toEqual(accepted);
-  expectOneStateStatement();
+  expectReads(1);
   const current = (await provider.get(actor))!;
   await provider.settings(actor, current.revision, {
     defaultVideoWatermark: !current.defaultVideoWatermark,
   });
   await expect(submit()).rejects.toMatchObject({ code: 'REQUEST_CONFLICT' });
-  expectOneStateStatement();
+  expectReads(1);
 
   await provider.settings(actor, (await provider.get(actor))!.revision, { enabled: false });
   const byRequest = vi.spyOn(store, 'byRequest');
   await expect(submit()).rejects.toMatchObject({ code: 'VIDEO_UNAVAILABLE' });
-  expectOneStateStatement();
+  expectReads(1);
   expect(byRequest).not.toHaveBeenCalled();
   expect(wake).toHaveBeenCalledOnce();
   expect((await pool.query('SELECT id FROM mio_video_jobs')).rows).toEqual([

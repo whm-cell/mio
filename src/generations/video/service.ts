@@ -10,7 +10,7 @@ import { defaultVideoGenerateAudio } from './driver-capabilities.ts';
 import { validateVideoParameters } from '../../providers/onelink/video-route.ts';
 import type { createVideoInputResolver } from './inputs.ts';
 import type { VideoCreateRequest, VideoCapabilitiesView, VideoMode } from './contracts.ts';
-import type { VideoJobCommand } from './store.ts';
+import type { VideoJobCommand } from './execution.ts';
 import type { VideoJobCursor } from './store.ts';
 
 function parseCursor(value: string | undefined): VideoJobCursor | undefined {
@@ -61,13 +61,6 @@ function inputSnapshot(request: VideoCreateRequest): VideoJobCommand['inputSnaps
   for (const subject of parameters.subjects ?? []) {
     for (const image of subject.images)
       inputs.push({ assetId: image.assetId, mediaType: 'image', role: `subject:${subject.name}` });
-  }
-  for (const [index, segment] of (parameters.multiframeSegments ?? []).entries()) {
-    inputs.push({
-      assetId: segment.keyImage.assetId,
-      mediaType: 'image',
-      role: `segment:${index}`,
-    });
   }
   return inputs;
 }

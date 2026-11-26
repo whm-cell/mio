@@ -483,11 +483,7 @@ ${voiceSchemaSQL}
 ${audioSchemaSQL}
 `;
 
-export async function checkProviderSchema(
-  pool: Pick<Pool, 'query'>,
-  _images = false,
-): Promise<void> {
-  void _images;
+export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await checkProviderOperations(pool, [
     'mio_provider_model_routes',
     'mio_provider_model_verifications',

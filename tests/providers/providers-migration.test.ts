@@ -45,12 +45,9 @@ it('upgrades all three installed operation constraints atomically without losing
         ADD CONSTRAINT ${table}_operation_check CHECK (operation IN ('chat', 'image.generate'))`);
     await expect(checkProviderSchema(pool)).rejects.toThrow('operation constraints');
     const route = makeAudioRouteFixture('exact-tts-fixture');
-    const environment = {
-      PATH: process.env.PATH,
-      MIO_PROVIDERS_DATABASE_URL: (pool.options as { connectionString: string }).connectionString,
-      MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
-      MIO_PROVIDERS_MASTER_KEY_ID: 'migration-fixture',
-    };
+    const environment = providerEnv(
+      (pool.options as { connectionString: string }).connectionString,
+    );
     const cli = (name: string, argument: string, input?: string) =>
       spawnSync(process.execPath, [`scripts/service/${name}.ts`, argument], {
         env: environment,
@@ -110,15 +107,13 @@ it('enforces route and verification primary keys and active schema columns uncon
   databaseTest(async (pool) => {
     await pool.query(providerSchemaSQL);
     await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
-    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
 
     await pool.query(
       'ALTER TABLE mio_provider_model_routes DROP CONSTRAINT mio_provider_model_routes_pkey',
     );
     await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
-    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
     await pool.query(providerSchemaSQL);
-    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+    await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
 
     await pool.query(
       'ALTER TABLE mio_provider_model_verifications DROP CONSTRAINT mio_provider_model_verifications_pkey',
@@ -126,7 +121,6 @@ it('enforces route and verification primary keys and active schema columns uncon
     await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
     await pool.query(providerSchemaSQL);
     await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
-    await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
   }));
 
 it('upgrades valid success/empty success, failed and rotated observations without a static seed; reruns preserve identity', async () =>

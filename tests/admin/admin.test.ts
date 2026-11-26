@@ -221,7 +221,7 @@ beforeAll(async () => {
     return new Response('not found', { status: 404 });
   };
 
-  providerStore = await createProviderStore(providerConfig, true);
+  providerStore = await createProviderStore(providerConfig);
   providerService = createProviderService(providerStore, providerConfig, transport);
   adminStore = await createAdminStore(adminConfig);
   adminService = createAdminService(adminStore, providerService, providerConfig, transport, {

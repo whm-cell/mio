@@ -62,10 +62,16 @@ export class MaterialAuthStore {
     this.pool = pool;
   }
   async expire(id?: string): Promise<void> {
+    const match =
+      id === undefined
+        ? `id IN (SELECT id FROM mio_material_auth_sessions
+            WHERE state NOT IN ('completed','expired') AND ${pastDeadline}
+            ORDER BY expires_at,id LIMIT 100 FOR UPDATE SKIP LOCKED)`
+        : 'id=$1';
     await this.pool.query(
       `UPDATE mio_material_auth_sessions SET state='expired',${clear},lease_id=NULL,lease_until=NULL,error_code='AUTH_EXPIRED',updated_at=now()
-      WHERE id IN (SELECT id FROM mio_material_auth_sessions WHERE state NOT IN ('completed','expired') AND expires_at<=clock_timestamp() AND ($1::uuid IS NULL OR id=$1) ORDER BY expires_at,id LIMIT 100) AND state NOT IN ('completed','expired') AND expires_at<=clock_timestamp()`,
-      [id ?? null],
+      WHERE ${match} AND state NOT IN ('completed','expired') AND ${pastDeadline}`,
+      id === undefined ? [] : [id],
     );
   }
   async get(id: string, owner?: string): Promise<MaterialAuthRow> {

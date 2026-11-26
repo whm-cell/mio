@@ -12,8 +12,9 @@ CREATE TABLE IF NOT EXISTS mio_assets (
   created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL,
   staging_deleted_at timestamptz
 );
-CREATE INDEX IF NOT EXISTS mio_assets_cleanup ON mio_assets(expires_at)
+CREATE INDEX IF NOT EXISTS mio_assets_cleanup_order ON mio_assets(expires_at,id)
   WHERE staging_deleted_at IS NULL;
+DROP INDEX IF EXISTS mio_assets_cleanup;
 CREATE TABLE IF NOT EXISTS mio_asset_derivative_intents (
   asset_id uuid NOT NULL REFERENCES mio_assets(id), owner_id text NOT NULL,
   profile text NOT NULL CHECK (profile='ordinary'),

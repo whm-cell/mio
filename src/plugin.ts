@@ -422,7 +422,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     }
     if (providerConfig) {
-      const store = await createProviderStore(providerConfig, imageEnabled);
+      const store = await createProviderStore(providerConfig);
       providers = createProviderService(
         store,
         providerConfig,

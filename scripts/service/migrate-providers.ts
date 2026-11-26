@@ -36,7 +36,7 @@ try {
       const bindings = externalBindings ?? (await readConversationReferences(client));
       for (const rows of bindings)
         if (rows.length) await client.query(providerReferencesSQL, [JSON.stringify(rows)]);
-      await checkProviderSchema(client, true);
+      await checkProviderSchema(client);
       await client.query('COMMIT');
     } catch {
       await client.query('ROLLBACK');

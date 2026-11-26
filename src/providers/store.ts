@@ -55,14 +55,14 @@ export interface ModelPatch {
   name?: string | null;
   description?: string | null;
 }
-export interface RouteRevisionResult {
+interface RouteRevisionResult {
   id: string;
   rawModelId: string;
   operation: ProviderOperation;
   declarationVersion: number;
   action: RouteRevisionAction;
 }
-export interface RouteImportSummary {
+interface RouteImportSummary {
   total: number;
   inserted: number;
   updated: number;
@@ -788,10 +788,7 @@ export class ProviderStore {
     return (this.closing ??= this.pool.end());
   }
 }
-export async function createProviderStore(
-  config: ProviderConfig,
-  images = false,
-): Promise<ProviderStore> {
+export async function createProviderStore(config: ProviderConfig): Promise<ProviderStore> {
   const pool = new Pool({
     connectionString: config.databaseURL,
     max: 5,
@@ -802,7 +799,7 @@ export async function createProviderStore(
   });
   pool.on('error', () => log.error('PROVIDER_DATABASE_CONNECTION_ERROR'));
   try {
-    await checkProviderSchema(pool, images);
+    await checkProviderSchema(pool);
     return new ProviderStore(pool, config);
   } catch {
     await pool.end();

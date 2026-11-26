@@ -131,17 +131,15 @@ export function createMaterialService(
     // A database failure after a successful response is just as uncertain as a transport timeout.
     const uncertain =
       returned || (attempted && (!(error instanceof MaterialUpstreamError) || error.uncertain));
-    await store
-      .failOperation(
-        owner,
-        op,
-        uncertain,
-        !attempted && !(error instanceof MaterialError) && !(error instanceof ProviderError)
-          ? 'MATERIAL_UNAVAILABLE'
-          : errorCode(error),
-        knownCreate,
-      )
-      .catch(() => {});
+    await store.failOperation(
+      owner,
+      op,
+      uncertain,
+      !attempted && !(error instanceof MaterialError) && !(error instanceof ProviderError)
+        ? 'MATERIAL_UNAVAILABLE'
+        : errorCode(error),
+      knownCreate,
+    );
   };
   const operationResult = async (owner: string, op: OperationRow) => {
     const current = await store.operation(owner, op.id);

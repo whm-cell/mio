@@ -138,7 +138,7 @@ beforeAll(async () => {
     });
 
   auth = await createAuthentication(authConfig);
-  providerStore = await createProviderStore(providerConfig, false);
+  providerStore = await createProviderStore(providerConfig);
   providerService = createProviderService(providerStore, providerConfig);
   adminStore = await createAdminStore(adminConfig, oneLinkSsoConfig.environment);
   adminService = createAdminService(

@@ -727,7 +727,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
       // Run incremental schema migrations on top of legacy state
       await pool.query(providerSchemaSQL);
       await pool.query(generationSchemaSQL);
-      await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+      await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
       await expect(checkGenerationSchema(pool)).resolves.toBeUndefined();
 
       // Backfills matching chat verified row & legacy policy row, then drops retired tables & dead columns
@@ -824,7 +824,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         await pool.query(generationSchemaSQL);
 
         const generationDir = mkdtempSync(join(tmpdir(), 'mio-routed-multi-'));
-        const store = await createProviderStore(config, true);
+        const store = await createProviderStore(config);
         const providerService = createProviderService(store, config, async () =>
           Response.json({
             data: [{ id: 'custom-gpt-sync' }, { id: 'custom-volc-ref' }],

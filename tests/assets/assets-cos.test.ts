@@ -1147,3 +1147,60 @@ it('returns the private upload header and conditionally publishes audio from onl
     await service.close();
   }
 });
+
+it('signs only static avatar types inline for 300 seconds with the supplied private-bucket token', () => {
+  const storage = createCosStorage({ ...copyFixture, sessionToken: 'synthetic+avatar=/&%#?' });
+  for (const contentType of ['image/jpeg', 'image/png', 'image/webp']) {
+    const url = new URL(storage.avatarInlineUrl!('mio/raw/example/avatar', contentType));
+    expect(url.protocol).toBe('https:');
+    expect(url.searchParams.get('response-content-disposition')).toBe('inline');
+    expect(url.searchParams.get('response-content-type')).toBe(contentType);
+    expect(url.searchParams.get('x-cos-security-token')).toBe('synthetic+avatar=/&%#?');
+    expect(url.searchParams.get('q-signature')).toBeTruthy();
+    const [start, end] = url.searchParams.get('q-sign-time')!.split(';').map(Number);
+    expect(end! - start!).toBe(300);
+  }
+  for (const type of ['image/gif', 'image/svg+xml', 'text/html'])
+    expect(() => storage.avatarInlineUrl!('key', type)).toThrow('AVATAR_CONTENT_TYPE_INVALID');
+});
+
+it('writes normalized avatar output with private ACL and immutable content checks through the SDK', async () => {
+  const storage = createCosStorage(copyFixture);
+  const bytes = Buffer.from('fixture normalized webp');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const put = vi.spyOn(COS.prototype, 'putObject').mockResolvedValue({
+    statusCode: 200,
+    Location: 'fixture.invalid/mio/raw/avatar/output',
+    ETag: 'avatar-output-etag',
+  });
+  try {
+    await storage.putImage!(
+      'mio/raw/avatar/output',
+      bytes,
+      'webp',
+      digest,
+      new AbortController().signal,
+      'private',
+    );
+    expect(put.mock.calls[0]![0]).toMatchObject({
+      ACL: 'private',
+      ContentType: 'image/webp',
+      ContentLength: bytes.length,
+      'x-cos-meta-sha256': digest,
+      Headers: {
+        'x-cos-forbid-overwrite': 'true',
+        'Content-MD5': createHash('md5').update(bytes).digest('base64'),
+      },
+    });
+    await storage.putImage!(
+      'mio/derived/existing/image',
+      bytes,
+      'webp',
+      digest,
+      new AbortController().signal,
+    );
+    expect(put.mock.calls[1]![0].ACL).toBeUndefined();
+  } finally {
+    put.mockRestore();
+  }
+});

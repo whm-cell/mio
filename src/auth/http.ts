@@ -1,3 +1,6 @@
+import { HttpError } from '@mio/foundation/errors';
+import { isUuidV4 } from '@mio/foundation/identifiers';
+import type { ProfileRecord } from './account.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -14,6 +17,52 @@ export type AvatarAssetVerifier = (
   identity: { userId: string; sessionId: string },
   assetId: string,
 ) => Promise<AvatarAssetStatus>;
+
+export interface AvatarCallbacks {
+  avatarUrl?: (
+    identity: { userId: string; sessionId: string },
+    assetId: string,
+  ) => Promise<string | null>;
+  normalizeAvatar?: (
+    identity: { userId: string; sessionId: string },
+    sourceAssetId: string,
+  ) => Promise<{ avatarAssetId: string }>;
+}
+
+async function profileResponse(
+  profile: ProfileRecord,
+  identity: { userId: string; sessionId: string },
+  display: boolean,
+  callbacks: AvatarCallbacks,
+) {
+  const { wechatNickname, ...legacy } = profile;
+  if (!display) return legacy;
+  let avatarUrl: string | null = null;
+  if (profile.avatarAssetId) {
+    try {
+      avatarUrl = (await callbacks.avatarUrl?.(identity, profile.avatarAssetId)) ?? null;
+    } catch {
+      /* Media failures cannot block profile reads or a successful profile write. */
+    }
+  }
+  const phone = profile.phoneNumber;
+  return {
+    userId: profile.userId,
+    displayId: profile.displayId ?? profile.userId,
+    name: profile.name,
+    avatarAssetId: profile.avatarAssetId,
+    avatarUrl,
+    maskedPhoneNumber: phone
+      ? /^\+86\d{11}$/.test(phone)
+        ? `${phone.slice(0, -8)}****${phone.slice(-4)}`
+        : '****'
+      : null,
+    phoneNumberVerified: profile.phoneNumberVerified,
+    wechatBound: profile.wechatBound,
+    wechatNickname: profile.wechatBound ? (wechatNickname ?? '已绑定') : null,
+    onelinkBound: profile.onelinkBound,
+  };
+}
 
 const AUTH_BODY_LIMIT_BYTES = 16 * 1024;
 const WECHAT_BRIDGE_PARAM = 'mio_bridge';
@@ -101,15 +150,18 @@ async function handleProfileRequest(
   headers: Headers,
   auth: Authentication,
   fail: (status: number, code: string) => void,
-  verifyAvatarAsset?: AvatarAssetVerifier,
+  verifyAvatarAsset: AvatarAssetVerifier | undefined,
+  callbacks: AvatarCallbacks,
 ): Promise<void> {
+  const display =
+    new URL(request.url ?? '/', 'http://mio.invalid').searchParams.get('view') === 'display';
   if (request.method === 'GET') {
     const identity = await auth.identity(headers);
     if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
     const profile = await auth.profile(identity.userId);
     if (!profile) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
     response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
-    response.end(JSON.stringify(profile));
+    response.end(JSON.stringify(await profileResponse(profile, identity, display, callbacks)));
     return;
   }
   const body = await readJsonBody(request, AUTH_BODY_LIMIT_BYTES);
@@ -119,7 +171,9 @@ async function handleProfileRequest(
   if (!patch) return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
   if (patch.avatarAssetId) {
     if (!verifyAvatarAsset) return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
-    const assetStatus = await verifyAvatarAsset(identity, patch.avatarAssetId);
+    const assetStatus = await verifyAvatarAsset(identity, patch.avatarAssetId).catch(
+      () => 'unavailable' as const,
+    );
     if (assetStatus === 'not_found') return fail(HTTP_STATUS.NOT_FOUND, 'ASSET_NOT_FOUND');
     if (assetStatus === 'not_ready') return fail(HTTP_STATUS.CONFLICT, 'ASSET_NOT_READY');
     if (assetStatus === 'invalid_type') return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
@@ -129,12 +183,13 @@ async function handleProfileRequest(
   const updated = await auth.updateProfile(identity.userId, patch);
   if (!updated) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
   response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
-  response.end(JSON.stringify(updated));
+  response.end(JSON.stringify(await profileResponse(updated, identity, display, callbacks)));
 }
 
 function allowedMethodsFor(pathname: string, qrPoll: boolean): readonly string[] | undefined {
   if (pathname === '/api/v1/me' || qrPoll) return ['GET'];
   if (pathname === '/api/v1/me/profile') return ['GET', 'PATCH'];
+  if (pathname === '/api/v1/me/profile/avatar/normalize') return ['POST'];
   if (!pathname.startsWith(`${AUTH_BASE_PATH}/`)) return undefined;
   const method = routes.get(pathname.slice(AUTH_BASE_PATH.length));
   return method ? [method] : undefined;
@@ -146,6 +201,7 @@ export function createAuthHandler(
   auth: Authentication,
   verifyAvatarAsset?: AvatarAssetVerifier,
   getPolicy?: AuthPolicyReader,
+  avatarCallbacks: AvatarCallbacks = {},
 ) {
   const allowed = new Set(config.origins);
   const readPolicy: AuthPolicyReader =
@@ -252,7 +308,37 @@ export function createAuthHandler(
         return;
       }
       if (pathname === '/api/v1/me/profile') {
-        await handleProfileRequest(request, response, headers, auth, fail, verifyAvatarAsset);
+        await handleProfileRequest(
+          request,
+          response,
+          headers,
+          auth,
+          fail,
+          verifyAvatarAsset,
+          avatarCallbacks,
+        );
+        return;
+      }
+      if (pathname === '/api/v1/me/profile/avatar/normalize') {
+        const body = await readJsonBody(request, AUTH_BODY_LIMIT_BYTES);
+        const identity = await auth.identity(headers);
+        if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        if (
+          Object.keys(body).length !== 1 ||
+          typeof body.sourceAssetId !== 'string' ||
+          !isUuidV4(body.sourceAssetId)
+        )
+          return fail(HTTP_STATUS.BAD_REQUEST, 'INVALID_INPUT');
+        if (!avatarCallbacks.normalizeAvatar)
+          return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+        try {
+          const result = await avatarCallbacks.normalizeAvatar(identity, body.sourceAssetId);
+          response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
+          response.end(JSON.stringify(result));
+        } catch (error) {
+          if (error instanceof HttpError) return fail(error.status, error.code);
+          return fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_UNAVAILABLE');
+        }
         return;
       }
       let body =

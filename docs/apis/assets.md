@@ -14,6 +14,8 @@ AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?,
 
 [素材登记](materials.md#post-apiv1materialsgroupsidmaterials)复用本域的 ready 原件和已登记 derived 图片；不要求客户端重传已知 assetId。内部 `readMaterialSource` 使用独立 20 MiB 上限（视觉 `readVisionSource` 仍为 10 MiB，通用资产仍为 1 GiB），按 raw ETag 的 If-Match 读取并冻结 SHA-256/大小/键；`materialUrl` 重新核对归属、ready 与 raw HEAD 后签发 600 秒无 attachment 的供应商 GET。该 URL 不进入公开 AssetView、日志或永久文件身份；原上传 URL 不得覆盖 ready raw。
 
+头像读取独立于通用下载签名：认证装配仅调用 `verifyAvatar`、`avatarUrl` 和 `normalizeAvatar`。静态头像核验本人 ready 元数据及实际 HEAD 大小、类型；签名只允许 JPEG/PNG/WebP，采用私有桶 300 秒 HTTPS inline URL，不落库。GIF 转换直接在主服务 A 执行，复用 `mio_assets` 保存不可变的静态 WebP，设置 private ACL；版本化确定性资产 ID 和对象键支持重试、并发恢复与重启复用，不新增表、队列或计算任务。完成登记再次核对原件快照仍为本人 ready。转换细节及前端接口见[头像转换](auth.md#post-apiv1meprofileavatarnormalize)，不改变通用 AssetView 的 attachment 下载语义。
+
 ## POST /api/v1/assets/uploads
 
 身份：当前登录用户。

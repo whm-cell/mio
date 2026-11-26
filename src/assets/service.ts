@@ -1,3 +1,4 @@
+import { createAvatarOperations } from './avatar.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
@@ -190,6 +191,7 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
       throw new AssetError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ASSET_STORAGE_UNAVAILABLE');
     }
   };
+  const avatars = createAvatarOperations(store, objects, stop.signal);
   let cleanupCursor: { expires_at: string; id: string } | undefined;
   const clean = () => {
     if (stopping) return Promise.resolve();
@@ -225,6 +227,23 @@ export function createAssetService(store: AssetStore, objects: AssetObjectStore)
   void clean().catch(() => log.error('ASSET_CLEANUP_FAILED'));
 
   return {
+    async verifyAvatar(actor: AssetPrincipal, id: string) {
+      try {
+        return await admit(() => avatars.verifyAvatar(actor, id));
+      } catch {
+        return 'unavailable' as const;
+      }
+    },
+    async avatarUrl(actor: AssetPrincipal, id: string) {
+      try {
+        return await admit(() => avatars.avatarUrl(actor, id));
+      } catch {
+        return null;
+      }
+    },
+    normalizeAvatar(actor: AssetPrincipal, sourceId: string) {
+      return admit(() => avatars.normalizeAvatar(actor, sourceId));
+    },
     create(actor: AssetPrincipal, filename: string, contentType: string, size: number) {
       return admit(async () => {
         if (

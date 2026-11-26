@@ -33,6 +33,10 @@ export interface UserProfile {
   onelinkBound: boolean;
 }
 
+export interface ProfileRecord extends UserProfile {
+  wechatNickname?: string | null;
+}
+
 export interface UserProfilePatch {
   name?: string;
   avatarAssetId?: string | null;
@@ -54,6 +58,7 @@ interface ProfileRow {
   phoneNumberVerified: boolean | null;
   wechatBound: boolean;
   onelinkBound: boolean;
+  wechatNickname: string | null;
 }
 
 const accountSchema = {
@@ -197,6 +202,8 @@ const PROFILE_SELECT = `
          EXISTS (
            SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'wechat'
          ) AS "wechatBound",
+         (SELECT a."wechatNickname" FROM "account" a
+          WHERE a."userId"=u.id AND a."providerId"='wechat') AS "wechatNickname",
          EXISTS (
            SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'onelink'
          ) AS "onelinkBound"
@@ -204,7 +211,7 @@ const PROFILE_SELECT = `
   WHERE u.id = $1 AND COALESCE(u.disabled, false) = false
 `;
 
-function toProfile(row: ProfileRow): UserProfile {
+function toProfile(row: ProfileRow): ProfileRecord {
   return {
     userId: row.id,
     displayId: row.displayId,
@@ -213,6 +220,7 @@ function toProfile(row: ProfileRow): UserProfile {
     phoneNumber: row.phoneNumber,
     phoneNumberVerified: Boolean(row.phoneNumberVerified),
     wechatBound: Boolean(row.wechatBound),
+    wechatNickname: row.wechatNickname,
     onelinkBound: Boolean(row.onelinkBound),
   };
 }
@@ -220,13 +228,13 @@ function toProfile(row: ProfileRow): UserProfile {
 async function queryProfile(
   client: Pool | PoolClient,
   userId: string,
-): Promise<UserProfile | null> {
+): Promise<ProfileRecord | null> {
   const result = await client.query<ProfileRow>(PROFILE_SELECT, [userId]);
   const row = result.rows[0];
   return row ? toProfile(row) : null;
 }
 
-export function readUserProfile(pool: Pool, userId: string): Promise<UserProfile | null> {
+export function readUserProfile(pool: Pool, userId: string): Promise<ProfileRecord | null> {
   return queryProfile(pool, userId);
 }
 
@@ -234,7 +242,7 @@ export function updateUserProfile(
   pool: Pool,
   userId: string,
   patch: UserProfilePatch,
-): Promise<UserProfile | null> {
+): Promise<ProfileRecord | null> {
   const sets: string[] = [];
   const values: unknown[] = [userId];
   if (patch.name !== undefined) {

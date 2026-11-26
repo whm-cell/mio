@@ -381,6 +381,8 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 
 副作用：只读取当前用户资料与微信、万联绑定状态，不刷新会话或写入数据。
 
+指定 `?view=display` 时，成功回执仅为 `{userId,displayId,name,avatarAssetId,avatarUrl,maskedPhoneNumber,phoneNumberVerified,wechatBound,wechatNickname,onelinkBound}`。`displayId` 为旧账号缺失时回落到 `userId`；未绑手机时 `maskedPhoneNumber=null`，大陆号形如 `+86138****8000`，不含原始手机号；微信未绑时 `wechatNickname=null`，已绑但缺已核实展示名时为“已绑定”。微信展示名只取服务端已核验的微信授权资料，旧数据不自动回填。`avatarUrl` 为本人 ready 静态头像的 300 秒 HTTPS inline 地址；头像缺失、资产库或签名暂不可用时仍返回 200，保留 `avatarAssetId` 并返回 `avatarUrl=null`。URL 不写入认证数据库，过期后重新 GET。
+
 ## PATCH /api/v1/me/profile
 
 身份：Cookie 经数据库校验后的未禁用可信身份；读取正文后重新核对身份。
@@ -392,3 +394,19 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 错误：字段非法或头像资产非 `image/jpeg`、`image/png`、`image/webp` 返回 400 `INVALID_INPUT`；未登录或账号已禁用返回 401 `UNAUTHORIZED`；头像资产不存在或不属于当前用户返回 404 `ASSET_NOT_FOUND`；头像资产非 `ready` 返回 409 `ASSET_NOT_READY`；资产服务未装配或不可用时设置非空头像返回 503 `ASSET_UNAVAILABLE`；正文与来源错误沿共同约定。
 
 副作用：设置非空 `avatarAssetId` 前经装配注入的资产服务核验归属、就绪状态与图片 MIME；在单事务内更新当前未禁用用户的对应字段与 `updatedAt`，不修改 `displayId` 或登录凭据。
+
+`?view=display` 同 GET 的精确展示字段。仅改昵称、清空头像，以及资料已成功写入后的 URL 签发阶段遇到媒体故障仍返回 200；保存原有资产 ID，仅把 `avatarUrl` 降级为 null。绑定非空资产 ID 必须核验本人归属、ready、实际 HEAD 大小（1 字节至资产域上限 1 GiB；20 MiB 仅限制 GIF 转换输入）、登记与 HEAD 的 JPEG/PNG/WebP 类型一致；404 表示他人或不存在，409 表示未就绪或大小冲突，400 表示类型或大小不合法，核验不可用返回 503 `ASSET_UNAVAILABLE`。默认响应和服务端昵称 1–50 个 Unicode 字符的规则不变；只改头像时不截断历史长昵称。
+
+## POST /api/v1/me/profile/avatar/normalize
+
+身份：仅接受当前有效 Cookie 会话；读取正文后核验身份。
+
+输入：要求允许的精确 Origin、`application/json`，正文上限 16 KiB、10 秒。严格对象 `{sourceAssetId}`，值须为 UUID v4，不接受 owner 或其他字段。
+
+成功：200 `{avatarAssetId}`。原件必须属于本人、ready、登记和实际 HEAD 均为 GIF，实际大小与登记相等且不超过 20 MiB（含恰好 20 MiB）。按 HEAD ETag 的 If-Match 有界读取，核对实际字节数和 GIF 格式；在主服务 A 仅解码首帧（`pages:1`），单帧最多 16,000,000 像素、单边最多 8192，输出最大 512×512、2 MiB 的静态 WebP。随后用返回的 ID 调用资料 PATCH；转换本身不改用户资料。
+
+同一源资产用版本化的确定性 ID 和不可覆盖的私有对象键复用结果；竞争或上传回执丢失时复核输出 HEAD 的大小、SHA-256、类型和 ETag，再幂等登记 ready 资产。重试和重启保留同一转换结果；已保存的 URL 仍按每次 GET/PATCH 签发。一次只允许一个进程内转换，无等待队列，打满快速返回 503 `ASSET_BUSY`；正常资料读取可继续执行。原件只沿既有 staging 清理规则处理，U6 暂存与共享物理 GC 不在本单元实施。
+
+副作用：向私有桶写入不可覆盖的静态 WebP 并幂等登记 ready 资产；不改用户资料，资料 PATCH 由调用方另行完成。
+
+错误：400 `INVALID_INPUT`/`ASSET_INPUT_INVALID`（包含格式、像素、尺寸或解码失败）；401 `UNAUTHORIZED`；403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`；404 `ASSET_NOT_FOUND`；409 `ASSET_NOT_READY`/`ASSET_SIZE_MISMATCH`/`ASSET_SOURCE_CHANGED`；503 `ASSET_BUSY`/`ASSET_UNAVAILABLE`/`ASSET_STORAGE_UNAVAILABLE`。正文和方法错误沿认证共同约定。无 RabbitMQ、计算 Worker、自动重试或外部供应商调用。

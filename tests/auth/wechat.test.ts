@@ -23,7 +23,7 @@ const servers: ReturnType<typeof createServer>[] = [];
 const auths: Awaited<ReturnType<typeof createAuthentication>>[] = [];
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
-let fixtures = new Map<string, { openid: string; unionid?: string }>();
+let fixtures = new Map<string, { openid: string; unionid?: string; nickname?: string | null }>();
 let exchanges = 0;
 let holdExchange: Promise<void> | undefined;
 let exchangeStarted: (() => void) | undefined;
@@ -147,7 +147,7 @@ beforeAll(async () => {
       if (!fixture) return Response.json({ errcode: 40001 });
       return Response.json({
         ...fixture,
-        nickname: '微信用户',
+        nickname: fixture.nickname === undefined ? '微信用户' : fixture.nickname,
         headimgurl: 'https://image.example.test/avatar',
       });
     }
@@ -1254,4 +1254,44 @@ it('distinguishes __Secure-mio.state under HTTPS iframe bridge and rejects disab
       await auth.close();
     }
   }
+});
+
+it('refreshes the trusted account nickname on login and link, preserving user edits and identities', async () => {
+  fixtures.set('nickname-first', { openid: 'nickname-owner', nickname: '微信名一' });
+  const first = await callback(await start('/sign-in/social'), 'nickname-first');
+  expect(first.status).toBe(302);
+  const owner = await identity(cookies(first));
+  expect(
+    (await pool.query('SELECT "wechatNickname" FROM "account" WHERE "userId"=$1', [owner.userId]))
+      .rows[0].wechatNickname,
+  ).toBe('微信名一');
+  await pool.query('UPDATE "user" SET name=$2 WHERE id=$1', [owner.userId, '自选昵称']);
+  fixtures.set('nickname-next', { openid: 'nickname-owner', nickname: '微信名二' });
+  const next = await callback(await start('/sign-in/social'), 'nickname-next');
+  expect(next.status).toBe(302);
+  expect((await identity(cookies(next))).userId).toBe(owner.userId);
+  expect(await auths[0]!.profile(owner.userId)).toMatchObject({
+    name: '自选昵称',
+    wechatNickname: '微信名二',
+  });
+  fixtures.set('nickname-missing', { openid: 'nickname-owner', nickname: null });
+  const missing = await callback(await start('/sign-in/social'), 'nickname-missing');
+  expect(missing.status).toBe(302);
+  expect(
+    await (await call('/api/v1/me/profile?view=display', { cookie: cookies(missing) })).json(),
+  ).toMatchObject({ name: '自选昵称', wechatNickname: '已绑定' });
+  const localCookie = await emailUser(),
+    local = await identity(localCookie);
+  fixtures.set('nickname-link', { openid: 'nickname-link-owner', nickname: '绑定微信名' });
+  const linked = await callback(
+    await start('/link-social', localCookie),
+    'nickname-link',
+    localCookie,
+  );
+  expect(linked.status).toBe(302);
+  expect(await auths[0]!.profile(local.userId)).toMatchObject({
+    name: 'Owner',
+    wechatNickname: '绑定微信名',
+  });
+  expect((await identity(localCookie)).userId).toBe(local.userId);
 });

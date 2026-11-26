@@ -13,6 +13,9 @@ import type { WechatConfig } from '../integrations/wechat.ts';
 import type { Pool } from 'pg';
 import { admitWechatQR, finishWechatQR } from './wechat-qr-store.ts';
 
+// Populated only after the verified provider profile and original binding session pass validation.
+const verifiedProfiles = new WeakMap<Request, { nickname: string | null }>();
+
 const MAX_BINDING_AGE = 10 * 60_000;
 const STATE_RESERVATION_AGE = 15 * 60_000;
 
@@ -39,7 +42,9 @@ export function wechatPlugin(
     id: 'mio-wechat',
     schema: {
       account: {
-        fields: {},
+        fields: {
+          wechatNickname: { type: 'string', required: false, input: false, returned: false },
+        },
         indexes: [
           { fields: ['providerId', 'accountId'], unique: true },
           { fields: ['userId', 'providerId'], unique: true },
@@ -47,12 +52,31 @@ export function wechatPlugin(
       },
     },
     init(context) {
-      if (!config) return;
-      const client = createWechatClient(config, domain);
+      const client = config && createWechatClient(config, domain);
       return {
+        options: {
+          databaseHooks: {
+            account: {
+              create: {
+                async before(account, ctx) {
+                  const profile = ctx?.request && verifiedProfiles.get(ctx.request);
+                  if (account.providerId === 'wechat' && profile)
+                    return { data: { ...account, wechatNickname: profile.nickname } };
+                },
+              },
+              update: {
+                async before(account, ctx) {
+                  const profile = ctx?.request && verifiedProfiles.get(ctx.request);
+                  if (account.providerId === 'wechat' && profile)
+                    return { data: { ...account, wechatNickname: profile.nickname } };
+                },
+              },
+            },
+          },
+        },
         context: {
           socialProviders: context.socialProviders.map((provider) =>
-            provider.id !== 'wechat'
+            provider.id !== 'wechat' || !client || !config
               ? provider
               : {
                   ...provider,
@@ -141,7 +165,17 @@ export const validateWechatUser: ValidateUser = async ({ user, source }, ctx) =>
   if (source.method !== 'oauth' || source.oauth?.providerId !== 'wechat') return;
   const state = await getOAuthState();
   if (!state) return { error: 'STATE_MISMATCH' };
-  if (!state.link) return;
+  const rememberProfile = () => {
+    if (!ctx.request) return;
+    const profile = source.oauth?.profile as { nickname?: unknown } | undefined;
+    const value = profile?.nickname;
+    const nickname =
+      typeof value === 'string' && value.trim() && !/[\u0000-\u001f\u007f]/.test(value)
+        ? value.trim()
+        : null;
+    verifiedProfiles.set(ctx.request, { nickname });
+  };
+  if (!state.link) return rememberProfile();
   const binding = state.serverContext?.mioWechatBinding;
   if (!binding || typeof binding !== 'object' || Array.isArray(binding))
     return { error: 'SESSION_REQUIRED' };
@@ -156,4 +190,5 @@ export const validateWechatUser: ValidateUser = async ({ user, source }, ctx) =>
     epochMs() - new Date(current.session.createdAt).getTime() >= MAX_BINDING_AGE
   )
     return { error: 'SESSION_REQUIRED' };
+  rememberProfile();
 };

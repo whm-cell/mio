@@ -175,6 +175,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     sha256: string,
     signal: AbortSignal,
     label: 'AUDIO' | 'IMAGE',
+    acl?: 'private',
   ) => {
     signal.throwIfAborted();
     const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -188,7 +189,7 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       ContentLength: body.length,
       ContentType: contentType,
       'x-cos-meta-sha256': sha256,
-      ...(label === 'AUDIO' ? { ACL: 'private' } : {}),
+      ...(label === 'AUDIO' || acl ? { ACL: 'private' } : {}),
       Headers: {
         'x-cos-forbid-overwrite': 'true',
         'Content-MD5': createHash('md5').update(body).digest('base64'),
@@ -261,6 +262,11 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         }),
       );
     },
+    avatarInlineUrl(Key, contentType) {
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType))
+        throw new Error('AVATAR_CONTENT_TYPE_INVALID');
+      return inlinePlaybackUrl(Key, contentType);
+    },
     audioPlaybackUrl: inlinePlaybackUrl,
     hlsSegmentUrl(Key, expiresIn) {
       return inlinePlaybackUrl(Key, 'video/mp2t', expiresIn);
@@ -278,9 +284,9 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       return readObject(Key, etag, length, signal, size);
     },
     readAudio: readObject,
-    putImage(Key, bytes, format, sha256, signal) {
+    putImage(Key, bytes, format, sha256, signal, acl) {
       if (!['png', 'jpeg', 'webp'].includes(format)) throw new Error('IMAGE_OUTPUT_INVALID');
-      return putObject(Key, bytes, 'image/' + format, sha256, signal, 'IMAGE');
+      return putObject(Key, bytes, 'image/' + format, sha256, signal, 'IMAGE', acl);
     },
     putAudio(Key, bytes, format, sha256, signal) {
       if (!['mp3', 'wav', 'flac'].includes(format)) throw new Error('AUDIO_OUTPUT_INVALID');

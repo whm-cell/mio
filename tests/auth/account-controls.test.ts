@@ -1,3 +1,4 @@
+import COS from 'cos-nodejs-sdk-v5';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -615,6 +616,11 @@ it('reads and updates /api/v1/me/profile with strict input and avatar asset vali
 });
 
 it('migrates an existing populated auth user table cleanly and wires /api/v1/me/profile in plugin', async () => {
+  const avatarHead = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
+    statusCode: 200,
+    ETag: 'fixture-avatar',
+    headers: { 'content-length': '1024', 'content-type': 'image/png' },
+  });
   const upgradeDb = await authDatabase();
   const upgradePool = new Pool({ connectionString: upgradeDb.url });
   let ctx: Context | undefined;
@@ -718,6 +724,16 @@ it('migrates an existing populated auth user table cleanly and wires /api/v1/me/
       body: JSON.stringify({ avatarAssetId: randomUUID() }),
     });
     expect(avatarNoAssets.status).toBe(503);
+    const normalizeNoAssets = await originalFetch(
+      `${pluginOrigin}/api/v1/me/profile/avatar/normalize`,
+      {
+        method: 'POST',
+        headers: { origin: pluginOrigin, cookie: pluginCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ sourceAssetId: randomUUID() }),
+      },
+    );
+    expect(normalizeNoAssets.status).toBe(503);
+    expect((await normalizeNoAssets.json()).error.code).toBe('ASSET_UNAVAILABLE');
 
     // 4. Reload plugin with assets enabled and exercise the real plugin verifyAvatarAsset wiring.
     await mounted.dispose();
@@ -775,11 +791,56 @@ it('migrates an existing populated auth user table cleanly and wires /api/v1/me/
     const savedAvatar = await patchAvatar(readyImg);
     expect(savedAvatar.status).toBe(200);
     expect(await savedAvatar.json()).toMatchObject({ avatarAssetId: readyImg });
+
+    // The pre-U1 default binding contract accepts static assets above the GIF conversion cap.
+    const largeImage = randomUUID(),
+      largeSize = 21 * 1024 * 1024;
+    const largeKey = `mio/raw/${largeImage}/${randomUUID()}`;
+    await upgradePool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,state,staging_key,raw_key,expires_at)
+       VALUES($1,$2,'large.png','image/png',$3,'ready',$4,$5,now()+interval '1 day')`,
+      [largeImage, profile.userId, largeSize, `mio/staging/${largeImage}`, largeKey],
+    );
+    avatarHead.mockResolvedValue({
+      statusCode: 200,
+      ETag: 'large-static-avatar',
+      headers: { 'content-length': String(largeSize), 'content-type': 'image/png' },
+    });
+    const savedLarge = await patchAvatar(largeImage);
+    expect(savedLarge.status).toBe(200);
+    const legacyLarge = await savedLarge.json();
+    expect(legacyLarge.avatarAssetId).toBe(largeImage);
+    expect(Object.keys(legacyLarge).sort()).toEqual(
+      [
+        'userId',
+        'displayId',
+        'name',
+        'avatarAssetId',
+        'phoneNumber',
+        'phoneNumberVerified',
+        'wechatBound',
+        'onelinkBound',
+      ].sort(),
+    );
+    const displayedLarge = await originalFetch(`${pluginOrigin}/api/v1/me/profile?view=display`, {
+      headers: { origin: pluginOrigin, cookie: pluginCookie },
+    });
+    expect(displayedLarge.status).toBe(200);
+    const displayed = await displayedLarge.json();
+    expect(displayed.avatarAssetId).toBe(largeImage);
+    expect(new URL(displayed.avatarUrl).pathname).toBe('/' + largeKey);
+    avatarHead.mockResolvedValueOnce({
+      statusCode: 200,
+      ETag: 'large-static-avatar',
+      headers: { 'content-length': String(largeSize - 1), 'content-type': 'image/png' },
+    });
+    expect((await patchAvatar(largeImage)).status).toBe(409);
   } finally {
     vi.unstubAllEnvs();
     if (ctx) await ctx.fiber.dispose();
     await upgradePool.end();
     await upgradeDb.close();
+    avatarHead.mockRestore();
   }
 }, 30_000);
 

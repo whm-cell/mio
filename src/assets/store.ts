@@ -143,6 +143,38 @@ export class AssetStore {
     if (!result.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
   }
 
+  /** Publish the immutable first-frame result only while the same owned original remains ready. */
+  async publishAvatar(
+    source: AssetRow,
+    output: { assetId: string; key: string; filename: string; sizeBytes: number; etag: string },
+  ): Promise<void> {
+    const result = await this.pool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
+       SELECT $1,s.owner_id,$3,'image/webp',$4,$2,$2,'ready',$5,now(),now() FROM mio_assets s
+       WHERE s.id=$6 AND s.owner_id=$7 AND s.state='ready' AND s.raw_key=$8
+         AND s.size_bytes=$9 AND s.content_type=$10 AND s.source_etag IS NOT DISTINCT FROM $11
+       ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id
+       WHERE mio_assets.owner_id=EXCLUDED.owner_id AND mio_assets.state='ready'
+         AND mio_assets.raw_key=EXCLUDED.raw_key AND mio_assets.source_etag=EXCLUDED.source_etag
+         AND mio_assets.size_bytes=EXCLUDED.size_bytes AND mio_assets.content_type=EXCLUDED.content_type
+         AND mio_assets.filename=EXCLUDED.filename`,
+      [
+        output.assetId,
+        output.key,
+        output.filename,
+        output.sizeBytes,
+        output.etag,
+        source.id,
+        source.owner_id,
+        source.raw_key,
+        source.size_bytes,
+        source.content_type,
+        source.source_etag,
+      ],
+    );
+    if (!result.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+  }
+
   async claim(id: string, owner: string, etag: string, lease: string): Promise<AssetRow | null> {
     return (
       (

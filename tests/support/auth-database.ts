@@ -6,6 +6,18 @@ import { createServer } from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 
+export async function authTableIndexes(pool: Pool, schema: string, table: string) {
+  const { rows } = await pool.query<{ indexdef: string }>(
+    'SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2',
+    [schema, table],
+  );
+  return {
+    unique: (column: string) =>
+      rows.some(({ indexdef }) => indexdef.includes(column) && indexdef.includes('UNIQUE')),
+    has: (column: string) => rows.some(({ indexdef }) => indexdef.includes(column)),
+  };
+}
+
 /** Dedicated test DB only. Each run owns one schema; local mode owns and removes the entire cluster. */
 export async function authDatabase() {
   let directory: string | undefined;

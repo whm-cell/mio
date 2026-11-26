@@ -7,12 +7,12 @@ import type { AccountOperationSmsPurpose, PhoneLimits } from './phone-budget.ts'
 import type { SmsBudgetTables } from './phone-budget-schema.ts';
 import { withAuthTransaction } from './transaction.ts';
 
-export type PhonePurpose = 'login' | 'bind' | AccountOperationSmsPurpose;
+type PhonePurpose = 'login' | 'bind' | AccountOperationSmsPurpose;
 export interface BindingIdentity {
   userId: string;
   sessionId: string;
 }
-export interface OneLinkExistingChallengeScope {
+interface OneLinkExistingChallengeScope {
   readonly pendingId: string;
   readonly candidateToken: string;
 }

@@ -108,7 +108,7 @@ async function invalidateLoginCallbacks(
   );
 }
 
-export interface AvailableLoginMethods {
+interface AvailableLoginMethods {
   sms: boolean;
   emailPassword: boolean;
   wechat: boolean;

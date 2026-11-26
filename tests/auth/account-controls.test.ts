@@ -15,7 +15,6 @@ import { hashAdminPassword } from '../../src/auth/admin-password.ts';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import type { AuthRuntimePolicy } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
-import type { AvatarAssetStatus } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
@@ -34,7 +33,11 @@ const auths: Awaited<ReturnType<typeof createAuthentication>>[] = [];
 const origins: string[] = [];
 const delivered = new Map<string, string>();
 const wechatFixtures = new Map<string, { openid: string }>();
-const avatarRegistry = new Map<string, { ownerId: string; status: AvatarAssetStatus }>();
+type AvatarAssetVerifier = NonNullable<Parameters<typeof createAuthHandler>[2]>;
+const avatarRegistry = new Map<
+  string,
+  { ownerId: string; status: Awaited<ReturnType<AvatarAssetVerifier>> }
+>();
 
 const sender = async (phone: string, code: string) => {
   delivered.set(phone, code);
@@ -192,12 +195,9 @@ beforeAll(async () => {
     })!;
     const auth = await createAuthentication(config, undefined, sender);
     auths.push(auth);
-    const verifier =
+    const verifier: AvatarAssetVerifier | undefined =
       index === 0
-        ? async (
-            identity: { userId: string; sessionId: string },
-            assetId: string,
-          ): Promise<AvatarAssetStatus> => {
+        ? async (identity, assetId) => {
             const item = avatarRegistry.get(assetId);
             if (!item || item.ownerId !== identity.userId) return 'not_found';
             return item.status;
@@ -1363,16 +1363,20 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
     expect(bypassAfterRestart.status).toBe(200);
 
     // 3. Without MIO_ADMIN_ENABLED, auth falls back to MIO_AUTH_EMAIL_PASSWORD_ENABLED and smsMode='live'
-    await mounted.dispose();
-    setPluginEnv({
-      MIO_ADMIN_ENABLED: 'false',
-      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
-      MIO_PROVIDERS_DATABASE_URL: undefined,
-      MIO_PROVIDERS_MASTER_KEY: undefined,
-      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
-    });
-    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
-    await mounted;
+    const context = ctx;
+    const restartWithoutAdmin = async (emailPasswordEnabled: 'true' | 'false') => {
+      await mounted.dispose();
+      setPluginEnv({
+        MIO_ADMIN_ENABLED: 'false',
+        MIO_AUTH_EMAIL_PASSWORD_ENABLED: emailPasswordEnabled,
+        MIO_PROVIDERS_DATABASE_URL: undefined,
+        MIO_PROVIDERS_MASTER_KEY: undefined,
+        MIO_PROVIDERS_MASTER_KEY_ID: undefined,
+      });
+      mounted = context.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+      await mounted;
+    };
+    await restartWithoutAdmin('false');
 
     expect(
       (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,
@@ -1386,16 +1390,7 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
       ).status,
     ).toBe(503);
 
-    await mounted.dispose();
-    setPluginEnv({
-      MIO_ADMIN_ENABLED: 'false',
-      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true',
-      MIO_PROVIDERS_DATABASE_URL: undefined,
-      MIO_PROVIDERS_MASTER_KEY: undefined,
-      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
-    });
-    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
-    await mounted;
+    await restartWithoutAdmin('true');
 
     expect(
       (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,

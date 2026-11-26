@@ -1,4 +1,3 @@
-import { sha256Utf8 } from '@mio/foundation/hash';
 import { epochMs, monotonicMs } from '@mio/foundation/time';
 
 export interface WechatConfig {
@@ -75,7 +74,7 @@ export function wechatAccountId(appId: string, openid: string) {
 }
 
 /** Reuses the provider's authorization URL and account/session flow, replacing only its I/O. */
-export function createWechatClient(config: WechatConfig, placeholderDomain: string) {
+export function createWechatClient(config: WechatConfig) {
   return {
     async exchangeCode(code: string): Promise<WechatTokens> {
       if (!present(code)) throw new Error('WECHAT_UNAVAILABLE');
@@ -111,13 +110,8 @@ export function createWechatClient(config: WechatConfig, placeholderDomain: stri
         lang: 'zh_CN',
       });
       if (data.openid !== tokens.openid) throw new Error('WECHAT_UNAVAILABLE');
-      const id = wechatAccountId(config.appId, tokens.openid);
-      const hash = sha256Utf8(id).slice(0, 56);
       return {
         user: {
-          name: typeof data.nickname === 'string' ? data.nickname : '微信用户',
-          email: `wechat-${hash}@${placeholderDomain}`,
-          emailVerified: false,
           ...(typeof data.headimgurl === 'string' ? { image: data.headimgurl } : {}),
         },
         data,

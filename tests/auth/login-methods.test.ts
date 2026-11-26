@@ -50,6 +50,20 @@ async function checked(response: Response, status = 200) {
   expect(response.status, await response.clone().text()).toBe(status);
   return response;
 }
+async function waitForBlockedSession(blockerPid: number) {
+  await expect
+    .poll(
+      async () =>
+        (
+          await pool.query(
+            `SELECT 1 FROM pg_stat_activity
+             WHERE datname=current_database() AND wait_event_type='Lock' AND $1::int=ANY(pg_blocking_pids(pid))`,
+            [blockerPid],
+          )
+        ).rowCount,
+    )
+    .toBe(1);
+}
 async function me(session: string) {
   return (await (await checked(await call('/api/v1/me', { cookie: session }))).json()) as {
     userId: string;
@@ -689,18 +703,7 @@ it.each([
       const blockerPid = (await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
         .rows[0]!.pid;
       pendingRequest = startRequest();
-      await expect
-        .poll(
-          async () =>
-            (
-              await pool.query(
-                `SELECT 1 FROM pg_stat_activity
-      WHERE datname=current_database() AND wait_event_type='Lock' AND $1::int=ANY(pg_blocking_pids(pid))`,
-                [blockerPid],
-              )
-            ).rowCount,
-        )
-        .toBe(1);
+      await waitForBlockedSession(blockerPid);
       expect(
         (
           await pool.query('SELECT 1 FROM "account" WHERE "userId"=$1 AND "providerId"=$2', [
@@ -964,18 +967,7 @@ it.each(['success', 'session_failure', 'proof_failure'] as const)(
         body: { action: 'link_existing', candidateToken: qr.candidateToken, phoneNumber, code },
         cookie: qr.pendingCookie,
       });
-      await expect
-        .poll(
-          async () =>
-            (
-              await pool.query(
-                `SELECT 1 FROM pg_stat_activity
-        WHERE datname=current_database() AND wait_event_type='Lock' AND $1::int=ANY(pg_blocking_pids(pid))`,
-                [pid],
-              )
-            ).rowCount,
-        )
-        .toBe(1);
+      await waitForBlockedSession(pid);
       expect((await pool.query('SELECT status FROM "mioWechatPending"')).rows[0]!.status).toBe(
         'completed',
       );

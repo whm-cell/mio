@@ -31,7 +31,7 @@ export const wechatPendingSchema = {
   },
 } as const;
 
-export interface WechatCredentials {
+interface WechatCredentials {
   accountId: string;
   nickname: string | null;
   image: string | null;
@@ -41,7 +41,7 @@ export interface WechatCredentials {
   scope: string;
 }
 
-export interface WechatPending extends WechatCredentials {
+interface WechatPending extends WechatCredentials {
   id: string;
   tokenDigest: string;
   candidateToken: string;

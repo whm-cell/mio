@@ -6,13 +6,14 @@ import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
+import type { AuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import type { Authentication } from '../../src/auth/service.ts';
 import { pollWechatQR } from '../../src/auth/wechat-qr-store.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
-import { authDatabase } from '../support/auth-database.ts';
+import { authDatabase, authTableIndexes } from '../support/auth-database.ts';
 
 const secret = randomBytes(40).toString('hex');
 const password = 'correct-horse-wechat-test-19';
@@ -55,6 +56,58 @@ function call(
     },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
   });
+}
+
+async function withLegacyAuthSchema(
+  prefix: string,
+  run: (config: AuthConfig, oldPool: Pool, schema: string) => Promise<void>,
+) {
+  const schema = `${prefix}_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE SCHEMA "${schema}"`);
+  const scoped = new URL(database.url);
+  scoped.searchParams.set('options', `-csearch_path=${schema}`);
+  const oldPool = new Pool({ connectionString: scoped.toString() });
+  try {
+    const config = readAuthConfig({
+      MIO_AUTH_BASE_URL: origins[0],
+      MIO_AUTH_SECRET: secret,
+      MIO_AUTH_DATABASE_URL: scoped.toString(),
+    })!;
+    await run(config, oldPool, schema);
+  } finally {
+    await oldPool.end();
+    await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+  }
+}
+
+async function withWechatServer(
+  enabled: boolean,
+  run: (config: AuthConfig, origin: string) => Promise<void>,
+) {
+  const config = readAuthConfig({
+    MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
+    MIO_AUTH_SECRET: secret,
+    MIO_AUTH_DATABASE_URL: database.url,
+    ...(enabled
+      ? {
+          MIO_AUTH_WECHAT_ENABLED: 'true',
+          MIO_AUTH_WECHAT_APP_ID: appId,
+          MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
+        }
+      : {}),
+  })!;
+  const auth = await createAuthentication(config);
+  const server = createServer(createAuthHandler(config, auth));
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    await run(config, `http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await auth.close();
+  }
 }
 
 async function emailUser() {
@@ -472,17 +525,7 @@ it('rejects a configured AppID change when existing WeChat accounts use another 
 });
 
 it('adds both unique indexes idempotently and refuses existing conflicting accounts', async () => {
-  const schema = `mio_wechat_old_${randomUUID().replaceAll('-', '')}`;
-  await pool.query(`CREATE SCHEMA "${schema}"`);
-  const scoped = new URL(database.url);
-  scoped.searchParams.set('options', `-csearch_path=${schema}`);
-  const oldPool = new Pool({ connectionString: scoped.toString() });
-  try {
-    const config = readAuthConfig({
-      MIO_AUTH_BASE_URL: origins[0],
-      MIO_AUTH_SECRET: secret,
-      MIO_AUTH_DATABASE_URL: scoped.toString(),
-    })!;
+  await withLegacyAuthSchema('mio_wechat_old', async (config, oldPool) => {
     const oldOptions = authOptions(config, oldPool);
     oldOptions.plugins = oldOptions.plugins?.filter((plugin) => plugin.id !== 'mio-wechat');
     await (await getMigrations(oldOptions)).runMigrations();
@@ -528,10 +571,7 @@ it('adds both unique indexes idempotently and refuses existing conflicting accou
     await oldPool.query(`DELETE FROM "account" WHERE id='credential-duplicate'`);
     await (await getMigrations(authOptions(config, oldPool))).runMigrations();
     expect((await getMigrations(authOptions(config, oldPool))).toBeAddedIndexes).toHaveLength(0);
-  } finally {
-    await oldPool.end();
-    await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
-  }
+  });
 });
 
 async function startQR(cookie?: string) {
@@ -853,17 +893,7 @@ it('keeps the QR HTTP boundary precise and validates input before creating OAuth
 });
 
 it('requires explicit QR schema migration and includes its indexes idempotently', async () => {
-  const schema = `mio_qr_old_${randomUUID().replaceAll('-', '')}`;
-  await pool.query(`CREATE SCHEMA "${schema}"`);
-  const scoped = new URL(database.url);
-  scoped.searchParams.set('options', `-csearch_path=${schema}`);
-  const oldPool = new Pool({ connectionString: scoped.toString() });
-  try {
-    const config = readAuthConfig({
-      MIO_AUTH_BASE_URL: origins[0],
-      MIO_AUTH_SECRET: secret,
-      MIO_AUTH_DATABASE_URL: scoped.toString(),
-    })!;
+  await withLegacyAuthSchema('mio_qr_old', async (config, oldPool, schema) => {
     const old = authOptions(config, oldPool);
     old.plugins = old.plugins?.filter((plugin) => plugin.id !== 'mio-wechat-qr');
     await (await getMigrations(old)).runMigrations();
@@ -876,21 +906,11 @@ it('requires explicit QR schema migration and includes its indexes idempotently'
     expect(current.toBeAddedIndexes).toHaveLength(0);
     const enabled = await createAuthentication(config);
     await enabled.close();
-    const indexes = await oldPool.query(
-      `SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename='mioWechatQR'`,
-      [schema],
-    );
-    expect(
-      indexes.rows.some(
-        (row) => row.indexdef.includes('stateHash') && row.indexdef.includes('UNIQUE'),
-      ),
-    ).toBe(true);
-    expect(indexes.rows.some((row) => row.indexdef.includes('expiresAt'))).toBe(true);
-    expect(indexes.rows.some((row) => row.indexdef.includes('status'))).toBe(true);
-  } finally {
-    await oldPool.end();
-    await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
-  }
+    const indexes = await authTableIndexes(oldPool, schema, 'mioWechatQR');
+    expect(indexes.unique('stateHash')).toBe(true);
+    expect(indexes.has('expiresAt')).toBe(true);
+    expect(indexes.has('status')).toBe(true);
+  });
 });
 
 it('signs in an existing WeChat user through QR without changing identity or merging a matching email', async () => {
@@ -980,26 +1000,7 @@ it('applies login transaction timeouts and rolls back an unsuccessful QR claim',
 
 it('uses Secure QR cookies under HTTPS and rejects both QR routes while WeChat is disabled', async () => {
   for (const enabled of [true, false]) {
-    const config = readAuthConfig({
-      MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
-      MIO_AUTH_SECRET: secret,
-      MIO_AUTH_DATABASE_URL: database.url,
-      ...(enabled
-        ? {
-            MIO_AUTH_WECHAT_ENABLED: 'true',
-            MIO_AUTH_WECHAT_APP_ID: appId,
-            MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
-          }
-        : {}),
-    })!;
-    const auth = await createAuthentication(config);
-    const server = createServer(createAuthHandler(config, auth));
-    try {
-      server.listen(0, '127.0.0.1');
-      await once(server, 'listening');
-      const address = server.address();
-      if (!address || typeof address === 'string') throw new Error('missing address');
-      const origin = `http://127.0.0.1:${address.port}`;
+    await withWechatServer(enabled, async (config, origin) => {
       const response = await originalFetch(`${origin}/api/auth/wechat/qr-session`, {
         method: 'POST',
         headers: { origin: config.baseURL, 'content-type': 'application/json' },
@@ -1019,10 +1020,7 @@ it('uses Secure QR cookies under HTTPS and rejects both QR routes while WeChat i
           (await originalFetch(`${origin}/api/auth/wechat/qr-session/${randomUUID()}/poll`)).status,
         ).toBe(503);
       }
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await auth.close();
-    }
+    });
   }
 });
 
@@ -1225,26 +1223,7 @@ it('prevents iframe bridge loops, enforces non-iframe and cookie guards, and str
 
 it('distinguishes __Secure-mio.state under HTTPS iframe bridge and rejects disabled WeChat with 503', async () => {
   for (const enabled of [true, false]) {
-    const config = readAuthConfig({
-      MIO_AUTH_BASE_URL: enabled ? 'https://mio-qr.example.test' : origins[0],
-      MIO_AUTH_SECRET: secret,
-      MIO_AUTH_DATABASE_URL: database.url,
-      ...(enabled
-        ? {
-            MIO_AUTH_WECHAT_ENABLED: 'true',
-            MIO_AUTH_WECHAT_APP_ID: appId,
-            MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
-          }
-        : {}),
-    })!;
-    const auth = await createAuthentication(config);
-    const server = createServer(createAuthHandler(config, auth));
-    try {
-      server.listen(0, '127.0.0.1');
-      await once(server, 'listening');
-      const address = server.address();
-      if (!address || typeof address === 'string') throw new Error('missing address');
-      const origin = `http://127.0.0.1:${address.port}`;
+    await withWechatServer(enabled, async (config, origin) => {
       if (enabled) {
         const created = await originalFetch(`${origin}/api/auth/wechat/qr-session`, {
           method: 'POST',
@@ -1298,10 +1277,7 @@ it('distinguishes __Secure-mio.state under HTTPS iframe bridge and rejects disab
         expect(disabled.status).toBe(503);
         expect(await disabled.text()).toContain('WECHAT_UNAVAILABLE');
       }
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await auth.close();
-    }
+    });
   }
 });
 

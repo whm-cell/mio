@@ -52,12 +52,8 @@ async function originalBinding(
 }
 
 /** Library-owned authorization state, with explicit app-owned final account transactions. */
-export function wechatPlugin(
-  config: WechatConfig | undefined,
-  domain: string,
-  pool: Pool,
-): BetterAuthPlugin {
-  const client = config && createWechatClient(config, domain);
+export function wechatPlugin(config: WechatConfig | undefined, pool: Pool): BetterAuthPlugin {
+  const client = config && createWechatClient(config);
   return {
     id: 'mio-wechat',
     schema: {

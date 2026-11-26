@@ -9,6 +9,7 @@ import {
   lockLoginIdentity,
   loginCallbackIsCurrent,
 } from './login-methods.ts';
+import type { LoginUser } from './login-methods.ts';
 
 export const oneLinkPendingSchema = {
   mioOneLinkPending: {
@@ -30,10 +31,9 @@ export const oneLinkPendingSchema = {
 } as const;
 
 export type OneLinkPendingIntent = 'login' | 'bind';
-export type OneLinkPendingStatus =
-  'started' | 'candidate_ready' | 'completed' | 'rejected' | 'cancelled';
+type OneLinkPendingStatus = 'started' | 'candidate_ready' | 'completed' | 'rejected' | 'cancelled';
 
-export interface CreateOneLinkPendingInput {
+interface CreateOneLinkPendingInput {
   readonly tokenDigest: string;
   readonly intent: OneLinkPendingIntent;
   readonly initiatorUserId: string | null;
@@ -41,7 +41,7 @@ export interface CreateOneLinkPendingInput {
   readonly returnPath: string;
 }
 
-export interface OneLinkPendingCandidateInput {
+interface OneLinkPendingCandidateInput {
   readonly candidateSub: string;
   readonly candidateClientId: string | null;
   readonly candidateToken: string;
@@ -64,16 +64,7 @@ export interface OneLinkPendingRecord {
   readonly expired: boolean;
 }
 
-export interface BoundOneLinkUser {
-  readonly id: string;
-  readonly email: string;
-  readonly emailVerified: boolean;
-  readonly name: string;
-  readonly image: string | null;
-  readonly createdAt: Date;
-  readonly updatedAt: Date;
-  readonly disabled: boolean;
-}
+export type BoundOneLinkUser = Readonly<LoginUser>;
 
 /** Retain expired rows for ten minutes before bounded cleanup so expiry remains observable. */
 export function createOneLinkPending(
@@ -318,7 +309,7 @@ function validateLoginCandidatePending(
   return { status: 'ok', id: row.id, candidateSub: row.candidateSub };
 }
 
-export type CompleteOneLinkCreateResult =
+type CompleteOneLinkCreateResult =
   | {
       readonly status: 'ok';
       readonly user: BoundOneLinkUser;
@@ -384,7 +375,7 @@ export async function completeOneLinkCreate(
   }
 }
 
-export type CompleteOneLinkLinkExistingResult =
+type CompleteOneLinkLinkExistingResult =
   | {
       readonly status: 'ok';
       readonly user: BoundOneLinkUser;
@@ -509,7 +500,7 @@ export async function completeOneLinkLinkExisting(
   }
 }
 
-export type CompleteOneLinkBindCurrentResult =
+type CompleteOneLinkBindCurrentResult =
   | { readonly status: 'ok'; readonly userId: string; readonly alreadyBound: boolean }
   | { readonly status: 'session_required' }
   | { readonly status: 'not_found' }

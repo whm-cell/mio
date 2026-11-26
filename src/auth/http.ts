@@ -12,13 +12,13 @@ import type { AuthConfig, AuthPolicyReader } from './config.ts';
 import type { Authentication } from './service.ts';
 import { wechatCallbackURL } from './wechat-input.ts';
 
-export type AvatarAssetStatus = 'ok' | 'not_found' | 'not_ready' | 'invalid_type' | 'unavailable';
-export type AvatarAssetVerifier = (
+type AvatarAssetStatus = 'ok' | 'not_found' | 'not_ready' | 'invalid_type' | 'unavailable';
+type AvatarAssetVerifier = (
   identity: { userId: string; sessionId: string },
   assetId: string,
 ) => Promise<AvatarAssetStatus>;
 
-export interface AvatarCallbacks {
+interface AvatarCallbacks {
   avatarUrl?: (
     identity: { userId: string; sessionId: string },
     assetId: string,

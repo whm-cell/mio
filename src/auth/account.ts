@@ -24,7 +24,7 @@ const SESSION_GUARDED_PATHS = new Set([
   '/phone-rebind/confirm',
 ]);
 
-export interface UserProfile {
+interface UserProfile {
   userId: string;
   displayId: string | null;
   name: string;

@@ -4,6 +4,22 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import type { Authentication } from '../../src/auth/service.ts';
 
+const config = {
+  baseURL: 'http://localhost',
+  secret: 'unused',
+  databaseURL: 'unused',
+  origins: ['http://client.test'],
+  emailPasswordEnabled: true,
+  smsLimits: {
+    phoneHour: 5,
+    phoneDay: 10,
+    ipHour: 20,
+    ipDay: 100,
+    globalDay: 1000,
+    accountOpsDay: 300,
+  },
+};
+
 let server: Server | undefined;
 afterEach(async () => {
   if (server) {
@@ -32,24 +48,7 @@ it('preserves raw UTF-8 authentication input and does not forward an aborted bod
     observed = resolve;
   });
   const auth = { handler: forwarded } as unknown as Authentication;
-  const handler = createAuthHandler(
-    {
-      baseURL: 'http://localhost',
-      secret: 'unused',
-      databaseURL: 'unused',
-      origins: ['http://client.test'],
-      emailPasswordEnabled: true,
-      smsLimits: {
-        phoneHour: 5,
-        phoneDay: 10,
-        ipHour: 20,
-        ipDay: 100,
-        globalDay: 1000,
-        accountOpsDay: 300,
-      },
-    },
-    auth,
-  );
+  const handler = createAuthHandler(config, auth);
   let requests = 0;
   server = createServer((incoming, response) => {
     if (++requests === 2) incoming.once('data', () => observed());
@@ -99,24 +98,7 @@ it('does not copy upstream headers when the upstream response body fails', async
         },
       ),
   } as unknown as Authentication;
-  const handler = createAuthHandler(
-    {
-      baseURL: 'http://localhost',
-      secret: 'unused',
-      databaseURL: 'unused',
-      origins: ['http://client.test'],
-      emailPasswordEnabled: true,
-      smsLimits: {
-        phoneHour: 5,
-        phoneDay: 10,
-        ipHour: 20,
-        ipDay: 100,
-        globalDay: 1000,
-        accountOpsDay: 300,
-      },
-    },
-    auth,
-  );
+  const handler = createAuthHandler(config, auth);
   server = createServer(handler);
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();

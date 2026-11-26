@@ -8,7 +8,6 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
-import type { AvatarAssetStatus } from '../../src/auth/http.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
@@ -18,7 +17,7 @@ const server = createServer();
 let origin: string;
 const secret = randomBytes(40).toString('hex');
 const password = 'profile-regression-password-42';
-const verify = vi.fn<() => Promise<AvatarAssetStatus>>(async () => 'ok');
+const verify = vi.fn<NonNullable<Parameters<typeof createAuthHandler>[2]>>(async () => 'ok');
 const sign = vi.fn(async () => 'https://avatar.invalid/private?expires=300');
 const normalize = vi.fn<
   (

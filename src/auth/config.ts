@@ -16,7 +16,7 @@ import { wechatPendingPlugin } from './wechat-pending.ts';
 import { AuthPostgresDialect } from './database.ts';
 
 export const AUTH_BASE_PATH = '/api/auth';
-export const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
+const AUTH_PLACEHOLDER_EMAIL_DOMAIN = 'auth.mio.invalid';
 
 export type { AuthSmsMode, OneLinkSsoPolicyReader, OneLinkSsoRuntimePolicy };
 
@@ -220,7 +220,7 @@ export function authOptions(
       accountPlugin(),
       phonePlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       phoneRebindPlugin(config, pool, sms, getPolicy),
-      wechatPlugin(config.wechat, AUTH_PLACEHOLDER_EMAIL_DOMAIN, pool),
+      wechatPlugin(config.wechat, pool),
       wechatQRPlugin(config.baseURL, pool),
       wechatPendingPlugin(config, pool, sms, AUTH_PLACEHOLDER_EMAIL_DOMAIN, getPolicy),
       oneLinkPlugin(

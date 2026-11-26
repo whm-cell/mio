@@ -15,7 +15,7 @@ import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import type { Authentication } from '../../src/auth/service.ts';
 import type { OneLinkSsoConfig } from '../../src/integrations/onelink/sso.ts';
-import { authDatabase } from '../support/auth-database.ts';
+import { authDatabase, authTableIndexes } from '../support/auth-database.ts';
 
 const SYNTHETIC_ENC_KEY = 'synthetic-test-only-enc-key-32ch';
 const PASSWORD = 'correct-horse-onelink-test-42';
@@ -133,6 +133,20 @@ async function countUsersAndAccounts() {
     users: Number(users.rows[0]!.count),
     accounts: Number(accounts.rows[0]!.count),
   };
+}
+
+async function waitForTransactionLock(xid: string) {
+  await vi.waitFor(
+    async () => {
+      const waiting = await pool.query(
+        `SELECT 1 FROM pg_locks
+         WHERE locktype = 'transactionid' AND transactionid::text = $1 AND NOT granted`,
+        [xid],
+      );
+      expect(waiting.rowCount).toBeGreaterThanOrEqual(1);
+    },
+    { timeout: 5000, interval: 10 },
+  );
 }
 
 async function createPhoneUser(phoneNumber: string) {
@@ -363,17 +377,10 @@ describe('OneLink schema migration & unconfigured/disabled gating', () => {
         await unconfiguredAuth.close();
       }
 
-      const indexes = await oldPool.query<{ indexdef: string }>(
-        `SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = 'mioOneLinkPending'`,
-        [schema],
-      );
-      expect(
-        indexes.rows.some(
-          (row) => row.indexdef.includes('tokenDigest') && row.indexdef.includes('UNIQUE'),
-        ),
-      ).toBe(true);
-      expect(indexes.rows.some((row) => row.indexdef.includes('status'))).toBe(true);
-      expect(indexes.rows.some((row) => row.indexdef.includes('expiresAt'))).toBe(true);
+      const indexes = await authTableIndexes(oldPool, schema, 'mioOneLinkPending');
+      expect(indexes.unique('tokenDigest')).toBe(true);
+      expect(indexes.has('status')).toBe(true);
+      expect(indexes.has('expiresAt')).toBe(true);
     } finally {
       await oldPool.end();
       await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
@@ -1287,17 +1294,7 @@ describe('GET /api/auth/callback/onelink, GET /api/auth/onelink/pending and POST
           origin: false,
         });
 
-        await vi.waitFor(
-          async () => {
-            const waiting = await pool.query(
-              `SELECT 1 FROM pg_locks
-               WHERE locktype = 'transactionid' AND transactionid::text = $1 AND NOT granted`,
-              [xid],
-            );
-            expect(waiting.rowCount).toBeGreaterThanOrEqual(1);
-          },
-          { timeout: 5000, interval: 10 },
-        );
+        await waitForTransactionLock(xid);
 
         // Commit the winning started -> candidate_ready transition before releasing the lock.
         await locker.query(
@@ -1550,6 +1547,21 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
     const noSmsBase = `http://127.0.0.1:${noSmsAddr.port}`;
     try {
       const stagedForNoSms = await stageLoginCandidate(`ol-nosms-${randomUUID()}`);
+      const completeWithoutSms = (code: string, phoneNumber = bypassOnlyPhone) =>
+        fetch(`${noSmsBase}/api/auth/onelink/complete`, {
+          method: 'POST',
+          headers: {
+            origin,
+            'content-type': 'application/json',
+            cookie: stagedForNoSms.pendingCookie,
+          },
+          body: JSON.stringify({
+            action: 'link_existing',
+            candidateToken: stagedForNoSms.candidateToken,
+            phoneNumber,
+            code,
+          }),
+        });
       const noSmsLiveSend = await fetch(`${noSmsBase}/api/auth/onelink/existing/send-otp`, {
         method: 'POST',
         headers: {
@@ -1575,20 +1587,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
       expect(noSmsMalformedSend.status).toBe(503);
       expect(await noSmsMalformedSend.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
 
-      const noSmsMalformedComplete = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
-        method: 'POST',
-        headers: {
-          origin,
-          'content-type': 'application/json',
-          cookie: stagedForNoSms.pendingCookie,
-        },
-        body: JSON.stringify({
-          action: 'link_existing',
-          candidateToken: stagedForNoSms.candidateToken,
-          phoneNumber: bypassOnlyPhone,
-          code: '654321',
-        }),
-      });
+      const noSmsMalformedComplete = await completeWithoutSms('654321');
       expect(noSmsMalformedComplete.status).toBe(503);
       expect(await noSmsMalformedComplete.json()).toMatchObject({ code: 'SMS_UNAVAILABLE' });
 
@@ -1605,57 +1604,18 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
       expect(noSmsBypassSend.status).toBe(200);
       expect(await noSmsBypassSend.json()).toEqual({ status: true });
 
-      const noSmsWrongCode = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
-        method: 'POST',
-        headers: {
-          origin,
-          'content-type': 'application/json',
-          cookie: stagedForNoSms.pendingCookie,
-        },
-        body: JSON.stringify({
-          action: 'link_existing',
-          candidateToken: stagedForNoSms.candidateToken,
-          phoneNumber: bypassOnlyPhone,
-          code: '000000',
-        }),
-      });
+      const noSmsWrongCode = await completeWithoutSms('000000');
       expect(noSmsWrongCode.status).toBe(400);
       expect(await noSmsWrongCode.json()).toMatchObject({ code: 'INVALID_OTP' });
 
       // A bypass code without a pending-and-phone-scoped send cannot prove any target account.
       const beforeNoSmsUnreg = await countUsersAndAccounts();
-      const noSmsUnreg = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
-        method: 'POST',
-        headers: {
-          origin,
-          'content-type': 'application/json',
-          cookie: stagedForNoSms.pendingCookie,
-        },
-        body: JSON.stringify({
-          action: 'link_existing',
-          candidateToken: stagedForNoSms.candidateToken,
-          phoneNumber: unregisteredPhone,
-          code: '654321',
-        }),
-      });
+      const noSmsUnreg = await completeWithoutSms('654321', unregisteredPhone);
       expect(noSmsUnreg.status).toBe(400);
       expect(await noSmsUnreg.json()).toMatchObject({ code: 'INVALID_OTP' });
       expect(await countUsersAndAccounts()).toEqual(beforeNoSmsUnreg);
 
-      const noSmsBypassOk = await fetch(`${noSmsBase}/api/auth/onelink/complete`, {
-        method: 'POST',
-        headers: {
-          origin,
-          'content-type': 'application/json',
-          cookie: stagedForNoSms.pendingCookie,
-        },
-        body: JSON.stringify({
-          action: 'link_existing',
-          candidateToken: stagedForNoSms.candidateToken,
-          phoneNumber: bypassOnlyPhone,
-          code: '654321',
-        }),
-      });
+      const noSmsBypassOk = await completeWithoutSms('654321');
       expect(noSmsBypassOk.status).toBe(200);
       expect(await noSmsBypassOk.json()).toEqual({
         status: true,
@@ -2526,17 +2486,7 @@ describe('Unit 3: POST /api/auth/onelink/existing/send-otp & POST /api/auth/onel
         cookie: expStaged.pendingCookie,
       });
 
-      await vi.waitFor(
-        async () => {
-          const waiting = await pool.query(
-            `SELECT 1 FROM pg_locks
-             WHERE locktype = 'transactionid' AND transactionid::text = $1 AND NOT granted`,
-            [xid],
-          );
-          expect(waiting.rowCount).toBeGreaterThanOrEqual(1);
-        },
-        { timeout: 5000, interval: 10 },
-      );
+      await waitForTransactionLock(xid);
 
       // Hold the lock until PostgreSQL's own clock_timestamp() passes expiresAt, then release with ROLLBACK.
       await vi.waitFor(

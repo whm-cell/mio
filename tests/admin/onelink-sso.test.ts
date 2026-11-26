@@ -34,6 +34,22 @@ import { authDatabase } from '../support/auth-database.ts';
 
 const SYNTHETIC_ENC_KEY = 'synthetic-admin-sso-test-key-32c';
 
+const unregisteredConfig = {
+  enabled: false,
+  clientName: 'miioo',
+  clientId: null,
+  expectedClientId: null,
+  registrationStatus: 'unregistered',
+  registrationSource: null,
+  lastRegisterCode: null,
+  lastRegisterTraceId: null,
+  lastRegisterMessage: null,
+  lastRegisteredAt: null,
+  revision: 0,
+  updatedBy: null,
+  updatedAt: null,
+};
+
 let database: Awaited<ReturnType<typeof authDatabase>>;
 let pool: Pool;
 let auth: Awaited<ReturnType<typeof createAuthentication>>;
@@ -80,6 +96,28 @@ function requestApi(
     headers,
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+}
+
+function ssoProviderConfig(masterKeyId: string) {
+  return readProviderConfig({
+    MIO_PROVIDERS_DATABASE_URL: database.url,
+    MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+    MIO_PROVIDERS_MASTER_KEY_ID: masterKeyId,
+  })!;
+}
+
+function ssoRuntime(environment: string) {
+  return {
+    config: {
+      environment,
+      encryptionKey: SYNTHETIC_ENC_KEY,
+      authorizeUrl: 'https://scenic.wanlian.cloud/authorize',
+      registerUrl: 'https://api-test.wanlian.cloud/sso/client/register',
+      clientName: 'miioo',
+      appName: 'Miioo',
+    },
+    authBaseURL: origin,
+  };
 }
 
 beforeAll(async () => {
@@ -307,19 +345,7 @@ it('reports unconfigured runtime cleanly, blocks enabling and rejects register w
   expect(view).toEqual({
     config: {
       environment: 'unconfigured-env',
-      enabled: false,
-      clientName: 'miioo',
-      clientId: null,
-      expectedClientId: null,
-      registrationStatus: 'unregistered',
-      registrationSource: null,
-      lastRegisterCode: null,
-      lastRegisterTraceId: null,
-      lastRegisterMessage: null,
-      lastRegisteredAt: null,
-      revision: 0,
-      updatedBy: null,
-      updatedAt: null,
+      ...unregisteredConfig,
     },
     runtime: {
       configured: false,
@@ -371,19 +397,7 @@ it('supports default GET, optimistic lock PATCH, input rejection, hot policy ref
   expect(initial).toEqual({
     config: {
       environment: 'staging',
-      enabled: false,
-      clientName: 'miioo',
-      clientId: null,
-      expectedClientId: null,
-      registrationStatus: 'unregistered',
-      registrationSource: null,
-      lastRegisterCode: null,
-      lastRegisterTraceId: null,
-      lastRegisterMessage: null,
-      lastRegisteredAt: null,
-      revision: 0,
-      updatedBy: null,
-      updatedAt: null,
+      ...unregisteredConfig,
     },
     runtime: {
       configured: true,
@@ -507,11 +521,7 @@ it('supports default GET, optimistic lock PATCH, input rejection, hot policy ref
   expect(conflict1.status).toBe(409);
 
   // Restart hydration: fresh store + service hydrates enabled & revision from PostgreSQL
-  const restartProviderConfig = readProviderConfig({
-    MIO_PROVIDERS_DATABASE_URL: database.url,
-    MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
-    MIO_PROVIDERS_MASTER_KEY_ID: 'restart-test-v1',
-  })!;
+  const restartProviderConfig = ssoProviderConfig('restart-test-v1');
   const restartedStore = await createAdminStore(
     {
       databaseURL: database.url,
@@ -527,17 +537,7 @@ it('supports default GET, optimistic lock PATCH, input rejection, hot policy ref
     undefined,
     undefined,
     undefined,
-    {
-      config: {
-        environment: 'staging',
-        encryptionKey: SYNTHETIC_ENC_KEY,
-        authorizeUrl: 'https://scenic.wanlian.cloud/authorize',
-        registerUrl: 'https://api-test.wanlian.cloud/sso/client/register',
-        clientName: 'miioo',
-        appName: 'Miioo',
-      },
-      authBaseURL: origin,
-    },
+    ssoRuntime('staging'),
   );
   const restartedUnconfiguredStore = await createAdminStore(
     {
@@ -853,24 +853,12 @@ it('falls back to expectedClientId on 362 when clientId is still null', async ()
   const service362 = createAdminService(
     store362,
     providerService,
-    readProviderConfig({
-      MIO_PROVIDERS_DATABASE_URL: database.url,
-      MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
-      MIO_PROVIDERS_MASTER_KEY_ID: 'expected-362-v1',
-    })!,
+    ssoProviderConfig('expected-362-v1'),
     undefined,
     undefined,
     undefined,
     {
-      config: {
-        environment: 'expected-362',
-        encryptionKey: SYNTHETIC_ENC_KEY,
-        authorizeUrl: 'https://scenic.wanlian.cloud/authorize',
-        registerUrl: 'https://api-test.wanlian.cloud/sso/client/register',
-        clientName: 'miioo',
-        appName: 'Miioo',
-      },
-      authBaseURL: origin,
+      ...ssoRuntime('expected-362'),
       registerTransport: async () =>
         Response.json({ traceId: 'trace-362-expected', code: 362, message: 'exists' }),
     },
@@ -918,24 +906,12 @@ it('aborts in-flight OneLink registration when admin service closes', async () =
   const ephemeralService = createAdminService(
     ephemeralStore,
     providerService,
-    readProviderConfig({
-      MIO_PROVIDERS_DATABASE_URL: database.url,
-      MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
-      MIO_PROVIDERS_MASTER_KEY_ID: 'close-test-v1',
-    })!,
+    ssoProviderConfig('close-test-v1'),
     undefined,
     undefined,
     undefined,
     {
-      config: {
-        environment: 'close-test',
-        encryptionKey: SYNTHETIC_ENC_KEY,
-        authorizeUrl: 'https://scenic.wanlian.cloud/authorize',
-        registerUrl: 'https://api-test.wanlian.cloud/sso/client/register',
-        clientName: 'miioo',
-        appName: 'Miioo',
-      },
-      authBaseURL: origin,
+      ...ssoRuntime('close-test'),
       registerTransport: (_url, init) =>
         new Promise((_resolve, reject) => {
           started.resolve();

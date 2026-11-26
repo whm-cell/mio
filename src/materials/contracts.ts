@@ -5,9 +5,9 @@ export interface MaterialPrincipal {
   userId: string;
   sessionId: string;
 }
-export type GroupType = 'real' | 'aigc';
-export type GroupState = 'creating' | 'ready' | 'unknown' | 'deleting' | 'deleted' | 'failed';
-export type MaterialState =
+type GroupType = 'real' | 'aigc';
+type GroupState = 'creating' | 'ready' | 'unknown' | 'deleting' | 'deleted' | 'failed';
+type MaterialState =
   | 'registering'
   | 'processing'
   | 'active'

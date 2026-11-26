@@ -21,3 +21,31 @@ CREATE TABLE mio_provider_model_preferences (
 CREATE UNIQUE INDEX mio_provider_category_default
   ON mio_provider_model_preferences(provider_id,category) WHERE is_default;
 `;
+
+/** Retired tables shared by current-catalog upgrade scenarios; column defaults stay scenario-specific. */
+export const legacyProviderAdaptationTablesSQL = `
+CREATE TABLE mio_provider_model_adaptations (
+  provider_id uuid NOT NULL,
+  model_key uuid NOT NULL,
+  operation text NOT NULL,
+  profile text NOT NULL,
+  declaration_version integer NOT NULL DEFAULT 1,
+  verification_status text NOT NULL DEFAULT 'unverified',
+  verified_at timestamptz,
+  verification_evidence text,
+  tested_tuple jsonb,
+  PRIMARY KEY(provider_id, model_key, operation)
+);
+CREATE TABLE mio_provider_model_policies (
+  provider_type text NOT NULL DEFAULT 'onelink',
+  raw_model_id text COLLATE "C" NOT NULL,
+  user_visible boolean NOT NULL DEFAULT true,
+  allow_undiscovered boolean NOT NULL DEFAULT false,
+  display_label text,
+  call_notes text,
+  updated_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_type, raw_model_id)
+);
+`;

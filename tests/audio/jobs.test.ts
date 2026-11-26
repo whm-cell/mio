@@ -283,6 +283,21 @@ async function fixture() {
     },
   };
 }
+function cloneWithAudition(f: Awaited<ReturnType<typeof fixture>>, sampleAssetId: string) {
+  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
+    bytes: Buffer.from('checkpoint-audio-fixture'),
+    voiceId: input.voiceId!,
+  }));
+  return f.jobs.clone(f.actor, {
+    requestId: randomUUID(),
+    modelRef: f.modelRef,
+    sampleAssetId,
+    name: '我的音色',
+    auditionText: '这是试听。',
+    sampleAuthorization: true,
+  });
+}
+
 it('accepts short and 10000-codepoint text, freezes parameters, publishes separate job/record/asset IDs', async () => {
   const f = await fixture();
   const { job } = await f.jobs.create(f.actor, { ...f.body, text: '字'.repeat(10000) });
@@ -823,18 +838,7 @@ it('checks ownership and rejects undeclared parameters, oversized text and missi
 it('clones an authorized ready sample then reuses its stable voice reference for TTS', async () => {
   const f = await fixture(),
     sampleAssetId = await f.sample();
-  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
-    bytes: Buffer.from('checkpoint-audio-fixture'),
-    voiceId: input.voiceId!,
-  }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await cloneWithAudition(f, sampleAssetId);
   const ready = await f.settled(job.jobId, 'ready');
   expect(ready.voiceRef).toBeTruthy();
   expect(f.inspect).toHaveBeenCalledWith(
@@ -914,18 +918,7 @@ it('recovers a pre-submit clone after shutdown without repeating its supplier PO
       signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
     });
   });
-  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
-    bytes: Buffer.from('checkpoint-audio-fixture'),
-    voiceId: input.voiceId!,
-  }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await cloneWithAudition(f, sampleAssetId);
   await entered.promise;
   expect((await f.jobs.get(f.actor, job.jobId)).status).toBe('queued');
   expect(f.submit).not.toHaveBeenCalled();

@@ -119,11 +119,13 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
       column_default: 'now()',
     },
   ]);
-  const indexes = await pool.query<{ name: string; definition: string; oid: number }>(`
+  const readIndexes = () =>
+    pool.query<{ name: string; definition: string; oid: number }>(`
     SELECT indexrelid::regclass::text AS name,pg_get_indexdef(indexrelid) AS definition,
       indexrelid::oid::int AS oid
     FROM pg_index WHERE indrelid IN ('mio_conversations'::regclass,'mio_conversation_requests'::regclass)
     ORDER BY name`);
+  const indexes = await readIndexes();
   const definitions = new Map(indexes.rows.map((row) => [row.name, row.definition]));
   expect(definitions.has('mio_conversations_owner_activity_page')).toBe(false);
   expect(definitions.get('mio_conversations_audio_activity_page')).toContain(
@@ -169,14 +171,7 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
   expect(
     (await pool.query("SELECT to_regclass('mio_conversations_owner_activity_page') AS index")).rows,
   ).toEqual([{ index: null }]);
-  expect(
-    (
-      await pool.query(`SELECT indexrelid::regclass::text AS name,pg_get_indexdef(indexrelid) AS definition,
-      indexrelid::oid::int AS oid
-      FROM pg_index WHERE indrelid IN ('mio_conversations'::regclass,'mio_conversation_requests'::regclass)
-      ORDER BY name`)
-    ).rows,
-  ).toEqual(indexes.rows);
+  expect((await readIndexes()).rows).toEqual(indexes.rows);
   expect((await pool.query('SELECT to_jsonb(c) AS row FROM mio_conversations c')).rows).toEqual(
     migratedRows,
   );

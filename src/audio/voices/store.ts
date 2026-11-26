@@ -6,10 +6,7 @@ import type { AudioAdmission } from '../contracts.ts';
 import type { VoiceFilters, VoiceRow } from './contracts.ts';
 
 /** Narrow access to the existing provider-owned pool/transaction, without a second pool or pg adapter. */
-export type VoiceQuery = <Row extends object>(
-  sql: string,
-  values?: unknown[],
-) => Promise<{ rows: Row[] }>;
+type VoiceQuery = <Row extends object>(sql: string, values?: unknown[]) => Promise<{ rows: Row[] }>;
 export interface VoiceCatalogState {
   status: 'running' | 'connected' | 'failed' | 'empty';
   errorCode: string | null;

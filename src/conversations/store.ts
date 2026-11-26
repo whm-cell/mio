@@ -259,7 +259,6 @@ export class ConversationStore {
       if (reserved) return { sourceSessionId: source.dsh_session_id, targetId: reserved.id };
       this.assertActive();
       const cutoff = await resolveBoundary(source.dsh_session_id);
-      this.assertActive();
       return this.transaction(async (client) => {
         this.assertPrepared(source, await this.readOwned(actor, id, client));
         const targetId = createId();
@@ -313,7 +312,6 @@ export class ConversationStore {
         Number(target.forked_until_seq),
         target.model_binding ?? undefined,
       );
-      this.assertActive();
       return this.transaction(async (client) => {
         const current = await this.readOwned(actor, targetId, client);
         this.assertPrepared(target, current);
@@ -343,7 +341,6 @@ export class ConversationStore {
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
       this.assertActive();
       const selection = await select(row);
-      this.assertActive();
       return this.transaction(async (client) => {
         const current = await this.readOwned(actor, id, client);
         this.assertPrepared(row, current);
@@ -365,7 +362,6 @@ export class ConversationStore {
       requireUnarchived(row);
       this.assertActive();
       const title = await writeNative(row);
-      this.assertActive();
       return this.transaction(async (client) => {
         const current = await this.readOwned(actor, id, client);
         this.assertPrepared(row, current);
@@ -428,7 +424,6 @@ export class ConversationStore {
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'AUDIO_SELECTION_CONFLICT');
       this.assertActive();
       const selected = await resolve(voiceRef);
-      this.assertActive();
       return this.transaction(async (client) => {
         this.assertPrepared(row, await this.readOwned(actor, id, client));
         if (selected.voiceRef === previous.voiceRef && selected.name === previous.name)

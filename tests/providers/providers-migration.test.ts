@@ -9,7 +9,10 @@ import { expect, it } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { makeAudioRouteFixture } from './fixtures/onelink-audio-route.ts';
 import { makeChatRouteFixture } from './fixtures/onelink-routes-fixture.ts';
-import { legacyProviderSchemaSQL } from './fixtures/provider-legacy-schema.ts';
+import {
+  legacyProviderAdaptationTablesSQL,
+  legacyProviderSchemaSQL,
+} from './fixtures/provider-legacy-schema.ts';
 import { providerSchemaSQL, checkProviderSchema } from '../../src/providers/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 
@@ -246,30 +249,7 @@ it('upgrades an existing catalog, retires legacy adaptations/policies tables and
     await pool.query(providerSchemaSQL);
     // Simulate pre-existing legacy adaptations/policies tables, adaptation_origin, and classification* columns
     await pool.query(`
-      CREATE TABLE mio_provider_model_adaptations (
-        provider_id uuid NOT NULL,
-        model_key uuid NOT NULL,
-        operation text NOT NULL,
-        profile text NOT NULL,
-        declaration_version integer NOT NULL DEFAULT 1,
-        verification_status text NOT NULL DEFAULT 'unverified',
-        verified_at timestamptz,
-        verification_evidence text,
-        tested_tuple jsonb,
-        PRIMARY KEY(provider_id, model_key, operation)
-      );
-      CREATE TABLE mio_provider_model_policies (
-        provider_type text NOT NULL DEFAULT 'onelink',
-        raw_model_id text COLLATE "C" NOT NULL,
-        user_visible boolean NOT NULL DEFAULT true,
-        allow_undiscovered boolean NOT NULL DEFAULT false,
-        display_label text,
-        call_notes text,
-        updated_by text,
-        created_at timestamptz NOT NULL DEFAULT now(),
-        updated_at timestamptz NOT NULL DEFAULT now(),
-        PRIMARY KEY (provider_type, raw_model_id)
-      );
+      ${legacyProviderAdaptationTablesSQL}
       ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text DEFAULT 'platform';
       ALTER TABLE mio_provider_models
         ADD COLUMN classification text,

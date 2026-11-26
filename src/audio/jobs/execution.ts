@@ -208,11 +208,21 @@ export function createAudioExecution(
       const code = error instanceof AudioError ? error.code : 'AUDIO_PROCESSING_UNAVAILABLE';
       const missingOutput = job.status === 'materializing' && !job.output_bytes && !job.output_url;
       const unknown = job.status === 'submitted' && code !== 'AUDIO_UPSTREAM_REJECTED';
+      const invalidOutput =
+        job.status === 'materializing' &&
+        error instanceof AudioError &&
+        ((error.status === 400 && code === 'AUDIO_OUTPUT_INVALID') ||
+          (error.status === 409 &&
+            (code === 'AUDIO_OUTPUT_MISMATCH' || code === 'AUDIO_VOICE_CONFLICT')));
       const resume =
-        stop.aborted && !unknown && !missingOutput && code !== 'AUDIO_UPSTREAM_REJECTED';
+        stop.aborted &&
+        !unknown &&
+        !missingOutput &&
+        !invalidOutput &&
+        code !== 'AUDIO_UPSTREAM_REJECTED';
       const status = unknown
         ? 'unknown'
-        : job.status === 'materializing' && !missingOutput
+        : job.status === 'materializing' && !missingOutput && !invalidOutput
           ? 'materializing'
           : resume && job.status === 'queued'
             ? 'queued'

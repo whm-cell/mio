@@ -119,11 +119,27 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
       column_default: 'now()',
     },
   ]);
-  const { rows: indexes } = await pool.query(`
-    SELECT indexdef FROM pg_indexes
-    WHERE schemaname=current_schema() AND indexname='mio_conversations_owner_activity_page'`);
-  expect(indexes[0]?.indexdef).toContain(
-    'USING btree (owner_id, updated_at DESC, id DESC) WHERE (archived_at IS NULL)',
+  const indexes = await pool.query<{ name: string; definition: string; oid: number }>(`
+    SELECT indexrelid::regclass::text AS name,pg_get_indexdef(indexrelid) AS definition,
+      indexrelid::oid::int AS oid
+    FROM pg_index WHERE indrelid IN ('mio_conversations'::regclass,'mio_conversation_requests'::regclass)
+    ORDER BY name`);
+  const definitions = new Map(indexes.rows.map((row) => [row.name, row.definition]));
+  expect(definitions.has('mio_conversations_owner_activity_page')).toBe(false);
+  expect(definitions.get('mio_conversations_audio_activity_page')).toContain(
+    "USING btree (owner_id, updated_at DESC, id DESC) WHERE ((archived_at IS NULL) AND (purpose = 'audio'::text))",
+  );
+  expect(definitions.get('mio_conversations_nonaudio_activity_page')).toContain(
+    "USING btree (owner_id, updated_at DESC, id DESC) WHERE ((archived_at IS NULL) AND (purpose <> 'audio'::text))",
+  );
+  expect(definitions.get('mio_conversation_requests_latest')).toContain(
+    'USING btree (conversation_id, created_at DESC, request_id DESC)',
+  );
+  expect(definitions.get('mio_conversation_requests_recovery')).toContain(
+    "WHERE (status = ANY (ARRAY['accepted'::text, 'input-persisted'::text]))",
+  );
+  expect(definitions.get('mio_conversations_recovery')).toContain(
+    "WHERE ((active_request IS NOT NULL) OR ((state = 'creating'::text) AND (fork_request_id IS NULL)))",
   );
   expect(
     (
@@ -145,7 +161,22 @@ it('migrates pre-lifecycle metadata and preserves activity and receipts on repea
     updated_at='2026-01-03T04:05:06.000007Z',archived_at='2026-01-03T04:05:07.123456Z'`);
   const migratedRows = (await pool.query('SELECT to_jsonb(c) AS row FROM mio_conversations c'))
     .rows;
+  // Upgrade an existing current-layout database which still has the superseded broad index.
+  await pool.query(`CREATE INDEX mio_conversations_owner_activity_page
+    ON mio_conversations(owner_id,updated_at DESC,id DESC) WHERE archived_at IS NULL`);
   migrate();
+  migrate();
+  expect(
+    (await pool.query("SELECT to_regclass('mio_conversations_owner_activity_page') AS index")).rows,
+  ).toEqual([{ index: null }]);
+  expect(
+    (
+      await pool.query(`SELECT indexrelid::regclass::text AS name,pg_get_indexdef(indexrelid) AS definition,
+      indexrelid::oid::int AS oid
+      FROM pg_index WHERE indrelid IN ('mio_conversations'::regclass,'mio_conversation_requests'::regclass)
+      ORDER BY name`)
+    ).rows,
+  ).toEqual(indexes.rows);
   expect((await pool.query('SELECT to_jsonb(c) AS row FROM mio_conversations c')).rows).toEqual(
     migratedRows,
   );

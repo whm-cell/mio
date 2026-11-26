@@ -1,4 +1,5 @@
 import type { FrozenAudioContext } from '../audio/jobs/service.ts';
+import { isDeepStrictEqual } from 'node:util';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createId } from '@mio/foundation/identifiers';
 import { createLogger } from '@mio/foundation/logging';
@@ -104,6 +105,7 @@ const LOCK = "hashtext(current_database()), hashtext(current_schema() || ':mio-c
 export class ConversationStore {
   private readonly pool: Pool;
   private readonly lease: PoolClient;
+  private readonly mutations = new Map<string, Promise<unknown>>();
   private active = true;
   private closing: Promise<void> | undefined;
 
@@ -120,6 +122,43 @@ export class ConversationStore {
   }
   markUnavailable(): void {
     this.active = false;
+  }
+  /** Keep native work and metadata in the same order without occupying a PG client. */
+  private inConversationOrder<T>(id: string, work: () => Promise<T>): Promise<T> {
+    this.assertActive();
+    const key = id.replace(/[{}-]/g, '').toLowerCase();
+    const run = () => {
+      this.assertActive();
+      return work();
+    };
+    const previous = this.mutations.get(key) ?? Promise.resolve();
+    const pending = previous.then(run, run);
+    this.mutations.set(key, pending);
+    const forget = () => {
+      if (this.mutations.get(key) === pending) this.mutations.delete(key);
+    };
+    void pending.then(forget, forget);
+    return pending;
+  }
+  /** Compare prepared inputs while holding the row again; activity projection is independent. */
+  private assertPrepared(before: ConversationRow, current: ConversationRow): void {
+    this.assertActive();
+    if (current.archived_at?.getTime() !== before.archived_at?.getTime())
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_ARCHIVED');
+    if (current.state !== before.state)
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+    if (current.active_request !== before.active_request)
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+    if (!isDeepStrictEqual(current.audio_selection, before.audio_selection))
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'AUDIO_SELECTION_CONFLICT');
+    if (
+      current.dsh_session_id !== before.dsh_session_id ||
+      current.purpose !== before.purpose ||
+      current.reasoning_effort !== before.reasoning_effort ||
+      current.forked_until_seq !== before.forked_until_seq ||
+      !isDeepStrictEqual(current.model_binding, before.model_binding)
+    )
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
   }
   private async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     this.assertActive();
@@ -199,53 +238,61 @@ export class ConversationStore {
     requestedSeq: number | undefined,
     resolveBoundary: (nativeId: string) => Promise<number>,
   ): Promise<{ sourceSessionId: string; targetId: string }> {
-    return this.transaction(async (client) => {
-      const source = await this.readOwned(actor, id, client);
-      const reserved = (
-        await client.query<Pick<ConversationRow, 'id' | 'fork_requested_until_seq'>>(
-          `SELECT id, fork_requested_until_seq FROM mio_conversations
-           WHERE owner_id=$1 AND forked_from_conversation_id=$2 AND fork_request_id=$3`,
-          [actor.userId, id, requestId],
-        )
-      ).rows[0];
-      if (reserved) {
-        if (reserved.fork_requested_until_seq !== (requestedSeq?.toString() ?? null))
-          throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
-        return { sourceSessionId: source.dsh_session_id, targetId: reserved.id };
-      }
-      if (source.state !== 'ready')
-        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+    return this.inConversationOrder(id, async () => {
+      const { source, reserved } = await this.transaction(async (client) => {
+        const source = await this.readOwned(actor, id, client);
+        const reserved = (
+          await client.query<Pick<ConversationRow, 'id' | 'fork_requested_until_seq'>>(
+            `SELECT id, fork_requested_until_seq FROM mio_conversations
+             WHERE owner_id=$1 AND forked_from_conversation_id=$2 AND fork_request_id=$3`,
+            [actor.userId, id, requestId],
+          )
+        ).rows[0];
+        if (reserved) {
+          if (reserved.fork_requested_until_seq !== (requestedSeq?.toString() ?? null))
+            throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
+        } else if (source.state !== 'ready') {
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+        }
+        return { source, reserved };
+      });
+      if (reserved) return { sourceSessionId: source.dsh_session_id, targetId: reserved.id };
+      this.assertActive();
       const cutoff = await resolveBoundary(source.dsh_session_id);
-      const targetId = createId();
-      const binding = source.model_binding;
-      const selection = binding && {
-        providerConfigId: binding.providerConfigId,
-        modelRef: binding.modelRef,
-        modelKey: binding.modelKey,
-        modelId: binding.modelId,
-        protocol: binding.protocol,
-      };
-      await client.query(
-        `INSERT INTO mio_conversations(
-           id,owner_id,dsh_session_id,state,model_binding,purpose,reasoning_effort,title,title_pinned,
-           forked_from_conversation_id,forked_until_seq,fork_request_id,fork_requested_until_seq
-         ) VALUES($1,$2,$3,'creating',$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [
-          targetId,
-          actor.userId,
-          `mio-${targetId}`,
-          selection ? JSON.stringify(selection) : null,
-          source.purpose,
-          source.reasoning_effort,
-          source.title,
-          source.title_pinned,
-          id,
-          cutoff,
-          requestId,
-          requestedSeq ?? null,
-        ],
-      );
-      return { sourceSessionId: source.dsh_session_id, targetId };
+      this.assertActive();
+      return this.transaction(async (client) => {
+        this.assertPrepared(source, await this.readOwned(actor, id, client));
+        const targetId = createId();
+        const binding = source.model_binding;
+        const selection = binding && {
+          providerConfigId: binding.providerConfigId,
+          modelRef: binding.modelRef,
+          modelKey: binding.modelKey,
+          modelId: binding.modelId,
+          protocol: binding.protocol,
+        };
+        await client.query(
+          `INSERT INTO mio_conversations(
+             id,owner_id,dsh_session_id,state,model_binding,purpose,reasoning_effort,title,title_pinned,
+             forked_from_conversation_id,forked_until_seq,fork_request_id,fork_requested_until_seq
+           ) VALUES($1,$2,$3,'creating',$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            targetId,
+            actor.userId,
+            `mio-${targetId}`,
+            selection ? JSON.stringify(selection) : null,
+            source.purpose,
+            source.reasoning_effort,
+            source.title,
+            source.title_pinned,
+            id,
+            cutoff,
+            requestId,
+            requestedSeq ?? null,
+          ],
+        );
+        return { sourceSessionId: source.dsh_session_id, targetId };
+      });
     });
   }
   /** Serialize native retries on the target, leaving the source free to receive a new turn. */
@@ -254,19 +301,25 @@ export class ConversationStore {
     targetId: string,
     materialize: (nativeId: string, cutoff: number, selection?: ChatSelection) => Promise<void>,
   ): Promise<{ conversation: Conversation; created: boolean }> {
-    return this.transaction(async (client) => {
-      const target = await this.readOwned(actor, targetId, client);
+    return this.inConversationOrder(targetId, async () => {
+      const target = await this.transaction((client) => this.readOwned(actor, targetId, client));
       if (target.state !== 'creating')
         return { conversation: projectConversation(target), created: false };
       if (target.forked_until_seq === null)
         throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNKNOWN');
+      this.assertActive();
       await materialize(
         target.dsh_session_id,
         Number(target.forked_until_seq),
         target.model_binding ?? undefined,
       );
-      await client.query("UPDATE mio_conversations SET state='ready' WHERE id=$1", [targetId]);
-      return { conversation: projectConversation({ ...target, state: 'ready' }), created: true };
+      this.assertActive();
+      return this.transaction(async (client) => {
+        const current = await this.readOwned(actor, targetId, client);
+        this.assertPrepared(target, current);
+        await client.query("UPDATE mio_conversations SET state='ready' WHERE id=$1", [targetId]);
+        return { conversation: projectConversation({ ...current, state: 'ready' }), created: true };
+      });
     });
   }
   async selectModel(
@@ -275,8 +328,8 @@ export class ConversationStore {
     modelRef: string,
     select: (row: Readonly<ConversationRow>) => Promise<ChatSelection>,
   ): Promise<Conversation> {
-    return this.transaction(async (client) => {
-      const row = await this.readOwned(actor, id, client);
+    return this.inConversationOrder(id, async () => {
+      const row = await this.transaction((client) => this.readOwned(actor, id, client));
       requireUnarchived(row);
       if (
         row.model_binding &&
@@ -288,12 +341,18 @@ export class ConversationStore {
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
       if (row.state !== 'ready')
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
-      row.model_binding = await select(row);
-      await client.query('UPDATE mio_conversations SET model_binding=$2::jsonb WHERE id=$1', [
-        id,
-        JSON.stringify(row.model_binding),
-      ]);
-      return projectConversation(row);
+      this.assertActive();
+      const selection = await select(row);
+      this.assertActive();
+      return this.transaction(async (client) => {
+        const current = await this.readOwned(actor, id, client);
+        this.assertPrepared(row, current);
+        await client.query('UPDATE mio_conversations SET model_binding=$2::jsonb WHERE id=$1', [
+          id,
+          JSON.stringify(selection),
+        ]);
+        return projectConversation({ ...current, model_binding: selection });
+      });
     });
   }
   async rename(
@@ -301,37 +360,47 @@ export class ConversationStore {
     id: string,
     writeNative: (row: Readonly<ConversationRow>) => Promise<string>,
   ): Promise<Conversation> {
-    return this.transaction(async (client) => {
-      const row = await this.readOwned(actor, id, client);
+    return this.inConversationOrder(id, async () => {
+      const row = await this.transaction((client) => this.readOwned(actor, id, client));
       requireUnarchived(row);
-      row.title = await writeNative(row);
       this.assertActive();
-      await client.query('UPDATE mio_conversations SET title=$2,title_pinned=true WHERE id=$1', [
-        id,
-        row.title,
-      ]);
-      return projectConversation(row);
+      const title = await writeNative(row);
+      this.assertActive();
+      return this.transaction(async (client) => {
+        const current = await this.readOwned(actor, id, client);
+        this.assertPrepared(row, current);
+        await client.query('UPDATE mio_conversations SET title=$2,title_pinned=true WHERE id=$1', [
+          id,
+          title,
+        ]);
+        return projectConversation({ ...current, title });
+      });
     });
   }
   async archive(actor: Principal, id: string): Promise<ConversationArchive> {
-    return this.transaction(async (client) => {
-      const row = await this.readOwned(actor, id, client);
-      if (row.archived_at) return { id, archivedAt: row.archived_at.toISOString() };
-      if (row.active_request || row.state === 'creating')
-        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
-      const { rows } = await client.query<{ archived_at: Date }>(
-        'UPDATE mio_conversations SET archived_at=clock_timestamp() WHERE id=$1 RETURNING archived_at',
-        [id],
-      );
-      return { id, archivedAt: rows[0]!.archived_at.toISOString() };
-    });
+    return this.inConversationOrder(id, () =>
+      this.transaction(async (client) => {
+        const row = await this.readOwned(actor, id, client);
+        if (row.archived_at) return { id, archivedAt: row.archived_at.toISOString() };
+        if (row.active_request || row.state === 'creating')
+          throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+        const { rows } = await client.query<{ archived_at: Date }>(
+          'UPDATE mio_conversations SET archived_at=clock_timestamp() WHERE id=$1 RETURNING archived_at',
+          [id],
+        );
+        return { id, archivedAt: rows[0]!.archived_at.toISOString() };
+      }),
+    );
   }
   async setReady(id: string, ready: boolean): Promise<void> {
-    this.assertActive();
-    await this.pool.query('UPDATE mio_conversations SET state=$2 WHERE id=$1', [
-      id,
-      ready ? 'ready' : 'unknown',
-    ]);
+    return this.inConversationOrder(id, () =>
+      this.transaction(async (client) => {
+        await client.query('UPDATE mio_conversations SET state=$2 WHERE id=$1', [
+          id,
+          ready ? 'ready' : 'unknown',
+        ]);
+      }),
+    );
   }
   async owned(actor: Principal, id: string): Promise<ConversationRow> {
     this.assertActive();
@@ -345,8 +414,8 @@ export class ConversationStore {
     resolve: (voiceRef: string) => Promise<{ voiceRef: string; name: string }>,
     requestId?: string,
   ): Promise<AudioSelection> {
-    return this.transaction(async (client) => {
-      const row = await this.readOwned(actor, id, client);
+    return this.inConversationOrder(id, async () => {
+      const row = await this.transaction((client) => this.readOwned(actor, id, client));
       requireUnarchived(row);
       if (row.state !== 'ready')
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
@@ -357,15 +426,20 @@ export class ConversationStore {
       const previous = row.audio_selection ?? emptyAudioSelection;
       if (previous.revision !== expectedRevision)
         throw new ConversationError(HTTP_STATUS.CONFLICT, 'AUDIO_SELECTION_CONFLICT');
+      this.assertActive();
       const selected = await resolve(voiceRef);
-      if (selected.voiceRef === previous.voiceRef && selected.name === previous.name)
-        return previous;
-      const selection = { ...selected, revision: previous.revision + 1 };
-      await client.query('UPDATE mio_conversations SET audio_selection=$2::jsonb WHERE id=$1', [
-        id,
-        JSON.stringify(selection),
-      ]);
-      return selection;
+      this.assertActive();
+      return this.transaction(async (client) => {
+        this.assertPrepared(row, await this.readOwned(actor, id, client));
+        if (selected.voiceRef === previous.voiceRef && selected.name === previous.name)
+          return previous;
+        const selection = { ...selected, revision: previous.revision + 1 };
+        await client.query('UPDATE mio_conversations SET audio_selection=$2::jsonb WHERE id=$1', [
+          id,
+          JSON.stringify(selection),
+        ]);
+        return selection;
+      });
     });
   }
   async list(
@@ -456,6 +530,26 @@ export class ConversationStore {
       receipt: row.latest && receipt(row.latest),
     };
   }
+  private async readReception(
+    actor: Principal,
+    id: string,
+    requestId: string,
+    digest: string,
+    client: PoolClient,
+  ) {
+    const row = await this.readOwned(actor, id, client);
+    const old = (await client.query<RequestRow>(replayRequest, [id, requestId])).rows[0];
+    if (old && old.digest !== digest)
+      throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
+    if (!old) {
+      requireUnarchived(row);
+      if (row.state !== 'ready')
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
+      if (row.active_request)
+        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+    }
+    return { row, old };
+  }
   async receive(
     actor: Principal,
     id: string,
@@ -464,20 +558,17 @@ export class ConversationStore {
     resolveFresh: (row: Readonly<ConversationRow>) => Promise<RequestModelSnapshot | undefined>,
     resolveAudio?: (row: Readonly<ConversationRow>) => Promise<FrozenAudioContext | undefined>,
   ) {
-    return this.transaction(async (client) => {
-      const row = await this.readOwned(actor, id, client);
-      const old = (await client.query<RequestRow>(replayRequest, [id, requestId])).rows[0];
-      if (old && old.digest !== digest)
-        throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
-      if (old) return { row, receipt: receipt(old), fresh: false };
-      requireUnarchived(row);
-      if (row.state !== 'ready')
-        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_UNKNOWN');
-      if (row.active_request)
-        throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
+    return this.inConversationOrder(id, async () => {
+      const prepared = await this.transaction((client) =>
+        this.readReception(actor, id, requestId, digest, client),
+      );
+      const { row } = prepared;
+      if (prepared.old) return { row, receipt: receipt(prepared.old), fresh: false };
       this.assertActive();
       const snapshot = await resolveFresh(row);
+      this.assertActive();
       const audioContext = await resolveAudio?.(row);
+      this.assertActive();
       // Only explicit non-secret fields may cross the persistence boundary.
       const binding = snapshot
         ? {
@@ -498,24 +589,35 @@ export class ConversationStore {
               : {}),
           }
         : null;
-      const accepted = (
-        await client.query<ReceiptRow>(
-          `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding,audio_context)
-           VALUES($1,$2,$3,'accepted',$4::jsonb,$5::jsonb) RETURNING ${receiptColumns}`,
-          [
-            id,
-            requestId,
-            digest,
-            binding ? JSON.stringify(binding) : null,
-            audioContext ? JSON.stringify(audioContext) : null,
-          ],
-        )
-      ).rows[0]!;
-      await client.query('UPDATE mio_conversations SET active_request=$2 WHERE id=$1', [
-        id,
-        requestId,
-      ]);
-      return { row, receipt: receipt(accepted), fresh: true, snapshot, audioContext };
+      return this.transaction(async (client) => {
+        const current = await this.readReception(actor, id, requestId, digest, client);
+        if (current.old) return { row: current.row, receipt: receipt(current.old), fresh: false };
+        this.assertPrepared(row, current.row);
+        const accepted = (
+          await client.query<ReceiptRow>(
+            `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding,audio_context)
+             VALUES($1,$2,$3,'accepted',$4::jsonb,$5::jsonb) RETURNING ${receiptColumns}`,
+            [
+              id,
+              requestId,
+              digest,
+              binding ? JSON.stringify(binding) : null,
+              audioContext ? JSON.stringify(audioContext) : null,
+            ],
+          )
+        ).rows[0]!;
+        await client.query('UPDATE mio_conversations SET active_request=$2 WHERE id=$1', [
+          id,
+          requestId,
+        ]);
+        return {
+          row: current.row,
+          receipt: receipt(accepted),
+          fresh: true,
+          snapshot,
+          audioContext,
+        };
+      });
     });
   }
   async observe(id: string, requestId: string, observation: ModelObservation): Promise<void> {
@@ -538,15 +640,18 @@ export class ConversationStore {
     eventTimeMs: number,
     autoTitle?: string | null,
   ): Promise<void> {
-    this.assertActive();
-    // The native event's time is stable across repeated callbacks. A stale fallback cannot replace a pin.
-    await this.pool.query(
-      `UPDATE mio_conversations
+    return this.inConversationOrder(id, () =>
+      this.transaction(async (client) => {
+        // The native event's time is stable across repeated callbacks. A stale fallback cannot replace a pin.
+        await client.query(
+          `UPDATE mio_conversations
        SET updated_at=GREATEST(updated_at, $3::timestamptz),
            title=CASE WHEN title IS NULL AND NOT title_pinned THEN $4::text ELSE title END
        WHERE id=$1 AND active_request=$2
          AND (updated_at<$3::timestamptz OR (title IS NULL AND NOT title_pinned AND $4::text IS NOT NULL))`,
-      [id, requestId, new Date(eventTimeMs).toISOString(), autoTitle ?? null],
+          [id, requestId, new Date(eventTimeMs).toISOString(), autoTitle ?? null],
+        );
+      }),
     );
   }
   /** Reconcile a lost reception acknowledgment only when this process has not started that request. */
@@ -556,45 +661,26 @@ export class ConversationStore {
     requestId: string,
     digest: string,
   ): Promise<void> {
-    this.assertActive();
-    const client = await this.pool.connect();
-    let discard = false;
-    const disconnected = () => {
-      discard = true;
-    };
-    // The pool handles errors only while this client is idle.
-    client.on('error', disconnected);
-    try {
-      await client.query('BEGIN');
-      const owned = await client.query(
-        'SELECT id FROM mio_conversations WHERE id=$1 AND owner_id=$2 FOR UPDATE',
-        [id, actor.userId],
-      );
-      if (owned.rowCount) {
-        const changed = await client.query(
-          `UPDATE mio_conversation_requests SET status='unknown',error_code='RECEPTION_UNKNOWN',updated_at=now() WHERE conversation_id=$1 AND request_id=$2 AND digest=$3 AND status IN ('accepted','input-persisted') RETURNING request_id`,
-          [id, requestId, digest],
+    return this.inConversationOrder(id, () =>
+      this.transaction(async (client) => {
+        const owned = await client.query(
+          'SELECT id FROM mio_conversations WHERE id=$1 AND owner_id=$2 FOR UPDATE',
+          [id, actor.userId],
         );
-        if (changed.rowCount)
-          await client.query(
-            'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
-            [id, requestId],
+        this.assertActive();
+        if (owned.rowCount) {
+          const changed = await client.query(
+            `UPDATE mio_conversation_requests SET status='unknown',error_code='RECEPTION_UNKNOWN',updated_at=now() WHERE conversation_id=$1 AND request_id=$2 AND digest=$3 AND status IN ('accepted','input-persisted') RETURNING request_id`,
+            [id, requestId, digest],
           );
-      }
-      await client.query('COMMIT');
-    } catch (error) {
-      if (!discard) {
-        try {
-          await client.query('ROLLBACK');
-        } catch {
-          discard = true;
+          if (changed.rowCount)
+            await client.query(
+              'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
+              [id, requestId],
+            );
         }
-      }
-      throw error;
-    } finally {
-      client.removeListener('error', disconnected);
-      client.release(discard);
-    }
+      }),
+    );
   }
   async finish(
     id: string,
@@ -603,55 +689,36 @@ export class ConversationStore {
     error?: string,
     truncationReason?: typeof outputTruncation.reason,
   ): Promise<Receipt> {
-    this.assertActive();
-    const client = await this.pool.connect();
-    let discard = false;
-    const disconnected = () => {
-      discard = true;
-    };
-    // The pool handles errors only while this client is idle.
-    client.on('error', disconnected);
-    try {
-      await client.query('BEGIN');
-      // Match the conversation-first lock order in receive() and reconcileReception().
-      await client.query('SELECT id FROM mio_conversations WHERE id=$1 FOR UPDATE', [id]);
-      const changed = (
-        await client.query<ReceiptRow>(
-          `UPDATE mio_conversation_requests SET status=$3,error_code=$4,truncation_reason=$5,updated_at=now()
+    return this.inConversationOrder(id, () =>
+      this.transaction(async (client) => {
+        // Match the conversation-first lock order in receive() and reconcileReception().
+        await client.query('SELECT id FROM mio_conversations WHERE id=$1 FOR UPDATE', [id]);
+        this.assertActive();
+        const changed = (
+          await client.query<ReceiptRow>(
+            `UPDATE mio_conversation_requests SET status=$3,error_code=$4,truncation_reason=$5,updated_at=now()
            WHERE conversation_id=$1 AND request_id=$2 AND status IN ('accepted','input-persisted')
            RETURNING ${receiptColumns}`,
-          [id, requestId, status, error ?? null, truncationReason ?? null],
-        )
-      ).rows[0];
-      if (changed)
-        await client.query(
-          'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
-          [id, requestId],
-        );
-      const row =
-        changed ??
-        (
-          await client.query<ReceiptRow>(
-            `SELECT ${receiptColumns} FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2`,
-            [id, requestId],
+            [id, requestId, status, error ?? null, truncationReason ?? null],
           )
         ).rows[0];
-      if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'REQUEST_NOT_FOUND');
-      await client.query('COMMIT');
-      return receipt(row);
-    } catch (error) {
-      if (!discard) {
-        try {
-          await client.query('ROLLBACK');
-        } catch {
-          discard = true;
-        }
-      }
-      throw error;
-    } finally {
-      client.removeListener('error', disconnected);
-      client.release(discard);
-    }
+        if (changed)
+          await client.query(
+            'UPDATE mio_conversations SET active_request=NULL WHERE id=$1 AND active_request=$2',
+            [id, requestId],
+          );
+        const row =
+          changed ??
+          (
+            await client.query<ReceiptRow>(
+              `SELECT ${receiptColumns} FROM mio_conversation_requests WHERE conversation_id=$1 AND request_id=$2`,
+              [id, requestId],
+            )
+          ).rows[0];
+        if (!row) throw new ConversationError(HTTP_STATUS.NOT_FOUND, 'REQUEST_NOT_FOUND');
+        return receipt(row);
+      }),
+    );
   }
   /** Read back a committed receipt before attempting to settle an unresolved execution. */
   async reconcileExecution(actor: Principal, id: string, requestId: string): Promise<Receipt> {

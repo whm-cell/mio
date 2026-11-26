@@ -21,7 +21,7 @@ const currentProvider = `c.enabled AND c.credential_auth_state<>'rejected'
   AND c.catalog_credential_version=c.credential_version`;
 
 function currentModelRoute(whitelist: boolean) {
-  return `m.provider_id=c.id AND m.membership_state='current'
+  return `m.membership_state='current'
     AND m.catalog_version=c.catalog_version AND m.credential_version=c.credential_version
     AND m.unavailable_reason IS NULL AND r.enabled AND r.vendor='minimax'
     AND r.classification='voice' AND r.edit_path IS NULL AND r.query_path_template IS NULL
@@ -31,32 +31,39 @@ function currentModelRoute(whitelist: boolean) {
       AND p.model_key=m.model_key AND p.usage='voice' AND NOT p.enabled)`;
 }
 
-const routeJoin = `FROM mio_provider_models m JOIN mio_provider_model_routes r
+const routeJoin = `JOIN mio_provider_model_routes r
   ON r.raw_model_id=m.raw_model_id COLLATE "C" AND r.provider_type=c.provider_type
   LEFT JOIN mio_provider_catalog_models cat
   ON cat.provider_type=c.provider_type AND cat.raw_model_id=m.raw_model_id COLLATE "C"`;
 
-function currentDynamicCatalog(whitelist: boolean) {
-  return `(s.credential_version=c.credential_version AND s.catalog_version=c.catalog_version
-    AND v.seen_seq=s.succeeded_seq AND EXISTS(SELECT 1 ${routeJoin}
-      WHERE ${currentModelRoute(whitelist)} AND m.model_key=s.model_key
-      AND m.raw_model_id=s.raw_model_id AND r.declaration_version=s.declaration_version
-      AND r.operation='${VOICE_OPERATION}' AND r.driver='${VOICE_DRIVER}'
-      AND r.submit_path='${VOICE_PATH}' AND r.param_spec='{}'::jsonb))`;
+/** Both readers bind owner at $1; owned builds any exact predicate from its local bind slots. */
+function routeReadiness(whitelist: boolean, exact = '') {
+  return `WITH owned_provider AS MATERIALIZED (
+    SELECT id,owner_id,provider_type,enabled,credential_auth_state,catalog_credential_version,
+      credential_version,catalog_version FROM mio_provider_configs WHERE owner_id=$1
+  ), tts_models AS MATERIALIZED (
+    SELECT m.provider_id,m.model_key FROM owned_provider c
+    JOIN mio_provider_models m ON m.provider_id=c.id ${routeJoin}
+    WHERE ${currentModelRoute(whitelist)} ${exact}
+      AND r.operation='${AUDIO_ROUTES.tts.operation}' AND r.driver='${AUDIO_ROUTES.tts.driver}'
+      AND r.submit_path='${AUDIO_ROUTES.tts.path}'
+  ), dynamic_catalog_ready AS MATERIALIZED (
+    SELECT s.provider_id,s.succeeded_seq FROM owned_provider c
+    JOIN mio_provider_voice_catalogs s ON s.provider_id=c.id
+    WHERE s.credential_version=c.credential_version AND s.catalog_version=c.catalog_version
+      AND EXISTS(SELECT 1 FROM mio_provider_models m ${routeJoin}
+        WHERE m.provider_id=c.id AND ${currentModelRoute(whitelist)}
+          AND m.model_key=s.model_key AND m.raw_model_id=s.raw_model_id
+          AND r.declaration_version=s.declaration_version
+          AND r.operation='${VOICE_OPERATION}' AND r.driver='${VOICE_DRIVER}'
+          AND r.submit_path='${VOICE_PATH}' AND r.param_spec='{}'::jsonb)
+  )`;
 }
 
-/** Exact-model checks are supplied by callers that already resolved a TTS admission. */
-export function currentTtsRoute(whitelist: boolean, exact = false) {
-  return `(${currentProvider} AND EXISTS(SELECT 1 ${routeJoin}
-    WHERE ${currentModelRoute(whitelist)}
-    AND (v.registration_model_key IS NULL OR m.model_key=v.registration_model_key)
-    ${exact ? 'AND m.model_key=$3 AND r.declaration_version=$7' : ''}
-    AND r.operation='${AUDIO_ROUTES.tts.operation}' AND r.driver='${AUDIO_ROUTES.tts.driver}'
-    AND r.submit_path='${AUDIO_ROUTES.tts.path}'))`;
-}
-
-function voiceColumns(whitelist: boolean, exact = false) {
-  const tts = currentTtsRoute(whitelist, exact);
+function voiceColumns() {
+  const tts = `(${currentProvider} AND EXISTS(SELECT 1 FROM tts_models m
+    WHERE m.provider_id=c.id
+      AND (v.registration_model_key IS NULL OR m.model_key=v.registration_model_key)))`;
   return `v.id,v.upstream_id,v.source,v.name,v.descriptions,v.favorite,v.preview_asset_id,v.registration_model_key,
     ${tts} AS generation_available,
     COALESCE(v.present AND ${currentProvider} AND (CASE WHEN v.source='system' THEN ${tts}
@@ -64,14 +71,15 @@ function voiceColumns(whitelist: boolean, exact = false) {
         AND cj.kind='clone' AND cj.owner_id=c.owner_id AND cj.upstream_voice_id=v.upstream_id
         AND cj.admission->>'providerConfigId'=c.id::text
         AND cj.admission->>'credentialVersion'=c.credential_version::text)
-        OR ${currentDynamicCatalog(whitelist)} END),false) AS available,
+        OR EXISTS(SELECT 1 FROM dynamic_catalog_ready s
+          WHERE s.provider_id=c.id AND v.seen_seq=s.succeeded_seq) END),false) AS available,
     to_char(v.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
     to_char(v.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time`;
 }
 
 export function createVoiceStore(query: VoiceQuery, whitelist = false) {
-  const columns = voiceColumns(whitelist);
-  const exactColumns = voiceColumns(whitelist, true);
+  const columns = voiceColumns();
+  const readiness = routeReadiness(whitelist);
   return {
     async localCount(owner: string) {
       const row = (
@@ -90,12 +98,13 @@ export function createVoiceStore(query: VoiceQuery, whitelist = false) {
       // Page and freshness come from one MVCC statement; no window of cross-credential readiness.
       const row = (
         await query<{ catalog: VoiceCatalogState; items: VoiceRow[]; total: number }>(
-          `SELECT jsonb_build_object('status',CASE WHEN tally.catalog_total>0 THEN 'connected' ELSE 'empty' END,
+          `${readiness}
+         SELECT jsonb_build_object('status',CASE WHEN tally.catalog_total>0 THEN 'connected' ELSE 'empty' END,
           'errorCode',NULL,'succeededAt',tally.updated_at,'current',tally.catalog_total>0,
           'stale',false) AS catalog,
           COALESCE(page.items,'[]'::jsonb) AS items
           ,tally.total
-         FROM mio_provider_configs c LEFT JOIN mio_provider_voice_catalogs s ON s.provider_id=c.id
+         FROM owned_provider c
          LEFT JOIN LATERAL (SELECT count(*)::integer AS catalog_total,max(v.updated_at) AS updated_at,
            count(*) FILTER (WHERE ($2::text='' OR v.name ILIKE '%'||$2||'%' OR v.upstream_id ILIKE '%'||$2||'%'
                OR EXISTS(SELECT 1 FROM jsonb_array_elements_text(v.descriptions) d WHERE d ILIKE '%'||$2||'%'))
@@ -127,23 +136,24 @@ export function createVoiceStore(query: VoiceQuery, whitelist = false) {
       );
     },
     async owned(owner: string, id: string, admission?: AudioAdmission) {
+      const values: unknown[] = [owner, id];
+      const bind = (value: unknown) => `$${values.push(value)}`;
+      const exact = admission
+        ? `AND m.model_key=${bind(admission.modelKey)}::uuid
+           AND r.declaration_version=${bind(admission.adaptationVersion)}::integer`
+        : '';
+      const provider = admission
+        ? `AND c.id=${bind(admission.providerConfigId)}::uuid
+           AND c.credential_version=${bind(admission.credentialVersion)}::integer
+           AND c.catalog_version=${bind(admission.catalogVersion)}::integer`
+        : '';
       const row = (
         await query<VoiceRow>(
-          `SELECT ${admission ? exactColumns : columns}
-         FROM mio_provider_voices v JOIN mio_provider_configs c ON c.id=v.provider_id
-         LEFT JOIN mio_provider_voice_catalogs s ON s.provider_id=c.id
-         WHERE c.owner_id=$1 AND v.id=$2${admission ? ` AND c.id=$4 AND c.credential_version=$5 AND c.catalog_version=$6` : ''}`,
-          admission
-            ? [
-                owner,
-                id,
-                admission.modelKey,
-                admission.providerConfigId,
-                admission.credentialVersion,
-                admission.catalogVersion,
-                admission.adaptationVersion,
-              ]
-            : [owner, id],
+          `${routeReadiness(whitelist, exact)}
+         SELECT ${columns}
+         FROM mio_provider_voices v JOIN owned_provider c ON c.id=v.provider_id
+         WHERE c.owner_id=$1 AND v.id=$2 ${provider}`,
+          values,
         )
       ).rows[0];
       if (!row || (admission && (!row.available || !row.generation_available)))

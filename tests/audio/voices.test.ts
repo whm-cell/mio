@@ -253,6 +253,115 @@ it('requires a current TTS route before a system voice can be selected', async (
   });
 });
 
+it('binds each exact admission dimension independently and rejects a changed route declaration', async () => {
+  const f = await fixture();
+  const voice = (await f.list()).items[0]!;
+  const admission = await f.service.snapshotAudio(f.actor, f.modelRef, 'tts');
+  await expect(
+    f.store.voices.owned(f.actor.userId, voice.voiceRef, admission),
+  ).resolves.toMatchObject({
+    available: true,
+    generation_available: true,
+  });
+  for (const changed of [
+    { modelKey: randomUUID() },
+    { providerConfigId: randomUUID() },
+    { credentialVersion: admission.credentialVersion + 1 },
+    { catalogVersion: admission.catalogVersion + 1 },
+    { adaptationVersion: admission.adaptationVersion + 1 },
+  ]) {
+    await expect(
+      f.store.voices.owned(f.actor.userId, voice.voiceRef, { ...admission, ...changed }),
+    ).rejects.toThrow('VOICE_NOT_FOUND');
+  }
+  await f.store.importRoutes({ ...f.ttsRoute, sourceVersion: 'changed-declaration' });
+  await expect(f.store.voices.owned(f.actor.userId, voice.voiceRef, admission)).rejects.toThrow(
+    'VOICE_NOT_FOUND',
+  );
+  expect((await f.list()).items[0]).toMatchObject({ available: true, generationAvailable: true });
+  expect(f.calls).not.toHaveBeenCalled();
+});
+
+it('keeps clone evidence independent of a stale dynamic catalog and checks its ownership and credential', async () => {
+  const f = await fixture();
+  await f.seed([
+    { source: 'system', upstreamId: 'system' },
+    { source: 'voice_cloning', upstreamId: 'local-private' },
+    { source: 'voice_generation', upstreamId: 'catalog-private' },
+  ]);
+  const admission = await f.service.snapshotAudio(f.actor, f.modelRef, 'tts');
+  const jobId = randomUUID();
+  const evidence = {
+    providerConfigId: f.providerId,
+    credentialVersion: admission.credentialVersion,
+  };
+  await pool.query(
+    `INSERT INTO mio_audio_jobs(id,owner_id,request_id,digest,kind,status,input,admission,
+       upstream_voice_id,output_asset_id,output_key)
+     VALUES($1,$2,$3,'synthetic-clone','clone','ready','{}',$4::jsonb,'local-private',$5,'synthetic')`,
+    [jobId, f.actor.userId, randomUUID(), JSON.stringify(evidence), randomUUID()],
+  );
+  await pool.query(
+    `UPDATE mio_provider_voices SET local_clone_job_id=$2
+     WHERE provider_id=$1 AND upstream_id='local-private'`,
+    [f.providerId, jobId],
+  );
+  await pool.query(
+    `INSERT INTO mio_provider_voice_catalogs(provider_id,latest_seq,last_status,started_at,finished_at,
+       lease_until,succeeded_seq,succeeded_at,credential_version,catalog_version,model_key,raw_model_id,declaration_version)
+     VALUES($1,1,'connected',now(),now(),now(),1,now(),$2,$3,$4,$5,1)`,
+    [
+      f.providerId,
+      admission.credentialVersion,
+      admission.catalogVersion,
+      admission.modelKey,
+      admission.modelId,
+    ],
+  );
+  const voices = (await f.list()).items;
+  expect(voices.every((voice) => voice.available)).toBe(true);
+  const local = voices.find((voice) => voice.name === 'local-private')!;
+  const catalog = voices.find((voice) => voice.name === 'catalog-private')!;
+  await pool.query(
+    'UPDATE mio_provider_voice_catalogs SET declaration_version=2 WHERE provider_id=$1',
+    [f.providerId],
+  );
+  expect(await f.service.voices.get(f.actor.userId, catalog.voiceRef)).toMatchObject({
+    available: false,
+  });
+  expect(await f.service.voices.get(f.actor.userId, local.voiceRef)).toMatchObject({
+    available: true,
+  });
+  for (const [owner, upstream, proof] of [
+    [randomUUID(), 'local-private', evidence],
+    [f.actor.userId, 'another-voice', evidence],
+    [f.actor.userId, 'local-private', { ...evidence, providerConfigId: randomUUID() }],
+    [
+      f.actor.userId,
+      'local-private',
+      { ...evidence, credentialVersion: admission.credentialVersion + 1 },
+    ],
+  ]) {
+    await pool.query(
+      'UPDATE mio_audio_jobs SET owner_id=$2,upstream_voice_id=$3,admission=$4::jsonb WHERE id=$1',
+      [jobId, owner, upstream, JSON.stringify(proof)],
+    );
+    expect(await f.service.voices.get(f.actor.userId, local.voiceRef)).toMatchObject({
+      available: false,
+    });
+  }
+  await pool.query(
+    'UPDATE mio_audio_jobs SET owner_id=$2,upstream_voice_id=$3,admission=$4::jsonb WHERE id=$1',
+    [jobId, f.actor.userId, 'local-private', JSON.stringify(evidence)],
+  );
+  await f.store.importRoutes({ ...f.ttsRoute, enabled: false });
+  expect(await f.service.voices.get(f.actor.userId, local.voiceRef)).toMatchObject({
+    available: true,
+    generationAvailable: false,
+  });
+  expect(f.calls).not.toHaveBeenCalled();
+});
+
 it('refreshes the local directory idempotently without outbound requests', async () => {
   const f = await fixture();
   await expect(Promise.all([f.refresh(), f.refresh()])).resolves.toEqual([

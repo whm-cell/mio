@@ -2,7 +2,7 @@
 
 [API 导航](index.md)。本轮范围见[音频 PRD](../tasks/onelink-audio-generation/prd.md)，凭据、模型和迁移见[供应商规范](../providers.md)。标准配音与声音复刻需要 providers、Asset 和计算服务。缺少执行依赖时 operation 模型列表为空、任务入口返回 AUDIO_UNAVAILABLE。
 
-音频任务与作品记录使用 providers 数据库，样本读取与成品登记使用 Asset 数据库，两者可以分库。完整解码验证后先按固定 Asset ID 幂等登记成品，再在任务事务中发布作品记录和 ready 状态。若任一步失败，保留供应商输出检查点，仅恢复检测与保存。恢复不再次提交生成，也不在 providers 数据库创建或查询素材表。Asset 登记失败返回 AUDIO_STORAGE_UNAVAILABLE。检测失败保留具体检测错误码。
+音频任务与作品记录使用 providers 数据库，样本读取与成品登记使用 Asset 数据库，两者可以分库。完整解码验证后先按固定 Asset ID 幂等登记成品，再在任务事务中发布作品记录和 ready 状态。暂时性检测、存储或发布失败保留供应商输出检查点，仅恢复检测与保存；确定性输出失败按[执行和恢复](#执行和恢复)结束任务并清除 PG 内输出。恢复不再次提交生成，也不在 providers 数据库创建或查询素材表。Asset 登记失败返回 AUDIO_STORAGE_UNAVAILABLE。检测失败保留具体检测错误码。
 
 ## 本域共同约定
 
@@ -94,7 +94,7 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 
 错误：共同错误。未授权为 400 AUDIO_SAMPLE_AUTHORIZATION_REQUIRED，样本格式或时长无效为 400 AUDIO_SAMPLE_FORMAT_INVALID/AUDIO_SAMPLE_DURATION_INVALID，样本变化为 409 AUDIO_SAMPLE_CHANGED，供应商确认后缺少试听为 409 AUDIO_AUDITION_MISSING。上游被拒为 AUDIO_UPSTREAM_REJECTED，提交结果未知为 AUDIO_SUBMIT_UNKNOWN。
 
-副作用：检测后条件读取本人样本并核对 SHA-256，确保同一已验证原件为私有，再向 OneLink 提交一次复刻请求。上传、检测或落库失败只恢复后续步骤，不重复复刻供应商调用。
+副作用：检测后条件读取本人样本并核对 SHA-256，确保同一已验证原件为私有，再向 OneLink 提交一次复刻请求。上传、检测或落库的暂时性失败只恢复后续步骤，不重复复刻供应商调用。
 
 ## GET /api/v1/audio/jobs/{jobId}
 
@@ -114,7 +114,7 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 
 输入：路径 UUID jobId，正文必须为 {}。
 
-成功：200 返回恢复后的统一任务视图。只恢复已有音频或供应商 URL 的上传、检测和发布。
+成功：200 返回恢复后的统一任务视图。只恢复已有音频或供应商 URL 的上传、检测和发布。确定性失败或取消后的任务保持原终态及错误，不因输出已清理而重新解释为克隆缺试听。
 
 错误：unknown 为 409 AUDIO_SUBMIT_UNKNOWN，已知克隆缺试听为 409 AUDIO_AUDITION_MISSING。其余见本域共同约定。下载过期保留原身份和错误。
 
@@ -126,11 +126,11 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 
 输入：路径 UUID jobId，正文必须为 {}。
 
-成功：200 返回统一任务视图。queued 包括样本预检，取消可结束为 cancelled。已持久化提交意图时仅标 cancelRequested，已收到的结果仍可继续发布和恢复。
+成功：200 返回统一任务视图。queued 包括样本预检，取消可结束为 cancelled。materializing 已停滞且无处理租约（lease_id 为空）、有错误码时，取消结束为 cancelled 并清除 PG 内输出字节或临时地址；此前已标 cancelRequested 的同类任务也可完成取消。仍有租约的 materializing、submitted 和 unknown 仅标 cancelRequested，不把租约到期视为已释放。其余已收到的结果仍可继续发布和恢复；ready、failed、cancelled 保持原终态。
 
 错误：不存在与越权均 404 AUDIO_JOB_NOT_FOUND。其余见本域共同约定。
 
-副作用：先保存取消意图，不声称供应商已撤回。关闭页面不取消任务。停止回复另用会话 cancel。
+副作用：保存取消意图，或结束上述已停滞的本地后处理；不声称供应商已撤回，也不删除既有音色、COS 或 Asset。关闭页面不取消任务。停止回复另用会话 cancel。
 
 ## GET /api/v1/audio/records
 
@@ -159,5 +159,7 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 ### 执行和恢复
 
 供应商截止 180 秒，处理租期 30 分钟。输出最多 100 MiB，实测最多 3600 秒。 上传样本随签发响应发送 private ACL 头。新成品和试听显式写入 private ACL。恢复时仅对任务生成的固定对象键，以及归属、内容、大小和 ETag 均匹配的同一文件补齐私有权限。成功发布后清除 PG 内的输出字节或临时地址。检查点短暂失败时可重试本地保存，提交意图始终对应一次供应商 POST。submitted 过期转 unknown，queued 和 materializing 可以收回过期租期并按原身份继续。关闭时等待准入、调度和执行收束，再关闭媒体与数据库连接。
+
+materializing 中明确的 400 AUDIO_OUTPUT_INVALID、409 AUDIO_OUTPUT_MISMATCH 或 409 AUDIO_VOICE_CONFLICT 结束为 failed，保留原错误、上游确认事实及固定输出身份，清除 PG 内输出字节或临时地址。其他错误不按全部 400/409 一概终结；暂时性 503、提交结果未知及检查点丢确认仍沿原恢复边界。failed 不再占用任务并发名额，也不触发再次生成。清理 PG 输出不撤销供应商副作用，不删除已登记的音色或对象。
 
 输入错误包括AUDIO_TEXT_INVALID、AUDIO_PARAMETERS_INVALID、AUDIO_FORMAT_INVALID、AUDIO_SAMPLE_INVALID、AUDIO_SAMPLE_FORMAT_INVALID、AUDIO_SAMPLE_DURATION_INVALID、AUDIO_SAMPLE_AUTHORIZATION_REQUIRED。样本变化为409 AUDIO_SAMPLE_CHANGED。供应商拒绝为AUDIO_UPSTREAM_REJECTED，提交不确定为AUDIO_SUBMIT_UNKNOWN。媒体/存储错误保持脱敏与recoverable事实，未验证不发布ready。隔离测试与真实供应商验收分别报告。

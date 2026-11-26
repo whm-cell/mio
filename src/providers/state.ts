@@ -62,6 +62,31 @@ export const providerStateSQL = (includeVerifications = true) => `SELECT c.*,
       }
   FROM mio_provider_configs c WHERE c.owner_id=$1`;
 
+/** Private runtime projection: discovery.ids is public, unbounded history and is not used by admission. */
+export const providerModelStateSQL = `WITH config AS MATERIALIZED (
+  SELECT id,owner_id,provider_type,enabled,default_image_watermark,default_video_watermark,
+    revision,credential_version,cipher_format,master_key_id,nonce,ciphertext,auth_tag,
+    catalog_version,catalog_credential_version,catalog_succeeded_at,latest_refresh_seq,
+    last_attempt_seq,last_attempt_credential_version,last_attempt_started_at,last_attempt_finished_at,
+    last_attempt_status,last_attempt_error_code,credential_auth_state,NULL::jsonb AS discovery
+  FROM mio_provider_configs WHERE owner_id=$1
+), target AS MATERIALIZED (
+  SELECT m.* FROM mio_provider_models m WHERE m.provider_id=(SELECT id FROM config)
+    AND (m.model_key=$2::uuid OR m.raw_model_id=$3 COLLATE "C" OR m.legacy_ref=$4)
+  ORDER BY m.raw_model_id COLLATE "C",m.model_key LIMIT 1
+)
+SELECT c.*,
+  COALESCE((SELECT jsonb_agg(m) FROM target m),'[]') AS models,
+  COALESCE((SELECT jsonb_agg(p) FROM mio_provider_model_preferences p
+    WHERE p.provider_id=c.id AND p.model_key=(SELECT model_key FROM target)),'[]') AS preferences,
+  COALESCE((SELECT jsonb_agg(r ORDER BY r.raw_model_id COLLATE "C",r.operation)
+    FROM mio_provider_model_routes r WHERE r.provider_type=c.provider_type
+      AND r.raw_model_id=(SELECT raw_model_id FROM target) COLLATE "C"),'[]') AS routes,
+  COALESCE((SELECT jsonb_agg(cat ORDER BY cat.raw_model_id COLLATE "C")
+    FROM mio_provider_catalog_models cat WHERE cat.provider_type=c.provider_type
+      AND cat.raw_model_id=(SELECT raw_model_id FROM target) COLLATE "C"),'[]') AS catalog_models
+FROM config c`;
+
 export function providerView(row: ProviderRow): ProviderView {
   const current =
     row.catalog_version !== null && row.catalog_credential_version === row.credential_version;

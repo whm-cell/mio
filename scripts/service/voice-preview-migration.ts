@@ -7,7 +7,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { AssetRow } from '../../src/assets/store.ts';
 import { AssetStore } from '../../src/assets/store.ts';
 import { selectAudioModel } from '../../src/providers/audio-admission.ts';
-import { providerStateSQL } from '../../src/providers/state.ts';
+import { providerModelStateSQL } from '../../src/providers/state.ts';
 import type { ProviderState } from '../../src/providers/state.ts';
 
 const execFileAsync = promisify(execFile);
@@ -323,7 +323,9 @@ async function previewTarget(
   modelId: string,
   whitelist: boolean,
 ) {
-  const state = (await pool.query<ProviderState>(providerStateSQL(false), [ownerId])).rows[0];
+  const state = (
+    await pool.query<ProviderState>(providerModelStateSQL, [ownerId, null, modelId, null])
+  ).rows[0];
   if (!state) throw new Error('VOICE_PREVIEW_MODEL_UNAVAILABLE');
   const discovered = state.models.find((candidate) => candidate.raw_model_id === modelId);
   if (!discovered) throw new Error('VOICE_PREVIEW_MODEL_UNAVAILABLE');
@@ -451,7 +453,7 @@ async function bindPreviewVoice(
   await client.query('BEGIN');
   try {
     await client.query(
-      'SELECT id FROM mio_provider_configs WHERE id=$1 AND owner_id=$2 FOR UPDATE',
+      'SELECT id FROM mio_provider_configs WHERE id=$1 AND owner_id=$2 FOR SHARE',
       [plan.providerId, plan.ownerId],
     );
     const target = await previewTarget(client, plan.ownerId, plan.modelId, plan.whitelist);

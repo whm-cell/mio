@@ -83,19 +83,26 @@ it('omits verification aggregation only for fresh runtime snapshots and retains 
   await f.declare(chatRef);
   await f.store.importRoutes([findFixtureRoute('image-vidu-q2', 'image.generate')]);
   const states = vi.spyOn(f.store, 'state');
+  const points = vi.spyOn(f.store, 'modelState');
   const queries = vi.spyOn(Pool.prototype, 'query');
   try {
     const selected = await f.service.selectChat(f.actor, chatRef);
     const chat = await f.service.resolveChat(f.actor, selected);
     expect((await f.service.snapshotImage(f.actor, imageRef)).modelId).toBe('image-vidu-q2');
-    expect(states.mock.calls).toEqual(Array.from({ length: 3 }, () => [f.actor.userId, false]));
-    for (const result of states.mock.results)
+    expect(states).not.toHaveBeenCalled();
+    expect(points.mock.calls).toEqual([
+      [f.actor.userId, chatRef],
+      [f.actor.userId, chatRef],
+      [f.actor.userId, imageRef],
+    ]);
+    for (const result of points.mock.results)
       expect(await result.value).not.toHaveProperty('verifications');
     expect(queries).toHaveBeenCalledTimes(3);
     for (const [sql, args] of queries.mock.calls) {
-      expect(sql).toContain('c.owner_id=$1');
+      expect(sql).toContain('FROM mio_provider_configs WHERE owner_id=$1');
+      expect(sql).toContain('NULL::jsonb AS discovery');
       expect(sql).not.toContain('mio_provider_model_verifications');
-      expect(args).toEqual([f.actor.userId]);
+      expect(args).toEqual([f.actor.userId, expect.any(String), null, expect.any(String)]);
     }
     await f.store.recordVerification(f.actor.userId, chat, 'fixture:runtime-projection');
     expect(
@@ -118,6 +125,7 @@ it('omits verification aggregation only for fresh runtime snapshots and retains 
   } finally {
     queries.mockRestore();
     states.mockRestore();
+    points.mockRestore();
   }
 });
 
@@ -154,7 +162,11 @@ it.each(['empty', 'current', 'stale'] as const)(
       await f.store.recordVerification(f.actor.userId, snapshot, 'fixture:latest-observation');
       const stateReads = queries.mock.calls
         .map(([sql]) => sql)
-        .filter((sql): sql is string => typeof sql === 'string' && sql.startsWith('SELECT c.*,'));
+        .filter(
+          (sql): sql is string =>
+            typeof sql === 'string' &&
+            (sql.startsWith('SELECT c.*,') || sql.startsWith('WITH config AS MATERIALIZED')),
+        );
       expect(stateReads).toHaveLength(3);
       for (const sql of stateReads) expect(sql).not.toContain('mio_provider_model_verifications');
       const visible = await f.service.catalog(f.actor);

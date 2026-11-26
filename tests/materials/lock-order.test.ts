@@ -1,43 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
 import { expect, it, onTestFinished, vi } from 'vitest';
-import { MaterialStore } from '../../src/materials/store.ts';
-import { MaterialAuthStore } from '../../src/materials/auth-store.ts';
+import type { MaterialStore } from '../../src/materials/store.ts';
 import { createMaterialService } from '../../src/materials/service.ts';
 import { createMaterialUpstream } from '../../src/integrations/onelink/materials.ts';
-import { materialFixture } from './fixture.ts';
+import { blockedBy, materialFixture, peer } from './fixture.ts';
 import type { MaterialFixture } from './fixture.ts';
 
 async function fixture() {
   const f = await materialFixture();
   onTestFinished(() => f.close());
   return f;
-}
-
-function peer(f: MaterialFixture, role: string) {
-  const name = `${f.database.applicationName}_${role}`;
-  const url = new URL(f.database.url);
-  url.searchParams.set('application_name', name);
-  const pool = new Pool({ connectionString: url.toString(), max: 1, statement_timeout: 3000 });
-  const store = new MaterialStore(pool, new MaterialAuthStore(pool), false);
-  onTestFinished(() => store.close());
-  return { name, pool, store };
-}
-
-async function blockedBy(f: MaterialFixture, name: string, blocker: number) {
-  return vi.waitFor(
-    async () => {
-      const rows = (
-        await f.pool.query<{ pid: number }>(
-          'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND $2=ANY(pg_blocking_pids(pid))',
-          [name, blocker],
-        )
-      ).rows;
-      expect(rows).toHaveLength(1);
-      return rows[0]!.pid;
-    },
-    { timeout: 2500, interval: 10 },
-  );
 }
 
 function observed<T>(work: Promise<T>) {

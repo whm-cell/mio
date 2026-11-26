@@ -1,9 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
-import { expect, it, onTestFinished, vi } from 'vitest';
-import { materialFixture } from './fixture.ts';
-import { MaterialStore } from '../../src/materials/store.ts';
-import { MaterialAuthStore } from '../../src/materials/auth-store.ts';
+import { expect, it, onTestFinished } from 'vitest';
+import { blockedBy, materialFixture, peer } from './fixture.ts';
+import type { MaterialStore } from '../../src/materials/store.ts';
 import { materialSchemaSQL } from '../../src/materials/schema.ts';
 
 async function fixture() {
@@ -169,12 +167,7 @@ it('counts the selected group page in the same snapshot when a material commits 
     group = await f.create();
   f.add(group.upstreamId);
   await f.service.sync(f.actor, group.groupId);
-  const name = `${f.database.applicationName}_snapshot`;
-  const url = new URL(f.database.url);
-  url.searchParams.set('application_name', name);
-  const pool = new Pool({ connectionString: url.toString(), max: 1, statement_timeout: 3000 });
-  const reader = new MaterialStore(pool, new MaterialAuthStore(pool), false);
-  onTestFinished(() => reader.close());
+  const { name, store: reader } = peer(f, 'snapshot');
   // RLS applies only in this random fixture schema. Its SELECT policy pauses a real count
   // after PostgreSQL has established the statement snapshot; INSERT has an independent policy.
   await f.pool.query(
@@ -195,19 +188,7 @@ it('counts the selected group page in the same snapshot when a material commits 
       )
     ).rows[0]!.pid;
     pending = reader.groups(f.actor.userId, undefined, 10);
-    await vi.waitFor(
-      async () => {
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND $2=ANY(pg_blocking_pids(pid))',
-              [name, pid],
-            )
-          ).rows,
-        ).toHaveLength(1);
-      },
-      { timeout: 2500, interval: 10 },
-    );
+    await blockedBy(f, name, pid);
     await f.pool.query(
       "INSERT INTO mio_materials(id,owner_id,provider_type,group_id,asset_type,name,state,registration_credential_version) VALUES($1,$2,'onelink',$3,'image','Concurrent','active',1)",
       [randomUUID(), f.actor.userId, group.groupId],

@@ -64,9 +64,12 @@ export function createProviderAudioService(
   assertOpen: () => void,
 ) {
   const whitelist = Boolean(config.catalogWhitelist);
-  async function currentState(owner: string, includeVerifications = true) {
+  async function currentState(owner: string, includeVerifications = true, modelRef?: string) {
     assertOpen();
-    const state = await store.state(owner, includeVerifications);
+    const state =
+      modelRef === undefined
+        ? await store.state(owner, includeVerifications)
+        : await store.modelState(owner, modelRef);
     assertOpen();
     return state;
   }
@@ -119,7 +122,7 @@ export function createProviderAudioService(
       modelRef: string,
       operation: AudioOperation,
     ): Promise<AudioAdmission> {
-      const state = await currentState(actor.userId, false);
+      const state = await currentState(actor.userId, false, modelRef);
       if (!state) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
       const { model, adaptation } = selectAudioModel(state, modelRef, operation, whitelist);
       return {

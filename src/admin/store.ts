@@ -16,6 +16,7 @@ import type {
   PlatformRouteRevisionRecord,
 } from '../providers/contracts.ts';
 import { checkProviderSchema } from '../providers/schema.ts';
+import { deleteProviderRoutes } from '../providers/store.ts';
 import type { AdminConfig } from './config.ts';
 import { AdminError, SMS_BYPASS_CODE_PATTERN, isAuthSmsMode } from './contracts.ts';
 import type {
@@ -248,24 +249,19 @@ function createManagedPool(connectionString: string, name: string, max = 3): Poo
 
 async function materializeCuratedModelForActiveProviders(
   client: PoolClient,
-  rawModelId: string,
-  displayLabel: string | null,
+  models: readonly { rawModelId: string; displayLabel: string | null }[],
 ): Promise<void> {
   await client.query(
-    `INSERT INTO mio_provider_models (
-       provider_id, raw_model_id, supplier_metadata, metadata_source, membership_state
-     )
-     SELECT c.id, $1,
-       jsonb_build_object('object', 'model', 'curated', true, 'description', COALESCE($2::text, '')),
-       'admin-curated-hidden', 'historical'
-     FROM mio_provider_configs c
-     WHERE c.provider_type = 'onelink'
-       AND c.enabled = true
-       AND c.credential_auth_state <> 'rejected'
-       AND c.catalog_version IS NOT NULL
-       AND c.catalog_credential_version = c.credential_version
-     ON CONFLICT (provider_id, raw_model_id) DO NOTHING`,
-    [rawModelId, displayLabel],
+    `WITH active_providers AS MATERIALIZED (
+    SELECT id FROM mio_provider_configs WHERE provider_type='onelink' AND enabled=true
+      AND credential_auth_state<>'rejected' AND catalog_version IS NOT NULL
+      AND catalog_credential_version=credential_version
+  ) INSERT INTO mio_provider_models(provider_id,raw_model_id,supplier_metadata,metadata_source,membership_state)
+    SELECT c.id,i."rawModelId",jsonb_build_object('object','model','curated',true,'description',COALESCE(i."displayLabel",'')),
+      'admin-curated-hidden','historical' FROM active_providers c
+      CROSS JOIN jsonb_to_recordset($1::jsonb) AS i("rawModelId" text,"displayLabel" text)
+    ORDER BY c.id,i."rawModelId" COLLATE "C" ON CONFLICT(provider_id,raw_model_id) DO NOTHING`,
+    [JSON.stringify(models)],
   );
 }
 
@@ -865,78 +861,78 @@ export class AdminStore {
     overwriteMetadata: boolean,
   ): Promise<{ imported: number; updated: number; skipped: number }> {
     return this.transaction(async (client) => {
-      let imported = 0;
-      let updated = 0;
-      let skipped = 0;
+      type Item = (typeof items)[number];
+      const prepared = new Map<string, Item & { firstDisplayLabel: string | null }>();
       for (const item of items) {
-        const existing = (
-          await client.query<CatalogModelDbRow>(
-            `SELECT * FROM mio_provider_catalog_models
-             WHERE provider_type='onelink' AND raw_model_id=$1 COLLATE "C" FOR UPDATE`,
-            [item.rawModelId],
-          )
-        ).rows[0];
-        await client.query(
-          'DELETE FROM mio_admin_ignored_models WHERE provider_type=\'onelink\' AND raw_model_id=$1 COLLATE "C"',
-          [item.rawModelId],
-        );
-        if (!existing) {
-          await client.query(
-            `INSERT INTO mio_provider_catalog_models (
-               provider_type, raw_model_id, display_label, vendor_label, category, description,
-               supplier_metadata, user_visible, allow_undiscovered, call_notes, origin_source, updated_by
-             ) VALUES ('onelink', $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, 'onelink-import', $10)`,
-            [
-              item.rawModelId,
-              item.displayLabel,
-              item.vendorLabel,
-              item.category,
-              item.description,
-              JSON.stringify(item.supplierMetadata),
-              item.userVisible,
-              item.allowUndiscovered,
-              item.callNotes,
-              actor.username,
-            ],
-          );
-          if (item.allowUndiscovered && item.userVisible) {
-            await materializeCuratedModelForActiveProviders(
-              client,
-              item.rawModelId,
-              item.displayLabel,
-            );
-          }
-          imported += 1;
-        } else if (overwriteMetadata) {
-          await client.query(
-            `UPDATE mio_provider_catalog_models SET
-               display_label = COALESCE($2, display_label),
-               vendor_label = COALESCE($3, vendor_label),
-               category = COALESCE($4, category),
-               description = COALESCE($5, description),
-               supplier_metadata = $6::jsonb,
-               updated_by = $7,
-               updated_at = now()
-             WHERE provider_type='onelink' AND raw_model_id=$1 COLLATE "C"`,
-            [
-              item.rawModelId,
-              item.displayLabel,
-              item.vendorLabel,
-              item.category,
-              item.description,
-              JSON.stringify(item.supplierMetadata),
-              actor.username,
-            ],
-          );
-          updated += 1;
-        } else {
-          skipped += 1;
-        }
+        const first = prepared.get(item.rawModelId);
+        if (!first)
+          prepared.set(item.rawModelId, { ...item, firstDisplayLabel: item.displayLabel });
+        else if (overwriteMetadata)
+          prepared.set(item.rawModelId, {
+            ...first,
+            displayLabel: item.displayLabel ?? first.displayLabel,
+            vendorLabel: item.vendorLabel ?? first.vendorLabel,
+            category: item.category ?? first.category,
+            description: item.description ?? first.description,
+            supplierMetadata: item.supplierMetadata,
+          });
       }
+      const inputs = [...prepared.values()],
+        ids = [...prepared.keys()];
+      // Both importers insert/lock every catalog key in C order. WHERE false locks conflicts without rewriting them.
+      // Conflicting rows are locked in the same C order as new rows, without no-op MVCC updates.
+      const inserted = new Set(
+        (
+          await client.query<{ raw_model_id: string }>(
+            `INSERT INTO mio_provider_catalog_models (
+        provider_type,raw_model_id,display_label,vendor_label,category,description,supplier_metadata,
+        user_visible,allow_undiscovered,call_notes,origin_source,updated_by
+      ) SELECT 'onelink',i."rawModelId",i."displayLabel",i."vendorLabel",i.category,i.description,i."supplierMetadata",
+        i."userVisible",i."allowUndiscovered",i."callNotes",'onelink-import',$2
+        FROM jsonb_to_recordset($1::jsonb) AS i("rawModelId" text,"displayLabel" text,
+          "vendorLabel" text,category text,description text,"supplierMetadata" jsonb,
+          "userVisible" boolean,"allowUndiscovered" boolean,"callNotes" text)
+        ORDER BY i."rawModelId" COLLATE "C"
+        ON CONFLICT(provider_type,raw_model_id) DO UPDATE SET raw_model_id=EXCLUDED.raw_model_id WHERE false
+        RETURNING raw_model_id`,
+            [JSON.stringify(inputs), actor.username],
+          )
+        ).rows.map((row) => row.raw_model_id),
+      );
       await client.query(
-        `INSERT INTO mio_admin_audit_logs (
-           id, actor_id, actor_name, action, target_id, summary, after_state
-         ) VALUES ($1, $2, $3, 'models.import', 'onelink', $4, $5::jsonb)`,
+        `WITH locked AS MATERIALIZED (
+        SELECT raw_model_id FROM mio_admin_ignored_models WHERE provider_type='onelink' AND raw_model_id=ANY($1::text[])
+        ORDER BY raw_model_id COLLATE "C" FOR UPDATE
+      ) DELETE FROM mio_admin_ignored_models i USING locked l
+        WHERE i.provider_type='onelink' AND i.raw_model_id=l.raw_model_id COLLATE "C"`,
+        [ids],
+      );
+      const updates = overwriteMetadata
+        ? inputs.filter((item) => !inserted.has(item.rawModelId))
+        : [];
+      if (updates.length)
+        await client.query(
+          `UPDATE mio_provider_catalog_models c SET
+        display_label=COALESCE(i."displayLabel",c.display_label),vendor_label=COALESCE(i."vendorLabel",c.vendor_label),
+        category=COALESCE(i.category,c.category),description=COALESCE(i.description,c.description),
+        supplier_metadata=i."supplierMetadata",updated_by=$2,updated_at=now()
+        FROM jsonb_to_recordset($1::jsonb) AS i("rawModelId" text,"displayLabel" text,
+          "vendorLabel" text,category text,description text,"supplierMetadata" jsonb)
+        WHERE c.provider_type='onelink' AND c.raw_model_id=i."rawModelId" COLLATE "C"`,
+          [JSON.stringify(updates), actor.username],
+        );
+      const curated = inputs
+        .filter(
+          (item) => inserted.has(item.rawModelId) && item.allowUndiscovered && item.userVisible,
+        )
+        .map((item) => ({ rawModelId: item.rawModelId, displayLabel: item.firstDisplayLabel }));
+      if (curated.length) await materializeCuratedModelForActiveProviders(client, curated);
+      const imported = inserted.size,
+        updated = overwriteMetadata ? items.length - imported : 0,
+        skipped = overwriteMetadata ? 0 : items.length - imported;
+      await client.query(
+        `INSERT INTO mio_admin_audit_logs(id,actor_id,actor_name,action,target_id,summary,after_state)
+        VALUES($1,$2,$3,'models.import','onelink',$4,$5::jsonb)`,
         [
           createId(),
           actor.id,
@@ -946,7 +942,7 @@ export class AdminStore {
             imported,
             updated,
             skipped,
-            modelIds: items.slice(0, 50).map((i) => i.rawModelId),
+            modelIds: items.slice(0, 50).map((item) => item.rawModelId),
           }),
         ],
       );
@@ -977,10 +973,6 @@ export class AdminStore {
         )
       ).rows[0];
       if (existing) throw new AdminError(HTTP_STATUS.CONFLICT, 'MODEL_ALREADY_EXISTS');
-      await client.query(
-        'DELETE FROM mio_admin_ignored_models WHERE provider_type=\'onelink\' AND raw_model_id=$1 COLLATE "C"',
-        [input.rawModelId],
-      );
       const inserted = (
         await client.query<CatalogModelDbRow>(
           `INSERT INTO mio_provider_catalog_models (
@@ -1002,12 +994,14 @@ export class AdminStore {
           ],
         )
       ).rows[0]!;
+      await client.query(
+        'DELETE FROM mio_admin_ignored_models WHERE provider_type=\'onelink\' AND raw_model_id=$1 COLLATE "C"',
+        [input.rawModelId],
+      );
       if (input.allowUndiscovered && input.userVisible) {
-        await materializeCuratedModelForActiveProviders(
-          client,
-          input.rawModelId,
-          input.displayLabel,
-        );
+        await materializeCuratedModelForActiveProviders(client, [
+          { rawModelId: input.rawModelId, displayLabel: input.displayLabel },
+        ]);
       }
       await client.query(
         `INSERT INTO mio_admin_audit_logs (
@@ -1088,7 +1082,9 @@ export class AdminStore {
         )
       ).rows[0]!;
       if (nextAllowUndiscovered && nextUserVisible) {
-        await materializeCuratedModelForActiveProviders(client, input.rawModelId, nextDisplayLabel);
+        await materializeCuratedModelForActiveProviders(client, [
+          { rawModelId: input.rawModelId, displayLabel: nextDisplayLabel },
+        ]);
       }
       await client.query(
         `INSERT INTO mio_admin_audit_logs (
@@ -1108,24 +1104,15 @@ export class AdminStore {
     });
   }
 
-  async modelExistsInCatalog(rawModelId: string): Promise<boolean> {
-    const res = await this.pool.query(
-      'SELECT 1 FROM mio_provider_catalog_models WHERE provider_type=\'onelink\' AND raw_model_id=$1 COLLATE "C"',
-      [rawModelId],
-    );
-    return res.rows.length > 0;
-  }
-
   async deleteCatalogModel(
     actor: AdminAccountView,
     input: {
       rawModelId: string;
       ignoreFutureImports: boolean;
       summary: string | null;
-      deletedRoutesCount: number;
     },
-  ): Promise<void> {
-    await this.transaction(async (client) => {
+  ): Promise<number> {
+    return this.transaction(async (client) => {
       const before = (
         await client.query<CatalogModelDbRow>(
           `SELECT * FROM mio_provider_catalog_models
@@ -1134,6 +1121,12 @@ export class AdminStore {
         )
       ).rows[0];
       if (!before) throw new AdminError(HTTP_STATUS.NOT_FOUND, 'MODEL_NOT_FOUND');
+      const deletedRoutes = await deleteProviderRoutes(client, input.rawModelId, {
+        actorType: 'admin',
+        actorId: actor.id,
+        actorName: actor.username,
+        summary: input.summary ?? `Cascade delete routes for ${input.rawModelId}`,
+      });
       await client.query(
         'DELETE FROM mio_provider_catalog_models WHERE provider_type=\'onelink\' AND raw_model_id=$1 COLLATE "C"',
         [input.rawModelId],
@@ -1163,10 +1156,11 @@ export class AdminStore {
           JSON.stringify({
             deleted: true,
             ignoreFutureImports: input.ignoreFutureImports,
-            deletedRoutesCount: input.deletedRoutesCount,
+            deletedRoutesCount: deletedRoutes.length,
           }),
         ],
       );
+      return deletedRoutes.length;
     });
   }
 

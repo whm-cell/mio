@@ -518,7 +518,6 @@ async function startAssetHttpFixture(
     snapshotVideo,
     heads,
     inputBytes,
-    inputs,
     objects,
     probe,
     upstream,
@@ -1871,23 +1870,35 @@ describe('video asset admission over HTTP', () => {
       const job: VideoJobView = await accepted.json();
       expect(job).toMatchObject({ state: 'accepted', inputSnapshot: references });
       const persisted = await f.pool.query(
-        "SELECT command->'inputObjects' AS input_objects FROM mio_video_jobs WHERE id=$1",
+        "SELECT owner_id, command->'inputObjects' AS input_objects FROM mio_video_jobs WHERE id=$1",
         [job.id],
       );
-      expect(persisted.rows).toEqual([{ input_objects: frozen }]);
+      expect(persisted.rows).toEqual([{ owner_id: actor.userId, input_objects: frozen }]);
+      const heads = [image, audio].map(({ key }) => [key, expect.any(AbortSignal)]);
+      const reads = [image, audio].map(({ key, head }) => [
+        key,
+        head.etag,
+        head.size,
+        expect.any(Number),
+        expect.any(AbortSignal),
+      ]);
+      expect(f.objects.head.mock.calls).toEqual(heads);
+      expect(f.objects.readPrefix.mock.calls).toEqual(reads);
       expect(f.objects.materialUrl).not.toHaveBeenCalled();
       expect(f.upstream).not.toHaveBeenCalled();
 
-      const resolve = vi.spyOn(f.inputs, 'resolve');
       expect((await f.runNext()).id).toBe(job.id);
-      expect(resolve).toHaveBeenCalledExactlyOnceWith(
-        actor.userId,
-        references,
-        expect.any(AbortSignal),
-        frozen,
-      );
+      expect(f.objects.head.mock.calls).toEqual([...heads, ...heads]);
+      expect(f.objects.readPrefix.mock.calls).toEqual([...reads, ...reads]);
       expect(f.objects.materialUrl.mock.calls).toEqual([[image.key], [audio.key]]);
       expect(f.upstream).toHaveBeenCalledOnce();
+      const submittedHeads = f.objects.head.mock.invocationCallOrder.slice(heads.length);
+      const submittedReads = f.objects.readPrefix.mock.invocationCallOrder.slice(reads.length);
+      const [firstSignature, lastSignature] = f.objects.materialUrl.mock.invocationCallOrder;
+      for (const [index, head] of submittedHeads.entries())
+        expect(head).toBeLessThan(submittedReads[index]!);
+      expect(Math.max(...submittedReads)).toBeLessThan(firstSignature!);
+      expect(lastSignature!).toBeLessThan(f.upstream.mock.invocationCallOrder[0]!);
       const [endpoint, outbound] = f.upstream.mock.calls[0]!;
       expect(new URL(String(endpoint)).pathname).toBe('/volc/api/v3/contents/generations/tasks');
       expect(outbound?.method).toBe('POST');

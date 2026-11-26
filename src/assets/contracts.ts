@@ -62,12 +62,12 @@ export interface AssetObjectStore {
     source: string,
     target: string,
     etag: string,
-    acl?: 'private',
-    options?: { signal: AbortSignal } & (
+    acl: 'private' | undefined,
+    options: { signal: AbortSignal } & (
       { contentType: string; sha256: string } | { contentType?: never; sha256?: never }
     ),
   ): Promise<{ etag: string } | void>;
-  delete(key: string, signal?: AbortSignal): Promise<void>;
+  delete(key: string, signal: AbortSignal): Promise<void>;
 }
 
 /** Bound caller wait even when a HEAD implementation ignores the optional signal. */

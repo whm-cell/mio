@@ -338,23 +338,14 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
         stream.destroy();
       }
     },
-    async copy(source, target, etag, acl, options) {
+    async copy(
+      source,
+      target,
+      etag,
+      acl,
+      { signal, contentType = 'application/octet-stream', sha256 },
+    ) {
       const sourcePath = `${Bucket}.cos.${Region}.myqcloud.com/${encodeURIComponent(source)}`;
-      if (!options) {
-        await cos.putObjectCopy({
-          Bucket,
-          Region,
-          Key: target,
-          CopySource: sourcePath,
-          CopySourceIfMatch: etag,
-          MetadataDirective: 'Replaced',
-          ContentType: 'application/octet-stream',
-          ...(acl ? { ACL: acl } : {}),
-          Headers: { 'x-cos-forbid-overwrite': 'true' },
-        });
-        return;
-      }
-      const { signal, contentType = 'application/octet-stream', sha256 } = options;
       const copied = await requestWithoutBody(target, 'PUT', signal, {
         'Content-Type': contentType,
         'x-cos-copy-source': sourcePath,
@@ -376,15 +367,11 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       return { etag: copiedEtag };
     },
     async delete(Key, signal) {
-      if (!signal) {
-        await cos.deleteObject({ Bucket, Region, Key });
-        return;
-      }
       try {
         await requestWithoutBody(Key, 'DELETE', signal);
       } catch (error) {
         signal.throwIfAborted();
-        // Match deleteObject's treatment of an already missing object or bucket.
+        // Deleting an already absent object is complete.
         if ((error as COS.CosError | undefined)?.statusCode !== HTTP_STATUS.NOT_FOUND) throw error;
       }
       signal.throwIfAborted();

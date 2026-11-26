@@ -25,7 +25,7 @@ import {
 import type { VideoAdmissionSnapshot, VideoRouteConfig } from '../../src/providers/contracts.ts';
 import {
   validateVideoRouteConfig,
-  videoModeParameters,
+  videoCapabilityModes,
   videoRouteRuntimeAvailable,
 } from '../../src/providers/onelink/video-route.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
@@ -131,9 +131,7 @@ function bridge(): ConversationVideoTools {
         vendor: 'Volcengine',
         available: true,
         unavailableReason: null,
-        supportedModes: [
-          { mode: 'text_to_video' as const, supported: true, parameters: { duration: [5] } },
-        ],
+        supportedModes: [{ mode: 'first_frame' as const, supported: true }],
       },
       {
         modelRef: 'onelink:model:pending-model',
@@ -173,7 +171,7 @@ it('registers the current-user video tools and exposes unavailable models withou
       supportedModes: unknown[];
     }[];
   };
-  expect(result.models[0]!.supportedModes).toEqual([{ mode: 'text_to_video', supported: true }]);
+  expect(result.models[0]!.supportedModes).toEqual([{ mode: 'first_frame', supported: true }]);
   expect(
     result.models.map(({ modelRef, available, unavailableReason }) => ({
       modelRef,
@@ -210,12 +208,7 @@ it('publishes distinct seeded submit options through DSH and admits the selected
     ]),
   );
   const catalogModes = (route: VideoRouteConfig) => {
-    const supported = videoRouteRuntimeAvailable(route);
-    return route.paramSpec.supportedModes.map((mode) => ({
-      mode,
-      supported,
-      parameters: videoModeParameters(route, mode)!,
-    }));
+    return videoCapabilityModes(route, videoRouteRuntimeAvailable(route));
   };
   const route = routes.get(vegaId)!;
   const modes = catalogModes(route);
@@ -276,11 +269,15 @@ it('publishes distinct seeded submit options through DSH and admits the selected
     ...model,
     credential: snapshot.credential,
     capabilitiesVersion: snapshot.capabilitiesVersion,
-    supportedModes: modes.map(({ parameters, ...entry }) => ({
-      ...entry,
-      submitPath: route.submitPath,
-      parameters: { ...parameters, privateOptions: { token: 'private-route-token' } },
-    })),
+    supportedModes: modes.map((entry) =>
+      entry.mode === 'text_to_video' && entry.parameters
+        ? {
+            ...entry,
+            submitPath: route.submitPath,
+            parameters: { ...entry.parameters, privateOptions: { token: 'private-route-token' } },
+          }
+        : entry,
+    ),
   };
   const klingRoute = routes.get(klingId)!;
   const klingModel = {

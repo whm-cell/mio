@@ -1,5 +1,3 @@
-import type { VideoResultSource } from '../../../generations/video/execution.ts';
-
 export const ONELINK_ORIGIN = 'https://api.onelinkai.cloud';
 const MAX_VIDEO_RESPONSE_BYTES = 1024 * 1024;
 export const TASK_ID = /^(?!\.{1,2}$)(?!.*\.\.)[A-Za-z0-9._:-]{1,256}$/;
@@ -60,20 +58,15 @@ export function endpoint(path: string): URL {
   return url;
 }
 
-export function resultUrls(values: unknown[]): VideoResultSource[] | undefined {
-  if (values.length === 0 || values.length > 16) return;
-  const output: VideoResultSource[] = [];
-  for (const value of values) {
-    if (typeof value !== 'string' || value.length > 8192) return;
-    try {
-      const url = new URL(value);
-      if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) return;
-      output.push({ url: url.href });
-    } catch {
-      return;
-    }
+export function parseVideoMediaUrl(value: unknown): URL | undefined {
+  if (typeof value !== 'string' || value.length > 8192) return;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && !url.username && !url.password && !url.port && !url.hash)
+      return url;
+  } catch {
+    return;
   }
-  return output;
 }
 
 /** A Veo operation remains a scoped path; arbitrary URLs never become authenticated requests. */

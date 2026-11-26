@@ -185,42 +185,31 @@ it('stops waiting for a hung SDK HEAD and detaches the abort listener', async ()
 });
 
 it('passes conditional copy and non-overwrite headers to the official SDK', async () => {
-  const copy = vi.spyOn(COS.prototype, 'putObjectCopy').mockResolvedValue({
-    ETag: 'etag',
-    CRC64: '',
-    LastModified: '',
-    VersionId: '',
-    Location: '',
-  });
-  const head = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
-    ETag: 'etag',
-    headers: { 'content-length': '17' },
-  });
+  const copy = vi.spyOn(COS.prototype, 'request').mockResolvedValue({});
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
-    expect(await storage.head('mio/staging/source')).toEqual({ etag: 'etag', size: 17 });
-    await storage.copy('mio/staging/source', 'mio/raw/destination', 'etag');
-    expect(copy).toHaveBeenCalledWith(
+    const storage = createCosStorage(copyFixture);
+    const signal = AbortSignal.timeout(3000);
+    await storage.copy('mio/staging/source', 'mio/raw/destination', 'etag', undefined, { signal });
+    expect(copy).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        Bucket: 'mio-test-1234567890',
-        Region: 'ap-shanghai',
+        Bucket: copyFixture.bucket,
+        Region: copyFixture.region,
         Key: 'mio/raw/destination',
-        CopySource: 'mio-test-1234567890.cos.ap-shanghai.myqcloud.com/mio%2Fstaging%2Fsource',
-        CopySourceIfMatch: 'etag',
-        MetadataDirective: 'Replaced',
-        ContentType: 'application/octet-stream',
-        Headers: { 'x-cos-forbid-overwrite': 'true' },
+        Method: 'PUT',
+        Headers: {
+          'x-cos-copy-source':
+            'mio-test-1234567890.cos.ap-shanghai.myqcloud.com/mio%2Fstaging%2Fsource',
+          'x-cos-copy-source-If-Match': 'etag',
+          'x-cos-metadata-directive': 'Replaced',
+          'Content-Type': 'application/octet-stream',
+          'x-cos-forbid-overwrite': 'true',
+          'Cache-Control': '',
+          'Content-Length': '0',
+        },
       }),
     );
   } finally {
     copy.mockRestore();
-    head.mockRestore();
   }
 });
 
@@ -1002,13 +991,8 @@ it('signs the required private ACL for audio staging and applies it to audio cop
   const put = vi
     .spyOn(COS.prototype, 'putObject')
     .mockResolvedValue({ ETag: '"audio"', Location: '' });
-  const copy = vi.spyOn(COS.prototype, 'putObjectCopy').mockResolvedValue({
-    ETag: '"audio"',
-    CRC64: '',
-    LastModified: '',
-    VersionId: '',
-    Location: '',
-  });
+  const copy = vi.spyOn(COS.prototype, 'request').mockResolvedValue({});
+  const signal = AbortSignal.timeout(3000);
   try {
     const plain = new URL(storage.uploadUrl('mio/staging/known', bytes.length));
     const privateUrl = new URL(storage.uploadUrl('mio/staging/known', bytes.length, 'private'));
@@ -1017,21 +1001,17 @@ it('signs the required private ACL for audio staging and applies it to audio cop
     expect(privateUrl.searchParams.get('q-signature')).not.toBe(
       plain.searchParams.get('q-signature'),
     );
-    await storage.copy('mio/staging/known', 'mio/raw/known/copy', '"audio"', 'private');
-    expect(copy).toHaveBeenCalledWith(
+    await storage.copy('mio/staging/known', 'mio/raw/known/copy', '"audio"', 'private', { signal });
+    expect(copy).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        ACL: 'private',
-        CopySourceIfMatch: '"audio"',
-        Headers: { 'x-cos-forbid-overwrite': 'true' },
+        Headers: expect.objectContaining({
+          'x-cos-acl': 'private',
+          'x-cos-copy-source-If-Match': '"audio"',
+          'x-cos-forbid-overwrite': 'true',
+        }),
       }),
     );
-    await storage.putAudio!(
-      'mio/raw/known/result',
-      bytes,
-      'mp3',
-      sha256,
-      new AbortController().signal,
-    );
+    await storage.putAudio!('mio/raw/known/result', bytes, 'mp3', sha256, signal);
     expect(put).toHaveBeenCalledWith(
       expect.objectContaining({
         ACL: 'private',

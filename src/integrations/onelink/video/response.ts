@@ -1,6 +1,6 @@
 import type { VideoDriver } from '../../../generations/video/contracts.ts';
 import type { VideoQueryResult, VideoResultSource } from '../../../generations/video/execution.ts';
-import { object, operationPath, resultUrls, TASK_ID, ONELINK_ORIGIN } from './shared.ts';
+import { object, operationPath, parseVideoMediaUrl, TASK_ID, ONELINK_ORIGIN } from './shared.ts';
 
 const invalid: VideoQueryResult = { state: 'failed', code: 'VIDEO_RESPONSE_INVALID' };
 const failed: VideoQueryResult = { state: 'failed', code: 'VIDEO_UPSTREAM_FAILED' };
@@ -41,9 +41,10 @@ export function submissionTask(
 
 function returned(values: unknown[]): VideoQueryResult {
   if (!values.length || values.length > 16) return invalid;
-  const videos = values.map<VideoResultSource>(
-    (value) => resultUrls([value])?.[0] ?? { errorCode: 'VIDEO_RESULT_INVALID' },
-  );
+  const videos = values.map<VideoResultSource>((value) => {
+    const url = parseVideoMediaUrl(value);
+    return url ? { url: url.href } : { errorCode: 'VIDEO_RESULT_INVALID' };
+  });
   return videos.some((video) => 'url' in video) ? { state: 'returned', videos } : invalid;
 }
 

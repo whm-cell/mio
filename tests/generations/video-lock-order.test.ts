@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, Pool } from 'pg';
+import type { QueryResult } from 'pg';
 import { afterEach, expect, it, vi } from 'vitest';
 import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
@@ -139,7 +140,7 @@ async function fixture() {
     (
       await pool.query(
         `SELECT j.id,j.owner_id,j.request_id,j.input_hash,j.state,j.error_code,j.completed_at,
-              e.phase,e.upstream_task_id,e.query_attempt,e.async_deadline,e.async_max_queries,e.checkpoint
+              e.phase,e.claim_id,e.upstream_task_id,e.query_attempt,e.async_deadline,e.async_max_queries,e.checkpoint
        FROM mio_video_jobs j JOIN mio_video_executions e ON e.job_id=j.id WHERE j.id=$1`,
         [jobId],
       )
@@ -239,7 +240,7 @@ it('checks an idle queue with one read and discovers later work without waiting 
   try {
     await expect(f.execution.claim()).resolves.toBeUndefined();
     expect(query).toHaveBeenCalledOnce();
-    expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT EXISTS \(/);
+    expect(await f.durable()).toMatchObject({ state: 'accepted', phase: 'ready', claim_id: null });
     await f.pool.query('UPDATE mio_video_executions SET next_query_at=now()');
 
     const locked = await f.pool.connect();
@@ -257,12 +258,13 @@ it('checks an idle queue with one read and discovers later work without waiting 
         claim_id: expect.any(String),
         phase: 'ready',
       });
-      expect(query.mock.calls.map(([sql]) => sql)).toEqual([
-        expect.stringMatching(/^SELECT EXISTS \(/),
-        'BEGIN',
-        expect.stringMatching(/^WITH claimed AS \([\s\S]+RETURNING[\s\S]+JOIN claimed/),
-        'COMMIT',
-      ]);
+      expect(query).toHaveBeenCalledTimes(4);
+      expect(query.mock.calls[1]?.[0]).toBe('BEGIN');
+      expect(query.mock.calls[3]?.[0]).toBe('COMMIT');
+      const durable = await f.pool.query(
+        'SELECT job_id, claim_id FROM mio_video_executions WHERE claim_id IS NOT NULL',
+      );
+      expect(durable.rows).toEqual([{ job_id: newer, claim_id: claimed!.claim_id }]);
     } finally {
       await locked.query('ROLLBACK').finally(() => locked.release());
     }
@@ -293,7 +295,6 @@ it('makes no claim after a stop during the peek or before the claim COMMIT', asy
     }
     await expect(waiting).rejects.toBe(stopped);
     expect(query).toHaveBeenCalledOnce();
-    expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT EXISTS \(/);
     query.mockClear();
     await expect(f.execution.claim(stop.signal)).rejects.toBe(stopped);
     expect(query).not.toHaveBeenCalled();
@@ -301,23 +302,21 @@ it('makes no claim after a stop during the peek or before the claim COMMIT', asy
     const duringClaim = new AbortController();
     query.mockImplementation(function (this: Client, ...args: unknown[]) {
       const result = Reflect.apply(original, this, args);
-      const sql = args[0];
-      if (typeof sql !== 'string' || !sql.startsWith('WITH claimed AS (')) return result;
-      return Promise.resolve(result).then((claimed) => {
-        duringClaim.abort(stopped);
-        return claimed;
+      if (!(result instanceof Promise)) return result;
+      return result.then((reply: QueryResult<{ id: string; claim_id: string | null }>) => {
+        const row = reply.rows?.[0];
+        if (row?.id === f.jobId && typeof row.claim_id === 'string') duringClaim.abort(stopped);
+        return reply;
       });
     });
     await expect(f.execution.claim(duringClaim.signal)).rejects.toMatchObject({
       cause: stopped,
       claim: { id: f.jobId, claim_id: expect.any(String) },
     });
-    expect(query.mock.calls.map(([sql]) => sql)).toEqual([
-      expect.stringMatching(/^SELECT EXISTS \(/),
-      'BEGIN',
-      expect.stringMatching(/^WITH claimed AS \(/),
-      'ROLLBACK',
-    ]);
+    expect(query).toHaveBeenCalledTimes(4);
+    expect(query.mock.calls[1]?.[0]).toBe('BEGIN');
+    expect(query.mock.calls[3]?.[0]).toBe('ROLLBACK');
+    expect(await f.durable()).toMatchObject({ state: 'accepted', phase: 'ready', claim_id: null });
   } finally {
     query.mockRestore();
   }

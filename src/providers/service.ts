@@ -39,7 +39,7 @@ import {
   legacyReference,
 } from './catalog.ts';
 import { deriveImageParameterView, resolveVideoRoute } from './onelink/router.ts';
-import { videoModeParameters, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
+import { videoCapabilityModes, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { discoverModels, DiscoveryError } from '../integrations/onelink/models.ts';
 import type { ModelTransport, DiscoveredModel } from '../integrations/onelink/models.ts';
 
@@ -333,15 +333,12 @@ export function createProviderService(
       modelRef: string,
     ): Promise<VideoCapabilitiesView> {
       const { route, reason, capabilitiesVersion } = await videoState(actor, modelRef);
-      const modes =
-        route?.route.paramSpec.supportedModes.map((mode) => {
-          const parameters = videoModeParameters(route.route, mode);
-          return {
-            mode,
-            supported: videoRuntime && reason === null && videoRouteRuntimeAvailable(route.route),
-            ...(parameters ? { parameters } : {}),
-          };
-        }) ?? [];
+      const modes = route
+        ? videoCapabilityModes(
+            route.route,
+            videoRuntime && reason === null && videoRouteRuntimeAvailable(route.route),
+          )
+        : [];
       return {
         modelRef,
         capabilitiesVersion,

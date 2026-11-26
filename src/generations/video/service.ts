@@ -65,7 +65,7 @@ function inputSnapshot(request: VideoCreateRequest): VideoJobCommand['inputSnaps
   return inputs;
 }
 
-function routeSnapshot(snapshot: Record<string, unknown>): Record<string, unknown> {
+function routeSnapshot(snapshot: VideoAdmissionSnapshot): Record<string, unknown> {
   const allowed = new Set([
     'providerConfigId',
     'providerRevision',
@@ -195,45 +195,35 @@ export function createVideoGenerationService(
     const audioDefault = defaultVideoGenerateAudio(snapshot.route.driver, snapshot.modelId);
     if (effective.generateAudio === undefined && audioDefault !== undefined)
       effective.generateAudio = audioDefault;
-    const snapshotRecord = snapshot as unknown as Record<string, unknown>;
-    const route = snapshotRecord.route;
-    const credential = snapshotRecord.credential;
-    if (
-      !route ||
-      typeof route !== 'object' ||
-      Array.isArray(route) ||
-      !credential ||
-      typeof credential !== 'object' ||
-      Array.isArray(credential)
-    )
-      throw videoUnavailable();
     const command: VideoJobCommand = {
       request: { ...request, parameters: effective },
       inputSnapshot: inputSnapshot(request),
     };
-    const admitted = Object.fromEntries(
-      [
-        'providerConfigId',
-        'providerRevision',
-        'credentialVersion',
-        'catalogVersion',
-        'adaptationVersion',
-        'modelRef',
-        'modelId',
-        'modelKey',
-        'profile',
-        'capabilitiesVersion',
-        'defaultVideoWatermark',
-      ]
-        .filter((key) => snapshotRecord[key] !== undefined)
-        .map((key) => [key, snapshotRecord[key]]),
+    const admitted: Record<string, unknown> = Object.fromEntries(
+      (
+        [
+          'providerConfigId',
+          'providerRevision',
+          'credentialVersion',
+          'catalogVersion',
+          'adaptationVersion',
+          'modelRef',
+          'modelId',
+          'modelKey',
+          'profile',
+          'capabilitiesVersion',
+          'defaultVideoWatermark',
+        ] as const
+      )
+        .filter((key) => snapshot[key] !== undefined)
+        .map((key) => [key, snapshot[key]]),
     );
     admitted.driver = admitted.profile;
     delete admitted.profile;
     const executionSnapshot = {
-      providerConfigId: snapshotRecord.providerConfigId,
-      credentialVersion: snapshotRecord.credentialVersion,
-      credential,
+      providerConfigId: snapshot.providerConfigId,
+      credentialVersion: snapshot.credentialVersion,
+      credential: snapshot.credential,
     };
     let stored;
     try {
@@ -260,7 +250,7 @@ export function createVideoGenerationService(
         command,
         admitted,
         executionSnapshot,
-        routeSnapshot(snapshotRecord),
+        routeSnapshot(snapshot),
         signal,
       );
     } catch (error) {

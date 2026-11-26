@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client, Pool } from 'pg';
+import type { QueryResult } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { observeDirectorySync } from '../support/directory-sync.ts';
@@ -2461,26 +2462,29 @@ describe('video executor ownership and capacity', () => {
     await f.execution.close();
     await f.makeDue();
     vi.mocked(f.protocol.query).mockResolvedValueOnce({ state: 'processing' });
-    const committed = Promise.withResolvers<string>();
+    const committed = Promise.withResolvers<{ returnedClaim: string; durableClaim: string }>();
     const original = Client.prototype.query;
-    const claimants = new WeakSet<Client>();
+    let claimant: { client: Client; claimId: string } | undefined;
     let discarded = false;
     const query = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
       this: Client,
       ...args: unknown[]
     ) {
-      const sql = args[0];
-      if (typeof sql === 'string' && sql.startsWith('WITH claimed AS (')) claimants.add(this);
       const result = Reflect.apply(original, this, args);
-      if (sql === 'COMMIT' && claimants.has(this) && !discarded) {
-        discarded = true;
-        return Promise.resolve(result).then(async () => {
+      if (!(result instanceof Promise) || discarded) return result;
+      return result.then(async (reply: QueryResult<{ id: string; claim_id: string | null }>) => {
+        if (reply.command === 'COMMIT' && claimant?.client === this) {
+          const returnedClaim = claimant.claimId;
+          discarded = true;
           const durable = await f.durableState();
-          committed.resolve(durable.claim_id);
+          committed.resolve({ returnedClaim, durableClaim: durable.claim_id });
           throw new Error('fixture discarded committed claim reply');
-        });
-      }
-      return result;
+        }
+        const row = reply.rows?.[0];
+        if (row?.id === f.job.jobId && typeof row.claim_id === 'string')
+          claimant = { client: this, claimId: row.claim_id };
+        return reply;
+      });
     });
     const release = vi.spyOn(f.execution, 'release');
     const reserve = vi.spyOn(f.execution, 'beginQuery');
@@ -2494,8 +2498,9 @@ describe('video executor ownership and capacity', () => {
     );
     cleanups.push(() => executor.close());
     try {
-      const claim = await committed.promise;
+      const { returnedClaim: claim, durableClaim } = await committed.promise;
       expect(claim).toEqual(expect.any(String));
+      expect(durableClaim).toBe(claim);
       await vi.waitFor(
         async () =>
           expect(await f.durableState()).toMatchObject({
@@ -2539,28 +2544,25 @@ describe('video executor ownership and capacity', () => {
     const disconnected = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const original = Client.prototype.query;
-    const doomed = new WeakSet<Client>();
+    const doomed = new Set<Client>();
     const rollback = vi.fn();
-    let interrupted = false;
     const probe = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
       this: Client,
       ...args: unknown[]
     ) {
-      const sql = args[0];
-      if (sql === 'ROLLBACK' && doomed.has(this)) rollback();
+      if (args[0] === 'ROLLBACK' && doomed.has(this)) rollback();
       const result = Reflect.apply(original, this, args);
-      if (!interrupted && typeof sql === 'string' && sql.startsWith('WITH claimed AS (')) {
-        interrupted = true;
+      if (!(result instanceof Promise) || doomed.size) return result;
+      return result.then(async (reply: QueryResult<{ id: string; claim_id: string | null }>) => {
+        const row = reply.rows?.[0];
+        if (row?.id !== f.job.jobId || typeof row.claim_id !== 'string') return reply;
         doomed.add(this);
-        return Promise.resolve(result).then(async (written) => {
-          const metadata = await Reflect.apply(original, this, ['SELECT pg_backend_pid() AS pid']);
-          this.once('end', () => disconnected.resolve());
-          updated.resolve({ pid: metadata.rows[0].pid, claimId: (args[1] as [string])[0] });
-          await resume.promise;
-          return written;
-        });
-      }
-      return result;
+        const metadata = await Reflect.apply(original, this, ['SELECT pg_backend_pid() AS pid']);
+        this.once('end', () => disconnected.resolve());
+        updated.resolve({ pid: metadata.rows[0].pid, claimId: row.claim_id });
+        await resume.promise;
+        return reply;
+      });
     });
     const release = vi.spyOn(f.execution, 'release');
     const reserve = vi.spyOn(f.execution, 'beginQuery');
@@ -2626,7 +2628,17 @@ describe('video executor ownership and capacity', () => {
     let renewed: VideoExecution | undefined;
     const oldQuery = vi.spyOn(f.pool, 'query').mockImplementationOnce(async (sql, values) => {
       const result = await query(sql, values);
-      const cutoff = result.rows[0].next_query_at as Date;
+      const reserved = (
+        await separate.query<{ next_query_at: Date }>(
+          'SELECT phase, claim_id, query_attempt, next_query_at FROM mio_video_executions WHERE job_id=$1',
+          [claimed.id],
+        )
+      ).rows[0]!;
+      expect(reserved).toMatchObject({
+        phase: 'querying',
+        claim_id: claimed.claim_id,
+        query_attempt: 1,
+      });
       await f.execution.close();
       await takeover.startExecutor(() => {});
       const next = (
@@ -2636,7 +2648,7 @@ describe('video executor ownership and capacity', () => {
         )
       ).rows[0]!.next_query_at;
       expect(next.getTime()).toBeGreaterThanOrEqual(
-        cutoff.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
+        reserved.next_query_at.getTime() + VIDEO_EXECUTOR_QUERY_INTERVAL_MS,
       );
       expect(await takeover.claim()).toBeUndefined();
       // Advance just the fixture's due time after checking the real takeover floor.
@@ -2653,7 +2665,6 @@ describe('video executor ownership and capacity', () => {
     try {
       reserved = await f.execution.beginQuery(claimed);
       expect(oldQuery).toHaveBeenCalledOnce();
-      expect(oldQuery.mock.calls[0]![0]).toMatch(/^UPDATE .*?[\s\S]+RETURNING/);
       expect(reserved).toMatchObject({
         id: claimed.id,
         claim_id: claimed.claim_id,

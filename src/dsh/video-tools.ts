@@ -7,12 +7,13 @@ import {
   VIDEO_MAX_PROMPT_CODEPOINTS,
   VIDEO_MODES,
 } from '../generations/video/contracts.ts';
-import type { VideoCapabilityMode, VideoJobView } from '../generations/video/contracts.ts';
+import type { VideoJobView } from '../generations/video/contracts.ts';
 import type {
   ConversationRun,
   ConversationVideoJobOutput,
   ConversationVideoJobView,
   ConversationVideoModelSummary,
+  ConversationVideoSubmitParameterSpec,
   ConversationVideoToolName,
   ConversationVideoTools,
 } from '../conversations/contracts.ts';
@@ -112,42 +113,23 @@ const videoJobSchema = {
   },
 } as const;
 
-function projectVideoSubmitParameters(parameters: VideoCapabilityMode['parameters']) {
-  const {
-    ratios,
-    resolutions,
-    durations,
-    maxPromptCodepoints,
-    requiresResolution,
-    generateAudio,
-    watermark,
-  } = parameters ?? {};
-  if (
-    !Array.isArray(ratios) ||
-    !ratios.every((ratio) => typeof ratio === 'string') ||
-    !Array.isArray(resolutions) ||
-    !resolutions.every((resolution) => typeof resolution === 'string') ||
-    !Array.isArray(durations) ||
-    !durations.every(
-      (duration) => typeof duration === 'number' && Number.isSafeInteger(duration),
-    ) ||
-    typeof maxPromptCodepoints !== 'number' ||
-    !Number.isSafeInteger(maxPromptCodepoints) ||
-    maxPromptCodepoints < 1 ||
-    typeof requiresResolution !== 'boolean' ||
-    typeof generateAudio !== 'boolean' ||
-    typeof watermark !== 'boolean'
-  )
-    return;
-
+function projectVideoSubmitParameters({
+  ratios,
+  resolutions,
+  durations,
+  maxPromptCodepoints,
+  requiresResolution,
+  generateAudio,
+  watermark,
+}: ConversationVideoSubmitParameterSpec) {
   const required: (typeof VIDEO_SUBMIT_REQUIRED_FIELDS)[number][] = ['modelRef', 'prompt'];
   if (requiresResolution) required.push('resolution');
   return {
     required,
-    maxPromptCodepoints: Math.min(maxPromptCodepoints, VIDEO_MAX_PROMPT_CODEPOINTS),
-    ratios,
-    resolutions,
-    durationSeconds: durations,
+    maxPromptCodepoints,
+    ratios: [...ratios],
+    resolutions: [...resolutions],
+    durationSeconds: [...durations],
     supportsGenerateAudio: generateAudio,
     supportsWatermark: watermark,
   };
@@ -303,18 +285,14 @@ export function registerConversationVideoTools(
                 vendor: model.vendor,
                 available: model.available,
                 unavailableReason: model.unavailableReason,
-                supportedModes: model.supportedModes
-                  .filter(
-                    (entry) =>
-                      typeof entry.mode === 'string' && typeof entry.supported === 'boolean',
-                  )
-                  .map(({ mode, supported, parameters }) => {
-                    const submitParameters =
-                      model.available && supported && mode === 'text_to_video'
-                        ? projectVideoSubmitParameters(parameters)
-                        : undefined;
-                    return { mode, supported, ...(submitParameters ? { submitParameters } : {}) };
-                  }),
+                supportedModes: model.supportedModes.map((entry) => {
+                  const { mode, supported } = entry;
+                  const submitParameters =
+                    model.available && supported && mode === 'text_to_video' && entry.parameters
+                      ? projectVideoSubmitParameters(entry.parameters)
+                      : undefined;
+                  return { mode, supported, ...(submitParameters ? { submitParameters } : {}) };
+                }),
               })),
             };
           } catch (error) {

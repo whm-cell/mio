@@ -7,7 +7,7 @@ import {
 } from '../../src/providers/onelink/router.ts';
 import {
   validateVideoParameters,
-  videoModeParameters,
+  videoCapabilityModes,
   validateVideoRouteConfig,
   videoRouteRuntimeAvailable,
 } from '../../src/providers/onelink/video-route.ts';
@@ -235,6 +235,9 @@ it('keeps incomplete V1 declarations visible but rejects their execution paramet
   const legacy = { ...complete, paramSpec: { supportedModes: complete.paramSpec.supportedModes } };
   expect(validateVideoParameters(input(), legacy)).toBe(false);
   expect(videoRouteRuntimeAvailable(legacy)).toBe(false);
+  expect(videoCapabilityModes(legacy, false)).toEqual(
+    legacy.paramSpec.supportedModes.map((mode) => ({ mode, supported: false })),
+  );
   expect(videoRouteRuntimeAvailable(complete)).toBe(true);
   expect(videoRouteRuntimeAvailable(route('veo-3.1'))).toBe(false);
 });
@@ -327,8 +330,10 @@ it('keeps Vidu Q2 text and named subjects distinct from Q3 frame modes', () => {
 
 it('does not advertise Vidu ratios for modes where validation rejects them', () => {
   const q3 = route('video-viduq3-pro');
-  expect(videoModeParameters(q3, 'text_to_video')?.ratios).toContain('16:9');
-  expect(videoModeParameters(q3, 'first_frame')).not.toHaveProperty('ratios');
+  const modes = videoCapabilityModes(q3, true);
+  expect(modes.find(({ mode }) => mode === 'text_to_video')?.parameters?.ratios).toContain('16:9');
+  expect(modes.find(({ mode }) => mode === 'first_frame')?.parameters).toBeDefined();
+  expect(modes.find(({ mode }) => mode === 'first_frame')?.parameters).not.toHaveProperty('ratios');
   expect(
     validateVideoParameters(
       input({ mode: 'first_frame', ratio: '16:9', firstFrame: { assetId: 'image-a' } }),

@@ -7,7 +7,7 @@ import {
 } from '../../../generations/video/driver-capabilities.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
 import { happyhorsePrompt } from './happyhorse-prompt.ts';
-import { resultUrls } from './shared.ts';
+import { parseVideoMediaUrl } from './shared.ts';
 
 interface Submission {
   path: string;
@@ -17,7 +17,7 @@ interface Submission {
 
 function reference(refs: Record<string, string>, assetId: string): string {
   const value = refs[assetId];
-  if (!resultUrls([value])) throw new Error('VIDEO_INPUT_INVALID');
+  if (!parseVideoMediaUrl(value)) throw new Error('VIDEO_INPUT_INVALID');
   return value!;
 }
 
@@ -120,8 +120,6 @@ function vidu(
   input: VideoRequestParameters,
   refs: Record<string, string>,
 ): Submission {
-  if (input.ratio !== undefined && input.mode !== 'text_to_video')
-    throw new Error('VIDEO_INPUT_INVALID');
   const kind =
     input.mode === 'text_to_video'
       ? 'text2video'

@@ -1,4 +1,4 @@
-import { videoModeParameters, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
+import { videoCapabilityModes, videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { categories } from './contracts.ts';
 import type {
   Category,
@@ -376,15 +376,12 @@ export function catalogView(
                 ? undefined
                 : 'pending',
             ),
-            modes:
-              videoRoute?.route.paramSpec.supportedModes.map((mode) => {
-                const parameters = videoModeParameters(videoRoute.route, mode);
-                return {
-                  mode,
-                  supported: videoRuntime && videoRouteRuntimeAvailable(videoRoute.route),
-                  ...(parameters ? { parameters } : {}),
-                };
-              }) ?? [],
+            modes: videoRoute
+              ? videoCapabilityModes(
+                  videoRoute.route,
+                  videoRuntime && videoRouteRuntimeAvailable(videoRoute.route),
+                )
+              : [],
             cancellation: { supported: false as const },
             enabled: videoPreference?.enabled ?? true,
             runnable: videoReason === null,

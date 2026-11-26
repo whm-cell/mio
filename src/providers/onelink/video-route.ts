@@ -1,4 +1,8 @@
-import { VIDEO_DRIVERS, VIDEO_MODES } from '../../generations/video/contracts.ts';
+import {
+  VIDEO_DRIVERS,
+  VIDEO_MAX_PROMPT_CODEPOINTS,
+  VIDEO_MODES,
+} from '../../generations/video/contracts.ts';
 import type {
   VideoDriver,
   VideoMode,
@@ -134,7 +138,7 @@ function parameterSpec(value: unknown): VideoParameterSpec | undefined {
   if (
     !Number.isSafeInteger(value.maxPromptCodepoints) ||
     Number(value.maxPromptCodepoints) < 1 ||
-    Number(value.maxPromptCodepoints) > 5000 ||
+    Number(value.maxPromptCodepoints) > VIDEO_MAX_PROMPT_CODEPOINTS ||
     Number(value.maxInputs) > 16 ||
     Number(value.maxImages) > Number(value.maxInputs) ||
     Number(value.maxVideos) > Number(value.maxInputs) ||
@@ -272,16 +276,18 @@ export function videoRouteRuntimeAvailable(route: VideoRouteConfig): boolean {
   );
 }
 
-/** Project only the parameters that validation accepts for this exact mode. */
-export function videoModeParameters(
-  route: VideoRouteConfig,
-  mode: VideoMode,
-): Record<string, unknown> | undefined {
-  const parameters = route.paramSpec.parameters;
-  if (!parameters) return undefined;
-  const result: Record<string, unknown> = { ...parameters };
-  if (route.driver === 'vidu-videos' && mode !== 'text_to_video') delete result.ratios;
-  return result;
+/** Project verified route options while preserving whether each mode has a full declaration. */
+export function videoCapabilityModes(route: VideoRouteConfig, supported: boolean) {
+  const { supportedModes, parameters: spec } = route.paramSpec;
+  return supportedModes.map((mode) => {
+    if (!spec) return { mode, supported };
+    if (mode === 'text_to_video') return { mode, supported, parameters: { ...spec } };
+    const parameters: Omit<VideoParameterSpec, 'ratios'> & { ratios?: readonly string[] } = {
+      ...spec,
+    };
+    if (route.driver === 'vidu-videos') delete parameters.ratios;
+    return { mode, supported, parameters };
+  });
 }
 
 /** Only validation of a frozen submit command supplies the encoder default. */

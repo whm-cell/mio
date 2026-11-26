@@ -55,14 +55,14 @@ export interface ModelPatch {
   name?: string | null;
   description?: string | null;
 }
-interface RouteRevisionResult {
+export interface RouteRevisionResult {
   id: string;
   rawModelId: string;
   operation: ProviderOperation;
   declarationVersion: number;
   action: RouteRevisionAction;
 }
-interface RouteImportSummary {
+export interface RouteImportSummary {
   total: number;
   inserted: number;
   updated: number;

@@ -124,6 +124,12 @@ export class ConversationStore {
   private async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     this.assertActive();
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       this.assertActive();
@@ -132,10 +138,17 @@ export class ConversationStore {
       await client.query('COMMIT');
       return result;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       throw error;
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
   private async readOwned(
@@ -545,6 +558,12 @@ export class ConversationStore {
   ): Promise<void> {
     this.assertActive();
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       const owned = await client.query(
@@ -564,10 +583,17 @@ export class ConversationStore {
       }
       await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       throw error;
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
   async finish(
@@ -579,6 +605,12 @@ export class ConversationStore {
   ): Promise<Receipt> {
     this.assertActive();
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       // Match the conversation-first lock order in receive() and reconcileReception().
@@ -608,10 +640,17 @@ export class ConversationStore {
       await client.query('COMMIT');
       return receipt(row);
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       throw error;
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
   /** Read back a committed receipt before attempting to settle an unresolved execution. */
@@ -645,7 +684,7 @@ export async function createConversationStore(databaseURL: string): Promise<Conv
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-conversations',
   });
   pool.on('error', () => log.error('CONVERSATION_DATABASE_CONNECTION_ERROR'));

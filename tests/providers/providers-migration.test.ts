@@ -1,6 +1,10 @@
 import { randomUUID, randomBytes } from 'node:crypto';
 import { Pool } from 'pg';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { makeAudioRouteFixture } from './fixtures/onelink-audio-route.ts';
@@ -504,3 +508,409 @@ it('imports only owner-matching legacy conversation/receipt references from a se
     await conversations.close();
   }
 }, 30000);
+
+// Observe real child-process driver results; SQL and database behavior are not substituted.
+const migrationTrace = `data:text/javascript,${encodeURIComponent(`
+  import pg from ${JSON.stringify(pathToFileURL(resolve('node_modules/pg/lib/index.js')).href)};
+  const query = pg.Client.prototype.query;
+  pg.Client.prototype.query = function(...args) {
+    const sql = typeof args[0] === 'string' ? args[0] : args[0].text;
+    const report = result => {
+      if (sql.includes('AS "ownerId"')) console.log(JSON.stringify({trace:'source', rows:result.rows.length, bytes:Buffer.byteLength(JSON.stringify(result.rows))}));
+      if (sql.includes('jsonb_to_recordset($1::jsonb)')) console.log(JSON.stringify({trace:'import', rows:JSON.parse(args[1][0]).length}));
+      return result;
+    };
+    const callback = args.at(-1);
+    if (typeof callback === 'function') {
+      args[args.length-1] = (error,result) => callback(error,error ? result : report(result));
+      return query.apply(this,args);
+    }
+    return query.apply(this,args).then(report);
+  };
+`)}`;
+const providerEnv = (url: string) => ({
+  PATH: process.env.PATH,
+  MIO_PROVIDERS_DATABASE_URL: url,
+  MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+  MIO_PROVIDERS_MASTER_KEY_ID: 'migration-fixture',
+});
+
+it.each([false, true])(
+  'filters source rows, deduplicates exact triples and skips empty imports (external=%s)',
+  async (external) => {
+    const target = await authDatabase();
+    const source = external ? await authDatabase() : target;
+    const providers = new Pool({ connectionString: target.observerURL });
+    const history = new Pool({ connectionString: source.observerURL });
+    try {
+      const identity = (
+        await providers.query('SELECT current_database() AS db,current_user AS usr')
+      ).rows[0];
+      const fixtureURL = new URL(target.url);
+      expect(identity).toEqual({
+        db: decodeURIComponent(fixtureURL.pathname.slice(1)),
+        usr: decodeURIComponent(fixtureURL.username),
+      });
+      if (process.env.GITHUB_ACTIONS !== 'true')
+        expect(identity).toEqual({ db: 'mio_regression_test', usr: 'mio_regression' });
+      console.log(
+        'MIGRATION_IDENTITY',
+        JSON.stringify({ ...identity, isolation: 'random-schema' }),
+      );
+      await providers.query(legacyProviderSchemaSQL);
+      const owner = await seed(providers, null);
+      const other = await seed(providers, null);
+      await history.query(conversationSchemaSQL);
+      const refs = [
+        ...Array.from({ length: 600 }, () => ({
+          owner,
+          provider: owner,
+          ref: 'onelink:chat:Exact:Q',
+        })),
+        { owner, provider: owner, ref: 'onelink:image:exact:Q' },
+        { owner, provider: owner, ref: 'unparseable-original' },
+        { owner: other, provider: owner, ref: 'onelink:chat:wrong-owner' },
+        { owner, provider: other, ref: 'onelink:chat:wrong-config' },
+        { owner, provider: owner, ref: `onelink:model:${randomUUID()}` },
+        { owner, provider: owner, ref: null },
+      ];
+      await history.query(
+        `INSERT INTO mio_conversations(id,owner_id,dsh_session_id,state,model_binding)
+      SELECT gen_random_uuid(),x->>'owner',gen_random_uuid()::text,'ready',
+        jsonb_build_object('providerConfigId',x->>'provider','modelRef',x->>'ref')
+      FROM jsonb_array_elements($1::jsonb) x`,
+        [JSON.stringify(refs)],
+      );
+      const conversation = (
+        await history.query('SELECT id FROM mio_conversations WHERE owner_id=$1 LIMIT 1', [owner])
+      ).rows[0].id;
+      await history.query(
+        `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding)
+      SELECT $1,n::text,'preserved-digest','completed',
+        jsonb_build_object('providerConfigId',$2::text,'modelRef','onelink:chat:unique-'||n)
+      FROM generate_series(1,32) n`,
+        [conversation, owner],
+      );
+      const before = (
+        await history.query(
+          'SELECT to_jsonb(r) AS row FROM mio_conversation_requests r ORDER BY request_id',
+        )
+      ).rows;
+      const run = () =>
+        spawnSync(
+          process.execPath,
+          [
+            '--import',
+            migrationTrace,
+            'scripts/service/migrate-providers.ts',
+            '--apply',
+            ...(external ? ['--with-conversations'] : []),
+          ],
+          {
+            env: { ...providerEnv(target.url), MIO_CONVERSATIONS_DATABASE_URL: source.url },
+            encoding: 'utf8',
+            timeout: 10000,
+          },
+        );
+      const first = run();
+      expect(first.status, first.stderr).toBe(0);
+      const trace = first.stdout
+        .split('\n')
+        .filter((line) => line.startsWith('{'))
+        .map((line) => JSON.parse(line));
+      console.log(
+        'MIGRATION_REFERENCE_COUNTS',
+        JSON.stringify({
+          input: [refs.length, 32],
+          observed: trace.filter((row) => row.trace === 'source'),
+        }),
+      );
+      expect(trace.filter((row) => row.trace === 'source').map((row) => row.rows)).toEqual([5, 32]);
+      expect(trace.filter((row) => row.trace === 'import').map((row) => row.rows)).toEqual([5, 32]);
+      const models = (await providers.query('SELECT * FROM mio_provider_models ORDER BY model_key'))
+        .rows;
+      expect(models).toHaveLength(35);
+      expect(models.filter((row) => row.legacy_ref).map((row) => row.legacy_ref)).toEqual([
+        'unparseable-original',
+      ]);
+      expect(
+        models
+          .filter((row) => row.raw_model_id?.includes(':Q'))
+          .map((row) => row.raw_model_id)
+          .sort(),
+      ).toEqual(['Exact:Q', 'exact:Q']);
+      expect(
+        models.every(
+          (row) =>
+            row.provider_id === owner &&
+            row.membership_state === 'historical' &&
+            row.catalog_version === null &&
+            row.first_seen_at === null,
+        ),
+      ).toBe(true);
+      expect(run().status).toBe(0);
+      expect(
+        (await providers.query('SELECT * FROM mio_provider_models ORDER BY model_key')).rows,
+      ).toEqual(models);
+      expect(
+        (
+          await history.query(
+            'SELECT to_jsonb(r) AS row FROM mio_conversation_requests r ORDER BY request_id',
+          )
+        ).rows,
+      ).toEqual(before);
+      // Exercise deduplication/filtering in the receipt query too, without changing valid imported identities.
+      await history.query(`INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding)
+        SELECT conversation_id,'copy-'||request_id,digest,status,model_binding FROM mio_conversation_requests`);
+      await history.query(
+        `INSERT INTO mio_conversation_requests(conversation_id,request_id,digest,status,model_binding)
+        VALUES($1,'stable','same','completed',$2::jsonb),($1,'null','same','completed',NULL),
+          ($1,'wrong-config','same','completed',$3::jsonb)`,
+        [
+          conversation,
+          JSON.stringify({ providerConfigId: owner, modelRef: `onelink:model:${randomUUID()}` }),
+          JSON.stringify({ providerConfigId: other, modelRef: 'onelink:chat:wrong-config' }),
+        ],
+      );
+      const repeated = run();
+      expect(repeated.status, repeated.stderr).toBe(0);
+      const repeatedTrace = repeated.stdout
+        .split('\n')
+        .filter((line) => line.startsWith('{'))
+        .map((line) => JSON.parse(line));
+      expect(repeatedTrace.filter((row) => row.trace === 'source').map((row) => row.rows)).toEqual([
+        5, 33,
+      ]);
+      expect(
+        (await providers.query('SELECT * FROM mio_provider_models ORDER BY model_key')).rows,
+      ).toEqual(models);
+      await history.query(
+        `UPDATE mio_conversations SET model_binding=jsonb_build_object('providerConfigId',$1::text,'modelRef',$2::text)`,
+        [owner, `onelink:model:${randomUUID()}`],
+      );
+      await history.query('UPDATE mio_conversation_requests SET model_binding=NULL');
+      const empty = run();
+      expect(empty.status, empty.stderr).toBe(0);
+      const emptyTrace = empty.stdout
+        .split('\n')
+        .filter((line) => line.startsWith('{'))
+        .map((line) => JSON.parse(line));
+      expect(emptyTrace.filter((row) => row.trace === 'source').map((row) => row.rows)).toEqual([
+        0, 0,
+      ]);
+      expect(emptyTrace.filter((row) => row.trace === 'import')).toEqual([]);
+    } finally {
+      await providers.end();
+      await history.end();
+      if (external) await source.close();
+      await target.close();
+    }
+  },
+);
+
+it.each(['mio_conversations', 'mio_conversation_requests'])(
+  'finishes blocked external %s reads before target DDL and leaves target intact on source failure',
+  async (table) => {
+    const target = await authDatabase();
+    const source = await authDatabase();
+    const providers = new Pool({ connectionString: target.observerURL });
+    const history = new Pool({ connectionString: source.observerURL });
+    const blocker = await history.connect();
+    let child: ReturnType<typeof spawn> | undefined;
+    let closed: Promise<unknown> | undefined;
+    try {
+      await providers.query(legacyProviderSchemaSQL);
+      await seed(providers, null);
+      await history.query(conversationSchemaSQL);
+      await blocker.query('BEGIN');
+      await blocker.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+      child = spawn(
+        process.execPath,
+        ['scripts/service/migrate-providers.ts', '--apply', '--with-conversations'],
+        {
+          env: { ...providerEnv(target.url), MIO_CONVERSATIONS_DATABASE_URL: source.url },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      closed = once(child, 'close');
+      child.stdout!.resume();
+      child.stderr!.resume();
+      let sourcePid: number | undefined;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        sourcePid = (
+          await history.query(
+            "SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",
+            [source.applicationName],
+          )
+        ).rows[0]?.pid;
+        if (sourcePid) break;
+        await delay(50);
+      }
+      expect(sourcePid).toBeTypeOf('number');
+      const locks = await providers.query(
+        `SELECT mode FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+      WHERE a.application_name=$1 AND l.granted AND l.locktype='relation' AND mode='AccessExclusiveLock'`,
+        [target.applicationName],
+      );
+      expect(locks.rows).toEqual([]);
+      expect(
+        (
+          await providers.query('SELECT state FROM pg_stat_activity WHERE application_name=$1', [
+            target.applicationName,
+          ])
+        ).rows,
+      ).toEqual([]);
+      expect(
+        (await providers.query("SELECT to_regclass('mio_provider_models') AS name")).rows[0].name,
+      ).toBeNull();
+      await history.query('SELECT pg_cancel_backend($1)', [sourcePid]);
+      expect(await closed).toEqual([1, null]);
+      expect(
+        (await providers.query("SELECT to_regclass('mio_provider_models') AS name")).rows[0].name,
+      ).toBeNull();
+      expect(
+        (await providers.query('SELECT count(*)::int AS count FROM mio_provider_configs')).rows[0]
+          .count,
+      ).toBe(1);
+    } finally {
+      if (child && child.exitCode === null) child.kill('SIGTERM');
+      if (closed) await closed;
+      await blocker.query('ROLLBACK');
+      blocker.release();
+      await providers.end();
+      await history.end();
+      await source.close();
+      await target.close();
+    }
+  },
+);
+
+it('retains canonical revision constraint OIDs and validates correct NOT VALID checks', async () =>
+  databaseTest(async (pool) => {
+    await pool.query(providerSchemaSQL);
+    const read = () =>
+      pool.query(`SELECT oid::text,conname,convalidated,conenforced,pg_get_expr(conbin,conrelid) AS expression
+    FROM pg_constraint WHERE conrelid='mio_provider_model_route_revisions'::regclass
+    AND conname IN ('mio_provider_model_route_revisions_action_check','mio_provider_model_route_revisions_after_route_check') ORDER BY conname`);
+    const original = (await read()).rows;
+    expect(original).toHaveLength(2);
+    await pool.query(providerSchemaSQL);
+    expect((await read()).rows).toEqual(original);
+    for (const constraint of original)
+      await pool.query(
+        `ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT ${constraint.conname}, ADD CONSTRAINT ${constraint.conname} CHECK (${constraint.expression}) NOT VALID`,
+      );
+    const unvalidated = (await read()).rows;
+    expect(unvalidated.every((row) => !row.convalidated && row.conenforced)).toBe(true);
+    await pool.query(providerSchemaSQL);
+    expect((await read()).rows).toEqual(unvalidated.map((row) => ({ ...row, convalidated: true })));
+    const action = original[0];
+    await pool.query(`ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT ${action.conname},
+      ADD CONSTRAINT ${action.conname} CHECK (${action.expression}) NOT ENFORCED`);
+    expect((await read()).rows[0].conenforced).toBe(false);
+    await pool.query(providerSchemaSQL);
+    expect((await read()).rows.every((row) => row.conenforced && row.convalidated)).toBe(true);
+    await expect(
+      pool.query(
+        `INSERT INTO mio_provider_model_route_revisions(id,raw_model_id,operation,declaration_version,action,actor_type,actor_name,after_route)
+      VALUES($1,'fixture','chat',1,'unknown','cli','fixture','{}')`,
+        [randomUUID()],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await pool.query(`ALTER TABLE mio_provider_models DROP CONSTRAINT mio_provider_models_display_name_length,
+      ADD CONSTRAINT mio_provider_models_display_name_length CHECK(char_length(display_name)<=100) NOT VALID`);
+    const metadata = (
+      await pool.query(
+        `SELECT oid::text FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND conname='mio_provider_models_display_name_length'`,
+      )
+    ).rows;
+    await pool.query(providerSchemaSQL);
+    await checkProviderSchema(pool);
+    expect(
+      (
+        await pool.query(
+          `SELECT oid::text FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND conname='mio_provider_models_display_name_length' AND convalidated AND conenforced`,
+        )
+      ).rows,
+    ).toEqual(metadata);
+  }));
+
+it('upgrades partial columns and old NOT NULL revisions, replaces weak checks and rolls back invalid history', async () =>
+  databaseTest(async (pool) => {
+    await pool.query(providerSchemaSQL);
+    await pool.query(`ALTER TABLE mio_provider_configs DROP COLUMN last_attempt_seq;
+    ALTER TABLE mio_provider_models DROP COLUMN description_override,ADD COLUMN classification text;
+    ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text;
+    ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route SET NOT NULL,
+      DROP CONSTRAINT mio_provider_model_route_revisions_action_check,
+      DROP CONSTRAINT mio_provider_model_route_revisions_after_route_check,
+      ADD CONSTRAINT mio_provider_model_route_revisions_action_check CHECK (true),
+      ADD CONSTRAINT mio_provider_model_route_revisions_after_route_check CHECK (true);`);
+    await pool.query(providerSchemaSQL);
+    await checkProviderSchema(pool);
+    expect(
+      (
+        await pool.query(
+          `SELECT attnotnull FROM pg_attribute WHERE attrelid='mio_provider_model_route_revisions'::regclass AND attname='after_route'`,
+        )
+      ).rows[0].attnotnull,
+    ).toBe(false);
+    await pool.query(
+      `INSERT INTO mio_provider_model_route_revisions(id,raw_model_id,operation,declaration_version,action,actor_type,actor_name,after_route)
+    VALUES($1,'old-route','chat',1,'delete','cli','fixture',NULL)`,
+      [randomUUID()],
+    );
+    await expect(
+      pool.query("UPDATE mio_provider_model_route_revisions SET action='cli-import'"),
+    ).rejects.toMatchObject({ code: '23514' });
+    await pool.query(`ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT mio_provider_model_route_revisions_after_route_check,
+    ADD CONSTRAINT mio_provider_model_route_revisions_after_route_check CHECK (true);
+    UPDATE mio_provider_model_route_revisions SET action='cli-import';
+    ALTER TABLE mio_provider_configs DROP COLUMN last_attempt_seq;`);
+    const before = (await pool.query('SELECT * FROM mio_provider_model_route_revisions')).rows;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await expect(client.query(providerSchemaSQL)).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
+    expect((await pool.query('SELECT * FROM mio_provider_model_route_revisions')).rows).toEqual(
+      before,
+    );
+    expect(
+      (
+        await pool.query(
+          `SELECT attname FROM pg_attribute WHERE attrelid='mio_provider_configs'::regclass AND attname='last_attempt_seq' AND NOT attisdropped`,
+        )
+      ).rows,
+    ).toEqual([]);
+  }));
+
+it('reruns current provider columns without blocking readers of the guarded tables', async () => {
+  const database = await authDatabase();
+  const pool = new Pool({ connectionString: database.observerURL });
+  const blocker = await pool.connect();
+  try {
+    await pool.query(providerSchemaSQL);
+    await blocker.query('BEGIN');
+    await blocker.query(`LOCK TABLE mio_provider_configs, mio_provider_models,
+      mio_provider_model_verifications, mio_provider_model_route_revisions IN ACCESS SHARE MODE`);
+    const result = spawnSync(
+      process.execPath,
+      ['scripts/service/migrate-providers.ts', '--apply'],
+      {
+        env: providerEnv(database.url),
+        encoding: 'utf8',
+        timeout: 7500,
+      },
+    );
+    expect(result.status, result.stderr).toBe(0);
+  } finally {
+    await blocker.query('ROLLBACK');
+    blocker.release();
+    await pool.end();
+    await database.close();
+  }
+});

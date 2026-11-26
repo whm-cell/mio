@@ -96,20 +96,33 @@ export class ProviderStore {
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       const value = await action(client);
       await client.query('COMMIT');
       return value;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       throw error instanceof ProviderError ||
         error instanceof VoiceError ||
         error instanceof AudioError
         ? error
         : new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
   private async locked(client: PoolClient, owner: string, expected?: number): Promise<ProviderRow> {
@@ -784,7 +797,7 @@ export async function createProviderStore(
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-providers',
   });
   pool.on('error', () => log.error('PROVIDER_DATABASE_CONNECTION_ERROR'));

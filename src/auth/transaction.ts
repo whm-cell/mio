@@ -5,6 +5,12 @@ export async function withAuthTransaction<T>(
   action: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  let discard = false;
+  const disconnected = () => {
+    discard = true;
+  };
+  // The pool handles errors only while this client is idle.
+  client.on('error', disconnected);
   try {
     await client.query('BEGIN');
     await client.query("SET LOCAL lock_timeout = '3s'");
@@ -13,9 +19,16 @@ export async function withAuthTransaction<T>(
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (!discard) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        discard = true;
+      }
+    }
     throw error;
   } finally {
-    client.release();
+    client.removeListener('error', disconnected);
+    client.release(discard);
   }
 }

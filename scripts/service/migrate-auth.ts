@@ -10,7 +10,15 @@ const apply = args.includes('--apply');
 const rollback = args.includes('--rollback-sms-budget');
 const config = readAuthConfig();
 if (!config) throw new Error('AUTH_CONFIG: authentication configuration required');
-const pool = new Pool({ connectionString: config.databaseURL, connectionTimeoutMillis: 5000 });
+// Better Auth may use several connections without one encompassing transaction.
+// Append the migration policy after existing startup options so URL overrides cannot disable it.
+const databaseURL = new URL(config.databaseURL);
+databaseURL.searchParams.delete('lock_timeout');
+databaseURL.searchParams.set(
+  'options',
+  `${databaseURL.searchParams.get('options') ?? ''} -c lock_timeout=5000`,
+);
+const pool = new Pool({ connectionString: databaseURL.toString(), connectionTimeoutMillis: 5000 });
 try {
   const plan = await getMigrations(authOptions(config, pool));
   if (plan.schemaProblems.length)

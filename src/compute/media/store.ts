@@ -239,7 +239,7 @@ export async function createMediaStore(databaseURL: string): Promise<MediaStore>
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-media',
   });
   pool.on('error', () => log.error('MEDIA_DATABASE_CONNECTION_ERROR'));

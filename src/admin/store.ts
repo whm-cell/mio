@@ -239,7 +239,7 @@ function createManagedPool(connectionString: string, name: string, max = 3): Poo
     max,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: name,
   });
   pool.on('error', () => log.error('ADMIN_DATABASE_CONNECTION_ERROR'));
@@ -299,13 +299,25 @@ export class AdminStore {
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       const value = await action(client);
       await client.query('COMMIT');
       return value;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       if (error instanceof AdminError) throw error;
       const pgErr = error as { code?: string; constraint?: string } | null;
       if (pgErr?.code === '23505') {
@@ -320,7 +332,8 @@ export class AdminStore {
       }
       throw new AdminError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'ADMIN_UNAVAILABLE');
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
 

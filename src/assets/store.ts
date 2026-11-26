@@ -296,7 +296,7 @@ export async function createAssetStore(
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-assets',
   });
   pool.on('error', () => log.error('ASSET_DATABASE_CONNECTION_ERROR'));

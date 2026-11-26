@@ -26,19 +26,32 @@ export async function withMaterialTransaction<T>(
   action: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  let discard = false;
+  const disconnected = () => {
+    discard = true;
+  };
+  // The pool handles errors only while this client is idle.
+  client.on('error', disconnected);
   try {
     await client.query('BEGIN');
     const result = await action(client);
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (!discard) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        discard = true;
+      }
+    }
     if (error instanceof MaterialError) throw error;
     if ((error as { code?: string }).code === '23505')
       throw new MaterialError(HTTP_STATUS.CONFLICT, 'UPSTREAM_RESOURCE_COLLISION');
     throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
   } finally {
-    client.release();
+    client.removeListener('error', disconnected);
+    client.release(discard);
   }
 }
 

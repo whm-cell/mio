@@ -1,4 +1,8 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
@@ -379,3 +383,111 @@ it('keeps both budget relations in the owning schema through cutover and rollbac
     }
   }
 }, 20_000);
+
+it('sets effective auth migration startup lock_timeout while preserving URL search_path/options', async () => {
+  const url = new URL(database.url);
+  url.searchParams.set(
+    'options',
+    `${url.searchParams.get('options')} -cstatement_timeout=11000 -clock_timeout=0`,
+  );
+  url.searchParams.set('lock_timeout', '0');
+  const trace = `data:text/javascript,${encodeURIComponent(`
+    import pg from ${JSON.stringify(pathToFileURL(resolve('node_modules/pg/lib/index.js')).href)};
+    const query = pg.Client.prototype.query;
+    pg.Client.prototype.query = async function(...args) {
+      const sql=typeof args[0]==='string'?args[0]:args[0].text;
+      if (/^create table/i.test(sql)) {
+        const lock=await query.call(this,'SHOW lock_timeout');
+        const statement=await query.call(this,'SHOW statement_timeout');
+        const schema=await query.call(this,'SELECT current_schema() AS schema');
+        console.log(JSON.stringify({trace:'auth-ddl',lock:lock.rows[0].lock_timeout,statement:statement.rows[0].statement_timeout,schema:schema.rows[0].schema}));
+      }
+      return query.apply(this,args);
+    };
+  `)}`;
+  const result = spawnSync(
+    process.execPath,
+    ['--import', trace, 'scripts/service/migrate-auth.ts', '--apply'],
+    {
+      env: configEnv(url.toString()),
+      encoding: 'utf8',
+      timeout: 15000,
+    },
+  );
+  expect(result.status, result.stderr).toBe(0);
+  const traces = result.stdout
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line));
+  console.log('MIGRATION_AUTH_SETTINGS', JSON.stringify(traces));
+  expect(traces.length).toBeGreaterThan(1);
+  expect(
+    traces.every(
+      (row) =>
+        row.lock === '5s' && row.statement === '11s' && row.schema === database.applicationName,
+    ),
+  ).toBe(true);
+  expect((await pool.query('SHOW lock_timeout')).rows[0].lock_timeout).toBe('0');
+  expect((await schemaVersion()).event).toBe('"mioSmsBudgetEvent"');
+});
+
+it('times out a blocked third-party auth ALTER and succeeds after the lock is released', async () => {
+  await legacySchema();
+  await pool.query('ALTER TABLE "user" DROP COLUMN "emailVerified"');
+  const blocker = await pool.connect();
+  let child: ReturnType<typeof spawn> | undefined;
+  let closed: Promise<unknown> | undefined;
+  try {
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE "user" IN SHARE MODE');
+    child = spawn(process.execPath, ['scripts/service/migrate-auth.ts', '--apply'], {
+      env: configEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    closed = once(child, 'close');
+    child.stdout!.resume();
+    let stderr = '';
+    child.stderr!.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    let waiting = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      waiting = Boolean(
+        (
+          await pool.query(
+            `SELECT 1 FROM pg_stat_activity
+        WHERE application_name=$1 AND wait_event_type='Lock' AND query ILIKE 'alter table%'`,
+            [database.applicationName],
+          )
+        ).rowCount,
+      );
+      if (waiting) break;
+      await delay(50);
+    }
+    expect(waiting, stderr).toBe(true);
+    expect(
+      await Promise.race([closed, delay(7500).then(() => 'did not exit on lock timeout')]),
+      stderr,
+    ).toEqual([1, null]);
+    expect(stderr).toContain('lock timeout');
+    expect(
+      (
+        await pool.query(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema=current_schema() AND table_name='user' AND column_name='emailVerified'`)
+      ).rows,
+    ).toEqual([]);
+    await blocker.query('ROLLBACK');
+    migrate(['--apply']);
+    expect(
+      (
+        await pool.query(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema=current_schema() AND table_name='user' AND column_name='emailVerified'`)
+      ).rows,
+    ).toHaveLength(1);
+  } finally {
+    if (child && child.exitCode === null) child.kill('SIGTERM');
+    if (closed) await closed;
+    await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+});

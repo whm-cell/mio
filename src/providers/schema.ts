@@ -23,19 +23,27 @@ CREATE TABLE IF NOT EXISTS mio_provider_configs (
   auth_tag bytea NOT NULL CHECK(octet_length(auth_tag)=16), discovery jsonb,
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
-ALTER TABLE mio_provider_configs
-  ADD COLUMN IF NOT EXISTS catalog_version integer CHECK(catalog_version>0),
-  ADD COLUMN IF NOT EXISTS catalog_credential_version integer CHECK(catalog_credential_version>0),
-  ADD COLUMN IF NOT EXISTS catalog_succeeded_at timestamptz,
-  ADD COLUMN IF NOT EXISTS latest_refresh_seq integer NOT NULL DEFAULT 0 CHECK(latest_refresh_seq>=0),
-  ADD COLUMN IF NOT EXISTS last_attempt_seq integer,
-  ADD COLUMN IF NOT EXISTS last_attempt_credential_version integer,
-  ADD COLUMN IF NOT EXISTS last_attempt_started_at timestamptz,
-  ADD COLUMN IF NOT EXISTS last_attempt_finished_at timestamptz,
-  ADD COLUMN IF NOT EXISTS last_attempt_status text CHECK(last_attempt_status IN ('running','connected','failed')),
-  ADD COLUMN IF NOT EXISTS last_attempt_error_code text,
-  ADD COLUMN IF NOT EXISTS credential_auth_state text NOT NULL DEFAULT 'unchecked'
-    CHECK(credential_auth_state IN ('unchecked','valid','rejected'));
+DO $$ BEGIN
+  IF (SELECT count(*) FROM pg_attribute
+    WHERE attrelid='mio_provider_configs'::regclass AND attnum>0 AND NOT attisdropped
+      AND attname IN ('catalog_version','catalog_credential_version','catalog_succeeded_at',
+        'latest_refresh_seq','last_attempt_seq','last_attempt_credential_version','last_attempt_started_at',
+        'last_attempt_finished_at','last_attempt_status','last_attempt_error_code','credential_auth_state')) <> 11 THEN
+    ALTER TABLE mio_provider_configs
+      ADD COLUMN IF NOT EXISTS catalog_version integer CHECK(catalog_version>0),
+      ADD COLUMN IF NOT EXISTS catalog_credential_version integer CHECK(catalog_credential_version>0),
+      ADD COLUMN IF NOT EXISTS catalog_succeeded_at timestamptz,
+      ADD COLUMN IF NOT EXISTS latest_refresh_seq integer NOT NULL DEFAULT 0 CHECK(latest_refresh_seq>=0),
+      ADD COLUMN IF NOT EXISTS last_attempt_seq integer,
+      ADD COLUMN IF NOT EXISTS last_attempt_credential_version integer,
+      ADD COLUMN IF NOT EXISTS last_attempt_started_at timestamptz,
+      ADD COLUMN IF NOT EXISTS last_attempt_finished_at timestamptz,
+      ADD COLUMN IF NOT EXISTS last_attempt_status text CHECK(last_attempt_status IN ('running','connected','failed')),
+      ADD COLUMN IF NOT EXISTS last_attempt_error_code text,
+      ADD COLUMN IF NOT EXISTS credential_auth_state text NOT NULL DEFAULT 'unchecked'
+        CHECK(credential_auth_state IN ('unchecked','valid','rejected'));
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS mio_provider_models (
   model_key uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   provider_id uuid NOT NULL REFERENCES mio_provider_configs(id),
@@ -51,22 +59,42 @@ CREATE TABLE IF NOT EXISTS mio_provider_models (
     OR (credential_version>0 AND catalog_version>0 AND first_seen_at IS NOT NULL AND last_seen_at IS NOT NULL)),
   CHECK(membership_state<>'current' OR (credential_version IS NOT NULL AND catalog_version IS NOT NULL))
 );
-ALTER TABLE mio_provider_models
-  ADD COLUMN IF NOT EXISTS display_name text,
-  ADD COLUMN IF NOT EXISTS description_override text;
-ALTER TABLE mio_provider_models
-  DROP COLUMN IF EXISTS classification,
-  DROP COLUMN IF EXISTS classification_source;
+DO $$ BEGIN
+  IF (SELECT count(*) FROM pg_attribute
+    WHERE attrelid='mio_provider_models'::regclass AND attnum>0 AND NOT attisdropped
+      AND attname IN ('display_name','description_override')) <> 2 THEN
+    ALTER TABLE mio_provider_models
+      ADD COLUMN IF NOT EXISTS display_name text,
+      ADD COLUMN IF NOT EXISTS description_override text;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_attribute
+    WHERE attrelid='mio_provider_models'::regclass AND attnum>0 AND NOT attisdropped
+      AND attname IN ('classification','classification_source')) THEN
+    ALTER TABLE mio_provider_models
+      DROP COLUMN IF EXISTS classification,
+      DROP COLUMN IF EXISTS classification_source;
+  END IF;
+END $$;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
     AND conname='mio_provider_models_display_name_length') THEN
     ALTER TABLE mio_provider_models ADD CONSTRAINT mio_provider_models_display_name_length
-      CHECK(char_length(display_name)<=100);
+      CHECK(char_length(display_name)<=100) NOT VALID;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
     AND conname='mio_provider_models_description_override_length') THEN
     ALTER TABLE mio_provider_models ADD CONSTRAINT mio_provider_models_description_override_length
-      CHECK(char_length(description_override)<=500);
+      CHECK(char_length(description_override)<=500) NOT VALID;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
+    AND conname='mio_provider_models_display_name_length' AND contype='c' AND conenforced
+    AND pg_get_expr(conbin,conrelid)='(char_length(display_name) <= 100)' AND NOT convalidated) THEN
+    ALTER TABLE mio_provider_models VALIDATE CONSTRAINT mio_provider_models_display_name_length;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass
+    AND conname='mio_provider_models_description_override_length' AND contype='c' AND conenforced
+    AND pg_get_expr(conbin,conrelid)='(char_length(description_override) <= 500)' AND NOT convalidated) THEN
+    ALTER TABLE mio_provider_models VALIDATE CONSTRAINT mio_provider_models_description_override_length;
   END IF;
 END $$;
 CREATE TABLE IF NOT EXISTS mio_provider_model_routes (
@@ -256,7 +284,13 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_verifications (
 );
 ${upgradeProviderOperationSQL('mio_provider_model_routes')}
 ${upgradeProviderOperationSQL('mio_provider_model_verifications')}
-ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute
+    WHERE attrelid='mio_provider_model_verifications'::regclass AND attnum>0 AND NOT attisdropped
+      AND attname='adaptation_origin') THEN
+    ALTER TABLE mio_provider_model_verifications DROP COLUMN IF EXISTS adaptation_origin;
+  END IF;
+END $$;
 DO $$ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conrelid = 'mio_provider_model_routes'::regclass AND contype = 'p'
@@ -363,7 +397,13 @@ CREATE TABLE IF NOT EXISTS mio_provider_model_route_revisions (
   )
 );
 ${upgradeProviderOperationSQL('mio_provider_model_route_revisions')}
-ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute
+    WHERE attrelid='mio_provider_model_route_revisions'::regclass AND attnum>0 AND NOT attisdropped
+      AND attname='after_route' AND attnotnull) THEN
+    ALTER TABLE mio_provider_model_route_revisions ALTER COLUMN after_route DROP NOT NULL;
+  END IF;
+END $$;
 DO $$
 DECLARE
   target_table regclass;
@@ -398,25 +438,26 @@ BEGIN
   LOOP
     EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', rec.conrelid::regclass, rec.conname);
   END LOOP;
-  FOR rec IN
-    SELECT conname FROM pg_constraint
-    WHERE conrelid = 'mio_provider_model_route_revisions'::regclass
-      AND contype = 'c'
-      AND (
-        pg_get_constraintdef(oid) LIKE '%cli-import%'
-        OR conname = 'mio_provider_model_route_revisions_after_route_check'
-      )
-  LOOP
-    EXECUTE format('ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT %I', rec.conname);
+  -- Canonical expressions follow pg_get_expr, as with the operation constraint upgrade.
+  FOR rec IN SELECT * FROM (VALUES
+    ('mio_provider_model_route_revisions_action_check',
+      $check$(action = ANY (ARRAY['create'::text, 'update'::text, 'enable'::text, 'disable'::text, 'delete'::text, 'rollback'::text, 'cli-import'::text]))$check$),
+    ('mio_provider_model_route_revisions_after_route_check',
+      $check$(((action = 'delete'::text) AND (after_route IS NULL)) OR ((action <> 'delete'::text) AND (after_route IS NOT NULL) AND (jsonb_typeof(after_route) = 'object'::text)))$check$)
+  ) AS checks(name,expression) LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid='mio_provider_model_route_revisions'::regclass
+        AND conname=rec.name AND contype='c' AND conenforced
+        AND pg_get_expr(conbin,conrelid)=rec.expression) THEN
+      EXECUTE format('ALTER TABLE mio_provider_model_route_revisions DROP CONSTRAINT IF EXISTS %I, ADD CONSTRAINT %I CHECK (%s) NOT VALID',
+        rec.name,rec.name,rec.expression);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid='mio_provider_model_route_revisions'::regclass
+        AND conname=rec.name AND NOT convalidated) THEN
+      EXECUTE format('ALTER TABLE mio_provider_model_route_revisions VALIDATE CONSTRAINT %I',rec.name);
+    END IF;
   END LOOP;
-  ALTER TABLE mio_provider_model_route_revisions
-    ADD CONSTRAINT mio_provider_model_route_revisions_action_check
-      CHECK (action IN ('create', 'update', 'enable', 'disable', 'delete', 'rollback', 'cli-import')),
-    ADD CONSTRAINT mio_provider_model_route_revisions_after_route_check
-      CHECK (
-        (action = 'delete' AND after_route IS NULL)
-        OR (action <> 'delete' AND after_route IS NOT NULL AND jsonb_typeof(after_route) = 'object')
-      );
   IF to_regclass('mio_provider_model_policies') IS NOT NULL THEN
     INSERT INTO mio_provider_catalog_models (
       provider_type, raw_model_id, display_label, user_visible, allow_undiscovered, call_notes, origin_source, updated_by, created_at, updated_at
@@ -489,7 +530,7 @@ export async function checkProviderSchema(
       throw new Error('PROVIDER_SCHEMA: incompatible columns');
   }
   const constraints = await pool.query<{ name: string; definition: string; valid: boolean }>(`
-    SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AS valid
+    SELECT conname AS name,pg_get_constraintdef(oid) AS definition,convalidated AND conenforced AS valid
     FROM pg_constraint WHERE conrelid='mio_provider_models'::regclass AND contype='c'
       AND conname IN ('mio_provider_models_display_name_length','mio_provider_models_description_override_length')`);
   for (const [name, definition] of [

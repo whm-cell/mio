@@ -33,6 +33,7 @@ import {
 import type { VideoCreateRequest } from '../../src/generations/video/contracts.ts';
 import { VIDEO_USER_QUOTA } from '../../src/generations/video/contracts.ts';
 import { createVideoProtocol } from '../../src/integrations/onelink/video/index.ts';
+import { legacyVideoRouteEntries } from '../../scripts/service/legacy-video-routes.ts';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -259,6 +260,151 @@ async function fixture(reference?: 'frozen' | 'legacy', family: keyof typeof que
 }
 
 describe('durable video execution', () => {
+  it('settles a legacy unconstructible video after a rolled-back terminal write without reclaiming it', async () => {
+    const f = await fixture();
+    // A previous release could admit this exact catalog ID before trying to construct the driver.
+    await f.pool.query(
+      `UPDATE mio_video_jobs SET route_snapshot=jsonb_set(route_snapshot,'{modelId}',to_jsonb($2::text))
+       WHERE id=$1`,
+      [f.job.jobId, 'seedance/fixture'],
+    );
+    const create = () =>
+      f.create({ request: { ...f.request, requestId: randomUUID() }, inputSnapshot: [] });
+    for (let count = 1; count < VIDEO_USER_QUOTA; count++) await create();
+    await expect(create()).rejects.toMatchObject({ code: 'VIDEO_QUOTA_EXCEEDED' });
+    await f.pool.query(
+      `UPDATE mio_video_executions SET next_query_at=now()+interval '1 hour' WHERE job_id<>$1`,
+      [f.job.jobId],
+    );
+    await f.pool.query(`
+      CREATE SEQUENCE fixture_video_terminal_attempts;
+      CREATE FUNCTION fixture_rollback_first_terminal() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF nextval('fixture_video_terminal_attempts') = 1 THEN
+          RAISE EXCEPTION 'fixture could not commit the video rejection';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER fixture_first_terminal BEFORE UPDATE OF phase ON mio_video_executions
+      FOR EACH ROW WHEN (OLD.phase='ready' AND NEW.phase='done')
+      EXECUTE FUNCTION fixture_rollback_first_terminal();
+    `);
+
+    await f.execution.close();
+    const protocol = vi.fn<VideoProtocolFactory>(createVideoProtocol);
+    const transport = vi.fn<typeof fetch>();
+    const release = vi.spyOn(f.execution, 'release');
+    const executor = await createVideoExecutor(
+      f.store,
+      () => f.provider,
+      f.materialize,
+      { protocol, transport },
+      f.directory,
+    );
+    try {
+      await vi.waitFor(
+        async () => {
+          expect(await f.durableState()).toMatchObject({
+            state: 'rejected',
+            error_code: 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE',
+            completed_at: expect.any(Date),
+            phase: 'done',
+            claim_id: null,
+            upstream_task_id: null,
+            async_deadline: null,
+          });
+        },
+        { timeout: 4000 },
+      );
+      expect(
+        (await f.pool.query('SELECT last_value FROM fixture_video_terminal_attempts')).rows,
+      ).toEqual([{ last_value: '2' }]);
+      expect(protocol).toHaveBeenCalledOnce();
+      expect(release).not.toHaveBeenCalled();
+      expect(transport).not.toHaveBeenCalled();
+      await expect(readFile(f.receiptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await executor.close();
+      release.mockRestore();
+    }
+    await f.makeDue();
+    expect(await f.execution.claim()).toBeUndefined();
+    await expect(create()).resolves.toMatchObject({ created: true });
+    await expect(create()).rejects.toMatchObject({ code: 'VIDEO_QUOTA_EXCEEDED' });
+  });
+
+  it('closes with a locked job row and lets the next lease settle the unconstructible video', async () => {
+    const f = await fixture();
+    await f.pool.query(
+      `UPDATE mio_video_jobs SET route_snapshot=jsonb_set(route_snapshot,'{modelId}',to_jsonb($2::text))
+       WHERE id=$1`,
+      [f.job.jobId, 'seedance/fixture'],
+    );
+    await f.execution.close();
+    const protocol = vi.fn<VideoProtocolFactory>(createVideoProtocol);
+    const transport = vi.fn<typeof fetch>();
+    const start = () =>
+      createVideoExecutor(
+        f.store,
+        () => f.provider,
+        f.materialize,
+        { protocol, transport },
+        f.directory,
+      );
+    const lock = await f.pool.connect();
+    let executor: Awaited<ReturnType<typeof start>> | undefined;
+    try {
+      await lock.query('BEGIN');
+      await lock.query('SELECT id FROM mio_video_jobs WHERE id=$1 FOR UPDATE', [f.job.jobId]);
+      executor = await start();
+      await vi.waitFor(() => expect(protocol).toHaveBeenCalledOnce());
+      const leasePid = await videoLeasePid(f.pool);
+      const before = await f.durableState();
+      expect(before).toMatchObject({
+        state: 'accepted',
+        phase: 'ready',
+        claim_id: expect.any(String),
+      });
+
+      const closed = await Promise.race([
+        executor.close().then(() => 'closed'),
+        delay(5000, 'timed out', { ref: false }),
+      ]);
+      expect(closed).toBe('closed');
+      const { rows } = await lock.query(
+        `SELECT EXISTS (SELECT FROM pg_locks WHERE pid=$1 AND locktype='advisory') AS leased,
+          EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database()
+            AND application_name=current_setting('application_name')
+            AND pg_backend_pid()=ANY(pg_blocking_pids(pid))) AS blocked`,
+        [leasePid],
+      );
+      expect(rows).toEqual([{ leased: false, blocked: false }]);
+      expect(await f.durableState()).toEqual(before);
+      expect(protocol).toHaveBeenCalledOnce();
+      expect(transport).not.toHaveBeenCalled();
+    } finally {
+      await lock.query('ROLLBACK').finally(() => lock.release());
+      await executor?.close();
+    }
+
+    const restarted = await start();
+    try {
+      await vi.waitFor(async () => {
+        expect(await f.durableState()).toMatchObject({
+          state: 'rejected',
+          error_code: 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE',
+          phase: 'done',
+          claim_id: null,
+          upstream_task_id: null,
+        });
+      });
+      expect(protocol).toHaveBeenCalledTimes(2);
+      expect(transport).not.toHaveBeenCalled();
+    } finally {
+      await restarted.close();
+    }
+  });
+
   it('recovers an owner result from the checkpoint without submitting another video', async () => {
     const f = await fixture();
     await f.run(await f.next());
@@ -1469,6 +1615,64 @@ function arkQueryTransport() {
 }
 
 describe('durable video query outcomes', () => {
+  it('queries an old Kling token using its original endpoint and the frozen Turbo declaration', async () => {
+    const f = await fixture('legacy', 'kling');
+    const modelId = 'kling-v2-5-turbo';
+    const declaration = legacyVideoRouteEntries([modelId])[0]!;
+    const legacyPath = '/kling/v1/videos/multi-image2video';
+    const priorSubmitPath = '/kling/v1/videos/image2video';
+    const taskId = JSON.stringify({ path: priorSubmitPath, id: 'safe-task' });
+    const frozen = {
+      driver: declaration.driver,
+      vendor: declaration.vendor,
+      submitPath: legacyPath,
+      queryPathTemplate: `${legacyPath}/{task_id}`,
+      paramSpec: {
+        ...declaration.paramSpec,
+        parameters: { ...declaration.paramSpec.parameters!, generateAudio: true },
+      },
+      requestDefaults: {},
+      outputSpec: {},
+    };
+    // The old importer accepted this spec, and the first-frame POST used image2video.
+    await f.pool.query(
+      `UPDATE mio_video_jobs SET route_snapshot=route_snapshot||$2::jsonb,
+        command=jsonb_set(command,'{request,parameters,durationSeconds}','5') WHERE id=$1`,
+      [f.job.jobId, { modelId, route: frozen }],
+    );
+    const admitted = await f.next();
+    expect(admitted.command.request.parameters).toMatchObject({
+      mode: 'first_frame',
+      durationSeconds: 5,
+    });
+    expect(admitted.command.request.parameters).not.toHaveProperty('generateAudio');
+    expect(await f.execution.submitting(admitted)).toBe(true);
+    expect(await f.execution.receive({ ...f.expectedReceipt, upstreamTaskId: taskId }, true)).toBe(
+      'confirmed',
+    );
+
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json(klingSuccess([{ url: 'https://media.fixture/video.mp4' }])),
+      );
+    const run = f.runner({ protocol: createVideoProtocol, transport });
+    await run(await f.next());
+    expect(await f.durableState()).toMatchObject({
+      state: 'completed',
+      phase: 'done',
+      upstream_task_id: taskId,
+      query_attempt: 1,
+    });
+    expect(
+      transport.mock.calls.map(([url, options]) => [
+        new URL(String(url)).pathname,
+        options?.method,
+      ]),
+    ).toEqual([[`${priorSubmitPath}/safe-task`, 'GET']]);
+    expect(f.provider.snapshotVideo).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       family: 'kling',

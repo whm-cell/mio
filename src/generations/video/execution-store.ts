@@ -24,7 +24,7 @@ import {
 } from './execution.ts';
 
 const EXECUTOR_LOCK = 672049927;
-const RELEASE_TIMEOUT_MS = 2000;
+const CLAIM_SETTLEMENT_TIMEOUT_MS = 2000;
 const CLEANUP_RETRY_INTERVAL_MS = 30_000;
 const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
 const executionSelection = `SELECT j.id,j.owner_id,j.state,j.error_code,j.command,j.admitted,j.route_snapshot,
@@ -34,6 +34,8 @@ const runnable = `e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiti
   AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp()
     OR (e.phase='waiting' AND (e.async_deadline<=statement_timestamp()
       OR e.query_attempt>=e.async_max_queries)))`;
+const terminalExecutionSet = `phase='done',claim_id=NULL,
+          snapshot='{}'::jsonb,next_query_at=NULL,updated_at=now()`;
 
 export type VideoClaim = Pick<VideoExecution, 'id' | 'claim_id'>;
 
@@ -103,7 +105,7 @@ export class VideoExecutionStore {
         const unlock = {
           text: 'SELECT pg_advisory_unlock(hashtext(current_schema()),$1)',
           values: [EXECUTOR_LOCK],
-          query_timeout: RELEASE_TIMEOUT_MS,
+          query_timeout: CLAIM_SETTLEMENT_TIMEOUT_MS,
         };
         await executor.client.query(unlock);
       }
@@ -183,7 +185,7 @@ export class VideoExecutionStore {
         ELSE statement_timestamp()+interval '1 second' END),updated_at=now()
       WHERE job_id=$1 AND claim_id=$2`,
       values: [row.id, row.claim_id, VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
-      query_timeout: RELEASE_TIMEOUT_MS,
+      query_timeout: CLAIM_SETTLEMENT_TIMEOUT_MS,
     };
     await this.pool.query(release);
   }
@@ -405,6 +407,30 @@ export class VideoExecutionStore {
     return Boolean(result.rowCount);
   }
 
+  async settleInvalidRoute(
+    row: VideoClaim,
+    state: 'rejected' | 'failed',
+    code: string,
+  ): Promise<void> {
+    // Lock the execution before its job and fail immediately if either row is locked.
+    const settlement = {
+      text: `WITH claimed AS (
+        SELECT job_id FROM mio_video_executions WHERE job_id=$1 AND claim_id=$2
+        FOR NO KEY UPDATE NOWAIT
+      ), locked_job AS (
+        SELECT j.id FROM mio_video_jobs j JOIN claimed c ON c.job_id=j.id
+        FOR NO KEY UPDATE OF j NOWAIT
+      ), settled AS (
+        UPDATE mio_video_executions e SET ${terminalExecutionSet}
+        FROM locked_job j WHERE e.job_id=j.id RETURNING e.job_id
+      ) UPDATE mio_video_jobs j SET state=$3,error_code=$4,completed_at=now(),updated_at=now()
+        FROM settled e WHERE j.id=e.job_id`,
+      values: [row.id, row.claim_id, state, code],
+      query_timeout: CLAIM_SETTLEMENT_TIMEOUT_MS,
+    };
+    await this.pool.query(settlement);
+  }
+
   async terminal(
     row: VideoExecution,
     state: VideoJobState,
@@ -415,8 +441,7 @@ export class VideoExecutionStore {
       this.pool,
       async (client) => {
         const changed = await client.query(
-          `UPDATE mio_video_executions SET phase='done',claim_id=NULL,
-          snapshot='{}'::jsonb,next_query_at=NULL,updated_at=now()
+          `UPDATE mio_video_executions SET ${terminalExecutionSet}
           WHERE job_id=$1 AND claim_id=$2 RETURNING job_id`,
           [row.id, row.claim_id],
         );

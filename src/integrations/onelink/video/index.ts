@@ -1,5 +1,8 @@
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
-import { defaultVideoGenerateAudio } from '../../../generations/video/driver-capabilities.ts';
+import {
+  defaultVideoGenerateAudio,
+  isVideoProtocolModelId,
+} from '../../../generations/video/driver-capabilities.ts';
 import {
   validateVideoParameters,
   validateVideoRouteConfig,
@@ -9,6 +12,7 @@ import type {
   VideoQueryResult,
   VideoSubmitResult,
 } from '../../../generations/video/execution.ts';
+import { VideoProtocolRouteInvalid } from '../../../generations/video/execution.ts';
 import { endpoint, operationPath, readJson, TASK_ID } from './shared.ts';
 import { videoSubmission } from './payload.ts';
 import { submissionTask, videoQueryResult } from './response.ts';
@@ -71,8 +75,7 @@ export function createVideoProtocol(
   transport: typeof fetch = fetch,
 ): VideoProtocol {
   const validated = validateVideoRouteConfig({ ...route, editPath: null });
-  if (!validated || !/^[A-Za-z0-9._:-]{1,256}$/.test(modelId))
-    throw new Error('VIDEO_ROUTE_INVALID');
+  if (!validated || !isVideoProtocolModelId(modelId)) throw new VideoProtocolRouteInvalid();
   const audioDefault = defaultVideoGenerateAudio(validated.driver, modelId);
   return {
     async submit(parameters, refs, key, signal): Promise<VideoSubmitResult> {

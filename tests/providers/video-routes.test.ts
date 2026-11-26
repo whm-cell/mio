@@ -143,7 +143,7 @@ it.each([
 it('allows a sourced dynamic Vidu model and binds Kling video_ref to exact Omni', () => {
   const dynamic = {
     ...legacyVideoRouteEntries(['video-vidu-q2'])[0]!,
-    rawModelId: 'video-vidu-fixture-new-subject-model',
+    rawModelId: 'video-vidu-fixture_new-subject-model:v2.1',
   };
   expect(validateModelRouteEntry(dynamic).paramSpec.supportedModes).toEqual([
     'text_to_video',
@@ -160,6 +160,34 @@ it('allows a sourced dynamic Vidu model and binds Kling video_ref to exact Omni'
   };
   expect(() => validateModelRouteEntry(omniAlias)).toThrow('ROUTE_INVALID');
   expect(resolveVideoRoute(storedRoute(omniAlias))).toBeUndefined();
+});
+
+it.each(['video-vidu/fixture', 'video-vidu fixture', 'video-vidu-测试'])(
+  'rejects an unconstructible video model ID at import and live resolution: %s',
+  (rawModelId) => {
+    const declared = { ...legacyVideoRouteEntries(['video-vidu-q2'])[0]!, rawModelId };
+    expect.soft(() => validateRouteImportPayload(declared)).toThrow('ROUTE_INVALID');
+    expect(resolveVideoRoute(storedRoute(declared))).toBeUndefined();
+  },
+);
+
+it.each([
+  ['video-vidu-q2', { resolutions: ['720p'] }],
+  ['video-vidu-q2', { resolutions: ['720p'], requiresResolution: true }],
+  ['video-vidu-q2', { watermark: true }],
+  ['video-vidu-q2', { offPeak: true }],
+  ['video-vidu-q2', { audioSettings: ['origin'] }],
+  ['kling-v2-5-turbo', { generateAudio: true }],
+  ['kling-v2-5-turbo', { watermark: true }],
+  ['kling-v2-5-turbo', { audioSettings: ['origin'] }],
+])('rejects %s live capabilities without corresponding wire fields: %j', (model, parameters) => {
+  const seed = legacyVideoRouteEntries([model])[0]!;
+  const declared = {
+    ...seed,
+    paramSpec: { ...seed.paramSpec, parameters: { ...seed.paramSpec.parameters!, ...parameters } },
+  };
+  expect.soft(() => validateRouteImportPayload(declared)).toThrow('ROUTE_INVALID');
+  expect(resolveVideoRoute(storedRoute(declared))).toBeUndefined();
 });
 
 it.each([

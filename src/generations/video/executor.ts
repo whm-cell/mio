@@ -6,6 +6,7 @@ import { GenerationError } from '../errors.ts';
 import { VideoClaimUnsettled } from './execution-store.ts';
 import type { VideoClaim, VideoExecutionStore } from './execution-store.ts';
 import type { VideoExecution, VideoMaterializer } from './execution.ts';
+import { VideoProtocolRouteInvalid } from './execution.ts';
 import { createVideoRunner } from './runner.ts';
 import type { VideoExecutorProvider, VideoTransports } from './runner.ts';
 import type { VideoGenerationStore } from './store.ts';
@@ -14,25 +15,29 @@ import { VideoSubmissionReceipts } from './submission-receipts.ts';
 const log = createLogger('app', 'video-executor');
 const CONCURRENCY = 4;
 const POLL_INTERVAL_MS = 1000;
-const STOP_RELEASE_ATTEMPTS = 3;
+const STOP_SETTLEMENT_ATTEMPTS = 3;
 
-async function releaseClaim(execution: VideoExecutionStore, row: VideoClaim, stop: AbortSignal) {
+async function settleClaim(
+  settle: () => Promise<unknown>,
+  stop: AbortSignal,
+  action: 'RELEASE' | 'TERMINAL',
+) {
   let pending = false;
   let attemptsAfterStop = 0;
-  // Keep the original claim in its slot until PostgreSQL acknowledges its release.
+  // Keep the original claim in its slot until PostgreSQL acknowledges the write.
   for (;;) {
     // The runner may already have attempted a release before reaching this fallback.
-    await delay(POLL_INTERVAL_MS);
+    if (pending || action === 'RELEASE') await delay(POLL_INTERVAL_MS);
     if (stop.aborted) attemptsAfterStop++;
     try {
-      await execution.release(row);
+      await settle();
       return;
     } catch {
-      if (!pending) log.error('VIDEO_CLAIM_RELEASE_PENDING');
+      if (!pending) log.error(`VIDEO_CLAIM_${action}_PENDING`);
       pending = true;
-      if (attemptsAfterStop === STOP_RELEASE_ATTEMPTS) {
+      if (attemptsAfterStop === STOP_SETTLEMENT_ATTEMPTS) {
         // A new lease holder reconciles any claim that survived these attempts.
-        log.error('VIDEO_CLAIM_RELEASE_UNAVAILABLE');
+        log.error(`VIDEO_CLAIM_${action}_UNAVAILABLE`);
         return;
       }
     }
@@ -91,6 +96,9 @@ export async function createVideoExecutor(
     stop.abort(new GenerationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'VIDEO_UNAVAILABLE'));
   };
 
+  const releaseClaim = (row: VideoClaim) =>
+    settleClaim(() => execution.release(row), signal, 'RELEASE');
+
   const runClaim = async () => {
     let row: VideoExecution | undefined;
     let unsettled: VideoClaim | undefined;
@@ -105,16 +113,29 @@ export async function createVideoExecutor(
     } finally {
       claiming = false;
     }
-    if (unsettled) return releaseClaim(execution, unsettled, signal);
+    if (unsettled) return releaseClaim(unsettled);
     if (!row) return;
     wantsClaim = true;
     pump();
     try {
       await run(row);
-    } catch {
+    } catch (error) {
+      if (error instanceof VideoProtocolRouteInvalid) {
+        const beforeSubmit = row.phase === 'ready';
+        return settleClaim(
+          () =>
+            execution.settleInvalidRoute(
+              row,
+              beforeSubmit ? 'rejected' : 'failed',
+              beforeSubmit ? 'VIDEO_INPUT_OR_CREDENTIAL_UNAVAILABLE' : 'VIDEO_TASK_INVALID',
+            ),
+          signal,
+          'TERMINAL',
+        );
+      }
       retryAt = epochMs() + POLL_INTERVAL_MS;
       log.error('VIDEO_EXECUTION_PENDING');
-      await releaseClaim(execution, row, signal);
+      await releaseClaim(row);
     }
   };
 

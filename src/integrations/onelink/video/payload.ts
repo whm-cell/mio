@@ -3,6 +3,7 @@ import {
   defaultVideoGenerateAudio,
   KLING_OMNI_MODEL,
   KLING_OMNI_SUBMIT_PATH,
+  VIDU_Q2_MODEL,
 } from '../../../generations/video/driver-capabilities.ts';
 import type { VideoRouteConfig } from '../../../providers/contracts.ts';
 import { happyhorsePrompt } from './happyhorse-prompt.ts';
@@ -132,6 +133,7 @@ function vidu(
   const images = [input.firstFrame, input.lastFrame].flatMap((frame) =>
     frame ? [reference(refs, frame.assetId)] : [],
   );
+  const isQ2 = model === VIDU_Q2_MODEL;
   return {
     path: '/vidu/ent/v2/' + kind,
     body: {
@@ -142,15 +144,11 @@ function vidu(
       ...(input.ratio !== undefined && input.mode === 'text_to_video'
         ? { aspect_ratio: input.ratio }
         : {}),
-      ...(model !== 'video-vidu-q2' && input.resolution !== undefined
+      ...(!isQ2 && input.resolution !== undefined
         ? { resolution: input.resolution.toLowerCase() }
         : {}),
-      ...(model !== 'video-vidu-q2' && input.watermark !== undefined
-        ? { watermark: input.watermark }
-        : {}),
-      ...(model !== 'video-vidu-q2' && input.offPeak !== undefined
-        ? { off_peak: input.offPeak }
-        : {}),
+      ...(!isQ2 && input.watermark !== undefined ? { watermark: input.watermark } : {}),
+      ...(!isQ2 && input.offPeak !== undefined ? { off_peak: input.offPeak } : {}),
       ...(images.length ? { images } : {}),
       ...(input.subjects
         ? {

@@ -114,6 +114,12 @@ export type VideoMaterializer = (
   freshResult?: boolean,
 ) => Promise<VideoMaterializedOutput>;
 
+export class VideoProtocolRouteInvalid extends Error {
+  constructor() {
+    super('VIDEO_ROUTE_INVALID');
+  }
+}
+
 export type VideoSubmitResult =
   { state: 'submitted'; upstreamTaskId: string } | { state: 'rejected' | 'unknown'; code: string };
 export const VIDEO_QUERY_RETRY_CODES = [

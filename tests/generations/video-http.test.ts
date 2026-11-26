@@ -176,7 +176,7 @@ type VideoHttpDatabase = Awaited<ReturnType<typeof authDatabase>>;
 
 interface AssetHttpFixtureOptions {
   withExecutor?: boolean;
-  withProviderStore?: boolean;
+  providerModelIds?: readonly string[];
   realOutput?: Buffer<ArrayBuffer>;
   alternate?: { route: VideoRouteConfig; modelId: string };
   migrateGenerations?: (pool: Pool, database: VideoHttpDatabase) => Promise<unknown>;
@@ -216,7 +216,7 @@ async function assetHttpFixture(options: AssetHttpFixtureOptions = {}) {
 async function startAssetHttpFixture(
   {
     withExecutor = false,
-    withProviderStore = false,
+    providerModelIds,
     realOutput,
     alternate,
     migrateGenerations = (pool) => pool.query(generationSchemaSQL),
@@ -361,8 +361,7 @@ async function startAssetHttpFixture(
     resolveImageTaskCredential: vi.fn(async () => 'fixture-key'),
   } as unknown as ProviderService;
   let modelRef = 'onelink:model:' + randomUUID();
-  if (withProviderStore) {
-    const modelId = 'vega-1.5-pro';
+  if (providerModelIds) {
     const config = {
       databaseURL: database.url,
       masterKey: randomBytes(32),
@@ -373,13 +372,13 @@ async function startAssetHttpFixture(
     provider = createProviderService(
       providerStore,
       config,
-      async () => Response.json({ data: [{ id: modelId }] }),
+      async () => Response.json({ data: providerModelIds.map((id) => ({ id })) }),
       true,
     );
     cleanups.push(provider.close);
     await provider.save(actor, 0, 'synthetic-video-http-key');
     await provider.discover(actor);
-    await providerStore.importRoutes(legacyVideoRouteEntries([modelId]));
+    await providerStore.importRoutes(legacyVideoRouteEntries(providerModelIds));
     modelRef = (await provider.catalog(actor, 'video')).items[0]!.modelRef;
   }
   const upstream = vi.fn<typeof fetch>(async (_url, options) => {
@@ -573,9 +572,9 @@ async function startAssetHttpFixture(
     post(references: VideoAssetReference[], id?: string, signal?: AbortSignal) {
       return postRequest(request(references, id), 'fixture', signal);
     },
-    capabilities() {
+    capabilities(ref = modelRef) {
       const url = new URL(
-        `/api/v1/compute/video-capabilities/${encodeURIComponent(modelRef)}`,
+        `/api/v1/compute/video-capabilities/${encodeURIComponent(ref)}`,
         endpoint,
       );
       return fetch(url, { headers: { cookie: 'session=fixture' } });
@@ -971,7 +970,7 @@ describe('video admission cancellation', () => {
 
 describe('video admission replay', () => {
   it('reads current owner state once at HTTP admission and refreshes it after dispatch reference checks', async () => {
-    const f = await assetHttpFixture({ withProviderStore: true });
+    const f = await assetHttpFixture({ providerModelIds: ['vega-1.5-pro'] });
     const queries = vi.spyOn(Pool.prototype, 'query');
     const expectStateReads = (count: number) => {
       const reads = queries.mock.calls.filter(
@@ -1557,6 +1556,91 @@ describe('video admission after executor lease loss', () => {
       await f.close();
     }
   });
+});
+
+it('blocks video discovery and HTTP admission for previously accepted invalid routes', async () => {
+  const q2 = 'video-vidu-q2';
+  const turbo = 'kling-v2-5-turbo';
+  const invalidId = 'video-vidu/fixture';
+  const alias = 'video-vidu-fixture:v2.1';
+  const f = await assetHttpFixture({ providerModelIds: [q2, turbo, invalidId, alias] });
+  try {
+    // Reproduce what the previous platform importer could persist for these discovered IDs.
+    await f.pool.query(
+      `INSERT INTO mio_provider_model_routes (raw_model_id,operation,vendor,driver,classification,
+        submit_path,query_path_template,param_spec,capability_metadata,source_kind,source,source_version)
+       SELECT model_id,operation,vendor,driver,classification,submit_path,query_path_template,
+        param_spec,capability_metadata,source_kind,source,source_version
+       FROM mio_provider_model_routes CROSS JOIN unnest($2::text[]) AS model_id
+       WHERE raw_model_id=$1 AND operation='video.generate'`,
+      [q2, [invalidId, alias]],
+    );
+    await f.pool.query(
+      `UPDATE mio_provider_model_routes SET param_spec=jsonb_set(param_spec,'{parameters,resolutions}','["720p"]')
+       WHERE raw_model_id=$1 AND operation='video.generate'`,
+      [q2],
+    );
+    await f.pool.query(
+      `UPDATE mio_provider_model_routes SET param_spec=jsonb_set(param_spec,'{parameters,generateAudio}','true')
+       WHERE raw_model_id=$1 AND operation='video.generate'`,
+      [turbo],
+    );
+
+    const catalog = await f.provider.catalog(actor);
+    for (const [modelId, parameters] of [
+      [q2, { resolution: '720p' }],
+      [turbo, { generateAudio: true }],
+      [invalidId, {}],
+    ] as const) {
+      const member = catalog.items.find((item) => item.modelId === modelId)!;
+      expect.soft(member).toMatchObject({
+        discovered: true,
+        video: { runnable: false, adaptation: null, modes: [] },
+      });
+      const response = await f.capabilities(member.modelRef);
+      expect(response.status).toBe(200);
+      const capability: VideoCapabilitiesView = await response.json();
+      expect.soft(capability).toMatchObject({
+        available: false,
+        unavailableReason: 'ROUTE_NOT_CONFIGURED',
+        modes: [],
+      });
+      const rejected = await f.postRequest({
+        ...f.request([]),
+        modelRef: member.modelRef,
+        expectedCapabilitiesVersion: capability.capabilitiesVersion,
+        parameters: { mode: 'text_to_video', prompt: 'A spring morning.', ...parameters },
+      });
+      expect.soft(rejected.status).toBe(503);
+      expect.soft(await rejected.json()).toEqual({
+        error: {
+          code: 'VIDEO_UNAVAILABLE',
+          message: 'VIDEO_UNAVAILABLE',
+          requestId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          ),
+        },
+      });
+    }
+
+    const dynamic = catalog.items.find((item) => item.modelId === alias)!;
+    expect(dynamic).toMatchObject({ discovered: true, video: { runnable: true } });
+    const capability: VideoCapabilitiesView = await (await f.capabilities(dynamic.modelRef)).json();
+    expect(capability).toMatchObject({ available: true });
+    const accepted = await f.postRequest({
+      ...f.request([]),
+      modelRef: dynamic.modelRef,
+      expectedCapabilitiesVersion: capability.capabilitiesVersion,
+      parameters: { mode: 'text_to_video', prompt: 'A spring morning.', generateAudio: true },
+    });
+    expect(accepted.status).toBe(202);
+    const job: VideoJobView = await accepted.json();
+    expect(job).toMatchObject({ state: 'accepted', effectiveParameters: { generateAudio: true } });
+    expect((await f.pool.query('SELECT id FROM mio_video_jobs')).rows).toEqual([{ id: job.id }]);
+    expect(f.upstream).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
 });
 
 it.each([true, false])(

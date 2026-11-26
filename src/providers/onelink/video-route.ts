@@ -5,9 +5,11 @@ import type {
   VideoRequestParameters,
 } from '../../generations/video/contracts.ts';
 import {
+  isVideoProtocolModelId,
   KLING_OMNI_MODEL,
   KLING_OMNI_SUBMIT_PATH,
   KLING_TURBO_MODEL,
+  VIDU_Q2_MODEL,
 } from '../../generations/video/driver-capabilities.ts';
 import { isSafeRouteIdentifier } from '../../generations/image/contracts.ts';
 import { happyhorsePrompt } from '../../integrations/onelink/video/happyhorse-prompt.ts';
@@ -228,7 +230,7 @@ function executableRouteModes(route: VideoRouteConfig, model?: string): readonly
       return KLING_OMNI_MODES;
     if (model === KLING_TURBO_MODEL) return ['text_to_video', 'first_frame'];
   } else if (driver === 'vidu-videos') {
-    if (model === 'video-vidu-q2') return SUBJECT_MODES;
+    if (model === VIDU_Q2_MODEL) return SUBJECT_MODES;
     if (model === 'video-viduq3-pro') return FRAME_MODES;
   } else if (driver === 'happyhorse-videos') {
     const variant = model && /^happyhorse-1\.[01]-(.+)$/.exec(model)?.[1];
@@ -239,11 +241,23 @@ function executableRouteModes(route: VideoRouteConfig, model?: string): readonly
 }
 
 /** Check live declarations. Already admitted jobs retain their frozen route shape. */
-export function validateVideoRouteModes(route: VideoRouteConfig, model?: string): boolean {
+export function validateLiveVideoRoute(route: VideoRouteConfig, model?: string): boolean {
+  if (model !== undefined && !isVideoProtocolModelId(model)) return false;
   const supported = executableRouteModes(route, model);
   const { supportedModes, parameters } = route.paramSpec;
   if (!supportedModes.every((mode) => supported.includes(mode))) return false;
   if (!parameters) return true;
+  if (route.driver === 'vidu-videos' && model === VIDU_Q2_MODEL)
+    return (
+      parameters.resolutions.length === 0 &&
+      !parameters.watermark &&
+      !parameters.offPeak &&
+      parameters.audioSettings.length === 0
+    );
+  if (route.driver === 'kling-videos' && model === KLING_TURBO_MODEL)
+    return (
+      !parameters.generateAudio && !parameters.watermark && parameters.audioSettings.length === 0
+    );
   if (route.driver === 'kling-videos' && supportedModes.includes('video_ref'))
     return parameters.maxVideos === 1 && parameters.maxAudios === 0;
   if (route.driver === 'happyhorse-videos' && supportedModes.includes('video_edit'))

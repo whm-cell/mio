@@ -16,7 +16,7 @@ import type {
 import type { VideoDriver, VideoMode } from '../../generations/video/contracts.ts';
 import { AUDIO_ROUTES, audioCapabilities, validAudioRoute } from './audio.ts';
 import { VOICE_DRIVER, VOICE_OPERATION, VOICE_PATH, validVoiceRoute } from './voices.ts';
-import { validateVideoRouteConfig, validateVideoRouteModes } from './video-route.ts';
+import { validateLiveVideoRoute, validateVideoRouteConfig } from './video-route.ts';
 import {
   CHAT_PROFILES,
   DEFAULT_CHAT_IMAGE_BUDGET,
@@ -391,7 +391,7 @@ export function validateModelRouteEntry(
     });
     if (
       !canonical ||
-      !validateVideoRouteModes(canonical, context === 'model' ? rawModelId : undefined)
+      !validateLiveVideoRoute(canonical, context === 'model' ? rawModelId : undefined)
     )
       invalidRoute();
     validateVideoCapabilityMetadata(value.capabilityMetadata, canonical.paramSpec.supportedModes);
@@ -775,7 +775,7 @@ export function resolveVideoRoute(row: PlatformRouteRecord): ResolvedVideoRoute 
     requestDefaults: row.request_defaults,
     outputSpec: row.output_spec,
   });
-  if (!route || !validateVideoRouteModes(route, row.raw_model_id)) return undefined;
+  if (!route || !validateLiveVideoRoute(route, row.raw_model_id)) return undefined;
   let video: VideoCapabilityMetadata;
   try {
     video = validateVideoCapabilityMetadata(

@@ -19,6 +19,7 @@ import {
   isVideoUpstreamTaskId,
   VIDEO_INVALID_OUTPUT_ERRORS,
   VIDEO_MATERIALIZATION_MAX_ATTEMPTS,
+  VideoProtocolRouteInvalid,
   VideoResultUrlExpired,
 } from './execution.ts';
 import type { VideoSubmissionReceipts } from './submission-receipts.ts';
@@ -146,8 +147,10 @@ export function createVideoRunner(
       stop.throwIfAborted();
       if (bounded.aborted) return { state: 'retry', code: 'VIDEO_QUERY_TIMEOUT' } as const;
       if (!dispatchExpired) return result;
-    } catch {
+    } catch (error) {
       stop.throwIfAborted();
+      if (error instanceof VideoProtocolRouteInvalid)
+        return { state: 'failed', code: 'VIDEO_TASK_INVALID' } as const;
       if (!dispatchExpired) return { state: 'retry', code: 'VIDEO_QUERY_NETWORK_ERROR' } as const;
     }
     return { state: 'failed', code: 'VIDEO_RECOVERY_QUERY_DISPATCH_EXPIRED' } as const;

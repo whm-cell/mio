@@ -100,6 +100,10 @@ import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
 import type { AdminService } from './admin/service.ts';
 import { createAdminHandler, readAdminSessionCookie } from './admin/http.ts';
+import { readNotificationsConfig } from './notifications/config.ts';
+import { createNotificationStore } from './notifications/store.ts';
+import { createNotificationService } from './notifications/service.ts';
+import { createNotificationHandler } from './notifications/http.ts';
 
 export const name = 'mio-foundation';
 export const inject = ['webServer', 'tools'];
@@ -182,6 +186,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
   const generationConfig = readGenerationConfig();
   const adminConfig = readAdminConfig(process.env, authConfig?.origins);
+  const notificationsConfig = readNotificationsConfig();
+  if (notificationsConfig && !authConfig)
+    throw new Error('NOTIFICATIONS_CONFIG: authentication required');
   const oneLinkSsoConfig = readOneLinkSsoConfig();
   const rabbitmqMonitorConfig = adminConfig ? readRabbitmqMonitorConfig() : undefined;
   const redisMonitorConfig = adminConfig ? readRedisMonitorConfig() : undefined;
@@ -212,6 +219,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
     let admin: AdminService | undefined;
+    let notifications: ReturnType<typeof createNotificationService> | undefined;
     const getAuthPolicy = (): AuthRuntimePolicy =>
       admin?.getAuthPolicy() ?? {
         emailPasswordEnabled: authConfig.emailPasswordEnabled,
@@ -246,6 +254,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       throw error;
     }
     let conversations: ConversationService | undefined;
+    if (notificationsConfig) {
+      const store = await createNotificationStore(notificationsConfig.databaseURL);
+      try {
+        const acquired = (notifications = createNotificationService(store, (actor, action, id) => {
+          if (!admin) throw new Error('ADMIN_UNAVAILABLE');
+          return admin.recordAnnouncementOperation(actor, action, id);
+        }));
+        ctx.effect(() => () => acquired.close());
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/announcements',
+            handler: createNotificationHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await (notifications ? notifications.close() : store.close());
+        throw error;
+      }
+    }
     let generations: GenerationService | undefined;
     let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
     const closeWithVideo = (
@@ -439,7 +467,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ctx.effect(
           () => () =>
             closeWithVideo(
-              [() => admin?.close(), () => conversations?.close()],
+              [() => notifications?.close(), () => admin?.close(), () => conversations?.close()],
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
@@ -498,7 +526,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 authBaseURL: authConfig.baseURL,
               },
             ));
-        ctx.effect(() => () => acquired.close());
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              () => notifications?.close(),
+              () => acquired.close(),
+            ),
+        );
         const computeHandler = computeOps
           ? createComputeOpsHandler(
               computeOps.view,
@@ -523,7 +557,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/admin',
-            handler: createAdminHandler(acquired, adminConfig.allowedOrigins, computeHandler),
+            handler: createAdminHandler(
+              acquired,
+              adminConfig.allowedOrigins,
+              computeHandler,
+              notifications,
+            ),
           }),
         );
       } catch (error) {

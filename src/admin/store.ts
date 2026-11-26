@@ -297,6 +297,25 @@ export class AdminStore {
     this.oneLinkSsoEnv = oneLinkSsoEnv;
   }
 
+  async recordAnnouncementOperation(
+    actor: { id: string; username: string },
+    action: string,
+    targetId: string,
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO mio_admin_audit_logs(id,actor_id,actor_name,action,target_id,summary)
+       VALUES($1,$2,$3,$4,$5,$6)`,
+      [
+        createId(),
+        actor.id,
+        actor.username,
+        `announcement.${action}`,
+        targetId,
+        `Announcement ${action} requested; outcome is not implied`,
+      ],
+    );
+  }
+
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {

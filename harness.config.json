@@ -41,6 +41,8 @@
       "src/admin/contracts.ts",
       "src/admin/schema.ts",
       "src/admin/store.ts",
+      "src/notifications/config.ts",
+      "src/notifications/schema.ts",
       "src/integrations/cos.ts",
       "src/integrations/redis.ts",
       "src/integrations/rabbitmq-monitor.ts",

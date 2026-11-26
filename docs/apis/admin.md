@@ -435,3 +435,87 @@
 错误：400 `BODY_INVALID`/`QUERY_INVALID`/`WORKER_HARD_LIMIT_EXCEEDED`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`，404 `NOT_FOUND`/`WORKER_NOT_FOUND`，409 `WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`，408 `BODY_TIMEOUT`，413 `BODY_TOO_LARGE`，415 `JSON_REQUIRED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或写入不可用）。
 
 副作用：事务写入不可变审计（`requested_by` 为当前 `admin.username`）、desired 配置和控制 outbox，并立即唤醒控制派发。B 取得后持久化校验结果，降限让占槽任务继续完成；上调或暂停只改变该实例的新准入。
+
+## GET /api/v1/admin/announcements
+
+身份：当前管理员，沿用 `mio.admin_session`；普通用户 Cookie 和部署 Bearer 均不授权。配置见[公告配置](../notifications.md)。
+
+输入：`page` 默认 1、范围 1–1000000，`pageSize` 默认 10、范围 1–100，均为十进制正整数，拒绝重复和额外参数。
+
+成功：200 `{items,page,pageSize,hasMore}`。每项含 `id,title,body,status,enabled,popup,effectiveAt,publishedAt,createdAt,updatedAt,isRead`；管理列表 `isRead` 固定为 false，不读取用户回执。按发布时间及 ID 倒序，空发布时间草稿在后。
+
+错误：未登录 401 `ADMIN_UNAUTHORIZED`；启用公告域前已登录请求返回 503 `NOTIFICATIONS_UNAVAILABLE`；其余沿用共同约定。
+
+副作用：只读查询，包括草稿、停用及未来公告，不续期会话。
+
+## GET /api/v1/admin/announcements/{id}
+
+身份：当前管理员。
+
+输入：UUID v4 公告 ID，无查询参数。
+
+成功：200 `{announcement:{id,title,body,status,enabled,popup,effectiveAt,publishedAt,createdAt,updatedAt}}`。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用管理和公告共同约定。
+
+副作用：只读，不记录用户已读。
+
+## POST /api/v1/admin/announcements
+
+身份：当前管理员，必须有允许列表精确匹配的 Origin。
+
+输入：JSON `{title,body,enabled?,popup?,effectiveAt?}`，标题非空且最多 200 个 Unicode 字符，纯文本正文非空且最多 16000 个字符；`enabled` 默认 true，`popup` 默认 false。`effectiveAt` 为带时区的 ISO 时间或 null（立即生效）；无查询参数，拒绝额外键。正文上限 64 KiB。
+
+成功：201 `{announcement}`，结构同详情；始终创建草稿，`publishedAt=null`。
+
+错误：400 `ANNOUNCEMENT_INPUT_INVALID`；其余沿用共同约定。审计或数据库暂不可用返回 503。
+
+副作用：先向现有 `mio_admin_audit_logs` 独立提交 `announcement.create` 操作意图，再创建公告草稿；真实管理员 ID、用户名和新公告 ID 被保留。审计失败阻止公告写入；公告库失败时保留尝试审计，其摘要不表示变更成功。公告和审计没有跨库事务。所有公告写入结束即使同实例元数据缓存失效，旧在途查询不能重新填回旧值；其他实例按 4 秒 TTL 收敛。
+
+## PATCH /api/v1/admin/announcements/{id}
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：至少一个 `{title?,body?,enabled?,popup?,effectiveAt?}`，各字段约束同创建；不得直接设置 status、发布时间或身份，无查询参数。
+
+成功：200 `{announcement}`。发布后编辑沿用原发布时间；`enabled=false` 使公告从用户查询中移除。
+
+错误：400 `ANNOUNCEMENT_INPUT_INVALID`、404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：按公告行锁串行编辑，保留 `announcement.update` 操作意图审计，缓存行为及跨库失败语义同创建。
+
+## POST /api/v1/admin/announcements/{id}/publish
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：JSON `{}`，无查询参数。
+
+成功：200 `{announcement}`；状态变为 published，首次发布生成发布时间。已发布时重复发布保留原发布时间；未来生效或停用公告仍不向用户可见。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：公告域行锁更新并记录 `announcement.publish` 操作意图；缓存与审计边界同创建。
+
+## POST /api/v1/admin/announcements/{id}/unpublish
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：JSON `{}`，无查询参数。
+
+成功：200 `{announcement}`；状态变回 draft，发布时间清空，用户不可见。再次发布取得新的发布时间。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：保留内容及已读记录，记录 `announcement.unpublish` 操作意图；缓存与审计边界同创建。
+
+## DELETE /api/v1/admin/announcements/{id}
+
+身份：当前管理员，包含 DELETE 在内必须有允许列表精确匹配的 Origin。
+
+输入：UUID v4 公告 ID，无正文及查询参数；独立管理前端先完成删除确认。
+
+成功：200 `{ok:true}`。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：删除公告及同域全部回执，保留管理员域 `announcement.delete` 操作意图审计，不能恢复公告；缓存与跨库失败边界同创建。不新增账号注销机制。

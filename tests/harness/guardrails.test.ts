@@ -193,6 +193,10 @@ it.each([
   ['src/generations-extra/image/store.ts', 1],
   ['src/admin/store.ts', 0],
   ['src/admin/schema.ts', 0],
+  ['src/notifications/store.ts', 0],
+  ['src/notifications/schema.ts', 0],
+  ['src/notifications/service.ts', 1],
+  ['src/notifications/http.ts', 1],
   ['src/admin/service.ts', 1],
 ] as const)(
   'limits business PostgreSQL imports to reviewed conversation/provider adapters: %s',
@@ -223,6 +227,10 @@ it.each([
   ['src/generations/image/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/store.ts', 'database-alias', 'pg', 0],
   ['src/admin/schema.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/store.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/schema.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/service.ts', 'database-alias', 'pg', 1],
+  ['src/notifications/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/service.ts', 'database-alias', 'pg', 1],
   ['src/admin/store.ts', 'pg', 'better-auth', 1],
 ] as const)(

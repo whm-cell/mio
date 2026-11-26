@@ -62,6 +62,7 @@
     "providers:migrate": "node scripts/service/migrate-providers.ts",
     "providers:route": "node scripts/service/import-provider-route.ts",
     "admin:migrate": "node scripts/service/migrate-admin.ts",
+    "notifications:migrate": "node scripts/service/migrate-notifications.ts",
     "admin:bootstrap": "node scripts/service/bootstrap-admin.ts",
     "admin:dev": "node scripts/service/local.ts dev admin-bootstrap",
     "admin:test": "node scripts/service/local.ts test admin-bootstrap",

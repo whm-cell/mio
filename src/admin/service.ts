@@ -568,6 +568,15 @@ export function createAdminService(
       return store.resolveSession(sha256Utf8(sessionToken));
     },
 
+    recordAnnouncementOperation(
+      actor: { id: string; username: string },
+      action: string,
+      targetId: string,
+    ) {
+      assertOpen();
+      return store.recordAnnouncementOperation(actor, action, targetId);
+    },
+
     async logout(sessionToken: string | null): Promise<void> {
       assertOpen();
       if (!sessionToken || sessionToken.length > 256) return;

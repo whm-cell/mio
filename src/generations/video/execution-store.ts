@@ -1,3 +1,4 @@
+import { recordGenerationCreationLog } from '../creation-log.ts';
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { GenerationError } from '../errors.ts';
@@ -428,7 +429,11 @@ export class VideoExecutionStore {
       values: [row.id, row.claim_id, state, code],
       query_timeout: CLAIM_SETTLEMENT_TIMEOUT_MS,
     };
-    await this.pool.query(settlement);
+    await transaction(this.pool, async (client) => {
+      const changed = await client.query(settlement);
+      if (changed.rowCount)
+        await recordGenerationCreationLog(client.query.bind(client), 'video', row.id, state, code);
+    });
   }
 
   async terminal(
@@ -451,6 +456,7 @@ export class VideoExecutionStore {
           completed_at=now(),updated_at=now() WHERE id=$1`,
           [row.id, state, code],
         );
+        await recordGenerationCreationLog(client.query.bind(client), 'video', row.id, state, code);
         return true;
       },
       signal,

@@ -281,6 +281,23 @@ it('accepts short and 10000-codepoint text, freezes parameters, publishes separa
   const f = await fixture();
   const { job } = await f.jobs.create(f.actor, { ...f.body, text: '字'.repeat(10000) });
   const ready = await f.settled(job.jobId, 'ready');
+  expect(
+    (
+      await pool.query('SELECT event_kind,payload FROM mio_audio_creation_outbox WHERE job_id=$1', [
+        job.jobId,
+      ])
+    ).rows,
+  ).toMatchObject([
+    {
+      event_kind: 'completed',
+      payload: {
+        ownerId: f.actor.userId,
+        mediaType: 'audio',
+        jobId: job.jobId,
+        eventKind: 'completed',
+      },
+    },
+  ]);
   expect(ready.parameters).toEqual(parameters);
   expect(ready.outputs[0]?.durationMs).toBe(1500);
   expect(new Set([ready.jobId, ready.recordId, ready.assetIds[0]]).size).toBe(3);
@@ -338,6 +355,10 @@ it('recovers upload and publication failure using the saved output without anoth
   await vi.waitFor(async () =>
     expect((await f.jobs.get(f.actor, job.jobId)).recoverable).toBe(true),
   );
+  expect(
+    (await pool.query('SELECT * FROM mio_audio_creation_outbox WHERE job_id=$1', [job.jobId]))
+      .rowCount,
+  ).toBe(0);
   f.failUpload(false);
   f.failPublish(true);
   await f.jobs.recover(f.actor, job.jobId);
@@ -479,6 +500,10 @@ it('preserves unknown upstream result and never re-POSTs it', async () => {
   f.submit.mockRejectedValueOnce(new Error('CONNECTION_LOST'));
   const { job } = await f.jobs.create(f.actor, f.body);
   await f.settled(job.jobId, 'unknown');
+  expect(
+    (await pool.query('SELECT * FROM mio_audio_creation_outbox WHERE job_id=$1', [job.jobId]))
+      .rowCount,
+  ).toBe(0);
   await expect(f.jobs.recover(f.actor, job.jobId)).rejects.toMatchObject({
     code: 'AUDIO_SUBMIT_UNKNOWN',
   });
@@ -695,6 +720,13 @@ it('classifies a business error in HTTP 200 as a known supplier rejection', asyn
     recordId: null,
     recoverable: false,
   });
+  expect(
+    (
+      await pool.query('SELECT event_kind FROM mio_audio_creation_outbox WHERE job_id=$1', [
+        job.jobId,
+      ])
+    ).rows,
+  ).toEqual([{ event_kind: 'failed' }]);
   expect(once).toHaveBeenCalledOnce();
   expect(f.publishAudio).not.toHaveBeenCalled();
 });

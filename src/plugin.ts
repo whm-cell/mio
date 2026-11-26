@@ -1,3 +1,6 @@
+import { createCreationLogStore } from './notifications/creation-store.ts';
+import { createCreationLogHandler } from './notifications/creation-http.ts';
+import { startAudioCreationDelivery } from './audio/jobs/creation-outbox.ts';
 import { monotonicMs } from '@mio/foundation/time';
 import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
@@ -220,6 +223,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (authConfig) {
     let admin: AdminService | undefined;
     let notifications: ReturnType<typeof createNotificationService> | undefined;
+    let creationLogs: Awaited<ReturnType<typeof createCreationLogStore>> | undefined;
+    let creationDelivery: ReturnType<typeof startAudioCreationDelivery> | undefined;
+    const closeCreationLogs = () =>
+      closeMioResources(
+        () => creationDelivery?.close(),
+        () => creationLogs?.close(),
+      );
     const getAuthPolicy = (): AuthRuntimePolicy =>
       admin?.getAuthPolicy() ?? {
         emailPasswordEnabled: authConfig.emailPasswordEnabled,
@@ -467,7 +477,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ctx.effect(
           () => () =>
             closeWithVideo(
-              [() => notifications?.close(), () => admin?.close(), () => conversations?.close()],
+              [
+                closeCreationLogs,
+                () => notifications?.close(),
+                () => admin?.close(),
+                () => conversations?.close(),
+              ],
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
@@ -529,6 +544,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ctx.effect(
           () => () =>
             closeMioResources(
+              closeCreationLogs,
               () => notifications?.close(),
               () => acquired.close(),
             ),
@@ -716,6 +732,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         } catch (failure) {
           throw new AggregateError([error, failure], 'Generation startup cleanup failed');
         }
+        throw error;
+      }
+    }
+    // Publish a single creation feed only when all three production paths and retention policy exist.
+    if (
+      admin &&
+      providers &&
+      audio &&
+      assetConfig &&
+      generationConfig?.videoEnabled &&
+      computeConfig
+    ) {
+      const policy = admin;
+      const store = await createCreationLogStore(assetConfig.databaseURL, () =>
+        policy.getCreationLogRetentionDays(),
+      );
+      creationLogs = store;
+      try {
+        creationDelivery = startAudioCreationDelivery(
+          providers.audioStore.creationOutbox,
+          store.receiveAudio,
+        );
+        ctx.effect(() => closeCreationLogs);
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/notifications',
+            handler: createCreationLogHandler(store, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await closeCreationLogs();
         throw error;
       }
     }

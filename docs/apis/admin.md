@@ -519,3 +519,27 @@
 错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
 
 副作用：删除公告及同域全部回执，保留管理员域 `announcement.delete` 操作意图审计，不能恢复公告；缓存与跨库失败边界同创建。不新增账号注销机制。
+
+## GET /api/v1/admin/settings/creation-logs
+
+身份：独立管理员 Cookie 会话；普通用户 Cookie、服务 Bearer 均无权限。来源及响应头沿管理域共同约定。
+
+输入：无查询参数或正文。
+
+成功：200 `{revision,retentionDays}`。首次设置前为 `{revision:0,retentionDays:null}`；已有配置从管理库回读，重启保留。
+
+错误：401 `ADMIN_UNAUTHORIZED`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：只读配置并刷新进程内只读快照，不改写配置或操作审计。
+
+## PATCH /api/v1/admin/settings/creation-logs
+
+身份：独立管理员 Cookie，必须携带精确匹配允许列表的 Origin。请求读取完毕再次校验管理员会话。
+
+输入：JSON 体严格为 `{expectedRevision,retentionDays}`；`expectedRevision` 为非负整数，`retentionDays` 为安全正整数，不接受 null、零、负数、小数或字符串。`/settings/global` 仍只接收 `{expectedRevision,auth}`。
+
+成功：200 `{revision,retentionDays}`，版本递增。
+
+错误：版本冲突为 409 `SETTINGS_CONFLICT`，非法输入为 400 `ADMIN_INPUT_INVALID`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：管理库一个事务内完成配置版本检查、更新及 `settings.creation-logs.update` 审计；审计包含操作者和前后天数／版本，审计失败回滚配置。保存实例立即更新进程内只读快照，其他实例每秒刷新、快照最长有效 5 秒；刷新失败并过期后，创作日志读取／清理失败关闭，不退回无限保留。用户热路径不查询管理库。设置缩短或首次保存时，管理端应先提示超期旧消息会被清理。更改仅影响创作消息和已读状态，作品、生成历史和公告沿各自规则。

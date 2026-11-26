@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { Pool } from 'pg';
 import { expect, it } from 'vitest';
+import { creationLogSchemaSQL } from '../../src/notifications/creation-schema.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
@@ -30,6 +31,18 @@ async function schema(database: Pick<Pool, 'query'>) {
 }
 
 const migrations = [
+  {
+    name: 'creation-logs',
+    ddl: creationLogSchemaSQL,
+    legacy: `${creationLogSchemaSQL}
+      DROP INDEX mio_creation_logs_expiry_idx;
+      INSERT INTO mio_creation_logs(id,owner_id,media_type,job_id,event_kind,title,summary,occurred_at)
+        VALUES('${assetId}','history','image','${jobId}','completed','existing','saved',now());`,
+    damage: 'ALTER TABLE mio_creation_logs ALTER COLUMN summary TYPE varchar(500)',
+    repair: 'ALTER TABLE mio_creation_logs ALTER COLUMN summary TYPE text',
+    error: 'CREATION_LOG_SCHEMA: migration failed',
+    history: 'SELECT * FROM mio_creation_logs',
+  },
   {
     name: 'assets',
     ddl: assetSchemaSQL,

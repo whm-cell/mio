@@ -1,3 +1,4 @@
+import { recordGenerationCreationLog } from '../creation-log.ts';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
@@ -304,11 +305,13 @@ export class GenerationStore {
         "UPDATE mio_image_executions SET phase='done',claim_id=NULL,snapshot=NULL,updated_at=now() WHERE job_id=$1 AND claim_id=$2 RETURNING job_id",
         [row.id, row.claim_id],
       );
-      if (changed.rowCount)
+      if (changed.rowCount) {
         await client.query(
           'UPDATE mio_image_jobs SET state=$2,error_code=$3,next_query_at=NULL WHERE id=$1',
           [row.id, state, code],
         );
+        await recordGenerationCreationLog(client.query.bind(client), 'image', row.id, state, code);
+      }
     });
   }
 
@@ -431,6 +434,7 @@ export class GenerationStore {
         return { index, output };
       });
       await this.acceptOutputBatch(client, row, indexed);
+      await recordGenerationCreationLog(client.query.bind(client), 'image', row.id, state);
       await client.query(
         'UPDATE mio_image_jobs SET state=$2,error_code=NULL,next_query_at=NULL WHERE id=$1',
         [row.id, state],

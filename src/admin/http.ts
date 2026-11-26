@@ -145,6 +145,7 @@ const KNOWN_ROUTES: Record<string, readonly string[]> = {
   '/revisions': ['GET'],
   '/monitoring': ['GET'],
   '/settings/global': ['GET', 'PATCH'],
+  '/settings/creation-logs': ['GET', 'PATCH'],
 };
 
 interface RouteContext {
@@ -365,6 +366,16 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
       HTTP_STATUS.OK,
       await service.readMonitoring(url.searchParams.get('window') ?? undefined),
     );
+  },
+
+  'GET /settings/creation-logs': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getCreationLogSettings());
+  },
+  'PATCH /settings/creation-logs': async ({ response, service, readAuthJson }) => {
+    const { principal, body } = await readAuthJson(['expectedRevision', 'retentionDays']);
+    sendJson(response, HTTP_STATUS.OK, await service.updateCreationLogSettings(principal, body));
   },
 
   'GET /settings/global': async ({ response, url, service, requireAdmin }) => {

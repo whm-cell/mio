@@ -463,6 +463,10 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/admin/schema.ts',
         'src/notifications/store.ts',
         'src/notifications/schema.ts',
+        'src/notifications/creation-store.ts',
+        'src/notifications/creation-schema.ts',
+        'src/audio/jobs/schema.ts',
+        'src/admin/creation-logs.ts',
       ].includes(file);
       if (
         ((authPackage || specifier.startsWith('@better-auth/')) && !beneath(file, 'src/auth')) ||

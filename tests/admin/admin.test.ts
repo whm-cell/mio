@@ -1522,6 +1522,7 @@ function createPolicyRaceService(initial: AdminStoredAuthSettings | null) {
     null,
     false,
     null,
+    { revision: 0, retentionDays: null },
     initial,
   );
   const config = readProviderConfig({

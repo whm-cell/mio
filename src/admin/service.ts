@@ -1,3 +1,4 @@
+import { createCreationRetentionSnapshot } from './creation-logs.ts';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs, utcISOString } from '@mio/foundation/time';
@@ -419,6 +420,7 @@ export function createAdminService(
   authRuntimeDefaults?: AdminAuthRuntimeDefaults,
   oneLinkSso?: AdminOneLinkSsoRuntimeOptions,
 ) {
+  const creationRetention = createCreationRetentionSnapshot(store);
   const cancellation = new AbortController();
   const activeProbes = new Set<Promise<AdminProbeDiscoveryResult>>();
   let activeOneLinkRegister: Promise<AdminOneLinkSsoRegisterView> | null = null;
@@ -1335,6 +1337,40 @@ export function createAdminService(
       };
     },
 
+    getCreationLogRetentionDays(): number | null {
+      assertOpen();
+      return creationRetention.get();
+    },
+
+    getCreationLogSettings() {
+      assertOpen();
+      return creationRetention.refresh();
+    },
+
+    async updateCreationLogSettings(
+      principal: AdminPrincipal,
+      input: { expectedRevision?: unknown; retentionDays?: unknown },
+    ) {
+      assertOpen();
+      const { expectedRevision, retentionDays } = input;
+      if (
+        typeof expectedRevision !== 'number' ||
+        !Number.isInteger(expectedRevision) ||
+        expectedRevision < 0 ||
+        expectedRevision >= MAX_PG_INT32 ||
+        typeof retentionDays !== 'number' ||
+        !Number.isSafeInteger(retentionDays) ||
+        retentionDays < 1
+      )
+        throw new AdminError(400, 'ADMIN_INPUT_INVALID');
+      const saved = await store.updateCreationLogSettings(
+        principal.admin,
+        expectedRevision,
+        retentionDays,
+      );
+      return creationRetention.save(saved);
+    },
+
     getAuthPolicy(): AuthRuntimePolicy {
       return currentAuthPolicy;
     },
@@ -1460,6 +1496,7 @@ export function createAdminService(
             ...activeProbes,
             ...(activeOneLinkRegister ? [activeOneLinkRegister] : []),
           ]);
+          await creationRetention.close();
           await store.close();
         })();
       }

@@ -49,3 +49,5 @@
 改变驱动、连接生命周期、迁移行为或测试隔离方式时，沿调用关系核对运行时、显式迁移和测试消费者，执行受影响验证，并按[验证协议](../coordination.md#验证与接受)取得覆盖 `pnpm check` 的当前有效结论。新业务只沿用现有约束时，本页可保持不变，其模型、事务范围和业务行为由对应需求验收；公共约束改变时同步本页并回归受影响消费者。
 
 系统公告使用独立的 [NotificationStore](../../src/notifications/store.ts) 连接池，由插件注入 `MIO_NOTIFICATIONS_DATABASE_URL`。启动只读校验，显式迁移 `pnpm notifications:migrate` 默认预览，`--apply` 在本域事务内增量建表和索引并保留已有数据。公告及回执只有同域外键，用户与管理员身份无跨库 FK。管理员域先独立记录真实操作意图，审计失败阻止公告写入，公告失败可保留尝试审计；没有跨库原子提交承诺。缓存、写入竞争与配置规则见[系统公告](../notifications.md)。
+
+创作日志位于媒体库，图片／视频在既有结果事务内写入 `(owner_id,media_type,job_id,event_kind)` 唯一消息。音频在 providers 结果事务登记单向 outbox，媒体回调在独立池事务内写入消息与 event_id 去重回执；无跨库事务、外键或反向回收协议。显式迁移和保留窗口见[创作日志 HTTP](../apis/notifications.md#get-apiv1notifications)、[音频投递](../apis/audio.md#创作日志投递)及[管理配置](../apis/admin.md#patch-apiv1adminsettingscreation-logs)。管理全局设置的 CHECK 增量扩展为 auth／creation_logs／storage，不改写既有行；启动检查不执行 DDL。新模块依旧遵守本页连接、日志脱敏和隔离回归约束。

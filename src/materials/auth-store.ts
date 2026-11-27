@@ -26,19 +26,32 @@ export async function withMaterialTransaction<T>(
   action: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  let discard = false;
+  const disconnected = () => {
+    discard = true;
+  };
+  // The pool handles errors only while this client is idle.
+  client.on('error', disconnected);
   try {
     await client.query('BEGIN');
     const result = await action(client);
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (!discard) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        discard = true;
+      }
+    }
     if (error instanceof MaterialError) throw error;
     if ((error as { code?: string }).code === '23505')
       throw new MaterialError(HTTP_STATUS.CONFLICT, 'UPSTREAM_RESOURCE_COLLISION');
     throw new MaterialError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'MATERIAL_UNAVAILABLE');
   } finally {
-    client.release();
+    client.removeListener('error', disconnected);
+    client.release(discard);
   }
 }
 
@@ -49,10 +62,16 @@ export class MaterialAuthStore {
     this.pool = pool;
   }
   async expire(id?: string): Promise<void> {
+    const match =
+      id === undefined
+        ? `id IN (SELECT id FROM mio_material_auth_sessions
+            WHERE state NOT IN ('completed','expired') AND ${pastDeadline}
+            ORDER BY expires_at,id LIMIT 100 FOR UPDATE SKIP LOCKED)`
+        : 'id=$1';
     await this.pool.query(
       `UPDATE mio_material_auth_sessions SET state='expired',${clear},lease_id=NULL,lease_until=NULL,error_code='AUTH_EXPIRED',updated_at=now()
-      WHERE id IN (SELECT id FROM mio_material_auth_sessions WHERE state NOT IN ('completed','expired') AND expires_at<=clock_timestamp() AND ($1::uuid IS NULL OR id=$1) ORDER BY expires_at,id LIMIT 100) AND state NOT IN ('completed','expired') AND expires_at<=clock_timestamp()`,
-      [id ?? null],
+      WHERE ${match} AND state NOT IN ('completed','expired') AND ${pastDeadline}`,
+      id === undefined ? [] : [id],
     );
   }
   async get(id: string, owner?: string): Promise<MaterialAuthRow> {

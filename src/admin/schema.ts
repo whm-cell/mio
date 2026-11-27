@@ -482,6 +482,8 @@ CREATE TABLE IF NOT EXISTS mio_admin_audit_logs (
   after_state jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS mio_admin_audit_logs_target_created_idx
+  ON mio_admin_audit_logs(target_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS mio_admin_audit_logs_created_idx
   ON mio_admin_audit_logs (created_at DESC);
 CREATE TABLE IF NOT EXISTS mio_admin_global_settings (

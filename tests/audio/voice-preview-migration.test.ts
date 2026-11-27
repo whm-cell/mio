@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Pool } from 'pg';
-import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import {
@@ -547,4 +547,74 @@ it('keeps a recovered old object unbound until its private ACL has been verified
   });
   expect(objects.aclWrites).toEqual([entry.objectKey]);
   expect(objects.uploads).toEqual([]);
+});
+
+it('binds different voices concurrently under config SHARE while rotation and same-voice writes wait', async () => {
+  const fixture = await stageFixture({ voiceA: 'share-a.mp3', voiceB: 'share-b.mp3' });
+  await fixture.stage();
+  const ownerId = randomUUID(),
+    modelId = 'speech-share-' + randomUUID();
+  const providerId = await createTarget(ownerId, modelId, ['voiceA', 'voiceB']);
+  const plan = await planVoicePreviewMigration(pool, {
+    ownerId,
+    modelId,
+    stagingDirectory: fixture.staging,
+  });
+  const gate = await pool.connect();
+  const key = randomBytes(6).readUIntBE(0, 6);
+  const pid = (await gate.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+  await gate.query('SELECT pg_advisory_lock($1)', [key]);
+  await pool.query(`CREATE FUNCTION wait_preview_binding() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+    IF NEW.provider_id::text=TG_ARGV[1] THEN PERFORM pg_advisory_xact_lock_shared(TG_ARGV[0]::bigint); END IF;
+    RETURN NEW; END$$;
+    CREATE TRIGGER wait_preview_binding BEFORE UPDATE ON mio_provider_voices FOR EACH ROW
+      WHEN (OLD.preview_asset_id IS NULL) EXECUTE FUNCTION wait_preview_binding('${key}','${providerId}')`);
+  const migration = applyVoicePreviewMigration(pool, assets, new FakeObjects(), plan, {
+    stagingDirectory: fixture.staging,
+    concurrency: 2,
+  });
+  let rotation: Promise<unknown> | undefined, voiceWrite: Promise<unknown> | undefined;
+  try {
+    await vi.waitFor(async () =>
+      expect(
+        (
+          await pool.query('SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))', [
+            pid,
+          ])
+        ).rows,
+      ).toHaveLength(2),
+    );
+    rotation = pool.query(
+      'UPDATE mio_provider_configs SET credential_version=credential_version+1 WHERE id=$1',
+      [providerId],
+    );
+    voiceWrite = pool.query('UPDATE mio_provider_voices SET name=$2 WHERE id=$1', [
+      plan.entries[0]!.voiceRef,
+      'concurrent name',
+    ]);
+    await vi.waitFor(async () => {
+      const rows = (
+        await pool.query(
+          "SELECT query FROM pg_stat_activity WHERE datname=current_database() AND cardinality(pg_blocking_pids(pid))>0 AND (query LIKE 'UPDATE mio_provider_configs SET credential_version=%' OR query LIKE 'UPDATE mio_provider_voices SET name=%')",
+        )
+      ).rows;
+      expect(rows).toHaveLength(2);
+    });
+  } finally {
+    await gate.query('SELECT pg_advisory_unlock($1)', [key]);
+    gate.release();
+    await Promise.all([migration, rotation, voiceWrite]);
+    await pool.query(
+      'DROP TRIGGER wait_preview_binding ON mio_provider_voices; DROP FUNCTION wait_preview_binding()',
+    );
+  }
+  expect(await migration).toMatchObject({ bound: 2, failed: 0 });
+  expect(
+    (
+      await pool.query(
+        'SELECT count(*)::int AS n FROM mio_provider_voices WHERE provider_id=$1 AND preview_asset_id IS NOT NULL',
+        [providerId],
+      )
+    ).rows[0].n,
+  ).toBe(2);
 });

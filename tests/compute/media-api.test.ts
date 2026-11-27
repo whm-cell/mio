@@ -204,6 +204,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 it('serves owner scoped create/get/list, canonical idempotency and frozen snapshots through HTTP', async () => {
+  const ownerViews = vi.spyOn(store, 'ownerView');
   const request = body();
   const response = await call('', request);
   expect(response.status).toBe(202);
@@ -216,6 +217,7 @@ it('serves owner scoped create/get/list, canonical idempotency and frozen snapsh
   expect(
     (await call('', { ...request, parameters: { startSeconds: 0, endSeconds: 3 } })).status,
   ).toBe(409);
+  expect(ownerViews).not.toHaveBeenCalled();
   expect((await call('/' + created.jobId, undefined, 'other')).status).toBe(404);
   expect(await (await call('', undefined, 'other')).json()).toEqual({ jobs: [] });
   const fetched = await (await call('/' + created.jobId)).json();
@@ -229,6 +231,28 @@ it('serves owner scoped create/get/list, canonical idempotency and frozen snapsh
   expect(publish.mock.calls[0]![0]).toMatchObject({
     inputs: [{ key, sizeBytes: 3, etag: expect.stringContaining('etag-') }],
   });
+});
+it('returns empty-output mutation snapshots for cancellation and retry without reading file views', async () => {
+  const ownerViews = vi.spyOn(store, 'ownerView');
+  const created = await service.create(actor, body());
+  expect(await service.cancel(actor, created.job.jobId)).toMatchObject({
+    status: 'cancel_requested',
+    outputs: [],
+  });
+  const retryable = await service.create(actor, body());
+  await observer.query("UPDATE mio_media_jobs SET state='failed' WHERE id=$1", [
+    retryable.job.jobId,
+  ]);
+  const retryId = randomUUID();
+  expect(await service.retry(actor, retryable.job.jobId, retryId)).toMatchObject({
+    attempt: 2,
+    outputs: [],
+  });
+  expect(await service.retry(actor, retryable.job.jobId, retryId)).toMatchObject({
+    attempt: 2,
+    outputs: [],
+  });
+  expect(ownerViews).not.toHaveBeenCalled();
 });
 it('rejects invalid body, unauthorized assets, origins and methods before side effects', async () => {
   expect((await call('', body(), '')).status).toBe(401);

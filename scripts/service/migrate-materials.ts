@@ -13,6 +13,7 @@ try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query("SET LOCAL lock_timeout = '5s'");
       await client.query(materialSchemaSQL);
       await client.query(materialAuthSchemaSQL);
       await checkMaterialAuthSchema(client);

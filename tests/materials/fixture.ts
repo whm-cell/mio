@@ -1,14 +1,15 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
-import { vi } from 'vitest';
+import { expect, onTestFinished, vi } from 'vitest';
 import { authDatabase } from '../support/auth-database.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { createProviderService } from '../../src/providers/service.ts';
 import { materialAuthSchemaSQL } from '../../src/materials/auth-schema.ts';
+import { MaterialAuthStore } from '../../src/materials/auth-store.ts';
 import { materialSchemaSQL } from '../../src/materials/schema.ts';
-import { createMaterialStore } from '../../src/materials/store.ts';
+import { createMaterialStore, MaterialStore } from '../../src/materials/store.ts';
 import { createMaterialService } from '../../src/materials/service.ts';
 import { createMaterialUpstream } from '../../src/integrations/onelink/materials.ts';
 import type { createAssetService } from '../../src/assets/service.ts';
@@ -168,3 +169,29 @@ export async function materialFixture(
   };
 }
 export type MaterialFixture = Awaited<ReturnType<typeof materialFixture>>;
+
+export function peer(f: MaterialFixture, role: string) {
+  const name = `${f.database.applicationName}_${role}`;
+  const url = new URL(f.database.url);
+  url.searchParams.set('application_name', name);
+  const pool = new Pool({ connectionString: url.toString(), max: 1, statement_timeout: 3000 });
+  const store = new MaterialStore(pool, new MaterialAuthStore(pool), false);
+  onTestFinished(() => store.close());
+  return { name, pool, store };
+}
+
+export async function blockedBy(f: MaterialFixture, name: string, blocker: number) {
+  return vi.waitFor(
+    async () => {
+      const rows = (
+        await f.pool.query<{ pid: number }>(
+          'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND $2=ANY(pg_blocking_pids(pid))',
+          [name, blocker],
+        )
+      ).rows;
+      expect(rows).toHaveLength(1);
+      return rows[0]!.pid;
+    },
+    { timeout: 2500, interval: 10 },
+  );
+}

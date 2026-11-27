@@ -32,7 +32,7 @@ it('opens a prior SQLite journal additively, preserving attempts and retired ima
     const previous = new DatabaseSync(path);
     try {
       // Model the version 6 floor in this fixture only, retaining every legacy table and fact.
-      previous.exec(`DROP TABLE media_events; DROP TABLE media_cancellations;
+      previous.exec(`DROP TABLE media_uploads; DROP TABLE media_events; DROP TABLE media_cancellations;
         DROP TABLE media_manual_resolutions; DROP TABLE media_attempts;
         DROP TABLE worker_observation_outbox;
       DROP TABLE worker_observation_state;
@@ -64,10 +64,11 @@ it('opens a prior SQLite journal additively, preserving attempts and retired ima
     }
     const upgraded = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(upgraded.prepare('SELECT schema_version FROM metadata').get()?.schema_version).toBe(8);
+      expect(upgraded.prepare('SELECT schema_version FROM metadata').get()?.schema_version).toBe(9);
       expect(upgraded.prepare('SELECT phase FROM image_attempts').get()?.phase).toBe('unknown');
       for (const table of [
         'media_attempts',
+        'media_uploads',
         'media_events',
         'media_cancellations',
         'media_manual_resolutions',

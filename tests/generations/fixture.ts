@@ -37,7 +37,7 @@ export async function generationFixture(asyncModel = 'image-vidu-q2') {
     masterKey: randomBytes(32),
     masterKeyId: 'generation-test',
   };
-  const providerStore = await createProviderStore(config, true);
+  const providerStore = await createProviderStore(config);
   await providerStore.importRoutes([
     findFixtureRoute('gpt-image-2', 'image.generate'),
     findFixtureRoute(asyncModel, 'image.generate'),

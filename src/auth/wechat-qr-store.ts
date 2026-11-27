@@ -95,7 +95,7 @@ async function readWechatQRPoll(pool: Pool, id: string) {
     text: `SELECT "cookieHash",status,"userId","expiresAt"<=statement_timestamp() AS expired
            FROM "mioWechatQR" WHERE id=$1`,
     values: [id],
-    query_timeout: 5000,
+    query_timeout: 8000,
   };
   return (
     await pool.query<Pick<QRRow, 'cookieHash' | 'status' | 'userId'> & { expired: boolean }>(query)

@@ -10,6 +10,8 @@ import { createProviderService } from '../../src/providers/service.ts';
 import { createAudioJobService } from '../../src/audio/jobs/service.ts';
 import type { AssetObjectStore } from '../../src/assets/contracts.ts';
 import { submitAudio } from '../../src/integrations/onelink/audio.ts';
+import type { downloadAudio } from '../../src/integrations/onelink/audio.ts';
+import type { AudioJobRow } from '../../src/audio/jobs/store.ts';
 import { AudioError } from '../../src/audio/contracts.ts';
 import type { AudioInspectionInput, AudioInspection } from '@mio/compute-contracts';
 import { AudioMediaError } from '../../src/audio/media.ts';
@@ -159,6 +161,7 @@ async function fixture() {
     },
   };
   const submit = vi.fn<typeof submitAudio>(async () => ({ bytes: output }));
+  const download = vi.fn<typeof downloadAudio>(async () => output);
   const inspectObject = async (input: AudioInspectionInput): Promise<AudioInspection> => {
     if (failInspection) throw new Error('B_OFFLINE');
     const bytes = objects.get(input.key)!.bytes;
@@ -199,7 +202,7 @@ async function fixture() {
         checkAudioPublicationIdentity: (input) => assets.checkAudioPublicationIdentity(input),
         publishAudio,
       },
-      { submit, pollMs: 5 },
+      { submit, download, pollMs: 5 },
     );
   const jobs = startJobs();
   let replacement: ReturnType<typeof startJobs> | undefined;
@@ -243,6 +246,9 @@ async function fixture() {
     headObject,
     ensureAudioPrivate,
     submit,
+    download,
+    output,
+    baseStore,
     inspect,
     inspectObject,
     assets,
@@ -277,6 +283,21 @@ async function fixture() {
     },
   };
 }
+function cloneWithAudition(f: Awaited<ReturnType<typeof fixture>>, sampleAssetId: string) {
+  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
+    bytes: Buffer.from('checkpoint-audio-fixture'),
+    voiceId: input.voiceId!,
+  }));
+  return f.jobs.clone(f.actor, {
+    requestId: randomUUID(),
+    modelRef: f.modelRef,
+    sampleAssetId,
+    name: '我的音色',
+    auditionText: '这是试听。',
+    sampleAuthorization: true,
+  });
+}
+
 it('accepts short and 10000-codepoint text, freezes parameters, publishes separate job/record/asset IDs', async () => {
   const f = await fixture();
   const { job } = await f.jobs.create(f.actor, { ...f.body, text: '字'.repeat(10000) });
@@ -425,28 +446,335 @@ it('preserves inspection errors and recovers saved audio without another supplie
   await f.settled(job.jobId, 'ready');
   expect(f.submit).toHaveBeenCalledTimes(1);
 });
-it('keeps an invalid inspected output out of both published assets and audio records', async () => {
-  const f = await fixture();
-  f.inspect.mockImplementationOnce(async (input) => ({
-    ...(await f.inspectObject(input)),
-    sha256: '0'.repeat(64),
-  }));
-  const { job } = await f.jobs.create(f.actor, f.body);
-  await vi.waitFor(async () =>
-    expect(await f.jobs.get(f.actor, job.jobId)).toMatchObject({
-      errorCode: 'AUDIO_OUTPUT_INVALID',
+it.each(['inspection', 'download', 'object identity'])(
+  'terminates deterministic %s output failures and replays the same request without another POST',
+  async (failure) => {
+    const f = await fixture();
+    if (failure === 'inspection')
+      f.inspect.mockImplementationOnce(async (input) => ({
+        ...(await f.inspectObject(input)),
+        sha256: '0'.repeat(64),
+      }));
+    else if (failure === 'download') {
+      f.submit.mockResolvedValueOnce({ url: 'https://audio-fixture.invalid/output.wav' });
+      f.download.mockResolvedValueOnce(new Uint8Array());
+    } else
+      f.head.mockResolvedValueOnce({
+        size: f.output.length,
+        etag: 'other-etag',
+        sha256: '0'.repeat(64),
+      });
+    const { job } = await f.jobs.create(f.actor, f.body);
+    const failed = await f.settled(job.jobId, 'failed');
+    expect(failed).toMatchObject({
+      errorCode: failure === 'object identity' ? 'AUDIO_OUTPUT_MISMATCH' : 'AUDIO_OUTPUT_INVALID',
+      recoverable: false,
       recordId: null,
       outputs: [],
-    }),
+    });
+    expect(
+      (
+        await pool.query(
+          'SELECT output_bytes,output_url,lease_id,lease_until FROM mio_audio_jobs WHERE id=$1',
+          [job.jobId],
+        )
+      ).rows[0],
+    ).toEqual({ output_bytes: null, output_url: null, lease_id: null, lease_until: null });
+    expect(await f.jobs.recover(f.actor, job.jobId)).toEqual(failed);
+    expect(await f.jobs.recover(f.actor, job.jobId)).toEqual(failed);
+    expect(await f.jobs.cancel(f.actor, job.jobId)).toEqual(failed);
+    expect(await f.jobs.create(f.actor, f.body)).toEqual({ created: false, job: failed });
+    await expect(
+      f.jobs.create(f.actor, { ...f.body, text: 'changed input' }),
+    ).rejects.toMatchObject({ code: 'REQUEST_CONFLICT' });
+    expect(f.publishAudio).not.toHaveBeenCalled();
+    expect(
+      (await assetPool.query('SELECT id FROM mio_assets WHERE owner_id=$1', [f.actor.userId]))
+        .rowCount,
+    ).toBe(0);
+    expect(
+      (await pool.query('SELECT id FROM mio_audio_records WHERE job_id=$1', [job.jobId])).rowCount,
+    ).toBe(0);
+    expect(f.submit).toHaveBeenCalledOnce();
+  },
+);
+
+it('keeps a failed clone voice conflict terminal after clearing its audition checkpoint', async () => {
+  const f = await fixture(),
+    sampleAssetId = await f.sample();
+  const upstreamVoiceId = 'conflicting-clone-' + randomUUID();
+  await pool.query(
+    `INSERT INTO mio_provider_voices(provider_id,source,upstream_id,name,descriptions,seen_seq,local_clone_job_id)
+    SELECT provider_id,'voice_cloning',$2,'Prior clone','[]',1,$3 FROM mio_provider_voices WHERE id=$1`,
+    [f.voiceRef, upstreamVoiceId, randomUUID()],
   );
-  expect(f.publishAudio).not.toHaveBeenCalled();
+  f.submit.mockResolvedValueOnce({ voiceId: upstreamVoiceId, bytes: f.output });
+  const body = {
+    requestId: randomUUID(),
+    modelRef: f.modelRef,
+    sampleAssetId,
+    name: 'My clone',
+    auditionText: 'Synthetic audition',
+    sampleAuthorization: true,
+  };
+  const { job } = await f.jobs.clone(f.actor, body);
+  const failed = await f.settled(job.jobId, 'failed');
+  expect(failed).toMatchObject({
+    errorCode: 'AUDIO_VOICE_CONFLICT',
+    upstreamConfirmed: true,
+    recoverable: false,
+    recordId: null,
+  });
   expect(
-    (await assetPool.query('SELECT id FROM mio_assets WHERE owner_id=$1', [f.actor.userId]))
-      .rowCount,
-  ).toBe(0);
+    (
+      await pool.query(
+        'SELECT output_bytes,output_url,upstream_voice_id FROM mio_audio_jobs WHERE id=$1',
+        [job.jobId],
+      )
+    ).rows[0],
+  ).toEqual({ output_bytes: null, output_url: null, upstream_voice_id: upstreamVoiceId });
+  expect(await f.jobs.recover(f.actor, job.jobId)).toEqual(failed);
+  expect(await f.jobs.recover(f.actor, job.jobId)).toEqual(failed);
+  expect(await f.jobs.cancel(f.actor, job.jobId)).toEqual(failed);
+  expect(await f.jobs.clone(f.actor, body)).toEqual({ created: false, job: failed });
+  expect(f.submit).toHaveBeenCalledOnce();
+  expect(f.publishAudio).toHaveBeenCalledOnce();
   expect(
     (await pool.query('SELECT id FROM mio_audio_records WHERE job_id=$1', [job.jobId])).rowCount,
   ).toBe(0);
+});
+
+it.each([
+  [409, 'AUDIO_LEASE_LOST'],
+  [409, 'AUDIO_CHECKPOINT_CHANGED'],
+  [503, 'AUDIO_OUTPUT_INVALID'],
+])(
+  'preserves recovery for %i %s instead of treating every output error as terminal',
+  async (status, code) => {
+    const f = await fixture();
+    f.inspect.mockRejectedValueOnce(new AudioError(status, code));
+    const { job } = await f.jobs.create(f.actor, f.body);
+    await vi.waitFor(async () =>
+      expect(await f.jobs.get(f.actor, job.jobId)).toMatchObject({
+        status: 'materializing',
+        errorCode: code,
+        recoverable: true,
+      }),
+    );
+    expect(
+      (await pool.query('SELECT output_bytes FROM mio_audio_jobs WHERE id=$1', [job.jobId])).rows[0]
+        .output_bytes,
+    ).toEqual(f.output);
+    await f.jobs.recover(f.actor, job.jobId);
+    await f.settled(job.jobId, 'ready');
+    expect(f.submit).toHaveBeenCalledOnce();
+  },
+);
+
+it('releases both owner slots after deterministic output failures', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 2; i++) {
+    f.inspect.mockImplementationOnce(async (input) => ({
+      ...(await f.inspectObject(input)),
+      sha256: '0'.repeat(64),
+    }));
+    const { job } = await f.jobs.create(f.actor, { ...f.body, requestId: randomUUID() });
+    await f.settled(job.jobId, 'failed');
+  }
+  const { job } = await f.jobs.create(f.actor, { ...f.body, requestId: randomUUID() });
+  await f.settled(job.jobId, 'ready');
+  expect(f.submit).toHaveBeenCalledTimes(3);
+});
+
+it('retains a deterministic failure code when shutdown begins during output inspection', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  f.inspect.mockImplementationOnce(async (input) => {
+    entered.resolve();
+    await release.promise;
+    return { ...(await f.inspectObject(input)), sha256: '0'.repeat(64) };
+  });
+  const { job } = await f.jobs.create(f.actor, f.body);
+  await entered.promise;
+  const closing = f.jobs.close();
+  release.resolve();
+  await closing;
+  expect(await f.baseStore.owned(f.actor.userId, job.jobId)).toMatchObject({
+    status: 'failed',
+    error_code: 'AUDIO_OUTPUT_INVALID',
+    has_output: false,
+    lease_id: null,
+  });
+  expect(f.submit).toHaveBeenCalledOnce();
+});
+
+async function stalledFixture() {
+  const f = await fixture();
+  f.failUpload(true);
+  const { job } = await f.jobs.create(f.actor, f.body);
+  await vi.waitFor(async () =>
+    expect((await f.jobs.get(f.actor, job.jobId)).recoverable).toBe(true),
+  );
+  await f.jobs.close();
+  cleanup.push(async () => {
+    await pool.query(
+      "UPDATE mio_audio_jobs SET status='failed',lease_id=NULL,lease_until=NULL WHERE id=$1 AND status IN ('queued','submitted','materializing')",
+      [job.jobId],
+    );
+  });
+  return { ...f, job };
+}
+
+it.each([
+  ['stalled bytes', 'materializing', null, 'AUDIO_STORAGE_UNAVAILABLE', false, false, 'cancelled'],
+  [
+    'stalled URL with prior intent',
+    'materializing',
+    null,
+    'AUDIO_STORAGE_UNAVAILABLE',
+    true,
+    true,
+    'cancelled',
+  ],
+  [
+    'active lease',
+    'materializing',
+    'active',
+    'AUDIO_STORAGE_UNAVAILABLE',
+    false,
+    false,
+    'materializing',
+  ],
+  [
+    'expired lease',
+    'materializing',
+    'expired',
+    'AUDIO_STORAGE_UNAVAILABLE',
+    false,
+    false,
+    'materializing',
+  ],
+  ['unleased no error', 'materializing', null, null, false, false, 'materializing'],
+  ['submitted', 'submitted', 'active', null, false, false, 'submitted'],
+  ['unknown', 'unknown', null, 'AUDIO_SUBMIT_UNKNOWN', false, false, 'unknown'],
+  ['queued', 'queued', 'active', null, false, false, 'cancelled'],
+  ['ready', 'ready', null, null, false, false, 'ready'],
+  ['failed', 'failed', null, 'AUDIO_OUTPUT_INVALID', false, false, 'failed'],
+  ['cancelled', 'cancelled', null, 'AUDIO_STORAGE_UNAVAILABLE', true, false, 'cancelled'],
+])(
+  'cancels %s with its original lease and terminal boundaries',
+  async (_name, status, lease, error, prior, url, expected) => {
+    const f = await stalledFixture();
+    const leaseId = lease ? randomUUID() : null,
+      until = lease ? new Date(Date.now() + (lease === 'expired' ? -60000 : 60000)) : null;
+    await pool.query(
+      'UPDATE mio_audio_jobs SET status=$2,lease_id=$3,lease_until=$4,error_code=$5,cancel_requested=$6,output_bytes=$7,output_url=$8 WHERE id=$1',
+      [
+        f.job.jobId,
+        status,
+        leaseId,
+        until,
+        error,
+        prior,
+        url ? null : f.output,
+        url ? 'https://audio-fixture.invalid/output.wav' : null,
+      ],
+    );
+    const before = await f.baseStore.owned(f.actor.userId, f.job.jobId);
+    const result = await f.baseStore.cancel(f.actor.userId, f.job.jobId);
+    expect(result.status).toBe(expected);
+    const terminal = ['ready', 'failed', 'cancelled'].includes(status as string);
+    const ended = expected === 'cancelled' && !terminal;
+    expect(result).toMatchObject({
+      lease_id: ended ? null : leaseId,
+      has_output: !ended,
+      cancel_requested: terminal ? prior : true,
+      error_code: error,
+    });
+    if (terminal) expect(result).toEqual(before);
+    expect(await f.baseStore.cancel(f.actor.userId, f.job.jobId)).toEqual(result);
+    const row = (
+      await pool.query(
+        'SELECT output_bytes,output_url,lease_until FROM mio_audio_jobs WHERE id=$1',
+        [f.job.jobId],
+      )
+    ).rows[0];
+    expect(row).toEqual({
+      output_bytes: ended || url ? null : f.output,
+      output_url: !ended && url ? 'https://audio-fixture.invalid/output.wav' : null,
+      lease_until: ended ? null : until,
+    });
+    if (ended) expect(await f.baseStore.recover(f.actor.userId, f.job.jobId)).toEqual(result);
+    expect(f.submit).toHaveBeenCalledOnce();
+  },
+);
+
+it('keeps recovery idempotent and guards ownership, leased rows, and terminal state', async () => {
+  const f = await stalledFixture();
+  for (const operation of ['recover', 'cancel'] as const) {
+    await expect(f.baseStore[operation](randomUUID(), f.job.jobId)).rejects.toMatchObject({
+      status: 404,
+      code: 'AUDIO_JOB_NOT_FOUND',
+    });
+    await expect(f.baseStore[operation](f.actor.userId, randomUUID())).rejects.toMatchObject({
+      status: 404,
+      code: 'AUDIO_JOB_NOT_FOUND',
+    });
+  }
+  for (const offset of [60000, -60000]) {
+    const lease = randomUUID();
+    await pool.query('UPDATE mio_audio_jobs SET lease_id=$2,lease_until=$3 WHERE id=$1', [
+      f.job.jobId,
+      lease,
+      new Date(Date.now() + offset),
+    ]);
+    const before = await f.baseStore.owned(f.actor.userId, f.job.jobId);
+    expect(await f.baseStore.recover(f.actor.userId, f.job.jobId)).toEqual(before);
+  }
+  await pool.query('UPDATE mio_audio_jobs SET lease_id=NULL,lease_until=NULL WHERE id=$1', [
+    f.job.jobId,
+  ]);
+  const recovered = await f.baseStore.recover(f.actor.userId, f.job.jobId);
+  expect(recovered).toMatchObject({ status: 'materializing', error_code: null, has_output: true });
+  expect(await f.baseStore.recover(f.actor.userId, f.job.jobId)).toEqual(recovered);
+  await pool.query(
+    "UPDATE mio_audio_jobs SET status='unknown',error_code='AUDIO_SUBMIT_UNKNOWN' WHERE id=$1",
+    [f.job.jobId],
+  );
+  await expect(f.baseStore.recover(f.actor.userId, f.job.jobId)).rejects.toMatchObject({
+    code: 'AUDIO_SUBMIT_UNKNOWN',
+  });
+  expect(f.submit).toHaveBeenCalledOnce();
+});
+
+it('keeps committed output on lost checkpoint acknowledgement and rejects a stale worker cleanup', async () => {
+  const f = await stalledFixture(),
+    lease = randomUUID();
+  await pool.query(
+    "UPDATE mio_audio_jobs SET status='submitted',error_code=NULL,lease_id=$2,lease_until=now()+interval '30 minutes',output_bytes=NULL WHERE id=$1",
+    [f.job.jobId, lease],
+  );
+  const job = (
+    await pool.query<AudioJobRow>('SELECT * FROM mio_audio_jobs WHERE id=$1', [f.job.jobId])
+  ).rows[0]!;
+  await f.baseStore.checkpoint(job, { bytes: f.output });
+  await f.baseStore.defer(job, 'unknown', 'AUDIO_SUBMIT_UNKNOWN');
+  expect(await f.baseStore.owned(f.actor.userId, job.id)).toMatchObject({
+    status: 'materializing',
+    error_code: 'AUDIO_CHECKPOINT_UNAVAILABLE',
+    has_output: true,
+    lease_id: null,
+  });
+  await pool.query(
+    "UPDATE mio_audio_jobs SET lease_id=$2,lease_until=now()+interval '30 minutes' WHERE id=$1",
+    [job.id, randomUUID()],
+  );
+  const before = (await pool.query('SELECT * FROM mio_audio_jobs WHERE id=$1', [job.id])).rows[0];
+  await f.baseStore.defer(job, 'failed', 'AUDIO_OUTPUT_INVALID');
+  expect((await pool.query('SELECT * FROM mio_audio_jobs WHERE id=$1', [job.id])).rows[0]).toEqual(
+    before,
+  );
   expect(f.submit).toHaveBeenCalledOnce();
 });
 it("rejects another owner's sample in the separate asset database before supplier submission", async () => {
@@ -510,18 +838,7 @@ it('checks ownership and rejects undeclared parameters, oversized text and missi
 it('clones an authorized ready sample then reuses its stable voice reference for TTS', async () => {
   const f = await fixture(),
     sampleAssetId = await f.sample();
-  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
-    bytes: Buffer.from('checkpoint-audio-fixture'),
-    voiceId: input.voiceId!,
-  }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await cloneWithAudition(f, sampleAssetId);
   const ready = await f.settled(job.jobId, 'ready');
   expect(ready.voiceRef).toBeTruthy();
   expect(f.inspect).toHaveBeenCalledWith(
@@ -601,18 +918,7 @@ it('recovers a pre-submit clone after shutdown without repeating its supplier PO
       signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
     });
   });
-  f.submit.mockImplementationOnce(async (_admission, _key, input) => ({
-    bytes: Buffer.from('checkpoint-audio-fixture'),
-    voiceId: input.voiceId!,
-  }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await cloneWithAudition(f, sampleAssetId);
   await entered.promise;
   expect((await f.jobs.get(f.actor, job.jobId)).status).toBe('queued');
   expect(f.submit).not.toHaveBeenCalled();

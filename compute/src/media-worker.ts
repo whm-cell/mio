@@ -368,12 +368,12 @@ export class MediaWorker {
     try {
       release = await this.#slots.waitForOutputRecovery(execution.resource, signal, execution);
       this.#executionIds.set(attempt.command.attemptId, execution.executionId);
-      for (const upload of Object.values(attempt.uploads)) {
+      for (const [name, upload] of Object.entries(attempt.uploads)) {
         if (upload.state !== 'intent') continue;
         upload.object = await this.#verifyObject(upload.key, upload.file, upload.digest, signal);
         signal.throwIfAborted();
         upload.state = 'confirmed';
-        this.#journal.save(attempt);
+        this.#journal.saveUpload(attempt, name);
       }
       if (this.#journal.cancelled(attempt.command.attemptId))
         this.#transition(attempt, 'cancelled', { state: 'cancelled' });
@@ -599,14 +599,14 @@ export class MediaWorker {
     }
     const existing = await this.#store.headMedia(key, signal);
     attempt.uploads[file.name] = { file, key, digest: actual, state: 'intent', object: null };
-    this.#journal.save(attempt);
+    this.#journal.saveUpload(attempt, file.name);
     if (!existing) {
       try {
         await this.#store.uploadMedia(key, files, file.name, actual, file.contentType, signal);
       } catch (error) {
         if (error instanceof Error && error.message === 'STORAGE_WRITE_REJECTED') {
           attempt.uploads[file.name]!.state = 'rejected';
-          this.#journal.save(attempt);
+          this.#journal.saveUpload(attempt, file.name);
           throw new Error('EXECUTION_FAILED', { cause: error });
         }
         throw error;
@@ -615,7 +615,7 @@ export class MediaWorker {
     const object = await this.#verifyObject(key, file, actual, signal);
     attempt.uploads[file.name]!.state = 'confirmed';
     attempt.uploads[file.name]!.object = object;
-    this.#journal.save(attempt);
+    this.#journal.saveUpload(attempt, file.name);
     return object;
   }
   async #finish(attempt: MediaAttempt, signal: AbortSignal): Promise<void> {

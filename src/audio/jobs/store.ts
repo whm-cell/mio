@@ -294,6 +294,8 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
            THEN 'materializing' ELSE $3 END,
          error_code=CASE WHEN status='materializing' AND $3='unknown'
            THEN 'AUDIO_CHECKPOINT_UNAVAILABLE' ELSE $4 END,
+         output_bytes=CASE WHEN $3='failed' THEN NULL ELSE output_bytes END,
+         output_url=CASE WHEN $3='failed' THEN NULL ELSE output_url END,
          lease_id=NULL,lease_until=NULL,updated_at=now()
          WHERE id=$1 AND lease_id=$2 AND status NOT IN ('ready','failed','cancelled','unknown')`,
         [job.id, job.lease_id, status, code],
@@ -302,27 +304,39 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
     async recover(owner: string, id: string) {
       const job = await owned(owner, id);
       if (job.status === 'unknown') throw new AudioError(409, 'AUDIO_SUBMIT_UNKNOWN');
-      if (job.upstream_confirmed && !job.has_output && job.status !== 'ready')
+      if (
+        job.upstream_confirmed &&
+        !job.has_output &&
+        job.status !== 'ready' &&
+        ((job.status !== 'failed' && job.status !== 'cancelled') ||
+          job.error_code === 'AUDIO_AUDITION_MISSING')
+      )
         throw new AudioError(409, 'AUDIO_AUDITION_MISSING');
-      await query(
+      const updated = await query<AudioJobViewRow>(
         `UPDATE mio_audio_jobs SET error_code=NULL,lease_until=NULL,updated_at=now()
          WHERE id=$1 AND owner_id=$2 AND status='materializing' AND lease_id IS NULL
-         AND (output_bytes IS NOT NULL OR output_url IS NOT NULL)`,
+         AND (output_bytes IS NOT NULL OR output_url IS NOT NULL) RETURNING ${viewColumns}`,
         [id, owner],
       );
-      return owned(owner, id);
+      return updated.rows[0] ?? owned(owner, id);
     },
     async cancel(owner: string, id: string) {
-      await query(
+      const finish = `(status='queued' OR
+        (status='materializing' AND lease_id IS NULL AND error_code IS NOT NULL))`;
+      const updated = await query<AudioJobViewRow>(
         `UPDATE mio_audio_jobs SET cancel_requested=true,
-         status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
-         lease_id=CASE WHEN status='queued' THEN NULL ELSE lease_id END,
-         lease_until=CASE WHEN status='queued' THEN NULL ELSE lease_until END,updated_at=now()
+         status=CASE WHEN ${finish} THEN 'cancelled' ELSE status END,
+         output_bytes=CASE WHEN ${finish} THEN NULL ELSE output_bytes END,
+         output_url=CASE WHEN ${finish} THEN NULL ELSE output_url END,
+         lease_id=CASE WHEN ${finish} THEN NULL ELSE lease_id END,
+         lease_until=CASE WHEN ${finish} THEN NULL ELSE lease_until END,updated_at=now()
          WHERE id=$1 AND owner_id=$2 AND status NOT IN ('ready','failed','cancelled')
-         AND NOT cancel_requested`,
+         AND (NOT cancel_requested OR
+           (status='materializing' AND lease_id IS NULL AND error_code IS NOT NULL))
+         RETURNING ${viewColumns}`,
         [id, owner],
       );
-      return owned(owner, id);
+      return updated.rows[0] ?? owned(owner, id);
     },
     publish(job: AudioJobRow, inspection: AudioInspection) {
       return transaction((q) => publish(q, job, inspection));

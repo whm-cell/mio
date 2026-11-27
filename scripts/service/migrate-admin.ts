@@ -15,6 +15,7 @@ try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query("SET LOCAL lock_timeout = '5s'");
       await client.query(providerSchemaSQL);
       await client.query(adminSchemaSQL);
       await checkProviderSchema(client);

@@ -69,7 +69,7 @@ import { createMediaService } from './compute/media/service.ts';
 import { createMediaStore } from './compute/media/store.ts';
 import { createComputeOpsHandler } from './compute/observability/http.ts';
 import {
-  openWorkerObservabilityPool,
+  openWorkerObservabilityPools,
   WorkerObservabilityStore,
 } from './compute/observability/store.ts';
 import { WorkerObservabilityQueries } from './compute/observability/queries.ts';
@@ -381,12 +381,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
       | undefined;
     if (computeConfig?.workerInstances?.length && assetConfig) {
-      const pool = await openWorkerObservabilityPool(assetConfig.databaseURL);
+      const pools = await openWorkerObservabilityPools(assetConfig.databaseURL);
       let telemetry: ReturnType<typeof startWorkerObservability> | undefined;
       try {
         const instances = computeConfig.workerInstances;
-        const observations = new WorkerObservabilityStore(pool, instances);
-        const control = adminConfig ? new WorkerControlStore(pool, instances) : undefined;
+        const observations = new WorkerObservabilityStore(pools.write, instances);
+        const control = adminConfig ? new WorkerControlStore(pools.write, instances) : undefined;
         const ownedTelemetry = (telemetry = startWorkerObservability(
           (stop) =>
             ComputeBroker.connect(
@@ -403,12 +403,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           () => () =>
             closeMioResources(
               () => ownedTelemetry.close(),
-              () => pool.end(),
+              () => pools.close(),
             ),
         );
         if (adminConfig && control) {
           computeOps = {
-            view: new WorkerObservabilityQueries(pool, instances),
+            view: new WorkerObservabilityQueries(pools.read, instances),
             control,
             wake: ownedTelemetry.wake,
           };
@@ -416,13 +416,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       } catch (error) {
         await closeMioResources(
           () => telemetry?.close(),
-          () => pool.end(),
+          () => pools.close(),
         );
         throw error;
       }
     }
     if (providerConfig) {
-      const store = await createProviderStore(providerConfig, imageEnabled);
+      const store = await createProviderStore(providerConfig);
       providers = createProviderService(
         store,
         providerConfig,

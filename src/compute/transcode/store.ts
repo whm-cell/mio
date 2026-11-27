@@ -257,7 +257,7 @@ export async function createComputeStore(databaseURL: string) {
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-compute',
   });
   pool.on('error', () => log.error('COMPUTE_DATABASE_CONNECTION_ERROR'));

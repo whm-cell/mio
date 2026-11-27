@@ -805,16 +805,15 @@ it('rejects a missing route primary key during startup check until providerSchem
     'ALTER TABLE mio_provider_model_routes DROP CONSTRAINT mio_provider_model_routes_pkey',
   );
   try {
-    await expect(checkProviderSchema(pool, false)).rejects.toThrow('PROVIDER_SCHEMA');
-    await expect(checkProviderSchema(pool, true)).rejects.toThrow('PROVIDER_SCHEMA');
-    await expect(createProviderStore(config, true)).rejects.toThrow(
+    await expect(checkProviderSchema(pool)).rejects.toThrow('PROVIDER_SCHEMA');
+    await expect(createProviderStore(config)).rejects.toThrow(
       'PROVIDER_SCHEMA: run providers:migrate; database unavailable or incompatible',
     );
   } finally {
     await pool.query(providerSchemaSQL);
   }
-  await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
-  const upgradedStore = await createProviderStore(config, true);
+  await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
+  const upgradedStore = await createProviderStore(config);
   const isolatedService = createProviderService(upgradedStore, config, async () =>
     Response.json({ data: [{ id: 'image-kling-v3' }, { id: 'image-kling-v3-omni' }] }),
   );

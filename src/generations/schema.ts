@@ -24,8 +24,10 @@ ALTER TABLE mio_image_jobs ADD COLUMN IF NOT EXISTS route_snapshot jsonb;
 ALTER TABLE mio_image_jobs DROP CONSTRAINT IF EXISTS mio_image_jobs_state_check;
 ALTER TABLE mio_image_jobs ADD CONSTRAINT mio_image_jobs_state_check
   CHECK(state IN ('accepted','submitted','processing','materializing','completed','partial','materialization_failed','unknown','failed','rejected'));
-CREATE INDEX IF NOT EXISTS mio_image_jobs_unfinished ON mio_image_jobs(owner_id)
+CREATE INDEX IF NOT EXISTS mio_image_jobs_created_idx ON mio_image_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS mio_image_jobs_unfinished_state ON mio_image_jobs(state,owner_id)
   WHERE state IN ('accepted','submitted','processing','materializing');
+DROP INDEX IF EXISTS mio_image_jobs_unfinished;
 CREATE TABLE IF NOT EXISTS mio_image_outputs (
   job_id uuid NOT NULL REFERENCES mio_image_jobs(id), output_index integer NOT NULL,
   asset_id uuid NOT NULL REFERENCES mio_assets(id), PRIMARY KEY(job_id,output_index)
@@ -85,6 +87,9 @@ CREATE TABLE IF NOT EXISTS mio_video_executions (
 );
 CREATE INDEX IF NOT EXISTS mio_video_executions_pending ON mio_video_executions(phase,next_query_at)
   WHERE phase <> 'done';
+CREATE INDEX IF NOT EXISTS mio_video_executions_cleanup ON mio_video_executions(updated_at,job_id)
+  WHERE phase='done' AND checkpoint IS NOT NULL
+    AND checkpoint->'cleaned' IS DISTINCT FROM 'true'::jsonb;
 CREATE TABLE IF NOT EXISTS mio_video_outputs (
   job_id uuid NOT NULL REFERENCES mio_video_jobs(id),
   output_index integer NOT NULL CHECK (output_index BETWEEN 0 AND 15),

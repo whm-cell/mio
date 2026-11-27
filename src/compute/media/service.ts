@@ -117,7 +117,13 @@ export function createMediaService(
         if (previous) {
           if (previous.request_hash !== mediaRequestHash(request))
             throw new MediaError(HTTP_STATUS.CONFLICT, 'REQUEST_CONFLICT');
-          return { created: false, job: await owned(actor, previous.id) };
+          return {
+            created: false,
+            job:
+              previous.state === 'succeeded'
+                ? await owned(actor, previous.id)
+                : view({ ...previous, outputs: [] }),
+          };
         }
         const ids = request.inputs.map((input) => input.assetId);
         const assets = await store.inputs(actor.userId, ids);
@@ -156,7 +162,13 @@ export function createMediaService(
         signal.throwIfAborted();
         const created = await store.create(actor.userId, request, inputs);
         dispatch.wake();
-        return { created: created.created, job: await owned(actor, created.job.id) };
+        return {
+          created: created.created,
+          job:
+            created.job.state === 'succeeded'
+              ? await owned(actor, created.job.id)
+              : view({ ...created.job, outputs: [] }),
+        };
       });
     },
     get(actor: AssetPrincipal, id: string) {
@@ -187,9 +199,9 @@ export function createMediaService(
       return admit(async (signal) => {
         if (!isUuidV4(id)) throw new MediaError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
         signal.throwIfAborted();
-        await store.control(actor.userId, id, 'cancel');
+        const job = await store.control(actor.userId, id, 'cancel');
         dispatch.wake();
-        return owned(actor, id);
+        return job.state === 'succeeded' ? owned(actor, id) : view({ ...job, outputs: [] });
       });
     },
     retry(actor: AssetPrincipal, id: string, requestId: string) {
@@ -198,9 +210,9 @@ export function createMediaService(
           throw new MediaError(HTTP_STATUS.BAD_REQUEST, 'MEDIA_INPUT_INVALID');
         if (!isUuidV4(id)) throw new MediaError(HTTP_STATUS.NOT_FOUND, 'JOB_NOT_FOUND');
         signal.throwIfAborted();
-        await store.retry(actor.userId, id, requestId);
+        const job = await store.retry(actor.userId, id, requestId);
         dispatch.wake();
-        return owned(actor, id);
+        return job.state === 'succeeded' ? owned(actor, id) : view({ ...job, outputs: [] });
       });
     },
     recover(actor: AssetPrincipal, id: string) {

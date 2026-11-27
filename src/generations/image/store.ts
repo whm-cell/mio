@@ -335,21 +335,19 @@ export class GenerationStore {
         [row.id, row.claim_id],
       );
       if (!execution.rowCount) return undefined;
-      const job = await client.query(
-        `UPDATE mio_image_jobs j SET query_attempt=query_attempt+1,next_query_at=NULL
+      const changed = await client.query<Pick<GenerationExecution, 'phase' | 'query_attempt'>>(
+        `WITH reserved AS (
+         UPDATE mio_image_jobs j SET query_attempt=query_attempt+1,next_query_at=NULL
          FROM mio_image_executions e WHERE j.id=$1 AND e.job_id=j.id AND e.claim_id=$2
          AND e.phase='waiting' AND j.upstream_task_id IS NOT NULL
          AND j.query_attempt<j.async_max_queries AND j.async_deadline>statement_timestamp()
          AND to_timestamp((j.command->>'expiresAt')::double precision/1000)>statement_timestamp()
-         RETURNING j.id`,
+         RETURNING j.id,j.query_attempt
+         ) UPDATE mio_image_executions e SET phase='querying'
+         FROM reserved j WHERE e.job_id=j.id RETURNING e.phase,j.query_attempt`,
         [row.id, row.claim_id],
       );
-      if (!job.rowCount) return undefined;
-      await client.query("UPDATE mio_image_executions SET phase='querying' WHERE job_id=$1", [
-        row.id,
-      ]);
-      return (await client.query<GenerationExecution>(selection + ' WHERE j.id=$1', [row.id]))
-        .rows[0];
+      return changed.rows[0] ? { ...row, ...changed.rows[0] } : undefined;
     });
   }
 
@@ -511,8 +509,12 @@ export class GenerationStore {
         [id, owner],
       );
       const row = (
-        await client.query<GenerationExecution>(
-          selection + ' WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j,e',
+        await client.query<
+          Pick<GenerationExecution, 'state' | 'upstream_task_id' | 'active_recovery_seq'>
+        >(
+          `SELECT j.state,j.upstream_task_id,j.active_recovery_seq
+           FROM mio_image_jobs j JOIN mio_image_executions e ON e.job_id=j.id
+           WHERE j.id=$1 AND j.owner_id=$2 FOR UPDATE OF j,e`,
           [id, owner],
         )
       ).rows[0];

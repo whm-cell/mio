@@ -12,6 +12,7 @@ try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query("SET LOCAL lock_timeout = '5s'");
       await client.query(computeSchemaSQL);
       await checkComputeSchema(client, true);
       await client.query('COMMIT');

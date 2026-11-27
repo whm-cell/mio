@@ -4,13 +4,7 @@ import { checkMediaSchema } from './schema.ts';
 import { createId } from '@mio/foundation/identifiers';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
-import {
-  MEDIA_OPERATIONS,
-  MEDIA_PROFILE,
-  MEDIA_VERSION,
-  mediaResourceClass,
-  parseMediaCommand,
-} from '@mio/compute-contracts';
+import { MEDIA_PROFILE, MEDIA_VERSION, parseMediaCommand } from '@mio/compute-contracts';
 import type {
   MediaCommand,
   MediaControl,
@@ -32,11 +26,8 @@ import type { MediaHlsPackage } from './hls.ts';
 import type { MediaCommandLane, MediaInputRow, MediaJobViewRow, MediaJobRow } from './model.ts';
 
 const log = createLogger('app', 'media-store');
-const probeOperations = MEDIA_OPERATIONS.filter(
-  (operation) => mediaResourceClass(operation) === 'probe',
-);
-const viewSQL = (selected: string) => `
-  WITH selected AS (${selected}), output_groups AS (
+const ownerViewSQL = `
+  WITH selected AS (SELECT * FROM mio_media_jobs WHERE id=$1 AND owner_id=$2), output_groups AS (
     SELECT f.job_id,jsonb_agg(jsonb_build_object(
       'assetId',f.asset_id,'name',f.name,'role',f.role,
       'contentType',f.content_type,'sizeBytes',f.size_bytes
@@ -54,14 +45,13 @@ export class MediaStore {
     this.pool = pool;
   }
   async ownerView(id: string, owner: string): Promise<MediaJobViewRow | undefined> {
-    return (
-      await this.pool.query<MediaJobViewRow>(
-        viewSQL('SELECT * FROM mio_media_jobs WHERE id=$1 AND owner_id=$2'),
-        [id, owner],
-      )
-    ).rows[0];
+    return (await this.pool.query<MediaJobViewRow>(ownerViewSQL, [id, owner])).rows[0];
   }
-  async hlsPackage(id: string, owner: string): Promise<MediaHlsPackage | undefined> {
+  async hlsPackage(
+    id: string,
+    owner: string,
+    includeSegments = true,
+  ): Promise<MediaHlsPackage | undefined> {
     return (
       await this.pool.query<MediaHlsPackage>(
         `SELECT j.attempt_id AS "attemptId",jsonb_agg(jsonb_build_object(
@@ -70,21 +60,53 @@ export class MediaStore {
         )) AS files
         FROM mio_media_jobs j JOIN mio_media_files f ON f.job_id=j.id
         WHERE j.id=$1 AND j.owner_id=$2 AND j.state='succeeded' AND j.operation='video.derivatives'
-          AND f.role IN ('hls','segment')
+          AND (f.role='hls' OR ($3::boolean AND f.role='segment'))
         GROUP BY j.id`,
-        [id, owner],
+        [id, owner, includeSegments],
       )
     ).rows[0];
   }
   async list(owner: string): Promise<MediaJobViewRow[]> {
-    return (
-      await this.pool.query<MediaJobViewRow>(
-        viewSQL(
+    return computeTransaction(this.pool, async (client) => {
+      await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+      const jobs = (
+        await client.query<MediaJobRow>(
           'SELECT * FROM mio_media_jobs WHERE owner_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100',
-        ),
-        [owner],
-      )
-    ).rows;
+          [owner],
+        )
+      ).rows;
+      // Keep the jobs and their full output inventory in the same database snapshot.
+      const ids = jobs.filter((job) => job.state === 'succeeded').map((job) => job.id);
+      const byJob = new Map<string, MediaJobViewRow['outputs']>();
+      if (ids.length) {
+        const files = (
+          await client.query<{
+            job_id: string;
+            assetId: string;
+            name: string;
+            role: MediaJobViewRow['outputs'][number]['role'];
+            contentType: string;
+            size_bytes: string;
+          }>(
+            `SELECT job_id,asset_id AS "assetId",name,role,content_type AS "contentType",size_bytes
+            FROM mio_media_files WHERE job_id=ANY($1::uuid[]) ORDER BY job_id,ordinal,name`,
+            [ids],
+          )
+        ).rows;
+        for (const file of files) {
+          const outputs = byJob.get(file.job_id) ?? [];
+          outputs.push({
+            assetId: file.assetId,
+            name: file.name,
+            role: file.role,
+            contentType: file.contentType,
+            sizeBytes: Number(file.size_bytes),
+          });
+          byJob.set(file.job_id, outputs);
+        }
+      }
+      return jobs.map((job) => ({ ...job, outputs: byJob.get(job.id) ?? [] }));
+    });
   }
   async request(owner: string, requestId: string): Promise<MediaJobRow | undefined> {
     return (
@@ -202,10 +224,9 @@ export class MediaStore {
       await this.pool.query<{ command: MediaCommand | MediaControl }>(
         `UPDATE mio_media_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
        WHERE id=(SELECT id FROM mio_media_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now())
-       AND CASE WHEN command->>'type'='media.control' THEN 'control'
-           WHEN command->>'operation'=ANY($3::text[]) THEN 'probe' ELSE 'encode' END=$2
+       AND lane=$2
        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING command`,
-        [lease, lane, probeOperations],
+        [lease, lane],
       )
     ).rows[0];
     return row ? { command: row.command, lease } : undefined;
@@ -239,7 +260,7 @@ export async function createMediaStore(databaseURL: string): Promise<MediaStore>
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-media',
   });
   pool.on('error', () => log.error('MEDIA_DATABASE_CONNECTION_ERROR'));

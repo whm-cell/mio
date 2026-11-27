@@ -1,10 +1,19 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import { expect, it } from 'vitest';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
 import { generationSchemaSQL } from '../../src/generations/schema.ts';
+import { providerSchemaSQL } from '../../src/providers/schema.ts';
+import { adminSchemaSQL } from '../../src/admin/schema.ts';
+import { materialSchemaSQL } from '../../src/materials/schema.ts';
+import { materialAuthSchemaSQL } from '../../src/materials/auth-schema.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 const assetId = 'aaaaaaaa-0000-4000-8000-000000000001';
@@ -34,7 +43,7 @@ const migrations = [
     name: 'assets',
     ddl: assetSchemaSQL,
     legacy: `${assetSchemaSQL}
-      DROP INDEX mio_assets_cleanup;
+      DROP INDEX mio_assets_cleanup_order;
       ${originalAsset}`,
     damage: 'ALTER TABLE mio_assets ALTER COLUMN source_etag TYPE varchar(128)',
     repair: 'ALTER TABLE mio_assets ALTER COLUMN source_etag TYPE text',
@@ -78,6 +87,10 @@ const migrations = [
     ddl: generationSchemaSQL,
     legacy: `${assetSchemaSQL}
       ${generationSchemaSQL}
+      DROP INDEX mio_image_jobs_unfinished_state;
+      CREATE INDEX mio_image_jobs_unfinished ON mio_image_jobs(owner_id)
+        WHERE state IN ('accepted','submitted','processing','materializing');
+      DROP INDEX mio_video_executions_cleanup;
       ALTER TABLE mio_assets DROP COLUMN asset_kind, ALTER COLUMN staging_key SET NOT NULL;
       ALTER TABLE mio_image_jobs DROP COLUMN route_snapshot, DROP CONSTRAINT mio_image_jobs_state_check,
         ADD CONSTRAINT mio_image_jobs_state_check CHECK (state IN ('accepted','completed'));
@@ -158,6 +171,142 @@ it.each(migrations)(
       expect(await schema(pool)).toEqual(migrated);
       expect(await readHistory()).toEqual(legacyHistory);
     } finally {
+      await pool.end();
+      await database.close();
+    }
+  },
+);
+
+const timeoutTrace = `data:text/javascript,${encodeURIComponent(`
+  import pg from ${JSON.stringify(pathToFileURL(resolve('node_modules/pg/lib/index.js')).href)};
+  const query = pg.Client.prototype.query;
+  pg.Client.prototype.query = async function(...args) {
+    const sql = typeof args[0] === 'string' ? args[0] : args[0].text;
+    if (sql.includes('CREATE TABLE IF NOT EXISTS')) {
+      const result = await query.call(this, 'SHOW lock_timeout');
+      console.log('MIGRATION_LOCK_TIMEOUT ' + result.rows[0].lock_timeout);
+    }
+    return query.apply(this, args);
+  };
+`)}`;
+const lockingMigrations = [
+  {
+    name: 'assets',
+    ddl: assetSchemaSQL,
+    table: 'mio_assets',
+    damage: 'DROP INDEX mio_assets_cleanup_order',
+  },
+  {
+    name: 'compute',
+    ddl: assetSchemaSQL + computeSchemaSQL,
+    table: 'mio_assets',
+    damage: 'ALTER TABLE mio_assets DROP COLUMN asset_kind',
+  },
+  {
+    name: 'conversations',
+    ddl: conversationSchemaSQL,
+    table: 'mio_conversations',
+    damage: 'ALTER TABLE mio_conversations DROP COLUMN model_binding',
+  },
+  {
+    name: 'generations',
+    ddl: assetSchemaSQL + generationSchemaSQL,
+    table: 'mio_image_jobs',
+    damage: 'ALTER TABLE mio_image_jobs DROP COLUMN route_snapshot',
+  },
+  {
+    name: 'providers',
+    ddl: providerSchemaSQL,
+    table: 'mio_provider_models',
+    damage:
+      'ALTER TABLE mio_provider_configs DROP COLUMN last_attempt_seq; ALTER TABLE mio_provider_models DROP COLUMN description_override',
+  },
+  {
+    name: 'admin',
+    ddl: providerSchemaSQL + adminSchemaSQL,
+    table: 'mio_provider_models',
+    damage:
+      'ALTER TABLE mio_provider_configs DROP COLUMN last_attempt_seq; ALTER TABLE mio_provider_models DROP COLUMN description_override',
+  },
+  {
+    name: 'materials',
+    ddl: assetSchemaSQL + materialSchemaSQL + materialAuthSchemaSQL,
+    table: 'mio_materials',
+    damage: 'DROP TABLE mio_material_auth_sessions',
+  },
+];
+
+it.each(lockingMigrations)(
+  '$name bounds DDL lock waits and rolls back the entire migration',
+  async (migration) => {
+    const database = await authDatabase();
+    const pool = new Pool({ connectionString: database.observerURL });
+    const blocker = await pool.connect();
+    let child: ReturnType<typeof spawn> | undefined;
+    let closed: Promise<unknown> | undefined;
+    const env = {
+      PATH: process.env.PATH,
+      MIO_ASSETS_DATABASE_URL: database.url,
+      MIO_CONVERSATIONS_DATABASE_URL: database.url,
+      MIO_PROVIDERS_DATABASE_URL: database.url,
+      MIO_PROVIDERS_MASTER_KEY: randomBytes(32).toString('base64'),
+      MIO_PROVIDERS_MASTER_KEY_ID: 'migration-test',
+    };
+    try {
+      await pool.query(migration.ddl);
+      await pool.query(migration.damage);
+      const before = await schema(pool);
+      await blocker.query('BEGIN');
+      await blocker.query(`LOCK TABLE ${migration.table} IN ACCESS EXCLUSIVE MODE`);
+      child = spawn(
+        process.execPath,
+        ['--import', timeoutTrace, `scripts/service/migrate-${migration.name}.ts`, '--apply'],
+        { env, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      closed = once(child, 'close');
+      let stdout = '';
+      let stderr = '';
+      child.stdout!.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr!.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        waiting = Boolean(
+          (
+            await pool.query(
+              "SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",
+              [database.applicationName],
+            )
+          ).rowCount,
+        );
+        if (waiting) break;
+        await delay(50);
+      }
+      expect(waiting, stderr).toBe(true);
+      expect(stdout).toContain('MIGRATION_LOCK_TIMEOUT 5s');
+      const result = await Promise.race([
+        closed,
+        delay(7500).then(() => 'did not exit on lock timeout'),
+      ]);
+      expect(result, stderr).toEqual([1, null]);
+      if (!['providers', 'admin'].includes(migration.name))
+        expect(stderr).toContain('lock timeout');
+      await blocker.query('ROLLBACK');
+      expect(await schema(pool)).toEqual(before);
+      const retried = spawnSync(
+        process.execPath,
+        [`scripts/service/migrate-${migration.name}.ts`, '--apply'],
+        { env, encoding: 'utf8', timeout: 10000 },
+      );
+      expect(retried.status, retried.stderr).toBe(0);
+    } finally {
+      if (child && child.exitCode === null) child.kill('SIGTERM');
+      if (closed) await closed;
+      await blocker.query('ROLLBACK');
+      blocker.release();
       await pool.end();
       await database.close();
     }

@@ -260,6 +260,7 @@ describe('worker journal and real ffmpeg', () => {
     const old = new DatabaseSync(join(root, 'journal.sqlite3'));
     old.exec(`BEGIN IMMEDIATE;
       DROP TABLE image_attempts;
+      DROP TABLE media_uploads;
       DROP TABLE media_events;
       DROP TABLE media_cancellations;
       DROP TABLE media_manual_resolutions;

@@ -197,12 +197,6 @@ export interface UnifiedModelRawSources {
     in_latest_probe: boolean;
     last_seen_at: Date;
   }[];
-  readonly ignoredRows: readonly {
-    raw_model_id: string;
-    reason: string | null;
-    ignored_by: string | null;
-    ignored_at: Date;
-  }[];
   readonly userStatsRows: readonly {
     raw_model_id: string;
     discovered_users: number;

@@ -5,9 +5,9 @@ export interface MaterialPrincipal {
   userId: string;
   sessionId: string;
 }
-export type GroupType = 'real' | 'aigc';
-export type GroupState = 'creating' | 'ready' | 'unknown' | 'deleting' | 'deleted' | 'failed';
-export type MaterialState =
+type GroupType = 'real' | 'aigc';
+type GroupState = 'creating' | 'ready' | 'unknown' | 'deleting' | 'deleted' | 'failed';
+type MaterialState =
   | 'registering'
   | 'processing'
   | 'active'
@@ -193,7 +193,7 @@ export function groupView(row: CountedGroupRow): GroupView {
     lastSyncErrorCode: expired ? MATERIAL_SYNC_LEASE_EXPIRED : row.last_sync_error_code,
   };
 }
-export function materialView(row: MaterialRow): MaterialView {
+export function materialView(row: Omit<MaterialRow, 'raw_snapshot'>): MaterialView {
   // Older successful observations stored Failed as unknown, with no local operation error.
   const { state, errorCode } =
     row.state === 'unknown' &&

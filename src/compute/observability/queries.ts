@@ -51,7 +51,7 @@ type ExecutionRow = {
 // The stored gap position also applies when its carrier or the queued event arrives late.
 const executionStateSQL = `
   CASE WHEN e.event_state IN ('queued','active') AND
-    (e.uncertain OR COALESCE(LEAST(w.observed_at,w.received_at)<now()-interval '15 seconds',true)
+    (e.uncertain OR COALESCE(LEAST(w.observed_at,w.received_at)<$2::timestamptz-interval '15 seconds',true)
       OR (e.event_state='queued' AND e.boot_sequence=(w.latest_gap->'last'->>'bootSequence')::bigint
         AND e.sequence<(w.latest_gap->'last'->>'sequence')::bigint))
     THEN 'unknown' ELSE e.event_state END
@@ -147,11 +147,17 @@ interface HistoryPoint {
   clockUncertain: boolean;
   gap: boolean;
 }
+interface Sample extends Omit<HistoryPoint, 'workers'> {
+  instance_id: string;
+  tick: string;
+}
+const clock = 'abs(extract(epoch FROM s.observed_at - s.received_at)) > 15';
+const gap = `s.gap IS NOT NULL OR EXISTS (
+  SELECT 1 FROM mio_compute_worker_events e WHERE e.instance_id=s.instance_id AND e.gap IS NOT NULL
+    AND e.event_at>s.sample_at-interval '5 seconds' AND e.event_at<=s.sample_at
+)`;
 
 const metrics = ['total', 'encode', 'probe'] as const;
-const sumJSON = (name: 'usage' | 'waiting' | 'hard' | 'applied') =>
-  `jsonb_build_object(${metrics.map((key) => `'${key}', sum((s.${name}->>'${key}')::bigint)`).join(', ')})`;
-
 export class WorkerObservabilityQueries {
   readonly #pool: Pool;
   readonly #instances: readonly string[];
@@ -163,9 +169,10 @@ export class WorkerObservabilityQueries {
 
   async workers(limit: number, offset: number, now = epochMs()) {
     const ids = this.#instances.slice(offset, offset + limit);
+    if (!ids.length) return { workers: [], total: this.#instances.length, offset };
     const { rows } = await this.#pool.query<WorkerInstanceRow>(
-      'SELECT * FROM mio_compute_worker_instances WHERE instance_id=ANY($1::text[])',
-      [ids],
+      `SELECT * FROM mio_compute_worker_instances WHERE ${ids.length === 1 ? 'instance_id=$1' : 'instance_id=ANY($1::text[])'}`,
+      [ids.length === 1 ? ids[0] : ids],
     );
     const byId = new Map(rows.map((row) => [row.instance_id, row]));
     return {
@@ -196,10 +203,14 @@ export class WorkerObservabilityQueries {
       this.#pool.query<{ instanceId: string; peak: number }>(
         `
         SELECT instance_id AS "instanceId",max((usage->>'total')::bigint)::float8 AS peak
-        FROM mio_compute_worker_events WHERE instance_id=ANY($1::text[]) AND event_at BETWEEN $2 AND $3
+        FROM mio_compute_worker_events WHERE ${this.#instances.length === 1 ? 'instance_id=$1' : 'instance_id=ANY($1::text[])'} AND event_at BETWEEN $2 AND $3
         AND kind='execution' GROUP BY instance_id ORDER BY instance_id
       `,
-        [this.#instances, new Date(now - 3600_000), new Date(now)],
+        [
+          this.#instances.length === 1 ? this.#instances[0] : this.#instances,
+          new Date(now - 3600_000),
+          new Date(now),
+        ],
       ),
     ]);
     const counts = { online: 0, stale: 0, offline: 0, unseen: 0 };
@@ -234,31 +245,57 @@ export class WorkerObservabilityQueries {
     };
   }
 
-  async executions(input: WorkerExecutionFilters) {
+  async executions(input: WorkerExecutionFilters, now = epochMs()) {
+    if (
+      !this.#instances.length ||
+      (input.instanceId !== undefined && !this.#instances.includes(input.instanceId))
+    )
+      return { executions: [] };
+    const instanceId =
+      input.instanceId ?? (this.#instances.length === 1 ? this.#instances[0] : undefined);
+    const args: unknown[] = [instanceId ?? this.#instances, new Date(now)];
+    const conditions = [
+      instanceId === undefined ? 'e.instance_id=ANY($1::text[])' : 'e.instance_id=$1',
+    ];
+    if (input.jobId !== undefined) {
+      args.push(input.jobId);
+      conditions.push(`e.job_id=$${args.length}::uuid`);
+    }
+    if (input.state === 'active' || input.state === 'queued') {
+      // Fixed literals expose the existing open partial-index predicate.
+      conditions.push(
+        input.state === 'active' ? "e.event_state='active'" : "e.event_state='queued'",
+        'NOT e.uncertain',
+        "LEAST(w.observed_at,w.received_at)>=$2::timestamptz-interval '15 seconds'",
+      );
+      if (input.state === 'queued')
+        conditions.push(`NOT COALESCE(
+        e.boot_sequence=(w.latest_gap->'last'->>'bootSequence')::bigint
+        AND e.sequence<(w.latest_gap->'last'->>'sequence')::bigint,false)`);
+    } else if (input.state !== undefined) {
+      args.push(input.state);
+      conditions.push(
+        input.state === 'released' || input.state === 'cancelled'
+          ? `e.event_state=$${args.length}`
+          : `(${executionStateSQL})=$${args.length}`,
+      );
+    }
+    args.push(input.limit);
     const { rows } = await this.#pool.query<ExecutionRow>(
-      `
-      ${executionSQL}
-      WHERE e.instance_id=ANY($1::text[]) AND ($2::text IS NULL OR e.instance_id=$2)
-        AND ($3::uuid IS NULL OR e.job_id=$3)
-        AND ($4::text IS NULL OR (${executionStateSQL})=$4)
-      ORDER BY e.last_at DESC,e.execution_id LIMIT $5
-    `,
-      [
-        this.#instances,
-        input.instanceId ?? null,
-        input.jobId ?? null,
-        input.state ?? null,
-        input.limit,
-      ],
+      `${executionSQL} WHERE ${conditions.join(' AND ')}
+      ORDER BY e.last_at DESC,e.execution_id LIMIT $${args.length}`,
+      args,
     );
     return { executions: rows.map(executionView) };
   }
 
-  async execution(id: string) {
+  async execution(id: string, now = epochMs()) {
+    if (!this.#instances.length) return null;
+    const singleton = this.#instances.length === 1;
     const row = (
       await this.#pool.query<ExecutionRow>(
-        `${executionSQL} WHERE e.execution_id=$1 AND e.instance_id=ANY($2::text[])`,
-        [id, this.#instances],
+        `${executionSQL} WHERE e.execution_id=$3 AND ${singleton ? 'e.instance_id=$1' : 'e.instance_id=ANY($1::text[])'}`,
+        [singleton ? this.#instances[0] : this.#instances, new Date(now), id],
       )
     ).rows[0];
     if (!row) return null;
@@ -281,50 +318,115 @@ export class WorkerObservabilityQueries {
   }
 
   async history(instanceId: string | undefined, since: Date, until: Date, limit: number) {
-    const ids =
-      instanceId === undefined
-        ? this.#instances
-        : this.#instances.filter((id) => id === instanceId);
-    const args = [ids, since, until, limit];
-    const clock = 'abs(extract(epoch FROM s.observed_at - s.received_at)) > 15';
-    const gap = `s.gap IS NOT NULL OR EXISTS (
-      SELECT 1 FROM mio_compute_worker_events e WHERE e.instance_id=s.instance_id AND e.gap IS NOT NULL
-        AND e.event_at>s.sample_at-interval '5 seconds' AND e.event_at<=s.sample_at
-    )`;
-    const raw = `
-      SELECT s.sample_at AS at,s.boot_id AS "bootId",s.usage,s.waiting,s.applied,s.hard,1 AS workers,
-        ${clock} AS "clockUncertain",(${gap}) AS gap
-      FROM mio_compute_worker_samples s
-      WHERE s.instance_id=ANY($1::text[]) AND s.sample_at BETWEEN $2 AND $3
-      ORDER BY s.sample_at DESC,s.received_at DESC,s.message_id DESC LIMIT $4
-    `;
-    const aggregate = `
-      WITH times AS (
-        SELECT DISTINCT sample_at FROM mio_compute_worker_samples
-        WHERE instance_id=ANY($1::text[]) AND sample_at BETWEEN $2 AND $3
-        ORDER BY sample_at DESC LIMIT $4
-      )
-      SELECT t.sample_at AS at,${sumJSON('usage')} AS usage,${sumJSON('waiting')} AS waiting,
-        ${sumJSON('applied')} AS applied,${sumJSON('hard')} AS hard,
-        count(*)::integer AS workers,bool_or(${clock}) AS "clockUncertain",
-        bool_or(${gap}) AS gap
-      FROM times t CROSS JOIN unnest($1::text[]) AS w(instance_id)
-      CROSS JOIN LATERAL (
-        SELECT instance_id,sample_at,usage,waiting,applied,hard,observed_at,received_at,gap
+    if (
+      !this.#instances.length ||
+      (instanceId !== undefined && !this.#instances.includes(instanceId))
+    )
+      return { since, until, points: [] };
+    const pool = this.#pool;
+    const ids = this.#instances;
+    if (instanceId !== undefined) {
+      const { rows } = await pool.query<HistoryPoint>(
+        `SELECT s.sample_at AS at,s.boot_id AS "bootId",s.usage,s.waiting,s.applied,s.hard,1 AS workers,
+          ${clock} AS "clockUncertain",(${gap}) AS gap
+        FROM mio_compute_worker_samples s
+        WHERE s.instance_id=$1 AND s.sample_at BETWEEN $2 AND $3
+        ORDER BY s.sample_at DESC,s.received_at DESC,s.message_id DESC LIMIT $4`,
+        [instanceId, since, until, limit],
+      );
+      return { since, until, points: rows.reverse() };
+    }
+    const singleton = ids.length === 1;
+    const scope = singleton ? ids[0] : ids;
+    const client = await pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    client.on('error', disconnected);
+    try {
+      // READ ONLY alone would retain READ COMMITTED's per-statement snapshots.
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const { rows: times } = await client.query<{
+        sample_at: Date;
+        boundary: string;
+        tick: string;
+      }>(
+        `SELECT DISTINCT sample_at,sample_at::text AS boundary,
+          (extract(epoch FROM sample_at)*1000000)::bigint::text AS tick
         FROM mio_compute_worker_samples
-        WHERE instance_id=w.instance_id AND sample_at BETWEEN t.sample_at-interval '15 seconds' AND t.sample_at
-        ORDER BY sample_at DESC,received_at DESC,message_id DESC LIMIT 1
-      ) s
-      GROUP BY t.sample_at ORDER BY t.sample_at DESC
-    `;
-    const { rows } = await this.#pool.query<HistoryPoint>(
-      instanceId === undefined ? aggregate : raw,
-      args,
-    );
-    return { since, until, points: rows.reverse() };
+        WHERE ${singleton ? 'instance_id=$1' : 'instance_id=ANY($1::text[])'} AND sample_at BETWEEN $2 AND $3
+        ORDER BY sample_at DESC LIMIT $4`,
+        [scope, since, until, limit],
+      );
+      const { rows } = await client.query<Sample>(
+        `SELECT DISTINCT ON (s.instance_id,s.sample_at) s.instance_id,s.sample_at AS at,
+          (extract(epoch FROM s.sample_at)*1000000)::bigint::text AS tick,
+          s.usage,s.waiting,s.applied,s.hard,${clock} AS "clockUncertain",(${gap}) AS gap
+        FROM mio_compute_worker_samples s
+        WHERE ${singleton ? 's.instance_id=$1' : 's.instance_id=ANY($1::text[])'} AND $4::boolean
+          AND s.sample_at BETWEEN $2::timestamptz-interval '15 seconds' AND $3::timestamptz
+        ORDER BY s.instance_id,s.sample_at,s.received_at DESC,s.message_id DESC`,
+        [scope, times.at(-1)?.boundary ?? since, times[0]?.boundary ?? since, times.length > 0],
+      );
+      await client.query('COMMIT');
+      const byInstance = new Map<string, Array<Sample & { micros: bigint }>>();
+      for (const row of rows) {
+        const samples = byInstance.get(row.instance_id) ?? [];
+        samples.push({ ...row, micros: BigInt(row.tick) });
+        byInstance.set(row.instance_id, samples);
+      }
+      const positions = new Map<string, number>();
+      const points: HistoryPoint[] = [];
+      for (const time of times.reverse()) {
+        const tick = BigInt(time.tick);
+        const point: HistoryPoint = {
+          at: time.sample_at,
+          usage: { ...noSlots },
+          waiting: { ...noSlots },
+          applied: { ...noSlots },
+          hard: { ...noSlots },
+          workers: 0,
+          clockUncertain: false,
+          gap: false,
+        };
+        for (const [id, samples] of byInstance) {
+          let position = positions.get(id) ?? -1;
+          while (position + 1 < samples.length && samples[position + 1]!.micros <= tick) position++;
+          positions.set(id, position);
+          const sample = samples[position];
+          if (!sample || sample.micros < tick - 15_000_000n) continue;
+          point.workers++;
+          point.clockUncertain ||= sample.clockUncertain;
+          point.gap ||= sample.gap;
+          for (const name of ['usage', 'waiting', 'applied', 'hard'] as const)
+            for (const resource of metrics) point[name][resource] += sample[name][resource];
+        }
+        points.push(point);
+      }
+      return { since, until, points };
+    } catch (error) {
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
+      throw error;
+    } finally {
+      client.removeListener('error', disconnected);
+      client.release(discard);
+    }
   }
 
   async limits(instanceId: string | undefined, limit: number) {
+    if (
+      !this.#instances.length ||
+      (instanceId !== undefined && !this.#instances.includes(instanceId))
+    )
+      return { changes: [] };
+    const singleton = instanceId ?? (this.#instances.length === 1 ? this.#instances[0] : undefined);
     const { rows } = await this.#pool.query(
       `
       SELECT command_id AS "commandId",instance_id AS "instanceId",revision::float8,
@@ -333,10 +435,10 @@ export class WorkerObservabilityQueries {
         status,reason,applied_limits AS "appliedLimits",confirmed_at AS "confirmedAt",
         result_observed_at AS "resultObservedAt"
       FROM mio_compute_worker_limit_changes
-      WHERE instance_id=ANY($1::text[]) AND ($2::text IS NULL OR instance_id=$2)
-      ORDER BY requested_at DESC,command_id LIMIT $3
+      WHERE ${singleton === undefined ? 'instance_id=ANY($1::text[])' : 'instance_id=$1'}
+      ORDER BY requested_at DESC,command_id LIMIT $2
     `,
-      [this.#instances, instanceId ?? null, limit],
+      [singleton ?? this.#instances, limit],
     );
     return { changes: rows };
   }

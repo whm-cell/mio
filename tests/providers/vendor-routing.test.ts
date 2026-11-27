@@ -28,6 +28,7 @@ import { createProviderService } from '../../src/providers/service.ts';
 import { createProviderStore } from '../../src/providers/store.ts';
 import { protocolResponse } from '../onelink/fixture.ts';
 import { authDatabase } from '../support/auth-database.ts';
+import { legacyProviderAdaptationTablesSQL } from './fixtures/provider-legacy-schema.ts';
 import { kernelRuntime, ScriptedModel } from '../support/kernel-runtime.ts';
 import {
   findFixtureImageRouteConfig,
@@ -602,30 +603,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
       await pool.query(providerSchemaSQL);
       // Simulate pre-existing legacy adaptations/policies tables, adaptation_origin, and classification* columns
       await pool.query(`
-        CREATE TABLE mio_provider_model_adaptations (
-          provider_id uuid NOT NULL,
-          model_key uuid NOT NULL,
-          operation text NOT NULL,
-          profile text NOT NULL,
-          declaration_version integer NOT NULL DEFAULT 1,
-          verification_status text NOT NULL DEFAULT 'unverified',
-          verified_at timestamptz,
-          verification_evidence text,
-          tested_tuple jsonb,
-          PRIMARY KEY(provider_id, model_key, operation)
-        );
-        CREATE TABLE mio_provider_model_policies (
-          provider_type text NOT NULL DEFAULT 'onelink',
-          raw_model_id text COLLATE "C" NOT NULL,
-          user_visible boolean NOT NULL DEFAULT true,
-          allow_undiscovered boolean NOT NULL DEFAULT false,
-          display_label text,
-          call_notes text,
-          updated_by text,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (provider_type, raw_model_id)
-        );
+        ${legacyProviderAdaptationTablesSQL}
         ALTER TABLE mio_provider_model_verifications ADD COLUMN adaptation_origin text DEFAULT 'owner';
         ALTER TABLE mio_provider_models
           ADD COLUMN classification text,
@@ -727,7 +705,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
       // Run incremental schema migrations on top of legacy state
       await pool.query(providerSchemaSQL);
       await pool.query(generationSchemaSQL);
-      await expect(checkProviderSchema(pool, true)).resolves.toBeUndefined();
+      await expect(checkProviderSchema(pool)).resolves.toBeUndefined();
       await expect(checkGenerationSchema(pool)).resolves.toBeUndefined();
 
       // Backfills matching chat verified row & legacy policy row, then drops retired tables & dead columns
@@ -824,7 +802,7 @@ describe('OneLink database vendor routing acceptance scenarios (PRD §3.1)', () 
         await pool.query(generationSchemaSQL);
 
         const generationDir = mkdtempSync(join(tmpdir(), 'mio-routed-multi-'));
-        const store = await createProviderStore(config, true);
+        const store = await createProviderStore(config);
         const providerService = createProviderService(store, config, async () =>
           Response.json({
             data: [{ id: 'custom-gpt-sync' }, { id: 'custom-volc-ref' }],

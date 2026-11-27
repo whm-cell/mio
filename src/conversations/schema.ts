@@ -34,8 +34,6 @@ UPDATE mio_conversations SET updated_at=created_at WHERE updated_at IS NULL;
 ALTER TABLE mio_conversations
   ALTER COLUMN updated_at SET DEFAULT now(),
   ALTER COLUMN updated_at SET NOT NULL;
-CREATE INDEX IF NOT EXISTS mio_conversations_owner_activity_page
-  ON mio_conversations(owner_id, updated_at DESC, id DESC) WHERE archived_at IS NULL;
 ALTER TABLE mio_conversations ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'general'
   CHECK (purpose IN ('general', 'drama-script', 'audio'));
 DO $$ BEGIN
@@ -57,7 +55,23 @@ ALTER TABLE mio_conversations
   ADD COLUMN IF NOT EXISTS fork_requested_until_seq bigint CHECK (fork_requested_until_seq >= 0);
 CREATE UNIQUE INDEX IF NOT EXISTS mio_conversations_fork_request
   ON mio_conversations(owner_id, forked_from_conversation_id, fork_request_id)
-  WHERE fork_request_id IS NOT NULL;`;
+  WHERE fork_request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mio_conversation_requests_created_idx ON mio_conversation_requests(created_at DESC);
+CREATE INDEX IF NOT EXISTS mio_conversation_requests_latest
+  ON mio_conversation_requests(conversation_id, created_at DESC, request_id DESC);
+CREATE INDEX IF NOT EXISTS mio_conversation_requests_recovery
+  ON mio_conversation_requests(conversation_id, request_id)
+  WHERE status IN ('accepted','input-persisted');
+CREATE INDEX IF NOT EXISTS mio_conversations_recovery
+  ON mio_conversations(id)
+  WHERE active_request IS NOT NULL OR (state='creating' AND fork_request_id IS NULL);
+CREATE INDEX IF NOT EXISTS mio_conversations_audio_activity_page
+  ON mio_conversations(owner_id, updated_at DESC, id DESC)
+  WHERE archived_at IS NULL AND purpose='audio';
+CREATE INDEX IF NOT EXISTS mio_conversations_nonaudio_activity_page
+  ON mio_conversations(owner_id, updated_at DESC, id DESC)
+  WHERE archived_at IS NULL AND purpose<>'audio';
+DROP INDEX IF EXISTS mio_conversations_owner_activity_page;`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
 export async function checkConversationSchema(database: Pick<Pool, 'query'>): Promise<void> {

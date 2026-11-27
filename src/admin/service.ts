@@ -904,26 +904,15 @@ export function createAdminService(
         throw new AdminError(HTTP_STATUS.BAD_REQUEST, 'ADMIN_INPUT_INVALID');
       }
       const summary = parseOptionalBoundedString(input.summary, 500) ?? null;
-      const exists = await store.modelExistsInCatalog(input.rawModelId);
-      if (!exists) {
-        throw new AdminError(HTTP_STATUS.NOT_FOUND, 'MODEL_NOT_FOUND');
-      }
-      const deletedRevisions = await providers.deleteRoutes(input.rawModelId, {
-        actorType: 'admin',
-        actorId: principal.admin.id,
-        actorName: principal.admin.username,
-        summary: summary ?? `Cascade delete routes for ${input.rawModelId}`,
-      });
-      await store.deleteCatalogModel(principal.admin, {
+      const deletedRoutesCount = await store.deleteCatalogModel(principal.admin, {
         rawModelId: input.rawModelId,
         ignoreFutureImports: input.ignoreFutureImports === true,
         summary,
-        deletedRoutesCount: deletedRevisions.length,
       });
       return {
         ok: true,
         rawModelId: input.rawModelId,
-        deletedRoutesCount: deletedRevisions.length,
+        deletedRoutesCount,
       };
     },
 

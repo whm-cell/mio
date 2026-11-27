@@ -25,6 +25,11 @@ const syncExpired = `(last_sync_status IS NOT DISTINCT FROM 'running' AND
   (sync_lease_until IS NULL OR sync_lease_until<=statement_timestamp())) AS sync_expired`;
 const groupMaterialCount = `(SELECT count(*)::int FROM mio_materials m
   WHERE m.owner_id=g.owner_id AND m.group_id=g.id AND m.state<>'deleted') AS material_count`;
+const materialListFields = `id,owner_id,provider_type,group_id,source_asset_id,upstream_asset_id,
+  asset_type,name,state,upstream_status,registration_credential_version,last_synced_at,
+  next_query_at,error_code,revision,created_at,updated_at,deleted_at`;
+const operationExpired = `(state IN ('creating','deleting') AND lease_until<=clock_timestamp()) AS lease_expired`;
+type ObservedOperation = OperationRow & { lease_expired: boolean | null };
 type Query = Pick<Pool, 'query'> | PoolClient;
 export interface MaterialCursor {
   createdAt: string;
@@ -110,13 +115,18 @@ export class MaterialStore {
     limit: number,
     cursor?: MaterialCursor,
   ): Promise<CountedGroupRow[]> {
+    const parameters: unknown[] = [owner];
+    const typeFilter = type === undefined ? '' : ` AND g.group_type=$${parameters.push(type)}`;
+    const cursorFilter = cursor
+      ? ` AND (g.created_at,g.id)<($${parameters.push(cursor.createdAt)}::timestamptz,$${parameters.push(cursor.id)}::uuid)`
+      : '';
+    const pageLimit = parameters.push(limit + 1);
     return (
       await this.pool.query<CountedGroupRow>(
         `SELECT g.*, ${syncExpired}, to_char(g.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time, ${groupMaterialCount}
-      FROM mio_material_groups g WHERE g.owner_id=$1 AND g.state<>'deleted' AND ($2::text IS NULL OR g.group_type=$2)
-      AND ($3::timestamptz IS NULL OR (g.created_at,g.id)<($3::timestamptz,$4::uuid))
-      ORDER BY g.created_at DESC,g.id DESC LIMIT $5`,
-        [owner, type ?? null, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
+         FROM mio_material_groups g WHERE g.owner_id=$1 AND g.state<>'deleted'${typeFilter}${cursorFilter}
+         ORDER BY g.created_at DESC,g.id DESC LIMIT $${pageLimit}`,
+        parameters,
       )
     ).rows;
   }
@@ -126,36 +136,44 @@ export class MaterialStore {
     groupId: string,
     limit: number,
     cursor?: MaterialCursor,
-  ): Promise<MaterialRow[]> {
+  ): Promise<Omit<MaterialRow, 'raw_snapshot'>[]> {
     await this.ownedGroup(owner, groupId);
+    const parameters: unknown[] = [owner, groupId];
+    const cursorFilter = cursor
+      ? ` AND (created_at,id)<($${parameters.push(cursor.createdAt)}::timestamptz,$${parameters.push(cursor.id)}::uuid)`
+      : '';
+    const pageLimit = parameters.push(limit + 1);
     return (
-      await this.pool.query<MaterialRow>(
-        `SELECT *, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time FROM mio_materials WHERE owner_id=$1 AND group_id=$2 AND state<>'deleted'
-      AND ($3::timestamptz IS NULL OR (created_at,id)<($3::timestamptz,$4::uuid))
-      ORDER BY created_at DESC,id DESC LIMIT $5`,
-        [owner, groupId, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
+      await this.pool.query<Omit<MaterialRow, 'raw_snapshot'>>(
+        `SELECT ${materialListFields}, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_time
+         FROM mio_materials WHERE owner_id=$1 AND group_id=$2 AND state<>'deleted'${cursorFilter}
+         ORDER BY created_at DESC,id DESC LIMIT $${pageLimit}`,
+        parameters,
       )
     ).rows;
   }
 
   async operation(owner: string, id: string): Promise<OperationRow> {
+    const existing = (
+      await this.pool.query<ObservedOperation>(
+        `SELECT *, ${operationExpired} FROM mio_material_operations WHERE owner_id=$1 AND id=$2`,
+        [owner, id],
+      )
+    ).rows[0];
+    if (!existing) throw missing();
+    if (!existing.lease_expired) return existing;
     return withMaterialTransaction(this.pool, async (client) => {
+      // Targets are immutable once the admitting transaction commits. Lock the group before
+      // re-reading the operation, so completion and failure settlement share G -> O -> M.
+      if (existing.target_group_id) await this.group(client, owner, existing.target_group_id, true);
       const row = (
-        await client.query<OperationRow>(
-          'SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 FOR UPDATE',
+        await client.query<ObservedOperation>(
+          `SELECT *, ${operationExpired} FROM mio_material_operations WHERE owner_id=$1 AND id=$2 FOR UPDATE`,
           [owner, id],
         )
       ).rows[0];
       if (!row) throw missing();
-      if (
-        ['creating', 'deleting'].includes(row.state) &&
-        row.lease_until &&
-        row.lease_until.getTime() <=
-          Date.parse(
-            (await client.query<{ now: string }>('SELECT clock_timestamp()::text AS now')).rows[0]!
-              .now,
-          )
-      ) {
+      if (row.lease_expired) {
         const updated = (
           await client.query<OperationRow>(
             "UPDATE mio_material_operations SET state='unknown',error_code='UPSTREAM_RESULT_UNKNOWN',lease_id=NULL,lease_until=NULL,updated_at=now() WHERE id=$1 RETURNING *",
@@ -367,6 +385,7 @@ export class MaterialStore {
     requestId: string | null,
   ): Promise<void> {
     await withMaterialTransaction(this.pool, async (client) => {
+      await this.group(client, owner, operation.target_group_id!, true);
       const claim = (
         await client.query<OperationRow>(
           "SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 AND state='creating' AND lease_id=$3 AND lease_until>clock_timestamp() AND input_hash=$4 FOR UPDATE",
@@ -395,6 +414,8 @@ export class MaterialStore {
     knownCreate?: { id: string; requestId: string | null },
   ): Promise<void> {
     await withMaterialTransaction(this.pool, async (client) => {
+      if (operation.target_group_id)
+        await this.group(client, owner, operation.target_group_id, true);
       const row = (
         await client.query<OperationRow>(
           `UPDATE mio_material_operations SET state=$4,error_code=$5,lease_id=NULL,lease_until=NULL,updated_at=now(),
@@ -589,7 +610,7 @@ export class MaterialStore {
       const row = material ? await this.material(client, owner, id, true) : group;
       if (row.state === 'deleted') return row;
       if (row.revision !== revision) throw conflict();
-      if (['creating', 'registering', 'deleting'].includes(row.state))
+      if (group.state === 'deleting' || ['creating', 'registering', 'deleting'].includes(row.state))
         throw conflict('MATERIAL_BUSY');
       await this.assertIdle(client, owner, group, material?.id);
       if (kind === 'group') await this.assertEmpty(client, owner, id);
@@ -615,11 +636,20 @@ export class MaterialStore {
       [owner, group.id],
     );
     if (busy.rowCount) throw conflict('MATERIAL_BUSY');
+    const parameters: unknown[] = [owner, group.id];
+    // A NULL material target denotes an operation on the whole group, so it also blocks
+    // an individual member. Omitted filters are separate SQL shapes, not NULL parameters.
+    const materialFilter =
+      materialId === undefined
+        ? ''
+        : ` AND (target_material_id IS NULL OR target_material_id=$${parameters.push(materialId)}::uuid)`;
+    const operationFilter =
+      exceptOperation === undefined ? '' : ` AND id<>$${parameters.push(exceptOperation)}::uuid`;
     const operation = await client.query(
       `SELECT 1 FROM mio_material_operations WHERE owner_id=$1 AND target_group_id=$2
-      AND ($3::uuid IS NULL OR target_material_id=$3) AND ($4::uuid IS NULL OR id<>$4)
+      ${materialFilter}${operationFilter}
       AND state IN ('creating','deleting','unknown') LIMIT 1`,
-      [owner, group.id, materialId ?? null, exceptOperation ?? null],
+      parameters,
     );
     if (operation.rowCount) throw conflict('MATERIAL_BUSY');
   }
@@ -659,6 +689,18 @@ export class MaterialStore {
     return withMaterialTransaction(this.pool, async (client) => {
       const opKind: OperationKind =
         kind === 'group' ? 'delete_group_upstream' : 'delete_material_upstream';
+      const previous = (
+        await client.query<OperationRow>(
+          'SELECT * FROM mio_material_operations WHERE owner_id=$1 AND kind=$2 AND request_id=$3',
+          [owner, opKind, requestId],
+        )
+      ).rows[0];
+      if (previous) {
+        if (previous.input_hash !== hash) throw conflict('IDEMPOTENCY_CONFLICT');
+        return { operation: previous, fresh: false };
+      }
+      const material = kind === 'material' ? await this.material(client, owner, id) : undefined;
+      const group = await this.group(client, owner, material?.group_id ?? id, true);
       const op = (
         await client.query<OperationRow>(
           `INSERT INTO mio_material_operations(id,owner_id,request_id,kind,input_hash,state,provider_config_id,credential_version,protocol_snapshot,lease_id,lease_until)
@@ -686,8 +728,6 @@ export class MaterialStore {
         if (old.input_hash !== hash) throw conflict('IDEMPOTENCY_CONFLICT');
         return { operation: old, fresh: false };
       }
-      const material = kind === 'material' ? await this.material(client, owner, id) : undefined;
-      const group = await this.group(client, owner, material?.group_id ?? id, true);
       this.assertMutable(group);
       const row = material ? await this.material(client, owner, id, true) : group;
       if (row.revision !== revision) throw conflict();
@@ -734,11 +774,15 @@ export class MaterialStore {
   ): Promise<void> {
     const { owner_id: owner, target_group_id: id, protocol_snapshot: snapshot } = op;
     const confirmed = snapshot.confirmCascade === true;
+    const parameters: unknown[] = [owner, id, states, snapshot.upstreamId];
+    const providerFilter = confirmed
+      ? ` AND provider_config_id=$${parameters.push(op.provider_config_id)}::uuid`
+      : '';
     const saved = await client.query(
       `UPDATE mio_material_groups SET state='deleted',deleted_at=now(),revision=revision+1,updated_at=now()
        WHERE owner_id=$1 AND id=$2 AND state=ANY($3::text[]) AND upstream_group_id=$4
-       AND ($5::uuid IS NULL OR provider_config_id=$5)`,
-      [owner, id, states, snapshot.upstreamId, confirmed ? op.provider_config_id : null],
+       ${providerFilter}`,
+      parameters,
     );
     if (saved.rowCount !== 1) throw conflict('MATERIAL_OPERATION_SUPERSEDED');
     if (confirmed)
@@ -756,6 +800,7 @@ export class MaterialStore {
     requestId: string | null = null,
   ): Promise<void> {
     await withMaterialTransaction(this.pool, async (client) => {
+      await this.group(client, owner, op.target_group_id!, true);
       const claim = (
         await client.query<OperationRow>(
           "SELECT * FROM mio_material_operations WHERE owner_id=$1 AND id=$2 AND state='deleting' AND lease_id=$3 AND lease_until>clock_timestamp() AND input_hash=$4 FOR UPDATE",
@@ -1001,7 +1046,7 @@ export async function createMaterialStore(
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-materials',
   });
   pool.on('error', () => log.error('MATERIAL_DATABASE_CONNECTION_ERROR'));

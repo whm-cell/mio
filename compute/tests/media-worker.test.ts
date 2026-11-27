@@ -1,6 +1,7 @@
 import { MEDIA_VERSION } from '@mio/compute-contracts';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -16,6 +17,8 @@ import type { MediaExecutor } from '../src/media-execution.ts';
 import { ResourceSlots } from '../src/resource-slots.ts';
 import type { MediaFiles } from '../src/adapters/media-files.ts';
 import type { MediaDigest } from '../src/adapters/media-journal.ts';
+import { mediaIdentity } from '../src/adapters/media-journal.ts';
+import { mediaJournalV8Schema } from './media-journal-v8-fixture.ts';
 const roots: string[] = [];
 const journals: Journal[] = [];
 const hash = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -141,6 +144,70 @@ afterEach(() => {
   for (const directory of roots.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 describe('durable media execution', () => {
+  it('reopens a complete v8 unknown-upload journal, replays receipts and cleans without rerunning or reuploading the artifact', async () => {
+    const f = fixture();
+    f.store.unknown = true;
+    await f.worker.handle(f.command, () => {});
+    const prior = f.journal.media.get(f.command.attemptId)!;
+    const replay = f.events[0]!;
+    expect(prior).toMatchObject({ phase: 'reconciling', unknownCode: 'UPLOAD_UNKNOWN' });
+    expect(prior.uploads['audio.wav']?.state).toBe('intent');
+    await f.worker.close();
+    f.journal.close();
+    journals.splice(journals.indexOf(f.journal), 1);
+    const path = join(f.directory, 'journal.sqlite3');
+    rmSync(path);
+    writeFileSync(path, '', { mode: 0o600 });
+    const old = new DatabaseSync(path);
+    try {
+      old.exec(mediaJournalV8Schema);
+      old.exec("UPDATE metadata SET instance_id='worker-test'");
+      old
+        .prepare('INSERT INTO media_attempts(attempt_id,command_id,identity,body) VALUES(?,?,?,?)')
+        .run(
+          f.command.attemptId,
+          f.command.messageId,
+          mediaIdentity(f.command),
+          JSON.stringify(prior),
+        );
+      old
+        .prepare('INSERT INTO media_events(message_id,attempt_id,body) VALUES(?,?,?)')
+        .run(replay.messageId, f.command.attemptId, JSON.stringify(replay));
+    } finally {
+      old.close();
+    }
+    const journal = new Journal(f.directory, 'worker-test');
+    journals.push(journal);
+    const executor = vi.fn(execute);
+    const worker = new MediaWorker(
+      f.store,
+      f.publisher,
+      journal,
+      f.directory,
+      executor,
+      f.stop.signal,
+      new ResourceSlots(),
+    );
+    f.publisher.publishMedia.mockClear();
+    try {
+      await worker.recover();
+      expect(executor).not.toHaveBeenCalled();
+      expect(f.store.puts).toHaveLength(2);
+      expect(f.publisher.publishMedia.mock.calls[0]![0]).toEqual(replay);
+      expect(f.publisher.publishMedia.mock.calls[1]![0].state).toBe('succeeded');
+      expect(journal.media.get(f.command.attemptId)).toMatchObject({
+        phase: 'succeeded',
+        cleaned: true,
+      });
+      expect(journal.media.pending(f.command.attemptId)).toBeNull();
+      expect(existsSync(join(f.directory, `media-${f.command.attemptId}`))).toBe(false);
+      await worker.handle(f.command, () => {});
+      expect(f.store.puts).toHaveLength(2);
+      expect(executor).not.toHaveBeenCalled();
+    } finally {
+      await worker.close();
+    }
+  });
   it('uploads each artifact and the manifest last, confirms durable events before ACK, and deduplicates command replay', async () => {
     const { worker, command, store, events, journal, directory } = fixture();
     const ack = vi.fn(() => expect(events.at(-1)?.state).toBe('succeeded'));
@@ -603,7 +670,7 @@ describe('durable media execution', () => {
     await worker.control(control('recover'), ack);
     await entered.promise;
     const error = new Error('JOURNAL_MEDIA_WRITE_FAILED');
-    vi.spyOn(journal.media, 'save').mockImplementation(() => {
+    vi.spyOn(journal.media, 'saveUpload').mockImplementation(() => {
       throw error;
     });
     release.resolve(true);

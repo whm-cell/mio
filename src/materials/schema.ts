@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS mio_material_groups (
  CHECK((group_type='aigc' AND auth_status='not_applicable') OR (group_type='real' AND auth_status='verified'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS mio_material_groups_upstream_unique ON mio_material_groups(provider_type,upstream_group_id) WHERE upstream_group_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS mio_material_groups_owner_page ON mio_material_groups(owner_id,group_type,created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS mio_material_groups_live_page ON mio_material_groups(owner_id,created_at DESC,id DESC) WHERE state<>'deleted';
+CREATE INDEX IF NOT EXISTS mio_material_groups_live_type_page ON mio_material_groups(owner_id,group_type,created_at DESC,id DESC) WHERE state<>'deleted';
+DROP INDEX IF EXISTS mio_material_groups_owner_page;
 CREATE TABLE IF NOT EXISTS mio_materials (
  id uuid PRIMARY KEY, owner_id text NOT NULL, provider_type text NOT NULL CHECK(provider_type='onelink'),
  group_id uuid NOT NULL, source_asset_id uuid REFERENCES mio_assets(id), upstream_asset_id text,
@@ -31,7 +33,8 @@ CREATE TABLE IF NOT EXISTS mio_materials (
  UNIQUE(owner_id,id), FOREIGN KEY(owner_id,provider_type,group_id) REFERENCES mio_material_groups(owner_id,provider_type,id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS mio_materials_upstream_unique ON mio_materials(provider_type,upstream_asset_id) WHERE upstream_asset_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS mio_materials_group_page ON mio_materials(owner_id,group_id,created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS mio_materials_live_group_page ON mio_materials(owner_id,group_id,created_at DESC,id DESC) WHERE state<>'deleted';
+DROP INDEX IF EXISTS mio_materials_group_page;
 CREATE TABLE IF NOT EXISTS mio_material_operations (
  id uuid PRIMARY KEY,owner_id text NOT NULL,request_id uuid NOT NULL,
  kind text NOT NULL CHECK(kind IN ('create_group','register_material','delete_material_upstream','delete_group_upstream')),
@@ -47,6 +50,8 @@ CREATE TABLE IF NOT EXISTS mio_material_operations (
  FOREIGN KEY(owner_id,target_material_id) REFERENCES mio_materials(owner_id,id)
 );
 CREATE INDEX IF NOT EXISTS mio_material_operations_recovery ON mio_material_operations(next_query_at,lease_until) WHERE state IN ('creating','deleting','unknown');
+CREATE INDEX IF NOT EXISTS mio_material_operations_active_group ON mio_material_operations(owner_id,target_group_id,kind) WHERE state IN ('creating','deleting','unknown');
+CREATE INDEX IF NOT EXISTS mio_material_operations_active_material ON mio_material_operations(owner_id,target_material_id) WHERE state IN ('creating','deleting','unknown');
 `;
 
 export async function checkMaterialSchema(pool: Pick<Pool, 'query'>): Promise<void> {

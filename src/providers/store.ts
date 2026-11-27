@@ -22,11 +22,12 @@ import type { ProviderConfig } from './config.ts';
 import type { DiscoveredModel } from '../integrations/onelink/models.ts';
 import { encryptCredential } from './credentials.ts';
 import { checkProviderSchema } from './schema.ts';
-import { providerStateSQL, providerView } from './state.ts';
+import { providerModelStateSQL, providerStateSQL, providerView } from './state.ts';
 import type { ProviderRow, ProviderState } from './state.ts';
 import {
   findCatalogModel,
   findModel,
+  legacyReference,
   membershipError,
   modelReference,
   resolveEffectiveChat,
@@ -42,6 +43,16 @@ import { videoRouteRuntimeAvailable } from './onelink/video-route.ts';
 import { resolveProviderAudioRoute, selectAudioModel } from './audio-admission.ts';
 
 const log = createLogger('app', 'provider-store');
+
+function modelStateParameters(owner: string, ref: string) {
+  const legacy = legacyReference(ref);
+  const key =
+    !legacy &&
+    /^onelink:model:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(ref)
+      ? ref.slice('onelink:model:'.length)
+      : null;
+  return [owner, key, legacy?.id ?? null, legacy ? null : ref];
+}
 
 export interface SettingsPatch {
   enabled?: boolean;
@@ -62,6 +73,7 @@ export interface RouteRevisionResult {
   declarationVersion: number;
   action: RouteRevisionAction;
 }
+
 export interface RouteImportSummary {
   total: number;
   inserted: number;
@@ -69,7 +81,7 @@ export interface RouteImportSummary {
   unchanged: number;
   revisions: RouteRevisionResult[];
 }
-/** All mutations serialize on the configuration row; network calls run outside the transaction. */
+/** Owner changes and verification lock configuration; platform routes lock catalog keys. */
 export class ProviderStore {
   readonly voices: ReturnType<typeof createVoiceStore>;
   readonly audio: ReturnType<typeof createAudioStore>;
@@ -96,20 +108,33 @@ export class ProviderStore {
 
   private async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let discard = false;
+    const disconnected = () => {
+      discard = true;
+    };
+    // The pool handles errors only while this client is idle.
+    client.on('error', disconnected);
     try {
       await client.query('BEGIN');
       const value = await action(client);
       await client.query('COMMIT');
       return value;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (!discard) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discard = true;
+        }
+      }
       throw error instanceof ProviderError ||
         error instanceof VoiceError ||
         error instanceof AudioError
         ? error
         : new ProviderError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROVIDER_UNAVAILABLE');
     } finally {
-      client.release();
+      client.removeListener('error', disconnected);
+      client.release(discard);
     }
   }
   private async locked(client: PoolClient, owner: string, expected?: number): Promise<ProviderRow> {
@@ -142,6 +167,17 @@ export class ProviderStore {
     return (
       (await this.pool.query<ProviderState>(providerStateSQL(includeVerifications), [owner]))
         .rows[0] ?? null
+    );
+  }
+  /** One MVCC statement for an exact model; public state and default selection keep full discovery. */
+  async modelState(owner: string, modelRef: string): Promise<ProviderState | null> {
+    return (
+      (
+        await this.pool.query<ProviderState>(
+          providerModelStateSQL,
+          modelStateParameters(owner, modelRef),
+        )
+      ).rows[0] ?? null
     );
   }
   async save(owner: string, expected: number, apiKey: string): Promise<ProviderView> {
@@ -248,7 +284,12 @@ export class ProviderStore {
     const whitelist = Boolean(this.config.catalogWhitelist);
     return this.transaction(async (client) => {
       const row = await this.locked(client, owner, expected);
-      const state = (await client.query<ProviderState>(providerStateSQL(false), [owner])).rows[0]!;
+      const state = (
+        await client.query<ProviderState>(
+          providerModelStateSQL,
+          modelStateParameters(owner, modelRef),
+        )
+      ).rows[0]!;
       const model = findModel(state.models, modelRef);
       if ('enabled' in patch || 'isDefault' in patch) {
         const reason = membershipError(state, model, whitelist);
@@ -320,222 +361,130 @@ export class ProviderStore {
       actionOverride: 'cli-import',
     };
     return this.transaction(async (client) => {
-      let inserted = 0;
-      let updated = 0;
-      let unchanged = 0;
+      const firstByModel = new Map<string, (typeof entries)[number]>();
+      for (const entry of entries)
+        if (!firstByModel.has(entry.rawModelId)) firstByModel.set(entry.rawModelId, entry);
+      const catalogEntries = [...firstByModel.values()];
+      await client.query(
+        `INSERT INTO mio_provider_catalog_models (
+        provider_type,raw_model_id,vendor_label,category,origin_source,updated_by
+      ) SELECT 'onelink',i."rawModelId",i.vendor,i.classification,'route-import',$2
+        FROM jsonb_to_recordset($1::jsonb) AS i("rawModelId" text,vendor text,classification text)
+        ORDER BY i."rawModelId" COLLATE "C"
+        ON CONFLICT(provider_type,raw_model_id) DO UPDATE SET raw_model_id=EXCLUDED.raw_model_id WHERE false`,
+        [JSON.stringify(catalogEntries), resolvedActor.actorName],
+      );
+      const existingRows = (
+        await client.query<PlatformRouteRecord>(
+          `SELECT r.* FROM mio_provider_model_routes r
+        JOIN jsonb_to_recordset($1::jsonb) AS i("rawModelId" text,operation text)
+          ON r.provider_type='onelink' AND r.raw_model_id=i."rawModelId" COLLATE "C" AND r.operation=i.operation
+        ORDER BY r.raw_model_id COLLATE "C",r.operation COLLATE "C" FOR UPDATE OF r`,
+          [JSON.stringify(entries)],
+        )
+      ).rows;
+      const existingByKey = new Map(
+        existingRows.map((row) => [`${row.raw_model_id}\0${row.operation}`, row]),
+      );
+      let inserted = 0,
+        updated = 0,
+        unchanged = 0;
       const revisions: RouteRevisionResult[] = [];
+      const writes: Record<string, unknown>[] = [];
+      const history: Record<string, unknown>[] = [];
       for (const entry of entries) {
+        const existing = existingByKey.get(`${entry.rawModelId}\0${entry.operation}`);
+        if (existing && canonicalRouteComparable(existing) === canonicalRouteComparable(entry)) {
+          unchanged += 1;
+          continue;
+        }
+        const declarationVersion = (existing?.declaration_version ?? 0) + 1;
+        const onlyEnabledToggled =
+          existing &&
+          existing.enabled !== entry.enabled &&
+          canonicalRouteComparable({ ...existing, enabled: entry.enabled }) ===
+            canonicalRouteComparable(entry);
+        const action: RouteRevisionAction =
+          resolvedActor.actionOverride ??
+          (!existing
+            ? 'create'
+            : onlyEnabledToggled
+              ? entry.enabled
+                ? 'enable'
+                : 'disable'
+              : 'update');
+        const revision = {
+          id: createId(),
+          rawModelId: entry.rawModelId,
+          operation: entry.operation,
+          declarationVersion,
+          action,
+        };
+        revisions.push(revision);
+        writes.push({
+          ...entry,
+          declarationVersion,
+          isNew: !existing,
+        });
+        history.push({
+          ...revision,
+          before_route: existing ? serializeRouteInputSnapshot(existing) : null,
+          after_route: serializeRouteInputSnapshot(entry),
+        });
+        if (existing) updated += 1;
+        else inserted += 1;
+      }
+      if (writes.length) {
         await client.query(
-          `INSERT INTO mio_provider_catalog_models (
-             provider_type, raw_model_id, vendor_label, category, origin_source, updated_by
-           ) VALUES ($1, $2, $3, $4, 'route-import', $5)
-           ON CONFLICT (provider_type, raw_model_id) DO NOTHING`,
+          `WITH incoming AS MATERIALIZED (
+          SELECT * FROM jsonb_to_recordset($1::jsonb) AS i(
+            "providerType" text,"rawModelId" text,operation text,vendor text,driver text,classification text,
+            "submitPath" text,"editPath" text,"queryPathTemplate" text,"paramSpec" jsonb,
+            "requestDefaults" jsonb,"outputSpec" jsonb,"capabilityMetadata" jsonb,
+            "sourceKind" text,source text,"sourceVersion" text,enabled boolean,"declarationVersion" integer,"isNew" boolean)
+        ), inserted AS (
+          INSERT INTO mio_provider_model_routes (
+            provider_type,raw_model_id,operation,vendor,driver,classification,submit_path,edit_path,
+            query_path_template,param_spec,request_defaults,output_spec,capability_metadata,
+            source_kind,source,source_version,enabled,declaration_version
+          ) SELECT "providerType","rawModelId",operation,vendor,driver,classification,"submitPath","editPath",
+            "queryPathTemplate","paramSpec","requestDefaults","outputSpec","capabilityMetadata",
+            "sourceKind",source,"sourceVersion",enabled,"declarationVersion" FROM incoming WHERE "isNew"
+            ORDER BY "rawModelId" COLLATE "C",operation COLLATE "C" RETURNING raw_model_id
+        ) UPDATE mio_provider_model_routes r SET vendor=i.vendor,driver=i.driver,classification=i.classification,
+          submit_path=i."submitPath",edit_path=i."editPath",query_path_template=i."queryPathTemplate",
+          param_spec=i."paramSpec",request_defaults=i."requestDefaults",output_spec=i."outputSpec",
+          capability_metadata=i."capabilityMetadata",source_kind=i."sourceKind",source=i.source,
+          source_version=i."sourceVersion",enabled=i.enabled,declaration_version=i."declarationVersion",updated_at=now()
+          FROM incoming i WHERE NOT i."isNew" AND r.provider_type=i."providerType"
+            AND r.raw_model_id=i."rawModelId" COLLATE "C" AND r.operation=i.operation`,
+          [JSON.stringify(writes)],
+        );
+        await client.query(
+          `INSERT INTO mio_provider_model_route_revisions (
+          id,provider_type,raw_model_id,operation,declaration_version,action,actor_type,actor_id,actor_name,summary,before_route,after_route
+        ) SELECT i.id,'onelink',i."rawModelId",i.operation,i."declarationVersion",i.action,$2,$3,$4,$5,i.before_route,i.after_route
+          FROM jsonb_to_recordset($1::jsonb) AS i(id uuid,"rawModelId" text,operation text,"declarationVersion" integer,
+            action text,before_route jsonb,after_route jsonb)`,
           [
-            entry.providerType,
-            entry.rawModelId,
-            entry.vendor,
-            entry.classification,
+            JSON.stringify(history),
+            resolvedActor.actorType,
+            resolvedActor.actorId ?? null,
             resolvedActor.actorName,
+            resolvedActor.summary ?? null,
           ],
         );
-        const existing = (
-          await client.query<PlatformRouteRecord>(
-            `SELECT * FROM mio_provider_model_routes
-              WHERE provider_type=$1 AND raw_model_id=$2 COLLATE "C" AND operation=$3
-              FOR UPDATE`,
-            [entry.providerType, entry.rawModelId, entry.operation],
-          )
-        ).rows[0];
-        if (!existing) {
-          await client.query(
-            `INSERT INTO mio_provider_model_routes (
-              provider_type, raw_model_id, operation, vendor, driver, classification,
-              submit_path, edit_path, query_path_template, param_spec, request_defaults,
-              output_spec, capability_metadata, source_kind, source, source_version,
-              declaration_version, enabled
-            ) VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9,
-              $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb,
-              $14, $15, $16, 1, $17
-            )`,
-            [
-              entry.providerType,
-              entry.rawModelId,
-              entry.operation,
-              entry.vendor,
-              entry.driver,
-              entry.classification,
-              entry.submitPath,
-              entry.editPath,
-              entry.queryPathTemplate,
-              JSON.stringify(entry.paramSpec),
-              JSON.stringify(entry.requestDefaults),
-              JSON.stringify(entry.outputSpec),
-              JSON.stringify(entry.capabilityMetadata),
-              entry.sourceKind,
-              entry.source,
-              entry.sourceVersion,
-              entry.enabled,
-            ],
-          );
-          const revisionId = createId();
-          const action: RouteRevisionAction = resolvedActor.actionOverride ?? 'create';
-          await client.query(
-            `INSERT INTO mio_provider_model_route_revisions (
-              id, provider_type, raw_model_id, operation, declaration_version,
-              action, actor_type, actor_id, actor_name, summary, before_route, after_route
-            ) VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $8, $9, NULL, $10::jsonb)`,
-            [
-              revisionId,
-              entry.providerType,
-              entry.rawModelId,
-              entry.operation,
-              action,
-              resolvedActor.actorType,
-              resolvedActor.actorId ?? null,
-              resolvedActor.actorName,
-              resolvedActor.summary ?? null,
-              JSON.stringify(serializeRouteInputSnapshot(entry)),
-            ],
-          );
-          revisions.push({
-            id: revisionId,
-            rawModelId: entry.rawModelId,
-            operation: entry.operation,
-            declarationVersion: 1,
-            action,
-          });
-          inserted += 1;
-        } else if (canonicalRouteComparable(existing) === canonicalRouteComparable(entry)) {
-          unchanged += 1;
-        } else {
-          const nextVersion = existing.declaration_version + 1;
-          await client.query(
-            `UPDATE mio_provider_model_routes SET
-              vendor=$4, driver=$5, classification=$6, submit_path=$7, edit_path=$8,
-              query_path_template=$9, param_spec=$10::jsonb, request_defaults=$11::jsonb,
-              output_spec=$12::jsonb, capability_metadata=$13::jsonb, source_kind=$14,
-              source=$15, source_version=$16, enabled=$17,
-              declaration_version=$18,
-              updated_at=now()
-              WHERE provider_type=$1 AND raw_model_id=$2 COLLATE "C" AND operation=$3`,
-            [
-              entry.providerType,
-              entry.rawModelId,
-              entry.operation,
-              entry.vendor,
-              entry.driver,
-              entry.classification,
-              entry.submitPath,
-              entry.editPath,
-              entry.queryPathTemplate,
-              JSON.stringify(entry.paramSpec),
-              JSON.stringify(entry.requestDefaults),
-              JSON.stringify(entry.outputSpec),
-              JSON.stringify(entry.capabilityMetadata),
-              entry.sourceKind,
-              entry.source,
-              entry.sourceVersion,
-              entry.enabled,
-              nextVersion,
-            ],
-          );
-          const onlyEnabledToggled =
-            existing.enabled !== entry.enabled &&
-            canonicalRouteComparable({ ...existing, enabled: entry.enabled }) ===
-              canonicalRouteComparable(entry);
-          const action: RouteRevisionAction =
-            resolvedActor.actionOverride ??
-            (onlyEnabledToggled ? (entry.enabled ? 'enable' : 'disable') : 'update');
-          const revisionId = createId();
-          await client.query(
-            `INSERT INTO mio_provider_model_route_revisions (
-              id, provider_type, raw_model_id, operation, declaration_version,
-              action, actor_type, actor_id, actor_name, summary, before_route, after_route
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)`,
-            [
-              revisionId,
-              entry.providerType,
-              entry.rawModelId,
-              entry.operation,
-              nextVersion,
-              action,
-              resolvedActor.actorType,
-              resolvedActor.actorId ?? null,
-              resolvedActor.actorName,
-              resolvedActor.summary ?? null,
-              JSON.stringify(serializeRouteInputSnapshot(existing)),
-              JSON.stringify(serializeRouteInputSnapshot(entry)),
-            ],
-          );
-          revisions.push({
-            id: revisionId,
-            rawModelId: entry.rawModelId,
-            operation: entry.operation,
-            declarationVersion: nextVersion,
-            action,
-          });
-          updated += 1;
-        }
       }
       return { total: entries.length, inserted, updated, unchanged, revisions };
     });
   }
+
   async deleteRoutes(
     rawModelId: string,
     actor: RouteRevisionActor,
     operation?: ProviderOperation,
   ): Promise<RouteRevisionResult[]> {
-    return this.transaction(async (client) => {
-      const existingRows = (
-        await client.query<PlatformRouteRecord>(
-          operation
-            ? `SELECT * FROM mio_provider_model_routes
-               WHERE provider_type='onelink' AND raw_model_id=$1 COLLATE "C" AND operation=$2
-               FOR UPDATE`
-            : `SELECT * FROM mio_provider_model_routes
-               WHERE provider_type='onelink' AND raw_model_id=$1 COLLATE "C"
-               ORDER BY operation ASC
-               FOR UPDATE`,
-          operation ? [rawModelId, operation] : [rawModelId],
-        )
-      ).rows;
-      const revisions: RouteRevisionResult[] = [];
-      for (const existing of existingRows) {
-        await client.query(
-          `DELETE FROM mio_provider_model_routes
-           WHERE provider_type='onelink' AND raw_model_id=$1 COLLATE "C" AND operation=$2`,
-          [existing.raw_model_id, existing.operation],
-        );
-        const nextVersion = existing.declaration_version + 1;
-        const revisionId = createId();
-        await client.query(
-          `INSERT INTO mio_provider_model_route_revisions (
-             id, provider_type, raw_model_id, operation, declaration_version,
-             action, actor_type, actor_id, actor_name, summary, before_route, after_route
-           ) VALUES ($1, 'onelink', $2, $3, $4, 'delete', $5, $6, $7, $8, $9::jsonb, NULL)`,
-          [
-            revisionId,
-            existing.raw_model_id,
-            existing.operation,
-            nextVersion,
-            actor.actorType,
-            actor.actorId ?? null,
-            actor.actorName,
-            actor.summary ?? null,
-            JSON.stringify(serializeRouteInputSnapshot(existing)),
-          ],
-        );
-        revisions.push({
-          id: revisionId,
-          rawModelId: existing.raw_model_id,
-          operation: existing.operation,
-          declarationVersion: nextVersion,
-          action: 'delete',
-        });
-      }
-      return revisions;
-    });
+    return this.transaction((client) => deleteProviderRoutes(client, rawModelId, actor, operation));
   }
   async beginRefresh(owner: string): Promise<ProviderRow> {
     return this.transaction(async (client) => {
@@ -653,8 +602,12 @@ export class ProviderStore {
     if (Buffer.byteLength(input.upstreamId) > 256)
       throw new VoiceError(HTTP_STATUS.BAD_REQUEST, 'VOICE_REGISTRATION_INVALID');
     const register = async (client: Pick<Pool, 'query'> | PoolClient) => {
-      const state = (await client.query<ProviderState>(providerStateSQL(false), [input.ownerId]))
-        .rows[0];
+      const state = (
+        await client.query<ProviderState>(
+          providerModelStateSQL,
+          modelStateParameters(input.ownerId, input.modelRef),
+        )
+      ).rows[0];
       if (!state) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
       const { model } = selectAudioModel(
         state,
@@ -696,7 +649,9 @@ export class ProviderStore {
     };
     return apply
       ? this.transaction(async (client) => {
-          await this.locked(client, input.ownerId);
+          await client.query('SELECT id FROM mio_provider_configs WHERE owner_id=$1 FOR UPDATE', [
+            input.ownerId,
+          ]);
           return register(client);
         })
       : register(this.pool);
@@ -709,7 +664,13 @@ export class ProviderStore {
     evidence: string,
   ): Promise<void> {
     await this.transaction(async (client) => {
-      const row = await this.locked(client, owner);
+      const row = (
+        await client.query<Pick<ProviderRow, 'id' | 'credential_version' | 'catalog_version'>>(
+          'SELECT id,credential_version,catalog_version FROM mio_provider_configs WHERE owner_id=$1 FOR UPDATE',
+          [owner],
+        )
+      ).rows[0];
+      if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
       if (row.id !== snapshot.providerConfigId)
         throw new ProviderError(HTTP_STATUS.CONFLICT, 'MODEL_NOT_FOUND');
       const current =
@@ -717,7 +678,14 @@ export class ProviderStore {
         row.catalog_version === snapshot.catalogVersion;
       // Late completion remains in its request observation and cannot overwrite a newer tuple's verification.
       if (!current) return;
-      const state = (await client.query<ProviderState>(providerStateSQL(false), [owner])).rows[0];
+      const state = (
+        await client.query<ProviderState>(providerModelStateSQL, [
+          owner,
+          modelStateParameters(owner, modelReference(snapshot.modelKey))[1],
+          null,
+          null,
+        ])
+      ).rows[0];
       const model = state?.models.find((item) => item.model_key === snapshot.modelKey);
       if (!state || !model) return;
       const video =
@@ -775,21 +743,72 @@ export class ProviderStore {
     return (this.closing ??= this.pool.end());
   }
 }
-export async function createProviderStore(
-  config: ProviderConfig,
-  images = false,
-): Promise<ProviderStore> {
+/** Caller owns the transaction; catalog deletion and route-only deletion share the same revision semantics. */
+export async function deleteProviderRoutes(
+  client: PoolClient,
+  rawModelId: string,
+  actor: RouteRevisionActor,
+  operation?: ProviderOperation,
+): Promise<RouteRevisionResult[]> {
+  const rows = (
+    await client.query<PlatformRouteRecord>(
+      `SELECT * FROM mio_provider_model_routes WHERE provider_type='onelink'
+      AND raw_model_id=$1 COLLATE "C" AND ($2::text IS NULL OR operation=$2)
+      ORDER BY operation COLLATE "C" FOR UPDATE`,
+      [rawModelId, operation ?? null],
+    )
+  ).rows;
+  const changes = rows.map((row) => ({
+    id: createId(),
+    rawModelId: row.raw_model_id,
+    operation: row.operation,
+    declarationVersion: row.declaration_version + 1,
+    action: 'delete' as const,
+    before_route: serializeRouteInputSnapshot(row),
+  }));
+  if (changes.length) {
+    await client.query(
+      `DELETE FROM mio_provider_model_routes WHERE provider_type='onelink'
+      AND raw_model_id=$1 COLLATE "C" AND operation=ANY($2::text[])`,
+      [rawModelId, changes.map((row) => row.operation)],
+    );
+    await client.query(
+      `INSERT INTO mio_provider_model_route_revisions (
+      id,provider_type,raw_model_id,operation,declaration_version,action,
+      actor_type,actor_id,actor_name,summary,before_route,after_route
+    ) SELECT r.id,'onelink',$1,r.operation,r."declarationVersion",'delete',$3,$4,$5,$6,r.before_route,NULL
+      FROM jsonb_to_recordset($2::jsonb) AS r(id uuid,operation text,"declarationVersion" integer,before_route jsonb)`,
+      [
+        rawModelId,
+        JSON.stringify(changes),
+        actor.actorType,
+        actor.actorId ?? null,
+        actor.actorName,
+        actor.summary ?? null,
+      ],
+    );
+  }
+  return changes.map(({ id, rawModelId, operation, declarationVersion, action }) => ({
+    id,
+    rawModelId,
+    operation,
+    declarationVersion,
+    action,
+  }));
+}
+
+export async function createProviderStore(config: ProviderConfig): Promise<ProviderStore> {
   const pool = new Pool({
     connectionString: config.databaseURL,
     max: 5,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
-    query_timeout: 5000,
+    query_timeout: 8000,
     application_name: 'mio-providers',
   });
   pool.on('error', () => log.error('PROVIDER_DATABASE_CONNECTION_ERROR'));
   try {
-    await checkProviderSchema(pool, images);
+    await checkProviderSchema(pool);
     return new ProviderStore(pool, config);
   } catch {
     await pool.end();

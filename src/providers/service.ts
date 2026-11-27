@@ -67,7 +67,7 @@ export function createProviderService(
   const whitelist = Boolean(config.catalogWhitelist);
   const videoState = async (actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) => {
     assertOpen();
-    const row = await store.state(actor.userId, false);
+    const row = await store.modelState(actor.userId, modelRef);
     assertOpen();
     if (!row) {
       return {
@@ -166,7 +166,10 @@ export function createProviderService(
   };
   const chatState = async (actor: ProviderPrincipal, modelRef?: string) => {
     assertOpen();
-    const row = await store.state(actor.userId, false);
+    const row =
+      modelRef === undefined
+        ? await store.state(actor.userId, false)
+        : await store.modelState(actor.userId, modelRef);
     assertOpen();
     if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const preference = row.preferences.find((pref) => pref.usage === 'chat' && pref.is_default);
@@ -258,7 +261,7 @@ export function createProviderService(
   };
   const imageState = async (actor: Pick<ProviderPrincipal, 'userId'>, modelRef: string) => {
     assertOpen();
-    const row = await store.state(actor.userId, false);
+    const row = await store.modelState(actor.userId, modelRef);
     assertOpen();
     if (!row) throw new ProviderError(HTTP_STATUS.NOT_FOUND, 'PROVIDER_NOT_CONFIGURED');
     const model = findModel(row.models, modelRef);

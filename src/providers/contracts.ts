@@ -26,6 +26,29 @@ export type ProviderOperation = (typeof providerOperations)[number];
 export type AudioDriver = 'minimax-voices' | 'minimax-tts' | 'minimax-clone';
 export type ChatCacheRetention = 'none' | 'short' | 'long';
 export type ChatReasoningEffort = 'low' | 'medium' | 'high';
+export type ModelFailure =
+  | 'MODEL_AUTH_FAILED'
+  | 'MODEL_QUOTA_EXCEEDED'
+  | 'MODEL_RATE_LIMITED'
+  | 'MODEL_TIMEOUT'
+  | 'MODEL_CONTEXT_OVERFLOW'
+  | 'MODEL_UPSTREAM_ERROR';
+export interface ModelObservation {
+  readonly status?: number;
+  readonly providerRequestId?: string;
+  readonly usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
+  readonly usageStatus?: 'reported' | 'partial' | 'unknown';
+  readonly finish: string;
+  readonly failureCode?: string;
+  readonly purpose?: 'compaction' | 'structured' | 'structured-repair' | 'prompt-text';
+}
 export type ChatReasoningCapability =
   | { readonly supported: false }
   | { readonly supported: true; readonly efforts?: readonly ChatReasoningEffort[] };

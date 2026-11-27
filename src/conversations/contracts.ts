@@ -15,8 +15,11 @@ import type {
   ChatReasoningEffort,
   ChatRuntimeSnapshot,
   ChatSelection,
+  ModelFailure as ProviderModelFailure,
+  ModelObservation,
   VideoParameterSpec,
 } from '../providers/contracts.ts';
+export type { ModelObservation } from '../providers/contracts.ts';
 /** Application-facing values: no HTTP, authentication driver or DSH objects. */
 export interface Principal {
   userId: string;
@@ -25,14 +28,7 @@ export interface Principal {
 export type RequestStatus =
   'accepted' | 'input-persisted' | 'completed' | 'cancelled' | 'failed' | 'unknown';
 export type TerminalRequestStatus = Exclude<RequestStatus, 'accepted' | 'input-persisted'>;
-export type ModelFailure =
-  | 'MODEL_AUTH_FAILED'
-  | 'MODEL_QUOTA_EXCEEDED'
-  | 'MODEL_RATE_LIMITED'
-  | 'MODEL_TIMEOUT'
-  | 'MODEL_CONTEXT_OVERFLOW'
-  | 'MODEL_UPSTREAM_ERROR'
-  | 'TURN_STEP_BUDGET_EXCEEDED';
+export type ModelFailure = ProviderModelFailure | 'TURN_STEP_BUDGET_EXCEEDED';
 export type ConversationRunResult =
   | TerminalRequestStatus
   | typeof outputTruncation.reason
@@ -93,22 +89,6 @@ export interface ContextUsage {
   compacted: boolean;
 }
 export type CaptureContextUsage = (read: () => ContextUsage) => void;
-export interface ModelObservation {
-  readonly status?: number;
-  readonly providerRequestId?: string;
-  readonly usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-    cacheReadTokens?: number;
-    cacheWriteTokens?: number;
-    reasoningTokens?: number;
-  };
-  readonly usageStatus?: 'reported' | 'partial' | 'unknown';
-  readonly finish: string;
-  readonly failureCode?: string;
-  readonly purpose?: 'compaction';
-}
 export interface ConversationRun {
   readonly userId: string;
   readonly conversationId: string;

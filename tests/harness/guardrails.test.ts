@@ -281,6 +281,176 @@ function checkCli(root: string, env: NodeJS.ProcessEnv = process.env) {
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
 }
 
+it('allows only prompt primitives, the exact provider contract and unrestricted Node builtins', async () => {
+  const root = await fixture({
+    'src/prompts/contracts.ts': 'export interface Value { text: string }',
+    'src/prompts/use.ts': '',
+    'src/providers/contracts.ts': 'export interface Snapshot { modelId: string }',
+    'src/canvas/value.ts': 'export interface Value { text: string }',
+    'src/conversations/contracts.ts': 'export interface Value { text: string }',
+    'src/dsh/value.ts': 'export interface Value { text: string }',
+    'src/generations/contracts.ts': 'export interface Value { text: string }',
+    'src/providers/service.ts': 'export interface Value { text: string }',
+    'src/providers/contracts-extra.ts': 'export interface Value { text: string }',
+    'src/prompts-extra/value.ts': 'export interface Value { text: string }',
+    'scripts/harness/value.ts': 'export interface Value { text: string }',
+  });
+  const path = join(root, 'tsconfig.json');
+  const config = JSON.parse(await readFile(path, 'utf8'));
+  config.compilerOptions.paths = {
+    '@prompt': ['./src/prompts/contracts.ts'],
+    '@snapshot': ['./src/providers/contracts.ts'],
+    '@business': ['./src/canvas/value.ts'],
+  };
+  await writeFile(path, JSON.stringify(config));
+  const use = join(root, 'src/prompts/use.ts');
+  for (const source of [
+    "export type { Value } from './contracts.ts';",
+    "export type { Snapshot } from '../providers/contracts.ts';",
+    "export type { Value } from '@prompt';",
+    "export type { Snapshot } from '@snapshot';",
+    "export const path = () => import('node:path');",
+    "export { Buffer } from 'node:buffer';",
+    "export { basename } from 'path';",
+    "export const path = process.getBuiltinModule('node:path');",
+  ]) {
+    await writeFile(use, source);
+    const result = await check(root);
+    expect(result.status, source + result.output).toBe(0);
+  }
+  for (const source of [
+    "import type { Value } from '@business'; export type V = Value;",
+    "export type { Value } from '../conversations/contracts.ts';",
+    "export type Value = import('../generations/contracts.ts').Value;",
+    "export const value = () => import('../dsh/value.ts');",
+    "export type { Value } from '../providers/service.ts';",
+    "export type { Value } from '../providers/contracts-extra.ts';",
+    "export type { Value } from '../prompts-extra/value.ts';",
+    "import '../../scripts/harness/value.ts';",
+    "export type { Pool } from 'pg';",
+    "export type * from '@deepseek-ai/dsh-llm';",
+    "export type * from '@earendil-works/pi-ai';",
+    "export type * from 'arbitrary-package';",
+    "export { readFile } from 'node:fs/promises';",
+    "export { spawn } from 'child_process';",
+    "export { Script } from 'node:vm';",
+    "export const fs = process.getBuiltinModule('node:fs');",
+  ]) {
+    await writeFile(use, source);
+    const result = await check(root);
+    expect(result.status, source + result.output).toBe(1);
+    expect(result.output, source).toContain('PROMPTS_DEPENDENCY src/prompts/use.ts');
+  }
+  config.compilerOptions.paths['node:path'] = ['./src/canvas/value.ts'];
+  await writeFile(path, JSON.stringify(config));
+  await writeFile(use, "export type * from 'node:path';");
+  expect((await check(root)).output).toContain('PROMPTS_DEPENDENCY');
+  await symlink(join(root, 'src/canvas/value.ts'), join(root, 'src/prompts/disguised.ts'));
+  await writeFile(use, "export type * from './disguised.ts';");
+  expect((await check(root)).output).toContain('PROMPTS_DEPENDENCY');
+});
+
+it('rejects prompt aliases to framework and database packages by their resolved targets', async () => {
+  const root = await packageFixture({ 'src/prompts/use.ts': '' });
+  const path = join(root, 'tsconfig.json');
+  const config = JSON.parse(await readFile(path, 'utf8'));
+  config.compilerOptions.paths = {
+    '@framework': [fileURLToPath(import.meta.resolve('@earendil-works/pi-ai/models'))],
+    '@database': [join(project, 'node_modules/@types/pg/index.d.ts')],
+  };
+  await writeFile(path, JSON.stringify(config));
+  for (const [entry, existingDiagnostic] of [
+    ['@framework', 'DSH_BOUNDARY'],
+    ['@database', 'AUTH_ADAPTER'],
+  ]) {
+    await writeFile(join(root, 'src/prompts/use.ts'), "export type * from '" + entry + "';");
+    const result = await check(root);
+    expect(result.status, result.output).toBe(1);
+    expect(result.output).toContain('PROMPTS_DEPENDENCY');
+    expect(result.output).toContain(existingDiagnostic);
+  }
+});
+
+it('accepts canonical foundation public prompt imports and rejects misleading entry aliases', async () => {
+  const root = await fixture({
+    'package.json': JSON.stringify({ name: 'prompt-fixture', type: 'module' }),
+    'src/prompts/use.ts': "export { value } from '@mio/foundation/errors';",
+    'packages/foundation/package.json': JSON.stringify({
+      name: '@mio/foundation',
+      type: 'module',
+      exports: {
+        './errors': { types: './dist/errors.d.ts', default: './dist/errors.js' },
+        './time': { types: './dist/time.d.ts', default: './dist/time.js' },
+      },
+    }),
+    'packages/foundation/tsconfig.json': JSON.stringify({
+      compilerOptions: { target: 'ES2024', module: 'NodeNext', moduleResolution: 'NodeNext' },
+      include: ['src/**/*.ts'],
+    }),
+    'packages/foundation/tsconfig.build.json': JSON.stringify({
+      extends: './tsconfig.json',
+      compilerOptions: { rootDir: 'src', outDir: 'dist', declaration: true },
+      include: ['src/**/*.ts'],
+    }),
+    'packages/foundation/src/errors.ts': 'export const value = 1;',
+    'packages/foundation/src/time.ts': 'export const value = 2;',
+    'packages/foundation/src/private.ts': 'export const secret = 3;',
+  });
+  const harness = legacyHarness();
+  harness.sourceRoots['packages/foundation/src'] = 'production';
+  harness.generatedRoots.push('packages/foundation/dist');
+  harness.configurationFiles.push(
+    'packages/foundation/package.json',
+    'packages/foundation/tsconfig.json',
+    'packages/foundation/tsconfig.build.json',
+  );
+  harness.projects = {
+    app: {
+      kind: 'service',
+      packageRoot: '.',
+      sources: ['src'],
+      typecheck: 'tsconfig.json',
+      build: 'tsconfig.build.json',
+    },
+    foundation: {
+      kind: 'library',
+      packageRoot: 'packages/foundation',
+      sources: ['packages/foundation/src'],
+      typecheck: 'packages/foundation/tsconfig.json',
+      build: 'packages/foundation/tsconfig.build.json',
+      publicEntries: [
+        { source: 'packages/foundation/src/errors.ts', export: './errors' },
+        { source: 'packages/foundation/src/time.ts', export: './time' },
+      ],
+    },
+  };
+  await writeFile(join(root, 'harness.config.json'), JSON.stringify(harness));
+  const path = join(root, 'tsconfig.json');
+  const config = JSON.parse(await readFile(path, 'utf8'));
+  config.compilerOptions.paths = {
+    '@mio/foundation/errors': ['./packages/foundation/src/errors.ts'],
+    '@mio/foundation/private': ['./packages/foundation/src/private.ts'],
+  };
+  await writeFile(path, JSON.stringify(config));
+  const valid = await check(root);
+  expect(valid.status, valid.output).toBe(0);
+  await writeFile(
+    join(root, 'src/prompts/use.ts'),
+    "export { secret } from '@mio/foundation/private';",
+  );
+  expect((await check(root)).output).toContain('PROMPTS_DEPENDENCY');
+  config.compilerOptions.paths['@mio/foundation/errors'] = ['./packages/foundation/src/time.ts'];
+  await writeFile(path, JSON.stringify(config));
+  await writeFile(
+    join(root, 'src/prompts/use.ts'),
+    "export { value } from '@mio/foundation/errors';",
+  );
+  const wrongEntry = await check(root);
+  expect(wrongEntry.status, wrongEntry.output).toBe(1);
+  expect(wrongEntry.output).toContain('PROMPTS_DEPENDENCY');
+  expect(wrongEntry.output).toContain('LIBRARY_ENTRY_MISMATCH');
+});
+
 async function check(root: string, env?: NodeJS.ProcessEnv) {
   if (env !== undefined) return checkCli(root, env);
   return runGuardrails(root);

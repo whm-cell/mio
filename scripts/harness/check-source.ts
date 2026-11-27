@@ -1,4 +1,5 @@
 import { readFile, realpath } from 'node:fs/promises';
+import { isBuiltin } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
 import { beneath } from './inventory.ts';
@@ -74,6 +75,7 @@ export async function checkSource(root: string, files: readonly string[], harnes
   const errors: string[] = [];
   const metrics: string[] = [];
   const graph = new Map<string, string[]>();
+  const actualRoot = await realpath(root);
   const checked = await inspectProjects(root, files, harness);
   errors.push(...checked.errors);
   const libraryOutputs = new Map<string, string>();
@@ -376,6 +378,32 @@ export async function checkSource(root: string, files: readonly string[], harnes
           owner.declaration.kind === 'library' &&
           (specifier === owner.packageName || specifier.startsWith(`${owner.packageName}/`)),
       );
+      if (beneath(file, 'src/prompts')) {
+        const actualTarget =
+          resolved &&
+          relative(actualRoot, await realpath(resolved.resolvedFileName)).replaceAll('\\', '/');
+        const foundationEntry =
+          specifier.startsWith('@mio/foundation/') &&
+          ownedTarget?.project.packageName === '@mio/foundation' &&
+          ownedTarget.project.declaration.kind === 'library' &&
+          ownedTarget.project.publicEntryTargets
+            .get('.' + specifier.slice('@mio/foundation'.length))
+            ?.has(ownedTarget.path);
+        if (!(
+          (!resolved && isBuiltin(specifier) && !restrictedCapability(specifier)) ||
+          (actualTarget &&
+            (beneath(actualTarget, 'src/prompts') ||
+              actualTarget === 'src/providers/contracts.ts')) ||
+          foundationEntry
+        ))
+          errors.push(
+            'PROMPTS_DEPENDENCY ' +
+              file +
+              ': ' +
+              specifier +
+              ' is outside Node builtins, foundation public entries and prompt contracts',
+          );
+      }
       if (canonicalLibrary && resolved) {
         const entry =
           specifier === canonicalLibrary.packageName

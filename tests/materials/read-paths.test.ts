@@ -168,17 +168,15 @@ it('counts the selected group page in the same snapshot when a material commits 
   f.add(group.upstreamId);
   await f.service.sync(f.actor, group.groupId);
   const { name, store: reader } = peer(f, 'snapshot');
-  // RLS applies only in this random fixture schema. Its SELECT policy pauses a real count
-  // after PostgreSQL has established the statement snapshot; INSERT has an independent policy.
+  // Pause the count after PostgreSQL establishes its snapshot. A fixture-only view applies
+  // to both CI superusers and local regression roles, unlike row-level policies.
   await f.pool.query(
     'CREATE FUNCTION pause_snapshot() RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtext(current_schema()),5); RETURN true; END $$',
   );
-  await f.pool.query('ALTER TABLE mio_materials ENABLE ROW LEVEL SECURITY');
-  await f.pool.query('ALTER TABLE mio_materials FORCE ROW LEVEL SECURITY');
+  await f.pool.query('ALTER TABLE mio_materials RENAME TO mio_materials_snapshot_source');
   await f.pool.query(
-    'CREATE POLICY snapshot_select ON mio_materials FOR SELECT USING (pause_snapshot())',
+    'CREATE VIEW mio_materials WITH (security_barrier=true) AS SELECT * FROM mio_materials_snapshot_source WHERE pause_snapshot()',
   );
-  await f.pool.query('CREATE POLICY snapshot_insert ON mio_materials FOR INSERT WITH CHECK (true)');
   const gate = await f.pool.connect();
   let pending: ReturnType<MaterialStore['groups']> | undefined;
   try {

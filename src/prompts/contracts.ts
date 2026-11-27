@@ -40,9 +40,10 @@ export interface StructuredPromptSpec<TInput, TOutput> {
   };
 }
 
+const TEMPLATE_VERSION_PATTERN = /^[a-z][a-z0-9-]*\.[a-z][a-z0-9._-]*@v[1-9]\d*$/;
+
 export function assertTemplateVersion(templateVersion: string): void {
-  const match = /^[a-z][a-z0-9-]*\.[a-z][a-z0-9._-]*@v[1-9]\d*$/.exec(templateVersion);
-  if (!match || match[0] !== templateVersion)
+  if (!TEMPLATE_VERSION_PATTERN.test(templateVersion))
     throw new TypeError('Invalid prompt templateVersion: ' + templateVersion);
 }
 

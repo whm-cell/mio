@@ -20,6 +20,9 @@ it('escapes attribute boundaries and hazardous controls without losing ordinary 
     '<mio_material name="a&quot;&amp;&lt;&gt;&apos;&#xa;">' +
       '&#x0;&#x1b;&#x7f;&#x85;&#x202e;&#x2066;\n\t正文</mio_material>',
   );
+  expect(formatDataBlock('json', '{"speaker":"甲","line":"\'好\'"}')).toBe(
+    '<mio_material name="json">{"speaker":"甲","line":"\'好\'"}</mio_material>',
+  );
   expect(formatDataBlock('', '')).toBe('<mio_material name=""></mio_material>');
 });
 

@@ -247,9 +247,37 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
       value: 'canvas plain text',
       observations: [{ purpose: 'prompt-text', usage: { reasoningTokens: 12 } }],
     });
+    expect(f.callModel.mock.calls[0]![0].input.sharedContext).toBe('');
     expect(f.requests).toHaveLength(1);
     await f.runtime.close();
   });
+
+  it.each([
+    ['empty', '', UNTRUSTED_MATERIAL_DECLARATION],
+    [
+      'existing-declaration',
+      'Custom system.\n\n' + UNTRUSTED_MATERIAL_DECLARATION,
+      'Custom system.\n\n' + UNTRUSTED_MATERIAL_DECLARATION,
+    ],
+  ])(
+    'normalizes %s system declaration without duplicating or adding leading blanks',
+    async (_caseName, customSystem, expectedSystem) => {
+      const f = fixture(profile);
+      const result = await f.runtime.executeTextPrompt({
+        ...f.request,
+        input: { system: customSystem, prompt: 'text' },
+      });
+      expect(result.status).toBe('succeeded');
+      const body = f.requests[0]!.body;
+      const wireSystem =
+        profile === 'openai-chat'
+          ? ((body.messages as { role: string; content: string }[])[0]?.content ?? '')
+          : ((body.system as { text: string }[])[0]?.text ?? '');
+      expect(wireSystem).toBe(expectedSystem);
+      expect(wireSystem.split(UNTRUSTED_MATERIAL_DECLARATION)).toHaveLength(2);
+      await f.runtime.close();
+    },
+  );
 
   it.each([401, 402, 429, 504, 'overflow'] as const)(
     'sanitizes rejection %s, with one dispatch, zero repair and zero verification',

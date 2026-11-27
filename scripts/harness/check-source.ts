@@ -50,6 +50,33 @@ function builtinLoaderName(node: ts.Node): boolean {
   );
 }
 
+async function checkPromptsDependency(
+  file: string,
+  specifier: string,
+  actualRoot: string,
+  resolved: ts.ResolvedModuleWithFailedLookupLocations['resolvedModule'],
+  ownedTarget: Awaited<ReturnType<typeof projectForTarget>>,
+): Promise<string | undefined> {
+  const actualTarget =
+    resolved &&
+    relative(actualRoot, await realpath(resolved.resolvedFileName)).replaceAll('\\', '/');
+  const foundationEntry =
+    specifier.startsWith('@mio/foundation/') &&
+    ownedTarget?.project.packageName === '@mio/foundation' &&
+    ownedTarget.project.declaration.kind === 'library' &&
+    ownedTarget.project.publicEntryTargets
+      .get('.' + specifier.slice('@mio/foundation'.length))
+      ?.has(ownedTarget.path);
+  if (
+    (!resolved && isBuiltin(specifier) && !restrictedCapability(specifier)) ||
+    (actualTarget &&
+      (beneath(actualTarget, 'src/prompts') || actualTarget === 'src/providers/contracts.ts')) ||
+    foundationEntry
+  )
+    return undefined;
+  return `PROMPTS_DEPENDENCY ${file}: ${specifier} is outside Node builtins, foundation public entries and prompt contracts`;
+}
+
 // Aliases can lack packageId; file symlinks can retain a different packageId.
 async function owningPackageName(file: string): Promise<string | undefined> {
   let directory = dirname(await realpath(file));
@@ -379,30 +406,14 @@ export async function checkSource(root: string, files: readonly string[], harnes
           (specifier === owner.packageName || specifier.startsWith(`${owner.packageName}/`)),
       );
       if (beneath(file, 'src/prompts')) {
-        const actualTarget =
-          resolved &&
-          relative(actualRoot, await realpath(resolved.resolvedFileName)).replaceAll('\\', '/');
-        const foundationEntry =
-          specifier.startsWith('@mio/foundation/') &&
-          ownedTarget?.project.packageName === '@mio/foundation' &&
-          ownedTarget.project.declaration.kind === 'library' &&
-          ownedTarget.project.publicEntryTargets
-            .get('.' + specifier.slice('@mio/foundation'.length))
-            ?.has(ownedTarget.path);
-        if (!(
-          (!resolved && isBuiltin(specifier) && !restrictedCapability(specifier)) ||
-          (actualTarget &&
-            (beneath(actualTarget, 'src/prompts') ||
-              actualTarget === 'src/providers/contracts.ts')) ||
-          foundationEntry
-        ))
-          errors.push(
-            'PROMPTS_DEPENDENCY ' +
-              file +
-              ': ' +
-              specifier +
-              ' is outside Node builtins, foundation public entries and prompt contracts',
-          );
+        const promptError = await checkPromptsDependency(
+          file,
+          specifier,
+          actualRoot,
+          resolved,
+          ownedTarget,
+        );
+        if (promptError) errors.push(promptError);
       }
       if (canonicalLibrary && resolved) {
         const entry =

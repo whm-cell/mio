@@ -41,9 +41,12 @@ export const callPromptModel: PromptModelCaller = async (request) => {
     const adapter = requestAdapter(snapshot, facts, execution);
     const call = await adapter.prepareCall(provider, snapshot.modelId, signal);
     if (signal.aborted) return { status: 'cancelled' };
-    const messages: RequestMessage[] = [
-      createSystemMessage(input.system + '\n\n' + UNTRUSTED_MATERIAL_DECLARATION),
-    ];
+    const systemText = input.system.includes(UNTRUSTED_MATERIAL_DECLARATION)
+      ? input.system
+      : input.system
+        ? `${input.system}\n\n${UNTRUSTED_MATERIAL_DECLARATION}`
+        : UNTRUSTED_MATERIAL_DECLARATION;
+    const messages: RequestMessage[] = [createSystemMessage(systemText)];
     if (input.sharedContext !== undefined)
       messages.push(
         createUserMessage({

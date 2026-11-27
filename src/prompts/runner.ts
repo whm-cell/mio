@@ -17,6 +17,7 @@ import type {
 } from './contracts.ts';
 
 const log = createLogger('app', 'prompts');
+const MAX_IN_FLIGHT_PROMPTS = 16;
 
 export interface PromptExecution {
   readonly ownerId: string;
@@ -93,7 +94,7 @@ export function createPromptRuntime(ports: PromptRuntimePorts): PromptRuntime {
   let closing: Promise<void> | undefined;
   let drained: (() => void) | undefined;
   function admit<T>(execute: () => Promise<PromptResult<T>>): Promise<PromptResult<T>> {
-    if (closed || active >= 16)
+    if (closed || active >= MAX_IN_FLIGHT_PROMPTS)
       throw new HttpError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROMPT_RUNTIME_UNAVAILABLE');
     active++;
     return execute().finally(() => {

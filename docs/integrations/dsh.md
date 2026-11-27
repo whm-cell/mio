@@ -67,3 +67,11 @@ mioKernel.history 是可信内部读取，不是公共 DTO。活动 Session 先 
 调整版本、装配、scope、持久根、flush/关闭顺序或恢复策略时，重验受影响路径和打包。模拟模型、真实存储、正式 Profile、真实供应商、公共 API、生产及远端门禁分别报告；内核验证不等于公共对话服务已接受。
 
 视频对话工具沿当前轮次的服务端 userId 和持久会话授权，桥接 A 的视频任务能力查询、单次受理和状态读取；只有显式视频配置及 A/B 媒体检测均装配时开放。`mio.video-job` 仅投影经白名单校验的任务和已登记 Asset 元数据，持久恢复及媒体核验归[视频任务 HTTP](../apis/compute.md#post-apiv1computevideos)，不交给模型重发供应商请求。
+
+## 无会话提示词执行
+
+配置供应商后，Mio plugin 通过内部 Cordis 服务 `mioPromptRuntime` 提供 `executeStructuredPrompt` 与 `executeTextPrompt`，不增加 HTTP 路由。业务服务先通过本人 `selectChat` / `resolveChat` 取得冻结 `ChatRuntimeSnapshot`，显式传入 `ownerId`、`AbortSignal`、业务证据身份（如 `taskId:requestId`）与持久化 `observe` 回调。结构化 `Spec` 在代码中同源维护版本、输入构建与唯一解析校验边界；底座不重复解析业务已收窄的数据。契约见[受控提示词 PRD](../tasks/prompt-runtime/prd.md)。
+
+[无会话桥](../../src/dsh/prompt-caller.ts)复用 OneLink 的请求构造、公开 PiAi 编解码、固定 transport、路由期限与观测组装。它不创建 Agent 或 Session，不读写 `DSH_HOME`，不授权工具或附件，不查询凭据。静态 system 后附数据隔离声明，可选 sharedContext 为独立前置 user，任务 prompt 排在最后；修复保持原 system/sharedContext 字节。仅拼接 text 块，思考块不进入正文，供应商明确报告的 reasoningTokens 仍保留。
+
+[PromptRuntime](../../src/prompts/runner.ts) 默认最多 16 个在途执行（含一次修复、观测和验证）；满载或关闭时立即抛 `503 PROMPT_RUNTIME_UNAVAILABLE`，不排队。`close()` 同步停止准入并等待所有已准入工作。plugin 在 Cordis 的本 fiber 离开 ACTIVE 通知中同步关闭准入，覆盖父 fiber 等待依赖消费者卸载期间的旧端口调用。正常卸载与启动失败清理共用 provider 关闭 Promise，先排空 runtime 再关闭供应商服务及池；不依赖并发 effect 的执行先后。既有对话系统前缀、项目快照、会话绑定及压缩授权保持原有路径。

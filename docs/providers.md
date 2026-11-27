@@ -32,7 +32,7 @@ Key 仅由凭据写入口接收。AES-256-GCM 使用随机 12 字节 nonce、16 
 
 轮换原位替换密文、递增 credentialVersion，保留启停、水印、模型身份、适配和偏好/default 目标；旧成员成为 historical，旧成功目录保留历史版本但不授予新凭据资格。新版本必须显式成功发现。当前只保存当前密文，不提供历史 Key 平台。重启须注入同一主密钥和 ID；缺失在配置阶段拒绝，错误密钥/篡改在解密时拒绝，不回退。
 
-[存储](../src/providers/store.ts)自持最多 5 个连接、连接/查询等待各 5 秒。所有用户配置变更在配置行锁下串行；初建 owner 唯一约束及客户端 expectedRevision 防并发覆盖。刷新开始和完成、配置/展示覆盖及偏好更新递增 revision；平台路由实质更新独立递增 `mio_provider_model_routes.declaration_version`。关闭取消并等待发现，先收敛对话运行再关闭本域池；即使对话清理失败也释放本域并保留错误。共同资源约束沿[PostgreSQL](integrations/postgres.md)。
+[存储](../src/providers/store.ts)自持最多 5 个连接、连接/查询等待各 5 秒。所有用户配置变更在配置行锁下串行；初建 owner 唯一约束及客户端 expectedRevision 防并发覆盖。刷新开始和完成、配置/展示覆盖及偏好更新递增 revision；平台路由实质更新独立递增 `mio_provider_model_routes.declaration_version`。关闭取消并等待发现，先停止提示词 runtime 准入并排空其模型调用、观测与验证，再收敛对话运行并关闭本域池；即使对话清理失败也释放本域并保留错误。共同资源约束沿[PostgreSQL](integrations/postgres.md)。
 
 ## 无模型账号资源凭据
 
@@ -107,7 +107,7 @@ pnpm providers:route <--stdin | routes.json>
 
 chat 路由可显式声明 `capabilityMetadata.inputModalities`；必须包含 `text`，仅接受互异的 `text`、`image`，缺省按纯文本处理。只有声明二者的路由可使用对话图片，并可声明四项正整数预算：`maxRequestImages` 默认 4、上限 16；`maxRequestImageBytes` 默认 10 MiB、上限 20 MiB，是每次请求全部图片的 Base64 硬上限；`requestImagePixelBudget` 默认 4,194,304、上限 16,777,216；`requestImageMaxBytes` 默认 5 MiB、上限 10 MiB，是单张预览的软目标。纯文本或未声明视觉的路由不能携带视觉预算。能力声明和预算不证明真实视觉调用成功。
 
-验证只来自当前用户本人的成功运行观察（文本对话完成或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。chat 现有 verified 维度不区分文本和视觉，历史文本成功不代表视觉已实证。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
+验证只来自当前用户本人的成功运行观察（文本对话或无会话提示词的 HTTP 200 且 stop/max-tokens 正文调用，或图片全部请求输出物化完成），独立写入 `mio_provider_model_verifications`，绑定 `credentialVersion/catalogVersion/adaptationVersion` 及 `operation/profile`（不跨用户共享 `verified`）。chat 现有 verified 维度不区分文本和视觉，历史文本成功不代表视觉已实证。刷新、轮换或平台路由 `declaration_version` 递增均使当前有效验证回到 `unverified` 但保留旧观察引用；旧运行晚完成不能覆盖新版本验证，原请求观察仍保留。实际调用允许已实现但未实测项用于授权验证，不能提前展示已验证。
 
 ### 音频操作和音色登记
 
@@ -140,6 +140,8 @@ pnpm audio:voices:import --owner-id <id> --model-ref <ref> --voice-id <id> --nam
 ## 文本消费与验证入口
 
 selectChat 一致读取本人配置、目录、适配、偏好，不解密。fresh resolveChat 核对同一逻辑身份并冻结稳定模型键、raw ID、凭据/目录/声明版本及 operation/profile，再解密到请求内存。已有 requestId 先返回原回执，当前资格变化不重发；在途运行不换版本。详情见[对话规范](conversations.md)。
+
+无会话结构化/纯文本业务通过内部 `mioPromptRuntime` 执行。业务方负责本人目录/平台路由准入，使用 `selectChat` / `resolveChat` 返回的冻结快照及 owner，底座不重查或复制凭据；观察回调由业务方持久化，验证证据身份由业务请求显式提供（如 `taskId:requestId`），复用现有 `recordVerification({userId}, snapshot, evidence)` 与版本元组。目录发现、声明、静态协议替身通过都不构成真实模型验证。[DSH 无会话接入](integrations/dsh.md#无会话提示词执行)
 
 [HTTP/加密测试](../tests/providers/providers.test.ts)、[刷新测试](../tests/providers/providers-refresh.test.ts)、[迁移测试](../tests/providers/providers-migration.test.ts)、[打包 Profile](../tests/providers/providers-profile.test.ts)与[目录参考测试](../tests/providers/providers-catalog.test.ts)各自提供实际观察。普通检查使用隔离 PG 和协议替身，不读取私有 Key 或自动调用供应商；宿主 provider 配置由[测试 setup](../tests/providers-setup.ts)隔离。
 

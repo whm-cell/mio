@@ -25,6 +25,8 @@ import {
   DEFAULT_CHAT_IMAGE_BUDGET,
   DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS,
   supportsChatReasoning,
+  ProviderError,
+  snapshotMaxTokens as providerSnapshotMaxTokens,
 } from '../providers/contracts.ts';
 import { ONELINK_ORIGIN } from '../integrations/onelink/models.ts';
 import { chatTransport, isChatContextOverflow } from '../integrations/onelink/chat.ts';
@@ -84,10 +86,12 @@ export const onelinkRoute = (selection: ChatSelection) =>
   protocolProfile(selection.protocol).provider;
 
 export function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
-  const maxTokens = snapshot.maxOutputTokens ?? 1024;
-  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 65536)
-    throw new LlmError('OneLink maxOutputTokens is invalid', 'BINDING_REQUIRED');
-  return maxTokens;
+  try {
+    return providerSnapshotMaxTokens(snapshot);
+  } catch (error) {
+    if (!(error instanceof ProviderError)) throw error;
+    throw new LlmError(error.message, error.code);
+  }
 }
 
 function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
@@ -112,7 +116,7 @@ function resolveChatEndpoint(snapshot: ChatRuntimeSnapshot) {
   return { protocol, submitPath, baseUrl: ONELINK_ORIGIN };
 }
 
-function chatFailureCode(
+export function chatFailureCode(
   aborted: boolean,
   facts: ChatResponseFacts,
   failure: { code: string; message?: string },
@@ -161,7 +165,7 @@ function metadata(
   };
 }
 
-type OneLinkResponseFacts = ChatResponseFacts & { reasoningTokens?: number };
+export type OneLinkResponseFacts = ChatResponseFacts & { reasoningTokens?: number };
 
 /** Both fixed codecs expose the parsed event before usage normalization erases field presence. */
 function providerReasoningTokens(profile: ChatProfile, event: unknown): number | undefined {
@@ -212,18 +216,17 @@ function wireModel(
 }
 
 /** One immutable request's SDK provider; only the public protocol factories perform encoding. */
-function requestAdapter(
-  run: ConversationRun,
+export function requestAdapter(
+  snapshot: ChatRuntimeSnapshot,
   facts: OneLinkResponseFacts,
-  vision: ConversationVision | undefined,
-  expected: Parameters<typeof visionAttachmentStore>[2],
   execution: { started: boolean },
+  resolveAttachments?: () => ReturnType<typeof visionAttachmentStore>,
 ): PiAiAdapter {
-  const { protocol, submitPath, baseUrl } = resolveChatEndpoint(run.snapshot);
-  const maxTokens = snapshotMaxTokens(run.snapshot);
+  const { protocol, submitPath, baseUrl } = resolveChatEndpoint(snapshot);
+  const maxTokens = snapshotMaxTokens(snapshot);
   const provider = protocol.provider;
   const api = protocol.api();
-  const transport = chatTransport(run.snapshot.apiKey, submitPath, facts, (input, init) => {
+  const transport = chatTransport(snapshot.apiKey, submitPath, facts, (input, init) => {
     execution.started = true;
     return fetch(input, init);
   });
@@ -235,26 +238,26 @@ function requestAdapter(
       fetch: transport,
       maxRetries: 0,
       onProviderStreamEvent(event) {
-        const count = providerReasoningTokens(run.snapshot.protocol, event);
+        const count = providerReasoningTokens(snapshot.protocol, event);
         if (count !== undefined) facts.reasoningTokens = count;
       },
       headers: {
         ...rest.headers,
-        authorization: `Bearer ${run.snapshot.apiKey}`,
+        authorization: `Bearer ${snapshot.apiKey}`,
         'x-api-key': null,
       },
     };
   };
   const model: Model<Api> = {
-    id: run.snapshot.modelId,
-    name: run.snapshot.modelId,
+    id: snapshot.modelId,
+    name: snapshot.modelId,
     provider,
     api: protocol.apiId,
     baseUrl,
-    input: [...(run.snapshot.inputModalities ?? ['text'])],
-    reasoning: run.snapshot.reasoning?.supported === true,
+    input: [...(snapshot.inputModalities ?? ['text'])],
+    reasoning: snapshot.reasoning?.supported === true,
     // SDK 1.5.0 treats zero as unknown. Never expose this as supplier metadata.
-    contextWindow: run.snapshot.contextWindow ?? 0,
+    contextWindow: snapshot.contextWindow ?? 0,
     maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: protocol.compat,
@@ -276,27 +279,27 @@ function requestAdapter(
         api.stream(selected, context, requestOptions(options)),
       streamSimple: (selected, context, options) =>
         api.streamSimple(
-          wireModel(selected, options?.reasoning, run.snapshot.vendor),
+          wireModel(selected, options?.reasoning, snapshot.vendor),
           context,
           requestOptions(options),
         ),
     },
   });
-  const budget = run.snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET;
+  const budget = snapshot.imageBudget ?? DEFAULT_CHAT_IMAGE_BUDGET;
   const streamIdleTimeoutMs =
-    (run.snapshot.reasoning?.supported ? run.snapshot.streamIdleTimeoutMs : undefined) ??
+    (snapshot.reasoning?.supported ? snapshot.streamIdleTimeoutMs : undefined) ??
     DEFAULT_CHAT_STREAM_IDLE_TIMEOUT_MS;
   const profile: ResolvedPiAiProviderProfile = {
     provider,
     displayName: 'OneLinkAI',
     piProvider,
     modelErrors: new Map(),
-    configuredMaxTokens: new Map([[run.snapshot.modelId, maxTokens]]),
+    configuredMaxTokens: new Map([[snapshot.modelId, maxTokens]]),
     retryPolicy,
     streamIdleTimeoutMs,
     timeoutMs: streamIdleTimeoutMs,
     transport: 'sse',
-    cacheRetention: run.snapshot.cacheRetention ?? protocol.defaultCacheRetention,
+    cacheRetention: snapshot.cacheRetention ?? protocol.defaultCacheRetention,
     maxRequestImageBytes: budget.maxRequestImageBytes,
     maxRequestImages: budget.maxRequestImages,
     imageOffloadCountQuantum: 1,
@@ -306,15 +309,45 @@ function requestAdapter(
   const profiles = new Map([[provider, profile]]);
   return new PiAiAdapter({
     profiles: () => profiles,
-    resolveApiKey: async () => run.snapshot.apiKey,
+    resolveApiKey: async () => snapshot.apiKey,
     auth: {
       credentials: noCredentials,
       authContext: { env: async () => undefined, fileExists: async () => false },
     },
-    ...(vision
-      ? { resolveAttachments: () => visionAttachmentStore(vision, run.userId, expected) }
-      : {}),
+    ...(resolveAttachments ? { resolveAttachments } : {}),
   });
+}
+
+export function modelObservation(
+  facts: OneLinkResponseFacts,
+  usage: ModelObservation['usage'],
+  finish: string,
+  failureCode?: string,
+  purpose?: ModelObservation['purpose'],
+): ModelObservation {
+  const { status, providerRequestId, reasoningTokens } = facts;
+  const base = {
+    ...(status !== undefined ? { status } : {}),
+    ...(providerRequestId !== undefined ? { providerRequestId } : {}),
+    finish,
+    ...(purpose ? { purpose } : {}),
+    ...(failureCode ? { failureCode } : {}),
+  };
+  // DSH can report cached input with both uncached input and output at zero.
+  const observedUsage = reasoningTokens === undefined ? usage : { ...usage, reasoningTokens };
+  if (
+    !observedUsage ||
+    (reasoningTokens === undefined && !Object.values(observedUsage).some((count) => count > 0))
+  )
+    return { ...base, usageStatus: 'unknown' };
+  return {
+    ...base,
+    usage: observedUsage,
+    usageStatus:
+      usage && (finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls')
+        ? 'reported'
+        : 'partial',
+  };
 }
 
 export const OBSERVATION_UNAVAILABLE = 'OBSERVATION_UNAVAILABLE';
@@ -385,11 +418,12 @@ export class OneLinkAdapter extends LlmAdapter {
     const facts: OneLinkResponseFacts = {};
     const expected = new Map();
     const execution = { started: false };
-    const inner = await requestAdapter(run, facts, this.vision, expected, execution).prepareCall(
-      provider,
-      model,
-      signal,
-    );
+    const inner = await requestAdapter(
+      run.snapshot,
+      facts,
+      execution,
+      this.vision ? () => visionAttachmentStore(this.vision!, run.userId, expected) : undefined,
+    ).prepareCall(provider, model, signal);
     return {
       model: metadata(provider, model, run.snapshot),
       stream: (options: GenerateOptions) =>
@@ -449,34 +483,11 @@ export class OneLinkAdapter extends LlmAdapter {
     let observed = false;
     let release: (() => void) | undefined;
     execution.started = false;
-    const observation = (finish: string): ModelObservation => {
-      const { status, providerRequestId, reasoningTokens } = facts;
-      const base = {
-        ...(status !== undefined ? { status } : {}),
-        ...(providerRequestId !== undefined ? { providerRequestId } : {}),
-        finish,
-        ...(grant ? { purpose: 'compaction' as const } : {}),
-        ...(failureCode ? { failureCode } : {}),
-      };
-      // DSH can report cached input with both uncached input and output at zero.
-      const observedUsage = reasoningTokens === undefined ? usage : { ...usage, reasoningTokens };
-      if (
-        !observedUsage ||
-        (reasoningTokens === undefined && !Object.values(observedUsage).some((count) => count > 0))
-      )
-        return { ...base, usageStatus: 'unknown' };
-      return {
-        ...base,
-        usage: observedUsage,
-        usageStatus:
-          usage && (finish === 'stop' || finish === 'max-tokens' || finish === 'tool-calls')
-            ? 'reported'
-            : 'partial',
-      };
-    };
     const persistObservation = async (finish: string) => {
       try {
-        await run.observe(observation(finish));
+        await run.observe(
+          modelObservation(facts, usage, finish, failureCode, grant ? 'compaction' : undefined),
+        );
       } catch {
         throw new LlmError('OneLink observation unavailable', OBSERVATION_UNAVAILABLE);
       }

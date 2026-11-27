@@ -1,4 +1,5 @@
 import { HttpError } from '@mio/foundation/errors';
+import { HTTP_STATUS } from '@mio/foundation/http-status';
 import type {
   ImageDriver,
   ImageGeometryEdge,
@@ -334,6 +335,18 @@ export interface ChatRuntimeSnapshot extends ChatSelection, VerificationSnapshot
   readonly imageBudget?: ChatImageBudget;
   readonly apiKey: string;
 }
+/** One route-owned output budget, shared by stateless and conversation calls. */
+export function snapshotMaxTokens(snapshot: ChatRuntimeSnapshot): number {
+  const maxTokens = snapshot.maxOutputTokens ?? 1024;
+  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 65536)
+    throw new ProviderError(
+      HTTP_STATUS.BAD_REQUEST,
+      'BINDING_REQUIRED',
+      'OneLink maxOutputTokens is invalid',
+    );
+  return maxTokens;
+}
+
 /** Account resources have no model/catalog dependency. Open only for one controlled outbound request. */
 export interface AccountCredentialSnapshot {
   readonly providerConfigId: string;

@@ -38,6 +38,10 @@ M3 在声明了上下文窗口的路由上使用同一请求冻结的账号、�
 
 Mio 文本输出上限按路由/适配 `maxOutputTokens`（合法范围 `1..65536`，未配置时默认 `1024`）执行，未知 supplier context/最大输出不从 SDK 默认大容量推导。普通路由的 HTTP 请求期限和 SDK 流式空闲期限均为 30 秒。明确支持推理的路由可声明最长 120 秒的 `streamIdleTimeoutMs`，并同时用于 HTTP 请求期限和流式空闲期限。普通 check 使用协议替身；独立 conversations-live 经正式用户入口执行真实文本，失败记录实际白名单观察。各协议保留确定性回归，真实验证目标与开发安排沿[万联 PRD](../tasks/onelink-integration/prd.md)与[万联原厂协议路由 PRD](../tasks/onelink-vendor-routing/prd.md)，实际接受范围与限制见对应成果入口。一个目标通过不证明其他目标，未发现或无对应成功观察的目标仍未验证。
 
+无会话提示词沿同一双协议 SDK/transport 执行，每个尝试显式使用当次冻结的本人路由快照，无 session、工具、附件或 ambient 凭据。`reasoningEffort` 默认省略；显式选择须由 `supportsChatReasoning` 放行，输出始终剥离 thinking/reasoning 块。只复用既有 `streamIdleTimeoutMs`，不增加空闲计时器；SDK 与网络重试均为零，不注入 `response_format` / `json_object`。
+
+结构化首轮仅在明确 `stop` 且 Spec 校验失败并声明 repair 时允许一次 `structured-repair`；首轮 `max-tokens` 直接失败，修复输出上限取路由预算与声明修复预算的较小值。`minOutputTokens` 不足返回 `MODEL_MAX_TOKENS_INSUFFICIENT`，不支持的显式思考档位返回 `MODEL_REASONING_UNSUPPORTED`，均零出站。出站前取消零观测；活动传输取消持久化 `aborted` 后返回 cancelled，非主动取消的未确认流中断返回 `unknown / MODEL_STREAM_INTERRUPTED`。观测落库失败优先返回 `unknown / OBSERVATION_UNAVAILABLE`，包括活动取消；上述 unknown 路径绝不重发。正常调用、修复及纯文本观测分别标识 `structured`、`structured-repair`、`prompt-text`，两次尝试按顺序保留。只在观测持久化后、实际 HTTP 200 且终止为 stop/max-tokens 时登记 chat 验证；验证写入失败沿既有对话语义记录脱敏诊断，不推翻已持久观察。普通回归使用[双协议替身](../../tests/prompts/runner.test.ts)，真实模型及业务接受另行取证。
+
 已实现的 MiniMax 配音与复刻沿[语音路由声明](../providers.md#音频操作和音色登记)固定相对路径。接收任务时冻结精确模型、参数、音色及加密凭据并持久化提交意图。配音发送 JSON，复刻发送 multipart，复刻样本须有当次授权和本人资产校验。HTTP 成功仍需解析业务状态和输出；只有确认的供应商结果才写实测验证。提交结果未知时保留原任务；已收到的输出沿本地检查点继续发布。音色浏览与刷新查询本人本地库。[音频 API](../apis/audio.md)
 
 旧地址归一化允许其他 host 原样通过，不能作为允许列表复用；旧 TLS 补链、回退和重试没有作为当前必需能力搬入。旧预设及其冲突仅是迁移参考。其余非文本协议路径、错误和生成重试在后续真实消费者出现时另行采纳，不从目录成功推导 Messages、图片、MiniMax 或素材线路可用。

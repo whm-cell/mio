@@ -56,6 +56,9 @@ import TokenMeter from '@deepseek-ai/dsh-token-meter';
 import { readProviderConfig } from './providers/config.ts';
 import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
+import { createPromptRuntime } from './prompts/runner.ts';
+import type { PromptRuntime } from './prompts/runner.ts';
+import { callPromptModel } from './dsh/prompt-caller.ts';
 import type { ProviderService } from './providers/service.ts';
 import { createProviderHandler } from './providers/http.ts';
 import { readAssetConfig } from './assets/config.ts';
@@ -124,6 +127,7 @@ export const inject = ['webServer', 'tools'];
 declare module '@deepseek-ai/cordis' {
   interface Context {
     mioConversationProjectContext: ConversationProjectContextResolver;
+    mioPromptRuntime: PromptRuntime;
   }
 }
 
@@ -533,18 +537,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
     if (providerConfig) {
       const store = await createProviderStore(providerConfig);
-      providers = createProviderService(
-        store,
-        providerConfig,
-        undefined,
-        Boolean(generationConfig?.videoEnabled && assetConfig && computeConfig),
-      );
-      const ownedProviders = providers;
+      let ownedProviders: ProviderService | undefined;
+      let prompts: PromptRuntime | undefined;
+      let providerClosing: Promise<void> | undefined;
+      // Both normal teardown and startup failure join the same drain before touching the pool.
+      const closeProviders = () =>
+        (providerClosing ??= closeMioResources(
+          () => prompts?.close(),
+          () => (ownedProviders ? ownedProviders.close() : store.close()),
+        ));
       try {
+        const acquired =
+          (providers =
+          ownedProviders =
+            createProviderService(
+              store,
+              providerConfig,
+              undefined,
+              Boolean(generationConfig?.videoEnabled && assetConfig && computeConfig),
+            ));
+        prompts = createPromptRuntime({
+          callModel: callPromptModel,
+          recordVerification: (ownerId, snapshot, evidence) =>
+            acquired.recordVerification({ userId: ownerId }, snapshot, evidence),
+        });
         if (computeConfig && assetResources) {
           audio = createAudioJobService(
-            ownedProviders.audioStore,
-            ownedProviders,
+            acquired.audioStore,
+            acquired,
             assetResources.objects,
             createAudioMediaClient(computeConfig),
             assetResources.store,
@@ -556,6 +576,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           () => () =>
             closeWithVideo(
               [
+                () => prompts!.close(),
                 closeCreationLogs,
                 () => notifications?.close(),
                 () => admin?.close(),
@@ -564,33 +585,41 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
-              () => ownedProviders.close(),
+              closeProviders,
             ),
         );
+        // Cordis waits for service dependents before running this fiber's effects.
+        // Stop admission at retirement, while admitted observations still own their provider pool.
+        const ownedPrompts = prompts;
+        ctx.on('internal/status', (fiber, previous) => {
+          // Cordis 4.1 ACTIVE is 2; its const enum has no JavaScript export.
+          if (fiber === ctx.fiber && previous === 2) void ownedPrompts.close();
+        });
+        ctx.provide('mioPromptRuntime', prompts);
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/providers/onelink',
-            handler: createProviderHandler(ownedProviders, auth.identity, authConfig.origins),
+            handler: createProviderHandler(acquired, auth.identity, authConfig.origins),
           }),
         );
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/audio',
-            handler: createAudioHandler(
-              ownedProviders,
-              auth.identity,
-              authConfig.origins,
-              ownedAudio,
-            ),
+            handler: createAudioHandler(acquired, auth.identity, authConfig.origins, ownedAudio),
           }),
         );
       } catch (error) {
-        await closeMioResources(
-          () => audio?.close(),
-          () => ownedProviders.close(),
-        );
+        try {
+          await closeMioResources(
+            () => prompts?.close(),
+            () => audio?.close(),
+            closeProviders,
+          );
+        } catch (failure) {
+          throw new AggregateError([error, failure], 'Provider startup cleanup failed');
+        }
         throw error;
       }
     }

@@ -1,3 +1,4 @@
+import { recordGenerationCreationLog } from '../creation-log.ts';
 import type { Pool, PoolClient } from 'pg';
 import { createId } from '@mio/foundation/identifiers';
 import { GenerationError } from '../errors.ts';
@@ -30,7 +31,7 @@ const queryRetryCodes = new Set<string>(VIDEO_QUERY_RETRY_CODES);
 const executionSelection = `SELECT j.id,j.owner_id,j.error_code,j.command,j.admitted,j.route_snapshot,
   e.phase,e.claim_id,e.snapshot,e.upstream_task_id,e.query_attempt,e.async_max_queries,
   e.async_deadline,e.checkpoint FROM mio_video_jobs j`;
-const runnable = `e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
+const runnable = `NOT EXISTS(SELECT 1 FROM mio_video_jobs closed_job JOIN mio_closed_accounts c ON c.user_id=closed_job.owner_id WHERE closed_job.id=e.job_id) AND e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
   AND (e.next_query_at IS NULL OR e.next_query_at<=statement_timestamp()
     OR (e.phase='waiting' AND (e.async_deadline<=statement_timestamp()
       OR e.query_attempt>=e.async_max_queries)))`;
@@ -59,6 +60,13 @@ export class VideoExecutionStore {
     this.capacity = capacity;
   }
 
+  async accountClosed(owner: string): Promise<boolean> {
+    return Boolean(
+      (await this.pool.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner]))
+        .rowCount,
+    );
+  }
+
   async startExecutor(onLost: () => void): Promise<void> {
     const client = await this.pool.connect();
     const executor = {
@@ -85,7 +93,7 @@ export class VideoExecutionStore {
         next_query_at=CASE WHEN phase='querying'
           THEN GREATEST(next_query_at,clock_timestamp())+$1*interval '1 millisecond'
           ELSE next_query_at END,updated_at=now()
-        WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`,
+        WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying') AND NOT EXISTS(SELECT 1 FROM mio_video_jobs j JOIN mio_closed_accounts c ON c.user_id=j.owner_id WHERE j.id=mio_video_executions.job_id)`,
         [VIDEO_EXECUTOR_QUERY_INTERVAL_MS],
       );
       this.executor = executor;
@@ -428,7 +436,11 @@ export class VideoExecutionStore {
       values: [row.id, row.claim_id, state, code],
       query_timeout: CLAIM_SETTLEMENT_TIMEOUT_MS,
     };
-    await this.pool.query(settlement);
+    await transaction(this.pool, async (client) => {
+      const changed = await client.query(settlement);
+      if (changed.rowCount)
+        await recordGenerationCreationLog(client.query.bind(client), 'video', row.id, state, code);
+    });
   }
 
   async terminal(
@@ -451,6 +463,7 @@ export class VideoExecutionStore {
           completed_at=now(),updated_at=now() WHERE id=$1`,
           [row.id, state, code],
         );
+        await recordGenerationCreationLog(client.query.bind(client), 'video', row.id, state, code);
         return true;
       },
       signal,

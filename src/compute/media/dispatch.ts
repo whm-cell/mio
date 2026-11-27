@@ -71,6 +71,7 @@ export function mediaDispatch(
           const item = await store.claim(lane.name);
           if (!item) break;
           try {
+            if (await store.commandClosed(item.command.jobId)) continue;
             await instance.publishMedia(item.command);
             await store.sent(item.command, item.lease);
             lane.retryAt = 0;

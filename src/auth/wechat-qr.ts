@@ -1,7 +1,13 @@
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import type { BetterAuthPlugin } from 'better-auth';
-import { APIError, createAuthEndpoint, getSession, signInSocial } from 'better-auth/api';
+import {
+  APIError,
+  addOAuthServerContext,
+  createAuthEndpoint,
+  getSession,
+  signInSocial,
+} from 'better-auth/api';
 import { randomBytes } from 'node:crypto';
 import type { Pool } from 'pg';
 import { isUserDisabled } from './account.ts';
@@ -13,6 +19,7 @@ import {
   wechatQRSchema,
 } from './wechat-qr-store.ts';
 import { wechatUnavailable } from './wechat.ts';
+import { readWechatPendingCookie } from './wechat-pending.ts';
 
 function fail(code: 'NOT_FOUND' | 'STATE_MISMATCH' | 'UNAUTHORIZED' | 'INVALID_INPUT'): never {
   throw new APIError(
@@ -45,6 +52,9 @@ export function wechatQRPlugin(baseURL: string, pool: Pool): BetterAuthPlugin {
         const cookieValue = randomBytes(32).toString('hex');
         try {
           const id = await reserveWechatQR(pool, sha256Utf8(cookieValue));
+          const started = (await pool.query<{ now: Date }>('SELECT clock_timestamp() AS now'))
+            .rows[0]!.now;
+          await addOAuthServerContext({ mioWechatStartedAt: started.toISOString() });
           const { headers, response } = await signInSocial()({
             context: ctx.context,
             headers: ctx.headers ?? new Headers(),
@@ -82,17 +92,23 @@ export function wechatQRPlugin(baseURL: string, pool: Pool): BetterAuthPlugin {
           if (!isUuidV4(id)) return fail('NOT_FOUND');
           const cookie = ctx.context.createAuthCookie('wechat_qr');
           const cookieValue = ctx.getCookie(cookie.name);
-          const result = await pollWechatQR(pool, id, sha256Utf8(cookieValue ?? ''), async () => {
-            const identity = await getSession()({
-              context: ctx.context,
-              headers: ctx.headers ?? new Headers(),
-              query: { disableCookieCache: true, disableRefresh: true },
-              asResponse: false,
-            });
-            return identity && !isUserDisabled(identity.user)
-              ? { userId: identity.user.id, sessionId: identity.session.id }
-              : undefined;
-          }).catch(wechatUnavailable);
+          const result = await pollWechatQR(
+            pool,
+            id,
+            sha256Utf8(cookieValue ?? ''),
+            async () => {
+              const identity = await getSession()({
+                context: ctx.context,
+                headers: ctx.headers ?? new Headers(),
+                query: { disableCookieCache: true, disableRefresh: true },
+                asResponse: false,
+              });
+              return identity && !isUserDisabled(identity.user)
+                ? { userId: identity.user.id, sessionId: identity.session.id }
+                : undefined;
+            },
+            sha256Utf8(readWechatPendingCookie(ctx) ?? ''),
+          ).catch(wechatUnavailable);
           if ('error' in result) return fail(result.error);
           return ctx.json(result);
         },

@@ -163,3 +163,11 @@ voiceRef 是本人配置下的稳定 UUID。上游同 ID 的不同来源仍是�
 materializing 中明确的 400 AUDIO_OUTPUT_INVALID、409 AUDIO_OUTPUT_MISMATCH 或 409 AUDIO_VOICE_CONFLICT 结束为 failed，保留原错误、上游确认事实及固定输出身份，清除 PG 内输出字节或临时地址。其他错误不按全部 400/409 一概终结；暂时性 503、提交结果未知及检查点丢确认仍沿原恢复边界。failed 不再占用任务并发名额，也不触发再次生成。清理 PG 输出不撤销供应商副作用，不删除已登记的音色或对象。
 
 输入错误包括AUDIO_TEXT_INVALID、AUDIO_PARAMETERS_INVALID、AUDIO_FORMAT_INVALID、AUDIO_SAMPLE_INVALID、AUDIO_SAMPLE_FORMAT_INVALID、AUDIO_SAMPLE_DURATION_INVALID、AUDIO_SAMPLE_AUTHORIZATION_REQUIRED。样本变化为409 AUDIO_SAMPLE_CHANGED。供应商拒绝为AUDIO_UPSTREAM_REJECTED，提交不确定为AUDIO_SUBMIT_UNKNOWN。媒体/存储错误保持脱敏与recoverable事实，未验证不发布ready。隔离测试与真实供应商验收分别报告。
+
+### 创作日志投递
+
+音频任务 ready 且作品记录发布后，在 providers 库同一结果事务登记稳定 event_id、原 occurredAt 的创作日志 outbox；确认无可恢复输出／克隆检查点的 failed 才登记失败。unknown、保存中及可恢复检查点不产生失败消息。outbox 插入失败回滚结果／作品记录，本地恢复不再次生成。
+
+插件在三类媒体及管理策略均可用时，将 outbox 注入媒体域 `receiveAudio(eventId,event)`；providers 与媒体使用独立池，跨域回调期间不持有 providers 事务或连接。每秒领取最多 20 条，以租约和 `SKIP LOCKED` 避免并发重复领取；失败至少间隔一分钟重试，保持原事件身份和时间。自原 occurredAt 满 7 天即停止投递并落 dead_lettered_at／脱敏告警；成功投递不重放。接收端在一个媒体库事务内登记回执和消息，超保留窗口或超硬性重试窗口仅记回执。回执固定保留 8 天，防止缩短后调长策略令已清理消息复活，无反向回收握手。
+
+`pnpm providers:migrate --apply` 包含 outbox 的幂等增量迁移，保留原任务与作品。启动只读检查所需表和字段；部署先迁移再启动。关闭插件先等待 outbox 当前回调，再关闭媒体消费者、策略快照及 providers 连接池。列表与已读接口见[创作日志 HTTP](notifications.md#get-apiv1notifications)。

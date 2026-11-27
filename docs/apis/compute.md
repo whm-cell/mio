@@ -4,6 +4,10 @@
 
 JobView 为 `{jobId,requestId,inputAssetId,status,attempt,resultAssetId,errorCode,createdAt,updatedAt}`；status 为 accepted、queued、running、succeeded 或 failed。`resultAssetId` 在成功前为 null，成功后可用本人[资产查询](assets.md)获取短期下载地址；errorCode 可为空，unknown 表示仍需对账而非终态。时长由 Worker 对实际媒体核验，最多 30 分钟。
 
+账号注销后，A 凭媒体域持久关闭栅栏拒绝旧号受理与结果发布。A 保留旧 job／attempt／command 身份供离线 B 迟到回传对账；通过原协议严格校验确切 COS 输出、manifest 摘要及成员键后交共享精确键 GC，不写作品／日志、不重新向上游提交。B 不访问注销库，不新增 B 本地文件清理命令或 GC 回执；离线 B 不阻塞 24 小时在线清理完成。见[永久注销](../auth.md#永久注销与清理)。
+
+注销清理图片恢复目录前，先将确切尝试键交共享 GC，再在原执行记录持久保存交接键。目录已删但任务元数据尚未删除时，重试沿该记录续接；没有交接记录且原检查点定位丢失时仍保持待处理，不把缺失当作清理成功。
+
 ## POST /api/v1/compute/jobs
 
 身份：当前登录用户。

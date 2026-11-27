@@ -1,3 +1,4 @@
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
@@ -18,7 +19,10 @@ async function authFixture(migrate = true) {
     MIO_AUTH_DATABASE_URL: database.url,
   })!;
   try {
-    if (migrate) await (await getMigrations(authOptions(config, pool))).runMigrations();
+    if (migrate) {
+      await (await getMigrations(authOptions(config, pool))).runMigrations();
+      await pool.query(authDeletionGuardsSQL);
+    }
     return {
       database,
       pool,

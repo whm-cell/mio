@@ -15,6 +15,8 @@ import {
   activatePhoneChallenge,
   bindPhoneWithoutChallenge,
   consumePhoneChallenge,
+  consumePhoneLoginChallenge,
+  validateNewPhoneSession,
   reservePhoneChallenge,
 } from './phone-store.ts';
 import type { BindingIdentity } from './phone-store.ts';
@@ -56,9 +58,12 @@ const schema = {
     fields: {
       challengeKey: { type: 'string', unique: true, sortable: true },
       codeHash: { type: 'string' },
+      phoneDigest: { type: 'string', required: false, index: true },
+      subjectUserId: { type: 'string', required: false, index: true },
       purpose: { type: 'string' },
       userId: { type: 'string', required: false },
       sessionId: { type: 'string', required: false },
+      originalPhone: { type: 'string', required: false },
       status: { type: 'string' },
       attempts: { type: 'number' },
       expiresAt: { type: 'date', index: true },
@@ -172,6 +177,7 @@ export function phonePlugin(
       purpose === 'login' ? '/phone-number/verify' : '/phone-binding/confirm',
       { method: 'POST' },
       async (ctx) => {
+        let loginProof: { userId: string | null } | undefined;
         const { phone, code } = parsePhoneInput(ctx.body, true);
         const policy = readPolicy();
         if (policy.smsMode === 'disabled') return failure('SMS_UNAVAILABLE');
@@ -203,22 +209,29 @@ export function phonePlugin(
               return failure('SESSION_REQUIRED');
             binding = { userId: session.user.id, sessionId: session.session.id };
           }
-          const consumed = await consumePhoneChallenge(
-            pool,
-            config.secret,
-            purpose,
-            phone,
-            code,
-            binding,
-          );
-          if (consumed !== 'ok')
-            return failure(
-              consumed === 'conflict'
-                ? 'PHONE_CONFLICT'
-                : consumed === 'session'
-                  ? 'SESSION_REQUIRED'
-                  : 'INVALID_OTP',
+          if (purpose === 'login') {
+            const verified = await consumePhoneLoginChallenge(pool, config.secret, phone, code);
+            if (verified.status === 'disabled') return failure('ACCOUNT_DISABLED');
+            if (verified.status !== 'ok') return failure('INVALID_OTP');
+            loginProof = { userId: verified.userId };
+          } else {
+            const consumed = await consumePhoneChallenge(
+              pool,
+              config.secret,
+              purpose,
+              phone,
+              code,
+              binding!,
             );
+            if (consumed !== 'ok')
+              return failure(
+                consumed === 'conflict'
+                  ? 'PHONE_CONFLICT'
+                  : consumed === 'session'
+                    ? 'SESSION_REQUIRED'
+                    : 'INVALID_OTP',
+              );
+          }
           if (binding) return ctx.json({ status: true });
         }
         let user = await ctx.context.adapter.findOne<{
@@ -229,8 +242,20 @@ export function phonePlugin(
           createdAt: Date;
           updatedAt: Date;
           phoneNumberVerified?: boolean | null;
+          phoneNumber?: string | null;
           disabled?: boolean | null;
-        }>({ model: 'user', where: [{ field: 'phoneNumber', value: phone }] });
+        }>(
+          loginProof?.userId
+            ? { model: 'user', where: [{ field: 'id', value: loginProof.userId }] }
+            : { model: 'user', where: [{ field: 'phoneNumber', value: phone }] },
+        );
+        if (
+          loginProof &&
+          (loginProof.userId
+            ? !user || user.id !== loginProof.userId || user.phoneNumber !== phone
+            : Boolean(user))
+        )
+          return failure('INVALID_OTP');
         if (user && !user.phoneNumberVerified) return failure('INVALID_OTP');
         if (user && user.disabled) return failure('ACCOUNT_DISABLED');
         if (!user)
@@ -246,6 +271,10 @@ export function phonePlugin(
           );
         const session = await ctx.context.internalAdapter.createSession(user.id);
         if (!session) return failure('SMS_UNAVAILABLE');
+        if (
+          !(await validateNewPhoneSession(pool, { userId: user.id, sessionId: session.id }, phone))
+        )
+          return failure('INVALID_OTP');
         await setSessionCookie(ctx, { session, user });
         return ctx.json({ status: true });
       },

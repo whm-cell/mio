@@ -5,6 +5,19 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
+
+export async function authTableIndexes(pool: Pool, schema: string, table: string) {
+  const { rows } = await pool.query<{ indexdef: string }>(
+    'SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2',
+    [schema, table],
+  );
+  return {
+    unique: (column: string) =>
+      rows.some(({ indexdef }) => indexdef.includes(column) && indexdef.includes('UNIQUE')),
+    has: (column: string) => rows.some(({ indexdef }) => indexdef.includes(column)),
+  };
+}
 
 /** Dedicated test DB only. Each run owns one schema; local mode owns and removes the entire cluster. */
 export async function authDatabase() {
@@ -93,6 +106,12 @@ export async function authDatabase() {
     const scoped = new URL(url);
     scoped.searchParams.set('options', `-csearch_path=${schema}`);
     scoped.searchParams.set('application_name', schema);
+    const setup = new Pool({ connectionString: scoped.toString() });
+    try {
+      await setup.query(accountDeletionSchemaSQL);
+    } finally {
+      await setup.end();
+    }
     const observer = new URL(scoped);
     observer.searchParams.set('application_name', `${schema}_observer`);
     return {

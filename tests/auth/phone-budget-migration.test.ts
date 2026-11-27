@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 import { randomBytes } from 'node:crypto';
 import { getMigrations } from 'better-auth/db/migration';
 import { Pool } from 'pg';
@@ -58,6 +59,7 @@ function migrate(args: string[] = [], databaseURL = database.url) {
 async function legacySchema() {
   // These are the original Better Auth tables, before the dedicated SMS event migration.
   await (await getMigrations(authOptions(config(), pool))).runMigrations();
+  await pool.query(authDeletionGuardsSQL);
 }
 
 function request(path: string, body: unknown) {

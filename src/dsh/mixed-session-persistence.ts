@@ -19,6 +19,7 @@ import type {
 import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl';
 import z from '@deepseek-ai/schemastery';
 import { resolve } from 'node:path';
+import { purgeNativeSession } from './account-deletion.ts';
 
 interface Config {
   legacyRoot: string;
@@ -31,14 +32,25 @@ export const Config = z.object({
   compressedRoot: z.string().required(),
 });
 
-class MixedSessionPersistence extends SessionPersistence {
+export class MixedSessionPersistence extends SessionPersistence {
   private readonly legacy: SessionPersistence;
   private readonly compressed: SessionPersistence;
+  private readonly roots: readonly string[];
 
-  constructor(ctx: Context, legacy: SessionPersistence, compressed: SessionPersistence) {
+  constructor(
+    ctx: Context,
+    legacy: SessionPersistence,
+    compressed: SessionPersistence,
+    roots: readonly string[],
+  ) {
     super(ctx);
     this.legacy = legacy;
     this.compressed = compressed;
+    this.roots = roots;
+  }
+
+  purgeMioSession(id: string, signal: AbortSignal) {
+    return purgeNativeSession(this.roots, id, signal);
   }
 
   async create(header: SessionHeader, options?: SessionPersistenceCreateOptions) {
@@ -145,7 +157,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const compressedBackend = compressed.ctx.get('sessionPersistence');
         if (!legacyBackend || !compressedBackend)
           throw new Error('Mio session persistence providers are unavailable');
-        new MixedSessionPersistence(serviceCtx, legacyBackend, compressedBackend);
+        new MixedSessionPersistence(serviceCtx, legacyBackend, compressedBackend, [
+          config.legacyRoot,
+          config.compressedRoot,
+        ]);
       },
     });
     yield service.dispose;

@@ -2,6 +2,7 @@ import { afterAll } from 'vitest';
 
 const keys = [
   'MIO_PROVIDERS_DATABASE_URL',
+  'MIO_NOTIFICATIONS_DATABASE_URL',
   'MIO_PROVIDERS_MASTER_KEY',
   'MIO_PROVIDERS_MASTER_KEY_ID',
   'MIO_PROVIDERS_CATALOG_WHITELIST',
@@ -13,7 +14,7 @@ const keys = [
 export const inheritedProviderVariableCount = keys.filter(
   (key) => process.env[key] !== undefined,
 ).length;
-/** Ordinary suites must not activate a provider domain from the host's deployment configuration. */
+/** Ordinary suites must not activate provider or notification domains from the host's deployment configuration. */
 export function isolateProviderEnvironment(env: NodeJS.ProcessEnv) {
   const previous = keys.map((key) => [key, env[key]] as const);
   for (const key of keys) delete env[key];

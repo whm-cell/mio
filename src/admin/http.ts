@@ -5,6 +5,9 @@ import { startHttpResponse, writeApiError } from '../http-response.ts';
 import { AdminError } from './contracts.ts';
 import type { AdminPrincipal } from './contracts.ts';
 import type { AdminService } from './service.ts';
+import { announcementMethods, handleAnnouncementRequest } from './announcements.ts';
+import { NotificationError } from '../notifications/contracts.ts';
+import type { NotificationService } from '../notifications/service.ts';
 
 const ADMIN_BASE = '/api/v1/admin';
 const COOKIE_NAME = 'mio.admin_session';
@@ -142,6 +145,8 @@ const KNOWN_ROUTES: Record<string, readonly string[]> = {
   '/revisions': ['GET'],
   '/monitoring': ['GET'],
   '/settings/global': ['GET', 'PATCH'],
+  '/settings/creation-logs': ['GET', 'PATCH'],
+  '/settings/storage': ['GET', 'PATCH'],
 };
 
 interface RouteContext {
@@ -364,6 +369,31 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
     );
   },
 
+  'GET /settings/creation-logs': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getCreationLogSettings());
+  },
+  'PATCH /settings/creation-logs': async ({ response, service, readAuthJson }) => {
+    const { principal, body } = await readAuthJson(['expectedRevision', 'retentionDays']);
+    sendJson(response, HTTP_STATUS.OK, await service.updateCreationLogSettings(principal, body));
+  },
+
+  'GET /settings/storage': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getStorageSettings());
+  },
+  'PATCH /settings/storage': async ({ response, url, service, readAuthJson }) => {
+    assertAllowedQuery(url, []);
+    const { principal, body } = await readAuthJson([
+      'expectedRevision',
+      'quotaBytes',
+      'warningAvailableBytes',
+    ]);
+    sendJson(response, HTTP_STATUS.OK, await service.updateStorageSettings(principal, body));
+  },
+
   'GET /settings/global': async ({ response, url, service, requireAdmin }) => {
     assertAllowedQuery(url, []);
     await requireAdmin();
@@ -380,6 +410,7 @@ export function createAdminHandler(
   service: AdminService,
   allowedOrigins: readonly string[],
   computeHandler?: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
+  notifications?: NotificationService,
 ) {
   const origins = new Set(allowedOrigins);
 
@@ -468,7 +499,8 @@ export function createAdminHandler(
       fail(HTTP_STATUS.SERVICE_UNAVAILABLE, 'COMPUTE_OPS_UNAVAILABLE');
       return;
     }
-    const methods = subPath ? KNOWN_ROUTES[subPath] : undefined;
+    const notificationMethods = subPath ? announcementMethods(subPath) : undefined;
+    const methods = notificationMethods ?? (subPath ? KNOWN_ROUTES[subPath] : undefined);
     if (!methods) {
       fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
       return;
@@ -514,6 +546,19 @@ export function createAdminHandler(
     };
 
     try {
+      if (notificationMethods) {
+        sendJson(
+          response,
+          method === 'POST' && subPath === '/announcements' ? HTTP_STATUS.CREATED : HTTP_STATUS.OK,
+          await handleAnnouncementRequest(notifications, {
+            url,
+            method,
+            requireAdmin,
+            readAuthJson,
+          }),
+        );
+        return;
+      }
       const routeHandler = ROUTE_HANDLERS[`${method} ${subPath}`];
       if (!routeHandler) {
         fail(HTTP_STATUS.NOT_FOUND, 'NOT_FOUND');
@@ -530,7 +575,11 @@ export function createAdminHandler(
       });
     } catch (error) {
       if (response.writableEnded) return;
-      if (error instanceof RequestBodyError || error instanceof AdminError) {
+      if (
+        error instanceof RequestBodyError ||
+        error instanceof AdminError ||
+        error instanceof NotificationError
+      ) {
         fail(error.status, error.code);
         return;
       }

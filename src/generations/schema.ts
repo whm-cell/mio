@@ -1,7 +1,10 @@
+import { creationLogSchemaSQL, checkCreationLogSchema } from '../notifications/creation-schema.ts';
 import type { Pool } from 'pg';
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 
 /** The media database is retained; this migration never rebuilds jobs or assets. */
-export const generationSchemaSQL = `
+export const generationSchemaSQL = `${creationLogSchemaSQL}
+
 ALTER TABLE mio_assets ALTER COLUMN staging_key DROP NOT NULL;
 ALTER TABLE mio_assets ADD COLUMN IF NOT EXISTS asset_kind text NOT NULL DEFAULT 'original'
   CHECK (asset_kind IN ('original','derived'));
@@ -105,9 +108,18 @@ CREATE TABLE IF NOT EXISTS mio_video_outputs (
   has_audio boolean,
   PRIMARY KEY(job_id,output_index),
   CHECK (phase <> 'registered' OR asset_id IS NOT NULL)
-);`;
+);
+${accountClosureSchemaSQL([
+  ['mio_image_jobs', 'owner_id'],
+  ['mio_image_executions', 'mio_image_jobs', 'job_id'],
+  ['mio_image_outputs', 'mio_image_jobs', 'job_id'],
+  ['mio_video_jobs', 'owner_id'],
+  ['mio_video_executions', 'mio_video_jobs', 'job_id'],
+  ['mio_video_outputs', 'mio_video_jobs', 'job_id'],
+])}`;
 
 export async function checkGenerationSchema(database: Pick<Pool, 'query'>): Promise<void> {
+  await checkCreationLogSchema(database);
   await database.query('SELECT asset_kind FROM mio_assets LIMIT 0');
   await database.query(
     'SELECT id,owner_id,request_id,input_hash,command,admitted,error_code,state,created_at,active_recovery_id,active_recovery_seq,upstream_task_id,query_attempt,async_max_queries,async_deadline,next_query_at,route_snapshot FROM mio_image_jobs LIMIT 0',

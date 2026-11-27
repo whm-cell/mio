@@ -1,3 +1,4 @@
+import { createOwnerWork } from '../../account-deletion/owner-work.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
@@ -37,7 +38,18 @@ export async function createGenerationService(
   const stop = new AbortController();
   const active = new Set<Promise<void>>();
   const admissions = new Set<Promise<unknown>>();
-  const run = createGenerationRunner(store, files, objects, provider, stop.signal, transports);
+  const ownerWork = createOwnerWork((owner) => store.accountClosed(owner));
+  const run = (row: Parameters<ReturnType<typeof createGenerationRunner>>[0]) =>
+    ownerWork.run(row.owner_id, (signal) =>
+      createGenerationRunner(
+        store,
+        files,
+        objects,
+        provider,
+        AbortSignal.any([stop.signal, signal]),
+        transports,
+      )(row),
+    );
   const head: GenerationObjects['head'] = (key, signal) => {
     const bounded = AbortSignal.any([
       stop.signal,
@@ -58,7 +70,15 @@ export async function createGenerationService(
         if (stopping) break;
         cleanupCursor = row.id;
         try {
-          await cleanCompletedGeneration(row, store, files, head, stop.signal);
+          await ownerWork.run(row.owner_id, (signal) =>
+            cleanCompletedGeneration(
+              row,
+              store,
+              files,
+              head,
+              AbortSignal.any([stop.signal, signal]),
+            ),
+          );
         } catch {
           log.error('GENERATION_FILE_CLEANUP_PENDING');
         }
@@ -122,6 +142,7 @@ export async function createGenerationService(
   pump();
   clean();
   return {
+    drainAccount: (owner: string) => ownerWork.drain(owner),
     createImage(
       actor: { readonly userId: string; readonly sessionId?: string },
       requestId: string,

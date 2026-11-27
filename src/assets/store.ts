@@ -60,6 +60,38 @@ export class AssetStore {
     this.derivativesEnabled = derivativesEnabled;
   }
 
+  async accountClosed(owner: string): Promise<boolean> {
+    return Boolean(
+      (await this.pool.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner]))
+        .rowCount,
+    );
+  }
+  async rememberObject(owner: string, key: string) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('mio:closed-account:'||$1,0))",
+        [owner],
+      );
+      if (
+        (await client.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner])).rowCount
+      )
+        throw new Error('ACCOUNT_DELETED');
+      await client.query(
+        `INSERT INTO mio_asset_gc_objects(object_key,owner_id,state) VALUES($1,$2,'held')
+        ON CONFLICT(object_key) DO NOTHING`,
+        [key, owner],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async create(id: string, owner: string, filename: string, contentType: string, size: number) {
     return (
       await this.pool.query<AssetRow>(
@@ -138,6 +170,38 @@ export class AssetStore {
         input.sizeBytes,
         input.key,
         input.etag,
+      ],
+    );
+    if (!result.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
+  }
+
+  /** Publish the immutable first-frame result only while the same owned original remains ready. */
+  async publishAvatar(
+    source: AssetRow,
+    output: { assetId: string; key: string; filename: string; sizeBytes: number; etag: string },
+  ): Promise<void> {
+    const result = await this.pool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at)
+       SELECT $1,s.owner_id,$3,'image/webp',$4,$2,$2,'ready',$5,now(),now() FROM mio_assets s
+       WHERE s.id=$6 AND s.owner_id=$7 AND s.state='ready' AND s.raw_key=$8
+         AND s.size_bytes=$9 AND s.content_type=$10 AND s.source_etag IS NOT DISTINCT FROM $11
+       ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id
+       WHERE mio_assets.owner_id=EXCLUDED.owner_id AND mio_assets.state='ready'
+         AND mio_assets.raw_key=EXCLUDED.raw_key AND mio_assets.source_etag=EXCLUDED.source_etag
+         AND mio_assets.size_bytes=EXCLUDED.size_bytes AND mio_assets.content_type=EXCLUDED.content_type
+         AND mio_assets.filename=EXCLUDED.filename`,
+      [
+        output.assetId,
+        output.key,
+        output.filename,
+        output.sizeBytes,
+        output.etag,
+        source.id,
+        source.owner_id,
+        source.raw_key,
+        source.size_bytes,
+        source.content_type,
+        source.source_etag,
       ],
     );
     if (!result.rowCount) throw new AssetError(HTTP_STATUS.CONFLICT, 'ASSET_SOURCE_CHANGED');
@@ -256,17 +320,22 @@ export class AssetStore {
   async expiredStaging(after?: {
     expires_at: string;
     id: string;
-  }): Promise<{ id: string; staging_key: string; expires_at: string }[]> {
+  }): Promise<{ id: string; staging_key: string; expires_at: string; owner_closed: boolean }[]> {
     return (
-      await this.pool.query<{ id: string; staging_key: string; expires_at: string }>(
+      await this.pool.query<{
+        id: string;
+        staging_key: string;
+        expires_at: string;
+        owner_closed: boolean;
+      }>(
         `WITH selected AS (
-           SELECT id,staging_key,expires_at,state FROM mio_assets
+           SELECT id,owner_id,staging_key,expires_at,state FROM mio_assets
            WHERE expires_at<=now() AND staging_deleted_at IS NULL AND staging_key IS NOT NULL
            AND (state<>'finalizing' OR lease_until<=now())
            AND ($1::timestamptz IS NULL OR (expires_at,id)>($1::timestamptz,$2::uuid))
            ORDER BY expires_at,id LIMIT 100
          ), locked AS (
-           SELECT id,staging_key,expires_at FROM mio_assets
+           SELECT id,owner_id,staging_key,expires_at FROM mio_assets
            WHERE id IN (SELECT id FROM selected WHERE state NOT IN ('ready','expired'))
            AND expires_at<=now() AND staging_deleted_at IS NULL AND staging_key IS NOT NULL
            AND (state<>'finalizing' OR lease_until<=now()) FOR UPDATE
@@ -274,9 +343,9 @@ export class AssetStore {
            UPDATE mio_assets SET state='expired'
            WHERE id IN (SELECT id FROM locked) AND state NOT IN ('ready','expired')
          )
-         SELECT id,staging_key,expires_at::text FROM locked
+         SELECT id,staging_key,expires_at::text,EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=locked.owner_id) AS owner_closed FROM locked
          UNION ALL
-         SELECT id,staging_key,expires_at::text FROM selected WHERE state IN ('ready','expired')
+         SELECT id,staging_key,expires_at::text,EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=selected.owner_id) AS owner_closed FROM selected WHERE state IN ('ready','expired')
          ORDER BY expires_at,id`,
         [after?.expires_at ?? null, after?.id ?? null],
       )

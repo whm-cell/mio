@@ -1,3 +1,4 @@
+import { createOwnerWork } from '../account-deletion/owner-work.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
@@ -62,7 +63,15 @@ export function createConversationService(
   vision?: ConversationVision,
   resolveProjectContext?: ConversationProjectContextResolver,
   audio?: ConversationAudioTools,
+  syncStorageHolders?: (owner: string, id: string, read: () => Promise<string[]>) => Promise<void>,
 ) {
+  const syncVisualHolds = async (owner: string, id: string, nativeId: string) => {
+    if (!syncStorageHolders || !engine.retainedAssetIds) return;
+    const read = engine.retainedAssetIds.bind(engine);
+    await syncStorageHolders(owner, id, () => read(nativeId)).catch(() =>
+      log.warn('CONVERSATION_STORAGE_HOLDERS_UNAVAILABLE'),
+    );
+  };
   const pending = new Map<string, Promise<void>>();
   const receiving = new Map<string, Promise<Receipt>>();
   const admissionStop = new AbortController();
@@ -84,9 +93,10 @@ export function createConversationService(
     if (closing)
       throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'CONVERSATION_UNAVAILABLE');
   };
-  const admit = <T>(work: () => Promise<T>): Promise<T> => {
+  const ownerWork = createOwnerWork((owner) => store.accountClosed(owner));
+  const admit = <T>(actor: Principal, work: () => Promise<T>): Promise<T> => {
     check();
-    const job = work();
+    const job = ownerWork.run(actor.userId, () => work());
     admissions.add(job);
     void job.then(
       () => admissions.delete(job),
@@ -110,7 +120,7 @@ export function createConversationService(
   ) => {
     const ownerKey = `${actor.userId}:${id}:${requestId}`;
     const earlier = receiving.get(ownerKey);
-    const job = admit(async () => {
+    const job = admit(actor, async () => {
       if (earlier) await earlier.catch(() => {});
       return work();
     });
@@ -222,6 +232,8 @@ export function createConversationService(
           ),
         );
       } catch {
+        // Account closure is an expected terminal outcome, not a loss of the whole metadata store.
+        if (await store.accountClosed(actor.userId).catch(() => false)) return;
         if (!executionEnded) await engine.cancel(dshSessionId, requestId).catch(() => {});
         await settleActivity?.();
         try {
@@ -231,6 +243,7 @@ export function createConversationService(
           publish(id, { type: 'error', code: 'CONVERSATION_UNAVAILABLE' });
         }
       } finally {
+        await syncVisualHolds(actor.userId, id, dshSessionId);
         cancellations.delete(key);
       }
     })();
@@ -245,7 +258,7 @@ export function createConversationService(
     revision: number,
     requestId?: string,
   ) =>
-    admit(async () => {
+    admit(actor, async () => {
       const selection = await store.selectAudioVoice(
         actor,
         id,
@@ -269,7 +282,7 @@ export function createConversationService(
       purpose: ConversationPurpose = 'general',
       reasoningEffort?: ChatReasoningEffort,
     ): Promise<Conversation> {
-      return admit(async () => {
+      return admit(actor, async () => {
         if (purpose === 'audio' && (!providers || !audio))
           throw new ConversationError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'AUDIO_UNAVAILABLE');
         if (!providers) {
@@ -292,7 +305,7 @@ export function createConversationService(
       });
     },
     fork(actor: Principal, id: string, requestId: string, turnEndSeq?: number) {
-      return admit(async () => {
+      return admit(actor, async () => {
         const reservation = await store.reserveFork(
           actor,
           id,
@@ -327,7 +340,7 @@ export function createConversationService(
       });
     },
     selectModel(actor: Principal, id: string, modelRef: string) {
-      return admit(async () => {
+      return admit(actor, async () => {
         if (!providers) {
           const row = await store.owned(actor, id);
           if (row.archived_at)
@@ -365,14 +378,67 @@ export function createConversationService(
         : store.list(actor, after, limit);
     },
     rename: (actor: Principal, id: string, title: string) =>
-      admit(() => store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title))),
-    archive: (actor: Principal, id: string) => admit(() => store.archive(actor, id)),
+      admit(actor, () =>
+        store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title)),
+      ),
+    async cancelDeletedAccount(owner: string, finalizedAt: Date) {
+      await store.closeDeletedAccount(owner, finalizedAt);
+      const rows = await store.deletionRows(owner, true);
+      for (const row of rows)
+        if (row.active_request) {
+          cancellations.add(row.id + ':' + row.active_request);
+          await engine.cancel(row.dsh_session_id, row.active_request);
+        }
+      await ownerWork.drain(owner);
+      await Promise.all(
+        rows.flatMap((row) => {
+          const run = row.active_request
+            ? pending.get(row.id + ':' + row.active_request)
+            : undefined;
+          return run ? [run] : [];
+        }),
+      );
+      await store.settleDeletedTurns(
+        owner,
+        rows.map((row) => row.id),
+      );
+      const remaining = (await store.deletionRows(owner, true)).length;
+      return { done: remaining === 0, remaining };
+    },
+    async deleteAccountBatch(owner: string, signal: AbortSignal) {
+      const rows = await store.deletionRows(owner);
+      if (rows.length && !engine.purgeSession) throw new Error('LOCAL_SESSION_VOLUME_NOT_OWNED');
+      for (const row of rows) {
+        signal.throwIfAborted();
+        await engine.purgeSession!(row.dsh_session_id, signal);
+      }
+      signal.throwIfAborted();
+      return store.deleteAccountRows(
+        owner,
+        rows.map((row) => row.id),
+      );
+    },
+    storageHolders(owner: string) {
+      return ownerWork.run(owner, async () => {
+        if (!engine.retainedAssetIds) throw new Error('CONVERSATION_STORAGE_UNAVAILABLE');
+        const rows = await store.storageConversations(owner);
+        const holders = [];
+        for (const row of rows)
+          holders.push({
+            type: 'conversation',
+            id: row.id,
+            assetIds: await engine.retainedAssetIds(row.dsh_session_id),
+          });
+        return holders;
+      });
+    },
+    archive: (actor: Principal, id: string) => admit(actor, () => store.archive(actor, id)),
     request: (actor: Principal, id: string, requestId: string) => {
       check();
       return store.request(actor, id, requestId);
     },
     history(actor: Principal, id: string, after: number, limit: number, signal?: AbortSignal) {
-      return admit(async () => {
+      return admit(actor, async () => {
         const stopped = AbortSignal.any([admissionStop.signal, ...(signal ? [signal] : [])]);
         stopped.throwIfAborted();
         const row = await store.owned(actor, id);
@@ -581,6 +647,7 @@ export function createConversationService(
               text,
               async () => {
                 await store.inputPersisted(id, requestId);
+                await syncVisualHolds(actor.userId, id, nativeId);
                 publish(id, {
                   type: 'state',
                   receipt: { conversationId: id, requestId, status: 'input-persisted' },

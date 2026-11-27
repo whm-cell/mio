@@ -1,3 +1,4 @@
+import { createAudioCreationOutbox, enqueueAudioCreationLog } from './creation-outbox.ts';
 import { createId } from '@mio/foundation/identifiers';
 import { AudioError } from '../contracts.ts';
 import type {
@@ -119,6 +120,12 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
     ).rows[0];
 
   return {
+    async accountClosed(owner: string) {
+      return Boolean(
+        (await query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner])).rowCount,
+      );
+    },
+    creationOutbox: createAudioCreationOutbox(query),
     owned,
     request,
     create(
@@ -225,11 +232,11 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
         await q(
           `UPDATE mio_audio_jobs SET status='unknown',error_code='AUDIO_SUBMIT_UNKNOWN',
            lease_id=NULL,lease_until=NULL,updated_at=now()
-           WHERE status='submitted' AND (lease_until IS NULL OR lease_until<=now())`,
+           WHERE status='submitted' AND (lease_until IS NULL OR lease_until<=now()) AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id)`,
         );
         const active = await q(
           `SELECT id FROM mio_audio_jobs WHERE status IN ('queued','submitted','materializing')
-           AND lease_until>now() LIMIT 2`,
+           AND lease_until>now() AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id) LIMIT 2`,
         );
         if (active.rows.length >= 2) return;
         return (
@@ -238,7 +245,7 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
              updated_at=now() WHERE id=(
                SELECT id FROM mio_audio_jobs WHERE status IN ('queued','materializing')
                AND (lease_until IS NULL OR lease_until<=now())
-               AND (NOT cancel_requested OR status='materializing') AND error_code IS NULL
+               AND (NOT cancel_requested OR status='materializing') AND error_code IS NULL AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id)
                ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED
              ) RETURNING ${executionColumns}`,
             [createId()],
@@ -289,17 +296,28 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
       status: 'queued' | 'failed' | 'unknown' | 'materializing',
       code: string | null,
     ) {
-      await query(
-        `UPDATE mio_audio_jobs SET status=CASE WHEN status='materializing' AND $3='unknown'
-           THEN 'materializing' ELSE $3 END,
-         error_code=CASE WHEN status='materializing' AND $3='unknown'
-           THEN 'AUDIO_CHECKPOINT_UNAVAILABLE' ELSE $4 END,
-         output_bytes=CASE WHEN $3='failed' THEN NULL ELSE output_bytes END,
-         output_url=CASE WHEN $3='failed' THEN NULL ELSE output_url END,
-         lease_id=NULL,lease_until=NULL,updated_at=now()
-         WHERE id=$1 AND lease_id=$2 AND status NOT IN ('ready','failed','cancelled','unknown')`,
-        [job.id, job.lease_id, status, code],
-      );
+      await transaction(async (q) => {
+        const changed = await q<{ id: string }>(
+          `UPDATE mio_audio_jobs SET status=CASE WHEN status='materializing' AND $3='unknown'
+             THEN 'materializing' ELSE $3 END,
+           error_code=CASE WHEN status='materializing' AND $3='unknown'
+             THEN 'AUDIO_CHECKPOINT_UNAVAILABLE' ELSE $4 END,
+           output_bytes=CASE WHEN $3='failed' THEN NULL ELSE output_bytes END,
+            output_url=CASE WHEN $3='failed' THEN NULL ELSE output_url END,
+            lease_id=NULL,lease_until=NULL,updated_at=now()
+           WHERE id=$1 AND lease_id=$2 AND status NOT IN ('ready','failed','cancelled','unknown')
+           RETURNING id`,
+          [job.id, job.lease_id, status, code],
+        );
+        if (changed.rowCount && status === 'failed') {
+          const definitive = await q(
+            `SELECT id FROM mio_audio_jobs WHERE id=$1 AND status='failed'
+             AND output_bytes IS NULL AND output_url IS NULL AND upstream_voice_id IS NULL`,
+            [job.id],
+          );
+          if (definitive.rowCount) await enqueueAudioCreationLog(q, job.id, 'failed');
+        }
+      });
     },
     async recover(owner: string, id: string) {
       const job = await owned(owner, id);
@@ -434,4 +452,5 @@ async function publish(q: AudioQuery, job: AudioJobRow, inspection: AudioInspect
      WHERE id=$1 AND lease_id=$2`,
     [job.id, job.lease_id, record.id, voiceRef, JSON.stringify(inspection)],
   );
+  await enqueueAudioCreationLog(q, job.id, 'completed');
 }

@@ -36,6 +36,7 @@ const smsSettings = {
   MIO_AUTH_SMS_IP_HOUR_LIMIT: '19',
   MIO_AUTH_SMS_IP_DAY_LIMIT: '90',
   MIO_AUTH_SMS_GLOBAL_DAY_LIMIT: '900',
+  MIO_AUTH_SMS_ACCOUNT_OPS_DAY_LIMIT: '90',
 };
 const wechatSettings = {
   MIO_AUTH_WECHAT_APP_ID: 'fixture-app',

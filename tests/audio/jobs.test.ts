@@ -198,6 +198,7 @@ async function fixture() {
       storage,
       { inspect, close: async () => {} },
       {
+        rememberObject: (owner, key) => assets.rememberObject(owner, key),
         owned: (id, owner) => assets.owned(id, owner),
         checkAudioPublicationIdentity: (input) => assets.checkAudioPublicationIdentity(input),
         publishAudio,
@@ -257,6 +258,14 @@ async function fixture() {
     otherModelRef,
     voiceRef,
     body,
+    cloneBody: (sampleAssetId: string) => ({
+      requestId: randomUUID(),
+      modelRef,
+      sampleAssetId,
+      name: '我的音色',
+      auditionText: '这是试听。',
+      sampleAuthorization: true,
+    }),
     settled,
     sample,
     async restart() {
@@ -302,6 +311,23 @@ it('accepts short and 10000-codepoint text, freezes parameters, publishes separa
   const f = await fixture();
   const { job } = await f.jobs.create(f.actor, { ...f.body, text: '字'.repeat(10000) });
   const ready = await f.settled(job.jobId, 'ready');
+  expect(
+    (
+      await pool.query('SELECT event_kind,payload FROM mio_audio_creation_outbox WHERE job_id=$1', [
+        job.jobId,
+      ])
+    ).rows,
+  ).toMatchObject([
+    {
+      event_kind: 'completed',
+      payload: {
+        ownerId: f.actor.userId,
+        mediaType: 'audio',
+        jobId: job.jobId,
+        eventKind: 'completed',
+      },
+    },
+  ]);
   expect(ready.parameters).toEqual(parameters);
   expect(ready.outputs[0]?.durationMs).toBe(1500);
   expect(new Set([ready.jobId, ready.recordId, ready.assetIds[0]]).size).toBe(3);
@@ -359,6 +385,10 @@ it('recovers upload and publication failure using the saved output without anoth
   await vi.waitFor(async () =>
     expect((await f.jobs.get(f.actor, job.jobId)).recoverable).toBe(true),
   );
+  expect(
+    (await pool.query('SELECT * FROM mio_audio_creation_outbox WHERE job_id=$1', [job.jobId]))
+      .rowCount,
+  ).toBe(0);
   f.failUpload(false);
   f.failPublish(true);
   await f.jobs.recover(f.actor, job.jobId);
@@ -807,6 +837,10 @@ it('preserves unknown upstream result and never re-POSTs it', async () => {
   f.submit.mockRejectedValueOnce(new Error('CONNECTION_LOST'));
   const { job } = await f.jobs.create(f.actor, f.body);
   await f.settled(job.jobId, 'unknown');
+  expect(
+    (await pool.query('SELECT * FROM mio_audio_creation_outbox WHERE job_id=$1', [job.jobId]))
+      .rowCount,
+  ).toBe(0);
   await expect(f.jobs.recover(f.actor, job.jobId)).rejects.toMatchObject({
     code: 'AUDIO_SUBMIT_UNKNOWN',
   });
@@ -886,14 +920,7 @@ it('cancels a clone during sample inspection before any supplier POST', async ()
     await resume.promise;
     return f.inspectObject(input);
   });
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   await entered.promise;
   try {
     expect(await f.jobs.cancel(f.actor, job.jobId)).toMatchObject({
@@ -940,14 +967,7 @@ it('rejects a changed sample after a completed inspection and keeps the supplier
     await resume.promise;
     return inspected;
   });
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   await entered.promise;
   f.replaceSample(sampleAssetId);
   resume.resolve();
@@ -967,14 +987,7 @@ it('preserves a confirmed clone without an audition as terminal, without publish
       Response.json({ base_resp: { status_code: 0 } }),
     ),
   );
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   expect(await f.settled(job.jobId, 'failed')).toMatchObject({
     upstreamConfirmed: true,
     errorCode: 'AUDIO_AUDITION_MISSING',
@@ -1001,6 +1014,13 @@ it('classifies a business error in HTTP 200 as a known supplier rejection', asyn
     recordId: null,
     recoverable: false,
   });
+  expect(
+    (
+      await pool.query('SELECT event_kind FROM mio_audio_creation_outbox WHERE job_id=$1', [
+        job.jobId,
+      ])
+    ).rows,
+  ).toEqual([{ event_kind: 'failed' }]);
   expect(once).toHaveBeenCalledOnce();
   expect(f.publishAudio).not.toHaveBeenCalled();
 });
@@ -1015,14 +1035,7 @@ it('closes fresh clone admission when the exact route is disabled during asset H
     await resume.promise;
     return f.headObject(key);
   });
-  const pending = f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const pending = f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   const rejected = expect(pending).rejects.toMatchObject({ code: 'AUDIO_OPERATION_UNAVAILABLE' });
   await entered.promise;
   try {
@@ -1056,14 +1069,7 @@ it('keeps an accepted clone on the frozen route after the route closes', async (
     bytes: Buffer.from('checkpoint-audio-fixture'),
     voiceId: input.voiceId!,
   }));
-  const body = {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  };
+  const body = f.cloneBody(sampleAssetId);
   const { job } = await f.jobs.clone(f.actor, body);
   await entered.promise;
   try {

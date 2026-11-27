@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 import { audioSchemaSQL, checkAudioSchema } from '../audio/jobs/schema.ts';
 import { voiceSchemaSQL, checkVoiceSchema } from '../audio/voices/schema.ts';
@@ -486,7 +487,15 @@ CREATE INDEX IF NOT EXISTS mio_provider_model_route_revisions_lookup
   ON mio_provider_model_route_revisions (provider_type, raw_model_id, operation, created_at DESC);
 ${voiceSchemaSQL}
 ${audioSchemaSQL}
-`;
+
+${accountClosureSchemaSQL([
+  ['mio_provider_configs', 'owner_id'],
+  ['mio_provider_models', 'mio_provider_configs', 'provider_id'],
+  ['mio_provider_model_preferences', 'mio_provider_configs', 'provider_id'],
+  ['mio_provider_model_verifications', 'mio_provider_configs', 'provider_id'],
+  ['mio_provider_voice_catalogs', 'mio_provider_configs', 'provider_id'],
+  ['mio_provider_voices', 'mio_provider_configs', 'provider_id'],
+])}`;
 
 export async function checkProviderSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await checkProviderOperations(pool, [

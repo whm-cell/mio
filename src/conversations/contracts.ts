@@ -375,6 +375,7 @@ export interface ConversationEngine {
     selection?: ChatSelection,
   ): Promise<void>;
   hasRetainedImages?(id: string): Promise<boolean>;
+  retainedAssetIds?(id: string): Promise<string[]>;
   rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
   contextUsage?(id: string, signal?: AbortSignal): Promise<ContextUsage>;
@@ -397,6 +398,7 @@ export interface ConversationEngine {
     turnContext?: ConversationTurnContext,
   ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
+  purgeSession?(id: string, signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 export class ConversationError extends HttpError {}

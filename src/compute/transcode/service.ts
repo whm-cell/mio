@@ -1,3 +1,5 @@
+import { AccountResultClosed } from '../deleted-results.ts';
+import type { DeletedAttempt } from '../deleted-results.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { epochMs } from '@mio/foundation/time';
@@ -36,6 +38,11 @@ export function createComputeService(
   store: ComputeStore,
   objects: AssetObjectStore,
   config: ComputeConfig,
+  deletedResult?: (
+    attempt: DeletedAttempt,
+    result: ComputeResultV1,
+    signal: AbortSignal,
+  ) => Promise<void>,
 ) {
   const videoProbe = createVideoProbeCoordinator();
   let stopping = false;
@@ -62,6 +69,13 @@ export function createComputeService(
     AbortSignal.any([stop.signal, AbortSignal.timeout(OBJECT_TIMEOUT_MS)]);
   const receive = (result: ComputeResultV1) =>
     admit(async () => {
+      const deleted = await store.deletedAttempt(result);
+      if (deleted) {
+        if (!deletedResult) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+        await deletedResult(deleted, result, objectReadSignal());
+        return;
+      }
+      if (await store.commandClosed(result.jobId)) return;
       const resultLog = log.child({
         jobId: result.jobId,
         attemptId: result.attemptId,
@@ -86,6 +100,14 @@ export function createComputeService(
         await store.accept(result);
         resultLog.info('RESULT_COMMITTED');
       } catch (error) {
+        if (error instanceof AccountResultClosed) {
+          const attempt = await store.deletedAttempt(result);
+          if (attempt) {
+            if (!deletedResult) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+            await deletedResult(attempt, result, objectReadSignal());
+          }
+          return;
+        }
         if (error instanceof ComputeError && error.code === 'RESULT_CONFLICT') {
           resultLog.warn('RESULT_CONFLICT');
           throw Object.assign(error, { permanent: true });
@@ -151,6 +173,7 @@ export function createComputeService(
         if (!item) break;
         try {
           if (broker !== instance) throw new Error('COMPUTE_BROKER_CLOSED');
+          if (await store.commandClosed(item.command.jobId)) continue;
           await instance.publish(item.command);
           await store.sent(item.command, item.lease);
         } catch (error) {

@@ -19,6 +19,7 @@
       "src/conversations/schema.ts",
       "src/assets/config.ts",
       "src/assets/schema.ts",
+      "src/assets/storage-schema.ts",
       "src/assets/store.ts",
       "src/materials/config.ts",
       "src/materials/schema.ts",
@@ -41,10 +42,19 @@
       "src/admin/contracts.ts",
       "src/admin/schema.ts",
       "src/admin/store.ts",
+      "src/notifications/config.ts",
+      "src/notifications/schema.ts",
+      "src/notifications/creation-schema.ts",
       "src/integrations/cos.ts",
       "src/integrations/redis.ts",
       "src/integrations/rabbitmq-monitor.ts",
-      "src/generations/video/contracts.ts"
+      "src/generations/video/contracts.ts",
+      "src/account-deletion/schema.ts",
+      "src/account-deletion/domain-schema.ts",
+      "src/assets/gc-schema.ts",
+      "src/auth/deletion.ts",
+      "src/auth/deletion-schema.ts",
+      "src/account-deletion/store.ts"
     ]
   },
   "documentRoots": [

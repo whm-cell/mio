@@ -160,6 +160,75 @@ export class ConversationStore {
     )
       throw new ConversationError(HTTP_STATUS.CONFLICT, 'CONVERSATION_BUSY');
   }
+  async accountClosed(owner: string) {
+    this.assertActive();
+    return Boolean(
+      (await this.pool.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner]))
+        .rowCount,
+    );
+  }
+  async closeDeletedAccount(owner: string, finalizedAt: Date) {
+    await this.transaction(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('mio:closed-account:'||$1,0))",
+        [owner],
+      );
+      await client.query(
+        `INSERT INTO mio_closed_accounts(user_id,finalized_at) VALUES($1,$2)
+        ON CONFLICT(user_id) DO NOTHING`,
+        [owner, finalizedAt],
+      );
+    });
+  }
+  async deletionRows(owner: string, activeOnly = false) {
+    this.assertActive();
+    return (
+      await this.pool.query<Pick<ConversationRow, 'id' | 'dsh_session_id' | 'active_request'>>(
+        `SELECT id,dsh_session_id,active_request FROM mio_conversations c WHERE owner_id=$1
+       AND (NOT $2::boolean OR active_request IS NOT NULL)
+       AND ($2::boolean OR NOT EXISTS(SELECT 1 FROM mio_conversations child WHERE child.forked_from_conversation_id=c.id))
+       ORDER BY id LIMIT 25`,
+        [owner, activeOnly],
+      )
+    ).rows;
+  }
+  async settleDeletedTurns(owner: string, ids: string[]) {
+    return this.transaction(async (client) => {
+      await client.query("SELECT set_config('mio.cleanup_owner',$1,true)", [owner]);
+      await client.query(
+        'UPDATE mio_conversations SET active_request=NULL WHERE owner_id=$1 AND id=ANY($2::uuid[])',
+        [owner, ids],
+      );
+    });
+  }
+  async deleteAccountRows(owner: string, ids: string[]) {
+    return this.transaction(async (client) => {
+      await client.query("SELECT set_config('mio.cleanup_owner',$1,true)", [owner]);
+      await client.query(
+        'DELETE FROM mio_conversation_requests WHERE conversation_id=ANY($1::uuid[])',
+        [ids],
+      );
+      await client.query('DELETE FROM mio_conversations WHERE owner_id=$1 AND id=ANY($2::uuid[])', [
+        owner,
+        ids,
+      ]);
+      const remaining = Number(
+        (
+          await client.query<{ count: string }>(
+            'SELECT count(*) FROM mio_conversations WHERE owner_id=$1',
+            [owner],
+          )
+        ).rows[0]!.count,
+      );
+      await client.query(
+        `INSERT INTO mio_account_cleanup_receipts(user_id,domain,remaining,completed_at)
+        VALUES($1,'conversations',$2,CASE WHEN $2=0 THEN clock_timestamp() ELSE NULL END)
+        ON CONFLICT(user_id,domain) DO UPDATE SET remaining=EXCLUDED.remaining,completed_at=EXCLUDED.completed_at`,
+        [owner, remaining],
+      );
+      return { done: remaining === 0, remaining };
+    });
+  }
   private async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     this.assertActive();
     const client = await this.pool.connect();
@@ -495,6 +564,15 @@ export class ConversationStore {
       throw new ConversationError(HTTP_STATUS.CONFLICT, 'REQUEST_ID_CONFLICT');
     if (!old) requireUnarchived(row);
     return { row, ...(old ? { replay: receipt(old) } : {}) };
+  }
+  async storageConversations(owner: string) {
+    this.assertActive();
+    return (
+      await this.pool.query<{ id: string; dsh_session_id: string }>(
+        "SELECT id,dsh_session_id FROM mio_conversations WHERE owner_id=$1 AND state='ready' ORDER BY id",
+        [owner],
+      )
+    ).rows;
   }
   async snapshot(actor: Principal, id: string): Promise<ConversationSnapshot> {
     this.assertActive();

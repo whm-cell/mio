@@ -1,3 +1,4 @@
+import { createOwnerWork } from '../../account-deletion/owner-work.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
@@ -78,7 +79,18 @@ export async function createVideoExecutor(
   const stop = new AbortController();
   const signal = stop.signal;
   const cleanup = transports.cleanup;
-  const run = createVideoRunner(execution, provider, materialize, signal, transports, receipts);
+  const ownerWork = createOwnerWork((owner) => execution.accountClosed(owner));
+  const run = (row: Parameters<ReturnType<typeof createVideoRunner>>[0]) =>
+    ownerWork.run(row.owner_id, (ownerSignal) =>
+      createVideoRunner(
+        execution,
+        provider,
+        materialize,
+        AbortSignal.any([signal, ownerSignal]),
+        transports,
+        receipts,
+      )(row),
+    );
   const active = new Set<Promise<void>>();
   let timer: NodeJS.Timeout | undefined;
   let closing: Promise<void> | undefined;
@@ -160,7 +172,10 @@ export async function createVideoExecutor(
       // Keep the existing bounded selection and yield between storage operations.
       if (!cleanupBatch.length) cleanupBatch = await execution.completedCleanup();
       const row = cleanupBatch.shift();
-      if (row && !signal.aborted) await cleanCompleted(execution, cleanup, row, signal);
+      if (row && !signal.aborted)
+        await ownerWork.run(row.owner_id, (ownerSignal) =>
+          cleanCompleted(execution, cleanup, row, AbortSignal.any([signal, ownerSignal])),
+        );
     } catch {
       log.error('VIDEO_CLEANUP_PENDING');
     } finally {
@@ -212,6 +227,7 @@ export async function createVideoExecutor(
     wake();
   }
   return {
+    drainAccount: (owner: string) => ownerWork.drain(owner),
     signal,
     wake() {
       if (!signal.aborted) setImmediate(wake);

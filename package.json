@@ -55,6 +55,7 @@
     "auth:migrate": "node scripts/service/migrate-auth.ts",
     "conversations:migrate": "node scripts/service/migrate-conversations.ts",
     "materials:migrate": "node scripts/service/migrate-materials.ts",
+    "storage:migrate": "node scripts/service/migrate-storage.ts",
     "assets:migrate": "node scripts/service/migrate-assets.ts",
     "audio:voices:import": "node --env-file-if-exists=.env scripts/service/import-system-voice.ts",
     "audio:previews:import": "node --env-file-if-exists=.env scripts/service/import-voice-previews.ts",
@@ -62,6 +63,8 @@
     "providers:migrate": "node scripts/service/migrate-providers.ts",
     "providers:route": "node scripts/service/import-provider-route.ts",
     "admin:migrate": "node scripts/service/migrate-admin.ts",
+    "creation-logs:migrate": "node scripts/service/migrate-creation-logs.ts",
+    "notifications:migrate": "node scripts/service/migrate-notifications.ts",
     "admin:bootstrap": "node scripts/service/bootstrap-admin.ts",
     "admin:dev": "node scripts/service/local.ts dev admin-bootstrap",
     "admin:test": "node scripts/service/local.ts test admin-bootstrap",
@@ -94,7 +97,10 @@
     "check:static": "pnpm check:static:base && pnpm build",
     "check": "node scripts/harness/validation-entry.ts check && pnpm check:static:base && pnpm test && pnpm build && pnpm test:smoke",
     "generations:migrate": "node scripts/service/migrate-generations.ts",
-    "generations:preflight": "node scripts/service/generation-cutover.ts"
+    "generations:preflight": "node scripts/service/generation-cutover.ts",
+    "account-deletion:migrate": "node scripts/service/migrate-account-deletion.ts",
+    "account-deletion:replay": "node scripts/service/replay-account-deletions.ts",
+    "account-deletion:monitor": "node scripts/service/monitor-account-deletion.ts"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0"

@@ -11,8 +11,17 @@ export interface AssetPrincipal {
 }
 
 export interface AssetObjectStore {
+  hasPendingWrites?(key: string): boolean;
+  archiveAccountDeletion?(
+    value: { userId: string; finalizedAt: string },
+    signal: AbortSignal,
+  ): Promise<void>;
+  accountDeletionTombstones?(
+    signal: AbortSignal,
+  ): AsyncIterable<{ userId: string; finalizedAt: string }>;
   uploadUrl(key: string, size: number, acl?: 'private'): string;
   downloadUrl(key: string): string;
+  avatarInlineUrl?(key: string, contentType: string): string;
   audioPlaybackUrl?(key: string, contentType: string): string;
   hlsSegmentUrl?(key: string, expiresIn: number): string;
   materialUrl?(key: string): string;
@@ -36,6 +45,7 @@ export interface AssetObjectStore {
     format: string,
     sha256: string,
     signal: AbortSignal,
+    acl?: 'private',
   ): Promise<{ key: string; sizeBytes: number; sha256: string; etag: string; contentType: string }>;
   putVideo?(
     key: string,
@@ -95,6 +105,7 @@ export async function waitForObjectHead<T>(
 
 export type AssetErrorCode =
   | 'ASSET_NOT_FOUND'
+  | 'ASSET_NOT_READY'
   | 'ASSET_UNAVAILABLE'
   | 'ASSET_INPUT_INVALID'
   | 'ASSET_EXPIRED'

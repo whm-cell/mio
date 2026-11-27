@@ -1,5 +1,16 @@
-import { HTTP_STATUS } from '@mio/foundation/http-status';
+import { createAccountDeletionRuntime } from './account-deletion/runtime.ts';
+import type { AccountDeletionRuntime } from './account-deletion/runtime.ts';
+import { reclaimDeletedMedia, reclaimDeletedTranscode } from './compute/deleted-results.ts';
+import { createStorageAccounting } from './assets/storage-store.ts';
+import { startStorageReconciliation } from './assets/storage-worker.ts';
+import { createStorageUsageHandler } from './assets/storage-http.ts';
+import { defaultStoragePolicy } from './assets/storage.ts';
+import type { StorageHolderSource } from './assets/storage-worker.ts';
+import { createCreationLogStore } from './notifications/creation-store.ts';
+import { createCreationLogHandler } from './notifications/creation-http.ts';
+import { startAudioCreationDelivery } from './audio/jobs/creation-outbox.ts';
 import { monotonicMs } from '@mio/foundation/time';
+import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
@@ -47,7 +58,6 @@ import { createProviderStore } from './providers/store.ts';
 import { createProviderService } from './providers/service.ts';
 import type { ProviderService } from './providers/service.ts';
 import { createProviderHandler } from './providers/http.ts';
-import { AssetError } from './assets/contracts.ts';
 import { readAssetConfig } from './assets/config.ts';
 import { createAssetStore } from './assets/store.ts';
 import type { AssetStore } from './assets/store.ts';
@@ -102,8 +112,13 @@ import { createAdminStore } from './admin/store.ts';
 import { createAdminService } from './admin/service.ts';
 import type { AdminService } from './admin/service.ts';
 import { createAdminHandler, readAdminSessionCookie } from './admin/http.ts';
+import { readNotificationsConfig } from './notifications/config.ts';
+import { createNotificationStore } from './notifications/store.ts';
+import { createNotificationService } from './notifications/service.ts';
+import { createNotificationHandler } from './notifications/http.ts';
 
 export const name = 'mio-foundation';
+const log = createLogger('app', 'plugin');
 export const inject = ['webServer', 'tools'];
 
 declare module '@deepseek-ai/cordis' {
@@ -116,8 +131,6 @@ class ConversationTokenMeter extends TokenMeter {
   // The parent retains sessionProjections until its conversation work drains.
   static override inject = [];
 }
-
-const AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 export interface Config {
   tokenEnv: string;
@@ -186,6 +199,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const conversationConfig = readConversationConfig(process.env, Boolean(providerConfig));
   const generationConfig = readGenerationConfig();
   const adminConfig = readAdminConfig(process.env, authConfig?.origins);
+  const notificationsConfig = readNotificationsConfig();
+  if (notificationsConfig && !authConfig)
+    throw new Error('NOTIFICATIONS_CONFIG: authentication required');
   const oneLinkSsoConfig = readOneLinkSsoConfig();
   const rabbitmqMonitorConfig = adminConfig ? readRabbitmqMonitorConfig() : undefined;
   const redisMonitorConfig = adminConfig ? readRedisMonitorConfig() : undefined;
@@ -215,7 +231,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (backend === 'redis' && !authConfig)
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
+    const deletionRef: { current?: AccountDeletionRuntime } = {};
+    const closeDeletion = () => deletionRef.current?.close();
+    let videoAccountDrain: ((owner: string) => Promise<void>) | undefined;
     let admin: AdminService | undefined;
+    let notifications: ReturnType<typeof createNotificationService> | undefined;
+    let creationLogs: Awaited<ReturnType<typeof createCreationLogStore>> | undefined;
+    let creationDelivery: ReturnType<typeof startAudioCreationDelivery> | undefined;
+    const closeCreationLogs = () =>
+      closeMioResources(
+        closeDeletion,
+        () => creationDelivery?.close(),
+        () => creationLogs?.close(),
+      );
     const getAuthPolicy = (): AuthRuntimePolicy =>
       admin?.getAuthPolicy() ?? {
         emailPasswordEnabled: authConfig.emailPasswordEnabled,
@@ -242,7 +270,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       });
       const acquired = auth;
       ctx.effect(() => async () => {
-        await Promise.all([acquired.close(), redis?.close()]);
+        await closeMioResources(
+          closeDeletion,
+          () => acquired.close(),
+          () => redis?.close(),
+        );
       });
     } catch (error) {
       // The fiber may have been disposed while either dependency was connecting.
@@ -250,44 +282,97 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       throw error;
     }
     let conversations: ConversationService | undefined;
+    if (notificationsConfig) {
+      const store = await createNotificationStore(notificationsConfig.databaseURL);
+      try {
+        const acquired = (notifications = createNotificationService(store, (actor, action, id) => {
+          if (!admin) throw new Error('ADMIN_UNAVAILABLE');
+          return admin.recordAnnouncementOperation(actor, action, id);
+        }));
+        ctx.effect(() => () => closeMioResources(closeDeletion, () => acquired.close()));
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/announcements',
+            handler: createNotificationHandler(acquired, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await (notifications ? notifications.close() : store.close());
+        throw error;
+      }
+    }
     let generations: GenerationService | undefined;
     let videoGenerations: ReturnType<typeof createVideoGenerationService> | undefined;
     const closeWithVideo = (
       drains: Array<() => Promise<void> | undefined>,
       ...dependencies: Array<() => Promise<void> | undefined>
     ) => {
+      const deletionDrain = closeDeletion();
       const video = videoGenerations?.close();
       // Cordis disposes sibling effects concurrently. Stop video immediately, then join its drain
       // before releasing any shared dependency, even if another consumer has a slow close.
       void video?.catch(() => {});
-      return closeMioResources(...drains, () => video, ...dependencies);
+      return closeMioResources(
+        () => deletionDrain,
+        ...drains,
+        () => video,
+        ...dependencies,
+      );
     };
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let storage: Awaited<ReturnType<typeof createStorageAccounting>> | undefined;
+    let storageWorker: ReturnType<typeof startStorageReconciliation> | undefined;
+    let storageClosing: Promise<void> | undefined;
+    const getStoragePolicy = () => (admin ? admin.getStoragePolicy() : defaultStoragePolicy);
+    const closeStorage = () =>
+      (storageClosing ??= (async () => {
+        await closeDeletion();
+        await storageWorker?.close();
+        await storage?.close();
+      })());
+    const syncAvatarHolder = (owner: string) =>
+      storage?.store.replaceHolder(owner, async () => {
+        const avatarAssetId = await auth.avatarAssetId(owner);
+        return {
+          type: 'avatar',
+          id: owner,
+          assetIds: avatarAssetId ? [avatarAssetId] : [],
+        };
+      }) ?? Promise.resolve();
+    const syncStorageHolders = (owner: string, id: string, read: () => Promise<string[]>) =>
+      storage?.store.replaceHolder(owner, async () => ({
+        type: 'conversation',
+        id,
+        assetIds: await read(),
+      })) ?? Promise.resolve();
     let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
     let audio: AudioJobService | undefined;
     let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
     let vision: ReturnType<typeof createConversationVision> | undefined;
-    const verifyAvatarAsset = async (
-      identity: { userId: string; sessionId: string },
-      assetId: string,
-    ): Promise<'ok' | 'not_found' | 'not_ready' | 'invalid_type' | 'unavailable'> => {
-      if (!assets) return 'unavailable';
-      try {
-        const asset = await assets.get(identity, assetId);
-        if (asset.status !== 'ready') return 'not_ready';
-        if (!AVATAR_MIME_TYPES.has(asset.contentType.toLowerCase())) return 'invalid_type';
-        return 'ok';
-      } catch (error) {
-        if (error instanceof AssetError && error.status === HTTP_STATUS.NOT_FOUND)
-          return 'not_found';
-        return 'unavailable';
-      }
-    };
-    const authHandler = createAuthHandler(authConfig, auth, verifyAvatarAsset, getAuthPolicy);
+    const authHandler = createAuthHandler(
+      authConfig,
+      auth,
+      (identity, assetId) =>
+        assets?.verifyAvatar(identity, assetId) ?? Promise.resolve('unavailable'),
+      getAuthPolicy,
+      {
+        accountDeleted: (owner, finalizedAt) =>
+          deletionRef.current?.wake(owner, new Date(finalizedAt)),
+        avatarChanged: syncAvatarHolder,
+        avatarUrl: (identity, assetId) =>
+          assets?.avatarUrl(identity, assetId) ?? Promise.resolve(null),
+        normalizeAvatar: (identity, sourceAssetId) => {
+          if (!assets) throw new Error('ASSET_UNAVAILABLE');
+          return assets.normalizeAvatar(identity, sourceAssetId);
+        },
+      },
+    );
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL, Boolean(computeConfig));
       try {
+        storage = await createStorageAccounting(assetConfig.databaseURL, getStoragePolicy);
         const objects = createCosStorage(assetConfig);
         assetResources = { store, objects };
         const acquired = (assets = createAssetService(store, objects));
@@ -302,6 +387,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 () => materials?.close(),
                 () => audio?.close(),
                 () => derivatives?.close(),
+                closeStorage,
               ],
               () => acquired.close(),
             ),
@@ -314,6 +400,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
+        await closeStorage();
         await (assets ? assets.close() : store.close());
         throw error;
       }
@@ -327,7 +414,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const acquired =
           (compute =
           ownedCompute =
-            createComputeService(store, assetResources.objects, computeConfig));
+            createComputeService(
+              store,
+              assetResources.objects,
+              computeConfig,
+              async (attempt, result) => {
+                if (!deletionRef.current?.gc)
+                  throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+                await reclaimDeletedTranscode(attempt, result, deletionRef.current!.gc);
+              },
+            ));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
           () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
@@ -348,7 +444,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const store = await createMediaStore(assetConfig.databaseURL);
       let media: ReturnType<typeof createMediaService> | undefined;
       try {
-        const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
+        const acquired = (media = createMediaService(
+          store,
+          assetResources.objects,
+          computeConfig,
+          async (attempt, result, signal) => {
+            if (!deletionRef.current?.gc) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+            await reclaimDeletedMedia(
+              attempt,
+              result,
+              assetResources!.objects,
+              deletionRef.current!.gc,
+              signal,
+            );
+          },
+        ));
         derivatives = startAssetDerivatives(assetResources.store, acquired);
         ctx.effect(() => () => {
           const scheduler = derivatives?.close();
@@ -445,7 +555,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         ctx.effect(
           () => () =>
             closeWithVideo(
-              [() => admin?.close(), () => conversations?.close()],
+              [
+                closeCreationLogs,
+                () => notifications?.close(),
+                () => admin?.close(),
+                () => conversations?.close(),
+              ],
               () => generations?.close(),
               () => materials?.close(),
               () => ownedAudio?.close(),
@@ -504,7 +619,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 authBaseURL: authConfig.baseURL,
               },
             ));
-        ctx.effect(() => () => acquired.close());
+        ctx.effect(
+          () => () =>
+            closeMioResources(
+              closeCreationLogs,
+              () => notifications?.close(),
+              () => acquired.close(),
+            ),
+        );
         const computeHandler = computeOps
           ? createComputeOpsHandler(
               computeOps.view,
@@ -529,7 +651,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           ctx.webServer.register({
             kind: 'prefix',
             path: '/api/v1/admin',
-            handler: createAdminHandler(acquired, adminConfig.allowedOrigins, computeHandler),
+            handler: createAdminHandler(
+              {
+                ...acquired,
+                async updateStorageSettings(...args) {
+                  const saved = await acquired.updateStorageSettings(...args);
+                  try {
+                    await storage?.store.updatePolicy();
+                  } catch {
+                    // The admin transaction is already committed. Existing background work repairs
+                    // the projection; usage reads reject a mismatched version until it catches up.
+                    log.warn('STORAGE_POLICY_PROJECTION_UNAVAILABLE');
+                  }
+                  return saved;
+                },
+              },
+              adminConfig.allowedOrigins,
+              computeHandler,
+              notifications,
+            ),
           }),
         );
       } catch (error) {
@@ -561,7 +701,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
         const owned = acquired;
         ctx.effect(() => async () => {
-          await owned.close();
+          await closeMioResources(closeDeletion, () => owned.close());
         });
         ctx.effect(() =>
           ctx.webServer.register({
@@ -636,6 +776,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             generationConfig.dataDirectory,
           );
         }
+        videoAccountDrain = videoExecutor?.drainAccount;
         const admission = (videoAdmission = createVideoGenerationService(
           videoStore,
           () => providers,
@@ -686,6 +827,38 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         throw error;
       }
     }
+    // Publish a single creation feed only when all three production paths and retention policy exist.
+    if (
+      admin &&
+      providers &&
+      audio &&
+      assetConfig &&
+      generationConfig?.videoEnabled &&
+      computeConfig
+    ) {
+      const policy = admin;
+      const store = await createCreationLogStore(assetConfig.databaseURL, () =>
+        policy.getCreationLogRetentionDays(),
+      );
+      creationLogs = store;
+      try {
+        creationDelivery = startAudioCreationDelivery(
+          providers.audioStore.creationOutbox,
+          store.receiveAudio,
+        );
+        ctx.effect(() => closeCreationLogs);
+        ctx.effect(() =>
+          ctx.webServer.register({
+            kind: 'prefix',
+            path: '/api/v1/notifications',
+            handler: createCreationLogHandler(store, auth.identity, authConfig.origins),
+          }),
+        );
+      } catch (error) {
+        await closeCreationLogs();
+        throw error;
+      }
+    }
     if (conversationConfig) {
       if (!ctx.get('mioKernel')) throw new Error('CONVERSATION_CONFIG: DSH kernel required');
       await ctx.plugin({
@@ -725,6 +898,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             yield policies.dispose;
             yield async () => {
               const failures: unknown[] = [];
+              await Promise.resolve(closeDeletion()).catch((error) => failures.push(error));
               try {
                 http?.close();
               } catch (error) {
@@ -798,6 +972,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     return resolve ? resolve(lookup) : null;
                   },
                   audioTools,
+                  syncStorageHolders,
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,
@@ -829,6 +1004,73 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         },
       });
     }
+    if (storage) {
+      const sources: StorageHolderSource[] = [
+        {
+          type: 'avatar',
+          async read(owner) {
+            const avatarAssetId = await auth.avatarAssetId(owner);
+            return avatarAssetId ? [{ type: 'avatar', id: owner, assetIds: [avatarAssetId] }] : [];
+          },
+        },
+      ];
+      if (conversationConfig)
+        sources.push({
+          type: 'conversation',
+          async read(owner) {
+            if (!conversations) throw new Error('CONVERSATION_STORAGE_UNAVAILABLE');
+            return conversations.storageHolders(owner);
+          },
+        });
+      storageWorker = startStorageReconciliation(storage.store, sources);
+    }
+    deletionRef.current = await createAccountDeletionRuntime({
+      auth,
+      authDatabaseURL: authConfig.databaseURL,
+      ...(providerConfig
+        ? {
+            providers: {
+              databaseURL: providerConfig.databaseURL,
+              drain: (owner: string) => audio?.drainAccount(owner) ?? Promise.resolve(),
+            },
+          }
+        : {}),
+      ...(notificationsConfig ? { notificationsDatabaseURL: notificationsConfig.databaseURL } : {}),
+      ...(materialConfig ? { materialsDatabaseURL: materialConfig.databaseURL } : {}),
+      ...(conversationConfig ? { conversations: () => conversations } : {}),
+      ...(assetConfig && assetResources && assets
+        ? {
+            media: {
+              databaseURL: assetConfig.databaseURL,
+              objects: assetResources.objects,
+              deleteEnabled: process.env.MIO_ASSETS_GC_DELETE_ENABLED === 'true',
+              ...(generationConfig ? { generationDirectory: generationConfig.dataDirectory } : {}),
+              cleanStaging: () => assets!.cleanup(),
+              drainAssets: (owner: string) => assets!.drainAccount(owner),
+              async drainGenerations(owner: string, kinds: readonly ('image' | 'video')[]) {
+                if (kinds.includes('image')) {
+                  if (!generations) throw new Error('LOCAL_GENERATION_VOLUME_NOT_OWNED');
+                  await generations.drainAccount(owner);
+                }
+                if (kinds.includes('video')) {
+                  if (!videoAccountDrain) throw new Error('LOCAL_VIDEO_VOLUME_NOT_OWNED');
+                  await videoAccountDrain(owner);
+                }
+              },
+            },
+          }
+        : {}),
+    });
+    auth.setDeletionDomains(deletionRef.current.domains);
+    ctx.effect(() => () => deletionRef.current!.close());
+    const storageHandler = createStorageUsageHandler(
+      () => storage?.store,
+      auth.identity,
+      authConfig.origins,
+    );
+    for (const path of ['/api/v1/me/storage-usage', '/api/v1/me/storage-usage/reminders/ack']) {
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path, handler: storageHandler }));
+    }
     ctx.effect(() =>
       ctx.webServer.register({
         kind: 'prefix',
@@ -850,6 +1092,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         handler: authHandler,
       }),
     );
+    ctx.effect(() =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: '/api/v1/me/profile/avatar/normalize',
+        handler: authHandler,
+      }),
+    );
+    for (const path of ['/api/v1/me/wechat', '/api/v1/me/onelink']) {
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path, handler: authHandler }));
+    }
   }
 
   // Registered on this fiber, so the guard and routes are removed together on disposal.

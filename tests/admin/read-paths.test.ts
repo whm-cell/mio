@@ -363,7 +363,14 @@ it('keeps catalog > benchmark including empty object > latest supplier metadata,
 
 async function monitoringFixture(migrate = true) {
   const f = await providerSqlFixture([]);
-  const admin = new AdminStore(f.pool, f.pool, false, f.pool);
+  const admin = new AdminStore(
+    f.pool,
+    f.pool,
+    false,
+    f.pool,
+    { revision: 0, retentionDays: null },
+    { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+  );
   const migrateDomains = async () => {
     for (const sql of [
       assetSchemaSQL,
@@ -577,7 +584,14 @@ it('retries absent schemas after migration, caches only positives per instance, 
   await f.admin.readMonitoring('7d');
   expect(query.mock.calls.filter(([sql]) => String(sql).includes('to_regclass'))).toHaveLength(3);
   expect((await g.admin.readMonitoring('all')).images.enabled).toBe(false);
-  const independent = new AdminStore(f.pool, f.pool, false, f.pool);
+  const independent = new AdminStore(
+    f.pool,
+    f.pool,
+    false,
+    f.pool,
+    { revision: 0, retentionDays: null },
+    { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+  );
   query.mockClear();
   await independent.readMonitoring('all');
   expect(query.mock.calls.filter(([sql]) => String(sql).includes('to_regclass'))).toHaveLength(3);
@@ -585,7 +599,14 @@ it('retries absent schemas after migration, caches only positives per instance, 
   query.mockImplementationOnce(() => Promise.reject(new Error('data failure')));
   await expect(f.admin.readMonitoring('all')).rejects.toThrow('data failure');
   query.mockRestore();
-  const unprobed = new AdminStore(f.pool, f.pool, false, f.pool);
+  const unprobed = new AdminStore(
+    f.pool,
+    f.pool,
+    false,
+    f.pool,
+    { revision: 0, retentionDays: null },
+    { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+  );
   let fail = true,
     failData = false,
     lookups = 0;
@@ -607,7 +628,14 @@ it('retries absent schemas after migration, caches only positives per instance, 
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  const retry = new AdminStore(proxy, proxy, false, proxy);
+  const retry = new AdminStore(
+    proxy,
+    proxy,
+    false,
+    proxy,
+    { revision: 0, retentionDays: null },
+    { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+  );
   await expect(retry.readMonitoring('all')).rejects.toThrow('lookup failure');
   fail = false;
   await retry.readMonitoring('all');

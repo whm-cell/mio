@@ -2,6 +2,8 @@ import { Pool } from 'pg';
 import { getMigrations } from 'better-auth/db/migration';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { migrateSmsBudget, previewSmsBudgetMigration } from './migrate-auth-sms-budget.ts';
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 
 const args = process.argv.slice(2);
 if (args.some((arg) => !['--apply', '--rollback-sms-budget'].includes(arg)))
@@ -42,11 +44,15 @@ try {
       await plan.runMigrations();
     }
     await migrateSmsBudget(pool, false);
+    await pool.query(accountDeletionSchemaSQL);
+    await pool.query(authDeletionGuardsSQL);
     console.log('Authentication schema migration completed.');
   } else {
     const smsPlan = await previewSmsBudgetMigration(pool, false);
     if (baseChanges) console.log(await plan.compileMigrations());
     if (smsPlan) console.log(smsPlan);
+    console.log(accountDeletionSchemaSQL);
+    console.log(authDeletionGuardsSQL);
     if (!baseChanges && !smsPlan) console.log('Authentication schema is current.');
   }
 } finally {

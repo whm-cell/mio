@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import { expect, it } from 'vitest';
+import { creationLogSchemaSQL } from '../../src/notifications/creation-schema.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { conversationSchemaSQL } from '../../src/conversations/schema.ts';
@@ -39,6 +40,18 @@ async function schema(database: Pick<Pool, 'query'>) {
 }
 
 const migrations = [
+  {
+    name: 'creation-logs',
+    ddl: creationLogSchemaSQL,
+    legacy: `${creationLogSchemaSQL}
+      DROP INDEX mio_creation_logs_expiry_idx;
+      INSERT INTO mio_creation_logs(id,owner_id,media_type,job_id,event_kind,title,summary,occurred_at)
+        VALUES('${assetId}','history','image','${jobId}','completed','existing','saved',now());`,
+    damage: 'ALTER TABLE mio_creation_logs ALTER COLUMN summary TYPE varchar(500)',
+    repair: 'ALTER TABLE mio_creation_logs ALTER COLUMN summary TYPE text',
+    error: 'CREATION_LOG_SCHEMA: migration failed',
+    history: 'SELECT * FROM mio_creation_logs',
+  },
   {
     name: 'assets',
     ddl: assetSchemaSQL,
@@ -127,10 +140,11 @@ it.each(migrations)(
     const readHistory = async () => (await pool.query(migration.history)).rows;
 
     try {
+      const initialSchema = await schema(pool);
       const preview = run();
       expect(preview.status, preview.stderr).toBe(0);
       expect(preview.stdout.trim()).toBe(migration.ddl.trim());
-      expect(await schema(pool)).toEqual([]);
+      expect(await schema(pool)).toEqual(initialSchema);
 
       await pool.query(migration.legacy);
       const legacyHistory = await readHistory();

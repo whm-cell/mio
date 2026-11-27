@@ -288,6 +288,7 @@ export function authOptions(
         '/phone-binding/confirm': { window: 60, max: 10 },
         '/phone-rebind/send-otp': { window: 60, max: 100 },
         '/phone-rebind/confirm': { window: 60, max: 10 },
+        '/account-deletion/send-otp': { window: 60, max: 100 },
         '/sign-in/social': { window: 60, max: 10 },
         '/link-social': { window: 60, max: 10 },
         '/wechat/qr-session': { window: 60, max: 20 },

@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 const purposeCheck = `(purpose = ANY (ARRAY['general'::text, 'drama-script'::text, 'audio'::text]))`;
@@ -57,7 +58,11 @@ ALTER TABLE mio_conversations
   ADD COLUMN IF NOT EXISTS fork_requested_until_seq bigint CHECK (fork_requested_until_seq >= 0);
 CREATE UNIQUE INDEX IF NOT EXISTS mio_conversations_fork_request
   ON mio_conversations(owner_id, forked_from_conversation_id, fork_request_id)
-  WHERE fork_request_id IS NOT NULL;`;
+  WHERE fork_request_id IS NOT NULL;
+${accountClosureSchemaSQL([
+  ['mio_conversations', 'owner_id'],
+  ['mio_conversation_requests', 'mio_conversations', 'conversation_id'],
+])}`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
 export async function checkConversationSchema(database: Pick<Pool, 'query'>): Promise<void> {

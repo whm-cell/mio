@@ -320,6 +320,7 @@ it.each([
     for (const shutdown of [false, true]) {
       const gate = Promise.withResolvers<unknown>();
       const store = {
+        accountClosed: async () => false,
         owned: vi.fn().mockResolvedValue({ dsh_session_id: 'session' }),
         snapshot: vi.fn().mockImplementation(async (_actor, id) => ({
           conversationId: id,

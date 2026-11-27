@@ -239,6 +239,14 @@ export async function confirmWechatPending(
   try {
     assertPending(observed, input.candidateToken);
     return await withAuthTransaction<ConfirmationResult>(pool, async (client) => {
+      const user =
+        input.action === 'link_existing'
+          ? await lockUser(
+              client,
+              input.session ? 'id' : 'phoneNumber',
+              input.session?.userId ?? input.phone ?? '',
+            )
+          : undefined;
       if (
         input.phone &&
         (!input.code ||
@@ -248,18 +256,14 @@ export async function confirmWechatPending(
             'wechat_existing',
             input.phone,
             input.code,
-            { pendingId: observed.id, candidateToken: input.candidateToken },
+            {
+              pendingId: observed.id,
+              candidateToken: input.candidateToken,
+              subjectUserId: user?.id ?? null,
+            },
           )))
       )
         return { error: 'INVALID_OTP' };
-      const user =
-        input.action === 'link_existing'
-          ? await lockUser(
-              client,
-              input.session ? 'id' : 'phoneNumber',
-              input.session?.userId ?? input.phone ?? '',
-            )
-          : undefined;
       if (input.session && !(await bindingSessionIsActive(client, input.session)))
         return reject('SESSION_REQUIRED');
       const row = (

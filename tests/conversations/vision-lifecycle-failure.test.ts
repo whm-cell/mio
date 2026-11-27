@@ -11,13 +11,26 @@ const fixture = vi.hoisted(() => ({
   closeService: vi.fn(async () => {}),
   closeHttp: vi.fn(() => {}),
 }));
+vi.mock('../../src/account-deletion/runtime.ts', () => ({
+  createAccountDeletionRuntime: async () => ({
+    domains: ['auth', 'archive'],
+    wake: () => {},
+    close: async () => {},
+    round: async () => {},
+    monitor: async () => {},
+  }),
+}));
 vi.mock('../../src/auth/config.ts', () => ({
   AUTH_BASE_PATH: '/api/auth',
   readAuthConfig: () => ({ origins: [] }),
   readAuthRateLimitBackend: () => 'database',
 }));
 vi.mock('../../src/auth/service.ts', () => ({
-  createAuthentication: async () => ({ identity: async () => null, close: async () => {} }),
+  createAuthentication: async () => ({
+    identity: async () => null,
+    setDeletionDomains: () => {},
+    close: async () => {},
+  }),
 }));
 vi.mock('../../src/auth/http.ts', () => ({ createAuthHandler: () => () => {} }));
 vi.mock('../../src/assets/config.ts', () => ({ readAssetConfig: () => undefined }));

@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 export const materialAuthSchemaSQL = `
 CREATE TABLE IF NOT EXISTS mio_material_auth_sessions (
@@ -23,7 +24,8 @@ ALTER TABLE mio_material_auth_sessions
  ADD COLUMN IF NOT EXISTS upstream_group_request_id varchar(256);
 CREATE INDEX IF NOT EXISTS mio_material_auth_sessions_expiry ON mio_material_auth_sessions(expires_at,id) WHERE state NOT IN ('completed','expired');
 CREATE INDEX IF NOT EXISTS mio_material_auth_sessions_owner ON mio_material_auth_sessions(owner_id,created_at DESC,id DESC);
-`;
+
+${accountClosureSchemaSQL([['mio_material_auth_sessions', 'owner_id']])}`;
 export async function checkMaterialAuthSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await pool.query(
     'SELECT id,owner_id,provider_type,provider_config_id,credential_version,request_id,input_hash,state,protocol_snapshot,return_target,token_digest,cipher_format,master_key_id,nonce,ciphertext,auth_tag,group_id,lease_id,lease_until,next_query_at,query_count,error_code,created_at,updated_at,expires_at,upstream_create_request_id,upstream_result_request_id,upstream_group_request_id FROM mio_material_auth_sessions LIMIT 0',

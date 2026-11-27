@@ -97,7 +97,10 @@
     "check:static": "pnpm check:static:base && pnpm build",
     "check": "node scripts/harness/validation-entry.ts check && pnpm check:static:base && pnpm test && pnpm build && pnpm test:smoke",
     "generations:migrate": "node scripts/service/migrate-generations.ts",
-    "generations:preflight": "node scripts/service/generation-cutover.ts"
+    "generations:preflight": "node scripts/service/generation-cutover.ts",
+    "account-deletion:migrate": "node scripts/service/migrate-account-deletion.ts",
+    "account-deletion:replay": "node scripts/service/replay-account-deletions.ts",
+    "account-deletion:monitor": "node scripts/service/monitor-account-deletion.ts"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0"

@@ -1,5 +1,7 @@
 import { storageSchemaSQL, checkStorageSchema } from './storage-schema.ts';
 import type { Pool } from 'pg';
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
+import { assetGcSchemaSQL, checkAssetGcSchema } from './gc-schema.ts';
 
 /** User media metadata is separate from authentication and DSH session storage. */
 export const assetSchemaSQL = `
@@ -25,10 +27,19 @@ CREATE TABLE IF NOT EXISTS mio_asset_derivative_intents (
 CREATE INDEX IF NOT EXISTS mio_asset_derivatives_due
   ON mio_asset_derivative_intents(next_attempt_at,asset_id,profile)
   WHERE job_id IS NULL AND error_code IS NULL;
-${storageSchemaSQL}`;
+${storageSchemaSQL}
+${accountClosureSchemaSQL([
+  ['mio_assets', 'owner_id'],
+  ['mio_asset_derivative_intents', 'owner_id'],
+  ['mio_asset_holders', 'owner_id'],
+  ['mio_storage_usage', 'owner_id'],
+  ['mio_storage_objects', 'owner_id'],
+])}
+${assetGcSchemaSQL}`;
 
 export async function checkAssetSchema(database: Pick<Pool, 'query'>): Promise<void> {
   await checkStorageSchema(database);
+  await checkAssetGcSchema(database);
   const result = await database.query(
     'SELECT id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,lease_id,lease_until,created_at,expires_at,staging_deleted_at FROM mio_assets LIMIT 0',
   );

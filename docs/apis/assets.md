@@ -2,6 +2,8 @@
 
 [API 导航](index.md)；存储与清理约束见 [COS 集成](../integrations/cos.md)。只在认证和完整资产配置启用后注册。
 
+旧 userId 关闭后停止签发新的读写地址，原签名仍受有效期及对象存续约束。注销清理释放所有逻辑持有，经共享 GC 确认独占零引用正式对象不存在；暂存加速过期并在原五分钟 PUT 窗口后复查。新账号与仍有独立合法持有的对象不被旧任务影响。状态与上线门禁见[认证规则](../auth.md#永久注销与清理)。
+
 ## 本域共同约定
 
 身份只来自登录 Cookie；服务 Bearer 和请求体不能指定 owner、桶、对象键或目标 URL。POST 要求允许的精确 Origin 和 `application/json`；GET 提供 Origin 时也须匹配；OPTIONS 无需登录但须允许 Origin。JSON 上限 8192 字节、10 秒，拒绝额外字段，读取后复核会话。所有响应 no-store，错误为 `{error:{code,message,requestId}}`，不返回 COS 或数据库错误详情。常见错误为 400 BODY_INVALID/QUERY_INVALID/ASSET_INPUT_INVALID、401 UNAUTHORIZED、403 ORIGIN_DENIED/ORIGIN_REQUIRED、404 NOT_FOUND/ASSET_NOT_FOUND、405 METHOD_NOT_ALLOWED、408 BODY_TIMEOUT、413 BODY_TOO_LARGE、415 JSON_REQUIRED 和 503 ASSET_UNAVAILABLE/ASSET_STORAGE_UNAVAILABLE。

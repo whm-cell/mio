@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
 
 export async function authTableIndexes(pool: Pool, schema: string, table: string) {
   const { rows } = await pool.query<{ indexdef: string }>(
@@ -105,6 +106,12 @@ export async function authDatabase() {
     const scoped = new URL(url);
     scoped.searchParams.set('options', `-csearch_path=${schema}`);
     scoped.searchParams.set('application_name', schema);
+    const setup = new Pool({ connectionString: scoped.toString() });
+    try {
+      await setup.query(accountDeletionSchemaSQL);
+    } finally {
+      await setup.end();
+    }
     const observer = new URL(scoped);
     observer.searchParams.set('application_name', `${schema}_observer`);
     return {

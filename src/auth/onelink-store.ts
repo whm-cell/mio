@@ -72,6 +72,17 @@ export function createOneLinkPending(
   input: CreateOneLinkPendingInput,
 ): Promise<string> {
   return withAuthTransaction(pool, async (client) => {
+    if (input.initiatorUserId) {
+      await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [input.initiatorUserId]);
+      if (
+        !input.initiatorSessionId ||
+        !(await bindingSessionIsActive(client, {
+          userId: input.initiatorUserId,
+          sessionId: input.initiatorSessionId,
+        }))
+      )
+        throw new Error('SESSION_REQUIRED');
+    }
     await client.query(
       `DELETE FROM "mioOneLinkPending" WHERE id IN (
          SELECT id FROM "mioOneLinkPending"
@@ -410,20 +421,6 @@ export async function completeOneLinkLinkExisting(
   if (initial.status !== 'ok') return initial;
   try {
     return await withAuthTransaction<CompleteOneLinkLinkExistingResult>(pool, async (client) => {
-      if (
-        input.phone &&
-        (!input.code ||
-          !input.secret ||
-          !(await consumePendingPhoneChallenge(
-            client,
-            input.secret,
-            'onelink_existing',
-            input.phone,
-            input.code,
-            { pendingId: observed.id, candidateToken: input.candidateToken },
-          )))
-      )
-        return { status: 'invalid_otp' };
       const userResult = await client.query<
         BoundOneLinkUser & { readonly phoneNumberVerified: boolean | null }
       >(
@@ -436,6 +433,24 @@ export async function completeOneLinkLinkExisting(
          FOR UPDATE`,
         [input.session?.userId ?? input.phone],
       );
+      if (
+        input.phone &&
+        (!input.code ||
+          !input.secret ||
+          !(await consumePendingPhoneChallenge(
+            client,
+            input.secret,
+            'onelink_existing',
+            input.phone,
+            input.code,
+            {
+              pendingId: observed.id,
+              candidateToken: input.candidateToken,
+              subjectUserId: userResult.rows[0]?.id ?? null,
+            },
+          )))
+      )
+        return { status: 'invalid_otp' };
       if (input.session && !(await bindingSessionIsActive(client, input.session)))
         return { status: 'session_required' };
       const row = await lockOneLinkPendingByDigest(client, input.tokenDigest);

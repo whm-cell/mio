@@ -1,3 +1,6 @@
+import { createAccountDeletionRuntime } from './account-deletion/runtime.ts';
+import type { AccountDeletionRuntime } from './account-deletion/runtime.ts';
+import { reclaimDeletedMedia, reclaimDeletedTranscode } from './compute/deleted-results.ts';
 import { createStorageAccounting } from './assets/storage-store.ts';
 import { startStorageReconciliation } from './assets/storage-worker.ts';
 import { createStorageUsageHandler } from './assets/storage-http.ts';
@@ -228,12 +231,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   if (backend === 'redis' && !authConfig)
     throw new Error('AUTH_CONFIG: authentication is required for Redis rate limiting');
   if (authConfig) {
+    const deletionRef: { current?: AccountDeletionRuntime } = {};
+    const closeDeletion = () => deletionRef.current?.close();
+    let videoAccountDrain: ((owner: string) => Promise<void>) | undefined;
     let admin: AdminService | undefined;
     let notifications: ReturnType<typeof createNotificationService> | undefined;
     let creationLogs: Awaited<ReturnType<typeof createCreationLogStore>> | undefined;
     let creationDelivery: ReturnType<typeof startAudioCreationDelivery> | undefined;
     const closeCreationLogs = () =>
       closeMioResources(
+        closeDeletion,
         () => creationDelivery?.close(),
         () => creationLogs?.close(),
       );
@@ -263,7 +270,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       });
       const acquired = auth;
       ctx.effect(() => async () => {
-        await Promise.all([acquired.close(), redis?.close()]);
+        await closeMioResources(
+          closeDeletion,
+          () => acquired.close(),
+          () => redis?.close(),
+        );
       });
     } catch (error) {
       // The fiber may have been disposed while either dependency was connecting.
@@ -278,7 +289,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           if (!admin) throw new Error('ADMIN_UNAVAILABLE');
           return admin.recordAnnouncementOperation(actor, action, id);
         }));
-        ctx.effect(() => () => acquired.close());
+        ctx.effect(() => () => closeMioResources(closeDeletion, () => acquired.close()));
         ctx.effect(() =>
           ctx.webServer.register({
             kind: 'prefix',
@@ -297,11 +308,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       drains: Array<() => Promise<void> | undefined>,
       ...dependencies: Array<() => Promise<void> | undefined>
     ) => {
+      const deletionDrain = closeDeletion();
       const video = videoGenerations?.close();
       // Cordis disposes sibling effects concurrently. Stop video immediately, then join its drain
       // before releasing any shared dependency, even if another consumer has a slow close.
       void video?.catch(() => {});
-      return closeMioResources(...drains, () => video, ...dependencies);
+      return closeMioResources(
+        () => deletionDrain,
+        ...drains,
+        () => video,
+        ...dependencies,
+      );
     };
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
@@ -311,6 +328,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const getStoragePolicy = () => (admin ? admin.getStoragePolicy() : defaultStoragePolicy);
     const closeStorage = () =>
       (storageClosing ??= (async () => {
+        await closeDeletion();
         await storageWorker?.close();
         await storage?.close();
       })());
@@ -340,6 +358,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         assets?.verifyAvatar(identity, assetId) ?? Promise.resolve('unavailable'),
       getAuthPolicy,
       {
+        accountDeleted: (owner, finalizedAt) =>
+          deletionRef.current?.wake(owner, new Date(finalizedAt)),
         avatarChanged: syncAvatarHolder,
         avatarUrl: (identity, assetId) =>
           assets?.avatarUrl(identity, assetId) ?? Promise.resolve(null),
@@ -394,7 +414,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         const acquired =
           (compute =
           ownedCompute =
-            createComputeService(store, assetResources.objects, computeConfig));
+            createComputeService(
+              store,
+              assetResources.objects,
+              computeConfig,
+              async (attempt, result) => {
+                if (!deletionRef.current?.gc)
+                  throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+                await reclaimDeletedTranscode(attempt, result, deletionRef.current!.gc);
+              },
+            ));
         // Parent/child effects may unload concurrently: drain conversations before closing compute.
         ctx.effect(
           () => () => closeWithVideo([() => conversations?.close()], () => acquired.close()),
@@ -415,7 +444,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const store = await createMediaStore(assetConfig.databaseURL);
       let media: ReturnType<typeof createMediaService> | undefined;
       try {
-        const acquired = (media = createMediaService(store, assetResources.objects, computeConfig));
+        const acquired = (media = createMediaService(
+          store,
+          assetResources.objects,
+          computeConfig,
+          async (attempt, result, signal) => {
+            if (!deletionRef.current?.gc) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+            await reclaimDeletedMedia(
+              attempt,
+              result,
+              assetResources!.objects,
+              deletionRef.current!.gc,
+              signal,
+            );
+          },
+        ));
         derivatives = startAssetDerivatives(assetResources.store, acquired);
         ctx.effect(() => () => {
           const scheduler = derivatives?.close();
@@ -658,7 +701,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
         const owned = acquired;
         ctx.effect(() => async () => {
-          await owned.close();
+          await closeMioResources(closeDeletion, () => owned.close());
         });
         ctx.effect(() =>
           ctx.webServer.register({
@@ -733,6 +776,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             generationConfig.dataDirectory,
           );
         }
+        videoAccountDrain = videoExecutor?.drainAccount;
         const admission = (videoAdmission = createVideoGenerationService(
           videoStore,
           () => providers,
@@ -854,6 +898,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             yield policies.dispose;
             yield async () => {
               const failures: unknown[] = [];
+              await Promise.resolve(closeDeletion()).catch((error) => failures.push(error));
               try {
                 http?.close();
               } catch (error) {
@@ -979,6 +1024,45 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         });
       storageWorker = startStorageReconciliation(storage.store, sources);
     }
+    deletionRef.current = await createAccountDeletionRuntime({
+      auth,
+      authDatabaseURL: authConfig.databaseURL,
+      ...(providerConfig
+        ? {
+            providers: {
+              databaseURL: providerConfig.databaseURL,
+              drain: (owner: string) => audio?.drainAccount(owner) ?? Promise.resolve(),
+            },
+          }
+        : {}),
+      ...(notificationsConfig ? { notificationsDatabaseURL: notificationsConfig.databaseURL } : {}),
+      ...(materialConfig ? { materialsDatabaseURL: materialConfig.databaseURL } : {}),
+      ...(conversationConfig ? { conversations: () => conversations } : {}),
+      ...(assetConfig && assetResources && assets
+        ? {
+            media: {
+              databaseURL: assetConfig.databaseURL,
+              objects: assetResources.objects,
+              deleteEnabled: process.env.MIO_ASSETS_GC_DELETE_ENABLED === 'true',
+              ...(generationConfig ? { generationDirectory: generationConfig.dataDirectory } : {}),
+              cleanStaging: () => assets!.cleanup(),
+              drainAssets: (owner: string) => assets!.drainAccount(owner),
+              async drainGenerations(owner: string, kinds: readonly ('image' | 'video')[]) {
+                if (kinds.includes('image')) {
+                  if (!generations) throw new Error('LOCAL_GENERATION_VOLUME_NOT_OWNED');
+                  await generations.drainAccount(owner);
+                }
+                if (kinds.includes('video')) {
+                  if (!videoAccountDrain) throw new Error('LOCAL_VIDEO_VOLUME_NOT_OWNED');
+                  await videoAccountDrain(owner);
+                }
+              },
+            },
+          }
+        : {}),
+    });
+    auth.setDeletionDomains(deletionRef.current.domains);
+    ctx.effect(() => () => deletionRef.current!.close());
     const storageHandler = createStorageUsageHandler(
       () => storage?.store,
       auth.identity,

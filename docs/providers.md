@@ -144,3 +144,7 @@ selectChat 一致读取本人配置、目录、适配、偏好，不解密。fre
 [HTTP/加密测试](../tests/providers/providers.test.ts)、[刷新测试](../tests/providers/providers-refresh.test.ts)、[迁移测试](../tests/providers/providers-migration.test.ts)、[打包 Profile](../tests/providers/providers-profile.test.ts)与[目录参考测试](../tests/providers/providers-catalog.test.ts)各自提供实际观察。普通检查使用隔离 PG 和协议替身，不读取私有 Key 或自动调用供应商；宿主 provider 配置由[测试 setup](../tests/providers-setup.ts)隔离。
 
 显式 live 入口 `node tests/providers/providers-live.ts <authorized-private-key-file>` 经隔离账号、公开 HTTP、正式 Profile 保存本人 Key、发现目录、部署声明测试默认，并重启再发现；只输出受控元数据。真实目录成功不等于聊天、全部模型、媒体或生产验收。源异常、代理配置、原响应和 Key 不打印。
+
+## 注销关闭栅栏
+
+T0 后主服务立即关闭旧 userId 并清空可复用凭据；音频 admission／输出快照、记录、用户模型偏好、成员与音色配置按批补清。provider 域在本库事务内复核持久关闭栅栏，旧异步执行不能恢复配置或发布音频／创作消息。音频精确输出键须先交媒体域共享 GC 再删除本库定位；跨库没有共享事务或 FK。公网托管音色／素材不因此自动远端删除，遵循原独立授权。新 userId 不继承旧凭据。总完成口径见[永久注销](auth.md#永久注销与清理)。

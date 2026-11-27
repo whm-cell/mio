@@ -1,3 +1,9 @@
+import {
+  AccountResultClosed,
+  closedComputeJob,
+  guardDeletedResult,
+  readDeletedAttempt,
+} from '../deleted-results.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
@@ -139,19 +145,24 @@ export class ComputeStore {
 
   async claim(): Promise<{ command: ComputeCommandV1; lease: string } | undefined> {
     const lease = createId();
-    const row = (
-      await this.pool.query<{ command: ComputeCommandV1 }>(
-        `UPDATE mio_compute_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
-       WHERE id=(SELECT id FROM mio_compute_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now())
+    return computeTransaction(this.pool, async (client) => {
+      // Take capacity before outbox/owner trigger locks, as ACK and result transactions do.
+      await lockComputeCapacity(client);
+      const row = (
+        await client.query<{ command: ComputeCommandV1 }>(
+          `UPDATE mio_compute_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
+       WHERE id=(SELECT id FROM mio_compute_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now()) AND NOT EXISTS(SELECT 1 FROM mio_compute_jobs j JOIN mio_closed_accounts c ON c.user_id=j.owner_id WHERE j.id=mio_compute_outbox.job_id)
          ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING command`,
-        [lease],
-      )
-    ).rows[0];
-    return row ? { command: row.command, lease } : undefined;
+          [lease],
+        )
+      ).rows[0];
+      return row ? { command: row.command, lease } : undefined;
+    });
   }
 
   async sent(message: ComputeCommandV1, lease: string): Promise<void> {
     await computeTransaction(this.pool, async (client) => {
+      if (await guardDeletedResult(client, 'transcode', message.jobId)) return;
       const sent = await client.query(
         'UPDATE mio_compute_outbox SET sent_at=now(),lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL RETURNING id',
         [message.messageId, lease],
@@ -164,12 +175,21 @@ export class ComputeStore {
     });
   }
   async release(messageId: string, lease: string): Promise<void> {
-    await this.pool.query(
-      'UPDATE mio_compute_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
-      [messageId, lease],
-    );
+    await computeTransaction(this.pool, async (client) => {
+      await lockComputeCapacity(client);
+      await client.query(
+        'UPDATE mio_compute_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
+        [messageId, lease],
+      );
+    });
   }
 
+  deletedAttempt(result: { jobId: string; attemptId: string; commandId: string }) {
+    return readDeletedAttempt(this.pool, 'transcode', result);
+  }
+  commandClosed(jobId: string) {
+    return closedComputeJob(this.pool, 'transcode', jobId);
+  }
   async current(result: ComputeResultV1): Promise<boolean> {
     const row = (
       await this.pool.query<JobRow>('SELECT * FROM mio_compute_jobs WHERE id=$1', [result.jobId])
@@ -184,7 +204,9 @@ export class ComputeStore {
   }
 
   async accept(result: ComputeResultV1): Promise<void> {
-    await computeTransaction(this.pool, async (client) => {
+    return computeTransaction(this.pool, async (client) => {
+      if (await guardDeletedResult(client, 'transcode', result.jobId))
+        throw new AccountResultClosed();
       const recorded = await client.query(
         'INSERT INTO mio_compute_inbox(id,payload) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id',
         [result.messageId, JSON.stringify(result)],

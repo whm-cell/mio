@@ -247,11 +247,15 @@ it('commits cancel intent and control together, then lets cancellation win over 
 });
 async function waitForJobRowLock() {
   await vi.waitFor(async () => {
-    const waiting = await pool.query(`
+    const waiting = await pool.query(
+      `
       SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
       AND usename=current_user AND wait_event_type='Lock'
-      AND query LIKE 'SELECT * FROM mio_media_jobs%FOR UPDATE'
-    `);
+      AND query LIKE 'SELECT % FROM mio_media_jobs%FOR UPDATE'
+      AND application_name=$1
+    `,
+      [database.applicationName],
+    );
     expect(waiting.rowCount).toBe(1);
   });
 }

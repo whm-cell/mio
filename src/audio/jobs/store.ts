@@ -120,6 +120,11 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
     ).rows[0];
 
   return {
+    async accountClosed(owner: string) {
+      return Boolean(
+        (await query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner])).rowCount,
+      );
+    },
     creationOutbox: createAudioCreationOutbox(query),
     owned,
     request,
@@ -227,11 +232,11 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
         await q(
           `UPDATE mio_audio_jobs SET status='unknown',error_code='AUDIO_SUBMIT_UNKNOWN',
            lease_id=NULL,lease_until=NULL,updated_at=now()
-           WHERE status='submitted' AND (lease_until IS NULL OR lease_until<=now())`,
+           WHERE status='submitted' AND (lease_until IS NULL OR lease_until<=now()) AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id)`,
         );
         const active = await q(
           `SELECT id FROM mio_audio_jobs WHERE status IN ('queued','submitted','materializing')
-           AND lease_until>now() LIMIT 2`,
+           AND lease_until>now() AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id) LIMIT 2`,
         );
         if (active.rows.length >= 2) return;
         return (
@@ -240,7 +245,7 @@ export function createAudioStore(query: AudioQuery, transaction: Transaction, wh
              updated_at=now() WHERE id=(
                SELECT id FROM mio_audio_jobs WHERE status IN ('queued','materializing')
                AND (lease_until IS NULL OR lease_until<=now())
-               AND (NOT cancel_requested OR status='materializing') AND error_code IS NULL
+               AND (NOT cancel_requested OR status='materializing') AND error_code IS NULL AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_jobs.owner_id)
                ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED
              ) RETURNING ${executionColumns}`,
             [createId()],

@@ -398,6 +398,7 @@ export interface ConversationEngine {
     turnContext?: ConversationTurnContext,
   ): Promise<ConversationRunResult>;
   cancel(id: string, requestId: string): Promise<void>;
+  purgeSession?(id: string, signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 export class ConversationError extends HttpError {}

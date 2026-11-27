@@ -19,6 +19,7 @@ type AvatarAssetVerifier = (
 ) => Promise<AvatarAssetStatus>;
 
 interface AvatarCallbacks {
+  accountDeleted?: (userId: string, finalizedAt: string) => void;
   avatarChanged?: (userId: string) => Promise<void>;
   avatarUrl?: (
     identity: { userId: string; sessionId: string },
@@ -90,6 +91,7 @@ const routes = new Map([
   ['/phone-binding/confirm', 'POST'],
   ['/phone-rebind/send-otp', 'POST'],
   ['/phone-rebind/confirm', 'POST'],
+  ['/account-deletion/send-otp', 'POST'],
   ['/sign-in/social', 'POST'],
   ['/link-social', 'POST'],
   ['/callback/wechat', 'GET'],
@@ -197,7 +199,8 @@ async function handleProfileRequest(
 }
 
 function allowedMethodsFor(pathname: string, qrPoll: boolean): readonly string[] | undefined {
-  if (pathname === '/api/v1/me' || qrPoll) return ['GET'];
+  if (pathname === '/api/v1/me') return ['GET', 'DELETE'];
+  if (qrPoll) return ['GET'];
   if (pathname === '/api/v1/me/profile') return ['GET', 'PATCH'];
   if (pathname === '/api/v1/me/profile/avatar/normalize') return ['POST'];
   if (pathname === '/api/v1/me/wechat' || pathname === '/api/v1/me/onelink') return ['DELETE'];
@@ -274,7 +277,7 @@ export function createAuthHandler(
     if (isMutation && !origin) return fail(HTTP_STATUS.FORBIDDEN, 'ORIGIN_REQUIRED');
     if (
       isMutation &&
-      method !== 'DELETE' &&
+      (method !== 'DELETE' || pathname === '/api/v1/me') &&
       request.headers['content-type']?.split(';')[0]?.trim() !== 'application/json'
     )
       return fail(HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE, 'JSON_REQUIRED');
@@ -332,6 +335,26 @@ export function createAuthHandler(
       if (pathname === '/api/v1/me') {
         const identity = await auth.identity(headers);
         if (!identity) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+        if (method === 'DELETE') {
+          const body = await readJsonBody(request, AUTH_BODY_LIMIT_BYTES);
+          const result = await auth.deleteAccount(identity, body);
+          if (result.status === 'session_required')
+            return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+          if (result.status !== 'ok')
+            return fail(
+              HTTP_STATUS.BAD_REQUEST,
+              result.status === 'invalid_otp' ? 'INVALID_OTP' : 'INVALID_INPUT',
+            );
+          const secure = config.baseURL.startsWith('https:');
+          response.setHeader(
+            'set-cookie',
+            `${secure ? '__Secure-' : ''}mio.session_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`,
+          );
+          avatarCallbacks.accountDeleted?.(identity.userId, result.finalizedAt);
+          response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ status: true, finalizedAt: result.finalizedAt }));
+          return;
+        }
         response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
         response.end(JSON.stringify(identity));
         return;

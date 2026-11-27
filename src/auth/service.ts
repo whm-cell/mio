@@ -14,6 +14,9 @@ import { unlinkLoginMethod } from './login-methods.ts';
 import type { LoginProvider } from './login-methods.ts';
 import type { BindingIdentity } from './phone-store.ts';
 import { isSixDigitCode } from './phone.ts';
+import { cleanupAuthAccount, deleteAccount } from './deletion.ts';
+import { checkAccountDeletionSchema } from '../account-deletion/schema.ts';
+import { checkAuthDeletionGuards } from './deletion-schema.ts';
 
 const log = createLogger('app', 'auth');
 
@@ -59,8 +62,17 @@ export async function createAuthentication(
     }
     const auth = betterAuth(options);
     await auth.$context;
+    await checkAccountDeletionSchema(pool);
+    await checkAuthDeletionGuards(pool);
+    let deletionDomains: readonly string[] = ['auth', 'archive'];
     return {
       handler: auth.handler,
+      deleteAccount: (identity: BindingIdentity, body: Record<string, unknown>) =>
+        deleteAccount(pool, config.secret, identity, body, deletionDomains),
+      setDeletionDomains: (domains: readonly string[]) => {
+        deletionDomains = [...domains];
+      },
+      cleanupDeletedAccount: (userId: string) => cleanupAuthAccount(pool, userId),
       /** Business services receive this verified identity, never a userId supplied in a body. */
       async identity(headers: Headers) {
         const session = await auth.api.getSession({ headers, query: { disableRefresh: true } });

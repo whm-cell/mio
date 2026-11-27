@@ -1,3 +1,9 @@
+import {
+  AccountResultClosed,
+  closedComputeJob,
+  guardDeletedResult,
+  readDeletedAttempt,
+} from '../deleted-results.ts';
 import { createLogger } from '@mio/foundation/logging';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { checkMediaSchema } from './schema.ts';
@@ -176,6 +182,12 @@ export class MediaStore {
       return next;
     });
   }
+  deletedAttempt(result: { jobId: string; attemptId: string; commandId: string }) {
+    return readDeletedAttempt(this.pool, 'media', result);
+  }
+  commandClosed(jobId: string) {
+    return closedComputeJob(this.pool, 'media', jobId);
+  }
   async current(result: MediaResult): Promise<MediaJobRow | undefined> {
     const job = (
       await this.pool.query<MediaJobRow>('SELECT * FROM mio_media_jobs WHERE id=$1', [result.jobId])
@@ -190,7 +202,7 @@ export class MediaStore {
     manifest?: MediaManifest,
     verificationError?: string,
   ): Promise<void> {
-    await computeTransaction(this.pool, (client) =>
+    return computeTransaction(this.pool, (client) =>
       acceptMedia(client, result, manifest, verificationError),
     );
   }
@@ -198,20 +210,25 @@ export class MediaStore {
     lane: MediaCommandLane,
   ): Promise<{ command: MediaCommand | MediaControl; lease: string } | undefined> {
     const lease = createId();
-    const row = (
-      await this.pool.query<{ command: MediaCommand | MediaControl }>(
-        `UPDATE mio_media_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
-       WHERE id=(SELECT id FROM mio_media_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now())
+    return computeTransaction(this.pool, async (client) => {
+      // Take capacity before outbox/owner trigger locks, as ACK and result transactions do.
+      await lockComputeCapacity(client);
+      const row = (
+        await client.query<{ command: MediaCommand | MediaControl }>(
+          `UPDATE mio_media_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
+       WHERE id=(SELECT id FROM mio_media_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now()) AND NOT EXISTS(SELECT 1 FROM mio_media_jobs j JOIN mio_closed_accounts c ON c.user_id=j.owner_id WHERE j.id=mio_media_outbox.job_id)
        AND CASE WHEN command->>'type'='media.control' THEN 'control'
            WHEN command->>'operation'=ANY($3::text[]) THEN 'probe' ELSE 'encode' END=$2
        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING command`,
-        [lease, lane, probeOperations],
-      )
-    ).rows[0];
-    return row ? { command: row.command, lease } : undefined;
+          [lease, lane, probeOperations],
+        )
+      ).rows[0];
+      return row ? { command: row.command, lease } : undefined;
+    });
   }
   async sent(command: MediaCommand | MediaControl, lease: string): Promise<void> {
     await computeTransaction(this.pool, async (client) => {
+      if (await guardDeletedResult(client, 'media', command.jobId)) return;
       const sent = await client.query(
         'UPDATE mio_media_outbox SET sent_at=now(),lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL RETURNING id',
         [command.messageId, lease],
@@ -224,10 +241,13 @@ export class MediaStore {
     });
   }
   async release(id: string, lease: string): Promise<void> {
-    await this.pool.query(
-      'UPDATE mio_media_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
-      [id, lease],
-    );
+    await computeTransaction(this.pool, async (client) => {
+      await lockComputeCapacity(client);
+      await client.query(
+        'UPDATE mio_media_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
+        [id, lease],
+      );
+    });
   }
   close(): Promise<void> {
     return this.pool.end();
@@ -443,6 +463,7 @@ export async function acceptMedia(
   manifest?: MediaManifest,
   verificationError?: string,
 ): Promise<void> {
+  if (await guardDeletedResult(client, 'media', result.jobId)) throw new AccountResultClosed();
   const inserted = await client.query(
     'INSERT INTO mio_media_inbox(id,payload) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id',
     [result.messageId, JSON.stringify(result)],

@@ -22,6 +22,7 @@ const SESSION_GUARDED_PATHS = new Set([
   '/phone-binding/confirm',
   '/phone-rebind/send-otp',
   '/phone-rebind/confirm',
+  '/account-deletion/send-otp',
 ]);
 
 interface UserProfile {
@@ -64,10 +65,14 @@ interface ProfileRow {
 }
 
 const accountSchema = {
+  verification: {
+    fields: { scopeUserId: { type: 'string', required: false, index: true, input: false } },
+  },
   user: {
     fields: {
       disabled: { type: 'boolean', required: false, defaultValue: false, input: false },
       disabledAt: { type: 'date', required: false, input: false },
+      deletedAt: { type: 'date', required: false, input: false },
       displayId: { type: 'string', required: false, unique: true, input: false },
       avatarAssetId: { type: 'string', required: false, input: false },
     },
@@ -76,7 +81,10 @@ const accountSchema = {
 
 export function isUserDisabled(user: unknown): boolean {
   return Boolean(
-    user && typeof user === 'object' && (user as { disabled?: unknown }).disabled === true,
+    user &&
+    typeof user === 'object' &&
+    ((user as { disabled?: unknown }).disabled === true ||
+      (user as { deletedAt?: unknown }).deletedAt != null),
   );
 }
 
@@ -275,11 +283,11 @@ export function setUserDisabled(
   disabled: boolean,
 ): Promise<UserDisabledStatus | null> {
   return withAuthTransaction(pool, async (client) => {
-    const locked = await client.query<{ id: string }>(
-      'SELECT id FROM "user" WHERE id = $1 FOR UPDATE',
+    const locked = await client.query<{ id: string; deletedAt: Date | null }>(
+      'SELECT id,"deletedAt" FROM "user" WHERE id = $1 FOR UPDATE',
       [userId],
     );
-    if (!locked.rowCount) return null;
+    if (!locked.rowCount || locked.rows[0]!.deletedAt) return null;
     if (disabled) {
       const updated = await client.query<{ disabledAt: Date }>(
         `UPDATE "user"

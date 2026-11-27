@@ -97,6 +97,13 @@ export class GenerationStore {
     return this.videos;
   }
 
+  async accountClosed(owner: string): Promise<boolean> {
+    return Boolean(
+      (await this.pool.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner]))
+        .rowCount,
+    );
+  }
+
   async startExecutor(onLost: () => void): Promise<void> {
     const client = await this.pool.connect();
     try {
@@ -111,7 +118,7 @@ export class GenerationStore {
       await client.query(
         `UPDATE mio_image_executions
          SET claim_id=NULL,phase=CASE WHEN phase='querying' THEN 'waiting' ELSE phase END
-         WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying')`,
+         WHERE phase<>'done' AND (claim_id IS NOT NULL OR phase='querying') AND NOT EXISTS(SELECT 1 FROM mio_image_jobs j JOIN mio_closed_accounts c ON c.user_id=j.owner_id WHERE j.id=mio_image_executions.job_id)`,
       );
     } catch (error) {
       client.release(true);
@@ -268,7 +275,7 @@ export class GenerationStore {
         `UPDATE mio_image_executions SET claim_id=$1,updated_at=now()
          WHERE job_id=(SELECT e.job_id FROM mio_image_executions e
            JOIN mio_image_jobs j ON j.id=e.job_id
-           WHERE e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing')
+           WHERE e.claim_id IS NULL AND e.phase IN ('ready','submitting','waiting','materializing') AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=j.owner_id)
            AND (e.phase <> 'waiting' OR j.next_query_at IS NULL OR j.next_query_at<=statement_timestamp())
            ORDER BY j.created_at LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
          RETURNING job_id`,

@@ -90,7 +90,7 @@ export async function loginCallbackIsCurrent(
   return !invalidated.rowCount;
 }
 
-async function invalidateLoginCallbacks(
+export async function invalidateLoginCallbacks(
   client: PoolClient,
   provider: LoginProvider,
   subject: string,

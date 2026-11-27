@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 export const notificationSchemaSQL = `
@@ -24,7 +25,8 @@ CREATE INDEX IF NOT EXISTS mio_announcements_visible_idx
   ON mio_announcements(published_at DESC, id DESC) WHERE status='published' AND enabled;
 CREATE INDEX IF NOT EXISTS mio_announcements_popup_idx
   ON mio_announcements(published_at DESC, id DESC) WHERE status='published' AND enabled AND popup;
-`;
+
+${accountClosureSchemaSQL([['mio_announcement_reads', 'user_id']])}`;
 
 /** Startup and migration share a read-only structure check. No startup DDL or backfill. */
 export async function checkNotificationSchema(pool: Pick<Pool, 'query'>): Promise<void> {

@@ -1,3 +1,5 @@
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
@@ -200,6 +202,7 @@ beforeAll(async () => {
     MIO_AUTH_WECHAT_APP_SECRET: 'fixture-secret',
   })!;
   await (await getMigrations(authOptions(config, pool))).runMigrations();
+  await pool.query(authDeletionGuardsSQL);
   await pool.query(providerSchemaSQL);
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
@@ -901,6 +904,8 @@ it('requires explicit QR schema migration and includes its indexes idempotently'
     const pending = await getMigrations(authOptions(config, oldPool));
     expect(pending.toBeCreated.some((entry) => entry.table === 'mioWechatQR')).toBe(true);
     await pending.runMigrations();
+    await oldPool.query(accountDeletionSchemaSQL);
+    await oldPool.query(authDeletionGuardsSQL);
     const current = await getMigrations(authOptions(config, oldPool));
     expect(current.toBeCreated).toHaveLength(0);
     expect(current.toBeAddedIndexes).toHaveLength(0);

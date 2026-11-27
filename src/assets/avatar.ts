@@ -178,6 +178,7 @@ export function createAvatarOperations(
             if (statusCode(error) !== 404) throw error;
           }
           if (!published) {
+            await store.rememberObject(owner.userId, key);
             try {
               const value = await wait(
                 () => objects.putImage!(key, output, 'webp', sha256, signal, 'private'),

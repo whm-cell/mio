@@ -1,3 +1,4 @@
+import { parseAccountDeletionTombstone } from '../account-deletion/tombstone.ts';
 import { createHash } from 'node:crypto';
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
 import { sha256Bytes } from '@mio/foundation/hash';
@@ -37,6 +38,19 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     Timeout: 60_000,
     FollowRedirect: false,
   });
+  const writes = new Map<string, Set<Promise<unknown>>>();
+  const trackWrite = <T>(key: string, run: () => Promise<T>): Promise<T> => {
+    const entries = writes.get(key) ?? new Set();
+    writes.set(key, entries);
+    const pending = Promise.resolve().then(run);
+    entries.add(pending);
+    const done = () => {
+      entries.delete(pending);
+      if (!entries.size) writes.delete(key);
+    };
+    void pending.then(done, done);
+    return pending;
+  };
   const requestWithoutBody = async (
     Key: string,
     Method: 'PUT' | 'DELETE',
@@ -174,27 +188,29 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
     contentType: string,
     sha256: string,
     signal: AbortSignal,
-    label: 'AUDIO' | 'IMAGE',
+    label: 'AUDIO' | 'IMAGE' | 'AUDIT',
     acl?: 'private',
   ) => {
     signal.throwIfAborted();
     const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     if (sha256Bytes(body) !== sha256) throw new Error(label + '_OUTPUT_INVALID');
-    const uploaded = await cos.putObject({
-      Bucket,
-      Region,
-      Key,
-      // The SDK cannot retry a consumed stream; reconcile this key before any new PUT.
-      Body: Readable.from(body),
-      ContentLength: body.length,
-      ContentType: contentType,
-      'x-cos-meta-sha256': sha256,
-      ...(label === 'AUDIO' || acl ? { ACL: 'private' } : {}),
-      Headers: {
-        'x-cos-forbid-overwrite': 'true',
-        'Content-MD5': createHash('md5').update(body).digest('base64'),
-      },
-    });
+    const uploaded = await trackWrite(Key, () =>
+      cos.putObject({
+        Bucket,
+        Region,
+        Key,
+        // The SDK cannot retry a consumed stream; reconcile this key before any new PUT.
+        Body: Readable.from(body),
+        ContentLength: body.length,
+        ContentType: contentType,
+        'x-cos-meta-sha256': sha256,
+        ...(label !== 'IMAGE' || acl ? { ACL: 'private' as const } : {}),
+        Headers: {
+          'x-cos-forbid-overwrite': 'true',
+          'Content-MD5': createHash('md5').update(body).digest('base64'),
+        },
+      }),
+    );
     signal.throwIfAborted();
     if (!uploaded.ETag) throw new Error(label + '_OUTPUT_MISMATCH');
     return {
@@ -235,6 +251,58 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       }),
     );
   return {
+    hasPendingWrites: (key) => Boolean(writes.get(key)?.size),
+    async archiveAccountDeletion(value, signal) {
+      value = parseAccountDeletionTombstone(value);
+      const Key = 'mio/audit/account-deletions/' + encodeURIComponent(value.userId) + '.json';
+      const bytes = Buffer.from(
+        JSON.stringify({ userId: value.userId, finalizedAt: value.finalizedAt }),
+      );
+      const sha256 = sha256Bytes(bytes);
+      let stored: Awaited<ReturnType<typeof head>> | undefined;
+      try {
+        stored = await head(Key, signal);
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      }
+      if (!stored) {
+        await putObject(Key, bytes, 'application/json', sha256, signal, 'AUDIT', 'private');
+        stored = await head(Key, signal);
+      }
+      if (stored.size !== bytes.length || stored.sha256 !== sha256)
+        throw new Error('ACCOUNT_TOMBSTONE_CONFLICT');
+      const archived = await readObject(Key, stored.etag, stored.size, signal);
+      if (
+        sha256Bytes(archived) !== sha256 ||
+        (await cos.getObjectAcl({ Bucket, Region, Key })).ACL !== 'private'
+      )
+        throw new Error('ACCOUNT_TOMBSTONE_UNCONFIRMED');
+    },
+    async *accountDeletionTombstones(signal) {
+      const Prefix = 'mio/audit/account-deletions/';
+      let Marker = '';
+      for (;;) {
+        signal.throwIfAborted();
+        const page = await cos.getBucket({ Bucket, Region, Prefix, Marker, MaxKeys: 100 });
+        for (const item of page.Contents ?? []) {
+          const key = item.Key;
+          if (!key.startsWith(Prefix) || !key.endsWith('.json'))
+            throw new Error('ACCOUNT_TOMBSTONE_INVALID');
+          const meta = await head(key, signal);
+          if (meta.size > 1024) throw new Error('ACCOUNT_TOMBSTONE_INVALID');
+          const bytes = await readObject(key, meta.etag, meta.size, signal);
+          if (sha256Bytes(bytes) !== meta.sha256) throw new Error('ACCOUNT_TOMBSTONE_INVALID');
+          const value = parseAccountDeletionTombstone(bytes);
+          if (key !== Prefix + encodeURIComponent(value.userId) + '.json')
+            throw new Error('ACCOUNT_TOMBSTONE_INVALID');
+          yield value;
+        }
+        if (String(page.IsTruncated) !== 'true') break;
+        if (!page.NextMarker || page.NextMarker === Marker)
+          throw new Error('ACCOUNT_TOMBSTONE_PAGE_INVALID');
+        Marker = page.NextMarker;
+      }
+    },
     uploadUrl(Key, size, acl) {
       return encodeUrlToken(
         cos.getObjectUrl({
@@ -325,17 +393,19 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       const abort = () => stream.destroy(new Error('VIDEO_UPLOAD_ABORTED'));
       signal.addEventListener('abort', abort, { once: true });
       try {
-        const uploaded = await cos.putObject({
-          Bucket,
-          Region,
-          Key,
-          Body: stream,
-          ContentLength: sizeBytes,
-          ContentType: 'video/mp4',
-          ACL: 'private',
-          'x-cos-meta-sha256': sha256,
-          Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': contentMd5 },
-        });
+        const uploaded = await trackWrite(Key, () =>
+          cos.putObject({
+            Bucket,
+            Region,
+            Key,
+            Body: stream,
+            ContentLength: sizeBytes,
+            ContentType: 'video/mp4',
+            ACL: 'private',
+            'x-cos-meta-sha256': sha256,
+            Headers: { 'x-cos-forbid-overwrite': 'true', 'Content-MD5': contentMd5 },
+          }),
+        );
         signal.throwIfAborted();
         if (!uploaded.ETag) throw new Error('VIDEO_OUTPUT_MISMATCH');
         return { key: Key, sizeBytes, sha256, etag: uploaded.ETag, contentType: 'video/mp4' };
@@ -352,15 +422,17 @@ export function createCosStorage(config: AssetConfig): AssetObjectStore {
       { signal, contentType = 'application/octet-stream', sha256 },
     ) {
       const sourcePath = `${Bucket}.cos.${Region}.myqcloud.com/${encodeURIComponent(source)}`;
-      const copied = await requestWithoutBody(target, 'PUT', signal, {
-        'Content-Type': contentType,
-        'x-cos-copy-source': sourcePath,
-        'x-cos-copy-source-If-Match': etag,
-        'x-cos-metadata-directive': 'Replaced',
-        ...(sha256 === undefined ? { 'Cache-Control': '' } : { 'x-cos-meta-sha256': sha256 }),
-        ...(acl ? { 'x-cos-acl': acl } : {}),
-        'x-cos-forbid-overwrite': 'true',
-      });
+      const copied = await trackWrite(target, () =>
+        requestWithoutBody(target, 'PUT', signal, {
+          'Content-Type': contentType,
+          'x-cos-copy-source': sourcePath,
+          'x-cos-copy-source-If-Match': etag,
+          'x-cos-metadata-directive': 'Replaced',
+          ...(sha256 === undefined ? { 'Cache-Control': '' } : { 'x-cos-meta-sha256': sha256 }),
+          ...(acl ? { 'x-cos-acl': acl } : {}),
+          'x-cos-forbid-overwrite': 'true',
+        }),
+      );
       signal.throwIfAborted();
       // COS can return HTTP 200 with an XML Error instead of CopyObjectResult.
       if (sha256 === undefined) {

@@ -48,7 +48,13 @@
       "src/integrations/cos.ts",
       "src/integrations/redis.ts",
       "src/integrations/rabbitmq-monitor.ts",
-      "src/generations/video/contracts.ts"
+      "src/generations/video/contracts.ts",
+      "src/account-deletion/schema.ts",
+      "src/account-deletion/domain-schema.ts",
+      "src/assets/gc-schema.ts",
+      "src/auth/deletion.ts",
+      "src/auth/deletion-schema.ts",
+      "src/account-deletion/store.ts"
     ]
   },
   "documentRoots": [

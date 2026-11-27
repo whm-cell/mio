@@ -75,10 +75,12 @@ it.each(['full', 'no-admin', 'no-video'] as const)(
       };
       for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
       vi.spyOn(Auth, 'createAuthentication').mockResolvedValue({
+        setDeletionDomains: () => {},
+        cleanupDeletedAccount: async () => ({ done: true, remaining: 0 }),
         identity: async (headers: Headers) =>
           headers.get('cookie') === 'session=fixture' ? actor : null,
         close: async () => {},
-      } as Authentication);
+      } as unknown as Authentication);
       vi.spyOn(Cos, 'createCosStorage').mockReturnValue({
         head: vi.fn().mockRejectedValue(new Error('unexpected COS')),
         putImage: vi.fn().mockRejectedValue(new Error('unexpected COS')),

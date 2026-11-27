@@ -1,3 +1,5 @@
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 import { spawnSync } from 'node:child_process';
 import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -322,6 +324,8 @@ describe('OneLink schema migration & unconfigured/disabled gating', () => {
       const pending = await getMigrations(authOptions(config, oldPool));
       expect(pending.toBeCreated.some((entry) => entry.table === 'mioOneLinkPending')).toBe(true);
       await pending.runMigrations();
+      await oldPool.query(accountDeletionSchemaSQL);
+      await oldPool.query(authDeletionGuardsSQL);
 
       const current = await getMigrations(authOptions(config, oldPool));
       expect(current.toBeCreated).toHaveLength(0);

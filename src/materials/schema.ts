@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 /** Unit 1 owns three tables; authentication sessions and video references arrive with their consumers. */
@@ -68,7 +69,12 @@ CREATE TABLE IF NOT EXISTS mio_material_operations (
  FOREIGN KEY(owner_id,target_material_id) REFERENCES mio_materials(owner_id,id)
 );
 CREATE INDEX IF NOT EXISTS mio_material_operations_recovery ON mio_material_operations(next_query_at,lease_until) WHERE state IN ('creating','deleting','unknown');
-${materialStorageSchemaSQL}`;
+${materialStorageSchemaSQL}
+${accountClosureSchemaSQL([
+  ['mio_material_groups', 'owner_id'],
+  ['mio_materials', 'owner_id'],
+  ['mio_material_operations', 'owner_id'],
+])}`;
 
 export async function checkMaterialSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   const storage = await pool.query(`SELECT 1 FROM pg_trigger WHERE tgrelid='mio_materials'::regclass

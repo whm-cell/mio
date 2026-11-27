@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 export const creationLogSchemaSQL = `
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS mio_audio_creation_receipts (
 );
 CREATE INDEX IF NOT EXISTS mio_audio_creation_receipts_expiry_idx
   ON mio_audio_creation_receipts(recorded_at, event_id);
-`;
+
+${accountClosureSchemaSQL([['mio_creation_logs', 'owner_id']])}`;
 
 /** Startup only inspects structures. Existing installations must explicitly migrate. */
 export async function checkCreationLogSchema(pool: Pick<Pool, 'query'>): Promise<void> {

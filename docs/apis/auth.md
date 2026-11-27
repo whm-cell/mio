@@ -6,11 +6,11 @@
 
 ## 本域共同约定
 
-只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST、PATCH 与 DELETE 必须携带允许的 Origin；POST 与 PATCH 另须为 JSON，正文最多 16 KiB、读取超时 10 秒。本文列出的 DELETE 不需要正文。浏览器请求使用 `credentials: 'include'`。
+只开放下列认证路由，其他库插件、邮箱修改、邮件找回、Better Auth 自带账号删除及未列出的 OAuth 入口不隐式开放。所有 POST、PATCH 与 DELETE 必须携带允许的 Origin；POST、PATCH 及账号注销 DELETE /api/v1/me 另须为 JSON，正文最多 16 KiB、读取超时 10 秒。登录方式解绑的 DELETE 不需要正文；账号注销 DELETE 必须提交 JSON。浏览器请求使用 `credentials: 'include'`。
 
 OPTIONS 预检同样必须携带允许的 Origin，只允许目标入口的方法和相应请求头，并允许 Cookie 凭据；204 无正文且不设置 JSON Content-Type。它与 Foundation 的 GET/Authorization、无 Cookie 预检不是同一套协议。无效 Origin 先于路由、方法和凭据处理而拒绝；缺少 Origin 时，未知路由仍先返回 404，已知 POST／PATCH／DELETE 与预检才返回 403。
 
-邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink`、`/api/auth/onelink/pending`、`/api/auth/onelink/existing/send-otp` 与 `/api/auth/onelink/complete` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
+邮箱/密码登录开关与短信验证模式由运行时认证策略控制：未启用管理后台或尚未写入全局配置时回落到启动环境默认（`MIO_AUTH_EMAIL_PASSWORD_ENABLED`，默认 `true`；短信模式默认为 `live`）；启用管理后台后可通过[全局配置](admin.md#patch-apiv1adminsettingsglobal)在线热更新，无需重启服务（不新增 `GET /api/auth/methods` 或其他 C 端公开探测接口）。当运行时策略 `emailPasswordEnabled=false` 时，`/api/auth/sign-up/email`、`/api/auth/sign-in/email` 与 `/api/auth/change-password` 在完成来源、方法与 JSON 校验后直接返回 `503 EMAIL_PASSWORD_UNAVAILABLE`（不消费限流额度），不影响短信验证码、微信扫码及既有有效会话的查询与退出。万联 OneLink 登录同步受服务端 `.env` 就绪度与管理端[万联 SSO 运行期热开关](admin.md#patch-apiv1adminonelinksso)（默认关闭）双重门控；未配置或热开关关闭时，`/api/auth/onelink/start`、`/api/auth/callback/onelink`、`/api/auth/onelink/pending`、`/api/auth/onelink/existing/send-otp` 与 `/api/auth/onelink/complete` 返回 `503 ONELINK_UNAVAILABLE`，`/api/auth/onelink/cancel` 仍可用于清理遗留待处理 Cookie。被禁用或永久注销账号在全部登录入口均被拒绝签发会话，已有或遗留会话在 `/api/v1/me`、`/api/v1/me/profile`、`/api/auth/get-session` 及受会话保护的认证接口上均按无效处理。
 
 cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域 cookie domain。固定 BASE_URL，不信任 Host/转发头决定 URL。前端与服务应同站点或同源反向代理部署；Origin 白名单不会让不同站点的浏览器发送 Lax cookie。本仓库不提供登录页面；浏览器与真实供应商的验收按具体候选单独记录。
 
@@ -27,6 +27,7 @@ cookie 使用 HttpOnly、SameSite=Lax，HTTPS 配置带 Secure，不设置跨域
 | `/sign-in/email`                                                                                               | 60 秒 / 10 次        |
 | `/sign-up/email`                                                                                               | 60 秒 / 5 次         |
 | `/phone-number/send-otp`、`/phone-binding/send-otp`                                                            | 各自 60 秒 / 100 次  |
+| `/account-deletion/send-otp`                                                                                   | 60 秒 / 100 次       |
 | `/phone-rebind/send-otp`                                                                                       | 60 秒 / 100 次       |
 | `/phone-rebind/confirm`                                                                                        | 60 秒 / 10 次        |
 | `/phone-number/verify`、`/phone-binding/confirm`                                                               | 各自 60 秒 / 10 次   |
@@ -444,6 +445,32 @@ QR 创建按直接连接 IP 共享额度，不额外消费内部复用的普通 
 错误：无效、过期、撤销、账号已禁用或仅有服务 token 时返回 401；其他错误见共同约定。
 
 副作用：只校验身份，不刷新会话或 cookie，也不授予项目/资产访问权。
+
+## POST /api/auth/account-deletion/send-otp
+
+身份：数据库权威的本人 Cookie 会话，原会话创建距今不足 10 分钟；不通过刷新会话更新时间绕过原创建时间。
+
+输入：严格 JSON `{}`；不接收手机号、userId、sessionId 或其他字段。只向本人当前已验证手机号发注销专用码。无已验证手机号返回 `409 PHONE_REQUIRED`。
+
+成功：`{status:true,expiresIn:300}`。挑战绑定注销用途、原 userId、原 sessionId 和当前号码，5 分钟过期、最多 3 次错误尝试；普通登录、绑定、换绑及其他会话的码不可替代。真实短信复用现行 `global:account_ops` 子预算和 IP／手机号预算；bypass 同样须先创建并激活持久挑战，不能直接提交全局测试码。
+
+错误：无有效近期原会话 `401 SESSION_REQUIRED`；错误输入 `400`；限额 `429 SMS_RATE_LIMITED`；短信停用、未配置、发送失败或存储不可用 `503 SMS_UNAVAILABLE`。Origin、JSON、正文与基础设施包装沿共同约定。
+
+副作用：发送注销专用验证码，消费现有账号操作短信预算；不提交注销。
+
+## DELETE /api/v1/me
+
+身份：本人原会话，创建距今不足 10 分钟。所有 DELETE mutation 同样要求精确允许的 Origin；`MIO_API_TOKEN` 不提供用户身份。
+
+输入：有已验证手机号时严格 `{code:"六位数字"}`；无已验证手机号时严格 `{}`。确认页须明确告知立即永久注销、所有设备退出、原账号与作品无法恢复，并让用户先下载要保留的作品；无号场景明确二次确认。服务端不提供冷静期或恢复入口。
+
+成功：`{status:true,finalizedAt:"ISO-8601"}`，清除 `mio.session_token` Cookie。认证库短事务锁定原用户，复核原会话／挑战，消费码、记录永久终态、撤销全部会话、释放手机号／微信／万联／登录邮箱并登记唯一清理任务；登记失败整体回滚。提交成功但响应丢失不撤销任务，原 Cookie 后续按 401 处理。
+
+永久终态与管理员暂时停用不同，普通解禁、旧回调、旧验证码和 U2 重绑均不能恢复旧 userId。同一登录身份可重新注册全新 userId。清理只按旧 userId 和确切资源，不影响新账号或平台公共公告。
+
+错误：无有效近期原会话 `401 UNAUTHORIZED`；缺码、额外字段、码格式错误 `400 INVALID_INPUT`；错误、过期、用途／会话／号码不符的码 `400 INVALID_OTP`；正文及 Origin 沿共同约定，数据库事务失败返回脱敏 `503 AUTH_UNAVAILABLE`。成功表示注销事务已提交；24 小时在线清理、外部墓碑归档、GC、备份轮转与恢复的完成口径见[账号注销运行规则](../auth.md#永久注销与清理)。
+
+副作用：永久关闭旧号、撤销全部设备、释放登录身份并持久触发逐域清理；清理不随请求断线停止。
 
 ## DELETE /api/v1/me/wechat
 

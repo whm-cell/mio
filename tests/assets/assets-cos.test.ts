@@ -1088,6 +1088,8 @@ it('returns the private upload header and conditionally publishes audio from onl
     created_at: new Date(),
   };
   const store = {
+    accountClosed: async () => false,
+    rememberObject: async () => {},
     create: async (created: string, owner: string, filename: string) => ({
       ...row,
       id: created,

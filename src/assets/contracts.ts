@@ -11,6 +11,14 @@ export interface AssetPrincipal {
 }
 
 export interface AssetObjectStore {
+  hasPendingWrites?(key: string): boolean;
+  archiveAccountDeletion?(
+    value: { userId: string; finalizedAt: string },
+    signal: AbortSignal,
+  ): Promise<void>;
+  accountDeletionTombstones?(
+    signal: AbortSignal,
+  ): AsyncIterable<{ userId: string; finalizedAt: string }>;
   uploadUrl(key: string, size: number, acl?: 'private'): string;
   downloadUrl(key: string): string;
   avatarInlineUrl?(key: string, contentType: string): string;

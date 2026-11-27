@@ -178,7 +178,7 @@ it('preserves auth wrapper responses, preflights and Origin precedence through t
       expect(response.headers.get('content-type')).toBeNull();
       expect(await response.text()).toBe('');
       expect(response.headers.get('access-control-allow-methods')).toBe(
-        scenario.path === '/api/v1/me' ? 'GET, OPTIONS' : 'POST, OPTIONS',
+        scenario.path === '/api/v1/me' ? 'GET, DELETE, OPTIONS' : 'POST, OPTIONS',
       );
       expect(response.headers.get('access-control-allow-headers')).toBe('Content-Type');
     } else {

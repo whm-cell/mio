@@ -143,6 +143,20 @@ export async function createCreationLogStore(
         client.on('error', disconnected);
         try {
           await client.query('BEGIN');
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('mio:closed-account:'||$1,0))",
+            [event.ownerId],
+          );
+          if (
+            (
+              await client.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [
+                event.ownerId,
+              ])
+            ).rowCount
+          ) {
+            await client.query('COMMIT');
+            return;
+          }
           const days = retentionDays();
           const receipt = await client.query<{ in_window: boolean }>(
             `INSERT INTO mio_audio_creation_receipts(event_id) VALUES($1) ON CONFLICT DO NOTHING

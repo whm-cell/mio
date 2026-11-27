@@ -195,6 +195,7 @@ async function fixture() {
       storage,
       { inspect, close: async () => {} },
       {
+        rememberObject: (owner, key) => assets.rememberObject(owner, key),
         owned: (id, owner) => assets.owned(id, owner),
         checkAudioPublicationIdentity: (input) => assets.checkAudioPublicationIdentity(input),
         publishAudio,

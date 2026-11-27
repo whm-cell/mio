@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
+import { MixedSessionPersistence } from './mixed-session-persistence.ts';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
@@ -794,6 +795,12 @@ export function createDshConversationEngine(
       const handle = await entry.opening;
       handle.agent.cancel({ kind: 'user' });
       await handle.agent.whenIdle();
+    },
+    async purgeSession(id, signal) {
+      const persistence = ctx.get('sessionPersistence');
+      if (!(persistence instanceof MixedSessionPersistence))
+        throw new Error('LOCAL_SESSION_VOLUME_NOT_OWNED');
+      await inSessionOrder(id, () => persistence.purgeMioSession(id, signal));
     },
     close() {
       return (closing ??= (async () => {

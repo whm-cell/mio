@@ -60,6 +60,38 @@ export class AssetStore {
     this.derivativesEnabled = derivativesEnabled;
   }
 
+  async accountClosed(owner: string): Promise<boolean> {
+    return Boolean(
+      (await this.pool.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner]))
+        .rowCount,
+    );
+  }
+  async rememberObject(owner: string, key: string) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('mio:closed-account:'||$1,0))",
+        [owner],
+      );
+      if (
+        (await client.query('SELECT 1 FROM mio_closed_accounts WHERE user_id=$1', [owner])).rowCount
+      )
+        throw new Error('ACCOUNT_DELETED');
+      await client.query(
+        `INSERT INTO mio_asset_gc_objects(object_key,owner_id,state) VALUES($1,$2,'held')
+        ON CONFLICT(object_key) DO NOTHING`,
+        [key, owner],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async create(id: string, owner: string, filename: string, contentType: string, size: number) {
     return (
       await this.pool.query<AssetRow>(
@@ -288,9 +320,14 @@ export class AssetStore {
   async expiredStaging(after?: {
     expires_at: string;
     id: string;
-  }): Promise<{ id: string; staging_key: string; expires_at: string }[]> {
+  }): Promise<{ id: string; staging_key: string; expires_at: string; owner_closed: boolean }[]> {
     return (
-      await this.pool.query<{ id: string; staging_key: string; expires_at: string }>(
+      await this.pool.query<{
+        id: string;
+        staging_key: string;
+        expires_at: string;
+        owner_closed: boolean;
+      }>(
         `WITH selected AS (
            SELECT id FROM mio_assets WHERE expires_at<=now() AND staging_deleted_at IS NULL AND staging_key IS NOT NULL
            AND (state<>'finalizing' OR lease_until<=now())
@@ -300,8 +337,8 @@ export class AssetStore {
            UPDATE mio_assets SET state=CASE WHEN state='ready' THEN state ELSE 'expired' END
            WHERE id IN (SELECT id FROM selected)
            AND expires_at<=now() AND staging_deleted_at IS NULL
-           AND (state<>'finalizing' OR lease_until<=now()) RETURNING id,staging_key,expires_at
-         ) SELECT id,staging_key,expires_at::text FROM updated ORDER BY expires_at,id`,
+           AND (state<>'finalizing' OR lease_until<=now()) RETURNING id,owner_id,staging_key,expires_at
+         ) SELECT id,staging_key,expires_at::text,EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=updated.owner_id) AS owner_closed FROM updated ORDER BY expires_at,id`,
         [after?.expires_at ?? null, after?.id ?? null],
       )
     ).rows;

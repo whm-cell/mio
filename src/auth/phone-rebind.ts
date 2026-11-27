@@ -15,6 +15,7 @@ import {
   activatePhoneChallenge,
   consumePhoneRebindChallenge,
   reservePhoneRebindChallenge,
+  reserveAccountDeletionChallenge,
 } from './phone-store.ts';
 
 function fail(code: string): never {
@@ -58,6 +59,45 @@ export function phoneRebindPlugin(
   return {
     id: 'mio-phone-rebind',
     endpoints: {
+      sendAccountDeletionOTP: createAuthEndpoint(
+        '/account-deletion/send-otp',
+        { method: 'POST' },
+        async (ctx) => {
+          if (
+            !ctx.body ||
+            typeof ctx.body !== 'object' ||
+            Array.isArray(ctx.body) ||
+            Object.keys(ctx.body).length
+          )
+            throw new APIError('BAD_REQUEST', { code: 'INVALID_INPUT', message: 'INVALID_INPUT' });
+          const binding = await recentSession(ctx);
+          const current = policy();
+          if (
+            current.smsMode === 'disabled' ||
+            (current.smsMode === 'live' && !sms) ||
+            (current.smsMode === 'bypass' && !isSixDigitCode(current.smsBypassCode))
+          )
+            return fail('SMS_UNAVAILABLE');
+          const ip = ctx.headers ? getIP(ctx.headers, ctx.context.options) : null;
+          if (!ip) return fail('SMS_UNAVAILABLE');
+          try {
+            const challenge = await reserveAccountDeletionChallenge(
+              pool,
+              sms?.tables,
+              config.secret,
+              config.smsLimits,
+              ip,
+              binding,
+              current.smsMode === 'bypass' ? current.smsBypassCode! : undefined,
+            );
+            if (current.smsMode === 'live') await sms!.sender(challenge.phone, challenge.code);
+            if (!(await activatePhoneChallenge(pool, challenge.id))) return fail('SMS_UNAVAILABLE');
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : 'SMS_UNAVAILABLE');
+          }
+          return ctx.json({ status: true, expiresIn: 300 });
+        },
+      ),
       sendPhoneRebindOTP: createAuthEndpoint(
         '/phone-rebind/send-otp',
         { method: 'POST' },

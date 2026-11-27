@@ -41,6 +41,8 @@ export function allowsCapability(
   if (
     name === 'fs' &&
     [
+      'src/dsh/account-deletion.ts',
+      'src/generations/account-deletion.ts',
       'src/generations/image/files.ts',
       'src/generations/video/media.ts',
       'src/generations/video/submission-receipts.ts',

@@ -108,6 +108,9 @@ it('replays each retained geometry key order after reopening without credentials
       retained.push(await retainLegacy(randomUUID(), { ...intent, geometry: oldGeometry }));
     }
     expect(new Set(retained.map(({ hash }) => hash)).size).toBe(24);
+    await f.pool.query('DELETE FROM mio_asset_holders WHERE asset_id=ANY($1::uuid[])', [
+      intent.imageAssetIds,
+    ]);
     await f.pool.query('DELETE FROM mio_assets WHERE id=ANY($1::uuid[])', [intent.imageAssetIds]);
     await f.start();
     await f.stop();
@@ -193,6 +196,9 @@ it('replays historically admitted null parameters over HTTP without admitting a 
     const previous = await Promise.all(
       retained.map(({ parameters, input }) => retainLegacy(randomUUID(), parameters, input)),
     );
+    await f.pool.query('DELETE FROM mio_asset_holders WHERE asset_id=ANY($1::uuid[])', [
+      imageAssetIds,
+    ]);
     await f.pool.query('DELETE FROM mio_assets WHERE id=ANY($1::uuid[])', [imageAssetIds]);
     const provider = await f.provider.get(f.actor);
     await f.provider.settings(f.actor, provider!.revision, { enabled: false });

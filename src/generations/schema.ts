@@ -1,5 +1,6 @@
 import { creationLogSchemaSQL, checkCreationLogSchema } from '../notifications/creation-schema.ts';
 import type { Pool } from 'pg';
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 
 /** The media database is retained; this migration never rebuilds jobs or assets. */
 export const generationSchemaSQL = `${creationLogSchemaSQL}
@@ -102,7 +103,15 @@ CREATE TABLE IF NOT EXISTS mio_video_outputs (
   has_audio boolean,
   PRIMARY KEY(job_id,output_index),
   CHECK (phase <> 'registered' OR asset_id IS NOT NULL)
-);`;
+);
+${accountClosureSchemaSQL([
+  ['mio_image_jobs', 'owner_id'],
+  ['mio_image_executions', 'mio_image_jobs', 'job_id'],
+  ['mio_image_outputs', 'mio_image_jobs', 'job_id'],
+  ['mio_video_jobs', 'owner_id'],
+  ['mio_video_executions', 'mio_video_jobs', 'job_id'],
+  ['mio_video_outputs', 'mio_video_jobs', 'job_id'],
+])}`;
 
 export async function checkGenerationSchema(database: Pick<Pool, 'query'>): Promise<void> {
   await checkCreationLogSchema(database);

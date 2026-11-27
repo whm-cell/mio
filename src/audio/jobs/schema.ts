@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 /** Incremental provider-pool migration. */
@@ -36,7 +37,12 @@ CREATE TABLE IF NOT EXISTS mio_audio_creation_outbox (
 );
 CREATE INDEX IF NOT EXISTS mio_audio_creation_outbox_pending
  ON mio_audio_creation_outbox(occurred_at,event_id) WHERE delivered_at IS NULL AND dead_lettered_at IS NULL;
-`;
+
+${accountClosureSchemaSQL([
+  ['mio_audio_jobs', 'owner_id'],
+  ['mio_audio_records', 'owner_id'],
+  ['mio_audio_creation_outbox', 'owner_id'],
+])}`;
 
 export async function checkAudioSchema(database: Pick<Pool, 'query'>): Promise<void> {
   for (const [sql, types] of [

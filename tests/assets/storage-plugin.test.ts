@@ -70,6 +70,8 @@ it('keeps the real plugin admin PATCH successful after media projection fails, r
     ])
       vi.stubEnv(key, undefined);
     vi.spyOn(Auth, 'createAuthentication').mockResolvedValue({
+      setDeletionDomains: () => {},
+      cleanupDeletedAccount: async () => ({ done: true, remaining: 0 }),
       identity: async (headers: Headers) =>
         headers.get('cookie') === 'session=user'
           ? { userId: 'storage-user', sessionId: 'fixture' }

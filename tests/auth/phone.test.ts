@@ -1,3 +1,5 @@
+import { accountDeletionSchemaSQL } from '../../src/account-deletion/schema.ts';
+import { authDeletionGuardsSQL } from '../../src/auth/deletion-schema.ts';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -227,6 +229,8 @@ it('migrates an existing email schema while preserving its user and session', as
     expect(plan.toBeCreated.length).toBeGreaterThan(0);
     expect(plan.toBeAdded.length).toBeGreaterThan(0);
     await plan.runMigrations();
+    await oldPool.query(accountDeletionSchemaSQL);
+    await oldPool.query(authDeletionGuardsSQL);
     upgraded = await createAuthentication(config);
     const after = await upgraded.identity(new Headers({ cookie: previousCookie }));
     expect(after?.userId).toBe(previousUser.user.id);

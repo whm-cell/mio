@@ -77,6 +77,24 @@ async function upsertPhoneChallenge(
   const id = createId();
   const code = input.fixedCode ?? String(randomInt(0, 1_000_000)).padStart(6, '0');
   return withAuthTransaction(pool, async (client) => {
+    let scopeUserId = input.scopeUserId;
+    let subjectUserId = input.binding?.userId ?? null;
+    if (['login', 'wechat_existing', 'onelink_existing'].includes(input.purpose)) {
+      subjectUserId =
+        (
+          await client.query<{ id: string }>(
+            'SELECT id FROM "user" WHERE "phoneNumber"=$1 FOR UPDATE',
+            [input.phone],
+          )
+        ).rows[0]?.id ?? null;
+      if (input.purpose === 'login') scopeUserId = subjectUserId;
+    }
+    // All session-scoped operations lock the user before any challenge. Deletion uses the same order.
+    if (input.binding) {
+      await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [input.binding.userId]);
+      if (!(await bindingSessionIsActive(client, input.binding)))
+        throw new Error('SESSION_REQUIRED');
+    }
     if (!input.fixedCode && !tables) throw new Error('SMS_UNAVAILABLE');
     const timestamp = input.fixedCode
       ? (
@@ -84,11 +102,11 @@ async function upsertPhoneChallenge(
         ).rows[0]!.now.getTime()
       : await reserveSmsBudget(client, tables!, limits, input.phone, input.ip, input.purpose);
     await client.query(
-      `INSERT INTO "mioPhoneChallenge" (id, "challengeKey", "codeHash", purpose, "userId", "sessionId", status, attempts, "expiresAt", "originalPhone")
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7, $8)
+      `INSERT INTO "mioPhoneChallenge" (id, "challengeKey", "codeHash", purpose, "userId", "sessionId", status, attempts, "expiresAt", "originalPhone", "phoneDigest", "subjectUserId")
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7, $8, $9, $10)
        ON CONFLICT ("challengeKey") DO UPDATE SET id = EXCLUDED.id, "codeHash" = EXCLUDED."codeHash", purpose = EXCLUDED.purpose,
        "userId" = EXCLUDED."userId", "sessionId" = EXCLUDED."sessionId", status = EXCLUDED.status,
-       attempts = EXCLUDED.attempts, "expiresAt" = EXCLUDED."expiresAt", "originalPhone" = EXCLUDED."originalPhone"`,
+       attempts = EXCLUDED.attempts, "expiresAt" = EXCLUDED."expiresAt", "originalPhone" = EXCLUDED."originalPhone", "phoneDigest"=EXCLUDED."phoneDigest", "subjectUserId"=EXCLUDED."subjectUserId"`,
       [
         id,
         input.key,
@@ -98,15 +116,17 @@ async function upsertPhoneChallenge(
           input.purpose,
           input.phone,
           code,
-          input.scopeUserId,
+          scopeUserId,
           input.scopeSessionId,
           input.originalPhone ?? null,
         ),
         input.purpose,
-        input.scopeUserId,
+        scopeUserId,
         input.scopeSessionId,
         new Date(timestamp + 5 * 60_000),
         input.originalPhone ?? null,
+        sha256Utf8(input.phone),
+        subjectUserId,
       ],
     );
     if (input.binding && input.originalPhone) {
@@ -129,6 +149,82 @@ async function upsertPhoneChallenge(
        (SELECT id FROM ${tables.budget} WHERE "updatedAt" <= clock_timestamp() - interval '24 hours' LIMIT 100 FOR UPDATE SKIP LOCKED)`,
       );
     return { id, code };
+  });
+}
+
+/** Freeze the phone's original account in the consumed proof; never look up a replacement account afterwards. */
+export async function consumePhoneLoginChallenge(
+  pool: Pool,
+  secret: string,
+  phone: string,
+  code: string,
+) {
+  const key = challengeKey('login', phone);
+  const observed = (
+    await pool.query<{ userId: string | null }>(
+      'SELECT "userId" FROM "mioPhoneChallenge" WHERE "challengeKey"=$1',
+      [key],
+    )
+  ).rows[0];
+  if (!observed) return { status: 'invalid' } as const;
+  return withAuthTransaction(pool, async (client) => {
+    const subject = (
+      await client.query<{
+        id: string;
+        phoneNumber: string | null;
+        phoneNumberVerified: boolean;
+        disabled: boolean;
+        deletedAt: Date | null;
+      }>(
+        `SELECT id,"phoneNumber","phoneNumberVerified",disabled,"deletedAt" FROM "user"
+       WHERE ${observed.userId ? 'id' : '"phoneNumber"'}=$1 FOR UPDATE`,
+        [observed.userId ?? phone],
+      )
+    ).rows[0];
+    if (
+      observed.userId
+        ? !subject ||
+          subject.phoneNumber !== phone ||
+          !subject.phoneNumberVerified ||
+          subject.deletedAt
+        : Boolean(subject)
+    )
+      return { status: 'invalid' } as const;
+    const row = await verifyChallengeRow(client, secret, {
+      key,
+      purpose: 'login',
+      phone,
+      code,
+      scopeUserId: observed.userId,
+      scopeSessionId: null,
+    });
+    if (!row) return { status: 'invalid' } as const;
+    const consumed = await client.query(
+      'DELETE FROM "mioPhoneChallenge" WHERE id=$1 AND "expiresAt">clock_timestamp() RETURNING id',
+      [row.id],
+    );
+    if (!consumed.rowCount) return { status: 'invalid' } as const;
+    return subject?.disabled
+      ? ({ status: 'disabled' } as const)
+      : ({ status: 'ok', userId: observed.userId } as const);
+  });
+}
+
+export function validateNewPhoneSession(pool: Pool, binding: BindingIdentity, phone: string) {
+  return withAuthTransaction(pool, async (client) => {
+    await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [binding.userId]);
+    const active = await client.query(
+      `SELECT 1 FROM "user" u JOIN "session" s ON s."userId"=u.id
+      WHERE u.id=$1 AND s.id=$2 AND u."phoneNumber"=$3 AND u."phoneNumberVerified"=true
+      AND COALESCE(u.disabled,false)=false AND u."deletedAt" IS NULL AND s."expiresAt">clock_timestamp()`,
+      [binding.userId, binding.sessionId, phone],
+    );
+    if (active.rowCount) return true;
+    await client.query('DELETE FROM "session" WHERE id=$1 AND "userId"=$2', [
+      binding.sessionId,
+      binding.userId,
+    ]);
+    return false;
   });
 }
 
@@ -255,6 +351,8 @@ interface ChallengeRow {
   attempts: number;
   expiresAt: Date;
   originalPhone: string | null;
+  phoneDigest: string | null;
+  subjectUserId: string | null;
 }
 
 async function verifyChallengeRow(
@@ -281,7 +379,8 @@ async function verifyChallengeRow(
     row.status !== 'active' ||
     row.expiresAt <= now ||
     row.userId !== input.scopeUserId ||
-    row.sessionId !== input.scopeSessionId
+    row.sessionId !== input.scopeSessionId ||
+    row.phoneDigest !== sha256Utf8(input.phone)
   )
     return null;
   const expected = Buffer.from(row.codeHash, 'hex');
@@ -348,37 +447,29 @@ export async function bindPhoneWithoutChallenge(
 export async function consumePhoneChallenge(
   pool: Pool,
   secret: string,
-  purpose: 'login' | 'bind',
+  purpose: 'bind',
   phone: string,
   code: string,
-  binding?: BindingIdentity,
+  binding: BindingIdentity,
 ): Promise<'ok' | 'invalid' | 'conflict' | 'session'> {
   return withAuthTransaction(pool, async (client) => {
+    await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [binding.userId]);
     const row = await verifyChallengeRow(client, secret, {
       key: challengeKey(purpose, phone),
       purpose,
       phone,
       code,
-      scopeUserId: binding?.userId ?? null,
-      scopeSessionId: binding?.sessionId ?? null,
+      scopeUserId: binding.userId,
+      scopeSessionId: binding.sessionId,
     });
     if (!row) return 'invalid';
-    if (binding) {
-      // Lock "user" before "session" to enforce global lock order ("mioPhoneChallenge" -> "user" -> "session").
-      await client.query('SELECT id FROM "user" WHERE id = $1 FOR UPDATE', [binding.userId]);
-      if (!(await bindingSessionIsActive(client, binding))) return 'session';
-      const consumed = await client.query(
-        'DELETE FROM "mioPhoneChallenge" WHERE id = $1 AND "expiresAt" > clock_timestamp() RETURNING id',
-        [row.id],
-      );
-      if (!consumed.rowCount) return 'invalid';
-      return applyUserPhoneBind(client, binding.userId, phone);
-    }
+    if (!(await bindingSessionIsActive(client, binding))) return 'session';
     const consumed = await client.query(
-      'DELETE FROM "mioPhoneChallenge" WHERE id = $1 AND "expiresAt" > clock_timestamp() RETURNING id',
+      'DELETE FROM "mioPhoneChallenge" WHERE id=$1 AND "expiresAt">clock_timestamp() RETURNING id',
       [row.id],
     );
-    return consumed.rowCount ? 'ok' : 'invalid';
+    if (!consumed.rowCount) return 'invalid';
+    return applyUserPhoneBind(client, binding.userId, phone);
   });
 }
 
@@ -389,7 +480,7 @@ export async function consumePendingPhoneChallenge(
   purpose: 'wechat_existing' | 'onelink_existing',
   phone: string,
   code: string,
-  scope: OneLinkExistingChallengeScope,
+  scope: OneLinkExistingChallengeScope & { subjectUserId: string | null },
 ) {
   const row = await verifyChallengeRow(client, secret, {
     key: pendingChallengeKey(purpose, scope.pendingId, phone),
@@ -399,7 +490,7 @@ export async function consumePendingPhoneChallenge(
     scopeUserId: scope.pendingId,
     scopeSessionId: sha256Utf8(scope.candidateToken),
   });
-  if (!row) return false;
+  if (!row || row.subjectUserId !== scope.subjectUserId) return false;
   const consumed = await client.query(
     'DELETE FROM "mioPhoneChallenge" WHERE id=$1 AND "expiresAt">clock_timestamp() RETURNING id',
     [row.id],
@@ -418,6 +509,7 @@ export async function consumePhoneRebindChallenge(
 ): Promise<'ok' | 'invalid' | 'conflict' | 'session'> {
   try {
     return await withAuthTransaction(pool, async (client) => {
+      await client.query('SELECT id FROM "user" WHERE id=$1 FOR UPDATE', [binding.userId]);
       const row = await verifyChallengeRow(client, secret, {
         key: rebindChallengeKey(binding, phone),
         purpose: 'phone_rebind',
@@ -461,4 +553,61 @@ export async function consumePhoneRebindChallenge(
     if (error instanceof RebindChallengeExpired) return 'invalid';
     throw error;
   }
+}
+
+const deletionChallengeKey = (binding: BindingIdentity, phone: string) =>
+  sha256Utf8(`account_deletion\0${binding.userId}\0${binding.sessionId}\0${phone}`);
+
+export async function reserveAccountDeletionChallenge(
+  pool: Pool,
+  tables: SmsBudgetTables | undefined,
+  secret: string,
+  limits: PhoneLimits,
+  ip: string,
+  binding: BindingIdentity,
+  fixedCode?: string,
+) {
+  const user = (
+    await pool.query<{ phoneNumber: string | null; phoneNumberVerified: boolean }>(
+      'SELECT "phoneNumber","phoneNumberVerified" FROM "user" WHERE id=$1',
+      [binding.userId],
+    )
+  ).rows[0];
+  if (!user?.phoneNumber || !user.phoneNumberVerified) throw new Error('PHONE_REQUIRED');
+  const challenge = await upsertPhoneChallenge(pool, tables, secret, limits, {
+    purpose: 'account_deletion',
+    key: deletionChallengeKey(binding, user.phoneNumber),
+    phone: user.phoneNumber,
+    ip,
+    scopeUserId: binding.userId,
+    scopeSessionId: binding.sessionId,
+    binding,
+    originalPhone: user.phoneNumber,
+    ...(fixedCode ? { fixedCode } : {}),
+  });
+  return { ...challenge, phone: user.phoneNumber };
+}
+
+/** Caller holds the user/session locks and commits consumption with permanent deletion. */
+export async function consumeAccountDeletionChallenge(
+  client: PoolClient,
+  secret: string,
+  binding: BindingIdentity,
+  phone: string,
+  code: string,
+) {
+  const row = await verifyChallengeRow(client, secret, {
+    key: deletionChallengeKey(binding, phone),
+    purpose: 'account_deletion',
+    phone,
+    code,
+    scopeUserId: binding.userId,
+    scopeSessionId: binding.sessionId,
+  });
+  if (!row || row.originalPhone !== phone) return false;
+  const consumed = await client.query(
+    'DELETE FROM "mioPhoneChallenge" WHERE id=$1 AND "expiresAt">clock_timestamp() RETURNING id',
+    [row.id],
+  );
+  return consumed.rowCount === 1;
 }

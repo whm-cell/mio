@@ -691,11 +691,12 @@ it.each([
           },
         );
     }
+    // Pause before the auth user-lock guard: this models the same pre-session race without holding its user lock.
     const lockId = 948372,
       blocker = await pool.connect();
     await pool.query(`CREATE FUNCTION u2_session_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
     IF NEW."userId"='${owner.userId}' THEN PERFORM pg_advisory_xact_lock(${lockId}); END IF; RETURN NEW; END $$;
-    CREATE TRIGGER u2_session_gate BEFORE INSERT ON "session" FOR EACH ROW EXECUTE FUNCTION u2_session_gate()`);
+    CREATE TRIGGER a_u2_session_gate BEFORE INSERT ON "session" FOR EACH ROW EXECUTE FUNCTION u2_session_gate()`);
     let pendingRequest: Promise<Response> | undefined;
     try {
       await blocker.query('BEGIN');
@@ -747,7 +748,7 @@ it.each([
       blocker.release();
       await pendingRequest?.catch(() => undefined);
       await pool.query(
-        'DROP TRIGGER u2_session_gate ON "session"; DROP FUNCTION u2_session_gate()',
+        'DROP TRIGGER a_u2_session_gate ON "session"; DROP FUNCTION u2_session_gate()',
       );
     }
   },
@@ -956,7 +957,7 @@ it.each(['success', 'session_failure', 'proof_failure'] as const)(
         PERFORM pg_advisory_xact_lock(${lockId});
         ${outcome === 'session_failure' ? "RAISE EXCEPTION 'synthetic session creation failure';" : ''}
       END IF; RETURN NEW; END $$;
-      CREATE TRIGGER u2_qr_session_gate BEFORE INSERT ON "session" FOR EACH ROW EXECUTE FUNCTION u2_qr_session_gate()`);
+      CREATE TRIGGER a_u2_qr_session_gate BEFORE INSERT ON "session" FOR EACH ROW EXECUTE FUNCTION u2_qr_session_gate()`);
     let confirmation: Promise<Response> | undefined;
     try {
       await blocker.query('BEGIN');
@@ -1014,7 +1015,7 @@ it.each(['success', 'session_failure', 'proof_failure'] as const)(
       blocker.release();
       await confirmation?.catch(() => undefined);
       await pool.query(
-        'DROP TRIGGER u2_qr_session_gate ON "session"; DROP FUNCTION u2_qr_session_gate()',
+        'DROP TRIGGER a_u2_qr_session_gate ON "session"; DROP FUNCTION u2_qr_session_gate()',
       );
     }
   },

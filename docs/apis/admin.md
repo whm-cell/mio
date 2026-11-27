@@ -12,6 +12,8 @@
 
 所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、OneLink SSO 加密密钥、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`/`ONELINK_SSO_NOT_CONFIGURED`/`WORKER_HARD_LIMIT_EXCEEDED`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`/`WORKER_NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`/`ONELINK_REGISTER_IN_PROGRESS`/`WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`/`ONELINK_SSO_UNAVAILABLE`/`COMPUTE_OPS_UNAVAILABLE`。
 
+永久注销属于认证独立终态，管理员会话与 `mio.admin_session` 仍隔离。全局认证策略和普通账号解禁均不能恢复已注销的旧 userId，不新增管理端“恢复注销”入口。全局设置写体仍仅 `{expectedRevision,auth}`，不以注销实现扩展该写体；审计不保存明文 smsBypassCode。注销任务监控与备份恢复走[认证运维规则](../auth.md#独立监控与灾备恢复)，不混入现有模型／Worker 运行期热配置。
+
 ## POST /api/v1/admin/auth/login
 
 身份：匿名管理员登录入口。

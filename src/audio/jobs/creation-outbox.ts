@@ -42,7 +42,7 @@ export function createAudioCreationOutbox(query: CreationQuery) {
         }>(
           `UPDATE mio_audio_creation_outbox SET lease_id=$1,lease_until=statement_timestamp()+interval '30 seconds'
            WHERE event_id IN (
-             SELECT event_id FROM mio_audio_creation_outbox WHERE delivered_at IS NULL AND dead_lettered_at IS NULL
+             SELECT event_id FROM mio_audio_creation_outbox WHERE delivered_at IS NULL AND dead_lettered_at IS NULL AND NOT EXISTS(SELECT 1 FROM mio_closed_accounts c WHERE c.user_id=mio_audio_creation_outbox.owner_id)
              AND (lease_until IS NULL OR lease_until<=statement_timestamp())
              AND (next_attempt_at<=statement_timestamp() OR occurred_at<=statement_timestamp()-$2*interval '24 hours')
              ORDER BY occurred_at,event_id LIMIT 20 FOR UPDATE SKIP LOCKED)

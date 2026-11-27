@@ -1,3 +1,4 @@
+import { createOwnerWork } from '../../account-deletion/owner-work.ts';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { isDeepStrictEqual } from 'node:util';
 import { isUuidV4 } from '@mio/foundation/identifiers';
@@ -126,16 +127,20 @@ export function createAudioJobService(
   const admissions = new Set<Promise<unknown>>();
   let polling: Promise<void> | undefined;
   let closing: Promise<void> | undefined;
-  const execute = createAudioExecution(
-    store,
-    providers,
-    objects,
-    media,
-    assets,
-    stop.signal,
-    dependencies.submit,
-    dependencies.download,
-  );
+  const ownerWork = createOwnerWork((owner) => store.accountClosed(owner));
+  const execute = (job: Parameters<ReturnType<typeof createAudioExecution>>[0]) =>
+    ownerWork.run(job.owner_id, (signal) =>
+      createAudioExecution(
+        store,
+        providers,
+        objects,
+        media,
+        assets,
+        AbortSignal.any([stop.signal, signal]),
+        dependencies.submit,
+        dependencies.download,
+      )(job),
+    );
   const assertOpen = () => {
     if (stop.signal.aborted) throw new AudioError(503, 'AUDIO_UNAVAILABLE');
   };
@@ -152,9 +157,13 @@ export function createAudioJobService(
         while (!stop.signal.aborted && active.size < 2) {
           const job = await store.claim();
           if (!job) break;
-          const task = execute(job).finally(() => {
-            active.delete(task);
-          });
+          const task = execute(job)
+            .catch(() => {
+              log.warn('AUDIO_JOB_EXECUTION_PENDING', { jobId: job.id });
+            })
+            .finally(() => {
+              active.delete(task);
+            });
           active.add(task);
         }
       } catch {
@@ -170,6 +179,7 @@ export function createAudioJobService(
   void poll();
 
   return {
+    drainAccount: (owner: string) => ownerWork.drain(owner),
     listModels(actor: { userId: string }, operation: AudioOperation) {
       return track(() => providers.listAudioModels(actor, operation));
     },

@@ -94,7 +94,7 @@ export const callPromptModel: PromptModelCaller = async (request) => {
     !aborted &&
     failureCode !== 'CONTEXT_OVERFLOW' &&
     (facts.status === undefined || facts.status < HTTP_STATUS.BAD_REQUEST) &&
-    (failure !== undefined || !terminal);
+    failure !== undefined;
   const finish = aborted ? 'aborted' : interrupted ? 'unknown' : (terminal?.kind ?? 'error');
   const observation = modelObservation(
     facts,

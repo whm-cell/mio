@@ -87,19 +87,13 @@ function preflight(
 }
 
 /** Process-local protection only. Durable business queues and frozen BYOK admission belong upstream. */
-export function createPromptRuntime(
-  ports: PromptRuntimePorts,
-  options: { maxInFlight?: number } = {},
-): PromptRuntime {
-  const maxInFlight = options.maxInFlight ?? 16;
-  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1)
-    throw new TypeError('Invalid prompt maxInFlight');
+export function createPromptRuntime(ports: PromptRuntimePorts): PromptRuntime {
   let closed = false;
   let active = 0;
   let closing: Promise<void> | undefined;
   let drained: (() => void) | undefined;
   function admit<T>(execute: () => Promise<PromptResult<T>>): Promise<PromptResult<T>> {
-    if (closed || active >= maxInFlight)
+    if (closed || active >= 16)
       throw new HttpError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'PROMPT_RUNTIME_UNAVAILABLE');
     active++;
     return execute().finally(() => {
@@ -164,16 +158,12 @@ export function createPromptRuntime(
           };
         if (request.signal.aborted) return { status: 'cancelled', observations };
         const repair = request.spec.repair(request.input, first.text, parsed.issues);
-        const maxOutputTokens =
-          repair.maxOutputTokens === undefined
-            ? undefined
-            : Math.min(snapshotMaxTokens(request.snapshot), repair.maxOutputTokens);
         const second = await attempt(
           request,
           { ...input, prompt: repair.prompt },
           'structured-repair',
           observations,
-          maxOutputTokens,
+          repair.maxOutputTokens,
         );
         if (second.status !== 'succeeded') return { ...second, observations };
         if (second.observation.finish === 'max-tokens')

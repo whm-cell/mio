@@ -101,7 +101,6 @@ export function fixture(
   profile: ChatProfile,
   respond: (request: Request, index: number) => Response | Promise<Response> = (request) =>
     protocolResponse(request, validOutput),
-  maxInFlight?: number,
 ) {
   const requests: { request: Request; body: Record<string, unknown> }[] = [];
   const transport = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -112,11 +111,8 @@ export function fixture(
   vi.stubGlobal('fetch', transport);
   const recordVerification = vi.fn(async () => {});
   const callModel = vi.fn(callPromptModel);
-  const runtime = createPromptRuntime(
-    { callModel, recordVerification },
-    maxInFlight === undefined ? {} : { maxInFlight },
-  );
-  const request = execution(profile);
+  const runtime = createPromptRuntime({ callModel, recordVerification });
+  const request = { ...execution(profile), spec: spec(), input: input() };
   return { runtime, request, requests, transport, recordVerification, callModel };
 }
 

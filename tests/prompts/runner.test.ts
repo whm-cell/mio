@@ -3,18 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { callPromptModel } from '../../src/dsh/prompt-caller.ts';
-import { createPromptRuntime } from '../../src/prompts/runner.ts';
 import { UNTRUSTED_MATERIAL_DECLARATION } from '../../src/prompts/envelope.ts';
 import { protocolResponse, protocolToolResponse } from '../onelink/fixture.ts';
-import {
-  fixture,
-  input,
-  profiles,
-  spec,
-  system,
-  thinkingResponse,
-  validOutput,
-} from './fixture.ts';
+import { fixture, profiles, system, thinkingResponse, validOutput } from './fixture.ts';
 
 let home: string;
 beforeEach(async () => {
@@ -35,11 +26,7 @@ afterEach(async () => {
 describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
   it('succeeds once, persists one observation, preserves prefixes, and has no session/tools/files or JSON wire override', async () => {
     const f = fixture(profile);
-    const result = await f.runtime.executeStructuredPrompt({
-      ...f.request,
-      spec: spec(),
-      input: input(),
-    });
+    const result = await f.runtime.executeStructuredPrompt(f.request);
     expect(result).toMatchObject({
       status: 'succeeded',
       value: { characterId: 'business-character' },
@@ -99,11 +86,7 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
     'strips unsolicited thinking while keeping reasoningTokens=%s and default effort absent',
     async (tokens) => {
       const f = fixture(profile, (request) => thinkingResponse(request, validOutput, tokens));
-      const result = await f.runtime.executeStructuredPrompt({
-        ...f.request,
-        spec: spec(),
-        input: input(),
-      });
+      const result = await f.runtime.executeStructuredPrompt(f.request);
       expect(result).toMatchObject({
         status: 'succeeded',
         observations: [{ usage: { reasoningTokens: tokens } }],
@@ -120,8 +103,6 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
     await f.runtime.executeStructuredPrompt({
       ...f.request,
       reasoningEffort: 'high',
-      spec: spec(),
-      input: input(),
     });
     expect(f.requests[0]!.body).toMatchObject(
       profile === 'openai-chat'
@@ -138,8 +119,7 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
       const result = await f.runtime.executeStructuredPrompt({
         ...f.request,
         ...(kind === 'effort' ? { reasoningEffort: 'medium' as const } : {}),
-        spec: spec(kind === 'minimum' ? { minOutputTokens: 1025 } : {}),
-        input: input(),
+        ...(kind === 'minimum' ? { spec: { ...f.request.spec, minOutputTokens: 1025 } } : {}),
       });
       expect(result).toEqual({
         status: 'failed',
@@ -159,12 +139,11 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
       const f = fixture(profile, (request, index) =>
         protocolResponse(request, index === 1 ? bad : validOutput),
       );
-      const current = spec();
+      const current = f.request.spec;
       const repair = vi.fn(current.repair!);
       const result = await f.runtime.executeStructuredPrompt({
         ...f.request,
         spec: { ...current, repair },
-        input: input(),
       });
       expect(result).toMatchObject({
         status: 'succeeded',
@@ -192,11 +171,7 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
     'fails after an invalid repair %s with no third dispatch',
     async (bad) => {
       const f = fixture(profile, (request) => protocolResponse(request, bad));
-      const result = await f.runtime.executeStructuredPrompt({
-        ...f.request,
-        spec: spec(),
-        input: input(),
-      });
+      const result = await f.runtime.executeStructuredPrompt(f.request);
       expect(result).toMatchObject({
         status: 'failed',
         error: 'MODEL_OUTPUT_INVALID',
@@ -214,7 +189,7 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
       const f = fixture(profile, (request, index) =>
         protocolResponse(request, index === 1 ? 'bad' : validOutput),
       );
-      const current = spec();
+      const current = f.request.spec;
       await f.runtime.executeStructuredPrompt({
         ...f.request,
         spec: {
@@ -228,9 +203,12 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
             };
           },
         },
-        input: input(),
       });
       expect(f.requests.map(({ body }) => body.max_tokens)).toEqual([1024, 1024]);
+      expect(f.callModel.mock.calls.map(([request]) => request.maxOutputTokens)).toEqual([
+        undefined,
+        limit,
+      ]);
       await f.runtime.close();
     },
   );
@@ -239,13 +217,12 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
     const f = fixture(profile, (request) =>
       protocolResponse(request, validOutput, false, { ending: 'max-tokens' }),
     );
-    const current = spec();
+    const current = f.request.spec;
     const parse = vi.fn(current.parseAndValidate);
     const repair = vi.fn(current.repair!);
     const result = await f.runtime.executeStructuredPrompt({
       ...f.request,
       spec: { ...current, parseAndValidate: parse, repair },
-      input: input(),
     });
     expect(result).toMatchObject({
       status: 'failed',
@@ -293,11 +270,7 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
             },
           ),
       );
-      const result = await f.runtime.executeStructuredPrompt({
-        ...f.request,
-        spec: spec(),
-        input: input(),
-      });
+      const result = await f.runtime.executeStructuredPrompt(f.request);
       const error = {
         401: 'MODEL_AUTH_FAILED',
         402: 'MODEL_QUOTA_EXCEEDED',
@@ -325,17 +298,9 @@ describe.each(profiles)('stateless prompt SDK boundary (%s)', (profile) => {
           })
         : protocolToolResponse(profile === 'anthropic-messages'),
     );
-    const first = await f.runtime.executeStructuredPrompt({
-      ...f.request,
-      spec: spec(),
-      input: input(),
-    });
+    const first = await f.runtime.executeStructuredPrompt(f.request);
     expect(first.status).toBe('succeeded');
-    const second = await f.runtime.executeStructuredPrompt({
-      ...f.request,
-      spec: spec(),
-      input: input(),
-    });
+    const second = await f.runtime.executeStructuredPrompt(f.request);
     expect(second.status).toBe('failed');
     expect(f.requests).toHaveLength(2);
     expect(f.recordVerification).not.toHaveBeenCalled();
@@ -352,8 +317,6 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
       await f.runtime.executeStructuredPrompt({
         ...f.request,
         signal: controller.signal,
-        spec: spec(),
-        input: input(),
       }),
     ).toEqual({ status: 'cancelled', observations: [] });
     expect(f.transport).not.toHaveBeenCalled();
@@ -384,8 +347,6 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
     const result = await f.runtime.executeStructuredPrompt({
       ...f.request,
       snapshot: selected,
-      spec: spec(),
-      input: input(),
     });
     expect(result).toMatchObject({
       status: 'unknown',
@@ -407,8 +368,6 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
     const pending = f.runtime.executeStructuredPrompt({
       ...f.request,
       signal: controller.signal,
-      spec: spec(),
-      input: input(),
     });
     await entered.promise;
     controller.abort();
@@ -448,11 +407,7 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
           throw new Error('synthetic-prompt-owner-key PRIVATE NETWORK DETAIL');
         return protocolResponse(request, validOutput, false, { ending: 'incomplete' });
       });
-      const result = await f.runtime.executeStructuredPrompt({
-        ...f.request,
-        spec: spec(),
-        input: input(),
-      });
+      const result = await f.runtime.executeStructuredPrompt(f.request);
       expect(result).toMatchObject({
         status: 'unknown',
         error: 'MODEL_STREAM_INTERRUPTED',
@@ -481,8 +436,6 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
         ...f.request,
         observe,
         signal: controller.signal,
-        spec: spec(),
-        input: input(),
       });
       await entered.promise;
       if (cancel) controller.abort();
@@ -496,53 +449,35 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
     },
   );
 
-  it('rejects a constructor override cap immediately with no queued dispatch', async () => {
-    const entered = Promise.withResolvers<void>();
-    const controller = new AbortController();
-    const f = fixture(
-      profile,
-      (request) => {
-        entered.resolve();
+  it.each(['structured', 'text'] as const)(
+    'enforces the fixed cap of sixteen for %s without a FIFO',
+    async (kind) => {
+      const entered = Promise.withResolvers<void>();
+      const f = fixture(profile, (request, index) => {
+        if (index === 16) entered.resolve();
         return protocolResponse(request, validOutput, true);
-      },
-      1,
-    );
-    const request = { ...f.request, signal: controller.signal, spec: spec(), input: input() };
-    const pending = f.runtime.executeStructuredPrompt(request);
-    await entered.promise;
-    expect(() => f.runtime.executeStructuredPrompt(request)).toThrow(
-      expect.objectContaining({ status: 503, code: 'PROMPT_RUNTIME_UNAVAILABLE' }),
-    );
-    expect(f.requests).toHaveLength(1);
-    controller.abort();
-    await pending;
-    await f.runtime.close();
-    expect(f.requests).toHaveLength(1);
-  });
-
-  it('enforces the default cap of sixteen without a FIFO', async () => {
-    const entered = Promise.withResolvers<void>();
-    const f = fixture(profile, (request, index) => {
-      if (index === 16) entered.resolve();
-      return protocolResponse(request, validOutput, true);
-    });
-    const controllers = Array.from({ length: 16 }, () => new AbortController());
-    const pending = controllers.map((controller) =>
-      f.runtime.executeTextPrompt({
-        ...f.request,
-        signal: controller.signal,
-        input: { system, prompt: 'text' },
-      }),
-    );
-    await entered.promise;
-    expect(() =>
-      f.runtime.executeTextPrompt({ ...f.request, input: { system, prompt: 'text' } }),
-    ).toThrow(expect.objectContaining({ status: 503 }));
-    for (const controller of controllers) controller.abort();
-    await Promise.all(pending);
-    await f.runtime.close();
-    expect(f.requests).toHaveLength(16);
-  });
+      });
+      const execute = (signal: AbortSignal) =>
+        kind === 'structured'
+          ? f.runtime.executeStructuredPrompt({ ...f.request, signal })
+          : f.runtime.executeTextPrompt({
+              ...f.request,
+              signal,
+              input: { system, prompt: 'text' },
+            });
+      const controllers = Array.from({ length: 16 }, () => new AbortController());
+      const pending = controllers.map((controller) => execute(controller.signal));
+      await entered.promise;
+      expect(() => execute(new AbortController().signal)).toThrow(
+        expect.objectContaining({ status: 503, code: 'PROMPT_RUNTIME_UNAVAILABLE' }),
+      );
+      expect(f.requests).toHaveLength(16);
+      for (const controller of controllers) controller.abort();
+      await Promise.all(pending);
+      await f.runtime.close();
+      expect(f.requests).toHaveLength(16);
+    },
+  );
 
   it('stops admission synchronously and drains observation, verification and the admitted repair', async () => {
     const f = fixture(profile, (request, index) =>
@@ -562,7 +497,7 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
       verificationEntered.resolve();
       await resumeVerification.promise;
     });
-    const request = { ...f.request, observe, spec: spec(), input: input() };
+    const request = { ...f.request, observe };
     const pending = f.runtime.executeStructuredPrompt(request);
     await observationEntered.promise;
     let closed = false;
@@ -612,12 +547,11 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
         index === 2 ? { ending: 'max-tokens' } : {},
       ),
     );
-    const noRepair = { ...spec() };
+    const noRepair = { ...f.request.spec };
     delete noRepair.repair;
     const first = await f.runtime.executeStructuredPrompt({
       ...f.request,
       spec: noRepair,
-      input: input(),
     });
     expect(first).toMatchObject({
       status: 'failed',
@@ -632,14 +566,4 @@ describe.each(profiles)('admission and terminal boundaries (%s)', (profile) => {
     expect(f.requests).toHaveLength(2);
     await f.runtime.close();
   });
-});
-
-it('requires a positive integer cap', () => {
-  for (const maxInFlight of [0, -1, 1.5, NaN])
-    expect(() =>
-      createPromptRuntime(
-        { callModel: callPromptModel, recordVerification: async () => {} },
-        { maxInFlight },
-      ),
-    ).toThrow(TypeError);
 });

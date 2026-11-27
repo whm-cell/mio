@@ -147,6 +147,10 @@ selectChat 一致读取本人配置、目录、适配、偏好，不解密。fre
 
 显式 live 入口 `node tests/providers/providers-live.ts <authorized-private-key-file>` 经隔离账号、公开 HTTP、正式 Profile 保存本人 Key、发现目录、部署声明测试默认，并重启再发现；只输出受控元数据。真实目录成功不等于聊天、全部模型、媒体或生产验收。源异常、代理配置、原响应和 Key 不打印。
 
+无会话结构化验证另用 `MIO_RUN_LIVE_PROMPT=yes node tests/prompts/prompts-live.ts <existing-owner-id> <new-evidence-file>`（例如将原件写入 `.runtime/prompt-live.jsonl`）。只有开关精确为 `yes` 才读取开发配置和本人已加密凭据；普通 `pnpm test` / `pnpm check` 保持离线。入口从常驻 `mio_dev` 通过 `selectChat` / `resolveChat` 读取该 owner 现有的启用 chat 默认，不创建或登录账号、不发现目录、不改写凭据或路由、不迁移。开发库未就绪，或缺配置、可用凭据、默认路由时，输出脱敏前置原因及 0 次上游 POST。
+
+该探针复用正式 runner/caller，省略 `reasoningEffort`，将请求输出预算限制为路由上限内的 128 tokens（支持推理的路由为 1024），首轮 `stop` 后由 Spec 故意触发唯一一次修复。Node `fetch` 和 SDK `undici` 共用的 dispatcher 在实际 dispatch 前计数，本次运行最多放行 2 次上游 POST；未知传输结果、截断或观测写入失败均不重发。新证据文件排他创建并逐条持久化，只保留路由版本、终态、token/`reasoningTokens` 和 POST 计数，不保存 Key、签名、原始提示词或响应。成功观测沿现有供应商验证记录保留；入口不启动 Agent、Session、DSH 会话 JSONL 持久化或工具。已尝试出站后沿原件核对，不能为补证盲目另开探针；脚本成功也不代表独立审查、人类接受或生产就绪。
+
 ## 注销关闭栅栏
 
 T0 后主服务立即关闭旧 userId 并清空可复用凭据；音频 admission／输出快照、记录、用户模型偏好、成员与音色配置按批补清。provider 域在本库事务内复核持久关闭栅栏，旧异步执行不能恢复配置或发布音频／创作消息。音频精确输出键须先交媒体域共享 GC 再删除本库定位；跨库没有共享事务或 FK。公网托管音色／素材不因此自动远端删除，遵循原独立授权。新 userId 不继承旧凭据。总完成口径见[永久注销](auth.md#永久注销与清理)。

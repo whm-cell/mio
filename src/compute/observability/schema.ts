@@ -17,11 +17,10 @@ CREATE TABLE IF NOT EXISTS mio_compute_worker_inbox (
   instance_id text NOT NULL REFERENCES mio_compute_worker_instances(instance_id),
   boot_id uuid NOT NULL, boot_sequence bigint NOT NULL, sequence bigint NOT NULL,
   digest text NOT NULL, received_at timestamptz NOT NULL,
+  kind text NOT NULL DEFAULT 'limit_result' CHECK (kind IN ('sample','event','limit_result')),
   UNIQUE(instance_id,boot_sequence,sequence),
   UNIQUE(instance_id,boot_id,sequence)
 );
-CREATE INDEX IF NOT EXISTS mio_compute_worker_inbox_retention
-  ON mio_compute_worker_inbox(received_at);
 CREATE TABLE IF NOT EXISTS mio_compute_worker_samples (
   message_id uuid PRIMARY KEY REFERENCES mio_compute_worker_inbox(message_id),
   instance_id text NOT NULL REFERENCES mio_compute_worker_instances(instance_id),
@@ -47,6 +46,8 @@ CREATE INDEX IF NOT EXISTS mio_compute_worker_events_execution
   ON mio_compute_worker_events(execution_id,sequence) WHERE execution_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS mio_compute_worker_events_time
   ON mio_compute_worker_events(event_at DESC);
+CREATE INDEX IF NOT EXISTS mio_compute_worker_events_execution_peak
+  ON mio_compute_worker_events(instance_id,event_at) WHERE kind='execution';
 CREATE INDEX IF NOT EXISTS mio_compute_worker_events_gap
   ON mio_compute_worker_events(instance_id,event_at) WHERE gap IS NOT NULL;
 CREATE INDEX IF NOT EXISTS mio_compute_worker_events_retention
@@ -98,11 +99,30 @@ CREATE INDEX IF NOT EXISTS mio_compute_worker_control_pending
   ON mio_compute_worker_control_outbox(instance_id,revision) WHERE sent_at IS NULL;
 CREATE INDEX IF NOT EXISTS mio_compute_worker_control_sent
   ON mio_compute_worker_control_outbox(sent_at) WHERE sent_at IS NOT NULL;
+DO $inbox_kind$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute
+    WHERE attrelid='mio_compute_worker_inbox'::regclass AND attname='kind' AND NOT attisdropped) THEN
+    ALTER TABLE mio_compute_worker_inbox ADD COLUMN kind text
+      CHECK (kind IN ('sample','event','limit_result'));
+    UPDATE mio_compute_worker_inbox i SET kind=CASE
+      WHEN EXISTS (SELECT 1 FROM mio_compute_worker_limit_changes l WHERE l.result_message_id=i.message_id) THEN 'limit_result'
+      WHEN EXISTS (SELECT 1 FROM mio_compute_worker_samples s WHERE s.message_id=i.message_id) THEN 'sample'
+      WHEN EXISTS (SELECT 1 FROM mio_compute_worker_events e WHERE e.message_id=i.message_id) THEN 'event'
+      ELSE 'limit_result' END;
+    ALTER TABLE mio_compute_worker_inbox ALTER COLUMN kind SET DEFAULT 'limit_result';
+    ALTER TABLE mio_compute_worker_inbox ALTER COLUMN kind SET NOT NULL;
+  END IF;
+END
+$inbox_kind$;
+CREATE INDEX IF NOT EXISTS mio_compute_worker_inbox_limit_result_retention
+  ON mio_compute_worker_inbox(received_at) WHERE kind='limit_result';
+DROP INDEX IF EXISTS mio_compute_worker_inbox_retention;
 `;
 
 export async function checkWorkerObservabilitySchema(database: Pick<Pool, 'query'>): Promise<void> {
   await database.query(`
-    SELECT message_id, instance_id, boot_id, boot_sequence, sequence, digest, received_at
+    SELECT message_id, instance_id, boot_id, boot_sequence, sequence, digest, received_at, kind
       FROM mio_compute_worker_inbox LIMIT 0;
     SELECT instance_id, boot_id, boot_sequence, sequence, observed_at, received_at, snapshot,
       desired_revision, desired_limits, desired_command_id, desired_requested_at, desired_status,

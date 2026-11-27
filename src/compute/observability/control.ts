@@ -98,37 +98,37 @@ export class WorkerControlStore {
     });
   }
 
-  async claim(blocked: ReadonlySet<string>) {
+  async claim(blocked: ReadonlySet<string>, now = epochMs()) {
     const { rows } = await this.#pool.query<ControlLease>(
       `
       WITH wanted AS (
         SELECT o.command_id FROM mio_compute_worker_control_outbox o
         WHERE o.instance_id=ANY($1::text[]) AND o.instance_id<>ALL($2::text[])
-          AND o.sent_at IS NULL AND (o.lease_until IS NULL OR o.lease_until<now())
+          AND o.sent_at IS NULL AND (o.lease_until IS NULL OR o.lease_until<$4)
           AND NOT EXISTS (
             SELECT 1 FROM mio_compute_worker_control_outbox earlier
             WHERE earlier.instance_id=o.instance_id AND earlier.revision<o.revision AND earlier.sent_at IS NULL
           )
         ORDER BY o.created_at,o.command_id LIMIT 1 FOR UPDATE OF o SKIP LOCKED
       )
-      UPDATE mio_compute_worker_control_outbox o SET lease_id=$3,lease_until=now()+interval '30 seconds'
+      UPDATE mio_compute_worker_control_outbox o SET lease_id=$3,lease_until=$4::timestamptz+interval '30 seconds'
       FROM wanted WHERE o.command_id=wanted.command_id RETURNING o.command,o.lease_id
     `,
-      [this.#instances, [...blocked], createId()],
+      [this.#instances, [...blocked], createId(), new Date(now)],
     );
     const row = rows[0];
     if (!row) return null;
     return { command: parseWorkerLimitsCommand(row.command), lease: row.lease_id };
   }
 
-  async settle(id: string, lease: string, confirmed: boolean): Promise<void> {
+  async settle(id: string, lease: string, confirmed: boolean, now = epochMs()): Promise<void> {
     await this.#pool.query(
       `
       UPDATE mio_compute_worker_control_outbox
-      SET lease_id=NULL,lease_until=NULL,sent_at=CASE WHEN $3 THEN now() END
+      SET lease_id=NULL,lease_until=NULL,sent_at=CASE WHEN $3 THEN $4::timestamptz END
       WHERE command_id=$1 AND lease_id=$2 AND sent_at IS NULL
     `,
-      [id, lease, confirmed],
+      [id, lease, confirmed, new Date(now)],
     );
   }
 }

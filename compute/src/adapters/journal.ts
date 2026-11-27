@@ -9,7 +9,11 @@ import {
 import type { ComputeCommandV1, ComputeResultV1 } from '@mio/compute-contracts';
 import type { Attempt, PendingEvent, Phase } from '../types.ts';
 import { prepareJournalFile } from './media.ts';
-import { checkMediaJournal, migrateMediaJournal } from './media-journal-schema.ts';
+import {
+  checkMediaJournal,
+  migrateMediaJournal,
+  migrateMediaUploads,
+} from './media-journal-schema.ts';
 import { MediaJournal } from './media-journal.ts';
 import {
   checkWorkerObservabilityJournal,
@@ -123,7 +127,7 @@ export class Journal {
       if (
         meta.length !== 1 ||
         meta[0]?.instance_id !== instanceId ||
-        ![3, 4, 5, 6, 7, 8].includes(Number(meta[0]?.schema_version))
+        ![3, 4, 5, 6, 7, 8, 9].includes(Number(meta[0]?.schema_version))
       ) {
         throw new Error('JOURNAL_IDENTITY_MISMATCH');
       }
@@ -186,8 +190,9 @@ export class Journal {
       // The retired image table remains intact for offline cutover reconciliation.
       db.prepare('SELECT job_id, identity, phase, payload FROM image_attempts LIMIT 0').all();
       if (Number(meta[0]?.schema_version) < 7) migrateMediaJournal(db);
-      checkMediaJournal(db);
       if (Number(meta[0]?.schema_version) < 8) migrateWorkerObservabilityJournal(db);
+      if (Number(meta[0]?.schema_version) < 9) migrateMediaUploads(db);
+      checkMediaJournal(db);
       checkWorkerObservabilityJournal(db);
       this.#db = db;
       this.media = new MediaJournal(db);

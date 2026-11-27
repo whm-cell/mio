@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { MEDIA_PROFILE, MEDIA_VERSION, mediaObjectPrefix } from '@mio/compute-contracts';
 import type { MediaManifest, MediaRequest, MediaResult } from '@mio/compute-contracts';
@@ -309,6 +309,62 @@ it('atomically registers files and data once and permits only owned derived inpu
   await expect(
     store.create(owner, { ...probe, requestId: randomUUID() }, snapshot),
   ).rejects.toMatchObject({ code: 'ASSET_SOURCE_CHANGED' });
+});
+it('freezes list states before batch outputs and keeps succeeded files immutable across result/control/retry', async () => {
+  const succeededJob = (await create()).job;
+  const later = (await create()).job;
+  await store.accept(succeeded(succeededJob), manifest(succeededJob));
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const original = Client.prototype.query;
+  let paused = false;
+  const spy = vi.spyOn(Client.prototype, 'query').mockImplementation(function (
+    this: Client,
+    ...args: unknown[]
+  ) {
+    const result = Reflect.apply(original, this, args);
+    if (
+      !paused &&
+      typeof args[0] === 'string' &&
+      args[0].startsWith('SELECT * FROM mio_media_jobs WHERE owner_id=')
+    ) {
+      paused = true;
+      return result.then(async (rows: unknown) => {
+        entered.resolve();
+        await release.promise;
+        return rows;
+      });
+    }
+    return result;
+  });
+  const pending = store.list(owner);
+  await entered.promise;
+  try {
+    await store.accept(succeeded(later), manifest(later));
+    await store.accept(succeeded(succeededJob), manifest(succeededJob));
+    await store.accept(event(succeededJob));
+    expect((await store.control(owner, succeededJob.id, 'cancel')).state).toBe('succeeded');
+    await expect(store.retry(owner, succeededJob.id, randomUUID())).rejects.toMatchObject({
+      code: 'MEDIA_RETRY_NOT_ALLOWED',
+    });
+    release.resolve();
+    const rows = await pending;
+    expect(rows.find((job) => job.id === later.id)).toMatchObject({
+      state: 'accepted',
+      outputs: [],
+    });
+    expect(rows.find((job) => job.id === succeededJob.id)?.outputs).toHaveLength(1);
+    expect(
+      (await store.list(owner)).every(
+        (job) => job.state === 'succeeded' && job.outputs.length === 1,
+      ),
+    ).toBe(true);
+    expect((await pool.query('SELECT count(*) AS n FROM mio_media_files')).rows[0].n).toBe('2');
+  } finally {
+    release.resolve();
+    await pending;
+    spy.mockRestore();
+  }
 });
 it('rolls back inbox, both assets and status when the second file registration is rejected', async () => {
   const job = (await create()).job;

@@ -84,10 +84,16 @@ async function reserveMessage(
   }
   const inserted = await client.query(
     `
-    INSERT INTO mio_compute_worker_inbox(instance_id,boot_id,boot_sequence,sequence,message_id,digest,received_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING
+    INSERT INTO mio_compute_worker_inbox(instance_id,boot_id,boot_sequence,sequence,message_id,digest,received_at,kind)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING
   `,
-    [...identity, message.messageId, digest, receivedAt],
+    [
+      ...identity,
+      message.messageId,
+      digest,
+      receivedAt,
+      message.type === 'worker.limits.result' ? 'limit_result' : message.event ? 'event' : 'sample',
+    ],
   );
   if (inserted.rowCount) return current;
   const previous = (
@@ -396,8 +402,6 @@ async function storeLimitResult(
 }
 
 const retention = [
-  ['mio_compute_worker_samples', 'message_id', "received_at < $1::timestamptz - interval '7 days'"],
-  ['mio_compute_worker_events', 'message_id', "received_at < $1::timestamptz - interval '30 days'"],
   [
     'mio_compute_worker_executions',
     'execution_id',
@@ -417,7 +421,7 @@ const retention = [
   [
     'mio_compute_worker_inbox',
     'message_id',
-    `received_at < $1::timestamptz - interval '7 days'
+    `kind='limit_result' AND received_at < $1::timestamptz - interval '7 days'
     AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_samples s WHERE s.message_id=t.message_id)
     AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_events e WHERE e.message_id=t.message_id)
     AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_limit_changes l WHERE l.result_message_id=t.message_id)`,
@@ -446,6 +450,30 @@ export class WorkerObservabilityStore {
   }
 
   async prune(now = new Date(epochMs())): Promise<void> {
+    for (const [table, days] of [
+      ['mio_compute_worker_samples', 7],
+      ['mio_compute_worker_events', 30],
+    ] as const) {
+      await computeTransaction(this.#pool, async (client) => {
+        const { rows } = await client.query<{ message_id: string }>(
+          `DELETE FROM ${table} WHERE message_id IN (
+            SELECT message_id FROM ${table}
+            WHERE received_at < $1::timestamptz - $2 * interval '1 day'
+            LIMIT 2000 FOR UPDATE SKIP LOCKED
+          ) RETURNING message_id`,
+          [now, days],
+        );
+        if (!rows.length) return;
+        // Restrict all reference checks to this batch's PKs, including legacy mixed references.
+        await client.query(
+          `DELETE FROM mio_compute_worker_inbox t WHERE message_id=ANY($1::uuid[])
+            AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_samples s WHERE s.message_id=t.message_id)
+            AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_events e WHERE e.message_id=t.message_id)
+            AND NOT EXISTS (SELECT 1 FROM mio_compute_worker_limit_changes l WHERE l.result_message_id=t.message_id)`,
+          [rows.map((row) => row.message_id)],
+        );
+      });
+    }
     // Independent bounded deletes release row locks between data classes.
     for (const [table, id, expired] of retention) {
       await this.#pool.query(
@@ -460,15 +488,36 @@ export class WorkerObservabilityStore {
   }
 }
 
-export async function openWorkerObservabilityPool(databaseURL: string): Promise<Pool> {
-  const pool = new Pool({ connectionString: databaseURL, max: 4, connectionTimeoutMillis: 5000 });
+export async function openWorkerObservabilityPools(databaseURL: string) {
+  const options = {
+    connectionString: databaseURL,
+    connectionTimeoutMillis: 5000,
+    statement_timeout: 5000,
+    query_timeout: 8000,
+    lock_timeout: 3000,
+  };
+  const read = new Pool({ ...options, max: 2 });
+  const write = new Pool({ ...options, max: 3 });
+  const close = async () => {
+    const results = await Promise.allSettled([read.end(), write.end()]);
+    const failures = results.filter((result) => result.status === 'rejected');
+    if (failures.length)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Worker database cleanup failed',
+      );
+  };
   const log = createLogger('app', 'worker-observability-db');
-  pool.on('error', () => log.error('WORKER_OBSERVABILITY_DATABASE_FAILED'));
+  for (const pool of [read, write])
+    pool.on('error', () => log.error('WORKER_OBSERVABILITY_DATABASE_FAILED'));
   try {
-    await checkWorkerObservabilitySchema(pool);
-    return pool;
+    await Promise.all([
+      checkWorkerObservabilitySchema(read),
+      checkWorkerObservabilitySchema(write),
+    ]);
+    return { read, write, close };
   } catch (error) {
-    await pool.end();
+    await close().catch(() => {});
     throw error;
   }
 }

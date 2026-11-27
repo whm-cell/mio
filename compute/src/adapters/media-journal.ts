@@ -1,6 +1,6 @@
 import { MEDIA_VERSION } from '@mio/compute-contracts';
 import { epochMs } from '@mio/foundation/time';
-import type { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { createId } from '@mio/foundation/identifiers';
 import type { MediaCommand, MediaControl, MediaFile, MediaResult } from '@mio/compute-contracts';
@@ -72,34 +72,41 @@ export class MediaJournal {
     this.#db = db;
   }
   get(id: string): MediaAttempt | null {
-    const row = this.#db
-      .prepare('SELECT body, identity FROM media_attempts WHERE attempt_id = ?')
-      .get(id);
-    if (!row) return null;
+    return this.#read('SELECT * FROM media_attempts WHERE attempt_id = ?', [id])[0] ?? null;
+  }
+  #read(sql: string, parameters: SQLInputValue[] = []): MediaAttempt[] {
+    const rows = this.#db.prepare(sql).all(...parameters);
+    if (!rows.length) return [];
     try {
-      const value = JSON.parse(String(row.body)) as MediaAttempt;
-      if (
-        value.command.attemptId !== id ||
-        mediaIdentity(value.command) !== row.identity ||
-        !Number.isSafeInteger(value.startedAt) ||
-        (value.failedAt !== undefined && !Number.isSafeInteger(value.failedAt)) ||
-        !value.steps ||
-        !value.uploads ||
-        !value.inputs ||
-        ![
-          'received',
-          'downloading',
-          'executing',
-          'output_ready',
-          'uploading',
-          'reconciling',
-          'succeeded',
-          'failed',
-          'cancelled',
-        ].includes(value.phase)
-      )
-        throw new Error();
-      return value;
+      const uploads = new Map<string, [string, MediaUploadCheckpoint][]>();
+      for (const row of this.#db
+        .prepare(
+          `SELECT attempt_id,name,state,body FROM media_uploads
+         WHERE attempt_id IN (SELECT value FROM json_each(?)) ORDER BY rowid`,
+        )
+        .all(JSON.stringify(rows.map((row) => row.attempt_id)))) {
+        const upload = JSON.parse(String(row.body)) as MediaUploadCheckpoint;
+        if (upload.state !== row.state) throw new Error();
+        const id = String(row.attempt_id);
+        const entries = uploads.get(id) ?? [];
+        entries.push([String(row.name), upload]);
+        uploads.set(id, entries);
+      }
+      return rows.map((row) => {
+        const value = JSON.parse(String(row.body)) as MediaAttempt;
+        if (
+          value.command.attemptId !== row.attempt_id ||
+          mediaIdentity(value.command) !== row.identity ||
+          !Number.isSafeInteger(value.startedAt) ||
+          (value.failedAt !== undefined && !Number.isSafeInteger(value.failedAt)) ||
+          !value.steps ||
+          !value.inputs ||
+          value.phase !== row.phase ||
+          Number(Boolean(value.cleaned)) !== row.cleaned
+        )
+          throw new Error();
+        return { ...value, uploads: Object.fromEntries(uploads.get(String(row.attempt_id)) ?? []) };
+      });
     } catch {
       throw new Error('JOURNAL_MEDIA_CORRUPT');
     }
@@ -137,19 +144,25 @@ export class MediaJournal {
       ackDispatched: false,
     };
     this.#db
-      .prepare('INSERT INTO media_attempts VALUES (?, ?, ?, ?)')
-      .run(command.attemptId, command.messageId, mediaIdentity(command), JSON.stringify(attempt));
+      .prepare(
+        'INSERT INTO media_attempts(attempt_id,command_id,identity,body,phase,cleaned) VALUES (?, ?, ?, ?, ?, 0)',
+      )
+      .run(
+        command.attemptId,
+        command.messageId,
+        mediaIdentity(command),
+        JSON.stringify({ ...attempt, uploads: undefined }),
+        attempt.phase,
+      );
     return attempt;
   }
   checkpointSource(command: MediaCommand): MediaAttempt | null {
-    const row = this.#db
-      .prepare(
-        `SELECT attempt_id FROM media_attempts
+    const prior = this.#read(
+      `SELECT * FROM media_attempts
       WHERE json_extract(body,'$.command.jobId')=? AND json_extract(body,'$.command.attempt')<?
       ORDER BY json_extract(body,'$.command.attempt') DESC LIMIT 1`,
-      )
-      .get(command.jobId, command.attempt);
-    const prior = row ? this.get(String(row.attempt_id)) : null;
+      [command.jobId, command.attempt],
+    )[0];
     if (!prior || prior.phase !== 'failed' || prior.cleaned) return null;
     const snapshot = (value: MediaCommand) =>
       mediaIdentity({
@@ -162,9 +175,51 @@ export class MediaJournal {
     return prior;
   }
   save(attempt: MediaAttempt): void {
+    const { uploads, ...body } = attempt;
+    this.#db.exec('SAVEPOINT media_save');
+    try {
+      const changed = this.#db
+        .prepare(
+          'UPDATE media_attempts SET body = ?, phase = ?, cleaned = ? WHERE attempt_id = ? AND identity = ?',
+        )
+        .run(
+          JSON.stringify(body),
+          attempt.phase,
+          Number(Boolean(attempt.cleaned)),
+          attempt.command.attemptId,
+          mediaIdentity(attempt.command),
+        );
+      if (changed.changes !== 1) throw new Error('JOURNAL_MEDIA_WRITE_FAILED');
+      this.#db
+        .prepare('DELETE FROM media_uploads WHERE attempt_id = ?')
+        .run(attempt.command.attemptId);
+      const insert = this.#db.prepare(
+        'INSERT INTO media_uploads(attempt_id,name,state,body) VALUES (?, ?, ?, ?)',
+      );
+      for (const [name, upload] of Object.entries(uploads))
+        insert.run(attempt.command.attemptId, name, upload.state, JSON.stringify(upload));
+      this.#db.exec('RELEASE media_save');
+    } catch (error) {
+      this.#db.exec('ROLLBACK TO media_save; RELEASE media_save');
+      throw error;
+    }
+  }
+  /** Persist one intent/receipt without rewriting the output inventory or other receipts. */
+  saveUpload(attempt: MediaAttempt, name: string): void {
+    const upload = attempt.uploads[name]!;
     const changed = this.#db
-      .prepare('UPDATE media_attempts SET body = ? WHERE attempt_id = ? AND identity = ?')
-      .run(JSON.stringify(attempt), attempt.command.attemptId, mediaIdentity(attempt.command));
+      .prepare(
+        `INSERT INTO media_uploads(attempt_id,name,state,body)
+       SELECT attempt_id,?,?,? FROM media_attempts WHERE attempt_id=? AND identity=?
+       ON CONFLICT(attempt_id,name) DO UPDATE SET state=excluded.state,body=excluded.body`,
+      )
+      .run(
+        name,
+        upload.state,
+        JSON.stringify(upload),
+        attempt.command.attemptId,
+        mediaIdentity(attempt.command),
+      );
     if (changed.changes !== 1) throw new Error('JOURNAL_MEDIA_WRITE_FAILED');
   }
   transition(attempt: MediaAttempt, phase: MediaPhase, event: MediaResult): void {
@@ -260,36 +315,27 @@ export class MediaJournal {
     );
   }
   unfinished(): MediaAttempt[] {
-    return this.#db
-      .prepare(
-        "SELECT attempt_id FROM media_attempts WHERE json_extract(body, '$.phase') NOT IN ('succeeded','failed','cancelled') ORDER BY attempt_id",
-      )
-      .all()
-      .map((row) => this.get(String(row.attempt_id))!);
+    return this.#read(
+      "SELECT * FROM media_attempts WHERE phase NOT IN ('succeeded','failed','cancelled') ORDER BY attempt_id",
+    );
   }
   recoverable(): MediaAttempt[] {
-    return this.#db
-      .prepare(
-        "SELECT attempt_id FROM media_attempts WHERE json_extract(body, '$.phase') NOT IN ('succeeded','failed','cancelled') OR COALESCE(json_extract(body, '$.cleaned'),0)=0 UNION SELECT attempt_id FROM media_events WHERE confirmed = 0 ORDER BY attempt_id",
-      )
-      .all()
-      .map((row) => this.get(String(row.attempt_id))!);
+    return this.#read(`SELECT * FROM media_attempts WHERE attempt_id IN (
+      SELECT attempt_id FROM media_attempts WHERE phase NOT IN ('succeeded','failed','cancelled')
+      UNION SELECT attempt_id FROM media_attempts WHERE phase IN ('succeeded','failed','cancelled') AND cleaned=0
+      UNION SELECT attempt_id FROM media_events WHERE confirmed=0
+    ) ORDER BY attempt_id`);
   }
   cleanupCandidates(): MediaAttempt[] {
-    return this.#db
-      .prepare(
-        "SELECT attempt_id FROM media_attempts WHERE json_extract(body,'$.phase') IN ('succeeded','failed','cancelled') AND COALESCE(json_extract(body,'$.cleaned'),0)=0 ORDER BY attempt_id",
-      )
-      .all()
-      .map((row) => this.get(String(row.attempt_id))!);
+    return this.#read(
+      "SELECT * FROM media_attempts WHERE phase IN ('succeeded','failed','cancelled') AND cleaned=0 ORDER BY attempt_id",
+    );
   }
   predecessors(command: MediaCommand): MediaAttempt[] {
-    return this.#db
-      .prepare(
-        "SELECT attempt_id FROM media_attempts WHERE json_extract(body,'$.command.jobId')=? AND json_extract(body,'$.command.attempt')<? ORDER BY json_extract(body,'$.command.attempt')",
-      )
-      .all(command.jobId, command.attempt)
-      .map((row) => this.get(String(row.attempt_id))!);
+    return this.#read(
+      "SELECT * FROM media_attempts WHERE json_extract(body,'$.command.jobId')=? AND json_extract(body,'$.command.attempt')<? ORDER BY json_extract(body,'$.command.attempt')",
+      [command.jobId, command.attempt],
+    );
   }
   pending(id: string): MediaResult | null {
     const row = this.#db

@@ -25,7 +25,11 @@ export interface MediaHlsPackage {
   files: readonly HlsFile[];
 }
 interface HlsStore {
-  hlsPackage(jobId: string, owner: string): Promise<MediaHlsPackage | undefined>;
+  hlsPackage(
+    jobId: string,
+    owner: string,
+    includeSegments?: boolean,
+  ): Promise<MediaHlsPackage | undefined>;
 }
 
 export function mediaHlsPath(jobId: string, assetId?: string): string {
@@ -157,7 +161,7 @@ export async function mediaHls(
   assetId: string | undefined,
   signal: AbortSignal,
 ): Promise<string> {
-  const bundle = await store.hlsPackage(jobId, owner);
+  const bundle = await store.hlsPackage(jobId, owner, Boolean(assetId));
   if (!bundle) missing();
   const prefix = mediaObjectPrefix(jobId, bundle.attemptId);
   const files = new Map(bundle.files.map((file) => [file.name, file]));

@@ -49,8 +49,10 @@ function setup(
     return file(name, 'segment', Buffer.from('local MPEG-TS fixture'));
   });
   const bundle: MediaHlsPackage = { attemptId, files: [parent, variant, ...segments] };
-  const hlsPackage = vi.fn(async (id: string, user: string) =>
-    id === jobId && user === owner ? bundle : undefined,
+  const hlsPackage = vi.fn(async (id: string, user: string, includeSegments?: boolean) =>
+    id === jobId && user === owner
+      ? { ...bundle, files: bundle.files.filter((file) => includeSegments || file.role === 'hls') }
+      : undefined,
   );
   const readMedia = vi.fn(async (key: string) => contents.get(key)!);
   const clock = { now: 1_000 };
@@ -68,6 +70,7 @@ function setup(
     mediaHls({ hlsPackage }, { readMedia }, sign, user, id, assetId, signal);
   return {
     get,
+    hlsPackage,
     jobId,
     parent,
     variant,
@@ -82,10 +85,12 @@ function setup(
 
 describe('owner-bound HLS playlists', () => {
   it('returns a MIME-compatible master with an authenticated child, then signs only its registered TS file', async () => {
-    const { get, jobId, variant, segment, readMedia, sign } = setup();
+    const { get, hlsPackage, jobId, variant, segment, readMedia, sign } = setup();
     expect(await get()).toContain(mediaHlsPath(jobId, variant.asset_id));
+    expect(hlsPackage).toHaveBeenLastCalledWith(jobId, 'fixture-owner', false);
     expect(sign).not.toHaveBeenCalled();
     const result = await get(variant.asset_id);
+    expect(hlsPackage).toHaveBeenLastCalledWith(jobId, 'fixture-owner', true);
     expect(result).toContain(`https://private.example/${segment.object_key}?signature=fixture`);
     expect(sign).toHaveBeenCalledExactlyOnceWith(segment.object_key, 300);
     expect(readMedia).toHaveBeenLastCalledWith(

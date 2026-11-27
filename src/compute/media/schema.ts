@@ -1,4 +1,11 @@
 import type { Pool } from 'pg';
+import { MEDIA_OPERATIONS, mediaResourceClass } from '@mio/compute-contracts';
+
+const probeOperations = MEDIA_OPERATIONS.filter(
+  (operation) => mediaResourceClass(operation) === 'probe',
+)
+  .map((operation) => `'${operation.replaceAll("'", "''")}'`)
+  .join(',');
 
 /** Additive media tables: immutable input snapshots and independently durable control intents. */
 export const mediaSchemaSQL = `
@@ -23,7 +30,13 @@ CREATE TABLE IF NOT EXISTS mio_media_outbox (
   command jsonb NOT NULL, lease_id uuid, lease_until timestamptz, sent_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS mio_media_outbox_pending ON mio_media_outbox(created_at) WHERE sent_at IS NULL;
+ALTER TABLE mio_media_outbox ADD COLUMN IF NOT EXISTS lane text GENERATED ALWAYS AS (
+  CASE WHEN command->>'type'='media.control' THEN 'control'
+    WHEN command->>'operation' IN (${probeOperations}) THEN 'probe' ELSE 'encode' END
+) STORED;
+CREATE INDEX IF NOT EXISTS mio_media_outbox_lane_pending ON mio_media_outbox(lane,created_at,id)
+  WHERE sent_at IS NULL;
+DROP INDEX IF EXISTS mio_media_outbox_pending;
 CREATE TABLE IF NOT EXISTS mio_media_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -46,14 +59,15 @@ CREATE TABLE IF NOT EXISTS mio_media_files (
   UNIQUE(job_id,name)
 );
 ALTER TABLE mio_media_files ADD COLUMN IF NOT EXISTS ordinal integer NOT NULL DEFAULT 0
-  CHECK (ordinal >= 0);`;
+  CHECK (ordinal >= 0);
+CREATE INDEX IF NOT EXISTS mio_media_files_order ON mio_media_files(job_id,ordinal,name);`;
 
 export async function checkMediaSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await pool.query(
     'SELECT id,owner_id,request_id,request_hash,operation,parameters,inputs,profile,state,attempt,attempt_id,command_id,cancel_requested,error_code,stage,progress,data,created_at,updated_at FROM mio_media_jobs LIMIT 0',
   );
   await pool.query(
-    'SELECT id,job_id,command,lease_id,lease_until,sent_at,created_at FROM mio_media_outbox LIMIT 0',
+    'SELECT id,job_id,command,lane,lease_id,lease_until,sent_at,created_at FROM mio_media_outbox LIMIT 0',
   );
   await pool.query('SELECT id,payload,created_at FROM mio_media_inbox LIMIT 0');
   await pool.query(

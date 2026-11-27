@@ -85,6 +85,11 @@ it('cleans actual independently pooled online domains and A files, keeps public/
         VALUES($1,$2,'private.png','image/png',1,$3,$3,'ready',now(),now())`,
         [asset, owner, key],
       );
+    // A write-ahead locator can outlive ownership; its GC request must retain the live owner's key.
+    await media.query(
+      "INSERT INTO mio_asset_gc_objects(object_key,owner_id,state) VALUES($1,$2,'held')",
+      [newRaw, actor.userId],
+    );
     await f.pool.query('UPDATE "user" SET "avatarAssetId"=$2 WHERE id=$1', [actor.userId, id]);
     await media.query(
       "INSERT INTO mio_asset_holders(owner_id,asset_id,holder_type,holder_id) VALUES($1,$2,'avatar',$1)",
@@ -261,6 +266,15 @@ it('cleans actual independently pooled online domains and A files, keeps public/
       { user_id: fresh.userId },
     ]);
     expect(keys).toEqual(new Set([newRaw]));
+    expect(await assets.get(fresh, newId)).toMatchObject({ assetId: newId, status: 'ready' });
+    expect(
+      (
+        await media.query(
+          'SELECT retained_refs,settled_at FROM mio_asset_gc_requests WHERE owner_id=$1 AND object_key=$2',
+          [actor.userId, newRaw],
+        )
+      ).rows[0],
+    ).toMatchObject({ retained_refs: 1, settled_at: expect.any(Date) });
     expect(
       (await f.pool.query('SELECT completed_at FROM mio_account_cleanup_jobs')).rows[0]
         .completed_at,

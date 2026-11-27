@@ -122,6 +122,7 @@ it.each([false, true])(
           [refB],
         ),
       ).toBe('completed');
+      expect(await engine.retainedAssetIds?.('vision-session')).toEqual([assetB]);
       expect(requests).toHaveLength(2);
       expect(observations).toHaveLength(2);
       const wire = JSON.stringify(requests[1]);

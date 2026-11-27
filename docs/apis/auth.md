@@ -2,6 +2,8 @@
 
 [API 领域导航](index.md)；配置、迁移、模块职责和测试入口见[认证底座](../auth.md)。沿 Better Auth 1.7.18 的现有行为，不把它与 Foundation 错误格式或服务凭据合并。
 
+个人空间计量与提醒使用同一已验证 Cookie 身份，接口见[存储用量与提醒](assets.md#get-apiv1mestorage-usage)。认证域不依赖资产或管理模块；头像持有同步通过装配层回调完成，失败保留既有头像降级行为并由后台对账恢复。
+
 ## 本域共同约定
 
 只开放下列认证路由，其他库插件、邮箱修改、邮件找回、账号删除及未列出的 OAuth 入口不隐式开放。所有 POST、PATCH 与 DELETE 必须携带允许的 Origin；POST 与 PATCH 另须为 JSON，正文最多 16 KiB、读取超时 10 秒。本文列出的 DELETE 不需要正文。浏览器请求使用 `credentials: 'include'`。

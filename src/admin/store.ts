@@ -1,9 +1,12 @@
 import { readCreationLogSettings, saveCreationLogSettings } from './creation-logs.ts';
 import type { CreationLogSettings } from './creation-logs.ts';
+import { readStorageSettings, saveStorageSettings } from './storage-store.ts';
+import type { StorageSettings } from './storage.ts';
+import type { validateStorageSettingsUpdate } from './storage-store.ts';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { createId } from '@mio/foundation/identifiers';
 import { createLogger } from '@mio/foundation/logging';
-import { utcISOString } from '@mio/foundation/time';
+import { epochMs, utcISOString } from '@mio/foundation/time';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import type { AuthRuntimePolicy, AuthSmsMode } from '../auth/config.ts';
@@ -274,6 +277,8 @@ async function materializeCuratedModelForActiveProviders(
 export class AdminStore {
   readonly initialAuthSettings: AdminStoredAuthSettings | null;
   readonly initialCreationLogSettings: CreationLogSettings;
+  readonly initialStorageSettings: StorageSettings;
+  readonly initialStorageSettingsReadAt: number;
   readonly initialOneLinkSsoConfig: AdminOneLinkSsoConfigView | null;
   readonly oneLinkSsoEnv: string;
   private readonly pool: Pool;
@@ -288,9 +293,11 @@ export class AdminStore {
     ownsConversationsPool: boolean,
     mediaPool: Pool | null,
     initialCreationLogSettings: CreationLogSettings,
+    initialStorageSettings: StorageSettings,
     initialAuthSettings: AdminStoredAuthSettings | null = null,
     initialOneLinkSsoConfig: AdminOneLinkSsoConfigView | null = null,
     oneLinkSsoEnv = 'dev',
+    initialStorageSettingsReadAt = epochMs(),
   ) {
     this.pool = pool;
     this.conversationsPool = conversationsPool;
@@ -298,6 +305,8 @@ export class AdminStore {
     this.mediaPool = mediaPool;
     this.initialAuthSettings = initialAuthSettings;
     this.initialCreationLogSettings = initialCreationLogSettings;
+    this.initialStorageSettings = initialStorageSettings;
+    this.initialStorageSettingsReadAt = initialStorageSettingsReadAt;
     this.initialOneLinkSsoConfig = initialOneLinkSsoConfig;
     this.oneLinkSsoEnv = oneLinkSsoEnv;
   }
@@ -1824,6 +1833,17 @@ export class AdminStore {
     );
   }
 
+  readStorageSettings() {
+    return readStorageSettings(this.pool);
+  }
+
+  updateStorageSettings(
+    actor: AdminAccountView,
+    input: ReturnType<typeof validateStorageSettingsUpdate>,
+  ) {
+    return this.transaction((client) => saveStorageSettings(client, actor, input));
+  }
+
   async readGlobalAuthSettings(): Promise<AdminStoredAuthSettings | null> {
     const row = (
       await this.pool.query<GlobalSettingsRow>(
@@ -2182,16 +2202,19 @@ export async function createAdminStore(
   try {
     await checkProviderSchema(pool);
     await checkAdminSchema(pool);
-    const [initialAuthRes, initialOneLinkRes, initialCreationLogSettings] = await Promise.all([
-      pool.query<GlobalSettingsRow>(
-        "SELECT setting_key, value, revision, updated_by, created_at, updated_at FROM mio_admin_global_settings WHERE setting_key = 'auth'",
-      ),
-      pool.query<OneLinkSsoConfigRow>(
-        `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1`,
-        [oneLinkSsoEnv],
-      ),
-      readCreationLogSettings(pool),
-    ]);
+    const initialStorageSettingsReadAt = epochMs();
+    const [initialAuthRes, initialOneLinkRes, initialCreationLogSettings, initialStorageSettings] =
+      await Promise.all([
+        pool.query<GlobalSettingsRow>(
+          "SELECT setting_key, value, revision, updated_by, created_at, updated_at FROM mio_admin_global_settings WHERE setting_key = 'auth'",
+        ),
+        pool.query<OneLinkSsoConfigRow>(
+          `SELECT ${ONELINK_SSO_COLUMNS} FROM mio_admin_onelink_sso_config WHERE environment = $1`,
+          [oneLinkSsoEnv],
+        ),
+        readCreationLogSettings(pool),
+        readStorageSettings(pool),
+      ]);
     const initialAuthRow = initialAuthRes.rows[0];
     const initialAuthSettings = initialAuthRow ? toStoredAuthSettings(initialAuthRow) : null;
     const initialOneLinkRow = initialOneLinkRes.rows[0];
@@ -2215,9 +2238,11 @@ export async function createAdminStore(
       ownsConversationsPool,
       mediaPool,
       initialCreationLogSettings,
+      initialStorageSettings,
       initialAuthSettings,
       initialOneLinkSsoConfig,
       oneLinkSsoEnv,
+      initialStorageSettingsReadAt,
     );
   } catch (error) {
     await Promise.allSettled([

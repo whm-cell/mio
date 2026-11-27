@@ -414,6 +414,15 @@ export class ConversationStore {
     if (!old) requireUnarchived(row);
     return { row, ...(old ? { replay: receipt(old) } : {}) };
   }
+  async storageConversations(owner: string) {
+    this.assertActive();
+    return (
+      await this.pool.query<{ id: string; dsh_session_id: string }>(
+        "SELECT id,dsh_session_id FROM mio_conversations WHERE owner_id=$1 AND state='ready' ORDER BY id",
+        [owner],
+      )
+    ).rows;
+  }
   async snapshot(actor: Principal, id: string): Promise<ConversationSnapshot> {
     this.assertActive();
     const row = (

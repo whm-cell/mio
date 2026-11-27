@@ -1,7 +1,13 @@
+import { createStorageAccounting } from './assets/storage-store.ts';
+import { startStorageReconciliation } from './assets/storage-worker.ts';
+import { createStorageUsageHandler } from './assets/storage-http.ts';
+import { defaultStoragePolicy } from './assets/storage.ts';
+import type { StorageHolderSource } from './assets/storage-worker.ts';
 import { createCreationLogStore } from './notifications/creation-store.ts';
 import { createCreationLogHandler } from './notifications/creation-http.ts';
 import { startAudioCreationDelivery } from './audio/jobs/creation-outbox.ts';
 import { monotonicMs } from '@mio/foundation/time';
+import { createLogger } from '@mio/foundation/logging';
 import { createId } from '@mio/foundation/identifiers';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
@@ -109,6 +115,7 @@ import { createNotificationService } from './notifications/service.ts';
 import { createNotificationHandler } from './notifications/http.ts';
 
 export const name = 'mio-foundation';
+const log = createLogger('app', 'plugin');
 export const inject = ['webServer', 'tools'];
 
 declare module '@deepseek-ai/cordis' {
@@ -298,6 +305,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     };
     let materials: MaterialService | undefined;
     let assets: ReturnType<typeof createAssetService> | undefined;
+    let storage: Awaited<ReturnType<typeof createStorageAccounting>> | undefined;
+    let storageWorker: ReturnType<typeof startStorageReconciliation> | undefined;
+    let storageClosing: Promise<void> | undefined;
+    const getStoragePolicy = () => (admin ? admin.getStoragePolicy() : defaultStoragePolicy);
+    const closeStorage = () =>
+      (storageClosing ??= (async () => {
+        await storageWorker?.close();
+        await storage?.close();
+      })());
+    const syncAvatarHolder = (owner: string) =>
+      storage?.store.replaceHolder(owner, async () => {
+        const avatarAssetId = await auth.avatarAssetId(owner);
+        return {
+          type: 'avatar',
+          id: owner,
+          assetIds: avatarAssetId ? [avatarAssetId] : [],
+        };
+      }) ?? Promise.resolve();
+    const syncStorageHolders = (owner: string, id: string, read: () => Promise<string[]>) =>
+      storage?.store.replaceHolder(owner, async () => ({
+        type: 'conversation',
+        id,
+        assetIds: await read(),
+      })) ?? Promise.resolve();
     let derivatives: ReturnType<typeof startAssetDerivatives> | undefined;
     let audio: AudioJobService | undefined;
     let assetResources: { store: AssetStore; objects: AssetObjectStore } | undefined;
@@ -309,6 +340,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         assets?.verifyAvatar(identity, assetId) ?? Promise.resolve('unavailable'),
       getAuthPolicy,
       {
+        avatarChanged: syncAvatarHolder,
         avatarUrl: (identity, assetId) =>
           assets?.avatarUrl(identity, assetId) ?? Promise.resolve(null),
         normalizeAvatar: (identity, sourceAssetId) => {
@@ -320,6 +352,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (assetConfig) {
       const store = await createAssetStore(assetConfig.databaseURL, Boolean(computeConfig));
       try {
+        storage = await createStorageAccounting(assetConfig.databaseURL, getStoragePolicy);
         const objects = createCosStorage(assetConfig);
         assetResources = { store, objects };
         const acquired = (assets = createAssetService(store, objects));
@@ -334,6 +367,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                 () => materials?.close(),
                 () => audio?.close(),
                 () => derivatives?.close(),
+                closeStorage,
               ],
               () => acquired.close(),
             ),
@@ -346,6 +380,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }),
         );
       } catch (error) {
+        await closeStorage();
         await (assets ? assets.close() : store.close());
         throw error;
       }
@@ -574,7 +609,20 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
             kind: 'prefix',
             path: '/api/v1/admin',
             handler: createAdminHandler(
-              acquired,
+              {
+                ...acquired,
+                async updateStorageSettings(...args) {
+                  const saved = await acquired.updateStorageSettings(...args);
+                  try {
+                    await storage?.store.updatePolicy();
+                  } catch {
+                    // The admin transaction is already committed. Existing background work repairs
+                    // the projection; usage reads reject a mismatched version until it catches up.
+                    log.warn('STORAGE_POLICY_PROJECTION_UNAVAILABLE');
+                  }
+                  return saved;
+                },
+              },
               adminConfig.allowedOrigins,
               computeHandler,
               notifications,
@@ -879,6 +927,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
                     return resolve ? resolve(lookup) : null;
                   },
                   audioTools,
+                  syncStorageHolders,
                 ));
             const ownedHttp = (http = createConversationHandler(
               ownedConversations,
@@ -909,6 +958,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           }
         },
       });
+    }
+    if (storage) {
+      const sources: StorageHolderSource[] = [
+        {
+          type: 'avatar',
+          async read(owner) {
+            const avatarAssetId = await auth.avatarAssetId(owner);
+            return avatarAssetId ? [{ type: 'avatar', id: owner, assetIds: [avatarAssetId] }] : [];
+          },
+        },
+      ];
+      if (conversationConfig)
+        sources.push({
+          type: 'conversation',
+          async read(owner) {
+            if (!conversations) throw new Error('CONVERSATION_STORAGE_UNAVAILABLE');
+            return conversations.storageHolders(owner);
+          },
+        });
+      storageWorker = startStorageReconciliation(storage.store, sources);
+    }
+    const storageHandler = createStorageUsageHandler(
+      () => storage?.store,
+      auth.identity,
+      authConfig.origins,
+    );
+    for (const path of ['/api/v1/me/storage-usage', '/api/v1/me/storage-usage/reminders/ack']) {
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path, handler: storageHandler }));
     }
     ctx.effect(() =>
       ctx.webServer.register({

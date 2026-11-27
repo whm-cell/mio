@@ -68,6 +68,14 @@ export async function createAuthentication(
         return { userId: session.user.id, sessionId: session.session.id };
       },
       profile: (userId: string) => readUserProfile(pool, userId),
+      /** Disabling login does not release a persisted avatar's media hold. No public profile bypass. */
+      async avatarAssetId(userId: string): Promise<string | null> {
+        const result = await pool.query<{ avatarAssetId: string | null }>(
+          'SELECT "avatarAssetId" FROM "user" WHERE id=$1',
+          [userId],
+        );
+        return result.rows[0]?.avatarAssetId ?? null;
+      },
       updateProfile: (userId: string, patch: UserProfilePatch) =>
         updateUserProfile(pool, userId, patch),
       setUserDisabled: (userId: string, disabled: boolean) =>

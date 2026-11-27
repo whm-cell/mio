@@ -140,6 +140,7 @@ async function main(name: 'dev' | 'test') {
         'conversations',
         'providers',
         'assets',
+        'storage',
         'compute',
         'generations',
         'materials',
@@ -154,7 +155,7 @@ async function main(name: 'dev' | 'test') {
       (domain !== 'auth' && args.includes('--rollback-sms-budget'))
     )
       throw new Error(
-        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|compute|generations|materials|admin|notifications|creation-logs] [--apply] [--rollback-sms-budget for auth]',
+        'Usage: local <dev|test> migrate [auth|conversations|providers|assets|storage|compute|generations|materials|admin|notifications|creation-logs] [--apply] [--rollback-sms-budget for auth]',
       );
     console.log(`${name}: ${domain} migration ${args.includes('--apply') ? 'apply' : 'preview'}`);
     await run(process.execPath, [`scripts/service/migrate-${domain}.ts`, ...args], runtime);

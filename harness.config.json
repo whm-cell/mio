@@ -19,6 +19,7 @@
       "src/conversations/schema.ts",
       "src/assets/config.ts",
       "src/assets/schema.ts",
+      "src/assets/storage-schema.ts",
       "src/assets/store.ts",
       "src/materials/config.ts",
       "src/materials/schema.ts",

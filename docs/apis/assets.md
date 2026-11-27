@@ -16,6 +16,40 @@ AssetView 是 `{assetId,status,filename,contentType,size,createdAt,downloadUrl?,
 
 头像读取独立于通用下载签名：认证装配仅调用 `verifyAvatar`、`avatarUrl` 和 `normalizeAvatar`。静态头像核验本人 ready 元数据及实际 HEAD 大小、类型；签名只允许 JPEG/PNG/WebP，采用私有桶 300 秒 HTTPS inline URL，不落库。GIF 转换直接在主服务 A 执行，复用 `mio_assets` 保存不可变的静态 WebP，设置 private ACL；版本化确定性资产 ID 和对象键支持重试、并发恢复与重启复用，不新增表、队列或计算任务。完成登记再次核对原件快照仍为本人 ready。转换细节及前端接口见[头像转换](auth.md#post-apiv1meprofileavatarnormalize)，不改变通用 AssetView 的 attachment 下载语义。
 
+## GET /api/v1/me/storage-usage
+
+身份：当前登录用户。响应遵循本域 Cookie、Origin、no-store 和标准错误包装。
+
+输入：无查询参数。
+
+错误：资产服务未配置或计量／策略不可用时返回 `503 STORAGE_UNAVAILABLE`；其余沿本域共同约定。
+
+副作用：严格只读，不执行数据库写入或行锁。
+
+成功：200 `{quotaBytes,warningAvailableBytes,usedBytes,availableBytes,usageRatio,objectCount,status,reminderVersion,thresholdReminderPending,calculatedAt}`。大小单位为字节，默认配额 5 GiB、可用低于 1 GiB 提醒。`availableBytes=max(0,quotaBytes-usedBytes)`，`usageRatio=usedBytes/quotaBytes`，超额时可大于 1。可用空间为 0 时为 `full`，严格低于提醒阈值时为 `warning`，恰等于阈值仍为 `safe`。本期只计量和提醒，空间不足不禁用上传、生成、查看、下载或清理，不返回预留量、限写或降级字段。
+
+GET 严格只读：按用户主键读取 `mio_storage_usage`，不写数据库、不加行锁、不扫描资产或跨表实时去重。新账号返回零用量而不建行，查询失败不返回假零。管理配额和阈值由装配层传入只读短快照，多实例遵循管理域至多 5 秒的快照有效期。查询同一快照中的媒体策略投影并核对配置版本及生效值；不一致时只读返回 `503 STORAGE_UNAVAILABLE`，不提前展示计量触发器尚未采用的新版本提醒。管理保存结果以管理库事务为准，已提交后的媒体投影同步失败记录日志并由现有后台恢复，不把已成功保存误报为失败。
+
+媒体库中的 `mio_asset_holders(owner_id,asset_id,holder_type,holder_id)` 按实际持有位置保存可扩展引用，使用库内 `(owner_id,asset_id)` 外键约束归属。`mio_storage_objects` 按 `(owner_id,object_key)` 物化去重，用户汇总保存字节数、底层对象数、`waterline_epoch`、确认版本和计算时间。ready 上传及图片／视频／音频成品登记自动建立 `asset` 持有；头像、DSH 当前持久模型表面的非 offloaded 视觉输入／工具图片、本地非 deleted 素材的 `source_asset_id` 分别建立持有。内部 preview、poster、HLS 清单／分片、staging、未完成上传和仅供应商托管的对象不计。目录副本、作品和回收站可作为独立持有方复用对象，只计一次，最后一处有效持有释放才扣减。完整目录库与正式媒体物理 GC 不在本单元内实施。
+
+资产及本地素材变更在媒体库同事务维护计量。跨认证／对话库通过装配层读取回调同步持有，不建立跨库外键或事务。头像提交后的同步失败不阻断读取、仅改昵称或清空头像；后台恢复已提交事实。DSH 读取复用当前持久模型表面，包含工具图片和分叉，不从历史文本猜测引用。周期对账按账号主键分页，每批至多 10 个账号；源读取失败保留已有持有。策略投影每秒独立刷新，不被某个账号的慢对账阻塞，关闭时等待两类在途工作。后台修复与扫描不进入 GET 路径。
+
+资产持有变更或后台对账导致任一下降（`full → warning`、`full → safe`、`warning → safe`）时推进持久化 `waterline_epoch`。`reminderVersion=storage:v1:{status}:{configRevision}:{waterlineEpoch}`，由三者确定性生成。仅 warning/full 且当前版本未确认时 `thresholdReminderPending=true`，满额提醒优先。相同区域内刷新、清理或保存同值配置不重复提醒；实际配置变化或降级后再次升入提醒／满额时产生新版本。
+
+存量环境先用 `pnpm storage:migrate` 预览，再显式执行 `pnpm storage:migrate --apply`；常驻环境可用 `pnpm migrate:dev storage --apply`。增量迁移保留资产和任务，分类既有内部媒体并回填 ready original/derived 及已存在的本地素材持有；重跑不恢复已释放的 `asset` 持有。新环境 `assets:migrate --apply` 同时建立计量底座，`materials:migrate --apply` 安装素材引用触发器。头像／当前对话持有由后台按权威源补齐。服务启动只核对结构，缺少迁移或计量触发器时拒绝装载，不自动迁移。
+
+## POST /api/v1/me/storage-usage/reminders/ack
+
+身份：当前登录用户；要求允许的精确 Origin 和 `application/json`。
+
+输入：仅为 `{reminderVersion}`，无查询参数；读完正文后再次核对会话。
+
+成功：204，无正文。按本人和版本幂等确认已展示；只允许匹配数据库当前区域、配置版本和 epoch 的版本写入确认。旧版本与重复回执均安全返回 204，不清除后续提醒，也不能替其他用户确认。条件更新同时核对媒体策略，并拒绝用较旧配置版本替换已保存的新确认；等待行锁的旧语句快照也受该行条件保护。
+
+错误：沿本域规则，资产库或策略暂不可用返回 `503 STORAGE_UNAVAILABLE`。
+
+副作用：按本人及当前版本幂等记录确认；旧版本或重复回执不改变当前确认。
+
 ## POST /api/v1/assets/uploads
 
 身份：当前登录用户。

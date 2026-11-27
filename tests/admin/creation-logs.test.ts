@@ -45,7 +45,7 @@ it('upgrades the old auth-only CHECK idempotently without changing auth, creatio
   expect(
     (await pool.query('SELECT * FROM mio_admin_global_settings ORDER BY setting_key')).rows,
   ).toEqual(all);
-  await pool.query("DELETE FROM mio_admin_global_settings WHERE setting_key='auth'");
+  await pool.query("DELETE FROM mio_admin_global_settings WHERE setting_key IN ('auth','storage')");
 });
 
 it('saves a single revision/audit atomically, rejects races and refreshes immediately and after restart', async () => {

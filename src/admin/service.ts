@@ -1,4 +1,7 @@
 import { createCreationRetentionSnapshot } from './creation-logs.ts';
+import { createStoragePolicySnapshot } from './storage.ts';
+import { validateStorageSettingsUpdate } from './storage-store.ts';
+import type { StorageSettings } from './storage.ts';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs, utcISOString } from '@mio/foundation/time';
@@ -421,6 +424,7 @@ export function createAdminService(
   oneLinkSso?: AdminOneLinkSsoRuntimeOptions,
 ) {
   const creationRetention = createCreationRetentionSnapshot(store);
+  const storagePolicy = createStoragePolicySnapshot(store);
   const cancellation = new AbortController();
   const activeProbes = new Set<Promise<AdminProbeDiscoveryResult>>();
   let activeOneLinkRegister: Promise<AdminOneLinkSsoRegisterView> | null = null;
@@ -1371,6 +1375,27 @@ export function createAdminService(
       return creationRetention.save(saved);
     },
 
+    getStoragePolicy(): StorageSettings {
+      assertOpen();
+      return storagePolicy.get();
+    },
+
+    getStorageSettings(): Promise<StorageSettings> {
+      assertOpen();
+      return storagePolicy.refresh();
+    },
+
+    async updateStorageSettings(
+      principal: AdminPrincipal,
+      input: Record<string, unknown>,
+    ): Promise<StorageSettings> {
+      assertOpen();
+      const validated = validateStorageSettingsUpdate(input);
+      const saved = await store.updateStorageSettings(principal.admin, validated);
+      storagePolicy.save(saved);
+      return saved;
+    },
+
     getAuthPolicy(): AuthRuntimePolicy {
       return currentAuthPolicy;
     },
@@ -1497,6 +1522,7 @@ export function createAdminService(
             ...(activeOneLinkRegister ? [activeOneLinkRegister] : []),
           ]);
           await creationRetention.close();
+          await storagePolicy.close();
           await store.close();
         })();
       }

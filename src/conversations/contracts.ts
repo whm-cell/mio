@@ -375,6 +375,7 @@ export interface ConversationEngine {
     selection?: ChatSelection,
   ): Promise<void>;
   hasRetainedImages?(id: string): Promise<boolean>;
+  retainedAssetIds?(id: string): Promise<string[]>;
   rename(id: string, title: string): Promise<string>;
   history(id: string, afterSeq: number, limit: number, signal?: AbortSignal): Promise<HistoryPage>;
   contextUsage?(id: string, signal?: AbortSignal): Promise<ContextUsage>;

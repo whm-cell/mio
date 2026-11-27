@@ -62,7 +62,15 @@ export function createConversationService(
   vision?: ConversationVision,
   resolveProjectContext?: ConversationProjectContextResolver,
   audio?: ConversationAudioTools,
+  syncStorageHolders?: (owner: string, id: string, read: () => Promise<string[]>) => Promise<void>,
 ) {
+  const syncVisualHolds = async (owner: string, id: string, nativeId: string) => {
+    if (!syncStorageHolders || !engine.retainedAssetIds) return;
+    const read = engine.retainedAssetIds.bind(engine);
+    await syncStorageHolders(owner, id, () => read(nativeId)).catch(() =>
+      log.warn('CONVERSATION_STORAGE_HOLDERS_UNAVAILABLE'),
+    );
+  };
   const pending = new Map<string, Promise<void>>();
   const receiving = new Map<string, Promise<Receipt>>();
   const admissionStop = new AbortController();
@@ -231,6 +239,7 @@ export function createConversationService(
           publish(id, { type: 'error', code: 'CONVERSATION_UNAVAILABLE' });
         }
       } finally {
+        await syncVisualHolds(actor.userId, id, dshSessionId);
         cancellations.delete(key);
       }
     })();
@@ -366,6 +375,18 @@ export function createConversationService(
     },
     rename: (actor: Principal, id: string, title: string) =>
       admit(() => store.rename(actor, id, (row) => engine.rename(row.dsh_session_id, title))),
+    async storageHolders(owner: string) {
+      if (!engine.retainedAssetIds) throw new Error('CONVERSATION_STORAGE_UNAVAILABLE');
+      const rows = await store.storageConversations(owner);
+      const holders = [];
+      for (const row of rows)
+        holders.push({
+          type: 'conversation',
+          id: row.id,
+          assetIds: await engine.retainedAssetIds(row.dsh_session_id),
+        });
+      return holders;
+    },
     archive: (actor: Principal, id: string) => admit(() => store.archive(actor, id)),
     request: (actor: Principal, id: string, requestId: string) => {
       check();
@@ -581,6 +602,7 @@ export function createConversationService(
               text,
               async () => {
                 await store.inputPersisted(id, requestId);
+                await syncVisualHolds(actor.userId, id, nativeId);
                 publish(id, {
                   type: 'state',
                   receipt: { conversationId: id, requestId, status: 'input-persisted' },

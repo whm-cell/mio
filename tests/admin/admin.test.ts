@@ -1523,6 +1523,7 @@ function createPolicyRaceService(initial: AdminStoredAuthSettings | null) {
     false,
     null,
     { revision: 0, retentionDays: null },
+    { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
     initial,
   );
   const config = readProviderConfig({

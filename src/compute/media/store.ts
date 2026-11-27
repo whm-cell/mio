@@ -398,10 +398,21 @@ async function registerFiles(
       etags = manifest.files.map((f) => f.etag);
     const types = manifest.files.map((f) => f.contentType);
     await client.query(
-      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind)
-       SELECT id,$1,name,type,size,NULL,key,'ready',etag,now(),now(),'derived'
-       FROM unnest($2::uuid[],$3::text[],$4::text[],$5::bigint[],$6::text[],$7::text[]) AS f(id,name,type,size,key,etag)`,
-      [job.owner_id, ids, names, types, sizes, keys, etags],
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind,storage_class)
+       SELECT id,$1,name,type,size,NULL,key,'ready',etag,now(),now(),'derived',storage_class
+       FROM unnest($2::uuid[],$3::text[],$4::text[],$5::bigint[],$6::text[],$7::text[],$8::text[]) AS f(id,name,type,size,key,etag,storage_class)`,
+      [
+        job.owner_id,
+        ids,
+        names,
+        types,
+        sizes,
+        keys,
+        etags,
+        manifest.files.map((f) =>
+          ['preview', 'poster', 'hls', 'segment'].includes(f.role) ? 'internal' : 'content',
+        ),
+      ],
     );
     await client.query(
       `INSERT INTO mio_media_files(asset_id,job_id,name,role,object_key,size_bytes,etag,sha256,content_type,ordinal)

@@ -543,3 +543,31 @@
 错误：版本冲突为 409 `SETTINGS_CONFLICT`，非法输入为 400 `ADMIN_INPUT_INVALID`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
 
 副作用：管理库一个事务内完成配置版本检查、更新及 `settings.creation-logs.update` 审计；审计包含操作者和前后天数／版本，审计失败回滚配置。保存实例立即更新进程内只读快照，其他实例每秒刷新、快照最长有效 5 秒；刷新失败并过期后，创作日志读取／清理失败关闭，不退回无限保留。用户热路径不查询管理库。设置缩短或首次保存时，管理端应先提示超期旧消息会被清理。更改仅影响创作消息和已读状态，作品、生成历史和公告沿各自规则。
+
+## GET /api/v1/admin/settings/storage
+
+身份：独立管理员 Cookie 会话；普通用户 Cookie、服务 Bearer 均不授权。来源及响应头沿管理域共同约定。
+
+输入：无查询参数或正文。
+
+成功：200 `{revision,quotaBytes,warningAvailableBytes}`。首次配置前为 `{revision:0,quotaBytes:5368709120,warningAvailableBytes:1073741824}`（5 GiB 配额、1 GiB 提醒阈值）；已有配置从管理库回读，重启保留。
+
+错误：401 `ADMIN_UNAUTHORIZED`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：只读配置并刷新进程内只读快照，不写配置或审计。缺配置才使用默认值，已有但格式损坏的配置失败关闭，不自动覆盖。
+
+## PATCH /api/v1/admin/settings/storage
+
+身份：独立管理员 Cookie，必须携带精确匹配允许列表的 Origin。请求读取完毕再次校验管理员会话。
+
+输入：JSON `{expectedRevision,quotaBytes?,warningAvailableBytes?}`，至少提交一个配置字段，拒绝额外字段及查询参数。`expectedRevision` 为 0–2147483647 的整数；字节值须为安全正整数，不接受 null、小数、字符串或超出安全整数的值。省略字段保留当前值，管理库事务内合并后必须满足 `0 < warningAvailableBytes < quotaBytes`。可同时调整两项。前端按 GiB 展示，服务端以字节保存；`/settings/global` 仍只接收认证配置。
+
+成功：200，结构同 GET。生效值有变化时版本加一（首次变更为 1）；合并后与当前值相同则返回当前版本，不递增、不写配置或变更审计。首次保存与默认值相同也保留版本 0。旧版本即使提交相同值也返回 409。
+
+错误：400 `ADMIN_INPUT_INVALID`；409 `SETTINGS_CONFLICT`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：复用 `mio_admin_global_settings` 的 `storage` 记录，在同一个管理库事务内按版本、行锁完成合并校验、配置写入和 `settings.storage.update` 审计（`target_id='storage'`，记录管理员 ID／用户名与前后值／版本）。首次写入竞争通过主键冲突返回 409；审计失败回滚配置。只修改全局策略，不逐账号更新。
+
+服务内同步 `getStoragePolicy(): StorageSettings` 返回不可变快照，供用户用量热路径直接读取，单次读取不查询管理库。保存实例在事务成功完成后立即刷新，并从完成时刻重新计算最长 5 秒有效期，避免锁等待消耗刚保存配置的有效期。其他实例每秒后台刷新，查询取得的快照仍从查询开始时计时；慢查询和失败均不延长旧快照寿命，过期返回 503 `STORAGE_POLICY_UNAVAILABLE`。旧在途查询不能覆盖本机刚保存的新版本，卸载时停止轮询并等待在途刷新结束。此处短快照用于满足[个人中心 U6](../tasks/personal-center/prd.md#u6-存储用量与提醒)的同步读和跨实例收敛要求，不新增 Redis 缓存或通用配置框架。
+
+配额只用于计量和提醒，实际用量可超过配额；此配置不拦截上传、生成、查看、下载或清理，不新增空间预留、限写或降级字段。

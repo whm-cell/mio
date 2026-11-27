@@ -242,6 +242,18 @@ export function createDshConversationEngine(
         );
       });
     },
+    async retainedAssetIds(id) {
+      const view = await ctx.mioKernel.readPersistedView(id);
+      const ids = new Set<string>();
+      for (const message of view.deriveMessages()) {
+        for (const block of message.content) {
+          if (block.type !== 'image' || block.offloaded === true) continue;
+          const assetId = conversationImageAssetId(String(block.attachment.attachmentId));
+          if (assetId) ids.add(assetId);
+        }
+      }
+      return [...ids];
+    },
     async hasRetainedImages(id) {
       const view = await ctx.mioKernel.readPersistedView(id);
       return containsRetainedImages(view.deriveMessages());

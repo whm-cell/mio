@@ -146,6 +146,7 @@ const KNOWN_ROUTES: Record<string, readonly string[]> = {
   '/monitoring': ['GET'],
   '/settings/global': ['GET', 'PATCH'],
   '/settings/creation-logs': ['GET', 'PATCH'],
+  '/settings/storage': ['GET', 'PATCH'],
 };
 
 interface RouteContext {
@@ -376,6 +377,21 @@ const ROUTE_HANDLERS: Record<string, (ctx: RouteContext) => Promise<void>> = {
   'PATCH /settings/creation-logs': async ({ response, service, readAuthJson }) => {
     const { principal, body } = await readAuthJson(['expectedRevision', 'retentionDays']);
     sendJson(response, HTTP_STATUS.OK, await service.updateCreationLogSettings(principal, body));
+  },
+
+  'GET /settings/storage': async ({ response, url, service, requireAdmin }) => {
+    assertAllowedQuery(url, []);
+    await requireAdmin();
+    sendJson(response, HTTP_STATUS.OK, await service.getStorageSettings());
+  },
+  'PATCH /settings/storage': async ({ response, url, service, readAuthJson }) => {
+    assertAllowedQuery(url, []);
+    const { principal, body } = await readAuthJson([
+      'expectedRevision',
+      'quotaBytes',
+      'warningAvailableBytes',
+    ]);
+    sendJson(response, HTTP_STATUS.OK, await service.updateStorageSettings(principal, body));
   },
 
   'GET /settings/global': async ({ response, url, service, requireAdmin }) => {

@@ -19,6 +19,7 @@ type AvatarAssetVerifier = (
 ) => Promise<AvatarAssetStatus>;
 
 interface AvatarCallbacks {
+  avatarChanged?: (userId: string) => Promise<void>;
   avatarUrl?: (
     identity: { userId: string; sessionId: string },
     assetId: string,
@@ -187,6 +188,10 @@ async function handleProfileRequest(
   }
   const updated = await auth.updateProfile(identity.userId, patch);
   if (!updated) return fail(HTTP_STATUS.UNAUTHORIZED, 'UNAUTHORIZED');
+  if (patch.avatarAssetId !== undefined) {
+    // Auth commits independently. Background reconciliation recovers an unavailable media bridge.
+    await callbacks.avatarChanged?.(identity.userId).catch(() => {});
+  }
   response.writeHead(HTTP_STATUS.OK, { 'content-type': 'application/json' });
   response.end(JSON.stringify(await profileResponse(updated, identity, display, callbacks)));
 }

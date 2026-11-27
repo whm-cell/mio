@@ -1,6 +1,27 @@
 import type { Pool } from 'pg';
 
 /** Unit 1 owns three tables; authentication sessions and video references arrive with their consumers. */
+export const materialStorageSchemaSQL = `
+CREATE OR REPLACE FUNCTION mio_storage_material_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP IN ('UPDATE','DELETE') THEN
+    DELETE FROM mio_asset_holders WHERE owner_id=OLD.owner_id AND holder_type='material' AND holder_id=OLD.id::text
+      AND (TG_OP='DELETE' OR NEW.state='deleted' OR OLD.source_asset_id IS DISTINCT FROM NEW.source_asset_id);
+  END IF;
+  IF TG_OP<>'DELETE' AND NEW.state<>'deleted' AND NEW.source_asset_id IS NOT NULL THEN
+    INSERT INTO mio_asset_holders(owner_id,asset_id,holder_type,holder_id)
+      SELECT NEW.owner_id,a.id,'material',NEW.id::text FROM mio_assets a
+      WHERE a.id=NEW.source_asset_id AND a.owner_id=NEW.owner_id ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE OR REPLACE TRIGGER mio_storage_material_changed AFTER INSERT OR UPDATE OF state,source_asset_id OR DELETE
+  ON mio_materials FOR EACH ROW EXECUTE FUNCTION mio_storage_material_changed();
+INSERT INTO mio_asset_holders(owner_id,asset_id,holder_type,holder_id)
+  SELECT m.owner_id,a.id,'material',m.id::text FROM mio_materials m JOIN mio_assets a
+    ON a.id=m.source_asset_id AND a.owner_id=m.owner_id WHERE m.state<>'deleted' ON CONFLICT DO NOTHING;
+`;
+
 export const materialSchemaSQL = `
 CREATE TABLE IF NOT EXISTS mio_material_groups (
  id uuid PRIMARY KEY, owner_id text NOT NULL, provider_type text NOT NULL CHECK(provider_type='onelink'),
@@ -47,9 +68,13 @@ CREATE TABLE IF NOT EXISTS mio_material_operations (
  FOREIGN KEY(owner_id,target_material_id) REFERENCES mio_materials(owner_id,id)
 );
 CREATE INDEX IF NOT EXISTS mio_material_operations_recovery ON mio_material_operations(next_query_at,lease_until) WHERE state IN ('creating','deleting','unknown');
-`;
+${materialStorageSchemaSQL}`;
 
 export async function checkMaterialSchema(pool: Pick<Pool, 'query'>): Promise<void> {
+  const storage = await pool.query(`SELECT 1 FROM pg_trigger WHERE tgrelid='mio_materials'::regclass
+    AND tgname='mio_storage_material_changed' AND NOT tgisinternal AND tgenabled='O'`);
+  if (storage.rowCount !== 1)
+    throw new Error('MATERIAL_SCHEMA: storage reference trigger required');
   await pool.query(
     'SELECT id,owner_id,provider_type,provider_config_id,upstream_scope,upstream_group_id,group_type,name,auth_status,state,revision,sync_cursor,sync_lease_id,sync_lease_until,last_sync_attempt_at,last_sync_status,last_sync_error_code,last_synced_at,source_session_id,created_at,updated_at,deleted_at FROM mio_material_groups LIMIT 0',
   );

@@ -46,10 +46,12 @@ async function jobs(owner: string, count: number, files: number) {
     [owner, count],
   );
   if (!files) return;
-  await pool.query(
-    `WITH inventory AS (
+  // Keep the full output inventory while bounding per-key GC locks held by each fixture write.
+  for (let first = 1; first <= files; first += 64) {
+    await pool.query(
+      `WITH inventory AS (
       SELECT gen_random_uuid() AS asset_id,j.id AS job_id,n,'file-'||lpad(n::text,5,'0') AS name
-      FROM mio_media_jobs j CROSS JOIN generate_series(1,$2::int) n WHERE j.owner_id=$1
+      FROM mio_media_jobs j CROSS JOIN generate_series($3::int,$4::int) n WHERE j.owner_id=$1
     ), assets AS (
       INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,raw_key,state,expires_at,asset_kind)
       SELECT asset_id,$1,name,'video/mp2t',7,'fixture/'||asset_id,'ready',now(),'derived' FROM inventory RETURNING id
@@ -57,8 +59,9 @@ async function jobs(owner: string, count: number, files: number) {
       SELECT i.asset_id,i.job_id,i.name,CASE WHEN i.n<=2 THEN 'hls' ELSE 'segment' END,
         'fixture/'||i.asset_id,7,'fixture',repeat('a',64),CASE WHEN i.n<=2 THEN 'application/vnd.apple.mpegurl' ELSE 'video/mp2t' END,
         $2-i.n FROM inventory i JOIN assets a ON a.id=i.asset_id ORDER BY i.job_id,i.n`,
-    [owner, files],
-  );
+      [owner, files, first, Math.min(files, first + 63)],
+    );
+  }
 }
 
 it('migrates persisted outbox lanes and pre-ordinal files without changing old commands, leases or INSERT callers', async () => {
@@ -165,9 +168,11 @@ it('uses the lane partial index for actual claims while excluding confirmed rows
     [randomUUID(), job.id],
   );
   await pool.query('ANALYZE mio_media_outbox');
-  const captured = vi.spyOn(pool, 'query');
+  const captured = vi.spyOn(Client.prototype, 'query');
   const claim = await store.claim('probe');
-  const [sql, parameters] = captured.mock.calls[0]!;
+  const [sql, parameters] = captured.mock.calls.find(([sql]) =>
+    String(sql).includes('UPDATE mio_media_outbox SET lease_id'),
+  )!;
   captured.mockRestore();
   expect(claim).toBeDefined();
   expect(String(sql)).toContain('AND lane=$2');

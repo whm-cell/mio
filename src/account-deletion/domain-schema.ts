@@ -66,9 +66,13 @@ export function accountClosureSchemaSQL(tables: readonly (readonly [string, stri
   const triggers = tables
     .map(
       ([table, ownerOrParent, childColumn]) => `
-    DROP TRIGGER IF EXISTS mio_closed_account_write ON ${table};
-    CREATE TRIGGER mio_closed_account_write BEFORE INSERT OR UPDATE ON ${table}
-      FOR EACH ROW EXECUTE FUNCTION mio_guard_closed_account('${ownerOrParent}'${childColumn ? `,'owner_id','${childColumn}'` : ''});`,
+    DO $closure_trigger$ BEGIN
+      IF NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='${table}'::regclass
+        AND tgname='mio_closed_account_write') THEN
+        CREATE TRIGGER mio_closed_account_write BEFORE INSERT OR UPDATE ON ${table}
+          FOR EACH ROW EXECUTE FUNCTION mio_guard_closed_account('${ownerOrParent}'${childColumn ? `,'owner_id','${childColumn}'` : ''});
+      END IF;
+    END $closure_trigger$;`,
     )
     .join('\n');
   return `
@@ -88,7 +92,7 @@ BEGIN
   ELSE EXECUTE format('SELECT %I FROM %I WHERE id=$1::uuid',TG_ARGV[1],TG_ARGV[0])
     INTO owner USING to_jsonb(NEW)->>TG_ARGV[2]; END IF;
   IF owner IS NULL OR current_setting('mio.cleanup_owner',true)=owner THEN RETURN NEW; END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended('mio:closed-account:'||owner,0));
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('mio:closed-account:'||owner,0));
   IF EXISTS(SELECT 1 FROM mio_closed_accounts WHERE user_id=owner) THEN
     IF TG_TABLE_NAME='mio_assets' AND TG_OP='UPDATE'
       AND (to_jsonb(NEW)-ARRAY['state','staging_deleted_at'])=(to_jsonb(OLD)-ARRAY['state','staging_deleted_at'])

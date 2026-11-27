@@ -140,10 +140,11 @@ it.each(migrations)(
     const readHistory = async () => (await pool.query(migration.history)).rows;
 
     try {
+      const initialSchema = await schema(pool);
       const preview = run();
       expect(preview.status, preview.stderr).toBe(0);
       expect(preview.stdout.trim()).toBe(migration.ddl.trim());
-      expect(await schema(pool)).toEqual([]);
+      expect(await schema(pool)).toEqual(initialSchema);
 
       await pool.query(migration.legacy);
       const legacyHistory = await readHistory();

@@ -11,6 +11,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
+import { listenLoopback } from '../support/http-server.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
 let database: Awaited<ReturnType<typeof authDatabase>>;
@@ -68,10 +69,7 @@ beforeAll(async () => {
   pool = new Pool({ connectionString: database.url });
   for (let index = 0; index < 2; index++) {
     const server = createServer();
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('missing address');
+    const address = await listenLoopback(server);
     origins.push(`http://127.0.0.1:${address.port}`);
     servers.push(server);
   }

@@ -252,6 +252,14 @@ async function fixture() {
     otherModelRef,
     voiceRef,
     body,
+    cloneBody: (sampleAssetId: string) => ({
+      requestId: randomUUID(),
+      modelRef,
+      sampleAssetId,
+      name: '我的音色',
+      auditionText: '这是试听。',
+      sampleAuthorization: true,
+    }),
     settled,
     sample,
     async restart() {
@@ -540,14 +548,7 @@ it('clones an authorized ready sample then reuses its stable voice reference for
     bytes: Buffer.from('checkpoint-audio-fixture'),
     voiceId: input.voiceId!,
   }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   const ready = await f.settled(job.jobId, 'ready');
   expect(ready.voiceRef).toBeTruthy();
   expect(f.inspect).toHaveBeenCalledWith(
@@ -595,14 +596,7 @@ it('cancels a clone during sample inspection before any supplier POST', async ()
     await resume.promise;
     return f.inspectObject(input);
   });
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   await entered.promise;
   try {
     expect(await f.jobs.cancel(f.actor, job.jobId)).toMatchObject({
@@ -631,14 +625,7 @@ it('recovers a pre-submit clone after shutdown without repeating its supplier PO
     bytes: Buffer.from('checkpoint-audio-fixture'),
     voiceId: input.voiceId!,
   }));
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   await entered.promise;
   expect((await f.jobs.get(f.actor, job.jobId)).status).toBe('queued');
   expect(f.submit).not.toHaveBeenCalled();
@@ -660,14 +647,7 @@ it('rejects a changed sample after a completed inspection and keeps the supplier
     await resume.promise;
     return inspected;
   });
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   await entered.promise;
   f.replaceSample(sampleAssetId);
   resume.resolve();
@@ -687,14 +667,7 @@ it('preserves a confirmed clone without an audition as terminal, without publish
       Response.json({ base_resp: { status_code: 0 } }),
     ),
   );
-  const { job } = await f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const { job } = await f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   expect(await f.settled(job.jobId, 'failed')).toMatchObject({
     upstreamConfirmed: true,
     errorCode: 'AUDIO_AUDITION_MISSING',
@@ -742,14 +715,7 @@ it('closes fresh clone admission when the exact route is disabled during asset H
     await resume.promise;
     return f.headObject(key);
   });
-  const pending = f.jobs.clone(f.actor, {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  });
+  const pending = f.jobs.clone(f.actor, f.cloneBody(sampleAssetId));
   const rejected = expect(pending).rejects.toMatchObject({ code: 'AUDIO_OPERATION_UNAVAILABLE' });
   await entered.promise;
   try {
@@ -783,14 +749,7 @@ it('keeps an accepted clone on the frozen route after the route closes', async (
     bytes: Buffer.from('checkpoint-audio-fixture'),
     voiceId: input.voiceId!,
   }));
-  const body = {
-    requestId: randomUUID(),
-    modelRef: f.modelRef,
-    sampleAssetId,
-    name: '我的音色',
-    auditionText: '这是试听。',
-    sampleAuthorization: true,
-  };
+  const body = f.cloneBody(sampleAssetId);
   const { job } = await f.jobs.clone(f.actor, body);
   await entered.promise;
   try {

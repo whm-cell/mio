@@ -103,62 +103,29 @@ afterAll(async () => {
 it('preserves auth wrapper responses, preflights and Origin precedence through the registered entry', async () => {
   const clientId = '11111111-1111-4111-8111-111111111111';
   const ids = new Set<string>();
-  for (const scenario of [
-    { path: '/api/v1/me', status: 401, code: 'UNAUTHORIZED' },
-    { path: '/api/auth/missing', method: 'OPTIONS', status: 404, code: 'NOT_FOUND' },
-    { path: '/api/auth/sign-in/email', method: 'OPTIONS', status: 403, code: 'ORIGIN_REQUIRED' },
-    { path: '/api/auth/sign-in/email', method: 'POST', status: 403, code: 'ORIGIN_REQUIRED' },
-    {
-      path: '/api/auth/sign-in/email',
-      method: 'GET',
-      origin: 'http://localhost:5173',
-      status: 405,
-      code: 'METHOD_NOT_ALLOWED',
-    },
-    {
-      path: '/api/auth/sign-in/email',
-      method: 'POST',
-      origin: 'http://localhost:5173',
-      status: 415,
-      code: 'JSON_REQUIRED',
-    },
-    {
-      path: '/api/auth/sign-in/social',
-      method: 'POST',
-      origin: 'http://localhost:5173',
-      status: 415,
-      code: 'JSON_REQUIRED',
-    },
-    {
-      path: '/api/auth/missing',
-      method: 'OPTIONS',
-      origin: 'https://evil.example',
-      status: 403,
-      code: 'ORIGIN_DENIED',
-    },
-    {
-      path: '/api/auth/sign-in/email',
-      method: 'GET',
-      origin: 'https://evil.example',
-      status: 403,
-      code: 'ORIGIN_DENIED',
-    },
-    {
-      path: '/api/auth/sign-in/email',
-      method: 'OPTIONS',
-      origin: 'http://localhost:5173',
-      status: 204,
-    },
-    { path: '/api/v1/me', method: 'OPTIONS', origin: 'http://localhost:5173', status: 204 },
-  ]) {
-    const response = await fetch(`${origin}${scenario.path}`, {
-      method: scenario.method ?? 'GET',
+  // path, method, Origin, status, error code
+  const scenarios = [
+    ['/api/v1/me', undefined, undefined, 401, 'UNAUTHORIZED'],
+    ['/api/auth/missing', 'OPTIONS', undefined, 404, 'NOT_FOUND'],
+    ['/api/auth/sign-in/email', 'OPTIONS', undefined, 403, 'ORIGIN_REQUIRED'],
+    ['/api/auth/sign-in/email', 'POST', undefined, 403, 'ORIGIN_REQUIRED'],
+    ['/api/auth/sign-in/email', 'GET', 'http://localhost:5173', 405, 'METHOD_NOT_ALLOWED'],
+    ['/api/auth/sign-in/email', 'POST', 'http://localhost:5173', 415, 'JSON_REQUIRED'],
+    ['/api/auth/sign-in/social', 'POST', 'http://localhost:5173', 415, 'JSON_REQUIRED'],
+    ['/api/auth/missing', 'OPTIONS', 'https://evil.example', 403, 'ORIGIN_DENIED'],
+    ['/api/auth/sign-in/email', 'GET', 'https://evil.example', 403, 'ORIGIN_DENIED'],
+    ['/api/auth/sign-in/email', 'OPTIONS', 'http://localhost:5173', 204, undefined],
+    ['/api/v1/me', 'OPTIONS', 'http://localhost:5173', 204, undefined],
+  ] as const;
+  for (const [path, method, requestOrigin, status, code] of scenarios) {
+    const response = await fetch(`${origin}${path}`, {
+      method: method ?? 'GET',
       headers: {
         'x-request-id': clientId,
-        ...(scenario.origin ? { origin: scenario.origin } : {}),
+        ...(requestOrigin ? { origin: requestOrigin } : {}),
       },
     });
-    expect(response.status, scenario.path).toBe(scenario.status);
+    expect(response.status, path).toBe(status);
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     const id = response.headers.get('x-request-id')!;
@@ -166,28 +133,28 @@ it('preserves auth wrapper responses, preflights and Origin precedence through t
     expect(id).not.toBe(clientId);
     expect(ids.has(id)).toBe(false);
     ids.add(id);
-    if (scenario.origin === 'http://localhost:5173') {
-      expect(response.headers.get('access-control-allow-origin')).toBe(scenario.origin);
+    if (requestOrigin === 'http://localhost:5173') {
+      expect(response.headers.get('access-control-allow-origin')).toBe(requestOrigin);
       expect(response.headers.get('access-control-allow-credentials')).toBe('true');
       expect(response.headers.get('vary')).toBe('Origin');
     } else {
       expect(response.headers.get('access-control-allow-origin')).toBeNull();
       expect(response.headers.get('access-control-allow-credentials')).toBeNull();
     }
-    if (scenario.status === 204) {
+    if (status === 204) {
       expect(response.headers.get('content-type')).toBeNull();
       expect(await response.text()).toBe('');
       expect(response.headers.get('access-control-allow-methods')).toBe(
-        scenario.path === '/api/v1/me' ? 'GET, DELETE, OPTIONS' : 'POST, OPTIONS',
+        path === '/api/v1/me' ? 'GET, DELETE, OPTIONS' : 'POST, OPTIONS',
       );
       expect(response.headers.get('access-control-allow-headers')).toBe('Content-Type');
     } else {
       expect(response.headers.get('content-type')).toBe('application/json');
       expect(await response.json()).toEqual({
-        error: { code: scenario.code, message: scenario.code, requestId: id },
+        error: { code, message: code, requestId: id },
       });
     }
-    if (scenario.status === 405) expect(response.headers.get('allow')).toBe('POST, OPTIONS');
+    if (status === 405) expect(response.headers.get('allow')).toBe('POST, OPTIONS');
   }
   const empty = await call('/api/auth/get-session');
   expect(empty.status).toBe(200);

@@ -1,15 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
-import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { AssetStore } from '../../src/assets/store.ts';
 import { StorageAccounting } from '../../src/assets/storage-store.ts';
 import { defaultStoragePolicy } from '../../src/assets/storage.ts';
 import type { StoragePolicy } from '../../src/assets/storage.ts';
-import { materialSchemaSQL } from '../../src/materials/schema.ts';
-import { authDatabase } from '../support/auth-database.ts';
+import { storageDatabase, resetStorageAccounting } from './storage-fixture.ts';
 
-let db: Awaited<ReturnType<typeof authDatabase>>;
+let db: Awaited<ReturnType<typeof storageDatabase>>['database'];
 let pool: Pool;
 let storage: StorageAccounting;
 let policy: StoragePolicy;
@@ -44,19 +42,11 @@ async function asset(
 }
 const release = (id: string) => storage.replaceHolder(owner, { type: 'asset', id, assetIds: [] });
 beforeAll(async () => {
-  db = await authDatabase();
-  pool = new Pool({ connectionString: db.url });
-  await pool.query(assetSchemaSQL);
-  await pool.query(materialSchemaSQL);
+  ({ database: db, pool } = await storageDatabase());
 });
 beforeEach(async () => {
-  await pool.query(
-    'TRUNCATE mio_assets,mio_asset_holders,mio_storage_objects,mio_storage_usage CASCADE',
-  );
   policy = { revision: 1, quotaBytes: 1000, warningAvailableBytes: 200 };
-  await pool.query('UPDATE mio_storage_policy SET revision=0');
-  storage = new StorageAccounting(pool, () => policy);
-  await storage.updatePolicy();
+  storage = await resetStorageAccounting(pool, () => policy);
 });
 afterAll(async () => {
   await pool?.end();

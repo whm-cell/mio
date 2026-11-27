@@ -15,6 +15,7 @@ import type { Authentication } from '../../src/auth/service.ts';
 import { pollWechatQR } from '../../src/auth/wechat-qr-store.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
 import { ProviderStore } from '../../src/providers/store.ts';
+import { listenLoopback } from '../support/http-server.ts';
 import { authDatabase, authTableIndexes } from '../support/auth-database.ts';
 
 const secret = randomBytes(40).toString('hex');
@@ -186,10 +187,7 @@ beforeAll(async () => {
   pool = new Pool({ connectionString: database.url });
   for (let index = 0; index < 2; index++) {
     const server = createServer();
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('missing address');
+    const address = await listenLoopback(server);
     origins.push(`http://127.0.0.1:${address.port}`);
     servers.push(server);
   }

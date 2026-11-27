@@ -340,7 +340,7 @@ async function nextMediaAttempt(client: PoolClient, job: MediaJobRow): Promise<M
   await enqueueMedia(client, next);
   return next;
 }
-export async function controlMedia(
+async function controlMedia(
   client: PoolClient,
   job: MediaJobRow,
   action: 'cancel' | 'recover',
@@ -457,7 +457,7 @@ async function registerFiles(
     [job.id, JSON.stringify(manifest.data)],
   );
 }
-export async function acceptMedia(
+async function acceptMedia(
   client: PoolClient,
   result: MediaResult,
   manifest?: MediaManifest,

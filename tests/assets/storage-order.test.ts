@@ -1,32 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
-import { authDatabase } from '../support/auth-database.ts';
-import { assetSchemaSQL } from '../../src/assets/schema.ts';
-import { materialSchemaSQL } from '../../src/materials/schema.ts';
+import { storageDatabase, resetStorageAccounting } from './storage-fixture.ts';
 import { StorageAccounting } from '../../src/assets/storage-store.ts';
 import { startStorageReconciliation } from '../../src/assets/storage-worker.ts';
 import type { StoragePolicy } from '../../src/assets/storage.ts';
 
-let database: Awaited<ReturnType<typeof authDatabase>>;
+let database: Awaited<ReturnType<typeof storageDatabase>>['database'];
 let pool: Pool;
 let storage: StorageAccounting;
 let policy: StoragePolicy;
 const owner = 'z-account';
 beforeAll(async () => {
-  database = await authDatabase();
-  pool = new Pool({ connectionString: database.url });
-  await pool.query(assetSchemaSQL);
-  await pool.query(materialSchemaSQL);
+  ({ database, pool } = await storageDatabase());
 });
 beforeEach(async () => {
-  await pool.query(
-    'TRUNCATE mio_assets,mio_asset_holders,mio_storage_objects,mio_storage_usage CASCADE',
-  );
   policy = { revision: 1, quotaBytes: 1000, warningAvailableBytes: 200 };
-  await pool.query('UPDATE mio_storage_policy SET revision=0');
-  storage = new StorageAccounting(pool, () => policy);
-  await storage.updatePolicy();
+  storage = await resetStorageAccounting(pool, () => policy);
 });
 afterAll(async () => {
   await pool?.end();
@@ -174,19 +164,25 @@ it('refreshes policy during a blocked owner reconciliation and records actual ma
       await release.promise;
     } else await reconcile(...args);
   });
+  const refresh = vi.spyOn(storage, 'updatePolicy');
   // Only interval scheduling is controlled; every policy/usage/material write runs in real PostgreSQL.
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
   const worker = startStorageReconciliation(storage, []);
   try {
     await vi.advanceTimersByTimeAsync(1000);
     await entered.promise;
+    // Owner lookup can finish before the first policy write; await the worker's actual promise.
+    expect(refresh).toHaveBeenCalledTimes(1);
+    await refresh.mock.results[0]!.value;
     policy = { revision: 2, quotaBytes: 2000, warningAvailableBytes: 200 };
     await vi.advanceTimersByTimeAsync(1000);
+    expect(refresh).toHaveBeenCalledTimes(2);
     await vi.waitFor(async () => {
       expect((await pool.query('SELECT revision FROM mio_storage_policy')).rows[0].revision).toBe(
         '2',
       );
     });
+    expect(slow).toHaveBeenCalledTimes(1);
     const full = await storage.usage(owner);
     expect(full.status).toBe('full');
     await storage.acknowledge(owner, full.reminderVersion);
@@ -205,5 +201,6 @@ it('refreshes policy during a blocked owner reconciliation and records actual ma
     await worker.close();
     vi.useRealTimers();
     slow.mockRestore();
+    refresh.mockRestore();
   }
 });

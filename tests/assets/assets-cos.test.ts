@@ -2,6 +2,7 @@ import COS from 'cos-nodejs-sdk-v5';
 import { createServer } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import { once } from 'node:events';
+import { listenLoopback } from '../support/http-server.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
@@ -441,18 +442,10 @@ it('aborts the SDK sender on oversized and cancelled image streams and forwards 
       response.write(Buffer.alloc(32));
     }
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     const controller = new AbortController();
     await expect(
       storage.readImage!('oversized', '"fixture-etag"', 4, controller.signal),
@@ -485,18 +478,10 @@ it('cancels an SDK image request while the server has not responded', async () =
     entered.resolve();
     response.on('close', () => disconnected.resolve());
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     const controller = new AbortController();
     const read = storage.readImage!('waiting', '"etag"', 4, controller.signal);
     await entered.promise;
@@ -528,18 +513,10 @@ it.each([
     response.writeHead(412, { 'content-type': 'application/xml' });
     response.end(body);
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     await expect(
       storage.readImage!('changed', '"old"', 4, new AbortController().signal),
     ).rejects.toMatchObject({ statusCode: 412 });

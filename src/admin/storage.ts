@@ -1,11 +1,8 @@
 import { epochMs } from '@mio/foundation/time';
 import { AdminError } from './contracts.ts';
+import type { StoragePolicy } from '../assets/storage.ts';
 
-export interface StorageSettings {
-  readonly revision: number;
-  readonly quotaBytes: number;
-  readonly warningAvailableBytes: number;
-}
+export type StorageSettings = Readonly<StoragePolicy>;
 
 /** User reads stay synchronous; failed refreshes cannot extend the five-second freshness window. */
 export function createStoragePolicySnapshot(store: {

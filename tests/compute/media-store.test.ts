@@ -7,7 +7,7 @@ import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { computeSchemaSQL } from '../../src/compute/schema.ts';
 import { ComputeStore } from '../../src/compute/transcode/store.ts';
 import { ComputeError } from '../../src/compute/errors.ts';
-import { acceptMedia, controlMedia, MediaStore } from '../../src/compute/media/store.ts';
+import { MediaStore } from '../../src/compute/media/store.ts';
 import type { MediaJobRow } from '../../src/compute/media/model.ts';
 import { authDatabase } from '../support/auth-database.ts';
 
@@ -245,16 +245,16 @@ it('commits cancel intent and control together, then lets cancellation win over 
     (await pool.query("SELECT * FROM mio_assets WHERE asset_kind='derived'")).rows,
   ).toHaveLength(0);
 });
-async function waitForJobRowLock() {
+async function waitForQueryLock(query = 'SELECT % FROM mio_media_jobs%FOR UPDATE') {
   await vi.waitFor(async () => {
     const waiting = await pool.query(
       `
       SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
       AND usename=current_user AND wait_event_type='Lock'
-      AND query LIKE 'SELECT % FROM mio_media_jobs%FOR UPDATE'
+      AND query LIKE $2
       AND application_name=$1
     `,
-      [database.applicationName],
+      [database.applicationName, query],
     );
     expect(waiting.rowCount).toBe(1);
   });
@@ -263,21 +263,26 @@ async function waitForJobRowLock() {
 it('lets a committed cancel intent win when success waits behind its row lock', async () => {
   const job = (await create()).job;
   const client = await pool.connect();
+  let cancelling: ReturnType<MediaStore['control']> | undefined;
   let accepting: Promise<void> | undefined;
   try {
     await client.query('BEGIN');
-    await client.query('SELECT id FROM mio_media_jobs WHERE id=$1 FOR UPDATE', [job.id]);
-    await controlMedia(client, job, 'cancel');
+    // Pause the public cancel transaction after it locks the job and writes its intent.
+    await client.query('LOCK mio_media_outbox IN SHARE MODE');
+    cancelling = store.control(owner, job.id, 'cancel');
+    void cancelling.catch(() => {});
+    await waitForQueryLock('INSERT INTO mio_media_outbox%');
     accepting = store.accept(succeeded(job), manifest(job));
     void accepting.catch(() => {});
-    await waitForJobRowLock();
+    await waitForQueryLock();
     await client.query('COMMIT');
+    await cancelling;
     await accepting;
     expect(await store.ownerView(job.id, owner)).toMatchObject({ state: 'cancelled', outputs: [] });
   } finally {
     await client.query('ROLLBACK');
     client.release();
-    await accepting;
+    await Promise.all([cancelling, accepting]);
   }
 });
 
@@ -363,19 +368,27 @@ it('reclaims expired outbox leases without letting a stale publisher acknowledge
 it('keeps committed success when cancellation waits behind its registration transaction', async () => {
   const job = (await create()).job;
   const client = await pool.connect();
+  let accepting: Promise<void> | undefined;
+  let cancelling: ReturnType<MediaStore['control']> | undefined;
   try {
     await client.query('BEGIN');
-    await acceptMedia(client, succeeded(job), manifest(job));
-    const cancel = store.control(owner, job.id, 'cancel');
-    void cancel.catch(() => {});
-    await waitForJobRowLock();
+    // Pause public publication after its job lock and asset INSERT, before file registration.
+    await client.query('LOCK mio_media_files IN SHARE MODE');
+    accepting = store.accept(succeeded(job), manifest(job));
+    void accepting.catch(() => {});
+    await waitForQueryLock('INSERT INTO mio_media_files%');
+    cancelling = store.control(owner, job.id, 'cancel');
+    void cancelling.catch(() => {});
+    await waitForQueryLock();
     await client.query('COMMIT');
-    expect((await cancel).state).toBe('succeeded');
+    await accepting;
+    expect((await cancelling).state).toBe('succeeded');
     expect((await store.ownerView(job.id, owner))?.outputs).toHaveLength(1);
     expect((await pool.query('SELECT * FROM mio_media_controls')).rows).toHaveLength(0);
   } finally {
     await client.query('ROLLBACK');
     client.release();
+    await Promise.all([accepting, cancelling]);
   }
 });
 

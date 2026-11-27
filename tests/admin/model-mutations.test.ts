@@ -1,4 +1,4 @@
-import { expect, it, vi } from 'vitest';
+import { expect, it } from 'vitest';
 import { providerSqlFixture } from '../providers/fixtures/provider-sql-fixture.ts';
 
 const item = (rawModelId: string) => ({
@@ -87,9 +87,7 @@ it('preserves sequential direct duplicates, null overwrite, policy flags, first 
       supplier_metadata: { object: 'model', curated: true, description: 'first label' },
     },
   ]);
-  expect(
-    (await f.pool.query('SELECT count(*)::int AS n FROM mio_admin_ignored_models')).rows[0].n,
-  ).toBe(0);
+  expect(await f.count('SELECT count(*)::int AS n FROM mio_admin_ignored_models')).toBe(0);
   expect(
     (
       await f.pool.query(
@@ -123,24 +121,7 @@ it('uses three body queries at one and 500 models, and locks reversed existing i
   }
   const ids = ['Z', 'a', 'é', '\uE000', '\u{10000}'];
   await f.admin.importCatalogModels(f.account, ids.map(item), false);
-  let arrived = 0,
-    release!: () => void;
-  const gate = new Promise<void>((resolve) => (release = resolve));
-  const peers = [0, 1].map(() => {
-    let first = true;
-    return f.peer(async (sql, args, result) => {
-      if (
-        first &&
-        sql.includes('FOR UPDATE') &&
-        result.rows.length === 1 &&
-        typeof args?.[0] === 'string'
-      ) {
-        first = false;
-        if (++arrived === 2) release();
-        await gate;
-      }
-    });
-  });
+  const peers = f.reverseImportPeers();
   const results = await Promise.all(
     peers.map((p, i) =>
       p.admin.importCatalogModels(f.account, (i ? [...ids].reverse() : ids).map(item), true),
@@ -167,25 +148,19 @@ it('rolls back imported catalog, materialized models and ignored removal when th
     ),
   ).rejects.toMatchObject({ code: 'ADMIN_UNAVAILABLE' });
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id='audit-rollback'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id='audit-rollback'",
+    ),
   ).toBe(0);
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_models WHERE raw_model_id='audit-rollback'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_models WHERE raw_model_id='audit-rollback'",
+    ),
   ).toBe(0);
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id='audit-rollback'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id='audit-rollback'",
+    ),
   ).toBe(1);
 });
 
@@ -199,36 +174,27 @@ it('rolls back routes, catalog, ignored state and revisions together when delete
     f.adminService.deleteModel(f.principal, { rawModelId: id, ignoreFutureImports: true }),
   ).rejects.toMatchObject({ code: 'ADMIN_UNAVAILABLE' });
   expect(
-    (
-      await f.pool.query(
-        'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
-        [id],
-      )
-    ).rows[0].n,
+    await f.count(
+      'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
+      [id],
+    ),
   ).toBe(1);
   expect(
-    (
-      await f.pool.query(
-        'SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id=$1',
-        [id],
-      )
-    ).rows[0].n,
+    await f.count(
+      'SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id=$1',
+      [id],
+    ),
   ).toBe(1);
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_model_route_revisions WHERE raw_model_id=$1 AND action='delete'",
-        [id],
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_model_route_revisions WHERE raw_model_id=$1 AND action='delete'",
+      [id],
+    ),
   ).toBe(0);
   expect(
-    (
-      await f.pool.query(
-        'SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id=$1',
-        [id],
-      )
-    ).rows[0].n,
+    await f.count('SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id=$1', [
+      id,
+    ]),
   ).toBe(0);
 });
 
@@ -266,16 +232,7 @@ it.each(['delete-first', 'import-first'] as const)(
     await ready;
     const secondWork = observe(order === 'delete-first' ? importing(follower) : deleting(follower));
     try {
-      await vi.waitFor(async () =>
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-              [follower.name],
-            )
-          ).rows,
-        ).toHaveLength(1),
-      );
+      await f.waitBlocked(follower.name);
     } finally {
       unlock();
     }
@@ -285,20 +242,16 @@ it.each(['delete-first', 'import-first'] as const)(
       if (!two.ok) expect(two.error).toMatchObject({ code: 'PROVIDER_UNAVAILABLE' });
     } else expect(two.ok).toBe(true);
     expect(
-      (
-        await f.pool.query(
-          'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
-          [id],
-        )
-      ).rows[0].n,
+      await f.count(
+        'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
+        [id],
+      ),
     ).toBe(order === 'delete-first' && two.ok ? 1 : 0);
     expect(
-      (
-        await f.pool.query(
-          'SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id=$1',
-          [id],
-        )
-      ).rows[0].n,
+      await f.count(
+        'SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id=$1',
+        [id],
+      ),
     ).toBe(order === 'delete-first' && two.ok ? 1 : 0);
     expect(
       (
@@ -312,12 +265,10 @@ it.each(['delete-first', 'import-first'] as const)(
       await f.adminService.deleteModel(f.principal, { rawModelId: id });
     expect(await f.store.importRoutes([f.route(id)])).toMatchObject({ inserted: 1 });
     expect(
-      (
-        await f.pool.query(
-          'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
-          [id],
-        )
-      ).rows[0].n,
+      await f.count(
+        'SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id=$1',
+        [id],
+      ),
     ).toBe(1);
   },
 );
@@ -348,16 +299,7 @@ it('orders mixed missing/existing catalog locks the same way across catalog and 
   );
   const outcomes = Promise.all([a, b]);
   try {
-    await vi.waitFor(async () =>
-      expect(
-        (
-          await f.pool.query(
-            'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-            [route.name],
-          )
-        ).rows,
-      ).toHaveLength(1),
-    );
+    await f.waitBlocked(route.name);
   } finally {
     release();
   }
@@ -402,16 +344,7 @@ it('serializes concurrently introduced catalog keys using existing metadata poli
       (error) => ({ ok: false as const, error }),
     );
   try {
-    await vi.waitFor(async () =>
-      expect(
-        (
-          await f.pool.query(
-            'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-            [two.name],
-          )
-        ).rows,
-      ).toHaveLength(1),
-    );
+    await f.waitBlocked(two.name);
   } finally {
     release();
   }
@@ -419,11 +352,9 @@ it('serializes concurrently introduced catalog keys using existing metadata poli
   const result = await b;
   expect(result).toMatchObject({ ok: true, value: { imported: 1, updated: 1, skipped: 0 } });
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id='absent-other'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id='absent-other'",
+    ),
   ).toBe(1);
   expect(
     (
@@ -496,16 +427,7 @@ it.each(['manual-first', 'import-first'] as const)(
     try {
       await ready;
       b = observed(order === 'manual-first' ? importing(follower) : manual(follower));
-      await vi.waitFor(async () =>
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-              [follower.name],
-            )
-          ).rows,
-        ).toHaveLength(1),
-      );
+      await f.waitBlocked(follower.name);
     } finally {
       release();
     }
@@ -521,12 +443,10 @@ it.each(['manual-first', 'import-first'] as const)(
       });
     }
     expect(
-      (
-        await f.pool.query(
-          'SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id=$1',
-          [id],
-        )
-      ).rows[0].n,
+      await f.count(
+        'SELECT count(*)::int AS n FROM mio_admin_ignored_models WHERE raw_model_id=$1',
+        [id],
+      ),
     ).toBe(0);
     const rows = (
       await f.pool.query(

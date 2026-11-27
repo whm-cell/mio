@@ -5,25 +5,7 @@ import { providerSqlFixture } from './fixtures/provider-sql-fixture.ts';
 it('locks reversed existing route imports in C order while retaining caller revision order and actions', async () => {
   const ids = ['z-lock', 'A-lock', 'é-lock', '\uE000-lock', '\u{10000}-lock'];
   const f = await providerSqlFixture(ids);
-  let arrive = 0,
-    release!: () => void;
-  const gate = new Promise<void>((resolve) => (release = resolve));
-  const peers = [0, 1].map(() => {
-    let first = true;
-    return f.peer(async (sql, args, result) => {
-      // Old scalar loops deterministically deadlock here; set locks return every row before this hook.
-      if (
-        first &&
-        sql.includes('FOR UPDATE') &&
-        result.rows.length === 1 &&
-        typeof args?.[0] === 'string'
-      ) {
-        first = false;
-        if (++arrive === 2) release();
-        await gate;
-      }
-    });
-  });
+  const peers = f.reverseImportPeers();
   const actor = {
     actorType: 'admin' as const,
     actorId: f.account.id,
@@ -117,17 +99,13 @@ it('rolls back catalog registration and every route write when revision insertio
     f.store.importRoutes([f.route('rollback-a'), f.route('rollback-b')]),
   ).rejects.toMatchObject({ code: 'PROVIDER_UNAVAILABLE' });
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id LIKE 'rollback-%'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_catalog_models WHERE raw_model_id LIKE 'rollback-%'",
+    ),
   ).toBe(0);
   expect(
-    (
-      await f.pool.query(
-        "SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id LIKE 'rollback-%'",
-      )
-    ).rows[0].n,
+    await f.count(
+      "SELECT count(*)::int AS n FROM mio_provider_model_routes WHERE raw_model_id LIKE 'rollback-%'",
+    ),
   ).toBe(0);
 });

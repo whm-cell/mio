@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import type { QueryResult } from 'pg';
-import { onTestFinished } from 'vitest';
+import { expect, onTestFinished, vi } from 'vitest';
 import { authDatabase } from '../../support/auth-database.ts';
 import { providerSchemaSQL } from '../../../src/providers/schema.ts';
 import { adminSchemaSQL } from '../../../src/admin/schema.ts';
@@ -132,6 +132,40 @@ export async function providerSqlFixture(ids = ['batch-a', 'batch-z']) {
       adminService: createAdminService(peerAdmin, service, config),
     };
   };
+  const count = async (sql: string, args?: unknown[]) =>
+    (await pool.query<{ n: number }>(sql, args)).rows[0]!.n;
+  const reverseImportPeers = () => {
+    let arrived = 0,
+      release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    return [0, 1].map(() => {
+      let first = true;
+      return peer(async (sql, args, result) => {
+        // Old scalar loops deterministically deadlock here; set locks return every row before this hook.
+        if (
+          first &&
+          sql.includes('FOR UPDATE') &&
+          result.rows.length === 1 &&
+          typeof args?.[0] === 'string'
+        ) {
+          first = false;
+          if (++arrived === 2) release();
+          await gate;
+        }
+      });
+    });
+  };
+  const waitBlocked = (applicationName: string) =>
+    vi.waitFor(async () =>
+      expect(
+        (
+          await pool.query(
+            'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
+            [applicationName],
+          )
+        ).rows,
+      ).toHaveLength(1),
+    );
   return {
     database,
     pool,
@@ -147,5 +181,8 @@ export async function providerSqlFixture(ids = ['batch-a', 'batch-z']) {
     models,
     route,
     peer,
+    count,
+    reverseImportPeers,
+    waitBlocked,
   };
 }

@@ -383,13 +383,14 @@ it('creates all six indexes only in their owning migration and replays without r
   });
   const before = await snapshot();
   const created = new Set<string>();
-  for (const sql of [
+  const schemas = [
     providerSchemaSQL,
     adminSchemaSQL,
     generationSchemaSQL,
     conversationSchemaSQL,
     computeSchemaSQL,
-  ]) {
+  ];
+  for (const sql of schemas) {
     await f.pool.query(sql);
     for (const index of indexes) if (index.sql === sql) created.add(index.name);
     const rows = (
@@ -414,14 +415,7 @@ it('creates all six indexes only in their owning migration and replays without r
       expect(row.uses_c_collation).toBe(true);
     } else expect(row.predicate).toBeNull();
   }
-  for (const sql of [
-    providerSchemaSQL,
-    adminSchemaSQL,
-    generationSchemaSQL,
-    conversationSchemaSQL,
-    computeSchemaSQL,
-  ])
-    await f.pool.query(sql);
+  for (const sql of schemas) await f.pool.query(sql);
   const replay = (
     await f.pool.query(
       'SELECT relname name,oid FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname=ANY($1::text[]) ORDER BY relname',

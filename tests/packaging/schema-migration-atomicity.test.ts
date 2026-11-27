@@ -87,6 +87,10 @@ const migrations = [
     ddl: generationSchemaSQL,
     legacy: `${assetSchemaSQL}
       ${generationSchemaSQL}
+      DROP INDEX mio_image_jobs_unfinished_state;
+      CREATE INDEX mio_image_jobs_unfinished ON mio_image_jobs(owner_id)
+        WHERE state IN ('accepted','submitted','processing','materializing');
+      DROP INDEX mio_video_executions_cleanup;
       ALTER TABLE mio_assets DROP COLUMN asset_kind, ALTER COLUMN staging_key SET NOT NULL;
       ALTER TABLE mio_image_jobs DROP COLUMN route_snapshot, DROP CONSTRAINT mio_image_jobs_state_check,
         ADD CONSTRAINT mio_image_jobs_state_check CHECK (state IN ('accepted','completed'));

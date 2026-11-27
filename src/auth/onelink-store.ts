@@ -125,7 +125,7 @@ export async function readOneLinkPendingByDigest(
            FROM "mioOneLinkPending"
            WHERE "tokenDigest" = $1`,
     values: [tokenDigest],
-    query_timeout: 5000,
+    query_timeout: 8000,
   };
   const result = await pool.query<OneLinkPendingRecord>(query);
   return result.rows[0] ?? null;
@@ -210,7 +210,7 @@ export async function findBoundOneLinkUser(
              AND a."accountId" = $1
            LIMIT 1`,
     values: [sub],
-    query_timeout: 5000,
+    query_timeout: 8000,
   };
   const result = await pool.query<BoundOneLinkUser>(query);
   return result.rows[0] ?? null;
@@ -222,7 +222,7 @@ export async function userHasOneLinkAccount(pool: Pool, userId: string): Promise
            WHERE "userId" = $1 AND "providerId" = 'onelink'
            LIMIT 1`,
     values: [userId],
-    query_timeout: 5000,
+    query_timeout: 8000,
   };
   const result = await pool.query(query);
   return Boolean(result.rowCount);

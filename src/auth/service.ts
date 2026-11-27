@@ -25,6 +25,9 @@ export async function createAuthentication(
     connectionString: config.databaseURL,
     max: 5,
     connectionTimeoutMillis: 5000,
+    statement_timeout: 5000,
+    lock_timeout: 3000,
+    query_timeout: 8000,
     application_name: 'mio-auth',
   });
   pool.on('error', () => log.error('AUTH_DATABASE_CONNECTION_ERROR'));

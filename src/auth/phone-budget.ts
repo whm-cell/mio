@@ -32,15 +32,28 @@ export async function reserveSmsBudget(
       cooldown: true,
     },
   ];
-  for (const { id } of keys) {
-    await client.query(
-      `INSERT INTO ${tables.budget} (id, events, "updatedAt")
-       VALUES ($1, '[]', clock_timestamp()) ON CONFLICT (id) DO NOTHING`,
-      [id],
-    );
-    await client.query(`SELECT id FROM ${tables.budget} WHERE id = $1 FOR UPDATE`, [id]);
-  }
   const ids = keys.map(({ id }) => id);
+  // Establish the global gate before creating or locking either lower key.
+  await client.query(
+    `INSERT INTO ${tables.budget} (id, events, "updatedAt")
+     VALUES ($1, '[]', clock_timestamp()) ON CONFLICT (id) DO NOTHING`,
+    [ids[0]],
+  );
+  await client.query(`SELECT id FROM ${tables.budget} WHERE id = $1 FOR UPDATE`, [ids[0]]);
+  const lowerIds = ids.slice(1);
+  await client.query(
+    `INSERT INTO ${tables.budget} (id, events, "updatedAt")
+     SELECT id, '[]', clock_timestamp()
+     FROM unnest($1::text[]) WITH ORDINALITY AS bucket(id, position)
+     ORDER BY bucket.position ON CONFLICT (id) DO NOTHING`,
+    [lowerIds],
+  );
+  await client.query(
+    `SELECT budget.id FROM ${tables.budget} AS budget
+     JOIN unnest($1::text[]) WITH ORDINALITY AS bucket(id, position) ON budget.id = bucket.id
+     ORDER BY bucket.position FOR UPDATE OF budget`,
+    [lowerIds],
+  );
   const { rows } = await client.query<{
     now: Date;
     day: number;

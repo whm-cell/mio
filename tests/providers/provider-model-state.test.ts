@@ -135,16 +135,7 @@ it.each(['rotation', 'settings', 'refresh'] as const)(
     let writer: Promise<unknown> | undefined;
     try {
       await vi.waitFor(() => expect(readers).toBe(1));
-      await vi.waitFor(async () =>
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-              [peer.name],
-            )
-          ).rows,
-        ).toHaveLength(1),
-      );
+      await f.waitBlocked(peer.name);
       expect(peer.trace.filter((sql) => sql.includes('FOR UPDATE'))).toHaveLength(2);
       expect(
         peer.trace
@@ -174,16 +165,7 @@ it.each(['rotation', 'settings', 'refresh'] as const)(
                   metadata: { id: m.raw_model_id, object: 'model' },
                 })),
               );
-      await vi.waitFor(async () =>
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-              [f.database.applicationName],
-            )
-          ).rows,
-        ).toHaveLength(1),
-      );
+      await f.waitBlocked(f.database.applicationName);
     } finally {
       release();
       await Promise.all(work);
@@ -243,16 +225,7 @@ it.each(['update', 'recreate'] as const)(
       current = await snapshot();
       expect(current.adaptationVersion).toBe(scenario === 'update' ? 2 : 1);
       b = second.store.recordVerification(f.actor.userId, current, 'new current observation');
-      await vi.waitFor(async () =>
-        expect(
-          (
-            await f.pool.query(
-              'SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND cardinality(pg_blocking_pids(pid))>0',
-              [second.name],
-            )
-          ).rows,
-        ).toHaveLength(1),
-      );
+      await f.waitBlocked(second.name);
     } finally {
       release();
       await Promise.all([a, ...(b ? [b] : [])]);

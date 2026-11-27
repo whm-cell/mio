@@ -2,6 +2,8 @@
 
 [API 导航](index.md)；需求与分期见[素材库 PRD](../tasks/onelink-material-library/prd.md)。当前采纳 Unit 1 管理、同步、读取与删除，以及 Unit 2 图片核验/登记候选；Unit 3 真人认证会话为实现候选；视频仍按后续单元推进。
 
+注销关闭旧号的本域异步写入，按批清理素材、分组、操作及认证会话的本地映射；认证会话计入剩余量，未清空时继续下一批并保留被引用的分组，全部清空后才记录本域完成。先确认确切资源定位与持有释放，再移除映射。远端供应商素材删除／撤销仍遵循上述独立授权，注销不自动扩大到远端级联。见[永久注销](../auth.md#永久注销与清理)。
+
 ## 本域共同约定
 
 显式设置 `MIO_MATERIALS_ENABLED=true`，配置认证、供应商和 `MIO_ASSETS_DATABASE_URL`，先迁移 assets，再执行 `pnpm materials:migrate --apply`（本地 `pnpm migrate:dev materials --apply`）。素材域独立持池；仅素材管理且所有 COS 字段缺省时不注册资产 HTTP；任一 COS 字段出现则沿既有资产完整配置校验，部分配置失败。启动只读检查三表和确切全局上游唯一索引，缺结构失败，不自动迁移或联网。未启用时不注册本域。真人认证额外显式设置 `MIO_MATERIALS_PUBLIC_BASE_URL` 为可达 HTTPS origin（可含非默认 HTTPS 端口，不能有用户信息、路径、query 或 fragment）；缺省时素材管理/图片登记照常使用，不注册认证端点。不得从请求 Host 或既有生产认证域推导。执行当前 `materials:migrate` 显式增量建立 auth_sessions 表及审计列；启用公开认证时启动只读核验该表的列、owner/requestId 唯一约束、owner/group 复合 FK 及到期清理索引。已有会话表时，素材服务的到期清理也覆盖关闭认证入口的运行环境。

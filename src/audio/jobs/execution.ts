@@ -21,7 +21,7 @@ export interface AudioInspector {
 
 export type AudioAssets = Pick<
   AssetStore,
-  'owned' | 'publishAudio' | 'checkAudioPublicationIdentity'
+  'owned' | 'publishAudio' | 'checkAudioPublicationIdentity' | 'rememberObject'
 >;
 
 async function materialize(
@@ -63,6 +63,7 @@ async function materialize(
   const reused = head !== undefined;
   if (!head) {
     const format = job.input.parameters?.format ?? 'mp3';
+    await assets.rememberObject(job.owner_id, job.output_key);
     await objects.putAudio(job.output_key, bytes, format, sha256, signal);
     head = await objects.head(job.output_key);
   }

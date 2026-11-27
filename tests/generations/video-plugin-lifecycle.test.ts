@@ -101,10 +101,11 @@ it('stops video admission and executor together and drains both before disposing
       {},
     );
     vi.spyOn(Auth, 'createAuthentication').mockResolvedValue({
+      setDeletionDomains: () => {},
       identity: async (headers: Headers) =>
         headers.get('cookie') === 'session=fixture' ? actor : null,
       close: async () => {},
-    } as Authentication);
+    } as unknown as Authentication);
     vi.spyOn(Cos, 'createCosStorage').mockReturnValue({
       head: vi.fn().mockRejectedValue(new Error('unexpected COS HEAD')),
       putImage: vi.fn().mockRejectedValue(new Error('unexpected COS upload')),

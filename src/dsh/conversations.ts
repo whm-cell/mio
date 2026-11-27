@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
+import { MixedSessionPersistence } from './mixed-session-persistence.ts';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import type { AgentHandle } from '@deepseek-ai/dsh-agent';
 import { AttachmentId } from '@deepseek-ai/dsh-attachment';
@@ -241,6 +242,18 @@ export function createDshConversationEngine(
           selectedOptions(selection),
         );
       });
+    },
+    async retainedAssetIds(id) {
+      const view = await ctx.mioKernel.readPersistedView(id);
+      const ids = new Set<string>();
+      for (const message of view.deriveMessages()) {
+        for (const block of message.content) {
+          if (block.type !== 'image' || block.offloaded === true) continue;
+          const assetId = conversationImageAssetId(String(block.attachment.attachmentId));
+          if (assetId) ids.add(assetId);
+        }
+      }
+      return [...ids];
     },
     async hasRetainedImages(id) {
       const view = await ctx.mioKernel.readPersistedView(id);
@@ -782,6 +795,12 @@ export function createDshConversationEngine(
       const handle = await entry.opening;
       handle.agent.cancel({ kind: 'user' });
       await handle.agent.whenIdle();
+    },
+    async purgeSession(id, signal) {
+      const persistence = ctx.get('sessionPersistence');
+      if (!(persistence instanceof MixedSessionPersistence))
+        throw new Error('LOCAL_SESSION_VOLUME_NOT_OWNED');
+      await inSessionOrder(id, () => persistence.purgeMioSession(id, signal));
     },
     close() {
       return (closing ??= (async () => {

@@ -8,6 +8,7 @@
   "include": [
     "scripts/service/migrate-auth.ts",
     "scripts/service/migrate-assets.ts",
+    "scripts/service/migrate-storage.ts",
     "scripts/service/migrate-materials.ts",
     "scripts/service/migrate-compute.ts",
     "scripts/service/migrate-conversations.ts",

@@ -10,6 +10,10 @@
 
 验证码的生成、用途、消费、持久预算和 HTTP 行为由[认证底座](../auth.md)与[认证 HTTP 契约](../apis/auth.md)维护。短信 SDK 仅由此适配器导入，模块边界见[源码护栏](../engineering/source-guardrails.md)。
 
+日常登录／注册与账号操作共用既有 `mioSmsBudget`、`mioSmsBudgetEvent`，不为 U2 新建或迁移预算表。`phone_rebind`、`wechat_existing`、`onelink_existing`、`account_deletion` 预约独立 `global:account_ops` 桶，默认滚动 24 小时 300 次、只能收紧，不扣减日常登录／注册的全局额度；手机号仍跨用途共享 60 秒冷却、每小时 5 次、每天 10 次，IP 仍共享既有额度。预算先预约，失败与未知不退款，不自动重试。
+
+固定测试码模式不调用短信供应商或占用持久预算。换绑及第三方绑定已有账号仍必须先发起本次 `send-otp` 建立会话／候选范围内的挑战，确认时核对归属、有效期和单次消费，不能凭固定码跳过操作上下文。测试替身或固定码通过不能证明真实短信已发送或送达。
+
 ## 验证入口与变更影响
 
 [适配器测试](../../tests/integrations/tencent-sms.test.ts)核对请求形状、脱敏失败和真实 SDK 对隔离本地 TLS 服务的发送、重定向、并发及响应体中止；[认证测试](../../tests/auth/phone.test.ts)通过受控发送替身和真实隔离 PostgreSQL／HTTP 核对业务行为。它们不能证明应用、签名、模板已审核或实际短信送达；真实供应商验证另行记录。SDK、模板参数或传输策略变化需重验发送、错误、超时与不重发语义。

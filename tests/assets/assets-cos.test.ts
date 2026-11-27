@@ -2,6 +2,7 @@ import COS from 'cos-nodejs-sdk-v5';
 import { createServer } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import { once } from 'node:events';
+import { listenLoopback } from '../support/http-server.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
@@ -441,18 +442,10 @@ it('aborts the SDK sender on oversized and cancelled image streams and forwards 
       response.write(Buffer.alloc(32));
     }
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     const controller = new AbortController();
     await expect(
       storage.readImage!('oversized', '"fixture-etag"', 4, controller.signal),
@@ -485,18 +478,10 @@ it('cancels an SDK image request while the server has not responded', async () =
     entered.resolve();
     response.on('close', () => disconnected.resolve());
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     const controller = new AbortController();
     const read = storage.readImage!('waiting', '"etag"', 4, controller.signal);
     await entered.promise;
@@ -528,18 +513,10 @@ it.each([
     response.writeHead(412, { 'content-type': 'application/xml' });
     response.end(body);
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('TEST_SERVER_ADDRESS');
+  const address = await listenLoopback(server);
   const get = redirectCosDownloads(address.port);
   try {
-    const storage = createCosStorage({
-      databaseURL: 'postgresql://example.invalid/media',
-      bucket: 'mio-test-1234567890',
-      region: 'ap-shanghai',
-      secretId: 'example-id',
-      secretKey: 'example-key',
-    });
+    const storage = createCosStorage(copyFixture);
     await expect(
       storage.readImage!('changed', '"old"', 4, new AbortController().signal),
     ).rejects.toMatchObject({ statusCode: 412 });
@@ -1088,6 +1065,8 @@ it('returns the private upload header and conditionally publishes audio from onl
     created_at: new Date(),
   };
   const store = {
+    accountClosed: async () => false,
+    rememberObject: async () => {},
     create: async (created: string, owner: string, filename: string) => ({
       ...row,
       id: created,
@@ -1145,5 +1124,62 @@ it('returns the private upload header and conditionally publishes audio from onl
     );
   } finally {
     await service.close();
+  }
+});
+
+it('signs only static avatar types inline for 300 seconds with the supplied private-bucket token', () => {
+  const storage = createCosStorage({ ...copyFixture, sessionToken: 'synthetic+avatar=/&%#?' });
+  for (const contentType of ['image/jpeg', 'image/png', 'image/webp']) {
+    const url = new URL(storage.avatarInlineUrl!('mio/raw/example/avatar', contentType));
+    expect(url.protocol).toBe('https:');
+    expect(url.searchParams.get('response-content-disposition')).toBe('inline');
+    expect(url.searchParams.get('response-content-type')).toBe(contentType);
+    expect(url.searchParams.get('x-cos-security-token')).toBe('synthetic+avatar=/&%#?');
+    expect(url.searchParams.get('q-signature')).toBeTruthy();
+    const [start, end] = url.searchParams.get('q-sign-time')!.split(';').map(Number);
+    expect(end! - start!).toBe(300);
+  }
+  for (const type of ['image/gif', 'image/svg+xml', 'text/html'])
+    expect(() => storage.avatarInlineUrl!('key', type)).toThrow('AVATAR_CONTENT_TYPE_INVALID');
+});
+
+it('writes normalized avatar output with private ACL and immutable content checks through the SDK', async () => {
+  const storage = createCosStorage(copyFixture);
+  const bytes = Buffer.from('fixture normalized webp');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const put = vi.spyOn(COS.prototype, 'putObject').mockResolvedValue({
+    statusCode: 200,
+    Location: 'fixture.invalid/mio/raw/avatar/output',
+    ETag: 'avatar-output-etag',
+  });
+  try {
+    await storage.putImage!(
+      'mio/raw/avatar/output',
+      bytes,
+      'webp',
+      digest,
+      new AbortController().signal,
+      'private',
+    );
+    expect(put.mock.calls[0]![0]).toMatchObject({
+      ACL: 'private',
+      ContentType: 'image/webp',
+      ContentLength: bytes.length,
+      'x-cos-meta-sha256': digest,
+      Headers: {
+        'x-cos-forbid-overwrite': 'true',
+        'Content-MD5': createHash('md5').update(bytes).digest('base64'),
+      },
+    });
+    await storage.putImage!(
+      'mio/derived/existing/image',
+      bytes,
+      'webp',
+      digest,
+      new AbortController().signal,
+    );
+    expect(put.mock.calls[1]![0].ACL).toBeUndefined();
+  } finally {
+    put.mockRestore();
   }
 });

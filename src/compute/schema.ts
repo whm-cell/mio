@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import { checkMediaSchema, mediaSchemaSQL } from './media/schema.ts';
 import {
   checkWorkerObservabilitySchema,
@@ -35,7 +36,16 @@ CREATE TABLE IF NOT EXISTS mio_compute_inbox (
   id uuid PRIMARY KEY, payload jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
 ${mediaSchemaSQL}
-${workerObservabilitySchemaSQL}`;
+${workerObservabilitySchemaSQL}
+${accountClosureSchemaSQL([
+  ['mio_compute_jobs', 'owner_id'],
+  ['mio_compute_outbox', 'mio_compute_jobs', 'job_id'],
+  ['mio_media_jobs', 'owner_id'],
+  ['mio_media_outbox', 'mio_media_jobs', 'job_id'],
+  ['mio_media_retries', 'owner_id'],
+  ['mio_media_files', 'mio_media_jobs', 'job_id'],
+  ['mio_media_controls', 'mio_media_jobs', 'job_id'],
+])}`;
 
 export async function checkComputeSchema(
   database: Pick<Pool, 'query'>,

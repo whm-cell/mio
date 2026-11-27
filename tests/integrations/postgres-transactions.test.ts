@@ -45,7 +45,14 @@ const adapters: { name: string; run: (pool: Pool) => Promise<unknown>; error?: (
   {
     name: 'admin',
     run: (pool: Pool) =>
-      new AdminStore(pool, null, false, null).createSession('admin', 'digest', new Date(0)),
+      new AdminStore(
+        pool,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      ).createSession('admin', 'digest', new Date(0)),
     error: () => new AdminError(409, 'ADMIN_FIXTURE_CONFLICT'),
   },
   {
@@ -135,7 +142,14 @@ it.each([
   {
     name: 'admin unavailable',
     run: (pool: Pool) =>
-      new AdminStore(pool, null, false, null).createSession('admin', 'digest', new Date(0)),
+      new AdminStore(
+        pool,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      ).createSession('admin', 'digest', new Date(0)),
     error: new Error('private database detail'),
     code: 'ADMIN_UNAVAILABLE',
     status: 503,
@@ -143,7 +157,14 @@ it.each([
   {
     name: 'admin template collision',
     run: (pool: Pool) =>
-      new AdminStore(pool, null, false, null).createSession('admin', 'digest', new Date(0)),
+      new AdminStore(
+        pool,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      ).createSession('admin', 'digest', new Date(0)),
     error: Object.assign(new Error('collision'), {
       code: '23505',
       constraint: 'template_key_unique',
@@ -154,7 +175,14 @@ it.each([
   {
     name: 'admin model collision',
     run: (pool: Pool) =>
-      new AdminStore(pool, null, false, null).createSession('admin', 'digest', new Date(0)),
+      new AdminStore(
+        pool,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      ).createSession('admin', 'digest', new Date(0)),
     error: Object.assign(new Error('collision'), {
       code: '23505',
       constraint: 'catalog_models_pkey',
@@ -165,7 +193,14 @@ it.each([
   {
     name: 'admin username collision',
     run: (pool: Pool) =>
-      new AdminStore(pool, null, false, null).createSession('admin', 'digest', new Date(0)),
+      new AdminStore(
+        pool,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      ).createSession('admin', 'digest', new Date(0)),
     error: Object.assign(new Error('collision'), { code: '23505' }),
     code: 'ADMIN_USERNAME_TAKEN',
     status: 409,

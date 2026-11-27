@@ -1,14 +1,13 @@
-import { sha256Bytes } from '@mio/foundation/hash';
+import { AccountResultClosed } from '../deleted-results.ts';
+import { readVerifiedMediaManifest } from './manifest.ts';
+import type { DeletedAttempt } from '../deleted-results.ts';
 import { isUuidV4 } from '@mio/foundation/identifiers';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { MAX_ASSET_BYTES, waitForObjectHead } from '../../assets/contracts.ts';
 import type { AssetObjectStore, AssetPrincipal } from '../../assets/contracts.ts';
 import {
   MEDIA_AVAILABLE_OPERATIONS,
-  MEDIA_MAX_FILES,
-  MEDIA_MAX_MANIFEST_BYTES,
   mediaObjectPrefix,
-  parseMediaManifest,
   parseMediaRequest,
   parseMediaResult,
 } from '@mio/compute-contracts';
@@ -29,6 +28,11 @@ export function createMediaService(
   store: MediaStore,
   objects: AssetObjectStore,
   config: ComputeConfig,
+  deletedResult?: (
+    attempt: DeletedAttempt,
+    result: MediaResult,
+    signal: AbortSignal,
+  ) => Promise<void>,
 ) {
   if (!objects.readMedia) throw new Error('MEDIA_STORAGE_READ_REQUIRED');
   let stopping = false;
@@ -80,6 +84,13 @@ export function createMediaService(
           permanent: true,
         });
       }
+      const deleted = await store.deletedAttempt(result);
+      if (deleted) {
+        if (!deletedResult) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+        await deletedResult(deleted, result, signal);
+        return;
+      }
+      if (await store.commandClosed(result.jobId)) return;
       const job = await store.current(result);
       let manifest: MediaManifest | undefined;
       let verificationError: string | undefined;
@@ -96,6 +107,14 @@ export function createMediaService(
       try {
         await store.accept(result, manifest, verificationError);
       } catch (error) {
+        if (error instanceof AccountResultClosed) {
+          const attempt = await store.deletedAttempt(result);
+          if (attempt) {
+            if (!deletedResult) throw new Error('ACCOUNT_DELETION_CLEANUP_UNAVAILABLE');
+            await deletedResult(attempt, result, signal);
+          }
+          return;
+        }
         if (error instanceof MediaError) Object.assign(error, { permanent: true });
         throw error;
       }
@@ -255,33 +274,7 @@ async function verifyMediaManifest(
   object: MediaObject,
   signal: AbortSignal,
 ): Promise<MediaManifest> {
-  if (
-    object.sizeBytes > MEDIA_MAX_MANIFEST_BYTES ||
-    !object.key.startsWith(mediaObjectPrefix(job.id, job.attempt_id))
-  )
-    throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
-  const meta = await waitForObjectHead(() => objects.head(object.key, signal), signal);
-  signal.throwIfAborted();
-  if (meta.size !== object.sizeBytes || meta.etag !== object.etag || meta.sha256 !== object.sha256)
-    throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
-  const bytes = await objects.readMedia!(object.key, object.etag, object.sizeBytes, signal);
-  signal.throwIfAborted();
-  if (bytes.length !== object.sizeBytes || sha256Bytes(bytes) !== object.sha256)
-    throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
-  let manifest: MediaManifest;
-  try {
-    manifest = parseMediaManifest(bytes);
-  } catch {
-    throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_INVALID');
-  }
-  if (
-    manifest.jobId !== job.id ||
-    manifest.attemptId !== job.attempt_id ||
-    manifest.operation !== job.operation ||
-    manifest.profile !== job.profile ||
-    manifest.files.length > MEDIA_MAX_FILES
-  )
-    throw new MediaError(HTTP_STATUS.CONFLICT, 'MEDIA_MANIFEST_MISMATCH');
+  const manifest = await readVerifiedMediaManifest(objects, job, object, signal);
   // Sequential HEADs keep memory, socket use and shutdown work bounded even at 4096 entries.
   for (const file of manifest.files) {
     signal.throwIfAborted();

@@ -1,3 +1,4 @@
+import COS from 'cos-nodejs-sdk-v5';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -14,7 +15,6 @@ import { hashAdminPassword } from '../../src/auth/admin-password.ts';
 import { authOptions, readAuthConfig } from '../../src/auth/config.ts';
 import type { AuthRuntimePolicy } from '../../src/auth/config.ts';
 import { createAuthHandler } from '../../src/auth/http.ts';
-import type { AvatarAssetStatus } from '../../src/auth/http.ts';
 import { createAuthentication } from '../../src/auth/service.ts';
 import { assetSchemaSQL } from '../../src/assets/schema.ts';
 import { providerSchemaSQL } from '../../src/providers/schema.ts';
@@ -33,7 +33,11 @@ const auths: Awaited<ReturnType<typeof createAuthentication>>[] = [];
 const origins: string[] = [];
 const delivered = new Map<string, string>();
 const wechatFixtures = new Map<string, { openid: string }>();
-const avatarRegistry = new Map<string, { ownerId: string; status: AvatarAssetStatus }>();
+type AvatarAssetVerifier = NonNullable<Parameters<typeof createAuthHandler>[2]>;
+const avatarRegistry = new Map<
+  string,
+  { ownerId: string; status: Awaited<ReturnType<AvatarAssetVerifier>> }
+>();
 
 const sender = async (phone: string, code: string) => {
   delivered.set(phone, code);
@@ -104,10 +108,31 @@ async function signInWechat(openid: string, instance = 0) {
   expect(started.status, await started.clone().text()).toBe(200);
   const { url } = (await started.json()) as { url: string };
   const state = new URL(url).searchParams.get('state')!;
-  return call(`/api/auth/callback/wechat?code=${code}&state=${encodeURIComponent(state)}`, {
-    cookie: cookies(started),
+  const callback = await call(
+    `/api/auth/callback/wechat?code=${code}&state=${encodeURIComponent(state)}`,
+    {
+      cookie: cookies(started),
+      instance,
+    },
+  );
+  if (!callback.headers.getSetCookie().some((cookie) => cookie.startsWith('mio.wechat_pending=')))
+    return callback;
+  const pending = await call('/api/auth/wechat/pending', { cookie: cookies(callback), instance });
+  expect(pending.status).toBe(200);
+  const { candidateToken } = (await pending.json()) as { candidateToken: string };
+  const confirmed = await call('/api/auth/wechat/pending/confirm', {
+    body: { action: 'create', candidateToken },
+    cookie: cookies(callback),
     instance,
   });
+  expect(confirmed.status, await confirmed.clone().text()).toBe(200);
+  const headers = new Headers(callback.headers);
+  headers.delete('set-cookie');
+  for (const cookie of confirmed.headers.getSetCookie()) headers.append('set-cookie', cookie);
+  const location = new URL(headers.get('location')!);
+  location.searchParams.delete('wechat_result');
+  headers.set('location', location.href);
+  return new Response(null, { status: callback.status, headers });
 }
 
 beforeAll(async () => {
@@ -170,12 +195,9 @@ beforeAll(async () => {
     })!;
     const auth = await createAuthentication(config, undefined, sender);
     auths.push(auth);
-    const verifier =
+    const verifier: AvatarAssetVerifier | undefined =
       index === 0
-        ? async (
-            identity: { userId: string; sessionId: string },
-            assetId: string,
-          ): Promise<AvatarAssetStatus> => {
+        ? async (identity, assetId) => {
             const item = avatarRegistry.get(assetId);
             if (!item || item.ownerId !== identity.userId) return 'not_found';
             return item.status;
@@ -615,6 +637,11 @@ it('reads and updates /api/v1/me/profile with strict input and avatar asset vali
 });
 
 it('migrates an existing populated auth user table cleanly and wires /api/v1/me/profile in plugin', async () => {
+  const avatarHead = vi.spyOn(COS.prototype, 'headObject').mockResolvedValue({
+    statusCode: 200,
+    ETag: 'fixture-avatar',
+    headers: { 'content-length': '1024', 'content-type': 'image/png' },
+  });
   const upgradeDb = await authDatabase();
   const upgradePool = new Pool({ connectionString: upgradeDb.url });
   let ctx: Context | undefined;
@@ -718,6 +745,16 @@ it('migrates an existing populated auth user table cleanly and wires /api/v1/me/
       body: JSON.stringify({ avatarAssetId: randomUUID() }),
     });
     expect(avatarNoAssets.status).toBe(503);
+    const normalizeNoAssets = await originalFetch(
+      `${pluginOrigin}/api/v1/me/profile/avatar/normalize`,
+      {
+        method: 'POST',
+        headers: { origin: pluginOrigin, cookie: pluginCookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ sourceAssetId: randomUUID() }),
+      },
+    );
+    expect(normalizeNoAssets.status).toBe(503);
+    expect((await normalizeNoAssets.json()).error.code).toBe('ASSET_UNAVAILABLE');
 
     // 4. Reload plugin with assets enabled and exercise the real plugin verifyAvatarAsset wiring.
     await mounted.dispose();
@@ -775,11 +812,56 @@ it('migrates an existing populated auth user table cleanly and wires /api/v1/me/
     const savedAvatar = await patchAvatar(readyImg);
     expect(savedAvatar.status).toBe(200);
     expect(await savedAvatar.json()).toMatchObject({ avatarAssetId: readyImg });
+
+    // The pre-U1 default binding contract accepts static assets above the GIF conversion cap.
+    const largeImage = randomUUID(),
+      largeSize = 21 * 1024 * 1024;
+    const largeKey = `mio/raw/${largeImage}/${randomUUID()}`;
+    await upgradePool.query(
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,state,staging_key,raw_key,expires_at)
+       VALUES($1,$2,'large.png','image/png',$3,'ready',$4,$5,now()+interval '1 day')`,
+      [largeImage, profile.userId, largeSize, `mio/staging/${largeImage}`, largeKey],
+    );
+    avatarHead.mockResolvedValue({
+      statusCode: 200,
+      ETag: 'large-static-avatar',
+      headers: { 'content-length': String(largeSize), 'content-type': 'image/png' },
+    });
+    const savedLarge = await patchAvatar(largeImage);
+    expect(savedLarge.status).toBe(200);
+    const legacyLarge = await savedLarge.json();
+    expect(legacyLarge.avatarAssetId).toBe(largeImage);
+    expect(Object.keys(legacyLarge).sort()).toEqual(
+      [
+        'userId',
+        'displayId',
+        'name',
+        'avatarAssetId',
+        'phoneNumber',
+        'phoneNumberVerified',
+        'wechatBound',
+        'onelinkBound',
+      ].sort(),
+    );
+    const displayedLarge = await originalFetch(`${pluginOrigin}/api/v1/me/profile?view=display`, {
+      headers: { origin: pluginOrigin, cookie: pluginCookie },
+    });
+    expect(displayedLarge.status).toBe(200);
+    const displayed = await displayedLarge.json();
+    expect(displayed.avatarAssetId).toBe(largeImage);
+    expect(new URL(displayed.avatarUrl).pathname).toBe('/' + largeKey);
+    avatarHead.mockResolvedValueOnce({
+      statusCode: 200,
+      ETag: 'large-static-avatar',
+      headers: { 'content-length': String(largeSize - 1), 'content-type': 'image/png' },
+    });
+    expect((await patchAvatar(largeImage)).status).toBe(409);
   } finally {
     vi.unstubAllEnvs();
     if (ctx) await ctx.fiber.dispose();
     await upgradePool.end();
     await upgradeDb.close();
+    avatarHead.mockRestore();
   }
 }, 30_000);
 
@@ -1281,16 +1363,20 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
     expect(bypassAfterRestart.status).toBe(200);
 
     // 3. Without MIO_ADMIN_ENABLED, auth falls back to MIO_AUTH_EMAIL_PASSWORD_ENABLED and smsMode='live'
-    await mounted.dispose();
-    setPluginEnv({
-      MIO_ADMIN_ENABLED: 'false',
-      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'false',
-      MIO_PROVIDERS_DATABASE_URL: undefined,
-      MIO_PROVIDERS_MASTER_KEY: undefined,
-      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
-    });
-    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
-    await mounted;
+    const context = ctx;
+    const restartWithoutAdmin = async (emailPasswordEnabled: 'true' | 'false') => {
+      await mounted.dispose();
+      setPluginEnv({
+        MIO_ADMIN_ENABLED: 'false',
+        MIO_AUTH_EMAIL_PASSWORD_ENABLED: emailPasswordEnabled,
+        MIO_PROVIDERS_DATABASE_URL: undefined,
+        MIO_PROVIDERS_MASTER_KEY: undefined,
+        MIO_PROVIDERS_MASTER_KEY_ID: undefined,
+      });
+      mounted = context.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
+      await mounted;
+    };
+    await restartWithoutAdmin('false');
 
     expect(
       (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,
@@ -1304,16 +1390,7 @@ it('hot-reloads admin global settings in full Mio plugin, hydrates on restart, a
       ).status,
     ).toBe(503);
 
-    await mounted.dispose();
-    setPluginEnv({
-      MIO_ADMIN_ENABLED: 'false',
-      MIO_AUTH_EMAIL_PASSWORD_ENABLED: 'true',
-      MIO_PROVIDERS_DATABASE_URL: undefined,
-      MIO_PROVIDERS_MASTER_KEY: undefined,
-      MIO_PROVIDERS_MASTER_KEY_ID: undefined,
-    });
-    mounted = ctx.plugin(Mio, { tokenEnv: 'MIO_AUTH_TEST_TOKEN', allowedOrigins: [] });
-    await mounted;
+    await restartWithoutAdmin('true');
 
     expect(
       (await req('/api/auth/sign-in/email', 'POST', { email: emailAddr, password })).status,

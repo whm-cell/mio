@@ -1,8 +1,7 @@
-import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { afterEach, expect, it, vi } from 'vitest';
-import { createWechatClient } from '../../src/integrations/wechat.ts';
+import { createWechatClient, wechatAccountId } from '../../src/integrations/wechat.ts';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -17,21 +16,18 @@ it('uses fixed destinations, refuses redirects and hides provider failures', asy
       scope: 'snsapi_login',
     }),
   );
-  fetcher.mockResolvedValueOnce(
-    Response.json({ openid: 'fixture-openid', nickname: 'Fixture', unionid: 'optional' }),
-  );
-  const client = createWechatClient(
-    { appId: 'fixture-app', appSecret: 'fixture-secret' },
-    'auth.mio.invalid',
-  );
+  const data = {
+    openid: 'fixture-openid',
+    nickname: 'Fixture',
+    unionid: 'optional',
+    headimgurl: 'https://avatar.invalid/fixture',
+  };
+  fetcher.mockResolvedValueOnce(Response.json(data));
+  const client = createWechatClient({ appId: 'fixture-app', appSecret: 'fixture-secret' });
   const tokens = await client.exchangeCode('fixture-code');
   const profile = await client.getUserInfo(tokens);
-  const legacyHash = createHash('sha256')
-    .update(JSON.stringify(['fixture-app', 'fixture-openid']))
-    .digest('hex')
-    .slice(0, 56);
-  expect(profile.user.email).toBe(`wechat-${legacyHash}@auth.mio.invalid`);
-  expect(profile.user.emailVerified).toBe(false);
+  expect(profile).toEqual({ user: { image: data.headimgurl }, data });
+  expect(wechatAccountId('fixture-app', tokens.openid)).toBe('["fixture-app","fixture-openid"]');
   expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
     '/sns/oauth2/access_token',
     '/sns/userinfo',
@@ -81,10 +77,7 @@ it('aborts a stalled response body at the request deadline', async () => {
   );
   vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => originalTimeout(150));
   try {
-    const client = createWechatClient(
-      { appId: 'fixture-app', appSecret: 'fixture-secret' },
-      'auth.mio.invalid',
-    );
+    const client = createWechatClient({ appId: 'fixture-app', appSecret: 'fixture-secret' });
     await expect(client.exchangeCode('fixture-code')).rejects.toThrow('WECHAT_UNAVAILABLE');
     await responseClosed;
   } finally {
@@ -113,10 +106,7 @@ it('does not follow an actual upstream redirect', async () => {
     originalFetch(`http://127.0.0.1:${address.port}/redirect`, options),
   );
   try {
-    const client = createWechatClient(
-      { appId: 'fixture-app', appSecret: 'fixture-secret' },
-      'auth.mio.invalid',
-    );
+    const client = createWechatClient({ appId: 'fixture-app', appSecret: 'fixture-secret' });
     await expect(client.exchangeCode('fixture-code')).rejects.toThrow('WECHAT_UNAVAILABLE');
     expect(destinationRequests).toBe(0);
   } finally {

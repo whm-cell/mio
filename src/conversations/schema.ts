@@ -1,3 +1,4 @@
+import { accountClosureSchemaSQL } from '../account-deletion/domain-schema.ts';
 import type { Pool } from 'pg';
 
 const purposeCheck = `(purpose = ANY (ARRAY['general'::text, 'drama-script'::text, 'audio'::text]))`;
@@ -71,7 +72,11 @@ CREATE INDEX IF NOT EXISTS mio_conversations_audio_activity_page
 CREATE INDEX IF NOT EXISTS mio_conversations_nonaudio_activity_page
   ON mio_conversations(owner_id, updated_at DESC, id DESC)
   WHERE archived_at IS NULL AND purpose<>'audio';
-DROP INDEX IF EXISTS mio_conversations_owner_activity_page;`;
+DROP INDEX IF EXISTS mio_conversations_owner_activity_page;
+${accountClosureSchemaSQL([
+  ['mio_conversations', 'owner_id'],
+  ['mio_conversation_requests', 'mio_conversations', 'conversation_id'],
+])}`;
 
 /** Read-only checks before acquiring ownership or writing recovery metadata. */
 export async function checkConversationSchema(database: Pick<Pool, 'query'>): Promise<void> {

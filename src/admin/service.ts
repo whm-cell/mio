@@ -1,3 +1,7 @@
+import { createCreationRetentionSnapshot } from './creation-logs.ts';
+import { createStoragePolicySnapshot } from './storage.ts';
+import { validateStorageSettingsUpdate } from './storage-store.ts';
+import type { StorageSettings } from './storage.ts';
 import { sha256Utf8 } from '@mio/foundation/hash';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { epochMs, utcISOString } from '@mio/foundation/time';
@@ -104,12 +108,12 @@ function validateGlobalSettingsUpdate(input: { expectedRevision?: unknown; auth?
   };
 }
 
-export interface AdminMonitorProbes {
+interface AdminMonitorProbes {
   readonly probeRabbitmq?: () => Promise<RabbitmqMonitorSnapshot>;
   readonly probeRedis?: () => Promise<RedisMonitorSnapshot>;
 }
 
-export interface AdminOneLinkSsoRuntimeOptions {
+interface AdminOneLinkSsoRuntimeOptions {
   readonly config?: OneLinkSsoConfig;
   readonly authBaseURL?: string;
   readonly registerTransport?: OneLinkSsoRegisterTransport;
@@ -419,6 +423,8 @@ export function createAdminService(
   authRuntimeDefaults?: AdminAuthRuntimeDefaults,
   oneLinkSso?: AdminOneLinkSsoRuntimeOptions,
 ) {
+  const creationRetention = createCreationRetentionSnapshot(store);
+  const storagePolicy = createStoragePolicySnapshot(store);
   const cancellation = new AbortController();
   const activeProbes = new Set<Promise<AdminProbeDiscoveryResult>>();
   let activeOneLinkRegister: Promise<AdminOneLinkSsoRegisterView> | null = null;
@@ -566,6 +572,15 @@ export function createAdminService(
       assertOpen();
       if (!sessionToken || sessionToken.length > 256) return null;
       return store.resolveSession(sha256Utf8(sessionToken));
+    },
+
+    recordAnnouncementOperation(
+      actor: { id: string; username: string },
+      action: string,
+      targetId: string,
+    ) {
+      assertOpen();
+      return store.recordAnnouncementOperation(actor, action, targetId);
     },
 
     async logout(sessionToken: string | null): Promise<void> {
@@ -1315,6 +1330,61 @@ export function createAdminService(
       };
     },
 
+    getCreationLogRetentionDays(): number | null {
+      assertOpen();
+      return creationRetention.get();
+    },
+
+    getCreationLogSettings() {
+      assertOpen();
+      return creationRetention.refresh();
+    },
+
+    async updateCreationLogSettings(
+      principal: AdminPrincipal,
+      input: { expectedRevision?: unknown; retentionDays?: unknown },
+    ) {
+      assertOpen();
+      const { expectedRevision, retentionDays } = input;
+      if (
+        typeof expectedRevision !== 'number' ||
+        !Number.isInteger(expectedRevision) ||
+        expectedRevision < 0 ||
+        expectedRevision >= MAX_PG_INT32 ||
+        typeof retentionDays !== 'number' ||
+        !Number.isSafeInteger(retentionDays) ||
+        retentionDays < 1
+      )
+        throw new AdminError(400, 'ADMIN_INPUT_INVALID');
+      const saved = await store.updateCreationLogSettings(
+        principal.admin,
+        expectedRevision,
+        retentionDays,
+      );
+      return creationRetention.save(saved);
+    },
+
+    getStoragePolicy(): StorageSettings {
+      assertOpen();
+      return storagePolicy.get();
+    },
+
+    getStorageSettings(): Promise<StorageSettings> {
+      assertOpen();
+      return storagePolicy.refresh();
+    },
+
+    async updateStorageSettings(
+      principal: AdminPrincipal,
+      input: Record<string, unknown>,
+    ): Promise<StorageSettings> {
+      assertOpen();
+      const validated = validateStorageSettingsUpdate(input);
+      const saved = await store.updateStorageSettings(principal.admin, validated);
+      storagePolicy.save(saved);
+      return saved;
+    },
+
     getAuthPolicy(): AuthRuntimePolicy {
       return currentAuthPolicy;
     },
@@ -1440,6 +1510,8 @@ export function createAdminService(
             ...activeProbes,
             ...(activeOneLinkRegister ? [activeOneLinkRegister] : []),
           ]);
+          await creationRetention.close();
+          await storagePolicy.close();
           await store.close();
         })();
       }

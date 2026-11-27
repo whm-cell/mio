@@ -22,7 +22,14 @@ const secret = randomBytes(40).toString('hex');
 const phone = '+8613800138101';
 const ip = '127.0.0.101';
 const ids = ['global', `ip:${sha256Utf8(ip)}`, `phone:${sha256Utf8(phone)}`];
-const limits = { globalDay: 1000, ipHour: 20, ipDay: 100, phoneHour: 5, phoneDay: 10 };
+const limits = {
+  globalDay: 1000,
+  accountOpsDay: 1000,
+  ipHour: 20,
+  ipDay: 100,
+  phoneHour: 5,
+  phoneDay: 10,
+};
 
 beforeAll(async () => {
   const target = new URL(process.env.MIO_TEST_DATABASE_URL!);

@@ -488,7 +488,7 @@ CREATE INDEX IF NOT EXISTS mio_admin_audit_logs_created_idx
   ON mio_admin_audit_logs (created_at DESC);
 CREATE TABLE IF NOT EXISTS mio_admin_global_settings (
   setting_key text PRIMARY KEY
-    CHECK (setting_key = 'auth'),
+    CHECK (setting_key IN ('auth','creation_logs','storage')),
   value jsonb NOT NULL
     CHECK (jsonb_typeof(value) = 'object'),
   revision integer NOT NULL DEFAULT 1
@@ -497,6 +497,9 @@ CREATE TABLE IF NOT EXISTS mio_admin_global_settings (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE mio_admin_global_settings DROP CONSTRAINT IF EXISTS mio_admin_global_settings_setting_key_check;
+ALTER TABLE mio_admin_global_settings ADD CONSTRAINT mio_admin_global_settings_setting_key_check
+  CHECK (setting_key IN ('auth','creation_logs','storage'));
 CREATE TABLE IF NOT EXISTS mio_admin_onelink_sso_config (
   environment text PRIMARY KEY
     CHECK (environment ~ '^[A-Za-z0-9_.-]{1,32}$'),
@@ -572,6 +575,16 @@ END $$;
 
 export async function checkAdminSchema(pool: Pick<Pool, 'query'>): Promise<void> {
   await checkProviderOperations(pool, ['mio_admin_route_templates']);
+  const settingCheck = await pool.query<{ definition: string }>(
+    `SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+     WHERE conrelid='mio_admin_global_settings'::regclass
+       AND conname='mio_admin_global_settings_setting_key_check' AND convalidated`,
+  );
+  if (
+    settingCheck.rows[0]?.definition !==
+    "CHECK ((setting_key = ANY (ARRAY['auth'::text, 'creation_logs'::text, 'storage'::text])))"
+  )
+    throw new Error('ADMIN_SCHEMA: creation log settings migration required');
   for (const [sql, types] of [
     [
       'SELECT id,username,password_hash,is_super_admin,created_at,updated_at FROM mio_admin_accounts LIMIT 0',

@@ -34,3 +34,11 @@ Worker 把预览、封面、主/子清单、分片及内部 manifest 按明确�
 ## 验证入口与变更影响
 
 `tests/assets/assets.test.ts` 使用隔离真实 PostgreSQL、实际插件 HTTP 和受控对象存储替身。`tests/assets/assets-cos.test.ts` 核对 SDK 签名及调用参数，并用本地 HTTP 对端观察复制及删除请求的连接关闭和发送次数。本机隔离测试桶已做小对象 SDK 签名、条件复制、下载和 A/B 分离身份权限正反例；还经真实插件登录入口和 Chrome 以指定 Origin 直传、登记并下载，并确认另一 Origin 的预检被拒。真实 A/B 本机链路与断线恢复也有开发探针。以上均只适用于所测小样本、测试桶和实际候选，不证明生产权限、生产负载或人类接受；已登记测试原件与成品按清单保留。
+
+## 账号注销与共享精确键 GC
+
+正式 ready 对象及已校验迟到输出统一进入媒体域 mio_asset_gc_objects／mio_asset_gc_requests。物理键 journal 保存领取租约、失败／下次尝试和删除确认；每个请求保存对应注销 owner 的收敛／保留回执。头像生成、raw 复制和音频输出先登记确切待写键；图片／视频沿原持久恢复回执保存定位。删除前在同库核对全部合法持有，删除期间禁止新绑定该键；等待 COS 时释放数据库，成功 DELETE 后 HEAD 404 才确认。相同 attempt 的迟到重传重新开启该键清理，不发布作品、消息或重提生成。独立合法持有者仍在时记录 retained 依据，不删除其对象。未知、越界或错误 manifest 的键不交清理。注销前已入箱但未发布的输出同样核对；manifest 与全部成员键原子登记到同一共享 GC journal，再移除原入箱回执，摘要／ETag 回执支持删除后崩溃重试。所有正式对象和 HLS 成员只经此共享管线，不新增注销专属 COS 扫描删除器。
+
+MIO_ASSETS_GC_DELETE_ENABLED 默认 false，生产退出 dry-run 显式设 true，先以实际权限和代表性数据验证 <=24h SLA。mio/staging 继续由现有 assets cleaner 负责，注销只加速到期，保留定位到原 5 分钟 PUT 窗口后的最终确认。COS 读写在途由适配器按键跟踪，尚未收束的写入不得记物理删除完成。
+
+私有 mio/audit/account-deletions/ 独立保存最小 {userId,finalizedAt}，禁止覆盖且重复归档须验证一致正文、摘要和 private ACL。A 需要该前缀 PUT/HEAD/GET/LIST；恢复工具只从此外部事实源分页读取。备份、前缀生命周期与审计归档不得随 PG 快照回滚或被普通资产 GC 覆盖。运维流程见[认证规则](../auth.md#独立监控与灾备恢复)。

@@ -434,6 +434,19 @@ export async function checkSource(root: string, files: readonly string[], harnes
         packageName,
       ].some((name) => name === 'pg' || name === '@types/pg');
       const businessDatabase = [
+        'src/account-deletion/schema.ts',
+        'src/account-deletion/store.ts',
+        'src/account-deletion/domain-schema.ts',
+        'src/account-deletion/domain-store.ts',
+        'src/compute/deleted-results.ts',
+        'src/assets/gc-schema.ts',
+        'src/assets/gc.ts',
+        'src/assets/account-deletion.ts',
+        'src/providers/account-deletion.ts',
+        'src/generations/account-deletion.ts',
+        'src/materials/account-deletion.ts',
+        'src/notifications/account-deletion.ts',
+        'src/compute/account-deletion.ts',
         'src/conversations/store.ts',
         'src/conversations/schema.ts',
         'src/providers/store.ts',
@@ -444,6 +457,8 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/materials/auth-schema.ts',
         'src/assets/store.ts',
         'src/assets/schema.ts',
+        'src/assets/storage-schema.ts',
+        'src/assets/storage-store.ts',
         'src/compute/transcode/store.ts',
         'src/compute/observability/store.ts',
         'src/compute/observability/control.ts',
@@ -460,7 +475,14 @@ export async function checkSource(root: string, files: readonly string[], harnes
         'src/generations/video/store.ts',
         'src/generations/video/execution-store.ts',
         'src/admin/store.ts',
+        'src/admin/storage-store.ts',
         'src/admin/schema.ts',
+        'src/notifications/store.ts',
+        'src/notifications/schema.ts',
+        'src/notifications/creation-store.ts',
+        'src/notifications/creation-schema.ts',
+        'src/audio/jobs/schema.ts',
+        'src/admin/creation-logs.ts',
       ].includes(file);
       if (
         ((authPackage || specifier.startsWith('@better-auth/')) && !beneath(file, 'src/auth')) ||

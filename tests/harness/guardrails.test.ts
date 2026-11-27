@@ -53,16 +53,14 @@ it.each([
     ['src/dsh-extra/pi.ts', 1],
     ['src/providers/pi.ts', 1],
   ] as const) {
-    const root = await fixture({ [file]: `export type * from '${entry}';` });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+    const root = await packageFixture({ [file]: `export type * from '${entry}';` });
     const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('DSH_BOUNDARY');
   }
 });
 it('recognizes a pi-ai type alias and rejects business imports of the local DSH adapter', async () => {
-  const root = await fixture({ 'src/providers/alias.ts': "export type * from 'pi-alias';" });
-  await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+  const root = await packageFixture({ 'src/providers/alias.ts': "export type * from 'pi-alias';" });
   const path = join(root, 'tsconfig.json');
   const config = JSON.parse(await readFile(path, 'utf8'));
   config.compilerOptions.paths = {
@@ -96,16 +94,16 @@ it.each([
   ['src/integrations/cos-extra.ts', 1],
   ['src/assets/service.ts', 1],
 ] as const)('limits COS package imports, including type-only imports: %s', async (file, status) => {
-  const root = await fixture({ [file]: "export type * from 'cos-nodejs-sdk-v5';" });
-  await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+  const root = await packageFixture({ [file]: "export type * from 'cos-nodejs-sdk-v5';" });
   const result = await check(root);
   expect(result.status, result.output).toBe(status);
   if (status) expect(result.output).toContain('COS_ADAPTER');
 });
 
 it('rejects the COS package under a business import alias', async () => {
-  const root = await fixture({ 'src/assets/service.ts': "export type * from 'storage-alias';" });
-  await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+  const root = await packageFixture({
+    'src/assets/service.ts': "export type * from 'storage-alias';",
+  });
   const path = join(root, 'tsconfig.json');
   const config = JSON.parse(await readFile(path, 'utf8'));
   config.compilerOptions.paths = {
@@ -193,12 +191,15 @@ it.each([
   ['src/generations-extra/image/store.ts', 1],
   ['src/admin/store.ts', 0],
   ['src/admin/schema.ts', 0],
+  ['src/notifications/store.ts', 0],
+  ['src/notifications/schema.ts', 0],
+  ['src/notifications/service.ts', 1],
+  ['src/notifications/http.ts', 1],
   ['src/admin/service.ts', 1],
 ] as const)(
   'limits business PostgreSQL imports to reviewed conversation/provider adapters: %s',
   async (file, status) => {
-    const root = await fixture({ [file]: "export type { PoolConfig } from 'pg';" });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+    const root = await packageFixture({ [file]: "export type { PoolConfig } from 'pg';" });
     const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('AUTH_ADAPTER');
@@ -223,15 +224,18 @@ it.each([
   ['src/generations/image/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/store.ts', 'database-alias', 'pg', 0],
   ['src/admin/schema.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/store.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/schema.ts', 'database-alias', 'pg', 0],
+  ['src/notifications/service.ts', 'database-alias', 'pg', 1],
+  ['src/notifications/store.ts', 'pg', 'better-auth', 1],
   ['src/admin/service.ts', 'database-alias', 'pg', 1],
   ['src/admin/store.ts', 'pg', 'better-auth', 1],
 ] as const)(
   'keeps package identity checks behind database aliases: %s, %s -> %s',
   async (file, alias, target, status) => {
-    const root = await fixture({
+    const root = await packageFixture({
       [file]: `import type * as Driver from '${alias}'; export type Value = typeof Driver;`,
     });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
     const configPath = join(root, 'tsconfig.json');
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     config.compilerOptions.paths = { [alias]: [createRequire(import.meta.url).resolve(target)] };
@@ -256,6 +260,12 @@ async function fixture(extra: Record<string, string>) {
     await mkdir(dirname(join(root, file)), { recursive: true });
     await writeFile(join(root, file), text);
   }
+  return root;
+}
+
+async function packageFixture(extra: Record<string, string>) {
+  const root = await fixture(extra);
+  await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
   return root;
 }
 
@@ -329,8 +339,7 @@ it.each([
 ] as const)(
   'keeps Redis driver imports in the public adapter and test fixtures: %s',
   async (file, status) => {
-    const root = await fixture({ [file]: "export { createClient } from '@redis/client';" });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
+    const root = await packageFixture({ [file]: "export { createClient } from '@redis/client';" });
     const result = await check(root);
     expect(result.status, result.output).toBe(status);
     if (status) expect(result.output).toContain('REDIS_ADAPTER');
@@ -340,10 +349,9 @@ it.each([
 it.each(['src/auth/limit.ts', 'scripts/service/redis-helper.ts'])(
   'checks Redis package ownership behind a paths alias in %s',
   async (file) => {
-    const root = await fixture({
+    const root = await packageFixture({
       [file]: "export type { RedisClientOptions } from 'driver-alias';",
     });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
     const configPath = join(root, 'tsconfig.json');
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     config.compilerOptions.paths = {
@@ -452,14 +460,13 @@ it.each([
 it.each(['src/other.ts', 'src/plugin.ts', 'src/dsh/kernel.ts', 'src/dsh-other/kernel.ts'])(
   'checks a valid framework paths alias in %s and preserves local aliases and import-like text',
   async (file) => {
-    const root = await fixture({
+    const root = await packageFixture({
       'package.json': JSON.stringify({ type: 'module' }),
       [file]: "export type { Context } from 'runtime-alias';",
       'src/local.ts': `export { value } from 'local-alias';
 // import '@deepseek-ai/not-a-package';
 export const documentation = "import '@deepseek-ai/not-a-package'";`,
     });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
     const manifestPath = createRequire(import.meta.url).resolve('@deepseek-ai/cordis/package.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { types: string };
     const configPath = join(root, 'tsconfig.json');
@@ -904,12 +911,11 @@ export function start(response: ServerResponse): ApiError { return { error: { co
 it.each(['src/plugin.ts', 'src/auth/query.ts'])(
   'resolves database and authentication type aliases before checking the boundary in %s',
   async (file) => {
-    const root = await fixture({
+    const root = await packageFixture({
       'package.json': JSON.stringify({ type: 'module' }),
       [file]:
         "export type { Pool } from 'database-alias'; export type { BetterAuthOptions } from 'authentication-alias';",
     });
-    await symlink(join(project, 'node_modules'), join(root, 'node_modules'), 'dir');
     const configPath = join(root, 'tsconfig.json');
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     config.compilerOptions.paths = {

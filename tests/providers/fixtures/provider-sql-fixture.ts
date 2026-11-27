@@ -35,7 +35,14 @@ export async function providerSqlFixture(ids = ['batch-a', 'batch-z']) {
     catalogWhitelist: true,
   };
   const store = new ProviderStore(pool, config),
-    admin = new AdminStore(pool, null, false, null);
+    admin = new AdminStore(
+      pool,
+      null,
+      false,
+      null,
+      { revision: 0, retentionDays: null },
+      { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+    );
   const service = createProviderService(store, config, async () => {
     throw new Error('EXTERNAL_REQUEST_FORBIDDEN');
   });
@@ -123,7 +130,14 @@ export async function providerSqlFixture(ids = ['batch-a', 'batch-z']) {
       },
     });
     const peerStore = new ProviderStore(proxy, config),
-      peerAdmin = new AdminStore(proxy, null, false, null);
+      peerAdmin = new AdminStore(
+        proxy,
+        null,
+        false,
+        null,
+        { revision: 0, retentionDays: null },
+        { revision: 0, quotaBytes: 5_368_709_120, warningAvailableBytes: 1_073_741_824 },
+      );
     return {
       name,
       trace,

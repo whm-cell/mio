@@ -10,6 +10,13 @@ import { readSmsBudgetSchema } from './phone-budget-schema.ts';
 import type { AuthRateLimitStorage } from './rate-limit.ts';
 import { createTencentSmsSender } from '../integrations/tencent-sms.ts';
 import type { SmsSender } from '../integrations/tencent-sms.ts';
+import { unlinkLoginMethod } from './login-methods.ts';
+import type { LoginProvider } from './login-methods.ts';
+import type { BindingIdentity } from './phone-store.ts';
+import { isSixDigitCode } from './phone.ts';
+import { cleanupAuthAccount, deleteAccount } from './deletion.ts';
+import { checkAccountDeletionSchema } from '../account-deletion/schema.ts';
+import { checkAuthDeletionGuards } from './deletion-schema.ts';
 
 const log = createLogger('app', 'auth');
 
@@ -58,8 +65,17 @@ export async function createAuthentication(
     }
     const auth = betterAuth(options);
     await auth.$context;
+    await checkAccountDeletionSchema(pool);
+    await checkAuthDeletionGuards(pool);
+    let deletionDomains: readonly string[] = ['auth', 'archive'];
     return {
       handler: auth.handler,
+      deleteAccount: (identity: BindingIdentity, body: Record<string, unknown>) =>
+        deleteAccount(pool, config.secret, identity, body, deletionDomains),
+      setDeletionDomains: (domains: readonly string[]) => {
+        deletionDomains = [...domains];
+      },
+      cleanupDeletedAccount: (userId: string) => cleanupAuthAccount(pool, userId),
       /** Business services receive this verified identity, never a userId supplied in a body. */
       async identity(headers: Headers) {
         const session = await auth.api.getSession({ headers, query: { disableRefresh: true } });
@@ -67,10 +83,34 @@ export async function createAuthentication(
         return { userId: session.user.id, sessionId: session.session.id };
       },
       profile: (userId: string) => readUserProfile(pool, userId),
+      /** Disabling login does not release a persisted avatar's media hold. No public profile bypass. */
+      async avatarAssetId(userId: string): Promise<string | null> {
+        const result = await pool.query<{ avatarAssetId: string | null }>(
+          'SELECT "avatarAssetId" FROM "user" WHERE id=$1',
+          [userId],
+        );
+        return result.rows[0]?.avatarAssetId ?? null;
+      },
       updateProfile: (userId: string, patch: UserProfilePatch) =>
         updateUserProfile(pool, userId, patch),
       setUserDisabled: (userId: string, disabled: boolean) =>
         setUserDisabled(pool, userId, disabled),
+      unlinkLoginMethod: (identity: BindingIdentity, provider: LoginProvider) => {
+        const policy = getPolicy?.() ?? {
+          emailPasswordEnabled: config.emailPasswordEnabled,
+          smsMode: 'live',
+          smsBypassCode: null,
+        };
+        return unlinkLoginMethod(pool, identity, provider, {
+          sms:
+            policy.smsMode === 'bypass'
+              ? isSixDigitCode(policy.smsBypassCode)
+              : policy.smsMode === 'live' && Boolean(smsSender),
+          emailPassword: policy.emailPasswordEnabled,
+          wechat: Boolean(config.wechat),
+          onelink: Boolean(oneLink?.config && oneLink.getPolicy().enabled),
+        });
+      },
       close: () => pool.end(),
     };
   } catch (error) {

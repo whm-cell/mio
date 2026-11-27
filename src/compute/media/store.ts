@@ -1,3 +1,9 @@
+import {
+  AccountResultClosed,
+  closedComputeJob,
+  guardDeletedResult,
+  readDeletedAttempt,
+} from '../deleted-results.ts';
 import { createLogger } from '@mio/foundation/logging';
 import { HTTP_STATUS } from '@mio/foundation/http-status';
 import { checkMediaSchema } from './schema.ts';
@@ -198,6 +204,12 @@ export class MediaStore {
       return next;
     });
   }
+  deletedAttempt(result: { jobId: string; attemptId: string; commandId: string }) {
+    return readDeletedAttempt(this.pool, 'media', result);
+  }
+  commandClosed(jobId: string) {
+    return closedComputeJob(this.pool, 'media', jobId);
+  }
   async current(result: MediaResult): Promise<MediaJobRow | undefined> {
     const job = (
       await this.pool.query<MediaJobRow>('SELECT * FROM mio_media_jobs WHERE id=$1', [result.jobId])
@@ -212,7 +224,7 @@ export class MediaStore {
     manifest?: MediaManifest,
     verificationError?: string,
   ): Promise<void> {
-    await computeTransaction(this.pool, (client) =>
+    return computeTransaction(this.pool, (client) =>
       acceptMedia(client, result, manifest, verificationError),
     );
   }
@@ -220,19 +232,24 @@ export class MediaStore {
     lane: MediaCommandLane,
   ): Promise<{ command: MediaCommand | MediaControl; lease: string } | undefined> {
     const lease = createId();
-    const row = (
-      await this.pool.query<{ command: MediaCommand | MediaControl }>(
-        `UPDATE mio_media_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
-       WHERE id=(SELECT id FROM mio_media_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now())
+    return computeTransaction(this.pool, async (client) => {
+      // Take capacity before outbox/owner trigger locks, as ACK and result transactions do.
+      await lockComputeCapacity(client);
+      const row = (
+        await client.query<{ command: MediaCommand | MediaControl }>(
+          `UPDATE mio_media_outbox SET lease_id=$1,lease_until=now()+interval '2 minutes'
+       WHERE id=(SELECT id FROM mio_media_outbox WHERE sent_at IS NULL AND (lease_until IS NULL OR lease_until<=now()) AND NOT EXISTS(SELECT 1 FROM mio_media_jobs j JOIN mio_closed_accounts c ON c.user_id=j.owner_id WHERE j.id=mio_media_outbox.job_id)
        AND lane=$2
        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING command`,
-        [lease, lane],
-      )
-    ).rows[0];
-    return row ? { command: row.command, lease } : undefined;
+          [lease, lane],
+        )
+      ).rows[0];
+      return row ? { command: row.command, lease } : undefined;
+    });
   }
   async sent(command: MediaCommand | MediaControl, lease: string): Promise<void> {
     await computeTransaction(this.pool, async (client) => {
+      if (await guardDeletedResult(client, 'media', command.jobId)) return;
       const sent = await client.query(
         'UPDATE mio_media_outbox SET sent_at=now(),lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL RETURNING id',
         [command.messageId, lease],
@@ -245,10 +262,13 @@ export class MediaStore {
     });
   }
   async release(id: string, lease: string): Promise<void> {
-    await this.pool.query(
-      'UPDATE mio_media_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
-      [id, lease],
-    );
+    await computeTransaction(this.pool, async (client) => {
+      await lockComputeCapacity(client);
+      await client.query(
+        'UPDATE mio_media_outbox SET lease_id=NULL,lease_until=NULL WHERE id=$1 AND lease_id=$2 AND sent_at IS NULL',
+        [id, lease],
+      );
+    });
   }
   close(): Promise<void> {
     return this.pool.end();
@@ -341,7 +361,7 @@ async function nextMediaAttempt(client: PoolClient, job: MediaJobRow): Promise<M
   await enqueueMedia(client, next);
   return next;
 }
-export async function controlMedia(
+async function controlMedia(
   client: PoolClient,
   job: MediaJobRow,
   action: 'cancel' | 'recover',
@@ -419,10 +439,21 @@ async function registerFiles(
       etags = manifest.files.map((f) => f.etag);
     const types = manifest.files.map((f) => f.contentType);
     await client.query(
-      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind)
-       SELECT id,$1,name,type,size,NULL,key,'ready',etag,now(),now(),'derived'
-       FROM unnest($2::uuid[],$3::text[],$4::text[],$5::bigint[],$6::text[],$7::text[]) AS f(id,name,type,size,key,etag)`,
-      [job.owner_id, ids, names, types, sizes, keys, etags],
+      `INSERT INTO mio_assets(id,owner_id,filename,content_type,size_bytes,staging_key,raw_key,state,source_etag,expires_at,staging_deleted_at,asset_kind,storage_class)
+       SELECT id,$1,name,type,size,NULL,key,'ready',etag,now(),now(),'derived',storage_class
+       FROM unnest($2::uuid[],$3::text[],$4::text[],$5::bigint[],$6::text[],$7::text[],$8::text[]) AS f(id,name,type,size,key,etag,storage_class)`,
+      [
+        job.owner_id,
+        ids,
+        names,
+        types,
+        sizes,
+        keys,
+        etags,
+        manifest.files.map((f) =>
+          ['preview', 'poster', 'hls', 'segment'].includes(f.role) ? 'internal' : 'content',
+        ),
+      ],
     );
     await client.query(
       `INSERT INTO mio_media_files(asset_id,job_id,name,role,object_key,size_bytes,etag,sha256,content_type,ordinal)
@@ -447,12 +478,13 @@ async function registerFiles(
     [job.id, JSON.stringify(manifest.data)],
   );
 }
-export async function acceptMedia(
+async function acceptMedia(
   client: PoolClient,
   result: MediaResult,
   manifest?: MediaManifest,
   verificationError?: string,
 ): Promise<void> {
+  if (await guardDeletedResult(client, 'media', result.jobId)) throw new AccountResultClosed();
   const inserted = await client.query(
     'INSERT INTO mio_media_inbox(id,payload) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id',
     [result.messageId, JSON.stringify(result)],

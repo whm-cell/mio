@@ -38,6 +38,7 @@ it('cancels only the disconnected history HTTP request and drains it before clos
   const entered = Promise.withResolvers<AbortSignal>();
   const cancelled = Promise.withResolvers<void>();
   const store = {
+    accountClosed: async () => false,
     owned: vi.fn(async () => ({ dsh_session_id: 'session' })),
     close: vi.fn(async () => {}),
   } as unknown as ConversationStore;

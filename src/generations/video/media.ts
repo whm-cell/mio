@@ -119,6 +119,7 @@ async function readReceipt(path: string, jobId: string, index: number, signal: A
     throw new Error('VIDEO_CHECKPOINT_INVALID');
   return saved;
 }
+export { readReceipt as readVideoRecoveryReceipt };
 
 async function digestFile(file: string, signal: AbortSignal) {
   signal.throwIfAborted();

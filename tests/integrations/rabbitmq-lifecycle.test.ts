@@ -110,6 +110,8 @@ it.each(['channel', 'consume'] as const)(
       pair.publisher.createConfirmChannel.mockImplementationOnce(() => new Promise(() => {}));
     else pair.consumer.channel.consume.mockImplementationOnce(() => new Promise(() => {}));
     const store = {
+      deletedAttempt: async () => undefined,
+      commandClosed: async () => false,
       claim: vi.fn(async () => undefined),
       close: vi.fn(async () => {}),
     } as unknown as ComputeStore;
@@ -282,6 +284,8 @@ it.each(['channel-close', 'consumer-cancel'] as const)(
     const first = connections();
     const second = connections();
     const store = {
+      deletedAttempt: async () => undefined,
+      commandClosed: async () => false,
       claim: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     } as unknown as ComputeStore;
@@ -355,6 +359,8 @@ it.each(['handshake', 'immediate-close', 'consume', 'publish-and-close'] as cons
     };
     let pending = true;
     const store = {
+      deletedAttempt: async () => undefined,
+      commandClosed: async () => false,
       claim: vi.fn(async () => (pending ? { command, lease: 'lease' } : undefined)),
       sent: vi.fn(async () => {
         pending = false;
@@ -401,6 +407,8 @@ it('ignores a delayed close from a broker already replaced after a registration 
   stale.publisher.close.mockImplementationOnce(() => new Promise(() => {}));
   const healthy = connections();
   const store = {
+    deletedAttempt: async () => undefined,
+    commandClosed: async () => false,
     claim: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
   } as unknown as ComputeStore;
@@ -465,6 +473,8 @@ it.each(['conflict', 'transient', 'sink-failure'] as const)(
       if (scenario === 'transient') throw new Error('database disconnected');
     });
     const store = {
+      deletedAttempt: async () => undefined,
+      commandClosed: async () => false,
       accept,
       claim: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
@@ -533,6 +543,8 @@ it.each(['conflict', 'transient', 'sink-failure'] as const)(
 it('rejects a retired image result and continues committing later transcode results', async () => {
   const pair = connections();
   const store = {
+    deletedAttempt: async () => undefined,
+    commandClosed: async () => false,
     accept: vi.fn().mockResolvedValue(undefined),
     claim: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
@@ -621,6 +633,8 @@ it.each(['drain', 'abort', 'legacy'] as const)('HEAD shutdown %s', async (shutdo
     releaseHeads = resolve;
   });
   const store = {
+    deletedAttempt: async () => undefined,
+    commandClosed: async () => false,
     current: vi.fn().mockResolvedValue(true),
     accept: vi.fn(async () => {
       events.push('accept');
@@ -741,6 +755,8 @@ it('returns compute storage unavailable when a legacy HEAD misses the deadline',
   const assetId = randomUUID();
   const key = `mio/raw/${assetId}/${randomUUID()}`;
   const store = {
+    deletedAttempt: async () => undefined,
+    commandClosed: async () => false,
     request: vi.fn().mockResolvedValue(undefined),
     input: vi.fn().mockResolvedValue({ raw_key: key, size_bytes: '3' }),
     create: vi.fn(),
@@ -803,6 +819,8 @@ it('wakes transcode outbox draining immediately and coalesces concurrent admissi
   const assetId = randomUUID(),
     key = `mio/raw/${assetId}/${randomUUID()}`;
   const store = {
+    deletedAttempt: async () => undefined,
+    commandClosed: async () => false,
     request: vi.fn().mockResolvedValue(undefined),
     input: vi.fn().mockResolvedValue({ raw_key: key, size_bytes: '3' }),
     create: vi.fn(async (owner: string, requestId: string) => {

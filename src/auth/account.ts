@@ -20,9 +20,12 @@ const SESSION_GUARDED_PATHS = new Set([
   '/link-social',
   '/phone-binding/send-otp',
   '/phone-binding/confirm',
+  '/phone-rebind/send-otp',
+  '/phone-rebind/confirm',
+  '/account-deletion/send-otp',
 ]);
 
-export interface UserProfile {
+interface UserProfile {
   userId: string;
   displayId: string | null;
   name: string;
@@ -31,6 +34,10 @@ export interface UserProfile {
   phoneNumberVerified: boolean;
   wechatBound: boolean;
   onelinkBound: boolean;
+}
+
+export interface ProfileRecord extends UserProfile {
+  wechatNickname?: string | null;
 }
 
 export interface UserProfilePatch {
@@ -54,13 +61,18 @@ interface ProfileRow {
   phoneNumberVerified: boolean | null;
   wechatBound: boolean;
   onelinkBound: boolean;
+  wechatNickname: string | null;
 }
 
 const accountSchema = {
+  verification: {
+    fields: { scopeUserId: { type: 'string', required: false, index: true, input: false } },
+  },
   user: {
     fields: {
       disabled: { type: 'boolean', required: false, defaultValue: false, input: false },
       disabledAt: { type: 'date', required: false, input: false },
+      deletedAt: { type: 'date', required: false, input: false },
       displayId: { type: 'string', required: false, unique: true, input: false },
       avatarAssetId: { type: 'string', required: false, input: false },
     },
@@ -69,7 +81,10 @@ const accountSchema = {
 
 export function isUserDisabled(user: unknown): boolean {
   return Boolean(
-    user && typeof user === 'object' && (user as { disabled?: unknown }).disabled === true,
+    user &&
+    typeof user === 'object' &&
+    ((user as { disabled?: unknown }).disabled === true ||
+      (user as { deletedAt?: unknown }).deletedAt != null),
   );
 }
 
@@ -197,6 +212,8 @@ const PROFILE_SELECT = `
          EXISTS (
            SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'wechat'
          ) AS "wechatBound",
+         (SELECT a."wechatNickname" FROM "account" a
+          WHERE a."userId"=u.id AND a."providerId"='wechat') AS "wechatNickname",
          EXISTS (
            SELECT 1 FROM "account" a WHERE a."userId" = u.id AND a."providerId" = 'onelink'
          ) AS "onelinkBound"
@@ -204,7 +221,7 @@ const PROFILE_SELECT = `
   WHERE u.id = $1 AND COALESCE(u.disabled, false) = false
 `;
 
-function toProfile(row: ProfileRow): UserProfile {
+function toProfile(row: ProfileRow): ProfileRecord {
   return {
     userId: row.id,
     displayId: row.displayId,
@@ -213,6 +230,7 @@ function toProfile(row: ProfileRow): UserProfile {
     phoneNumber: row.phoneNumber,
     phoneNumberVerified: Boolean(row.phoneNumberVerified),
     wechatBound: Boolean(row.wechatBound),
+    wechatNickname: row.wechatNickname,
     onelinkBound: Boolean(row.onelinkBound),
   };
 }
@@ -220,13 +238,13 @@ function toProfile(row: ProfileRow): UserProfile {
 async function queryProfile(
   client: Pool | PoolClient,
   userId: string,
-): Promise<UserProfile | null> {
+): Promise<ProfileRecord | null> {
   const result = await client.query<ProfileRow>(PROFILE_SELECT, [userId]);
   const row = result.rows[0];
   return row ? toProfile(row) : null;
 }
 
-export function readUserProfile(pool: Pool, userId: string): Promise<UserProfile | null> {
+export function readUserProfile(pool: Pool, userId: string): Promise<ProfileRecord | null> {
   return queryProfile(pool, userId);
 }
 
@@ -234,7 +252,7 @@ export function updateUserProfile(
   pool: Pool,
   userId: string,
   patch: UserProfilePatch,
-): Promise<UserProfile | null> {
+): Promise<ProfileRecord | null> {
   const sets: string[] = [];
   const values: unknown[] = [userId];
   if (patch.name !== undefined) {
@@ -265,11 +283,11 @@ export function setUserDisabled(
   disabled: boolean,
 ): Promise<UserDisabledStatus | null> {
   return withAuthTransaction(pool, async (client) => {
-    const locked = await client.query<{ id: string }>(
-      'SELECT id FROM "user" WHERE id = $1 FOR UPDATE',
+    const locked = await client.query<{ id: string; deletedAt: Date | null }>(
+      'SELECT id,"deletedAt" FROM "user" WHERE id = $1 FOR UPDATE',
       [userId],
     );
-    if (!locked.rowCount) return null;
+    if (!locked.rowCount || locked.rows[0]!.deletedAt) return null;
     if (disabled) {
       const updated = await client.query<{ disabledAt: Date }>(
         `UPDATE "user"

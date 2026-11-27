@@ -12,6 +12,8 @@
 
 所有响应携带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 `X-Request-Id`，错误统一为 `{error:{code,message,requestId}}`，绝不返回密码哈希、会话令牌明文、API Key 明文/密文、OneLink SSO 加密密钥、监控连接密码、数据库栈或带签名的 COS URL。通用状态：400 `BODY_INVALID`/`QUERY_INVALID`/`ADMIN_INPUT_INVALID`/`ONELINK_SSO_NOT_CONFIGURED`/`WORKER_HARD_LIMIT_EXCEEDED`、401 `ADMIN_UNAUTHORIZED`/`ADMIN_INVALID_CREDENTIALS`/`ADMIN_PASSWORD_MISMATCH`、403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`、404 `NOT_FOUND`/`WORKER_NOT_FOUND`、405 `METHOD_NOT_ALLOWED`、408 `BODY_TIMEOUT`、409 `ADMIN_USERNAME_TAKEN`/`MODEL_ALREADY_EXISTS`/`TEMPLATE_KEY_TAKEN`/`SETTINGS_CONFLICT`/`ONELINK_REGISTER_IN_PROGRESS`/`WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`、413 `BODY_TOO_LARGE`、415 `JSON_REQUIRED`、503 `ADMIN_UNAVAILABLE`/`ONELINK_SSO_UNAVAILABLE`/`COMPUTE_OPS_UNAVAILABLE`。
 
+永久注销属于认证独立终态，管理员会话与 `mio.admin_session` 仍隔离。全局认证策略和普通账号解禁均不能恢复已注销的旧 userId，不新增管理端“恢复注销”入口。全局设置写体仍仅 `{expectedRevision,auth}`，不以注销实现扩展该写体；审计不保存明文 smsBypassCode。注销任务监控与备份恢复走[认证运维规则](../auth.md#独立监控与灾备恢复)，不混入现有模型／Worker 运行期热配置。
+
 ## POST /api/v1/admin/auth/login
 
 身份：匿名管理员登录入口。
@@ -435,3 +437,139 @@
 错误：400 `BODY_INVALID`/`QUERY_INVALID`/`WORKER_HARD_LIMIT_EXCEEDED`，401 `ADMIN_UNAUTHORIZED`，403 `ORIGIN_DENIED`/`ORIGIN_REQUIRED`，404 `NOT_FOUND`/`WORKER_NOT_FOUND`，409 `WORKER_REVISION_CONFLICT`/`WORKER_NOT_OBSERVED`，408 `BODY_TIMEOUT`，413 `BODY_TOO_LARGE`，415 `JSON_REQUIRED`，503 `COMPUTE_OPS_UNAVAILABLE`（未配置 Worker 实例或写入不可用）。
 
 副作用：事务写入不可变审计（`requested_by` 为当前 `admin.username`）、desired 配置和控制 outbox，并立即唤醒控制派发。B 取得后持久化校验结果，降限让占槽任务继续完成；上调或暂停只改变该实例的新准入。
+
+## GET /api/v1/admin/announcements
+
+身份：当前管理员，沿用 `mio.admin_session`；普通用户 Cookie 和部署 Bearer 均不授权。配置见[公告配置](../notifications.md)。
+
+输入：`page` 默认 1、范围 1–1000000，`pageSize` 默认 10、范围 1–100，均为十进制正整数，拒绝重复和额外参数。
+
+成功：200 `{items,page,pageSize,hasMore}`。每项含 `id,title,body,status,enabled,popup,effectiveAt,publishedAt,createdAt,updatedAt,isRead`；管理列表 `isRead` 固定为 false，不读取用户回执。按发布时间及 ID 倒序，空发布时间草稿在后。
+
+错误：未登录 401 `ADMIN_UNAUTHORIZED`；启用公告域前已登录请求返回 503 `NOTIFICATIONS_UNAVAILABLE`；其余沿用共同约定。
+
+副作用：只读查询，包括草稿、停用及未来公告，不续期会话。
+
+## GET /api/v1/admin/announcements/{id}
+
+身份：当前管理员。
+
+输入：UUID v4 公告 ID，无查询参数。
+
+成功：200 `{announcement:{id,title,body,status,enabled,popup,effectiveAt,publishedAt,createdAt,updatedAt}}`。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用管理和公告共同约定。
+
+副作用：只读，不记录用户已读。
+
+## POST /api/v1/admin/announcements
+
+身份：当前管理员，必须有允许列表精确匹配的 Origin。
+
+输入：JSON `{title,body,enabled?,popup?,effectiveAt?}`，标题非空且最多 200 个 Unicode 字符，纯文本正文非空且最多 16000 个字符；`enabled` 默认 true，`popup` 默认 false。`effectiveAt` 为带时区的 ISO 时间或 null（立即生效）；无查询参数，拒绝额外键。正文上限 64 KiB。
+
+成功：201 `{announcement}`，结构同详情；始终创建草稿，`publishedAt=null`。
+
+错误：400 `ANNOUNCEMENT_INPUT_INVALID`；其余沿用共同约定。审计或数据库暂不可用返回 503。
+
+副作用：先向现有 `mio_admin_audit_logs` 独立提交 `announcement.create` 操作意图，再创建公告草稿；真实管理员 ID、用户名和新公告 ID 被保留。审计失败阻止公告写入；公告库失败时保留尝试审计，其摘要不表示变更成功。公告和审计没有跨库事务。所有公告写入结束即使同实例元数据缓存失效，旧在途查询不能重新填回旧值；其他实例按 4 秒 TTL 收敛。
+
+## PATCH /api/v1/admin/announcements/{id}
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：至少一个 `{title?,body?,enabled?,popup?,effectiveAt?}`，各字段约束同创建；不得直接设置 status、发布时间或身份，无查询参数。
+
+成功：200 `{announcement}`。发布后编辑沿用原发布时间；`enabled=false` 使公告从用户查询中移除。
+
+错误：400 `ANNOUNCEMENT_INPUT_INVALID`、404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：按公告行锁串行编辑，保留 `announcement.update` 操作意图审计，缓存行为及跨库失败语义同创建。
+
+## POST /api/v1/admin/announcements/{id}/publish
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：JSON `{}`，无查询参数。
+
+成功：200 `{announcement}`；状态变为 published，首次发布生成发布时间。已发布时重复发布保留原发布时间；未来生效或停用公告仍不向用户可见。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：公告域行锁更新并记录 `announcement.publish` 操作意图；缓存与审计边界同创建。
+
+## POST /api/v1/admin/announcements/{id}/unpublish
+
+身份：当前管理员，必须有允许的精确 Origin。
+
+输入：JSON `{}`，无查询参数。
+
+成功：200 `{announcement}`；状态变回 draft，发布时间清空，用户不可见。再次发布取得新的发布时间。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：保留内容及已读记录，记录 `announcement.unpublish` 操作意图；缓存与审计边界同创建。
+
+## DELETE /api/v1/admin/announcements/{id}
+
+身份：当前管理员，包含 DELETE 在内必须有允许列表精确匹配的 Origin。
+
+输入：UUID v4 公告 ID，无正文及查询参数；独立管理前端先完成删除确认。
+
+成功：200 `{ok:true}`。
+
+错误：404 `ANNOUNCEMENT_NOT_FOUND`；其余沿用共同约定。
+
+副作用：删除公告及同域全部回执，保留管理员域 `announcement.delete` 操作意图审计，不能恢复公告；缓存与跨库失败边界同创建。不新增账号注销机制。
+
+## GET /api/v1/admin/settings/creation-logs
+
+身份：独立管理员 Cookie 会话；普通用户 Cookie、服务 Bearer 均无权限。来源及响应头沿管理域共同约定。
+
+输入：无查询参数或正文。
+
+成功：200 `{revision,retentionDays}`。首次设置前为 `{revision:0,retentionDays:null}`；已有配置从管理库回读，重启保留。
+
+错误：401 `ADMIN_UNAUTHORIZED`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：只读配置并刷新进程内只读快照，不改写配置或操作审计。
+
+## PATCH /api/v1/admin/settings/creation-logs
+
+身份：独立管理员 Cookie，必须携带精确匹配允许列表的 Origin。请求读取完毕再次校验管理员会话。
+
+输入：JSON 体严格为 `{expectedRevision,retentionDays}`；`expectedRevision` 为非负整数，`retentionDays` 为安全正整数，不接受 null、零、负数、小数或字符串。`/settings/global` 仍只接收 `{expectedRevision,auth}`。
+
+成功：200 `{revision,retentionDays}`，版本递增。
+
+错误：版本冲突为 409 `SETTINGS_CONFLICT`，非法输入为 400 `ADMIN_INPUT_INVALID`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：管理库一个事务内完成配置版本检查、更新及 `settings.creation-logs.update` 审计；审计包含操作者和前后天数／版本，审计失败回滚配置。保存实例立即更新进程内只读快照，其他实例每秒刷新、快照最长有效 5 秒；刷新失败并过期后，创作日志读取／清理失败关闭，不退回无限保留。用户热路径不查询管理库。设置缩短或首次保存时，管理端应先提示超期旧消息会被清理。更改仅影响创作消息和已读状态，作品、生成历史和公告沿各自规则。
+
+## GET /api/v1/admin/settings/storage
+
+身份：独立管理员 Cookie 会话；普通用户 Cookie、服务 Bearer 均不授权。来源及响应头沿管理域共同约定。
+
+输入：无查询参数或正文。
+
+成功：200 `{revision,quotaBytes,warningAvailableBytes}`。首次配置前为 `{revision:0,quotaBytes:5368709120,warningAvailableBytes:1073741824}`（5 GiB 配额、1 GiB 提醒阈值）；已有配置从管理库回读，重启保留。
+
+错误：401 `ADMIN_UNAUTHORIZED`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：只读配置并刷新进程内只读快照，不写配置或审计。缺配置才使用默认值，已有但格式损坏的配置失败关闭，不自动覆盖。
+
+## PATCH /api/v1/admin/settings/storage
+
+身份：独立管理员 Cookie，必须携带精确匹配允许列表的 Origin。请求读取完毕再次校验管理员会话。
+
+输入：JSON `{expectedRevision,quotaBytes?,warningAvailableBytes?}`，至少提交一个配置字段，拒绝额外字段及查询参数。`expectedRevision` 为 0–2147483647 的整数；字节值须为安全正整数，不接受 null、小数、字符串或超出安全整数的值。省略字段保留当前值，管理库事务内合并后必须满足 `0 < warningAvailableBytes < quotaBytes`。可同时调整两项。前端按 GiB 展示，服务端以字节保存；`/settings/global` 仍只接收认证配置。
+
+成功：200，结构同 GET。生效值有变化时版本加一（首次变更为 1）；合并后与当前值相同则返回当前版本，不递增、不写配置或变更审计。首次保存与默认值相同也保留版本 0。旧版本即使提交相同值也返回 409。
+
+错误：400 `ADMIN_INPUT_INVALID`；409 `SETTINGS_CONFLICT`；503 `ADMIN_UNAVAILABLE`；其余沿管理域共同约定。
+
+副作用：复用 `mio_admin_global_settings` 的 `storage` 记录，在同一个管理库事务内按版本、行锁完成合并校验、配置写入和 `settings.storage.update` 审计（`target_id='storage'`，记录管理员 ID／用户名与前后值／版本）。首次写入竞争通过主键冲突返回 409；审计失败回滚配置。只修改全局策略，不逐账号更新。
+
+服务内同步 `getStoragePolicy(): StorageSettings` 返回不可变快照，供用户用量热路径直接读取，单次读取不查询管理库。保存实例在事务成功完成后立即刷新，并从完成时刻重新计算最长 5 秒有效期，避免锁等待消耗刚保存配置的有效期。其他实例每秒后台刷新，查询取得的快照仍从查询开始时计时；慢查询和失败均不延长旧快照寿命，过期返回 503 `STORAGE_POLICY_UNAVAILABLE`。旧在途查询不能覆盖本机刚保存的新版本，卸载时停止轮询并等待在途刷新结束。此处短快照用于满足[个人中心 U6](../tasks/personal-center/prd.md#u6-存储用量与提醒)的同步读和跨实例收敛要求，不新增 Redis 缓存或通用配置框架。
+
+配额只用于计量和提醒，实际用量可超过配额；此配置不拦截上传、生成、查看、下载或清理，不新增空间预留、限写或降级字段。

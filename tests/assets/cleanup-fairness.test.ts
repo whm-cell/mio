@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { setImmediate as immediate } from 'node:timers/promises';
 import { Pool } from 'pg';
 import { expect, it, vi } from 'vitest';
 import { AssetStore } from '../../src/assets/store.ts';
@@ -35,21 +34,23 @@ it('advances beyond a full page of failed cleanup entries and revisits them afte
       deleted.push(key);
     },
   });
+  const firstPass = service.cleanup();
   try {
-    await vi.waitFor(() => expect(attempts).toHaveLength(100));
-    await immediate();
+    await firstPass;
+    expect(attempts).toHaveLength(100);
     const tick = intervals.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
     if (typeof tick !== 'function') throw new Error('cleanup interval missing');
     tick();
-    await vi.waitFor(() => expect(deleted).toEqual([`mio/staging/${ids[100]}`]));
-    await immediate();
+    await service.cleanup();
+    expect(deleted).toEqual([`mio/staging/${ids[100]}`]);
     tick();
-    await vi.waitFor(() => expect(selected).toHaveBeenCalledTimes(3));
+    await service.cleanup();
+    expect(selected).toHaveBeenCalledTimes(3);
     await selected.mock.results[2]!.value;
-    await immediate();
     failing = false;
     tick();
-    await vi.waitFor(() => expect(deleted).toHaveLength(101));
+    await service.cleanup();
+    expect(deleted).toHaveLength(101);
     expect(
       (await pool.query('SELECT id FROM mio_assets WHERE staging_deleted_at IS NULL')).rowCount,
     ).toBe(0);

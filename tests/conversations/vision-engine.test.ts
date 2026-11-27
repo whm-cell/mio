@@ -37,6 +37,91 @@ const snapshot = (anthropic: boolean) => ({
   imageBudget: { ...DEFAULT_CHAT_IMAGE_BUDGET, maxRequestImages: 1 },
 });
 
+const engineConfig = { databaseURL: 'unused', byok: true };
+function ownedImages(objects: ReadonlyMap<string, Buffer>, missing = 'not owned') {
+  return createConversationVision(async (owner, assetId, expected, signal) => {
+    signal.throwIfAborted();
+    const data = objects.get(assetId);
+    if (owner !== 'owner' || !data) throw new Error(missing);
+    const etagDigest = digest(`etag:${assetId}`),
+      sourceDigest = digest(data);
+    if (expected && (expected.etagDigest !== etagDigest || expected.sourceDigest !== sourceDigest))
+      throw new Error('changed');
+    return { assetId, contentType: 'image/png', data, etagDigest, sourceDigest };
+  });
+}
+function captureRequests(respond: (request: Request, count: number) => Response) {
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    requests.push((await request.clone().json()) as Record<string, unknown>);
+    return respond(request, requests.length);
+  });
+  return requests;
+}
+function inspectionResponse(calls: { id: string; assetId: string }[], id = 'tool') {
+  const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+  return new Response(
+    [
+      event({
+        id,
+        object: 'chat.completion.chunk',
+        model: 'fixture',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: 'assistant',
+              tool_calls: calls.map((call, index) => ({
+                index,
+                id: call.id,
+                type: 'function',
+                function: {
+                  name: 'inspect_image_asset',
+                  arguments: JSON.stringify({ assetId: call.assetId }),
+                },
+              })),
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+      event({
+        id,
+        object: 'chat.completion.chunk',
+        model: 'fixture',
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      }),
+      'data: [DONE]\n\n',
+    ].join(''),
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+}
+function conversationRun(
+  dshSessionId: string,
+  requestId: string,
+  selected: ConversationRun['snapshot'],
+  observe: ConversationRun['observe'] = async () => {},
+): ConversationRun {
+  return {
+    userId: 'owner',
+    conversationId: 'conversation',
+    dshSessionId,
+    requestId,
+    snapshot: selected,
+    observe,
+  };
+}
+async function closeVisionEngine(
+  engine: ReturnType<typeof createDshConversationEngine>,
+  ctx: Awaited<ReturnType<typeof kernelRuntime>>,
+  root: string,
+) {
+  await engine.close();
+  await ctx.fiber.dispose();
+  await rm(root, { recursive: true, force: true });
+}
+
 it.each([false, true])(
   'sends owned image, offloads only old image, and replays JSONL (Messages=%s)',
   async (anthropic) => {
@@ -59,43 +144,17 @@ it.each([false, true])(
       [assetA, pngA],
       [assetB, pngB],
     ]);
-    const vision = createConversationVision(async (owner, assetId, expected, signal) => {
-      signal.throwIfAborted();
-      const data = objects.get(assetId);
-      if (owner !== 'owner' || !data) throw new Error('not found');
-      const etagDigest = digest(`etag:${assetId}`),
-        sourceDigest = digest(data);
-      if (
-        expected &&
-        (expected.etagDigest !== etagDigest || expected.sourceDigest !== sourceDigest)
-      )
-        throw new Error('changed');
-      return { assetId, contentType: 'image/png', data, etagDigest, sourceDigest };
+    const vision = ownedImages(objects, 'not found');
+    const requests = captureRequests((request, count) => {
+      return protocolResponse(request, `reply ${count}`);
     });
-    const requests: Record<string, unknown>[] = [];
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      requests.push((await request.clone().json()) as Record<string, unknown>);
-      return protocolResponse(request, `reply ${requests.length}`);
-    });
-    const engine = createDshConversationEngine(
-      ctx,
-      { databaseURL: 'unused', byok: true },
-      undefined,
-      vision,
-    );
+    const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
     const observations: ModelObservation[] = [];
     const selected = snapshot(anthropic);
-    const bind = (requestId: string): ConversationRun => ({
-      userId: 'owner',
-      conversationId: 'conversation',
-      dshSessionId: 'vision-session',
-      requestId,
-      snapshot: selected,
-      observe: async (value) => {
+    const bind = (requestId: string): ConversationRun =>
+      conversationRun('vision-session', requestId, selected, async (value) => {
         observations.push(value);
-      },
-    });
+      });
     try {
       const refA = await vision.prepare('owner', assetA, new AbortController().signal);
       const refB = await vision.prepare('owner', assetB, new AbortController().signal);
@@ -122,6 +181,7 @@ it.each([false, true])(
           [refB],
         ),
       ).toBe('completed');
+      expect(await engine.retainedAssetIds?.('vision-session')).toEqual([assetB]);
       expect(requests).toHaveLength(2);
       expect(observations).toHaveLength(2);
       const wire = JSON.stringify(requests[1]);
@@ -144,9 +204,7 @@ it.each([false, true])(
       expect(JSON.stringify(raw)).not.toContain(pngB.toString('base64'));
       expect(JSON.stringify(raw)).not.toContain('synthetic-key');
     } finally {
-      await engine.close();
-      await ctx.fiber.dispose();
-      await rm(root, { recursive: true, force: true });
+      await closeVisionEngine(engine, ctx, root);
     }
   },
   30000,
@@ -166,40 +224,17 @@ it('keeps four image IDs in order in real history and omits them for text', asyn
     ),
   );
   const objects = new Map<string, Buffer>(ids.map((id, index) => [id, images[index]!]));
-  const vision = createConversationVision(async (owner, assetId, expected, signal) => {
-    signal.throwIfAborted();
-    const data = objects.get(assetId);
-    if (owner !== 'owner' || !data) throw new Error('not owned');
-    const etagDigest = digest(`etag:${assetId}`);
-    const sourceDigest = digest(data);
-    if (expected && (expected.etagDigest !== etagDigest || expected.sourceDigest !== sourceDigest))
-      throw new Error('changed');
-    return { assetId, contentType: 'image/png', data, etagDigest, sourceDigest };
-  });
-  const requests: Record<string, unknown>[] = [];
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
+  const vision = ownedImages(objects);
+  const requests = captureRequests((request) => {
     return protocolResponse(request, 'reply');
   });
-  const engine = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
+  const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
   const selected = {
     ...snapshot(false),
     imageBudget: { ...DEFAULT_CHAT_IMAGE_BUDGET, maxRequestImages: 4 },
   };
-  const bind = (requestId: string): ConversationRun => ({
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'ordered-history',
-    requestId,
-    snapshot: selected,
-    observe: async () => {},
-  });
+  const bind = (requestId: string): ConversationRun =>
+    conversationRun('ordered-history', requestId, selected);
   try {
     const signal = new AbortController().signal;
     const refs = await Promise.all(ids.map((id) => vision.prepare('owner', id, signal)));
@@ -261,9 +296,7 @@ it('keeps four image IDs in order in real history and omits them for text', asyn
     expect(users[0]).not.toHaveProperty('imageAssetIds');
     expect(users[1]).toMatchObject({ text: 'four pictures', imageAssetIds: ids });
   } finally {
-    await engine.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(engine, ctx, root);
   }
 }, 30000);
 
@@ -292,27 +325,12 @@ it.each(['jpeg', 'webp'] as const)(
         throw new Error('changed');
       return { assetId, contentType: mediaType, data, etagDigest, sourceDigest };
     });
-    const requests: Record<string, unknown>[] = [];
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      requests.push((await request.clone().json()) as Record<string, unknown>);
+    const requests = captureRequests((request) => {
       return protocolResponse(request, 'reply');
     });
-    const engine = createDshConversationEngine(
-      ctx,
-      { databaseURL: 'unused', byok: true },
-      undefined,
-      vision,
-    );
+    const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
     const selected = snapshot(false);
-    const run: ConversationRun = {
-      userId: 'owner',
-      conversationId: 'conversation',
-      dshSessionId: 'format',
-      requestId: 'format',
-      snapshot: selected,
-      observe: async () => {},
-    };
+    const run: ConversationRun = conversationRun('format', 'format', selected);
     try {
       const ref = await vision.prepare('owner', assetId, new AbortController().signal);
       const target = vision.target(ref, {
@@ -338,9 +356,7 @@ it.each(['jpeg', 'webp'] as const)(
         `data:${preview.mediaType};base64,${Buffer.from(preview.data).toString('base64')}`,
       );
     } finally {
-      await engine.close();
-      await ctx.fiber.dispose();
-      await rm(root, { recursive: true, force: true });
+      await closeVisionEngine(engine, ctx, root);
     }
   },
   30000,
@@ -364,75 +380,15 @@ it('reopens an offloaded session and re-inspects its old asset after restart', a
     [oldId, old],
     [recentId, recent],
   ]);
-  const vision = createConversationVision(async (owner, assetId, expected, signal) => {
-    signal.throwIfAborted();
-    const data = objects.get(assetId);
-    if (owner !== 'owner' || !data) throw new Error('not owned');
-    const etagDigest = digest(`etag:${assetId}`),
-      sourceDigest = digest(data);
-    if (expected && (expected.etagDigest !== etagDigest || expected.sourceDigest !== sourceDigest))
-      throw new Error('changed');
-    return { assetId, contentType: 'image/png', data, etagDigest, sourceDigest };
-  });
-  const requests: Record<string, unknown>[] = [];
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
-    if (requests.length !== 3) return protocolResponse(request, 'done');
-    const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
-    return new Response(
-      [
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: 'assistant',
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: 'reinspect',
-                    type: 'function',
-                    function: {
-                      name: 'inspect_image_asset',
-                      arguments: JSON.stringify({ assetId: oldId }),
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
-            },
-          ],
-        }),
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-        }),
-        'data: [DONE]\n\n',
-      ].join(''),
-      { headers: { 'content-type': 'text/event-stream' } },
-    );
+  const vision = ownedImages(objects);
+  const requests = captureRequests((request, count) => {
+    if (count !== 3) return protocolResponse(request, 'done');
+    return inspectionResponse([{ id: 'reinspect', assetId: oldId }]);
   });
   const selected = snapshot(false);
-  const bind = (requestId: string): ConversationRun => ({
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'reinspect',
-    requestId,
-    snapshot: selected,
-    observe: async () => {},
-  });
-  let engine = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
+  const bind = (requestId: string): ConversationRun =>
+    conversationRun('reinspect', requestId, selected);
+  let engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
   try {
     const first = await vision.prepare('owner', oldId, new AbortController().signal);
     const second = await vision.prepare('owner', recentId, new AbortController().signal);
@@ -463,12 +419,7 @@ it('reopens an offloaded session and re-inspects its old asset after restart', a
     await ctx.fiber.dispose();
     ctx = await kernelRuntime(root, new ScriptedModel([]));
     await ctx.plugin(imageOffload);
-    engine = createDshConversationEngine(
-      ctx,
-      { databaseURL: 'unused', byok: true },
-      undefined,
-      vision,
-    );
+    engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
     expect(
       await engine.run(
         'reinspect',
@@ -487,9 +438,7 @@ it('reopens an offloaded session and re-inspects its old asset after restart', a
     expect(JSON.stringify(raw)).not.toContain(old.toString('base64'));
     expect(JSON.stringify(raw)).not.toContain(recent.toString('base64'));
   } finally {
-    await engine.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(engine, ctx, root);
   }
 }, 30000);
 
@@ -515,105 +464,60 @@ it.each([false, true])(
         throw new Error('changed');
       return { assetId, contentType: 'image/png', data: png, etagDigest, sourceDigest };
     });
-    const requests: Record<string, unknown>[] = [];
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      requests.push((await request.clone().json()) as Record<string, unknown>);
-      if (requests.length > 1) return protocolResponse(request, 'inspection complete');
-      const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
-      const body = anthropic
-        ? [
-            {
-              type: 'message_start',
-              message: {
-                id: 'msg_tool',
-                type: 'message',
-                role: 'assistant',
-                model: 'fixture',
-                content: [],
-                stop_reason: null,
-                usage: { input_tokens: 5, output_tokens: 0 },
-              },
-            },
-            {
-              type: 'content_block_start',
-              index: 0,
-              content_block: {
-                type: 'tool_use',
-                id: 'inspect-call',
-                name: 'inspect_image_asset',
-                input: {},
-              },
-            },
-            {
-              type: 'content_block_delta',
-              index: 0,
-              delta: { type: 'input_json_delta', partial_json: JSON.stringify({ assetId }) },
-            },
-            { type: 'content_block_stop', index: 0 },
-            {
-              type: 'message_delta',
-              delta: { stop_reason: 'tool_use' },
-              usage: { output_tokens: 4 },
-            },
-            { type: 'message_stop' },
-          ]
-            .map((value) => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`)
-            .join('')
-        : [
-            event({
-              id: 'chatcmpl_tool',
-              object: 'chat.completion.chunk',
-              model: 'fixture',
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    role: 'assistant',
-                    tool_calls: [
-                      {
-                        index: 0,
-                        id: 'inspect-call',
-                        type: 'function',
-                        function: {
-                          name: 'inspect_image_asset',
-                          arguments: JSON.stringify({ assetId }),
-                        },
-                      },
-                    ],
-                  },
-                  finish_reason: null,
-                },
-              ],
-            }),
-            event({
-              id: 'chatcmpl_tool',
-              object: 'chat.completion.chunk',
-              model: 'fixture',
-              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-            }),
-            'data: [DONE]\n\n',
-          ].join('');
+    const requests = captureRequests((request, count) => {
+      if (count > 1) return protocolResponse(request, 'inspection complete');
+      if (!anthropic) return inspectionResponse([{ id: 'inspect-call', assetId }], 'chatcmpl_tool');
+      const body = [
+        {
+          type: 'message_start',
+          message: {
+            id: 'msg_tool',
+            type: 'message',
+            role: 'assistant',
+            model: 'fixture',
+            content: [],
+            stop_reason: null,
+            usage: { input_tokens: 5, output_tokens: 0 },
+          },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'tool_use',
+            id: 'inspect-call',
+            name: 'inspect_image_asset',
+            input: {},
+          },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify({ assetId }) },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'tool_use' },
+          usage: { output_tokens: 4 },
+        },
+        { type: 'message_stop' },
+      ]
+        .map((value) => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`)
+        .join('');
       return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
     });
-    const engine = createDshConversationEngine(
-      ctx,
-      { databaseURL: 'unused', byok: true },
-      undefined,
-      vision,
-    );
+    const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
     const selected = snapshot(anthropic);
     const observed: ModelObservation[] = [];
-    const run: ConversationRun = {
-      userId: 'owner',
-      conversationId: 'conversation',
-      dshSessionId: 'tool-session',
-      requestId: 'inspect',
-      snapshot: selected,
-      observe: async (value) => {
+    const run: ConversationRun = conversationRun(
+      'tool-session',
+      'inspect',
+      selected,
+      async (value) => {
         observed.push(value);
       },
-    };
+    );
     try {
       await engine.create('tool-session', selected);
       expect(
@@ -639,9 +543,7 @@ it.each([false, true])(
       expect(JSON.stringify(raw)).not.toContain('synthetic-key');
       expect(observed).toHaveLength(2);
     } finally {
-      await engine.close();
-      await ctx.fiber.dispose();
-      await rm(root, { recursive: true, force: true });
+      await closeVisionEngine(engine, ctx, root);
     }
   },
   30000,
@@ -662,27 +564,17 @@ it('fails closed without an upstream call when an existing image route becomes t
     etagDigest: digest('etag'),
     sourceDigest: digest(png),
   }));
-  const requests: Record<string, unknown>[] = [];
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
+  const requests = captureRequests((request) => {
     return protocolResponse(request, 'reply');
   });
-  const engine = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
+  const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
   const selected = snapshot(false);
-  const bind = (requestId: string, textOnly = false): ConversationRun => ({
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'revoked',
-    requestId,
-    snapshot: textOnly ? { ...selected, inputModalities: ['text'] } : selected,
-    observe: async () => {},
-  });
+  const bind = (requestId: string, textOnly = false): ConversationRun =>
+    conversationRun(
+      'revoked',
+      requestId,
+      textOnly ? { ...selected, inputModalities: ['text'] } : selected,
+    );
   try {
     const image = await vision.prepare('owner', assetId, new AbortController().signal);
     await engine.create('revoked', selected);
@@ -711,9 +603,7 @@ it('fails closed without an upstream call when an existing image route becomes t
     const raw = await ctx.mioKernel.history('revoked');
     expect(raw.events.filter((event) => event.type === 'image/offload')).toHaveLength(0);
   } finally {
-    await engine.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(engine, ctx, root);
   }
 }, 30000);
 
@@ -728,83 +618,26 @@ it.each([1, 2])(
     const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#abcdee' } })
       .png()
       .toBuffer();
-    const vision = createConversationVision(async (owner, assetId, expected, signal) => {
-      signal.throwIfAborted();
-      if (owner !== 'owner' || (assetId !== oldId && assetId !== newId))
-        throw new Error('not owned');
-      const etagDigest = digest(`etag:${assetId}`),
-        sourceDigest = digest(png);
-      if (
-        expected &&
-        (expected.etagDigest !== etagDigest || expected.sourceDigest !== sourceDigest)
-      )
-        throw new Error('changed');
-      return { assetId, contentType: 'image/png', data: png, etagDigest, sourceDigest };
-    });
-    const requests: Record<string, unknown>[] = [];
-    const toolResponse = (ids: string[]) => {
-      const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
-      return new Response(
-        [
-          event({
-            id: 'tool',
-            object: 'chat.completion.chunk',
-            model: 'fixture',
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  role: 'assistant',
-                  tool_calls: ids.map((assetId, index) => ({
-                    index,
-                    id: `call-${index}`,
-                    type: 'function',
-                    function: {
-                      name: 'inspect_image_asset',
-                      arguments: JSON.stringify({ assetId }),
-                    },
-                  })),
-                },
-                finish_reason: null,
-              },
-            ],
-          }),
-          event({
-            id: 'tool',
-            object: 'chat.completion.chunk',
-            model: 'fixture',
-            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          }),
-          'data: [DONE]\n\n',
-        ].join(''),
-        { headers: { 'content-type': 'text/event-stream' } },
-      );
-    };
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      requests.push((await request.clone().json()) as Record<string, unknown>);
-      if (requests.length === 1) return toolResponse([oldId]);
-      if (requests.length === 3) return toolResponse(Array(newCount).fill(newId));
+    const vision = ownedImages(
+      new Map([
+        [oldId, png],
+        [newId, png],
+      ]),
+    );
+    const toolResponse = (ids: string[]) =>
+      inspectionResponse(ids.map((assetId, index) => ({ id: `call-${index}`, assetId })));
+    const requests = captureRequests((request, count) => {
+      if (count === 1) return toolResponse([oldId]);
+      if (count === 3) return toolResponse(Array(newCount).fill(newId));
       return protocolResponse(request, 'inspection complete');
     });
-    const engine = createDshConversationEngine(
-      ctx,
-      { databaseURL: 'unused', byok: true },
-      undefined,
-      vision,
-    );
+    const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
     const selected = snapshot(false);
     const observed: ModelObservation[] = [];
-    const bind = (requestId: string): ConversationRun => ({
-      userId: 'owner',
-      conversationId: 'conversation',
-      dshSessionId: 'mixed',
-      requestId,
-      snapshot: selected,
-      observe: async (value) => {
+    const bind = (requestId: string): ConversationRun =>
+      conversationRun('mixed', requestId, selected, async (value) => {
         observed.push(value);
-      },
-    });
+      });
     try {
       await engine.create('mixed', selected);
       expect(
@@ -838,9 +671,7 @@ it.each([1, 2])(
       }
       expect(JSON.stringify(raw)).not.toContain(png.toString('base64'));
     } finally {
-      await engine.close();
-      await ctx.fiber.dispose();
-      await rm(root, { recursive: true, force: true });
+      await closeVisionEngine(engine, ctx, root);
     }
   },
   30000,
@@ -853,28 +684,14 @@ it('does not register inspection for text-only routes or without an asset bridge
   const vision = createConversationVision(async () => {
     throw new Error('must not read');
   });
-  const requests: Record<string, unknown>[] = [];
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
+  const requests = captureRequests((request) => {
     return protocolResponse(request, 'reply');
   });
   const selected = snapshot(false);
   const text = { ...selected, inputModalities: ['text'] as ('text' | 'image')[] };
-  const withVision = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
-  const bind = (dshSessionId: string, value: typeof text): ConversationRun => ({
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId,
-    requestId: 'one',
-    snapshot: value,
-    observe: async () => {},
-  });
+  const withVision = createDshConversationEngine(ctx, engineConfig, undefined, vision);
+  const bind = (dshSessionId: string, value: typeof text): ConversationRun =>
+    conversationRun(dshSessionId, 'one', value);
   try {
     await withVision.create('text', text);
     expect(
@@ -892,7 +709,7 @@ it('does not register inspection for text-only routes or without an asset bridge
     const secondRoot = await mkdtemp(join(tmpdir(), 'mio-vision-no-bridge-'));
     const secondCtx = await kernelRuntime(secondRoot, new ScriptedModel([]));
     await secondCtx.plugin(imageOffload);
-    const noVision = createDshConversationEngine(secondCtx, { databaseURL: 'unused', byok: true });
+    const noVision = createDshConversationEngine(secondCtx, engineConfig);
     try {
       await noVision.create('no-bridge', selected);
       expect(
@@ -907,14 +724,10 @@ it('does not register inspection for text-only routes or without an asset bridge
       ).toBe('completed');
       expect(JSON.stringify(requests[1]!.tools ?? [])).not.toContain('inspect_image_asset');
     } finally {
-      await noVision.close();
-      await secondCtx.fiber.dispose();
-      await rm(secondRoot, { recursive: true, force: true });
+      await closeVisionEngine(noVision, secondCtx, secondRoot);
     }
   } finally {
-    await withVision.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(withVision, ctx, root);
   }
 }, 30000);
 
@@ -937,67 +750,20 @@ it('enforces inspect ownership and the shared 12-call turn budget', async () => 
     return { assetId: id, contentType: 'image/png', data: png, etagDigest, sourceDigest };
   });
   const prepare = vi.spyOn(vision, 'prepare');
-  const requests: Record<string, unknown>[] = [];
-  const toolResponse = (ids: string[]) => {
-    const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
-    return new Response(
-      [
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: 'assistant',
-                tool_calls: ids.map((assetId, index) => ({
-                  index,
-                  id: `inspect-${index}`,
-                  type: 'function',
-                  function: { name: 'inspect_image_asset', arguments: JSON.stringify({ assetId }) },
-                })),
-              },
-              finish_reason: null,
-            },
-          ],
-        }),
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-        }),
-        'data: [DONE]\n\n',
-      ].join(''),
-      { headers: { 'content-type': 'text/event-stream' } },
-    );
-  };
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
-    if (requests.length === 1) return toolResponse([foreign]);
-    if (requests.length === 3) return toolResponse(Array(13).fill(own));
+  const toolResponse = (ids: string[]) =>
+    inspectionResponse(ids.map((assetId, index) => ({ id: `inspect-${index}`, assetId })));
+  const requests = captureRequests((request, count) => {
+    if (count === 1) return toolResponse([foreign]);
+    if (count === 3) return toolResponse(Array(13).fill(own));
     return protocolResponse(request, 'done');
   });
-  const engine = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
+  const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
   const selected = {
     ...snapshot(false),
     imageBudget: { ...DEFAULT_CHAT_IMAGE_BUDGET, maxRequestImages: 16 },
   };
-  const bind = (requestId: string): ConversationRun => ({
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'grant',
-    requestId,
-    snapshot: selected,
-    observe: async () => {},
-  });
+  const bind = (requestId: string): ConversationRun =>
+    conversationRun('grant', requestId, selected);
   try {
     await engine.create('grant', selected);
     expect(
@@ -1029,9 +795,7 @@ it('enforces inspect ownership and the shared 12-call turn budget', async () => 
     expect(JSON.stringify(raw)).not.toContain(png.toString('base64'));
   } finally {
     prepare.mockRestore();
-    await engine.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(engine, ctx, root);
   }
 }, 30000);
 
@@ -1053,67 +817,15 @@ it('cancels an in-flight inspect read when the engine closes', async () => {
       else signal.addEventListener('abort', cancel, { once: true });
     });
   });
-  const requests: Record<string, unknown>[] = [];
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    requests.push((await request.clone().json()) as Record<string, unknown>);
-    const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
-    return new Response(
-      [
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: 'assistant',
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: 'inspect',
-                    type: 'function',
-                    function: {
-                      name: 'inspect_image_asset',
-                      arguments: JSON.stringify({ assetId }),
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
-            },
-          ],
-        }),
-        event({
-          id: 'tool',
-          object: 'chat.completion.chunk',
-          model: 'fixture',
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-        }),
-        'data: [DONE]\n\n',
-      ].join(''),
-      { headers: { 'content-type': 'text/event-stream' } },
-    );
+  const requests = captureRequests(() => {
+    return inspectionResponse([{ id: 'inspect', assetId }]);
   });
-  const engine = createDshConversationEngine(
-    ctx,
-    { databaseURL: 'unused', byok: true },
-    undefined,
-    vision,
-  );
+  const engine = createDshConversationEngine(ctx, engineConfig, undefined, vision);
   const selected = snapshot(false);
   const observations: ModelObservation[] = [];
-  const run: ConversationRun = {
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'cancel',
-    requestId: 'cancel',
-    snapshot: selected,
-    observe: async (value) => {
-      observations.push(value);
-    },
-  };
+  const run: ConversationRun = conversationRun('cancel', 'cancel', selected, async (value) => {
+    observations.push(value);
+  });
   try {
     await engine.create('cancel', selected);
     const running = engine.run(
@@ -1131,9 +843,7 @@ it('cancels an in-flight inspect read when the engine closes', async () => {
     expect(requests).toHaveLength(1);
     expect(observations).toHaveLength(1);
   } finally {
-    await engine.close();
-    await ctx.fiber.dispose();
-    await rm(root, { recursive: true, force: true });
+    await closeVisionEngine(engine, ctx, root);
   }
 }, 30000);
 
@@ -1158,16 +868,9 @@ it('does not persist a local finish as a supplier observation before transport s
   const observed: ModelObservation[] = [];
   const controller = new AbortController();
   const selected = snapshot(false);
-  const run: ConversationRun = {
-    userId: 'owner',
-    conversationId: 'conversation',
-    dshSessionId: 'local',
-    requestId: 'local',
-    snapshot: selected,
-    observe: async (value) => {
-      observed.push(value);
-    },
-  };
+  const run: ConversationRun = conversationRun('local', 'local', selected, async (value) => {
+    observed.push(value);
+  });
   const transport = vi.fn();
   vi.stubGlobal('fetch', transport);
   const adapter = new OneLinkAdapter();
